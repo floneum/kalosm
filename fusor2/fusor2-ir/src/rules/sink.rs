@@ -3,8 +3,8 @@
 
 use crate::dtype::Dtype;
 use crate::egraph::{Builder, Facts, Id, RuleTag};
-use crate::ir::level0::L0;
-use crate::ir::level1::{AccessPlan, L1, Operand};
+use crate::ir::logical::Logical;
+use crate::ir::launch::{AccessPlan, Launch, Operand};
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
 use crate::shape::{AxisGroup, Dim, Layout, MultiFlattenMap, SubAxis};
@@ -12,29 +12,29 @@ use smallvec::SmallVec;
 
 rule!(
     SINK_EPILOGUE,
-    level = Level::L1,
-    head = OpTag::KMap,
+    level = Level::Launch,
+    head = OpTag::LaunchMap,
     tag = RuleTag::Additive,
     apply = sink_epilogue,
 );
 
 rule!(
     FOLD_VIEWS_INTO_INDEX,
-    level = Level::L1,
-    head = OpTag::KMap,
+    level = Level::Launch,
+    head = OpTag::LaunchMap,
     tag = RuleTag::Additive,
     apply = fold_views_into_index,
 );
 
 rule!(
     FOLD_VIEWS_INTO_FOLD_INDEX,
-    level = Level::L1,
-    head = OpTag::KFold,
+    level = Level::Launch,
+    head = OpTag::LaunchFold,
     tag = RuleTag::Additive,
     apply = fold_views_into_fold_index,
 );
 
-/// `f(view(x)) == view(f(x))` when `view` is pure: a single-operand `KMap`
+/// `f(view(x)) == view(f(x))` when `view` is pure: a single-operand `Map`
 /// reading a contraction through a chain of restrides also equals that
 /// contraction with a longer `post`, re-viewed.
 ///
@@ -43,7 +43,7 @@ rule!(
 /// F16-accumulator/F32-epilogue widening pair. That is legality — whether
 /// sinking pays is priced elsewhere.
 pub fn sink_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    let Op::L1(L1::KMap { body, ops, .. }) = &node.op else {
+    let Op::Launch(Launch::Map { body, ops, .. }) = &node.op else {
         return None;
     };
     if ops.len() != 1 || !matches!(ops[0].access, AccessPlan::Alias) {
@@ -53,7 +53,7 @@ pub fn sink_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -
     let base = b.node(spine.base).op.clone();
 
     let sunk = match base {
-        Op::L1(L1::KContract {
+        Op::Launch(Launch::Contract {
             m,
             n,
             k,
@@ -68,7 +68,7 @@ pub fn sink_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -
             if !epilogue_preserves_accum(body.dtype(), acc) {
                 return None;
             }
-            b.add_l1(L1::KContract {
+            b.add_launch(Launch::Contract {
                 m,
                 n,
                 k,
@@ -89,11 +89,11 @@ pub fn sink_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -
     // spec vector, which is what makes a multi-node spine compose correctly.
     let mut cursor = sunk;
     for view in spine.views.iter() {
-        let Op::L0(L0::Restride { specs, bounds, .. }) = b.node(*view).op.clone() else {
+        let Op::Logical(Logical::Restride { specs, bounds, .. }) = b.node(*view).op.clone() else {
             return None;
         };
         cursor = b
-            .add_l0(L0::Restride {
+            .add_logical(Logical::Restride {
                 specs,
                 bounds,
                 x: cursor,
@@ -113,14 +113,10 @@ fn epilogue_preserves_accum(epilogue: Dtype, acc: Dtype) -> bool {
 }
 
 /// Read a view through the operand's index map instead of through a
-/// materialized copy.
-///
-/// The reference gates this on `needs_delinearize && input_reread_factor > 1`
-/// inside the generator; that gate is deleted. `MultiFlattenMap::divmod_ops`
-/// is the term the pricing crate charges for the divmod chain, so a reread
-/// factor of two with a trivial delinearize can win on its own merits.
+/// materialized copy. `MultiFlattenMap::divmod_ops` is the term the pricing
+/// crate charges for the divmod chain, so this stays ungated here.
 pub fn fold_views_into_index(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    let Op::L1(L1::KMap {
+    let Op::Launch(Launch::Map {
         space,
         body,
         ops,
@@ -131,7 +127,7 @@ pub fn fold_views_into_index(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Fact
     };
     let new_ops = fold_operand_views(b, ops, space)?;
     let alt = b
-        .add_l1(L1::KMap {
+        .add_launch(Launch::Map {
             space: space.clone(),
             body: body.clone(),
             ops: new_ops,
@@ -141,31 +137,19 @@ pub fn fold_views_into_index(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Fact
     b.union(id, alt).ok()
 }
 
-/// The same law with a `KFold` in the consumer position.
+/// The same law with a `Fold` in the consumer position.
 ///
-/// [`fold_views_into_index`] states "a view is an index map, not a copy", and
-/// nothing in that statement mentions the consumer's head. It shipped headed
-/// at `KMap` only, and the consequence was measurable rather than theoretical:
-/// on the attention forward chain the row max is broadcast back over the key
-/// axis and read by **two** consumers, the `exp` map and the sum fold. The map
-/// could fold the broadcast into its operand map; the fold could not, so the
-/// broadcast kept a live reader, stayed in `M`, and cost a whole dispatch that
-/// copied 48 floats into 192 bytes so a later kernel could read them back
-/// contiguously.
-///
-/// A `KFold`'s operands are indexed over `space` exactly as a `KMap`'s are
-/// (`verify_l1::check_operand_access` reads `index_space_of`, which returns
-/// `space` for both), so the rewrite is the same rewrite. `vec_axes` needs no
-/// special case: it renumbers nothing, and a promoted axis a rewritten operand
-/// varies along is checked by `check_vec_axes` on the minted node, so an
-/// illegal spelling is refused by `add_l1` rather than guarded here.
+/// A `Fold`'s operands are indexed over `space` exactly as a `Map`'s are, so
+/// the rewrite is the same rewrite. `vec_axes` needs no special case: it
+/// renumbers nothing, and `check_vec_axes` on the minted node refuses an
+/// illegal spelling at `add_launch`.
 pub fn fold_views_into_fold_index(
     b: &mut Builder<'_>,
     id: Id,
     node: &Node,
     _f: &Facts<'_>,
 ) -> Option<Id> {
-    let Op::L1(L1::KFold {
+    let Op::Launch(Launch::Fold {
         space,
         axis,
         vec_axes,
@@ -180,7 +164,7 @@ pub fn fold_views_into_fold_index(
     };
     let new_ops = fold_operand_views(b, ops, space)?;
     let alt = b
-        .add_l1(L1::KFold {
+        .add_launch(Launch::Fold {
             space: space.clone(),
             axis: *axis,
             vec_axes: vec_axes.clone(),
@@ -200,7 +184,7 @@ pub fn fold_views_into_fold_index(
 fn fold_operand_views(
     b: &Builder<'_>,
     ops: &[Operand],
-    space: &crate::ir::level1::IndexSpace,
+    space: &crate::ir::launch::IndexSpace,
 ) -> Option<Vec<Operand>> {
     let mut new_ops = ops.to_vec();
     let mut changed = false;
@@ -208,13 +192,10 @@ fn fold_operand_views(
         if !matches!(slot.access, AccessPlan::Alias) {
             continue;
         }
-        // The rewrite **replaces the operand's layout outright** with one
-        // derived from the view's base, so whatever that layout said is
-        // discarded. That is sound only when it said exactly "read the view
-        // dense at the consuming coordinate". A permuted, strided, broadcast
-        // or offset alias says something else — and since `check_operand_access`
-        // only pins an `Alias`'s rank and extents, not its strides, every one
-        // of those spellings reaches here.
+        // The rewrite replaces the operand's layout outright, which is sound
+        // only when that layout was the dense read of the consuming space. A
+        // permuted, broadcast or offset alias says something else, and every
+        // one of those spellings reaches here.
         if !reads_its_view_densely(slot, space) {
             continue;
         }
@@ -227,9 +208,7 @@ fn fold_operand_views(
             // stage is const, statically bounded and affine over the stage
             // below — `composed_spine_layout` states the conditions. This is
             // the narrow → reshape → transpose chain every rope operand and
-            // attention head split arrives as; before it composed, each such
-            // edge kept a whole identity-copy launch alive (916 of one 8B
-            // decode step's 2,355 launches were these copies).
+            // attention head split arrives as.
             let Some(layout) = crate::rules::composed_spine_layout(b, &spine) else {
                 continue;
             };
@@ -250,16 +229,13 @@ fn fold_operand_views(
             changed = true;
             continue;
         }
-        let Op::L0(L0::Restride { specs, .. }) = b.node(spine.views[0]).op.clone() else {
+        let Op::Logical(Logical::Restride { specs, .. }) = b.node(spine.views[0]).op.clone() else {
             continue;
         };
-        // The map replaces the operand's layout outright, and a
-        // `MultiFlattenMap`'s extents are what `Operand::address_map` derives
-        // its divisors from. So the view must already span the consuming
-        // index space. When it does not — an operand broadcast against the
-        // space, whose `[rows, 1]` view is read over `[rows, cols]` — the
-        // layout is doing work the map cannot express, and adopting the map
-        // reads `flat % rows` where `flat / cols` belongs.
+        // The view must span the consuming index space: a `[rows, 1]` view
+        // read over `[rows, cols]` has its layout doing work the map cannot
+        // express, and adopting the map reads `flat % rows` where
+        // `flat / cols` belongs.
         if specs.len() != space.dims.len()
             || !specs
                 .iter()
@@ -272,10 +248,10 @@ fn fold_operand_views(
         let Some((map, offset)) = unflatten_of(&specs, &base_shape) else {
             continue;
         };
-        // `MultiFlattenMap` is a pure sum of stride terms and has nowhere to
-        // put a base offset, so `Operand::address_map` takes it from the
-        // layout. A contiguous layout says offset 0, which silently turned a
-        // narrowed view (`table[2..]`) back into the whole table.
+        // `MultiFlattenMap` has nowhere to put a base offset, so
+        // `Operand::address_map` takes it from the layout. Offset 0 here
+        // silently turns a narrowed view (`table[2..]`) back into the whole
+        // table.
         let layout = Layout::from_parts(
             Dim::Const(offset),
             &base_shape,
@@ -296,27 +272,11 @@ fn fold_operand_views(
 /// zero — the one layout [`fold_operand_views`] may discard, because it is the
 /// one the replacement map reproduces.
 ///
-/// # Why this is a guard and not an assert
-///
-/// `verify_l1::check_operand_access` pins an `Alias`'s **rank and extents**
-/// against the index space and says nothing about its strides or its offset.
-/// So a transposed read (`strides = [1, rows]`), a broadcast one
-/// (`strides = [.., 0]`) and a window (`offset != 0`) are all legal operands
-/// at the extents this rule already checks, and all three arrive here.
-/// Replacing them with `unflatten_of`'s map states the *view's* index
-/// arithmetic in place of the operand's, which is a different address for
-/// every coordinate but the first.
-///
-/// Measured, and this is the whole reason the guard exists: with a co-selection
-/// pass in `fusor2-cost::extract` letting the search reach the fused members
-/// this rule mints, the unguarded version put **29** conformance cases on wrong
-/// values — every `softmax`, `layer_norm` and `rms_norm` row, `attention_qk_mask`
-/// and the attention gradients, on both backends. `softmax_rows_sum_to_one`
-/// reported a row summing to 1.13. The e-graph's invariant is that any member
-/// of a class computes the same value, so a search that reaches further is a
-/// search that reaches a wrong plan; the member has been in the graph, unequal
-/// and unselected, since this rule shipped.
-fn reads_its_view_densely(o: &Operand, space: &crate::ir::level1::IndexSpace) -> bool {
+/// `verify_launch::check_operand_access` pins an `Alias`'s rank and extents
+/// only, so transposed, broadcast and windowed operands all arrive here;
+/// replacing their layout with `unflatten_of`'s map addresses a different
+/// element at every coordinate but the first.
+fn reads_its_view_densely(o: &Operand, space: &crate::ir::launch::IndexSpace) -> bool {
     if !o.layout.offset().known_eq(Dim::Const(0)) {
         return false;
     }
@@ -376,7 +336,7 @@ fn unflatten_of(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::level1::L1;
+    use crate::ir::launch::Launch;
     use crate::rules::test_support as ts;
     use crate::rules::{alias_operand_of, ident_expr};
     use crate::scalar::{ScalarExpr, ScalarKind, UnOp};
@@ -389,13 +349,9 @@ mod tests {
         (r.apply)(&mut b, id, &node, &facts)
     }
 
-    /// The `KFold` arm reads a broadcast row statistic through the operand's
-    /// index map instead of through the copy the floor would materialize.
-    ///
-    /// This is the attention forward chain's shape in miniature: a `[rows]`
-    /// value broadcast back over the reduced axis and consumed by a fold. The
-    /// `KMap` arm always had this; without the fold arm the broadcast keeps a
-    /// reader, stays in `M` and costs a dispatch.
+    /// The `Fold` arm reads a broadcast row statistic through the operand's
+    /// index map instead of through the copy the floor would materialize —
+    /// the attention forward chain's shape in miniature.
     #[test]
     fn fold_views_into_fold_index_reads_a_broadcast_through_the_index_map() {
         use crate::carrier::Carrier;
@@ -430,13 +386,13 @@ mod tests {
             .iter()
             .copied()
             .find(|&i| {
-                matches!(&g.node(i).op, Op::L1(L1::KFold { ops, .. })
+                matches!(&g.node(i).op, Op::Launch(Launch::Fold { ops, .. })
                     if ops.len() == 1
                         && ops[0].src == stat
                         && matches!(ops[0].access, AccessPlan::Unflatten(_)))
             })
             .expect("an alternative reading the statistic through an index map");
-        let Op::L1(L1::KFold { ops, .. }) = &g.node(folded).op else {
+        let Op::Launch(Launch::Fold { ops, .. }) = &g.node(folded).op else {
             panic!()
         };
         let AccessPlan::Unflatten(map) = &ops[0].access else {
@@ -451,14 +407,8 @@ mod tests {
     }
 
     /// The rewrite discards the operand's own layout, so it fires only where
-    /// that layout was the dense read. Both halves, on one fixture: the
-    /// transposed read of a view is refused, and the dense read of the same
-    /// view is still rewritten.
-    ///
-    /// Without the guard the first assert fails — `check_operand_access` pins
-    /// an `Alias`'s rank and extents and says nothing about its strides, so a
-    /// transposed edge reaches the rule and comes back reading the view in
-    /// row-major order.
+    /// that layout was the dense read: the transposed read of a view is
+    /// refused, and the dense read of the same view is still rewritten.
     #[test]
     fn fold_views_into_index_refuses_an_operand_that_is_not_the_dense_read() {
         use crate::shape::StrideSpec;
@@ -505,9 +455,7 @@ mod tests {
     /// A narrow -> split-reshape -> transpose spine — the shape every rope
     /// operand and attention head split arrives as — composes to one alias
     /// layout over the base, offset included, and the copy the floor would
-    /// materialize gains a launch-free alternative. Before the multi-view
-    /// arm, `spine.views.len() != 1` declined this and 916 of one 8B decode
-    /// step's 2,355 launches were exactly these identity copies.
+    /// materialize gains a launch-free alternative.
     #[test]
     fn fold_views_into_index_composes_a_multi_view_spine() {
         use crate::shape::StrideSpec;
@@ -552,11 +500,11 @@ mod tests {
             .iter()
             .copied()
             .find(|&i| {
-                matches!(&g.node(i).op, Op::L1(L1::KMap { ops, .. })
+                matches!(&g.node(i).op, Op::Launch(Launch::Map { ops, .. })
                     if ops.len() == 1 && ops[0].src == base)
             })
             .expect("an alternative reading the base through the composed layout");
-        let Op::L1(L1::KMap { ops, .. }) = &g.node(folded).op else {
+        let Op::Launch(Launch::Map { ops, .. }) = &g.node(folded).op else {
             panic!()
         };
         assert!(matches!(ops[0].access, AccessPlan::Alias));
@@ -577,7 +525,7 @@ mod tests {
         let mut g = ts::graph();
         let base = ts::buffer(&mut g, Dtype::F32, &[Dim::Const(48)]);
         let masked = g
-            .add(Op::L0(crate::ir::level0::L0::Restride {
+            .add(Op::Logical(crate::ir::logical::Logical::Restride {
                 specs: [StrideSpec::dim(0, Dim::Const(16)).with_offset(Dim::Const(32))]
                     .into_iter()
                     .collect(),
@@ -658,9 +606,9 @@ mod tests {
         assert!(fire(&mut g, fold, &FOLD_VIEWS_INTO_FOLD_INDEX).is_none());
     }
 
-    /// Test 5. `KContract -> Restride -> Restride -> KMap(gelu-ish)`: the
-    /// map's class gains `Restride(Restride(KContract{post}))` and the
-    /// composed form survives.
+    /// `Contract -> Restride -> Restride -> Map(gelu-ish)`: the map's class
+    /// gains `Restride(Restride(Contract{post}))` and the composed form
+    /// survives.
     #[test]
     fn sink_epilogue_crosses_a_three_node_view_spine() {
         let mut g = ts::graph();
@@ -705,16 +653,16 @@ mod tests {
         let alt = members
             .iter()
             .copied()
-            .find(|&i| matches!(g.node(i).op, Op::L0(L0::Restride { .. })))
+            .find(|&i| matches!(g.node(i).op, Op::Logical(Logical::Restride { .. })))
             .expect("a re-viewed alternative");
         // Peel the two views back off and find the contraction underneath.
-        let Op::L0(L0::Restride { x: inner, .. }) = g.node(alt).op.clone() else {
+        let Op::Logical(Logical::Restride { x: inner, .. }) = g.node(alt).op.clone() else {
             panic!()
         };
-        let Op::L0(L0::Restride { x: base, .. }) = g.node(inner).op.clone() else {
+        let Op::Logical(Logical::Restride { x: base, .. }) = g.node(inner).op.clone() else {
             panic!("expected two stacked views")
         };
-        let Op::L1(L1::KContract { post, .. }) = &g.node(base).op else {
+        let Op::Launch(Launch::Contract { post, .. }) = &g.node(base).op else {
             panic!("expected the contraction to carry the epilogue")
         };
         assert!(matches!(post.kind(), ScalarKind::Un { op: UnOp::Tanh, .. }));
@@ -767,7 +715,7 @@ mod tests {
         );
         assert!(fire(&mut g, m, &FOLD_VIEWS_INTO_INDEX).is_some());
         let alt = g.chain(m).into_iter().find(|&i| i != m).unwrap();
-        let Op::L1(L1::KMap { ops, .. }) = &g.node(alt).op else {
+        let Op::Launch(Launch::Map { ops, .. }) = &g.node(alt).op else {
             panic!()
         };
         assert_eq!(ops[0].src, x);

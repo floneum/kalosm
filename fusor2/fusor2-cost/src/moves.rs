@@ -2,13 +2,12 @@
 //!
 //! Each move's delta is recomputed over only the affected launches, via a
 //! union-find over the realized cut. The accept test is always the exact
-//! global cost — the schedule score orders the `RESCHEDULE` frontier, it
-//! never gates candidates, so the full domain stays reachable.
+//! global cost; the schedule score only orders the `RESCHEDULE` frontier,
+//! never gates it.
 //!
-//! `FLIP` is refused when the node is pinned: an `Effect::InPlace` node is
-//! pinned in `M`, because inlining an atomic scatter into two consumers
-//! doubles the embedding gradient. Purity is a precondition of the
-//! materialization move.
+//! `FLIP` is refused when the node is pinned: inlining an `Effect::InPlace`
+//! node (an atomic scatter) into two consumers doubles the write. Purity is
+//! a precondition of the materialization move.
 
 use crate::realize::{self, Realized};
 use fusor2_ir::cost::{CostModel, Picoseconds};
@@ -16,7 +15,7 @@ use fusor2_ir::egraph::{ClassId, EGraph, Id};
 use fusor2_ir::extract::{ExtractBudget, Extraction, Move};
 use fusor2_ir::facts::ValueFacts;
 use fusor2_ir::ir::Op;
-use fusor2_ir::ir::level1::{Effect, L1, SchedPoint, ScheduleDomain};
+use fusor2_ir::ir::launch::{Effect, Launch, SchedPoint, ScheduleDomain};
 use fusor2_ir::shape::Layout;
 use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
@@ -54,9 +53,7 @@ pub enum Undo {
 }
 
 /// Memo for the `RESCHEDULE` frontier: the per-point score and the sorted
-/// order, both keyed on `(node, context_hash)`. This is what makes an
-/// ~8,300-point `CoopDomain` affordable — without it every sweep would
-/// rescore the whole domain of every contraction.
+/// order, both keyed on `(node, context_hash)`.
 #[derive(Default)]
 pub struct SchedCache {
     order: FxHashMap<(Id, u64), Vec<SchedPoint>>,
@@ -94,7 +91,7 @@ impl SchedCache {
                 .collect();
             let out = graph.facts(id);
             let domain = match &node.op {
-                Op::L1(l1) => l1.schedule(),
+                Op::Launch(l1) => l1.schedule(),
                 _ => None,
             };
             let mut points: Vec<(Picoseconds, usize, SchedPoint)> = match domain {
@@ -164,9 +161,8 @@ pub fn candidates(
     match mv {
         Move::Reselect(class) => {
             let current = extraction.sigma.get(&class).copied();
-            // Only runnable members: proposing the un-lowered `L0` node would
-            // be a move the objective cannot distinguish and the verifier
-            // rejects outright.
+            // Only runnable members: the verifier rejects the un-lowered
+            // `Logical` node.
             let mut members = realize::selectable(graph, class, &cost.facts().caps);
             // lb-ascending, ties by smaller id.
             members.sort_by_key(|m| (lb[m.index()], *m));
@@ -178,9 +174,9 @@ pub fn candidates(
         }
         Move::Flip(node) => {
             let on = !extraction.is_materialized(node);
-            // Only *leaving* `M` needs a guard. A node cut from a consumer by
-            // structure has to land in a buffer whatever it costs, or the
-            // consumer's launch reads a value nothing ever wrote.
+            // Only leaving `M` needs a guard: a node cut from a consumer by
+            // structure has to land in a buffer, or the consumer's launch
+            // reads a value nothing ever wrote.
             let blocked = !on
                 && (is_pinned(graph, &realized.roots, node)
                     || at_structural_boundary(graph, realized, node));
@@ -192,12 +188,9 @@ pub fn candidates(
             let current = extraction.theta.get(&node).copied();
             let context = context_hash(graph, realized, node);
             for theta in cache.ordered(graph, node, context, cost) {
-                // A point whose footprint is over the device cap is
-                // unselectable, not merely slow: §4.2 makes a lowering refusal
-                // a hard assert, so offering one lets the climb move onto a
-                // state that mints a crash. `has_legal_point` gates the node
-                // and passes as soon as *one* point fits, so the per-point
-                // test has to be here as well.
+                // A point whose footprint is over the device cap hard-asserts
+                // in lowering. `has_legal_point` passes as soon as one point
+                // fits, so each point must be checked here as well.
                 if !realize::point_is_legal(graph, node, *theta, &cost.facts().caps) {
                     continue;
                 }
@@ -225,9 +218,7 @@ pub fn apply(graph: &EGraph, extraction: &mut Extraction, c: Candidate) -> Optio
             extraction.sigma.insert(class, node);
             // `M` is keyed by node, but the decision it records belongs to the
             // class: a value that had to land in a buffer still has to,
-            // whichever member computes it. Without this, reselecting a root's
-            // class silently un-materializes the root and nothing lands
-            // anywhere.
+            // whichever member computes it.
             if extraction.is_materialized(was)
                 && realize::leaf_role(graph, node) == realize::LeafRole::NotLeaf
             {
@@ -335,12 +326,12 @@ pub fn context_hash(graph: &EGraph, realized: &Realized, node: Id) -> u64 {
     let n = graph.node(node);
 
     match &n.op {
-        Op::L1(L1::KContract { a, b, post, .. }) => {
+        Op::Launch(Launch::Contract { a, b, post, .. }) => {
             h.write_u64(a.pre.structural_hash());
             h.write_u64(b.pre.structural_hash());
             h.write_u64(post.structural_hash());
         }
-        Op::L1(L1::KFold { carrier, post, .. }) => {
+        Op::Launch(Launch::Fold { carrier, post, .. }) => {
             for l in &carrier.lift {
                 h.write_u64(l.structural_hash());
             }
@@ -351,7 +342,7 @@ pub fn context_hash(graph: &EGraph, realized: &Realized, node: Id) -> u64 {
                 h.write_u64(p.structural_hash());
             }
         }
-        Op::L1(L1::KMap { body, .. }) => h.write_u64(body.structural_hash()),
+        Op::Launch(Launch::Map { body, .. }) => h.write_u64(body.structural_hash()),
         _ => h.write_u64(0),
     }
 
@@ -377,17 +368,17 @@ pub fn context_hash(graph: &EGraph, realized: &Realized, node: Id) -> u64 {
 
 fn operand_layouts(op: &Op) -> SmallVec<[Layout; 4]> {
     let mut out: SmallVec<[Layout; 4]> = SmallVec::new();
-    if let Op::L1(l1) = op {
+    if let Op::Launch(l1) = op {
         match l1 {
-            L1::KMap { ops, .. }
-            | L1::KFold { ops, .. }
-            | L1::KGather { ops, .. }
-            | L1::KScatter { ops, .. }
-            | L1::Ext { ops, .. } => out.extend(ops.iter().map(|o| o.layout.clone())),
-            L1::KContract { a, b, .. } => {
+            Launch::Map { ops, .. }
+            | Launch::Fold { ops, .. }
+            | Launch::Gather { ops, .. }
+            | Launch::Scatter { ops, .. }
+            | Launch::Ext { ops, .. } => out.extend(ops.iter().map(|o| o.layout.clone())),
+            Launch::Contract { a, b, .. } => {
                 out.extend(a.ops.iter().chain(b.ops.iter()).map(|o| o.layout.clone()))
             }
-            L1::KRegion { .. } => {}
+            Launch::Region { .. } => {}
         }
     }
     out
@@ -395,7 +386,7 @@ fn operand_layouts(op: &Op) -> SmallVec<[Layout; 4]> {
 
 fn domain(graph: &EGraph, id: Id) -> Option<&ScheduleDomain> {
     match &graph.node(id).op {
-        Op::L1(l1) => l1.schedule(),
+        Op::Launch(l1) => l1.schedule(),
         _ => None,
     }
 }
@@ -459,13 +450,9 @@ mod tests {
         assert_eq!(ex.is_materialized(target), before);
     }
 
-    /// `M` is keyed by node but the decision belongs to the class.
-    ///
-    /// The regression: `RESELECT` swapped `sigma` and left `M` alone, so the
-    /// incoming member arrived unmaterialized. On a root's class that means
-    /// nothing lands in a buffer, `verify_plan`'s clause 6 rejects the
-    /// winner, and step 4 of extraction — the whole local search — turns
-    /// every valid plan it touches into an error.
+    /// Regression: `RESELECT` swapped `sigma` and left `M` alone, so the
+    /// incoming member arrived unmaterialized and a root's class stopped
+    /// landing in a buffer.
     #[test]
     fn reselect_carries_the_materialized_bit_across_the_swap() {
         let (g, roots, cheap, dear, class) = crate::realize::testkit::seeded_graph();
@@ -488,7 +475,7 @@ mod tests {
     }
 
     /// Every state one `RESELECT` can reach still derives a plan that
-    /// verifies. This is the assertion the desync above actually broke.
+    /// verifies.
     #[test]
     fn every_reselect_state_still_verifies() {
         let (g, roots, _cheap, _dear, class) = crate::realize::testkit::seeded_graph();

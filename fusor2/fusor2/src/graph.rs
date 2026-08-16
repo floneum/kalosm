@@ -1,9 +1,8 @@
 //! `Graph` and `Gradients`.
 //!
-//! The backward transform's output is ingested **together with the forward as
-//! one graph with one root set**, which is what makes gradient checkpointing
-//! the extractor's materialization bit. Nobody writes a checkpointing pass and
-//! there is no user annotation.
+//! The backward transform's output is ingested together with the forward as
+//! one graph with one root set, which is what makes gradient checkpointing
+//! the extractor's materialization bit.
 
 use std::sync::Arc;
 
@@ -12,7 +11,7 @@ use fusor2_autograd::tape::{GraphTape, splat_of};
 use fusor2_ir::autograd::{AdjointFn, Parent};
 use fusor2_ir::dtype::{Dtype, QFmt, QLayout};
 use fusor2_ir::egraph::{EGraph, Id};
-use fusor2_ir::ir::level0::{BufferId, L0, LeafKind};
+use fusor2_ir::ir::logical::{BufferId, Logical, LeafKind};
 use fusor2_ir::ir::{AttrId, Op};
 use fusor2_ir::shape::{Dim, SymId};
 use fusor2_ir::target::Buf;
@@ -33,18 +32,11 @@ pub type GraphRef = Arc<GraphInner>;
 #[derive(Default)]
 pub(crate) struct LeafStore {
     pub(crate) bytes: FxHashMap<Id, Arc<Vec<u8>>>,
-    /// The device buffer bound to a value, with the layout it was *written*
+    /// The device buffer bound to a value, with the layout it was written
     /// under when that is not the value's own dense shape. A selected
     /// `Coop`/`Sgemm` geometry pads the output to its tile multiple, so a
     /// readback that assumed contiguity would hand back the first row plus
     /// padding.
-    ///
-    /// One map, not a buffer map beside a layout map: the two were always
-    /// written together under the same key, and a decode step writes ~30,700
-    /// of those keys per token (one per member of every plan buffer's
-    /// e-class), so the second map was a second hash and probe for every one
-    /// of them. The layout is `Arc`-shared, cloned once per class rather than
-    /// once per member.
     pub(crate) device: FxHashMap<Id, (Buf, Option<Arc<fusor2_ir::shape::Layout>>)>,
 }
 
@@ -81,23 +73,14 @@ pub struct GraphInner {
     /// First-union roots, so a rebuilt composite keeps one name. See
     /// [`GraphInner::union_stable`].
     union_memo: Mutex<FxHashMap<(Id, Id), Id>>,
-    /// Serializes *whole* resolve-and-read sequences against this graph.
+    /// Serializes whole resolve-and-read sequences against this graph.
     ///
     /// [`crate::session::Session::resolve`] cannot hold [`Self::egraph`] for
-    /// its own duration: saturation and extraction need it, but so do
-    /// `selected`, `bind_class` and `leaf_buffer` inside the dispatch that
-    /// follows, and the mutex is not reentrant. Releasing it between the two
-    /// halves is what let two threads interleave — one binding a freshly
-    /// allocated output buffer into [`Self::leaves`] while the other's
-    /// `read_bytes` found that buffer, saw nothing in flight, and downloaded
-    /// a buffer no dispatch had written yet. That returns **zeros**, not an
-    /// error. Measured before this existed: 4 bad readbacks in 640 across 8
-    /// threads on one `Backend::cpu()`.
-    ///
-    /// A separate lock rather than a reentrant one, because the section that
-    /// has to be atomic is larger than any single e-graph operation:
-    /// `read_back` holds this across `resolve` *and* `read_bytes`, so a
-    /// concurrent resolve cannot land between them either.
+    /// its own duration (the mutex is not reentrant), and releasing it
+    /// between resolve and readback lets a thread download an output buffer
+    /// whose dispatch has not run yet — which returns zeros, not an error.
+    /// `read_back` holds this across `resolve` and `read_bytes`, so a
+    /// concurrent resolve cannot land between them.
     pub(crate) resolve_lock: Mutex<()>,
 }
 
@@ -130,28 +113,25 @@ impl GraphInner {
         self.egraph.lock().add(op)
     }
 
-    pub fn add_l0(&self, op: L0) -> Result<Id> {
-        self.egraph.lock().add(Op::L0(op))
+    pub fn add_logical(&self, op: Logical) -> Result<Id> {
+        self.egraph.lock().add(Op::Logical(op))
     }
 
     pub fn union(&self, a: Id, b: Id) -> Result<Id> {
         self.egraph.lock().union(a, b)
     }
 
-    /// [`Self::union`] with a **stable** return: the first call for a pair
+    /// [`Self::union`] with a stable return: the first call for a pair
     /// unions and memoizes the root it produced; every later call for the
     /// same pair returns that same id, even after saturation has grown the
     /// class and moved its current root.
     ///
-    /// This is what lets a decode loop rebuild the same composite each step
-    /// and land on the same node ids: `union` returns the *current* class
-    /// root, which is the newest spine node and moves every time a rule
-    /// unions another member in — so a rebuilt consumer referencing it
-    /// missed the hash-cons memo and re-minted the whole downstream graph
-    /// (measured: +28k nodes and a fresh saturate+extract per token on an
-    /// 8B decode). The memoized id is an ordinary member of the class, so
-    /// nothing downstream can tell the difference — selection, facts and
-    /// readback are all per class.
+    /// This lets a decode loop rebuild the same composite each step and land
+    /// on the same node ids: `union` returns the current class root, which
+    /// moves every time a rule unions another member in, so a rebuilt
+    /// consumer referencing it would miss the hash-cons memo and re-mint the
+    /// whole downstream graph. The memoized id is an ordinary member of the
+    /// class; selection, facts and readback are all per class.
     pub fn union_stable(&self, a: Id, b: Id) -> Result<Id> {
         let key = if a.0 <= b.0 { (a, b) } else { (b, a) };
         if let Some(hit) = self.union_memo.lock().get(&key).copied() {
@@ -218,15 +198,13 @@ impl GraphInner {
         id
     }
 
-    /// An immutable rank-N leaf holding `bytes`, named by its **content**.
+    /// An immutable rank-N leaf holding `bytes`, named by its content.
     ///
     /// A leaf's hash-cons key is its `LeafKind`, and host bytes live in a side
-    /// table that is not part of that key. So a caller that mints two constants
-    /// of the same dtype and shape under one name gets **one node**, and the
-    /// second `set_leaf_bytes` silently overwrites the first — which is how
-    /// rope's permutation vector became its table-expansion vector. Naming the
-    /// leaf by its content makes the key exact in both directions: equal
-    /// constants still share a node, unequal ones cannot.
+    /// table that is not part of that key, so two constants of the same dtype
+    /// and shape under one name would share a node and the second
+    /// `set_leaf_bytes` would silently overwrite the first. Naming the leaf by
+    /// its content makes the key exact in both directions.
     pub(crate) fn constant_leaf(&self, dtype: Dtype, shape: &[Dim], bytes: Vec<u8>) -> Result<Id> {
         let key = ConstKey {
             dtype,
@@ -236,7 +214,7 @@ impl GraphInner {
         if let Some(id) = self.constants.lock().get(&key).copied() {
             return Ok(id);
         }
-        let id = self.add_l0(L0::Leaf(LeafKind::Buffer {
+        let id = self.add_logical(Logical::Leaf(LeafKind::Buffer {
             name: self.fresh_buffer_id(),
             dtype,
             shape: shape.iter().copied().collect(),
@@ -247,14 +225,10 @@ impl GraphInner {
     }
 
     /// The rank-1 `U32` leaf reading `src`'s host bytes as words, minted at
-    /// most once per source leaf and **sharing the byte allocation** with it.
+    /// most once per source leaf and sharing the byte allocation with it.
     ///
-    /// This is [`Self::constant_leaf`] keyed by the *source id* instead of
-    /// the content: a leaf's bytes are immutable once set, so the id names
-    /// the content exactly, and neither the content hash nor the clones that
-    /// key would cost are paid. For a 9.4 MB Q4K weight the content key was
-    /// ~1.6 ms of hashing and copying per fresh graph — every decode
-    /// iteration, on the host, before anything resolved.
+    /// Keyed by the source id instead of the content: a leaf's bytes are
+    /// immutable once set, so the id names the content exactly.
     ///
     /// `None` when `src` has no host bytes or they are not whole words.
     pub(crate) fn words_leaf_of(&self, src: Id) -> Result<Option<Id>> {
@@ -267,7 +241,7 @@ impl GraphInner {
         if !bytes.len().is_multiple_of(4) {
             return Ok(None);
         }
-        let id = self.add_l0(L0::Leaf(LeafKind::Buffer {
+        let id = self.add_logical(Logical::Leaf(LeafKind::Buffer {
             name: self.fresh_buffer_id(),
             dtype: Dtype::U32,
             shape: std::iter::once(Dim::Const(bytes.len() as u64 / 4)).collect(),
@@ -278,18 +252,16 @@ impl GraphInner {
     }
 
     /// The word-aligned twin of a quantized leaf: the same blocks repacked
-    /// `Native -> F32Scales`, minted at most once per source leaf. This is
-    /// `qrepack`'s minting half — the leaf is a *separate value* with its own
-    /// buffer, never unioned with its source (every id in one value class
-    /// must denote one buffer; see `lower::PlanLowering::new`'s `slot_of`).
-    /// The consumer that wants the choice priced unions the *consuming* ops
-    /// instead (`Tensor::contract_2d`), so extraction selects a layout per
-    /// contraction and only the selected leaf ever uploads.
+    /// `Native -> F32Scales`, minted at most once per source leaf. The leaf
+    /// is a separate value with its own buffer, never unioned with its source
+    /// (every id in one value class must denote one buffer; see
+    /// `lower::PlanLowering::new`'s `slot_of`). The consumer that wants the
+    /// choice priced unions the consuming ops instead (`Tensor::contract_2d`),
+    /// so extraction selects a layout per contraction and only the selected
+    /// leaf ever uploads.
     ///
     /// `None` when the leaf is not quantized, is not `Native`, has no host
-    /// bytes, or its native block stride is already a whole number of words —
-    /// an aligned format's twin would be byte-identical addressing arithmetic
-    /// with two more bytes per block, a strictly worse duplicate.
+    /// bytes, or its native block stride is already a whole number of words.
     pub(crate) fn repacked_leaf_of(&self, src: Id) -> Result<Option<Id>> {
         if let Some(cached) = self.repack_leaves.lock().get(&src).copied() {
             return Ok(cached);
@@ -298,7 +270,7 @@ impl GraphInner {
             let (fmt, shape) = {
                 let g = self.egraph.lock();
                 match &g.node(src).op {
-                    Op::L0(L0::Leaf(LeafKind::Quantized {
+                    Op::Logical(Logical::Leaf(LeafKind::Quantized {
                         fmt,
                         layout: QLayout::Native,
                         shape,
@@ -318,7 +290,7 @@ impl GraphInner {
                 &bytes,
                 &mut repacked,
             )?;
-            let id = self.add_l0(L0::Leaf(LeafKind::Quantized {
+            let id = self.add_logical(Logical::Leaf(LeafKind::Quantized {
                 name: self.fresh_buffer_id(),
                 fmt,
                 layout: QLayout::F32Scales,
@@ -424,13 +396,7 @@ impl GraphInner {
         self.leaves.lock().bytes.get(&id).cloned()
     }
 
-    /// Run `f` over an external leaf's host bytes **without copying them**.
-    ///
-    /// [`Self::leaf_bytes`] clones the whole `Vec`. On the upload path that
-    /// clone is a fresh 16 MB allocation plus a 16 MB memcpy for a 2048^2 f32
-    /// leaf, per leaf, per resolve, for bytes that are read once, handed to
-    /// the staging belt and dropped. The reference copies an uploaded byte
-    /// exactly once (`fusor-ml` `eager_data.rs::new_from_slice`).
+    /// Run `f` over an external leaf's host bytes without copying them.
     ///
     /// `f` runs with the `leaves` mutex held, so it must not re-enter this
     /// graph. The only caller uploads through the target's pool, which locks
@@ -446,12 +412,8 @@ impl GraphInner {
     }
 
     /// For each of `ids`, whether it is an external leaf the caller must
-    /// supply and, if so, the device buffer it already carries.
-    ///
-    /// Two lock acquisitions for the whole set. The per-id form asks the same
-    /// two questions behind two mutexes each, and a decode step's plan binds
-    /// ~7,000 distinct values — 14,000 uncontended-but-not-free round trips
-    /// per token to answer a question that is one pass over a slice.
+    /// supply and, if so, the device buffer it already carries. Two lock
+    /// acquisitions for the whole set.
     pub(crate) fn external_leaf_buffers(&self, ids: &[Id]) -> Vec<(Id, Option<Buf>)> {
         let external: Vec<Id> = {
             let g = self.egraph.lock();
@@ -460,7 +422,7 @@ impl GraphInner {
                 .filter(|id| {
                     matches!(
                         &g.node(*id).op,
-                        Op::L0(L0::Leaf(
+                        Op::Logical(Logical::Leaf(
                             LeafKind::Buffer { .. }
                                 | LeafKind::Param { .. }
                                 | LeafKind::Quantized { .. }
@@ -499,11 +461,8 @@ impl GraphInner {
         store.device.insert(id, (buf, None));
     }
 
-    /// Register one buffer under every id of an e-class.
-    ///
-    /// The whole class in one lock acquisition: a decode step binds a buffer
-    /// per launch root and a class runs to tens of ids, so taking the leaf
-    /// lock per member made this tens of thousands of round trips per token.
+    /// Register one buffer under every id of an e-class, in one lock
+    /// acquisition.
     pub(crate) fn set_device_buf_class(
         &self,
         ids: &[Id],
@@ -518,11 +477,6 @@ impl GraphInner {
 
     /// Register each `(value, buffer, layout)` under every id of the value's
     /// e-class, for the whole batch under one lock apiece.
-    ///
-    /// The per-value form takes the e-graph mutex to read the class and the
-    /// leaf mutex to write it; a decode step binds one buffer per plan buffer
-    /// and there are ~1,700 of them, so doing it one at a time is ~3,400 lock
-    /// round trips and ~1,700 throwaway member vectors per token.
     pub(crate) fn bind_classes(
         &self,
         items: &[(Id, Buf, Option<Arc<fusor2_ir::shape::Layout>>)],
@@ -601,8 +555,7 @@ impl Graph {
         &self.inner
     }
 
-    /// The `Graph` a handle names. The handle *is* the graph — this only puts
-    /// the owned wrapper back on, which is what a value carries.
+    /// The `Graph` a handle names.
     pub(crate) fn from_handle(inner: GraphRef) -> Self {
         Self { inner }
     }
@@ -615,7 +568,7 @@ impl Graph {
     /// amortizes against its lifetime and the extractor knows it may not
     /// recompute it.
     pub fn param(&self, name: &str, shape: &[Dim], dtype: Dtype) -> Result<Tensor> {
-        let id = self.inner.add_l0(L0::Leaf(LeafKind::Param {
+        let id = self.inner.add_logical(Logical::Leaf(LeafKind::Param {
             name: self.inner.fresh_buffer_id(),
             dtype,
             shape: shape.iter().copied().collect(),
@@ -627,7 +580,7 @@ impl Graph {
     /// A step-local input buffer.
     pub fn leaf(&self, name: &str, shape: &[Dim], dtype: Dtype) -> Result<Tensor> {
         let _ = name;
-        let id = self.inner.add_l0(L0::Leaf(LeafKind::Buffer {
+        let id = self.inner.add_logical(Logical::Leaf(LeafKind::Buffer {
             name: self.inner.fresh_buffer_id(),
             dtype,
             shape: shape.iter().copied().collect(),
@@ -642,15 +595,14 @@ impl Graph {
         Ok(t)
     }
 
-    /// Upload dense host data. The preserved spelling of the reference's
-    /// `Graph::tensor`.
+    /// Upload dense host data.
     pub fn tensor(&self, dtype: Dtype, shape: &[Dim], bytes: &[u8]) -> Result<Tensor> {
         self.constant_from_raw(dtype, shape, bytes)
     }
 
     /// A splat constant. Folded into the kernel; never a buffer.
     pub fn constant(&self, value: f32, shape: &[Dim], dtype: Dtype) -> Result<Tensor> {
-        let id = self.inner.add_l0(L0::Leaf(LeafKind::Const {
+        let id = self.inner.add_logical(Logical::Leaf(LeafKind::Const {
             value: splat_of(dtype, value)?,
             shape: shape.iter().copied().collect(),
         }))?;
@@ -665,7 +617,7 @@ impl Graph {
         shape: [Dim; 2],
         bytes: &[u8],
     ) -> Result<Tensor> {
-        let id = self.inner.add_l0(L0::Leaf(LeafKind::Quantized {
+        let id = self.inner.add_logical(Logical::Leaf(LeafKind::Quantized {
             name: self.inner.fresh_buffer_id(),
             fmt,
             layout,
@@ -675,9 +627,8 @@ impl Graph {
         Ok(self.inner.tensor(id))
     }
 
-    /// A runtime scalar read from binding 0. **Not** a `[1]` tensor and not a
-    /// literal: `m * lr` built on one of these recompiles nothing when the
-    /// learning rate moves.
+    /// A runtime scalar read from binding 0: `m * lr` built on one of these
+    /// recompiles nothing when the learning rate moves.
     pub fn uniform(&self, name: &str) -> Result<Tensor> {
         self.uniform_typed(name, Dtype::F32)
     }
@@ -686,7 +637,7 @@ impl Graph {
         let sym = self.inner.named_sym(name);
         let id = self
             .inner
-            .add_l0(L0::Leaf(LeafKind::Uniform { sym, dtype }))?;
+            .add_logical(Logical::Leaf(LeafKind::Uniform { sym, dtype }))?;
         Ok(self.inner.tensor(id))
     }
 
@@ -765,16 +716,13 @@ impl Graph {
 
     /// The subset of `candidates` that `value` actually depends on.
     ///
-    /// [`Graph::backward_with`] refuses a `wrt` the loss cannot reach, which
-    /// is right when the caller named it: an unreachable `wrt` is a typo or a
-    /// stray `detach`. A partial backward driven by [`crate::autograd`] is the
-    /// other case — it hands over a whole frontier and expects most of it to
-    /// be behind whatever it is descending from — so it filters first rather
-    /// than asking for a weaker error.
+    /// A partial backward driven by [`crate::autograd`] hands over a whole
+    /// frontier and expects most of it to be unreachable, so it filters here
+    /// first; [`Graph::backward_with`] still errors on an unreachable `wrt`
+    /// the caller named.
     ///
-    /// Structural, over `children`: the e-graph only ever adds, so the
-    /// construction chain is still there to walk, and equal values are
-    /// compared by class rather than by id.
+    /// Structural, over `children`; equal values are compared by class rather
+    /// than by id.
     pub fn reachable_from(&self, value: &Tensor, candidates: &[Tensor]) -> Vec<Tensor> {
         let g = self.inner.egraph.lock();
         let mut want: FxHashMap<fusor2_ir::egraph::ClassId, Vec<usize>> = FxHashMap::default();
@@ -805,11 +753,9 @@ impl Graph {
             .collect()
     }
 
-    /// Refuse a tensor from another graph.
-    ///
-    /// An `Id` is an index into *one* e-graph's arena, so a foreign one either
-    /// names an unrelated node or is out of range — the latter panicked in
-    /// `facts()` before reaching any check.
+    /// Refuse a tensor from another graph. An `Id` is an index into one
+    /// e-graph's arena, so a foreign one either names an unrelated node or is
+    /// out of range.
     fn owns(&self, t: &Tensor, role: &str) -> Result<()> {
         if Arc::ptr_eq(&t.graph, &self.inner) {
             return Ok(());
@@ -839,7 +785,7 @@ impl Graph {
 
     fn ones_like(&self, t: &Tensor) -> Result<Id> {
         let facts = self.inner.facts(t.id);
-        self.inner.add_l0(L0::Leaf(LeafKind::Const {
+        self.inner.add_logical(Logical::Leaf(LeafKind::Const {
             value: splat_of(facts.dtype, 1.0)?,
             shape: facts.shape.clone(),
         }))
@@ -857,9 +803,9 @@ impl Graph {
         let grads = fusor2_autograd::backward::backward_into_with(
             &mut g, &caps, loss.id, seed, wrt, &custom,
         )?;
-        // Forward and backward are one graph with one root set: that is what
-        // makes "save this activation" versus "recompute it" the extractor's
-        // materialization bit rather than a pass anybody writes.
+        // Forward and backward are one graph with one root set, which makes
+        // "save this activation" versus "recompute it" the extractor's
+        // materialization bit.
         g.add_root(loss.id);
         let mut entries = FxHashMap::default();
         for (primal, grad) in wrt.iter().zip(&grads) {

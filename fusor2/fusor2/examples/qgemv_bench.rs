@@ -88,8 +88,8 @@ fn main() -> fusor2::Result<()> {
             &bytes,
         )?;
         let x = graph.leaf("x", &[Dim::Const(1), Dim::Const(*cols)], Dtype::F32)?;
-        // Same activation formula as the fusor-ml companion, element for
-        // element, so the printed y values must agree across implementations.
+        // Same activation formula as the fusor-ml companion, so the printed y
+        // values must agree across implementations.
         let xdata: Vec<f32> = (0..*cols).map(|i| ((i % 97) as f32) * 0.01 - 0.5).collect();
         x.set_bytes(xdata.iter().flat_map(|f| f.to_le_bytes()).collect())?;
 
@@ -100,8 +100,8 @@ fn main() -> fusor2::Result<()> {
         eprintln!("[bench] {name} y[0..2] = {:?}", &v[..2.min(v.len())]);
 
         // Steady state on the per-dispatch timestamp path. Fresh bytes each
-        // iteration so the leaf really rebinds and the resolve is a replay,
-        // not a memoized readback.
+        // iteration so the leaf rebinds and the resolve is a replay, not a
+        // memoized readback.
         let Backend::Gpu(target) = session.device() else {
             unreachable!("gpu_blocking returned a non-gpu device");
         };
@@ -114,8 +114,7 @@ fn main() -> fusor2::Result<()> {
             xbytes[0] = i as u8;
             x.set_bytes(xbytes.clone())?;
             // A resolved root's device buffer is the value cache; drop it so
-            // the resolve re-dispatches instead of early-returning (the same
-            // invalidation the KV cache does after adoption).
+            // the resolve re-dispatches instead of early-returning.
             y.clear_device_buf();
             session.resolve(std::slice::from_ref(&y))?;
             session.wait()?;

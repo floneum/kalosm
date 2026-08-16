@@ -6,11 +6,6 @@
 //! these exist because each defect is a one-line regression away and the
 //! suite takes minutes.
 
-// `Device` and `Tensor` are spelled by module path rather than through the
-// crate root, because the root pair is exactly what `typed-api` swaps. These
-// pins drive the runtime-rank lowering path, which both configurations build;
-// naming it directly is what makes this target compile under either feature
-// set. `Graph` and `Session` are the same type in both, so the root is fine.
 use fusor2::session::Backend as Device;
 use fusor2::tensor::Dyn as Tensor;
 use fusor2::{Graph, Session};
@@ -161,7 +156,7 @@ fn softmax_rows_sum_to_one_without_materializing_anything() {
 
 /// A contraction reads each operand through the spec's labels.
 ///
-/// `KContract` records only the products m, n, k and batch, so it cannot tell
+/// `Contract` records only the products m, n, k and batch, so it cannot tell
 /// a transposed rhs from a plain one; the generic floor aliased each operand's
 /// own dense layout, which says "space axis i is operand axis i". Both read a
 /// `[m, k]` activation as `[k, m]` under `d_rhs`.

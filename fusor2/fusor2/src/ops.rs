@@ -1,4 +1,4 @@
-//! The primitive op surface. Every entry mints one L0 node; none of them
+//! The primitive op surface. Every entry mints one Logical node; none of them
 //! chooses a kernel, a layout or a tiling.
 
 pub mod cast;

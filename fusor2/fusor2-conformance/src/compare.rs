@@ -1,19 +1,14 @@
 //! Numeric comparison, per-dtype tolerance, finite differences and backend
 //! parity.
 //!
-//! Ported from `conformance/src/comparison.rs`, with the const-generic rank
-//! erased: `fusor2::Tensor` has runtime rank, so a comparison takes a flat
-//! slice plus the shape and reports a multi-dimensional index on failure.
+//! A comparison takes a flat slice plus the shape and reports a
+//! multi-dimensional index on failure.
 
 use std::fmt::{self, Debug, Display};
 
 use fusor2::Dtype;
 
 use crate::harness::CaseError;
-
-// ---------------------------------------------------------------------------
-// Tolerance
-// ---------------------------------------------------------------------------
 
 /// `(dtype, absolute, relative)`. Integer dtypes compare exactly — a `U32`
 /// index or an `I32` sort key that is off by one is a bug, never roundoff.
@@ -40,10 +35,6 @@ pub fn is_exact(dtype: Dtype) -> bool {
     let (a, r) = tol_for(dtype);
     a == 0.0 && r == 0.0
 }
-
-// ---------------------------------------------------------------------------
-// Errors
-// ---------------------------------------------------------------------------
 
 /// One element disagreed. Carries the backend so a CPU/GPU parity failure
 /// names which side produced the bad value.
@@ -87,10 +78,6 @@ impl Display for ItemMismatchError {
 }
 
 impl std::error::Error for ItemMismatchError {}
-
-// ---------------------------------------------------------------------------
-// Comparators
-// ---------------------------------------------------------------------------
 
 /// Row-major index of `flat` in `shape`. An empty shape gives an empty index,
 /// which [`ItemMismatchError`] renders as `<scalar>`.
@@ -192,11 +179,6 @@ pub fn approx_or_relative_eq(
 }
 
 /// A comparator, produced by the `*_compare` factories below.
-///
-/// The reference returns `CompareFut<'a, E>` because its readback is async;
-/// `fusor2::Tensor::to_vec_f32` is blocking (readback is one of exactly three
-/// host syncs, and a case already sits on the calling thread), so these are
-/// plain closures. Nothing else about their role changes.
 pub type Comparator = Box<dyn Fn(&str, &[usize], &[f32], &[f32]) -> Result<(), ItemMismatchError>>;
 
 pub fn exact_compare() -> Comparator {
@@ -216,10 +198,6 @@ pub fn compare_for(dtype: Dtype) -> Comparator {
         approx_or_relative_compare(abs, rel)
     }
 }
-
-// ---------------------------------------------------------------------------
-// The two names `lib.rs` re-exports
-// ---------------------------------------------------------------------------
 
 /// Elementwise `|a - b| <= atol + rtol * |b|`.
 pub fn allclose(a: &[f32], b: &[f32], atol: f32, rtol: f32) -> bool {
@@ -272,10 +250,6 @@ pub fn assert_bytes_eq(a: &[u8], b: &[u8]) -> Result<(), String> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Backend parity
-// ---------------------------------------------------------------------------
-
 /// Every case that produces a tensor runs on both sessions and diffs through
 /// here. `tol` is `(absolute, relative)`, normally straight from [`tol_for`].
 pub fn assert_backend_parity(
@@ -287,16 +261,9 @@ pub fn assert_backend_parity(
     approx_or_relative_eq("cpu-vs-gpu", &shape, cpu, gpu, tol.0, tol.1)
 }
 
-// ---------------------------------------------------------------------------
-// Finite differences
-// ---------------------------------------------------------------------------
-
-/// The **starting** central-difference step. `1e-2`, not `1e-6`: the graph
-/// evaluates in f32 and a smaller step is swamped by cancellation, which is
-/// why the reference's autograd tests use this value.
-///
-/// It is a starting step because a fixed one is not a valid oracle for a
-/// piecewise-smooth function — see [`finite_difference_gradient`].
+/// The starting central-difference step. `1e-2`, not `1e-6`: the graph
+/// evaluates in f32 and a smaller step is swamped by cancellation. The step
+/// adapts from here — see [`finite_difference_gradient`].
 pub const FD_EPSILON: f32 = 1e-2;
 
 /// Factor the step shrinks by when the two one-sided slopes disagree.
@@ -327,12 +294,9 @@ fn refined_partial(
 ) -> Result<f32, CaseError> {
     let original = probe[slot];
     let mut eps = FD_EPSILON;
-    // The smallest disagreement seen and the central difference that came
-    // with it. Kept so that a shrink which makes things *worse* — the
-    // f32-noise regime, where the two slopes diverge as `eps` falls because
-    // the numerator is cancellation — cannot be what is returned. There the
-    // first and largest step wins, which is the fixed-step central difference
-    // this replaced.
+    // The smallest disagreement seen and its central difference, so a shrink
+    // into the f32-noise regime (slopes diverging as cancellation grows)
+    // cannot be what is returned.
     let mut best: Option<(f32, f32)> = None;
     for _ in 0..=FD_REFINEMENTS {
         probe[slot] = original + eps;
@@ -342,11 +306,9 @@ fn refined_partial(
         let h_down = original - probe[slot];
         let down = loss(probe)?;
         probe[slot] = original;
-        // `eps` has fallen below an ulp of `original`, so there is no step
-        // left to take. On a later try the previous candidate stands; on the
-        // first, `FD_EPSILON` itself vanished into the value and no finite
-        // difference exists at this magnitude. Say so rather than report the
-        // 0/0 the fixed-step form reported.
+        // `eps` has fallen below an ulp of `original`: no step left to take.
+        // On a later try the previous candidate stands; on the first, no
+        // finite difference exists at this magnitude.
         if h_up == 0.0 || h_down == 0.0 {
             if best.is_none() {
                 return Err(format!(
@@ -359,19 +321,13 @@ fn refined_partial(
         }
         let slope_up = (up - base) / h_up;
         let slope_down = (base - down) / h_down;
-        // Their average, and the plain central difference when the two half
-        // steps are the equal ones f32 usually gives.
         let central = (up - down) / (h_up + h_down);
-        // The resolution floor. The loss's own ulp divided by the step is the
-        // smallest slope this eps can distinguish from zero; once that
+        // The resolution floor: the loss's own ulp divided by the step is the
+        // smallest slope this eps can distinguish from zero. Once that
         // exceeds `FD_ABS_TOL`, nothing measured at this step — agreement
-        // included — is evidence. Shrinking past the floor is how a
-        // sum-of-log-softmax loss of magnitude ~400 "converged" on a
-        // quantization artifact: both perturbed losses rounded to the same
-        // neighbour of `base`, the two slopes agreed on the same wrong
-        // number, and the loop returned it as a derivative. The best
-        // resolvable estimate is the honest answer; when even the first and
-        // largest step is under the floor, its central is all there is.
+        // included — is evidence; shrinking further only lets both perturbed
+        // losses round to the same neighbour of `base` and agree on a
+        // quantization artifact. Return the best resolvable estimate instead.
         let quantum = base.abs().max(f32::MIN_POSITIVE) * f32::EPSILON;
         if quantum > FD_ABS_TOL * (h_up + h_down) {
             return Ok(best.map_or(central, |(_, c)| c));
@@ -387,9 +343,8 @@ fn refined_partial(
         }
         eps /= FD_SHRINK;
     }
-    // The refinements ran out with the slopes still apart. The least-bad
-    // estimate is the honest one to hand back; the assertion, not this, is
-    // what decides whether the adjoint agrees with it.
+    // The refinements ran out with the slopes still apart; hand back the
+    // least-bad estimate and let the assertion decide.
     match best {
         Some((_, central)) => Ok(central),
         None => Err(format!("no finite difference at element {slot}").into()),
@@ -399,33 +354,14 @@ fn refined_partial(
 /// The numeric gradient of `loss` with respect to each element of `data`, by
 /// central differences with an adaptive step.
 ///
-/// A **fixed** step is not a valid oracle for a piecewise-smooth loss. Every
-/// adjoint this suite checks against — `max`, `min`, `rem`, `abs`, `relu`,
-/// argmin-style reductions — is smooth only away from a kink or a jump, and a
-/// two-sided quotient taken at `FD_EPSILON` straddles one whenever the sample
-/// lands within `FD_EPSILON` of it. It then reports a chord across the two
-/// pieces, which is not a derivative of either: `max(x, 0.1)` sampled at
-/// `x = 0.0953` gives `0.2626` where every subgradient is `0`, and
-/// `x % 0.5` sampled just under a multiple gives `-24` where the derivative
-/// is `1` on both sides of the jump.
-///
-/// So the step adapts. The two one-sided slopes are computed as well as the
-/// central one; while they disagree by more than the tolerance the comparison
-/// itself uses, the step shrinks by [`FD_SHRINK`] and the element is
-/// re-sampled, up to [`FD_REFINEMENTS`] times. The criterion is exactly "the
-/// derivative is well defined across this step to the accuracy the assertion
-/// demands", so where it already holds — the common case — this costs what
-/// the fixed form cost. It converges either way: across a kink as soon as
-/// both samples land on one piece, and under curvature at `FD_SHRINK` per
-/// try, since a smooth loss's disagreement is `eps * |f''|`.
-///
-/// This is a *strengthening*: the oracle it converges to is tighter than the
-/// fixed one, and every finite-difference case in the suite is checked
-/// against it.
+/// The step adapts because a fixed one straddles kinks and jumps in
+/// piecewise-smooth losses (`max`, `rem`, `relu`, ...) and reports a chord
+/// that is not a derivative of either piece. While the two one-sided slopes
+/// disagree by more than the assertion tolerance, the step shrinks by
+/// [`FD_SHRINK`], up to [`FD_REFINEMENTS`] times.
 ///
 /// `loss` is re-evaluated `2 * data.len() + 1` times (more where the step
-/// refines), so this only ever runs at the small shapes the backward matrix
-/// uses.
+/// refines), so this only ever runs at small shapes.
 pub fn finite_difference_gradient(
     shape: &[usize],
     data: &[f32],
@@ -477,9 +413,9 @@ pub fn assert_gradient_matches_finite_difference(
 
 /// Every gradient element is exactly zero, and there *is* a gradient.
 ///
-/// What the twelve comparison cases assert: a comparison must register an
-/// adjoint that emits zeros rather than be absent from the table, because the
-/// tape validates that every requires-grad parent receives a gradient.
+/// A comparison must register an adjoint that emits zeros rather than be
+/// absent from the table: the tape validates that every requires-grad parent
+/// receives a gradient.
 pub fn assert_all_zero(name: &str, grad: &[f32]) -> Result<(), CaseError> {
     if grad.is_empty() {
         return Err(format!("{name}: no gradient was produced at all").into());
@@ -572,9 +508,8 @@ mod tests {
 
     #[test]
     fn compare_for_picks_exact_for_integers() {
-        // 2.000_001 is the smallest decimal literal here that is a *different*
-        // f32 from 2.0 (ulp at 2.0 is 2.4e-7), so the exact comparator has
-        // something to reject. It is still well inside F32's 1e-4 tolerance.
+        // 2.000_001 is a different f32 from 2.0 but well inside F32's 1e-4
+        // tolerance, so only the exact comparator rejects it.
         assert_ne!(2.000_001f32, 2.0f32);
         let cmp = compare_for(Dtype::U32);
         assert!(cmp("cpu", &[2], &[1.0, 2.0], &[1.0, 2.000_001]).is_err());
@@ -637,10 +572,10 @@ mod tests {
         // sits 0.00475 below it, inside FD_EPSILON.
         let data = [0.095_252_1f32];
         let numeric = finite_difference_gradient(&[1], &data, &mut |x| Ok(x[0].max(0.1))).unwrap();
-        // The subgradient of max(x, 0.1) below the kink is 0, and so is every
-        // one-sided slope once the step fits under 0.00475.
+        // The subgradient below the kink is 0, and so is every one-sided
+        // slope once the step fits under 0.00475.
         assert_gradient_matches_finite_difference(&[0.0], &numeric).unwrap();
-        // The fixed step reported 0.2626 here, which is a chord, not a slope.
+        // A fixed step reports 0.2626 here, a chord, not a slope.
         let fixed = ((data[0] + FD_EPSILON).max(0.1) - (data[0] - FD_EPSILON).max(0.1))
             / (2.0 * FD_EPSILON);
         assert!(
@@ -660,9 +595,8 @@ mod tests {
 
     #[test]
     fn a_shrunk_step_still_catches_a_wrong_subgradient() {
-        // The adaptive step must not turn into "agree with anything": below
-        // the kink the only right answer is 0, and 1 — the other side's
-        // subgradient — is still rejected.
+        // Below the kink the only right answer is 0; the other side's
+        // subgradient must still be rejected.
         let data = [0.094_747_9f32];
         let numeric = finite_difference_gradient(&[1], &data, &mut |x| Ok(x[0].max(0.1))).unwrap();
         assert!(assert_gradient_matches_finite_difference(&[1.0], &numeric).is_err());
@@ -671,7 +605,7 @@ mod tests {
     #[test]
     fn the_shrink_loop_does_not_run_where_the_slopes_already_agree() {
         // No curvature, no kink: the two one-sided slopes match at the first
-        // step, so the adaptive form costs what the fixed one did.
+        // step, so no refinement runs.
         let data = [0.5f32, -1.5, 2.0];
         let mut calls = 0usize;
         let numeric = finite_difference_gradient(&[3], &data, &mut |x| {
@@ -686,8 +620,8 @@ mod tests {
     #[test]
     fn curvature_refines_and_terminates() {
         // x^3 at 0.5 and -1.5 has |f''| just over the agreement tolerance, so
-        // the step shrinks once. What matters is the bound: refinement must
-        // converge rather than walk out to FD_REFINEMENTS.
+        // the step shrinks once; refinement must converge rather than walk
+        // out to FD_REFINEMENTS.
         let data = [0.5f32, -1.5, 2.0];
         let mut calls = 0usize;
         let numeric = finite_difference_gradient(&[3], &data, &mut |x| {

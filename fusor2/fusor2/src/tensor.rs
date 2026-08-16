@@ -8,7 +8,7 @@
 //!
 //! ```ignore
 //! impl GraphInner {
-//!     pub fn add_l0(&self, op: L0) -> Result<Id>;         // hash-cons + infer
+//!     pub fn add_logical(&self, op: Logical) -> Result<Id>;         // hash-cons + infer
 //!     pub fn facts(&self, id: Id) -> ValueFacts;          // cloned; total
 //!     pub fn tensor(self: &Arc<Self>, id: Id) -> Tensor;  // wrap an id
 //!     pub fn set_leaf_bytes(&self, id: Id, bytes: Vec<u8>);
@@ -25,7 +25,7 @@ pub mod typed;
 use fusor2_ir::dtype::{Dtype, NumericContract, Persistence, Splat};
 use fusor2_ir::egraph::Id;
 use fusor2_ir::facts::ValueFacts;
-use fusor2_ir::ir::level0::{L0, LeafKind};
+use fusor2_ir::ir::logical::{Logical, LeafKind};
 use fusor2_ir::scalar::ScalarExpr;
 use fusor2_ir::shape::{Dim, Dims, SymId};
 use smallvec::SmallVec;
@@ -39,23 +39,17 @@ pub use crate::ops::view::Extent;
 pub use construction::{FromArray, arange, arange_step};
 pub use readback::{TensorSlice, ToVec};
 pub use typed::{Axis, Element, SimdElement, Typed};
-/// The rounding an explicit `round_mode` selects. Off the crate root: it is
-/// the argument of exactly one op, and the root is for what a model spells.
+/// The rounding an explicit `round_mode` selects.
 pub use fusor2_ir::dtype::RoundMode;
 
 /// A value in a [`crate::Graph`] with **runtime** rank and dtype. Cloning is
 /// one `Arc` bump; the node it names is immutable.
 ///
-/// This is the escape hatch, not the headline type: [`crate::Tensor`] — the
-/// const-rank, infallible facade — is what a model is written in, and it is a
+/// [`crate::Tensor`] — the const-rank, infallible facade — is a
 /// `repr(transparent)` newtype over this. Reach for `Dyn` (via
-/// [`crate::Tensor::into_dyn`] / [`crate::Tensor::as_dyn`]) exactly when a
-/// rank or a dtype is *data*: a loader that reads it from a file, a pass that
-/// walks a heterogeneous list. Every op on it returns `Result`, because at
-/// that layer a shape error genuinely is a runtime condition.
-///
-/// There is no `const R: usize`, no `B: Fusion`, and no dtype type parameter:
-/// rank and dtype are runtime data that `verify_l0` checks.
+/// [`crate::Tensor::into_dyn`] / [`crate::Tensor::as_dyn`]) when a rank or a
+/// dtype is *data*: a loader that reads it from a file, a pass that walks a
+/// heterogeneous list. Every op on it returns `Result`.
 #[derive(Clone)]
 pub struct Dyn {
     pub(crate) id: Id,
@@ -63,11 +57,6 @@ pub struct Dyn {
 }
 
 /// The in-crate spelling of [`Dyn`].
-///
-/// Every module below this one was written against the name `Tensor` when
-/// there was only one tensor type. The public name is `Dyn`; this alias keeps
-/// the ~40 internal `use crate::tensor::Tensor` lines meaning what they always
-/// meant, and being `pub(crate)` it puts nothing back on the public surface.
 pub(crate) type Tensor = Dyn;
 
 impl Tensor {
@@ -83,17 +72,12 @@ impl Tensor {
     }
 
     /// Which backend the owning session runs on.
-    ///
-    /// The *device* — backend plus session plus graph, the thing a constructor
-    /// takes — is [`crate::Tensor::device`] on the const-rank facade. This is
-    /// the selector underneath it.
     pub fn backend(&self) -> Backend {
         self.graph.session().device().clone()
     }
 
-    /// This value's inference result, cloned out of the graph.
-    /// `CoreSemantics::infer` is total and already ran, when the node was
-    /// minted; nothing here recomputes a shape.
+    /// This value's inference result, cloned out of the graph. Inference ran
+    /// when the node was minted; nothing here recomputes a shape.
     pub fn facts(&self) -> ValueFacts {
         self.graph.facts(self.id)
     }
@@ -115,8 +99,7 @@ impl Tensor {
     /// Extent of axis `i`.
     ///
     /// # Panics
-    /// If `i >= self.rank()`. Axis arguments are program structure, not data;
-    /// every op in this crate range-checks before calling.
+    /// If `i >= self.rank()`.
     pub fn dim(&self, i: usize) -> Dim {
         let shape = self.shape();
         match shape.get(i) {
@@ -130,8 +113,7 @@ impl Tensor {
         self.facts().elements()
     }
 
-    /// Alternate spelling of [`Tensor::elem_count`], kept because the scaffold
-    /// declared it.
+    /// Alternate spelling of [`Tensor::elem_count`].
     pub fn elements(&self) -> Option<u64> {
         self.elem_count()
     }
@@ -144,17 +126,14 @@ impl Tensor {
         self.facts().persistence
     }
 
-    /// Rank 0 is a first-class rank: it is what a loss lives in.
     pub fn is_scalar(&self) -> bool {
         self.rank() == 0
     }
 
     /// Materialize and re-leaf, cutting this value off from its producers.
     ///
-    /// Correct but expensive: it resolves, reads the bytes back to the host
-    /// and uploads them into a fresh `Leaf::Buffer`. A device-side detach
-    /// wants a session-level "adopt this buffer as a leaf" hook that does not
-    /// exist yet; see the crate report.
+    /// Expensive: it resolves, reads the bytes back to the host and uploads
+    /// them into a fresh `Leaf::Buffer`.
     pub fn detach(&self) -> Result<Tensor> {
         let facts = self.facts();
         let bytes = self.graph.read_back(self.id)?;
@@ -239,7 +218,7 @@ impl Tensor {
             .with_egraph(|g| {
                 Ok(matches!(
                     &g.node(self.id).op,
-                    fusor2_ir::ir::Op::L0(L0::Leaf(
+                    fusor2_ir::ir::Op::Logical(Logical::Leaf(
                         LeafKind::Buffer { .. } | LeafKind::Param { .. } | LeafKind::Quantized { .. }
                     ))
                 ))
@@ -253,31 +232,29 @@ impl Tensor {
         Typed::try_from_dyn(self)
     }
 
-    // -- node minting -------------------------------------------------------
-
-    /// Mint one L0 node and wrap it. The single call site for `add_l0` in
+    /// Mint one Logical node and wrap it. The single call site for `add_logical` in
     /// this item.
-    pub(crate) fn emit(graph: &GraphRef, op: L0) -> Result<Tensor> {
-        let id = graph.add_l0(op)?;
+    pub(crate) fn emit(graph: &GraphRef, op: Logical) -> Result<Tensor> {
+        let id = graph.add_logical(op)?;
         Ok(graph.tensor(id))
     }
 
     /// [`Tensor::emit`] into this value's own graph.
-    pub(crate) fn emit_here(&self, op: L0) -> Result<Tensor> {
+    pub(crate) fn emit_here(&self, op: Logical) -> Result<Tensor> {
         Self::emit(&self.graph, op)
     }
 
-    /// One `L0::Map` over `self`, `outs: 1`. `expr` reads the operand as
+    /// One `Logical::Map` over `self`, `outs: 1`. `expr` reads the operand as
     /// `Arg(0)`.
     pub(crate) fn map1(&self, expr: ScalarExpr) -> Result<Tensor> {
-        self.emit_here(L0::Map {
+        self.emit_here(Logical::Map {
             expr,
             ins: SmallVec::from_slice(&[self.id]),
             outs: 1,
         })
     }
 
-    /// One `L0::Map` over several operands, `outs: 1`.
+    /// One `Logical::Map` over several operands, `outs: 1`.
     ///
     /// **Rejects** operands whose shapes are not pointwise [`Dim::known_eq`]:
     /// there is no implicit broadcasting inside the IR, callers pre-broadcast
@@ -298,7 +275,7 @@ impl Tensor {
         }
         Self::emit(
             g,
-            L0::Map {
+            Logical::Map {
                 expr,
                 ins: ins.iter().map(|t| t.id).collect(),
                 outs: 1,
@@ -351,17 +328,11 @@ pub(crate) fn dims_eq(a: &[Dim], b: &[Dim]) -> bool {
     a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.known_eq(*y))
 }
 
-// ---------------------------------------------------------------------------
-// Scalar
-// ---------------------------------------------------------------------------
-
 /// A scalar operand of a scalar-arith or comparison op.
 ///
-/// This single type is what deletes the trainer's `[1]`-tensor workaround:
-/// `m.mul_scalar(lr)` with `lr: Scalar::Uniform(sym)` reads the learning rate
-/// out of the uniform block and **never bakes a literal into a kernel**, so
-/// changing it recompiles nothing. `m.mul_scalar(2.0f32)` still folds to a
-/// literal, because a structural constant belongs in the kernel key.
+/// `Scalar::Uniform` reads the value out of the uniform block and never bakes
+/// a literal into a kernel, so changing it recompiles nothing. A `Lit` folds
+/// to a literal, which lands in the kernel key.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Scalar {
     Lit(Splat),
@@ -391,10 +362,9 @@ impl From<f32> for Scalar {
         Self::Lit(Splat::F32(v))
     }
 }
-// NOTE: deliberately no `From<f64>`. With exactly one float impl, trait
-// selection unifies an unsuffixed literal to `f32`, so `t.mul_scalar(2.0)`
-// compiles without a suffix; adding `From<f64>` makes every such call
-// ambiguous.
+// NOTE: no `From<f64>`. With exactly one float impl, an unsuffixed literal
+// unifies to `f32`, so `t.mul_scalar(2.0)` compiles; adding `From<f64>` makes
+// every such call ambiguous.
 impl From<half::f16> for Scalar {
     fn from(v: half::f16) -> Self {
         Self::Lit(Splat::F16(v.to_bits()))
@@ -505,13 +475,8 @@ mod tests {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Graph-level acceptance tests.
-//
-// Every assertion here is against the **built L0 term**, not against
-// execution: this item mints nodes and has no backend.
-// ---------------------------------------------------------------------------
-
+// Graph-level acceptance tests: every assertion is against the built Logical
+// term, not execution — this item mints nodes and has no backend.
 #[cfg(test)]
 mod graph_tests {
     use super::*;
@@ -519,7 +484,7 @@ mod graph_tests {
     use crate::ops::index::{IndexOp, cat, stack};
     use crate::ops::view::Extent;
     use crate::session::{Backend, Session};
-    use fusor2_ir::ir::level0::{L0, LeafKind, TiePolicy};
+    use fusor2_ir::ir::logical::{Logical, LeafKind, TiePolicy};
     use fusor2_ir::ir::{Op, OpTag};
     use fusor2_ir::shape::{Dim, Layout, SlidingWindow, StrideSpec};
 
@@ -558,7 +523,7 @@ mod graph_tests {
 
     fn specs_of(t: &Tensor) -> Vec<StrideSpec> {
         match op_of(t) {
-            Op::L0(L0::Restride { specs, .. }) => specs.to_vec(),
+            Op::Logical(Logical::Restride { specs, .. }) => specs.to_vec(),
             other => panic!("expected a Restride, got {other:?}"),
         }
     }
@@ -574,7 +539,6 @@ mod graph_tests {
             .unwrap()
     }
 
-    // ---- 1 ---------------------------------------------------------------
 
     /// Every elementwise/scalar-arith/comparison entry point grows the graph
     /// by exactly one node, and that node is a `Map`.
@@ -677,7 +641,6 @@ mod graph_tests {
         assert_eq!(tag_of(&w), OpTag::Map);
     }
 
-    // ---- 3 ---------------------------------------------------------------
 
     #[test]
     fn broadcast_right_aligned() {
@@ -709,7 +672,6 @@ mod graph_tests {
         assert_eq!(&midb.shape()[..], &dims(&[2, 3, 4])[..]);
     }
 
-    // ---- 4 ---------------------------------------------------------------
 
     #[test]
     fn no_implicit_broadcast_in_ir() {
@@ -725,7 +687,6 @@ mod graph_tests {
         assert_eq!(&c.shape()[..], &dims(&[2, 3])[..]);
     }
 
-    // ---- 5 ---------------------------------------------------------------
 
     #[test]
     fn scalar_is_lit_or_uniform() {
@@ -735,7 +696,7 @@ mod graph_tests {
 
         let lit = x.mul_scalar(2.0f32).unwrap();
         match op_of(&lit) {
-            Op::L0(L0::Map { expr, .. }) => match expr.kind() {
+            Op::Logical(Logical::Map { expr, .. }) => match expr.kind() {
                 ScalarKind::Bin { b, .. } => assert!(matches!(b.kind(), ScalarKind::Lit(_))),
                 other => panic!("{other:?}"),
             },
@@ -745,7 +706,7 @@ mod graph_tests {
         let sym = g.handle().fresh_sym();
         let uni = x.mul_scalar(Scalar::Uniform(sym)).unwrap();
         match op_of(&uni) {
-            Op::L0(L0::Map { expr, .. }) => match expr.kind() {
+            Op::Logical(Logical::Map { expr, .. }) => match expr.kind() {
                 ScalarKind::Bin { b, .. } => {
                     assert!(matches!(b.kind(), ScalarKind::Uniform(_)))
                 }
@@ -764,7 +725,6 @@ mod graph_tests {
         assert_eq!(uni.id(), third.id());
     }
 
-    // ---- 6 ---------------------------------------------------------------
 
     #[test]
     fn views_are_restride() {
@@ -803,11 +763,10 @@ mod graph_tests {
         assert_eq!(&w.shape()[..], &dims(&[2, 3, 2, 2])[..]);
     }
 
-    // ---- 7 ---------------------------------------------------------------
 
     #[test]
     fn restride_composes_relatively() {
-        use fusor2_ir::semantics::infer_l0::restride_layout;
+        use fusor2_ir::semantics::infer_logical::restride_layout;
         let g = graph();
         let x = leaf(&g, &[2, 3, 4]);
         let a = x.transpose(0, 1).unwrap();
@@ -827,11 +786,10 @@ mod graph_tests {
         assert_eq!(&b.shape()[..], want.shape());
     }
 
-    // ---- 8 ---------------------------------------------------------------
 
     #[test]
     fn matmul_spec() {
-        use fusor2_ir::ir::level0::Label;
+        use fusor2_ir::ir::logical::Label;
         let g = graph();
         let a = leaf(&g, &[2, 4, 8]);
         let b = leaf(&g, &[2, 8, 16]);
@@ -839,7 +797,7 @@ mod graph_tests {
         assert_eq!(tag_of(&y), OpTag::Contract);
         assert_eq!(&y.shape()[..], &dims(&[2, 4, 16])[..]);
         match op_of(&y) {
-            Op::L0(L0::Contract { spec, .. }) => {
+            Op::Logical(Logical::Contract { spec, .. }) => {
                 assert_eq!(&spec.a[..], &[Label(0), Label(1), Label(2)]);
                 assert_eq!(&spec.b[..], &[Label(0), Label(2), Label(3)]);
                 assert_eq!(&spec.out[..], &[Label(0), Label(1), Label(3)]);
@@ -855,7 +813,7 @@ mod graph_tests {
         assert_eq!(tag_of(&t), OpTag::Contract);
         assert_eq!(&t.shape()[..], &dims(&[4, 16])[..]);
         match op_of(&t) {
-            Op::L0(L0::Contract { spec, .. }) => {
+            Op::Logical(Logical::Contract { spec, .. }) => {
                 // b is [n, k], not [k, n]; the node is otherwise identical.
                 assert_eq!(&spec.b[..], &[Label(2), Label(1)]);
                 assert_eq!(spec.d_lhs().out, spec.a);
@@ -869,7 +827,6 @@ mod graph_tests {
         assert!(a.matmul(&wide).is_err());
     }
 
-    // ---- 9 ---------------------------------------------------------------
 
     #[test]
     fn reductions() {
@@ -903,7 +860,7 @@ mod graph_tests {
         use fusor2_ir::scalar::ScalarKind;
         let m = x.mean(1).unwrap();
         match op_of(&m) {
-            Op::L0(L0::Map { expr, .. }) => match expr.kind() {
+            Op::Logical(Logical::Map { expr, .. }) => match expr.kind() {
                 ScalarKind::Bin { b, .. } => assert!(matches!(b.kind(), ScalarKind::Lit(_))),
                 other => panic!("{other:?}"),
             },
@@ -913,7 +870,7 @@ mod graph_tests {
         let dyn_x = g.leaf("d", &[Dim::Const(2), s], Dtype::F32).unwrap();
         let dm = dyn_x.mean(1).unwrap();
         match op_of(&dm) {
-            Op::L0(L0::Map { expr, .. }) => match expr.kind() {
+            Op::Logical(Logical::Map { expr, .. }) => match expr.kind() {
                 ScalarKind::Bin { b, .. } => {
                     assert!(matches!(b.kind(), ScalarKind::Uniform(_)))
                 }
@@ -933,7 +890,6 @@ mod graph_tests {
         assert_eq!(&v.shape()[..], &dims(&[2, 4])[..]);
     }
 
-    // ---- 10 --------------------------------------------------------------
 
     #[test]
     fn rank_zero_first_class() {
@@ -953,7 +909,6 @@ mod graph_tests {
         assert_eq!(tag_of(&total), OpTag::Fold);
     }
 
-    // ---- 11 --------------------------------------------------------------
 
     #[test]
     fn scatter_substrate() {
@@ -966,15 +921,15 @@ mod graph_tests {
         let minted = &all_ops(&g)[before..];
         let consts = minted
             .iter()
-            .filter(|o| matches!(o, Op::L0(L0::Leaf(LeafKind::Const { .. }))))
+            .filter(|o| matches!(o, Op::Logical(Logical::Leaf(LeafKind::Const { .. }))))
             .count();
         let scatters = minted
             .iter()
             .filter(|o| {
                 matches!(
                     o,
-                    Op::L0(L0::Scatter {
-                        combine: fusor2_ir::ir::level0::ScatterCombine::Set,
+                    Op::Logical(Logical::Scatter {
+                        combine: fusor2_ir::ir::logical::ScatterCombine::Set,
                         unique: true,
                         ..
                     })
@@ -993,7 +948,7 @@ mod graph_tests {
         assert_eq!(minted.len(), 1);
         assert!(matches!(
             minted[0],
-            Op::L0(L0::Leaf(LeafKind::Const { .. }))
+            Op::Logical(Logical::Leaf(LeafKind::Const { .. }))
         ));
 
         // stack is unsqueeze + cat.
@@ -1007,7 +962,6 @@ mod graph_tests {
         assert_eq!(&r.shape()[..], &dims(&[3, 2])[..]);
     }
 
-    // ---- 12 --------------------------------------------------------------
 
     #[test]
     fn index_ops() {
@@ -1049,7 +1003,6 @@ mod graph_tests {
         assert_eq!(linear, vec![1, 4, 11]);
     }
 
-    // ---- 13 --------------------------------------------------------------
 
     #[test]
     fn i_indexing() {
@@ -1088,7 +1041,6 @@ mod graph_tests {
         let _ = x.i((0usize, 1usize, ..));
     }
 
-    // ---- 16 --------------------------------------------------------------
 
     /// Every alias hash-conses onto its target, which is the strongest form of
     /// "structurally identical": the same node id.
@@ -1103,7 +1055,6 @@ mod graph_tests {
         assert_eq!(x.square().unwrap().id(), x.sqr().unwrap().id());
     }
 
-    // ---- 17 --------------------------------------------------------------
 
     #[test]
     fn arange_step_builds_the_right_leaf() {
@@ -1118,7 +1069,6 @@ mod graph_tests {
         assert_eq!(v, vec![5.0, 3.0, 1.0]);
     }
 
-    // ---- constructors, casts, typed --------------------------------------
 
     #[test]
     fn fills_are_const_leaves_with_no_upload() {
@@ -1133,7 +1083,7 @@ mod graph_tests {
             assert_eq!(tag_of(&t), OpTag::Leaf);
             assert!(matches!(
                 op_of(&t),
-                Op::L0(L0::Leaf(LeafKind::Const { .. }))
+                Op::Logical(Logical::Leaf(LeafKind::Const { .. }))
             ));
             assert!(g.handle().leaf_bytes(t.id()).is_none());
         }

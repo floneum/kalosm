@@ -1,8 +1,7 @@
 //! The op library, as methods.
 //!
-//! This file provides ergonomic method-style access to operations. The free
-//! functions stay where they are, at the [`Dyn`] layer, and every method below
-//! calls one. No math is re-implemented.
+//! Every method here calls the corresponding free function at the [`Dyn`]
+//! layer; no math is re-implemented.
 
 use crate::composite::PoolReduce;
 use crate::composite::attention::MaskKind;
@@ -11,16 +10,8 @@ use crate::composite::{attention, rope, upsample};
 use crate::quantized::QMatrix;
 use crate::tensor::typed::{Axis, Element, Tensor, narrow_acc};
 
-// ---------------------------------------------------------------------------
-// Normalization
-// ---------------------------------------------------------------------------
-
 impl<const R: usize, T: Element> Tensor<R, T> {
     /// Softmax over `axis`. Rank- and dtype-preserving.
-    ///
-    /// The reference took a phantom `R2` output rank and asserted
-    /// `R2 + 1 == R` while returning `Self` — softmax does not reduce, so the
-    /// parameter said nothing. It is dropped.
     #[track_caller]
     pub fn softmax(&self, axis: impl Axis<R>) -> Self {
         Self::wrap("softmax", self.as_dyn().softmax(axis.resolve() as u32))
@@ -53,12 +44,10 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         Self::wrap("rms_norm_no_weight", self.as_dyn().rms_norm_no_weight(eps))
     }
 
-    /// The transformer block boundary: `rms_norm(self + residual)` as one
-    /// node.
+    /// `rms_norm(self + residual)` as one node.
     ///
-    /// Not a `*_fused` alias — the add is *inside* the norm's expansion, so
-    /// this is a different node than `(x + r).rms_norm(w, eps)` and the
-    /// difference is what the residual-norm kernel reads.
+    /// The add is inside the norm's expansion, so this is a different node
+    /// than `(x + r).rms_norm(w, eps)`; the residual-norm kernel reads it.
     #[track_caller]
     pub fn rms_norm_residual<const W: usize>(
         &self,
@@ -80,8 +69,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
 
     /// `(x - mean) / sqrt(var + eps) * weight + bias` over the last axis.
     ///
-    /// `remove_mean == false` is the RMS-like spelling some checkpoints want,
-    /// which is why it is an argument rather than two methods.
+    /// `remove_mean == false` gives the RMS-like spelling some checkpoints use.
     #[track_caller]
     pub fn layer_norm<const W: usize>(
         &self,
@@ -102,15 +90,10 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Attention
-// ---------------------------------------------------------------------------
-
 impl<const R: usize, T: Element> Tensor<R, T> {
     /// Scaled dot-product attention, `self` being the queries.
     ///
-    /// `scale` is `Option` because `None` means "the head dimension's
-    /// `1/sqrt(d)`", which the graph reads off the shape. Grouped-query
+    /// `scale: None` means the head dimension's `1/sqrt(d)`. Grouped-query
     /// attention is inferred from the head counts of `self` and `k`.
     #[track_caller]
     pub fn attention(&self, k: &Self, v: &Self, mask: MaskKind, scale: Option<f32>) -> Self {
@@ -120,7 +103,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         )
     }
 
-    /// Attention with causality encoded **structurally** — no mask tensor is
+    /// Attention with causality encoded structurally — no mask tensor is
     /// built, so the upper triangle is never computed.
     #[track_caller]
     pub fn attention_causal(&self, k: &Self, v: &Self, scale: Option<f32>) -> Self {
@@ -132,8 +115,8 @@ impl<const R: usize, T: Element> Tensor<R, T> {
 
     /// Attention against a materialized additive mask.
     ///
-    /// The mask's rank is its own parameter: a `[Lq, Lk]` mask and a
-    /// `[B, 1, Lq, Lk]` one are both ordinary here.
+    /// The mask's rank is its own parameter: both `[Lq, Lk]` and
+    /// `[B, 1, Lq, Lk]` masks are accepted.
     #[track_caller]
     pub fn attention_masked<const MR: usize>(
         &self,
@@ -157,10 +140,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Rotary embeddings
-// ---------------------------------------------------------------------------
-
 impl<const R: usize, T: Element> Tensor<R, T> {
     /// Rotary embedding pairing `(i, i + Dh/2)` — the "normal" convention.
     #[track_caller]
@@ -180,11 +159,8 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         )
     }
 
-    /// [`Tensor::rope`] on `self` and `k` in **one** node, handing back two
-    /// views of it.
-    ///
-    /// Unlike calling [`Tensor::rope`] twice, q and k share the table read and
-    /// the rotation, so this is a different graph.
+    /// [`Tensor::rope`] on `self` and `k` in one node, handing back two
+    /// views of it. q and k share the table read and the rotation.
     #[track_caller]
     pub fn rope_pair(
         &self,
@@ -236,8 +212,8 @@ impl<const R: usize, T: Element> Tensor<R, T> {
 
     /// [`Tensor::rope`] against a device-side position vector.
     ///
-    /// The decode loop's form: the offset stays on device, so the cos/sin
-    /// table is never re-sliced on the host and the plan survives the step.
+    /// The offset stays on device, so the cos/sin table is never re-sliced on
+    /// the host and the plan survives the decode step.
     #[track_caller]
     pub fn rope_at(
         &self,
@@ -283,12 +259,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
 
     /// [`Tensor::rope_interleaved_pair`] against a device-side position
     /// vector.
-    ///
-    /// The fourth corner of the rope square. Which pairing a checkpoint uses
-    /// is architecture data — `llama` interleaves, `qwen2`/`qwen3`/`gemma3`
-    /// halve — while whether the offset is a host number or a device vector is
-    /// the *loop's* choice, so a decode loop that keeps its position on device
-    /// needs both pairings to have this form.
     #[track_caller]
     pub fn rope_interleaved_pair_at(
         &self,
@@ -314,19 +284,11 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Pooling and resampling
-// ---------------------------------------------------------------------------
-
 impl<const R: usize, T: Element> Tensor<R, T> {
-    /// Window the trailing `DIFF` axes and reduce each window.
+    /// Window the trailing `DIFF` axes and reduce each window. Rank-preserving.
     ///
-    /// Rank-preserving, which is why there is one const parameter here and
-    /// four (`DIFF`, `R2`, `R3`, `O`) plus seven witness bounds in the
-    /// reference: the intermediate window/unsqueeze/flatten ranks are the
-    /// lowering's business, not the caller's. The reduction is a
-    /// [`PoolReduce`] value so the node can carry it as an attribute and its
-    /// adjoint can read it.
+    /// The reduction is a [`PoolReduce`] value so the node can carry it as an
+    /// attribute and its adjoint can read it.
     #[track_caller]
     pub fn pool<const DIFF: usize>(
         &self,
@@ -352,8 +314,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         self.pool(pools, PoolReduce::Min)
     }
 
-    /// Average pooling. The reference has none; it is the same node with an
-    /// `Add` carrier, which is the point of the reduction being an attribute.
+    /// Average pooling over the trailing `DIFF` axes.
     #[track_caller]
     pub fn pool_avg<const DIFF: usize>(&self, pools: [impl Into<PoolSize>; DIFF]) -> Self {
         self.pool(pools, PoolReduce::Mean)
@@ -361,9 +322,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
 }
 
 impl<T: Element> Tensor<4, T> {
-    /// Nearest-neighbour upsample of a `[B, C, H, W]` value. `usize` scales,
-    /// as the reference spelled them; the lowering's `u32` is an internal
-    /// detail a caller should not have to cast for.
+    /// Nearest-neighbour upsample of a `[B, C, H, W]` value.
     #[track_caller]
     pub fn upsample_nearest2d(&self, scale_h: usize, scale_w: usize) -> Self {
         let (h, w) = (
@@ -387,17 +346,9 @@ impl<T: Element> Tensor<4, T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Quantized weights
-// ---------------------------------------------------------------------------
-
 impl<const R: usize, T: Element> Tensor<R, T> {
     /// `self @ weights^T`, reading the block-quantized weight in place.
-    ///
-    /// The receiver is the **activation**. The inverted `QMatrix::q_mat_mul(&act)`
-    /// spelling reads backwards in a forward pass — `x.q_mat_mul(&self.wq)` is
-    /// the projection — and it stays as the `Dyn`-layer entry point underneath
-    /// this.
+    /// The receiver is the activation.
     ///
     /// A rank-1 activation is one matrix row and routes through a `[1, k]`
     /// view, so the output rank matches the input rank.
@@ -415,12 +366,8 @@ impl QMatrix {
     /// `[vocab, dim]` matrix gives `[.., n, dim]`, so `O = IDS + 1`.
     ///
     /// The const-rank spelling of [`QMatrix::index_select_rows`], and the
-    /// counterpart of [`Tensor::embedding`] for a table that is still
-    /// quantized — a tied embedding is exactly that, so a model that reads its
-    /// vocabulary out of a GGUF file has no dense table to call the dense
-    /// method on. The element type is the one the caller asks for; the
-    /// underlying gather decodes straight to it rather than materializing an
-    /// f32 table first.
+    /// counterpart of [`Tensor::embedding`] for a quantized table. The gather
+    /// decodes straight to the requested element type.
     #[track_caller]
     pub fn embedding<const IDS: usize, const O: usize, T: Element>(
         &self,
@@ -439,8 +386,7 @@ mod tests {
     use crate::Device;
     use crate::tensor::typed::Minus1;
 
-    /// Softmax as a method is the same value as the `Dyn` op, and it does not
-    /// change the rank.
+    /// Softmax as a method matches the `Dyn` op and does not change the rank.
     #[test]
     fn softmax_is_rank_preserving_and_sums_to_one() {
         let device = Device::private();
@@ -461,8 +407,7 @@ mod tests {
         assert_eq!(a.softmax(Minus1).to_flat(), got);
     }
 
-    /// The method and the free function mint the *same node*, which is the
-    /// claim that makes this file free: it adds a spelling, not a program.
+    /// The method and the free function mint the same node.
     #[test]
     fn a_method_and_its_free_function_are_the_same_node() {
         let device = Device::private();
@@ -479,8 +424,7 @@ mod tests {
         assert_eq!(pooled.id(), pooled_fn.id());
     }
 
-    /// `rope_pair` is `rope` applied to q and k, and the pair form is what
-    /// `rope_normal_pair_fused` was called before the suffix came off.
+    /// `rope_pair` is `rope` applied to q and k.
     #[test]
     fn rope_pair_rotates_q_and_k_the_way_rope_rotates_one() {
         let device = Device::private();
@@ -502,7 +446,7 @@ mod tests {
         assert_eq!(rq.shape(), [1, 1, 2, 4]);
         assert_eq!(rq.to_flat(), q.rope(&cos, &sin, 0).to_flat());
         assert_eq!(rk.to_flat(), k.rope(&cos, &sin, 0).to_flat());
-        // And the interleaved pairing is a genuinely different rotation.
+        // The interleaved pairing is a different rotation.
         let (iq, _) = q.rope_interleaved_pair(&k, &cos, &sin, 0);
         assert_ne!(iq.to_flat(), rq.to_flat());
     }

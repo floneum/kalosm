@@ -1,7 +1,7 @@
 //! The saturation driver: a worklist in creation order over a
 //! `(RuleId, Id)` bitset, bounded by [`SaturationBudget`]. On exhaustion it
 //! offers only [`RuleTag::StrictlyLowering`] rules, guaranteeing every chain
-//! provably reaches a runnable L1 form — budget exhaustion yields a
+//! provably reaches a runnable Launch form — budget exhaustion yields a
 //! degraded-but-valid plan, never a hard error. Truncation is never silent.
 
 use crate::device::Caps;
@@ -44,12 +44,12 @@ const fn tag_index(tag: OpTag) -> usize {
         OpTag::Scatter => 7,
         OpTag::Dequant => 8,
         OpTag::Project => 9,
-        OpTag::KMap => 10,
-        OpTag::KFold => 11,
-        OpTag::KContract => 12,
-        OpTag::KGather => 13,
-        OpTag::KScatter => 14,
-        OpTag::KRegion => 15,
+        OpTag::LaunchMap => 10,
+        OpTag::LaunchFold => 11,
+        OpTag::LaunchContract => 12,
+        OpTag::LaunchGather => 13,
+        OpTag::LaunchScatter => 14,
+        OpTag::LaunchRegion => 15,
         OpTag::Ext => 16,
         OpTag::Union => 17,
     }
@@ -96,12 +96,12 @@ impl Saturate for CoreSaturate {
         let stride = max_nodes.max(initial).saturating_add(4096).max(64);
         let mut fired = FixedBitSet::with_capacity(rules.len().saturating_mul(64));
 
-        // Creation order is already a topological order, because children are
-        // strictly smaller ids. Nodes below the frontier were fully offered in
-        // an earlier pass over this same graph; a rule's applicability depends
-        // only on the node and its (immutable) child facts, so re-offering
-        // them is at best a memo hit and at worst — for rules that mint fresh
-        // ids — an unbounded re-expansion of an already-saturated region.
+        // Creation order is already a topological order: children are
+        // strictly smaller ids. Nodes below the frontier were fully offered
+        // in an earlier pass over this same graph; a rule's applicability
+        // depends only on the node and its (immutable) child facts, and
+        // re-offering rules that mint fresh ids re-expands an already-
+        // saturated region without bound.
         let from = graph.saturation_frontier.min(initial);
         let mut work: VecDeque<Id> = (from..initial).map(|i| Id(i as u32)).collect();
         let mut next: Vec<Id> = Vec::new();
@@ -161,7 +161,7 @@ impl Saturate for CoreSaturate {
         }
 
         // The degraded pass. Runs when a budget was hit, and unconditionally
-        // as a final sweep whenever some chain has no L1 member. A
+        // as a final sweep whenever some chain has no Launch member. A
         // `StrictlyLowering` rule is idempotent by hash-consing, so
         // re-offering one is a memo hit; that is what lets this ignore the
         // fired set and the node ceiling entirely.
@@ -170,13 +170,10 @@ impl Saturate for CoreSaturate {
         }
 
         // Advance the frontier: nodes below it have been offered every rule.
-        // A full drain (or a mere round exhaustion, whose leftover work is
-        // re-offers of freshly minted members that `lower_everything` has
-        // already made runnable) covers the whole graph; a hard budget break
-        // covers exactly the prefix walked. Without this, every resolve of a
-        // long-lived graph re-offers every historical node, and the rules
-        // that allocate fresh ids re-mint their results each time — measured
-        // as a 276k-node graph doubling on its second resolve.
+        // A full drain or round exhaustion covers the whole graph; a hard
+        // budget break covers exactly the prefix walked. Without this, every
+        // resolve of a long-lived graph re-offers every historical node and
+        // the id-minting rules re-mint their results each time.
         graph.saturation_frontier = budget_break
             .unwrap_or_else(|| graph.len())
             .max(graph.saturation_frontier);
@@ -201,20 +198,20 @@ impl Saturate for CoreSaturate {
     }
 }
 
-/// Whether any non-leaf L0 value still has no L1 spelling. This is the
+/// Whether any non-leaf Logical value still has no Launch spelling. This is the
 /// extractor's only contract with saturation, so it is checked rather than
 /// assumed.
 fn missing_l1(graph: &EGraph) -> bool {
     (0..graph.len()).any(|i| {
         let id = Id(i as u32);
         let node = graph.node(id);
-        if node.level != Level::L0 || matches!(node.op, Op::L0(crate::ir::level0::L0::Leaf(_))) {
+        if node.level != Level::Logical || matches!(node.op, Op::Logical(crate::ir::logical::Logical::Leaf(_))) {
             return false;
         }
         !graph
             .members(graph.class_of(id))
             .iter()
-            .any(|&m| graph.level(m) == Level::L1)
+            .any(|&m| graph.level(m) == Level::Launch)
     })
 }
 
@@ -232,7 +229,7 @@ fn lower_everything(
     while i < graph.len() {
         let id = Id(i as u32);
         i += 1;
-        if graph.node(id).level != Level::L0 {
+        if graph.node(id).level != Level::Logical {
             continue;
         }
         let candidates = &by_head[tag_index(graph.node(id).op.tag())];
@@ -264,8 +261,8 @@ fn lower_everything(
 mod tests {
     use super::*;
     use crate::dtype::Dtype;
-    use crate::ir::level0::L0;
-    use crate::ir::level1::{AccessPlan, L1};
+    use crate::ir::logical::Logical;
+    use crate::ir::launch::{AccessPlan, Launch};
     use crate::rules::test_support as ts;
     use crate::rules::{CORE_RULES, alias_operand_of, ident_expr};
     use crate::scalar::{BinOp, ScalarExpr, UnOp};
@@ -301,11 +298,8 @@ mod tests {
     /// A fingerprint of a node's whole subterm, with ids erased.
     ///
     /// Raw [`NodeKey`]s cannot be compared across two rule orders: a rewrite
-    /// that names a freshly minted node — `KRegion::members` — necessarily
-    /// records the id it was given, and ids
-    /// are a creation-order artifact. Erasing them and recursing over the
-    /// children's fingerprints compares exactly the structure that carries
-    /// meaning.
+    /// that names a freshly minted node records the id it was given, and ids
+    /// are a creation-order artifact.
     fn fingerprints(g: &EGraph) -> FxHashSet<u64> {
         use std::hash::{Hash, Hasher};
         let mut fp: Vec<u64> = Vec::with_capacity(g.len());
@@ -376,7 +370,7 @@ mod tests {
     }
 
     /// Test 9. Every budget path returns `Ok`, reports the truncation, and
-    /// still leaves every original L0 root with an L1 spelling.
+    /// still leaves every original Logical root with an Launch spelling.
     #[test]
     fn budget_exhaustion_degrades_not_errors() {
         let caps = ts::caps();
@@ -401,8 +395,8 @@ mod tests {
         for root in roots {
             let members = g.chain(root);
             assert!(
-                members.iter().any(|&m| g.level(m) == Level::L1),
-                "chain of {root} has no L1 member"
+                members.iter().any(|&m| g.level(m) == Level::Launch),
+                "chain of {root} has no Launch member"
             );
         }
     }
@@ -449,7 +443,7 @@ mod tests {
         }
     }
 
-    /// Self-referential members are only `KRegion`s. The invariant is enforced
+    /// Self-referential members are only `Region`s. The invariant is enforced
     /// at selection time by `fusor2_cost::realize::selectable`, which drops
     /// such members before they can be chosen.
     #[test]
@@ -474,8 +468,8 @@ mod tests {
                 .any(|c| g.class_of(*c) == class);
             if self_ref {
                 assert!(
-                    matches!(g.node(id).op, Op::L1(L1::KRegion { .. })),
-                    "{id} ({:?}) names its own class; only KRegion may",
+                    matches!(g.node(id).op, Op::Launch(Launch::Region { .. })),
+                    "{id} ({:?}) names its own class; only Region may",
                     g.node(id).op.tag()
                 );
             }
@@ -611,19 +605,19 @@ mod tests {
         assert!(
             members
                 .iter()
-                .any(|&m| matches!(g.node(m).op, Op::L0(L0::Contract { .. })))
+                .any(|&m| matches!(g.node(m).op, Op::Logical(Logical::Contract { .. })))
         );
         assert!(
             members
                 .iter()
-                .any(|&m| matches!(g.node(m).op, Op::L1(L1::KFold { .. })))
+                .any(|&m| matches!(g.node(m).op, Op::Launch(Launch::Fold { .. })))
         );
         // The fused nest reads the two buffers directly.
         let fused = members
             .iter()
             .copied()
             .find(|&m| match &g.node(m).op {
-                Op::L1(L1::KFold { ops, .. }) => {
+                Op::Launch(Launch::Fold { ops, .. }) => {
                     ops.len() == 2 && ops.iter().all(|o| matches!(o.access, AccessPlan::Alias))
                 }
                 _ => false,

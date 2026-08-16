@@ -1,11 +1,10 @@
 //! Every level-generic rewrite rule, and the one table the driver is handed.
 //!
 //! Guards may read only [`crate::egraph::Facts`] — legality, never
-//! profitability. That restriction is enforced by the API surface rather than
-//! by convention.
+//! profitability.
 //!
-//! **Rule order carries no semantics**; the fixed order below exists only for
-//! reproducibility, and `rule_order_is_semantically_inert` asserts it.
+//! Rule order carries no semantics; the fixed order below exists only for
+//! reproducibility.
 
 pub mod algebra;
 pub mod fusion;
@@ -20,8 +19,8 @@ pub mod tuple;
 use crate::dtype::Dtype;
 use crate::egraph::{Builder, Id, Rule};
 use crate::ir::Op;
-use crate::ir::level0::L0;
-use crate::ir::level1::{AccessPlan, IndexSpace, L1, Operand};
+use crate::ir::logical::Logical;
+use crate::ir::launch::{AccessPlan, IndexSpace, Launch, Operand};
 use crate::scalar::ScalarExpr;
 use crate::shape::{Dim, Layout, StrideSpec};
 
@@ -34,7 +33,7 @@ pub struct RuleId(pub u16);
 /// Every rule `fusor2-ir` owns, in a fixed order. A target's `rules()` is
 /// concatenated onto this; nothing here mentions lane or subgroup geometry.
 pub static CORE_RULES: &[Rule] = &[
-    // L0 algebra
+    // Logical algebra
     algebra::STRIP,
     algebra::RECOGNIZE_CONTRACT,
     algebra::CONTRACT_REASSOC,
@@ -42,28 +41,26 @@ pub static CORE_RULES: &[Rule] = &[
     algebra::IDENTITY_ELIM,
     algebra::WIDEN_STORE_CAST,
     algebra::UNIT_FOLD_COLLAPSE,
-    // L1 fusion
+    // Launch fusion
     fusion::ABSORB,
     fusion::MAP_INTO_CONTRACT,
     fusion::MAP_INTO_MAP,
     fusion::FOLD_POST_EPILOGUE,
     fusion::FORM_KREGION,
-    // L1 fold algebra — the carrier laws. `PROMOTE`, `HOIST`, `RETARGET`,
-    // `TUPLE` and `TUPLE_SIBLING` are registered here as stubs so their
-    // owners never have to edit this file. `HOIST` and `RETARGET` are two
-    // entries sharing one dependence query on purpose: the driver's fired
-    // set is per `(RuleId, Id)`, so one merged rule could fire at most once
-    // per node and the second answer would be unreachable.
+    // Launch fold algebra — the carrier laws. `HOIST` and `RETARGET` are two
+    // entries sharing one dependence query: the driver's fired set is per
+    // `(RuleId, Id)`, so one merged rule could fire at most once per node
+    // and the second answer would be unreachable.
     promote::PROMOTE,
     rebase::HOIST,
     rebase::RETARGET,
     tuple::TUPLE,
     tuple::TUPLE_SIBLING,
-    // L1 sinking
+    // Launch sinking
     sink::SINK_EPILOGUE,
     sink::FOLD_VIEWS_INTO_INDEX,
     sink::FOLD_VIEWS_INTO_FOLD_INDEX,
-    // L1 operand access
+    // Launch operand access
     layout::OPERAND_ALIAS,
     layout::OPERAND_GATHER,
     layout::OPERAND_PACK,
@@ -96,14 +93,6 @@ pub fn rule(id: RuleId) -> &'static Rule {
     &CORE_RULES[id.0 as usize]
 }
 
-// ---------------------------------------------------------------------------
-// Shared rule helpers
-//
-// These are the small pieces several rule modules need. They are all pure
-// functions over `Builder`'s read side plus IR values; none of them can reach
-// extraction state.
-// ---------------------------------------------------------------------------
-
 /// An operand read straight out of its producer's dense row-major layout.
 pub(crate) fn alias_operand_of(src: Id, shape: &[Dim]) -> Operand {
     Operand {
@@ -130,8 +119,8 @@ pub(crate) fn access_legal_in(a: &AccessPlan, space: &IndexSpace) -> bool {
 
 /// The elementwise producer shape a fusion rule inlines.
 ///
-/// Equality in this e-graph is **not congruent**, so an `L0::Map` and the
-/// `L1::KMap` it was lowered to are one class but the consuming L1 node's
+/// Equality in this e-graph is **not congruent**, so an `Logical::Map` and the
+/// `Launch::Map` it was lowered to are one class but the consuming Launch node's
 /// operand still names whichever id the frontend built. Both spellings
 /// denote the same value, so both are inlinable; this normalizes them.
 pub(crate) struct MapView {
@@ -143,10 +132,10 @@ pub(crate) struct MapView {
 /// Read `id` as an elementwise producer, in either spelling.
 pub(crate) fn map_view(b: &Builder<'_>, id: Id) -> Option<MapView> {
     match b.node(id).op.clone() {
-        Op::L1(L1::KMap {
+        Op::Launch(Launch::Map {
             space, body, ops, ..
         }) => Some(MapView { space, body, ops }),
-        Op::L0(L0::Map { expr, ins, outs }) if outs == 1 => {
+        Op::Logical(Logical::Map { expr, ins, outs }) if outs == 1 => {
             let space = IndexSpace::new(b.facts_of(id).shape.iter().copied());
             let ops = ins
                 .iter()
@@ -179,8 +168,7 @@ pub(crate) fn operand_dtypes(b: &Builder<'_>, ops: &[Operand]) -> Vec<Dtype> {
 }
 
 /// Apply a relative restride spec vector to a dense row-major input shape.
-/// Returns `None` when a stride or offset is not decidable, which is what
-/// keeps a symbolic view from being aliased on a guess.
+/// Returns `None` when a stride or offset is not decidable.
 pub(crate) fn composed_layout(specs: &[StrideSpec], in_shape: &[Dim]) -> Option<Layout> {
     let in_strides = Layout::row_major_strides(in_shape);
     let mut shape: Vec<Dim> = Vec::with_capacity(specs.len());
@@ -204,24 +192,21 @@ pub(crate) fn composed_layout(specs: &[StrideSpec], in_shape: &[Dim]) -> Option<
 /// The plain affine layout a whole view spine denotes over its base, or
 /// `None` when the composition is not expressible as one stride vector.
 ///
-/// [`composed_layout`] states one spec vector against a **dense** input;
-/// composing a chain substitutes each stage's strides into the next, so a
-/// narrow → reshape → transpose spine — the shape every rope operand and
-/// attention head split arrives as — collapses to `offset + Σ stride_j · i_j`
-/// over the base buffer. Everything must be const-decidable and every stage's
-/// bounds proof [`BoundsProof::Static`]: a `RuntimeMask` view masks reads the
-/// composed layout could not, and dropping a mask is a wrong value, not a
-/// missed optimization.
+/// Composing a chain substitutes each stage's strides into the next, so a
+/// narrow → reshape → transpose spine collapses to
+/// `offset + Σ stride_j · i_j` over the base buffer. Everything must be
+/// const-decidable and every stage's bounds proof [`BoundsProof::Static`]:
+/// a `RuntimeMask` view masks reads the composed layout could not, and
+/// dropping a mask is a wrong value.
 ///
 /// A spec that walks past its input axis's extent (an axis-merging reshape)
 /// is only affine when the stage it reads is dense row-major from that axis
-/// inward; elsewhere the walk leaves the axis and the address is not
-/// `stride · i` any more, so the composition declines rather than guesses.
+/// inward, so the composition declines elsewhere.
 pub(crate) fn composed_spine_layout(
     b: &Builder<'_>,
     spine: &crate::egraph::ViewSpine,
 ) -> Option<Layout> {
-    use crate::ir::level0::L0;
+    use crate::ir::logical::Logical;
     let base_shape = b.facts_of(spine.base).shape.clone();
     let mut shape: Vec<u64> = base_shape
         .iter()
@@ -233,7 +218,7 @@ pub(crate) fn composed_spine_layout(
         .collect::<Option<_>>()?;
     let mut offset: u64 = 0;
     for view in &spine.views {
-        let Op::L0(L0::Restride { specs, bounds, .. }) = &b.node(*view).op else {
+        let Op::Logical(Logical::Restride { specs, bounds, .. }) = &b.node(*view).op else {
             return None;
         };
         if *bounds != crate::shape::BoundsProof::Static {
@@ -303,8 +288,7 @@ pub(crate) fn is_identity_specs(specs: &[StrideSpec], in_shape: &[Dim]) -> bool 
 
 /// A minimal in-crate [`crate::ir::Semantics`] plus graph constructors, so
 /// every rule module can build a fixture without depending on
-/// `CoreSemantics`. Declared inline rather than in a new file:
-/// `src/rules/` is a fixed file set.
+/// `CoreSemantics`.
 #[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
@@ -315,8 +299,8 @@ pub(crate) mod test_support {
     use crate::error::{Error, Result};
     use crate::facts::{ValueFacts, Work};
     use crate::carrier::Carrier;
-    use crate::ir::level0::{BufferId, EinSpec, LeafKind, ScatterCombine};
-    use crate::ir::level1::{ContractSide, Effect, Family, ScheduleDomain};
+    use crate::ir::logical::{BufferId, EinSpec, LeafKind, ScatterCombine};
+    use crate::ir::launch::{ContractSide, Effect, Family, ScheduleDomain};
     use crate::ir::{Children, Semantics, VerifyCtx};
     use crate::shape::{BoundsProof, Dims};
     use smallvec::smallvec;
@@ -366,36 +350,36 @@ pub(crate) mod test_support {
     pub fn children_of(op: &Op) -> Children {
         match op {
             Op::Union(a, b) => smallvec![*a, *b],
-            Op::L0(o) => match o {
-                L0::Leaf(_) => Children::new(),
-                L0::Map { ins, .. } | L0::Fold { ins, .. } => ins.iter().copied().collect(),
-                L0::Restride { x, .. }
-                | L0::Window { x, .. }
-                | L0::Dequant { x, .. }
-                | L0::Project { x, .. } => smallvec![*x],
-                L0::Contract { a, b, .. } => smallvec![*a, *b],
-                L0::Gather { x, idx, .. } => smallvec![*x, *idx],
-                L0::Scatter {
+            Op::Logical(o) => match o {
+                Logical::Leaf(_) => Children::new(),
+                Logical::Map { ins, .. } | Logical::Fold { ins, .. } => ins.iter().copied().collect(),
+                Logical::Restride { x, .. }
+                | Logical::Window { x, .. }
+                | Logical::Dequant { x, .. }
+                | Logical::Project { x, .. } => smallvec![*x],
+                Logical::Contract { a, b, .. } => smallvec![*a, *b],
+                Logical::Gather { x, idx, .. } => smallvec![*x, *idx],
+                Logical::Scatter {
                     base, idx, upd, ..
                 } => smallvec![*base, *idx, *upd],
             },
-            Op::L1(o) => match o {
-                L1::KMap { ops, .. }
-                | L1::KFold { ops, .. }
-                | L1::KGather { ops, .. }
-                | L1::KScatter { ops, .. }
-                | L1::Ext { ops, .. } => ops.iter().map(|p| p.src).collect(),
-                L1::KContract { a, b, .. } => {
+            Op::Launch(o) => match o {
+                Launch::Map { ops, .. }
+                | Launch::Fold { ops, .. }
+                | Launch::Gather { ops, .. }
+                | Launch::Scatter { ops, .. }
+                | Launch::Ext { ops, .. } => ops.iter().map(|p| p.src).collect(),
+                Launch::Contract { a, b, .. } => {
                     a.ops.iter().chain(b.ops.iter()).map(|p| p.src).collect()
                 }
-                L1::KRegion { members, .. } => members.iter().copied().collect(),
+                Launch::Region { members, .. } => members.iter().copied().collect(),
             },
         }
     }
 
-    fn infer_l0(o: &L0, ins: &[ValueFacts]) -> Result<ValueFacts> {
+    fn infer_logical(o: &Logical, ins: &[ValueFacts]) -> Result<ValueFacts> {
         Ok(match o {
-            L0::Leaf(k) => match k {
+            Logical::Leaf(k) => match k {
                 LeafKind::Buffer { dtype, shape, .. } => {
                     facts(*dtype, shape.clone(), &[])
                 }
@@ -415,7 +399,7 @@ pub(crate) mod test_support {
                     f
                 }
             },
-            L0::Map { expr, ins: _, outs } => {
+            Logical::Map { expr, ins: _, outs } => {
                 let shape = ins
                     .first()
                     .map(|f| f.shape.clone())
@@ -429,7 +413,7 @@ pub(crate) mod test_support {
                 }
                 f
             }
-            L0::Fold {
+            Logical::Fold {
                 axis, acc, carrier, ..
             } => {
                 let src = ins.first().ok_or_else(|| Error::Shape("fold".into()))?;
@@ -446,7 +430,7 @@ pub(crate) mod test_support {
                 }
                 facts(*acc, shape, ins)
             }
-            L0::Contract { spec, acc, .. } => {
+            Logical::Contract { spec, acc, .. } => {
                 let a = &ins[0];
                 let b = &ins[1];
                 let mut shape: Dims = Dims::new();
@@ -462,10 +446,10 @@ pub(crate) mod test_support {
                 }
                 facts(*acc, shape, ins)
             }
-            L0::Restride { specs, .. } => {
+            Logical::Restride { specs, .. } => {
                 facts(ins[0].dtype, specs.iter().map(|s| s.size).collect(), ins)
             }
-            L0::Window { specs, .. } => {
+            Logical::Window { specs, .. } => {
                 let mut shape = ins[0].shape.clone();
                 for w in specs {
                     let n = shape[w.axis as usize]
@@ -477,7 +461,7 @@ pub(crate) mod test_support {
                 }
                 facts(ins[0].dtype, shape, ins)
             }
-            L0::Gather { axis, .. } => {
+            Logical::Gather { axis, .. } => {
                 let mut shape = ins[0].shape.clone();
                 shape[*axis as usize] = *ins[1]
                     .shape
@@ -485,18 +469,18 @@ pub(crate) mod test_support {
                     .ok_or_else(|| Error::Shape("gather index rank".into()))?;
                 facts(ins[0].dtype, shape, ins)
             }
-            L0::Scatter { .. } => facts(ins[0].dtype, ins[0].shape.clone(), ins),
-            L0::Dequant { .. } => facts(Dtype::F32, ins[0].shape.clone(), ins),
-            L0::Project { .. } => facts(ins[0].dtype, ins[0].shape.clone(), ins),
+            Logical::Scatter { .. } => facts(ins[0].dtype, ins[0].shape.clone(), ins),
+            Logical::Dequant { .. } => facts(Dtype::F32, ins[0].shape.clone(), ins),
+            Logical::Project { .. } => facts(ins[0].dtype, ins[0].shape.clone(), ins),
         })
     }
 
-    fn infer_l1(o: &L1, ins: &[ValueFacts]) -> Result<ValueFacts> {
+    fn infer_launch(o: &Launch, ins: &[ValueFacts]) -> Result<ValueFacts> {
         Ok(match o {
-            L1::KMap { space, body, .. } => {
+            Launch::Map { space, body, .. } => {
                 facts(body.dtype(), space.dims.clone(), ins)
             }
-            L1::KFold {
+            Launch::Fold {
                 space,
                 axis,
                 acc,
@@ -522,7 +506,7 @@ pub(crate) mod test_support {
                 }
                 facts(*acc, shape, ins)
             }
-            L1::KContract {
+            Launch::Contract {
                 m, n, batch, post, ..
             } => {
                 let mut shape: Dims = Dims::new();
@@ -533,16 +517,16 @@ pub(crate) mod test_support {
                 shape.push(*n);
                 facts(post.dtype(), shape, ins)
             }
-            L1::KGather { space, .. } | L1::KScatter { space, .. } => {
+            Launch::Gather { space, .. } | Launch::Scatter { space, .. } => {
                 facts(ins[0].dtype, space.dims.clone(), ins)
             }
-            L1::KRegion { .. } => {
+            Launch::Region { .. } => {
                 let last = ins
                     .last()
                     .ok_or_else(|| Error::Shape("empty region".into()))?;
                 facts(last.dtype, last.shape.clone(), ins)
             }
-            L1::Ext { .. } => return Err(Error::Legality("no test Ext registry".into())),
+            Launch::Ext { .. } => return Err(Error::Legality("no test Ext registry".into())),
         })
     }
 
@@ -552,8 +536,8 @@ pub(crate) mod test_support {
         }
         fn infer(&self, op: &Op, ins: &[ValueFacts]) -> Result<ValueFacts> {
             match op {
-                Op::L0(o) => infer_l0(o, ins),
-                Op::L1(o) => infer_l1(o, ins),
+                Op::Logical(o) => infer_logical(o, ins),
+                Op::Launch(o) => infer_launch(o, ins),
                 Op::Union(..) => Err(Error::Legality("union inferred by the graph".into())),
             }
         }
@@ -600,11 +584,9 @@ pub(crate) mod test_support {
         }
     }
 
-    // ---- graph constructors -------------------------------------------
-
     pub fn buffer(g: &mut EGraph, dtype: Dtype, shape: &[Dim]) -> Id {
         let n = g.len() as u32;
-        g.add(Op::L0(L0::Leaf(LeafKind::Buffer {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
             name: BufferId(n),
             dtype,
             shape: shape.iter().copied().collect(),
@@ -613,7 +595,7 @@ pub(crate) mod test_support {
     }
 
     pub fn map(g: &mut EGraph, expr: ScalarExpr, ins: &[Id]) -> Id {
-        g.add(Op::L0(L0::Map {
+        g.add(Op::Logical(Logical::Map {
             expr,
             ins: ins.iter().copied().collect(),
             outs: 1,
@@ -627,7 +609,7 @@ pub(crate) mod test_support {
     }
 
     pub fn fold(g: &mut EGraph, carrier: Carrier, axis: u32, acc: Dtype, x: Id) -> Id {
-        g.add(Op::L0(L0::Fold {
+        g.add(Op::Logical(Logical::Fold {
             carrier,
             axis,
             acc,
@@ -637,7 +619,7 @@ pub(crate) mod test_support {
     }
 
     pub fn restride(g: &mut EGraph, specs: &[StrideSpec], x: Id) -> Id {
-        g.add(Op::L0(L0::Restride {
+        g.add(Op::Logical(Logical::Restride {
             specs: specs.iter().copied().collect(),
             bounds: BoundsProof::Static,
             x,
@@ -646,7 +628,7 @@ pub(crate) mod test_support {
     }
 
     pub fn contract(g: &mut EGraph, spec: EinSpec, acc: Dtype, a: Id, b: Id) -> Id {
-        g.add(Op::L0(L0::Contract {
+        g.add(Op::Logical(Logical::Contract {
             spec,
             acc,
             a,
@@ -657,7 +639,7 @@ pub(crate) mod test_support {
     }
 
     pub fn scatter(g: &mut EGraph, axis: u32, base: Id, idx: Id, upd: Id) -> Id {
-        g.add(Op::L0(L0::Scatter {
+        g.add(Op::Logical(Logical::Scatter {
             axis,
             combine: ScatterCombine::Add,
             base,
@@ -669,7 +651,7 @@ pub(crate) mod test_support {
     }
 
     pub fn kmap(g: &mut EGraph, space: &[Dim], body: ScalarExpr, ops: Vec<Operand>) -> Id {
-        g.add(Op::L1(L1::KMap {
+        g.add(Op::Launch(Launch::Map {
             space: IndexSpace::new(space.iter().copied()),
             body,
             ops,
@@ -688,7 +670,7 @@ pub(crate) mod test_support {
         post: ScalarExpr,
         ops: Vec<Operand>,
     ) -> Id {
-        g.add(Op::L1(L1::KFold {
+        g.add(Op::Launch(Launch::Fold {
             space: IndexSpace::new(space.iter().copied()),
             axis,
             vec_axes: smallvec![],
@@ -710,7 +692,7 @@ pub(crate) mod test_support {
         a: Operand,
         b: Operand,
     ) -> Id {
-        g.add(Op::L1(L1::KContract {
+        g.add(Op::Launch(Launch::Contract {
             m,
             n,
             k,
@@ -778,8 +760,6 @@ mod tests {
         let got: Vec<&str> = CORE_RULES.iter().map(|r| r.name).collect();
         assert_eq!(got, expected);
         assert_eq!(CORE_RULES.len(), 34);
-        // No recognizer survives: nothing in the table is keyed on a frontend
-        // chain, and no rule names an algorithm.
         assert!(
             !CORE_RULES.iter().any(|r| r.name.contains("FLASH")),
             "a flash recognizer is back in the table"
@@ -811,21 +791,18 @@ mod tests {
             assert!(floors.contains(&tag), "no floor rule for {tag:?}");
         }
         assert!(!floors.contains(&OpTag::Leaf));
-        // Every lowering-floor rule descends from L0.
+        // Every lowering-floor rule descends from Logical.
         assert!(
             CORE_RULES
                 .iter()
                 .filter(|r| r.tag == RuleTag::StrictlyLowering)
-                .all(|r| r.level == Level::L0)
+                .all(|r| r.level == Level::Logical)
         );
     }
 
-    /// Test 13. Elementwise-into-elementwise is `ScalarExpr::compose` — the
-    /// *arithmetic* is a tree substitution and no `L0::Map`-headed rule
-    /// produces a second `L0::Map`.
-    ///
-    /// `compose` is called by the rules, so `Map{exp}(Map{sub}(s, m))` is
-    /// lowered from one `KMap` node via `fusion::MAP_INTO_MAP`.
+    /// Elementwise-into-elementwise is `ScalarExpr::compose` — a tree
+    /// substitution — and no `Logical::Map`-headed rule produces a second
+    /// `Logical::Map`; `fusion::MAP_INTO_MAP` fuses at Launch instead.
     #[test]
     fn elementwise_into_elementwise_needs_no_rule() {
         let inner = ScalarExpr::un(crate::scalar::UnOp::Exp, ScalarExpr::arg(0, Dtype::F32));
@@ -863,21 +840,21 @@ mod tests {
             .saturate(&mut g, &caps, CORE_RULES, SaturationBudget::default())
             .unwrap();
         let members = g.chain(m2);
-        // Only the KMap lowering joined the class; no second L0 Map appeared.
+        // Only the Map lowering joined the class; no second Logical Map appeared.
         let l0_maps = members
             .iter()
-            .filter(|&&m| matches!(g.node(m).op, Op::L0(L0::Map { .. })))
+            .filter(|&&m| matches!(g.node(m).op, Op::Logical(Logical::Map { .. })))
             .count();
         assert_eq!(before, 1);
         assert_eq!(l0_maps, 1, "a Map-into-Map alternative was minted");
 
-        // At L1 it *is* a rule, and it fires: the class holds a one-operand
-        // `KMap` whose body is the composed expression, reading `x` directly.
+        // At Launch it *is* a rule, and it fires: the class holds a one-operand
+        // `Map` whose body is the composed expression, reading `x` directly.
         let fused_kmap = members.iter().copied().find(|&m| {
-            matches!(&g.node(m).op, Op::L1(L1::KMap { ops, .. }) if ops.len() == 1 && ops[0].src == x)
+            matches!(&g.node(m).op, Op::Launch(Launch::Map { ops, .. }) if ops.len() == 1 && ops[0].src == x)
         });
         let fused_kmap = fused_kmap.expect("MAP_INTO_MAP did not fuse a two-map chain");
-        let Op::L1(L1::KMap { body, .. }) = &g.node(fused_kmap).op else {
+        let Op::Launch(Launch::Map { body, .. }) = &g.node(fused_kmap).op else {
             unreachable!()
         };
         assert_eq!(body, &fused, "the fused body is not the composed one");

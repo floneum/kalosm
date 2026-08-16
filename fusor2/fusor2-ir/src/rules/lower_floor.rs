@@ -1,5 +1,5 @@
 //! The [`crate::egraph::RuleTag::StrictlyLowering`] floor: one trivial,
-//! always-legal L0 -> L1 lowering per L0 op. These are what the driver falls
+//! always-legal Logical -> Launch lowering per Logical op. These are what the driver falls
 //! back to when a saturation budget is exhausted.
 //!
 //! Every one emits [`ScheduleDomain::Point`]: the floor depends on no
@@ -16,9 +16,9 @@
 use crate::dtype::Dtype;
 use crate::egraph::{Builder, Facts, Id, RuleTag};
 use crate::carrier::Carrier;
-use crate::ir::level0::{L0, Label};
-use crate::ir::level1::{
-    AccessPlan, GatherMode, IndexSpace, L1, Operand, ScatterMode, ScheduleDomain,
+use crate::ir::logical::{Logical, Label};
+use crate::ir::launch::{
+    AccessPlan, GatherMode, IndexSpace, Launch, Operand, ScatterMode, ScheduleDomain,
 };
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
@@ -29,7 +29,7 @@ use smallvec::SmallVec;
 
 rule!(
     LOWER_MAP,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Map,
     tag = RuleTag::StrictlyLowering,
     apply = lower_map,
@@ -37,7 +37,7 @@ rule!(
 
 rule!(
     LOWER_FOLD,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Fold,
     tag = RuleTag::StrictlyLowering,
     apply = lower_fold,
@@ -45,7 +45,7 @@ rule!(
 
 rule!(
     LOWER_CONTRACT_GENERIC,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Contract,
     tag = RuleTag::StrictlyLowering,
     apply = lower_contract_generic,
@@ -53,7 +53,7 @@ rule!(
 
 rule!(
     LOWER_RESTRIDE,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Restride,
     tag = RuleTag::StrictlyLowering,
     apply = lower_restride,
@@ -61,7 +61,7 @@ rule!(
 
 rule!(
     LOWER_WINDOW,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Window,
     tag = RuleTag::StrictlyLowering,
     apply = lower_window,
@@ -69,7 +69,7 @@ rule!(
 
 rule!(
     LOWER_GATHER,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Gather,
     tag = RuleTag::StrictlyLowering,
     apply = lower_gather,
@@ -77,7 +77,7 @@ rule!(
 
 rule!(
     LOWER_SCATTER,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Scatter,
     tag = RuleTag::StrictlyLowering,
     apply = lower_scatter,
@@ -85,7 +85,7 @@ rule!(
 
 rule!(
     LOWER_DEQUANT,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Dequant,
     tag = RuleTag::StrictlyLowering,
     apply = lower_dequant,
@@ -93,7 +93,7 @@ rule!(
 
 rule!(
     LOWER_PROJECT,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Project,
     tag = RuleTag::StrictlyLowering,
     apply = lower_project,
@@ -103,32 +103,27 @@ fn space_of(f: &Facts<'_>) -> IndexSpace {
     IndexSpace::new(f.own().shape.iter().copied())
 }
 
-// ---------------------------------------------------------------------------
-// The floor constructors — the only mints of `ScheduleDomain::Point`
-// ---------------------------------------------------------------------------
-
 /// The schedule a nest carries before any schedule rule has spoken.
 ///
 /// For a *descriptor* rather than a node: [`crate::rules::tuple`] normalizes an
-/// `L0::Fold` into the `KFold` fields it would lower to, and the schedule field
+/// `Logical::Fold` into the `Fold` fields it would lower to, and the schedule field
 /// of that normalization is this — the same value [`lower_fold`] would put
 /// there. Prefer the node constructors below wherever an id is what is wanted.
 pub(crate) fn floor_sched() -> ScheduleDomain {
     ScheduleDomain::Point
 }
 
-/// A `KMap` minted with no schedule of its own.
+/// A `Map` minted with no schedule of its own.
 ///
-/// The schedule rules expand it exactly as they expand a `lower_map` output,
-/// which is the point: a rule that restates a value does not get to decide how
-/// that value is scheduled.
+/// The schedule rules expand it exactly as they expand a `lower_map` output:
+/// a rule that restates a value does not decide how it is scheduled.
 pub(crate) fn floor_map(
     b: &mut Builder<'_>,
     space: IndexSpace,
     body: ScalarExpr,
     ops: Vec<Operand>,
 ) -> Option<Id> {
-    b.add_l1(L1::KMap {
+    b.add_launch(Launch::Map {
         space,
         body,
         ops,
@@ -137,14 +132,13 @@ pub(crate) fn floor_map(
     .ok()
 }
 
-/// The identity-body alias `KMap` that re-expresses `src` at `shape` through
+/// The identity-body alias `Map` that re-expresses `src` at `shape` through
 /// `layout`.
 ///
 /// This is the readback spelling: a slot view of a multi-slot carrier, a
 /// recovery view of a promoted fold's flattened carrier axis. It computes
-/// nothing — the body is `Arg(0)` and the access is [`AccessPlan::Alias`] — so
-/// it is a node with no schedule decision in it at all, and minting it here
-/// rather than at each call site is what keeps that true by construction.
+/// nothing — the body is `Arg(0)` and the access is [`AccessPlan::Alias`] —
+/// so it carries no schedule decision at all.
 pub(crate) fn floor_alias_map(
     b: &mut Builder<'_>,
     src: Id,
@@ -164,7 +158,7 @@ pub(crate) fn floor_alias_map(
     )
 }
 
-/// A `KFold` minted with no schedule of its own — the nest [`lower_fold`]
+/// A `Fold` minted with no schedule of its own — the nest [`lower_fold`]
 /// would have minted, given these fields.
 ///
 /// TUPLE's joint carrier is the case: the joint takes neither side's schedule,
@@ -182,7 +176,7 @@ pub(crate) fn floor_fold(
     post: SmallVec<[ScalarExpr; 4]>,
     ops: Vec<Operand>,
 ) -> Option<Id> {
-    b.add_l1(L1::KFold {
+    b.add_launch(Launch::Fold {
         space,
         axis,
         vec_axes,
@@ -195,10 +189,10 @@ pub(crate) fn floor_fold(
     .ok()
 }
 
-/// `L0::Map` -> `L1::KMap` reading every operand through its own dense
+/// `Logical::Map` -> `Launch::Map` reading every operand through its own dense
 /// layout.
 pub fn lower_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::L0(L0::Map { expr, ins, .. }) = &node.op else {
+    let Op::Logical(Logical::Map { expr, ins, .. }) = &node.op else {
         return None;
     };
     let ops: Vec<Operand> = ins
@@ -206,7 +200,7 @@ pub fn lower_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opt
         .map(|&s| alias_operand_of(s, &b.facts_of(s).shape.clone()))
         .collect();
     let k = b
-        .add_l1(L1::KMap {
+        .add_launch(Launch::Map {
             space: space_of(f),
             body: expr.clone(),
             ops,
@@ -216,10 +210,10 @@ pub fn lower_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opt
     b.union(id, k).ok()
 }
 
-/// `L0::Fold` -> `L1::KFold` over the pre-reduction space with identity
+/// `Logical::Fold` -> `Launch::Fold` over the pre-reduction space with identity
 /// `pre` and `post`.
 pub fn lower_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::L0(L0::Fold {
+    let Op::Logical(Logical::Fold {
         carrier,
         axis,
         acc,
@@ -244,7 +238,7 @@ pub fn lower_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Op
         .map(|e| crate::carrier::retype_args(e, dtype))
         .collect();
     let k = b
-        .add_l1(L1::KFold {
+        .add_launch(Launch::Fold {
             space: IndexSpace::new(in_shape.iter().copied()),
             axis: *axis,
             vec_axes: SmallVec::new(),
@@ -263,7 +257,7 @@ pub fn lower_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Op
     b.union(id, k).ok()
 }
 
-/// `L0::Contract` -> `KFold { combine: Add, pre: mul(Arg0, Arg1) }`.
+/// `Logical::Contract` -> `Fold { combine: Add, pre: mul(Arg0, Arg1) }`.
 ///
 /// This is the family-free floor: no lane geometry, no tile, no split. The
 /// four order-free family rules ride in a target's own rule table and are
@@ -274,7 +268,7 @@ pub fn lower_contract_generic(
     node: &Node,
     f: &Facts<'_>,
 ) -> Option<Id> {
-    let Op::L0(L0::Contract {
+    let Op::Logical(Logical::Contract {
         spec, acc, a, b: rhs, ..
     }) = &node.op
     else {
@@ -307,7 +301,7 @@ pub fn lower_contract_generic(
         contract_operand(*rhs, &spec.b, &b_shape, spec, &out_shape, &contracted, &a_shape, &b_shape)?,
     ];
     let kf = b
-        .add_l1(L1::KFold {
+        .add_launch(Launch::Fold {
             space: IndexSpace::new(space),
             axis,
             vec_axes: SmallVec::new(),
@@ -331,9 +325,8 @@ pub fn lower_contract_generic(
 /// The fold walks the output plus one merged contraction axis; the operand's
 /// own axes are in `spec` order, which in general is neither. Aliasing the
 /// operand's dense layout says "axis `i` of the space is axis `i` of the
-/// operand", which is true only for a left operand of a canonical matmul —
-/// it is what read a `[m, k]` activation as `[k, m]` under `d_rhs`. So each
-/// space axis gets an explicit stride: the operand's stride for that label,
+/// operand", which is true only for a left operand of a canonical matmul.
+/// So each space axis gets an explicit stride: the operand's stride for that label,
 /// or 0 where the operand does not carry it, and the merged `k` axis
 /// decomposes into one sub-axis per contracted label, most significant
 /// first, which is the order `fold_extent` multiplied them in.
@@ -342,7 +335,7 @@ fn contract_operand(
     src: Id,
     labels: &[Label],
     shape: &[Dim],
-    spec: &crate::ir::level0::EinSpec,
+    spec: &crate::ir::logical::EinSpec,
     out_shape: &[Dim],
     contracted: &[Label],
     a_shape: &[Dim],
@@ -403,7 +396,7 @@ fn contract_operand(
 /// several symbolic ones have no single-loop floor and decline.
 fn fold_extent(
     contracted: &[Label],
-    spec: &crate::ir::level0::EinSpec,
+    spec: &crate::ir::logical::EinSpec,
     a: &[Dim],
     b: &[Dim],
 ) -> Option<Dim> {
@@ -432,12 +425,12 @@ fn fold_extent(
     }
 }
 
-/// `L0::Restride` -> a copying `KMap` whose operand carries the composed
+/// `Logical::Restride` -> a copying `Map` whose operand carries the composed
 /// view. When the composition is not decidable the operand falls to a
 /// per-element address computation rather than to an invented contiguous
 /// layout.
 pub fn lower_restride(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::L0(L0::Restride { specs, x, .. }) = &node.op else {
+    let Op::Logical(Logical::Restride { specs, x, .. }) = &node.op else {
         return None;
     };
     let in_shape = f.operand(0)?.shape.clone();
@@ -455,7 +448,7 @@ pub fn lower_restride(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -
         },
     };
     let k = b
-        .add_l1(L1::KMap {
+        .add_launch(Launch::Map {
             space: space_of(f),
             body: ident_expr(dtype),
             ops: vec![operand],
@@ -465,11 +458,11 @@ pub fn lower_restride(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -
     b.union(id, k).ok()
 }
 
-/// `L0::Window` -> a `KMap` whose operand is read through the window's index
+/// `Logical::Window` -> a `Map` whose operand is read through the window's index
 /// map: one `AxisGroup` per output axis, the windowed axes decomposed into
 /// (position, offset) sub-axes so overlapping strides stay expressible.
 pub fn lower_window(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::L0(L0::Window { specs, x }) = &node.op else {
+    let Op::Logical(Logical::Window { specs, x }) = &node.op else {
         return None;
     };
     let in_shape = f.operand(0)?.shape.clone();
@@ -480,7 +473,7 @@ pub fn lower_window(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
     let access = window_map(specs, &in_shape, &out_shape, &in_strides)
         .map_or(AccessPlan::Gather, AccessPlan::Unflatten);
     let k = b
-        .add_l1(L1::KMap {
+        .add_launch(Launch::Map {
             space: space_of(f),
             body: ident_expr(dtype),
             ops: vec![Operand {
@@ -504,7 +497,7 @@ fn window_map(
     for (axis, extent) in out_shape.iter().enumerate() {
         let extent = u32::try_from(extent.as_const()?).ok()?;
         // Output axes past the input rank are the appended window offsets,
-        // in the order `L0::Window` pushed them.
+        // in the order `Logical::Window` pushed them.
         let (src_axis, step) = if axis < in_shape.len() {
             let step = specs
                 .iter()
@@ -526,14 +519,14 @@ fn window_map(
     Some(MultiFlattenMap { groups })
 }
 
-/// `L0::Gather` -> `KGather { mode: RowPerGroup }`, the mode legal on every
+/// `Logical::Gather` -> `Gather { mode: RowPerGroup }`, the mode legal on every
 /// device.
 pub fn lower_gather(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::L0(L0::Gather { axis, x, idx }) = &node.op else {
+    let Op::Logical(Logical::Gather { axis, x, idx }) = &node.op else {
         return None;
     };
     let k = b
-        .add_l1(L1::KGather {
+        .add_launch(Launch::Gather {
             space: space_of(f),
             axis: *axis,
             mode: GatherMode::RowPerGroup,
@@ -547,11 +540,11 @@ pub fn lower_gather(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
     b.union(id, k).ok()
 }
 
-/// `L0::Scatter` -> `KScatter { mode: SortSegment }`. Atomics and the
+/// `Logical::Scatter` -> `Scatter { mode: SortSegment }`. Atomics and the
 /// workgroup-private merge are target rules guarded on capabilities; the
 /// sorted segmented reduce needs neither and is therefore the floor.
 pub fn lower_scatter(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::L0(L0::Scatter {
+    let Op::Logical(Logical::Scatter {
         axis,
         combine,
         base,
@@ -563,7 +556,7 @@ pub fn lower_scatter(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
         return None;
     };
     let k = b
-        .add_l1(L1::KScatter {
+        .add_launch(Launch::Scatter {
             space: space_of(f),
             axis: *axis,
             mode: ScatterMode::SortSegment,
@@ -579,16 +572,16 @@ pub fn lower_scatter(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
     b.union(id, k).ok()
 }
 
-/// `L0::Dequant` -> a `KMap` reading a quantized operand. The block program
+/// `Logical::Dequant` -> a `Map` reading a quantized operand. The block program
 /// itself lives in the format table, keyed by `(fmt, layout)`; the nest only
 /// has to say that this operand decodes.
 pub fn lower_dequant(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::L0(L0::Dequant { x, .. }) = &node.op else {
+    let Op::Logical(Logical::Dequant { x, .. }) = &node.op else {
         return None;
     };
     let out = f.own().dtype;
     let k = b
-        .add_l1(L1::KMap {
+        .add_launch(Launch::Map {
             space: space_of(f),
             body: ident_expr(if out.is_quantized() { Dtype::F32 } else { out }),
             ops: vec![alias_operand_of(*x, &f.operand(0)?.shape.clone())],
@@ -598,14 +591,14 @@ pub fn lower_dequant(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
     b.union(id, k).ok()
 }
 
-/// `L0::Project` -> a `KMap` selecting one slot of a tuple-producing
+/// `Logical::Project` -> a `Map` selecting one slot of a tuple-producing
 /// operand. The slot rides in the body as `Arg(slot)`.
 pub fn lower_project(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::L0(L0::Project { slot, x }) = &node.op else {
+    let Op::Logical(Logical::Project { slot, x }) = &node.op else {
         return None;
     };
     let k = b
-        .add_l1(L1::KMap {
+        .add_launch(Launch::Map {
             space: space_of(f),
             body: ScalarExpr::arg(u32::from(*slot), f.own().dtype),
             ops: vec![alias_operand_of(*x, &f.operand(0)?.shape.clone())],
@@ -618,7 +611,7 @@ pub fn lower_project(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ir::level0::EinSpec;
+    use crate::ir::logical::EinSpec;
     use crate::rules::test_support as ts;
     use crate::scalar::UnOp;
     use crate::shape::{SlidingWindow, StrideSpec};
@@ -634,8 +627,8 @@ mod tests {
     fn l1_member(g: &crate::egraph::EGraph, id: Id) -> Id {
         g.chain(id)
             .into_iter()
-            .find(|&i| g.level(i) == Level::L1)
-            .expect("an L1 member")
+            .find(|&i| g.level(i) == Level::Launch)
+            .expect("an Launch member")
     }
 
     #[test]
@@ -650,7 +643,7 @@ mod tests {
             &[x],
         );
         assert!(fire(&mut g, m, &LOWER_MAP).is_some());
-        assert!(matches!(g.node(l1_member(&g, m)).op, Op::L1(L1::KMap { .. })));
+        assert!(matches!(g.node(l1_member(&g, m)).op, Op::Launch(Launch::Map { .. })));
 
         let fd = ts::fold(
             &mut g,
@@ -662,7 +655,7 @@ mod tests {
         assert!(fire(&mut g, fd, &LOWER_FOLD).is_some());
         assert!(matches!(
             g.node(l1_member(&g, fd)).op,
-            Op::L1(L1::KFold { .. })
+            Op::Launch(Launch::Fold { .. })
         ));
 
         let rhs = ts::buffer(&mut g, Dtype::F32, &[Dim::Const(6), Dim::Const(2)]);
@@ -679,7 +672,7 @@ mod tests {
         );
         assert!(fire(&mut g, ct, &LOWER_CONTRACT_GENERIC).is_some());
         let kf = l1_member(&g, ct);
-        let Op::L1(L1::KFold {
+        let Op::Launch(Launch::Fold {
             space,
             axis,
             carrier,
@@ -712,32 +705,32 @@ mod tests {
         );
         assert!(fire(&mut g, rs, &LOWER_RESTRIDE).is_some());
         let km = l1_member(&g, rs);
-        let Op::L1(L1::KMap { ops, .. }) = &g.node(km).op else {
+        let Op::Launch(Launch::Map { ops, .. }) = &g.node(km).op else {
             panic!()
         };
         assert!(matches!(ops[0].access, AccessPlan::Alias));
         assert_eq!(ops[0].layout.strides(), &[Dim::Const(1), Dim::Const(6)]);
 
         let win = g
-            .add(Op::L0(L0::Window {
+            .add(Op::Logical(Logical::Window {
                 specs: smallvec::smallvec![SlidingWindow::new(1, 3, 1)],
                 x,
             }))
             .unwrap();
         assert!(fire(&mut g, win, &LOWER_WINDOW).is_some());
         let kw = l1_member(&g, win);
-        let Op::L1(L1::KMap { ops, .. }) = &g.node(kw).op else {
+        let Op::Launch(Launch::Map { ops, .. }) = &g.node(kw).op else {
             panic!()
         };
         assert!(matches!(ops[0].access, AccessPlan::Unflatten(_)));
 
         let gth = g
-            .add(Op::L0(L0::Gather { axis: 0, x, idx }))
+            .add(Op::Logical(Logical::Gather { axis: 0, x, idx }))
             .unwrap();
         assert!(fire(&mut g, gth, &LOWER_GATHER).is_some());
         assert!(matches!(
             g.node(l1_member(&g, gth)).op,
-            Op::L1(L1::KGather {
+            Op::Launch(Launch::Gather {
                 mode: GatherMode::RowPerGroup,
                 ..
             })
@@ -748,22 +741,22 @@ mod tests {
         assert!(fire(&mut g, sc, &LOWER_SCATTER).is_some());
         assert!(matches!(
             g.node(l1_member(&g, sc)).op,
-            Op::L1(L1::KScatter {
+            Op::Launch(Launch::Scatter {
                 mode: ScatterMode::SortSegment,
                 ..
             })
         ));
 
         let q = g
-            .add(Op::L0(L0::Leaf(crate::ir::level0::LeafKind::Quantized {
-                name: crate::ir::level0::BufferId(99),
+            .add(Op::Logical(Logical::Leaf(crate::ir::logical::LeafKind::Quantized {
+                name: crate::ir::logical::BufferId(99),
                 fmt: crate::dtype::QFmt::Q4_0,
                 layout: crate::dtype::QLayout::Native,
                 shape: smallvec::smallvec![Dim::Const(4), Dim::Const(32)],
             })))
             .unwrap();
         let dq = g
-            .add(Op::L0(L0::Dequant {
+            .add(Op::Logical(Logical::Dequant {
                 fmt: crate::dtype::QFmt::Q4_0,
                 layout: crate::dtype::QLayout::Native,
                 x: q,
@@ -772,13 +765,13 @@ mod tests {
         assert!(fire(&mut g, dq, &LOWER_DEQUANT).is_some());
         assert!(matches!(
             g.node(l1_member(&g, dq)).op,
-            Op::L1(L1::KMap { .. })
+            Op::Launch(Launch::Map { .. })
         ));
 
-        let pj = g.add(Op::L0(L0::Project { slot: 1, x })).unwrap();
+        let pj = g.add(Op::Logical(Logical::Project { slot: 1, x })).unwrap();
         assert!(fire(&mut g, pj, &LOWER_PROJECT).is_some());
         let kp = l1_member(&g, pj);
-        let Op::L1(L1::KMap { body, .. }) = &g.node(kp).op else {
+        let Op::Launch(Launch::Map { body, .. }) = &g.node(kp).op else {
             panic!()
         };
         assert!(matches!(body.kind(), crate::scalar::ScalarKind::Arg(1)));

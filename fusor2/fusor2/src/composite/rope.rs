@@ -276,11 +276,7 @@ pub fn rotate_half(x: &Tensor) -> Result<Tensor> {
     Ok(graph.tensor(id))
 }
 
-// ---------------------------------------------------------------------------
-// Paired forms
-// ---------------------------------------------------------------------------
-
-/// Rotate `q` and `k` in **one** node, handed back as two views.
+/// Rotate `q` and `k` in one node, handed back as two views.
 ///
 /// The heads are concatenated along the head axis, rotated once and narrowed
 /// apart, so there is exactly one producer for a rule to mint a paired kernel
@@ -361,11 +357,10 @@ fn narrow_heads(x: &Tensor, start: u64, len: u64) -> Result<Tensor> {
     Ok(x.graph.tensor(id))
 }
 
-/// Rotate `q` and `k` under **one** node, pairing `(i, i + Dh/2)`.
+/// Rotate `q` and `k` under one node, pairing `(i, i + Dh/2)`.
 ///
-/// Not a `*_fused` spelling of [`rope`] applied twice: the pair node names both
-/// operands, so the rotation is built once and read back as two views. That is
-/// the only reason this exists beside [`rope`].
+/// The pair node names both operands, so the rotation is built once and read
+/// back as two views.
 pub fn rope_pair(
     q: &Tensor,
     k: &Tensor,
@@ -449,8 +444,8 @@ mod tests {
     use crate::session::{Backend, Session};
     use fusor2_ir::dtype::Dtype;
     use fusor2_ir::ir::Op;
-    use fusor2_ir::ir::level0::L0;
-    use fusor2_ir::ir::level1::L1;
+    use fusor2_ir::ir::logical::Logical;
+    use fusor2_ir::ir::launch::Launch;
 
     fn graph() -> Graph {
         Graph::new(&Session::new(Backend::cpu().unwrap()).unwrap())
@@ -529,7 +524,7 @@ mod tests {
             .handle()
             .with_egraph(|eg| {
                 let base = |t: &Tensor| match &eg.node(t.id()).op {
-                    Op::L0(L0::Restride { x, .. }) => Some(*x),
+                    Op::Logical(Logical::Restride { x, .. }) => Some(*x),
                     _ => None,
                 };
                 Ok(base(&qr) == base(&kr) && base(&qr).is_some())
@@ -550,7 +545,7 @@ mod tests {
                 let ms = eg.members(eg.class_of(y.id()));
                 let s = ms
                     .iter()
-                    .filter(|m| matches!(eg.node(**m).op, Op::L1(L1::Ext { .. })))
+                    .filter(|m| matches!(eg.node(**m).op, Op::Launch(Launch::Ext { .. })))
                     .count();
                 let d = ms.iter().filter(|m| eg.is_defn(**m)).count();
                 Ok((ms.len(), s, d))

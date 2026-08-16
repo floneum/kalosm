@@ -1,7 +1,7 @@
 //! The one analytic non-elementwise adjoint:
 //! `d(Contract) = (grad x b -> a, a x grad -> b)`, expressed by reusing the
-//! primal spec's [`fusor2_ir::ir::level0::EinSpec::d_lhs`] and `d_rhs`. It
-//! holds regardless of tile geometry, stated at L0 and not restated per lowering.
+//! primal spec's [`fusor2_ir::ir::logical::EinSpec::d_lhs`] and `d_rhs`. It
+//! holds regardless of tile geometry, stated at Logical and not restated per lowering.
 //!
 //! Because transposed-rhs is a *spec* and not an op, this rule subsumes
 //! `mat_mul`, `mat_mul_transposed_rhs`, every batched form and — through the
@@ -11,7 +11,7 @@
 use fusor2_ir::autograd::{Grads, Tape, Val};
 use fusor2_ir::ir::Node;
 use fusor2_ir::ir::Op;
-use fusor2_ir::ir::level0::{EinSpec, L0, Label};
+use fusor2_ir::ir::logical::{EinSpec, Logical, Label};
 use fusor2_ir::{Error, Result};
 use smallvec::SmallVec;
 
@@ -22,7 +22,7 @@ pub fn contract_adjoint(
     ins: &[Val],
     _out: Val,
 ) -> Result<Grads> {
-    let Op::L0(L0::Contract { spec, acc, outs, .. }) = &node.op else {
+    let Op::Logical(Logical::Contract { spec, acc, outs, .. }) = &node.op else {
         return Err(Error::Plan(format!(
             "contract_adjoint called on a non-Contract node: {:?}",
             node.op
@@ -43,12 +43,9 @@ pub fn contract_adjoint(
         }
     };
 
-    // A block-quantized operand gets `None`, which is what [`Grads`] means by
-    // "a parent that does not require grad". The route is not trainable: an
-    // adjoint contraction for it would produce a dense f32 tensor over the
-    // weight's element grid, and nothing can apply that to a block-quantized
-    // buffer — which is precisely why QAT keeps a separate f32 master copy
-    // rather than a quantized backward kernel.
+    // A block-quantized operand gets `None`: an adjoint contraction for it
+    // would produce a dense f32 tensor over the weight's element grid, and
+    // nothing can apply that to a block-quantized buffer.
     let da = if tape.facts(a).dtype.is_quantized() {
         None
     } else {
@@ -69,9 +66,8 @@ pub fn contract_adjoint(
 /// `verify_l0` rule 4, restated locally: every label appears in at least two
 /// of `{a, b, out}`, and no operand repeats a label.
 ///
-/// This duplicates `fusor2_ir::contract_spec::verify_spec` on purpose — the
-/// adjoint must reject an inconsistent derived partition *before* adding the
-/// node, and the tape cannot depend on a verifier that may not have run.
+/// The adjoint must reject an inconsistent derived partition *before* adding
+/// the node; the tape cannot depend on a verifier that may not have run.
 pub fn verify_spec(spec: &EinSpec) -> Result<()> {
     for (name, labels) in [("a", &spec.a), ("b", &spec.b), ("out", &spec.out)] {
         let mut seen: SmallVec<[Label; 8]> = SmallVec::new();
@@ -112,7 +108,7 @@ mod tests {
     use crate::tape::GraphTape;
     use crate::tape::testing::graph;
     use fusor2_ir::dtype::Dtype;
-    use fusor2_ir::ir::level0::{BufferId, LeafKind};
+    use fusor2_ir::ir::logical::{BufferId, LeafKind};
     use fusor2_ir::shape::{Dim, Dims};
 
     fn labels(v: &[u8]) -> SmallVec<[Label; 6]> {
@@ -129,7 +125,7 @@ mod tests {
     }
 
     fn param(g: &mut fusor2_ir::egraph::EGraph, shape: &[u64], name: u32) -> Val {
-        g.add(Op::L0(L0::Leaf(LeafKind::Param {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Param {
             name: BufferId(name),
             dtype: Dtype::F32,
             shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
@@ -162,7 +158,7 @@ mod tests {
         let b = param(&mut g, &[3, 5], 1);
         let spec = matmul_spec();
         let y = g
-            .add(Op::L0(L0::Contract {
+            .add(Op::Logical(Logical::Contract {
                 spec: spec.clone(),
                 acc: Dtype::F32,
                 a,
@@ -188,11 +184,6 @@ mod tests {
 
     /// A block-quantized weight receives `None`, and the activation beside it
     /// still receives its gradient.
-    ///
-    /// The invariant is stated by the adjoint, not inherited from a lowering
-    /// that happens to fail: any lowering of `a x grad -> b` computes a dense
-    /// f32 tensor over the weight's element grid, which no optimizer can apply
-    /// to a block-quantized buffer.
     #[test]
     fn a_quantized_operand_gets_no_gradient() {
         use fusor2_ir::dtype::{QFmt, QLayout};
@@ -206,7 +197,7 @@ mod tests {
         let mut g = graph();
         let a = param(&mut g, &[4, 32], 0);
         let w = g
-            .add(Op::L0(L0::Leaf(LeafKind::Quantized {
+            .add(Op::Logical(Logical::Leaf(LeafKind::Quantized {
                 name: BufferId(1),
                 fmt: QFmt::Q8_0,
                 layout: QLayout::Native,
@@ -214,7 +205,7 @@ mod tests {
             })))
             .unwrap();
         let y = g
-            .add(Op::L0(L0::Contract {
+            .add(Op::Logical(Logical::Contract {
                 spec,
                 acc: Dtype::F32,
                 a,
@@ -249,7 +240,7 @@ mod tests {
         let a = param(&mut g, &[4, 3], 0);
         let b = param(&mut g, &[5, 3], 1);
         let y = g
-            .add(Op::L0(L0::Contract {
+            .add(Op::Logical(Logical::Contract {
                 spec: spec.clone(),
                 acc: Dtype::F32,
                 a,
@@ -268,7 +259,7 @@ mod tests {
             "d_rhs comes out in the rhs's own layout"
         );
         assert!(
-            matches!(tape.node(db).op, Op::L0(L0::Contract { .. })),
+            matches!(tape.node(db).op, Op::Logical(Logical::Contract { .. })),
             "no extra Restride is inserted"
         );
     }
@@ -283,13 +274,13 @@ mod numeric {
     use crate::tape::testing::{Env, caps, check_gradients, graph};
     use fusor2_ir::dtype::{Dtype, Splat};
     use fusor2_ir::egraph::{EGraph, Id};
-    use fusor2_ir::ir::level0::{BufferId, LeafKind};
+    use fusor2_ir::ir::logical::{BufferId, LeafKind};
     use fusor2_ir::shape::Dim;
     use rustc_hash::FxHashMap;
 
     fn param(g: &mut EGraph, shape: &[u64]) -> Id {
         let n = g.len() as u32;
-        g.add(Op::L0(L0::Leaf(LeafKind::Param {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Param {
             name: BufferId(n),
             dtype: Dtype::F32,
             shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
@@ -298,7 +289,7 @@ mod numeric {
     }
 
     fn ones(g: &mut EGraph, shape: &[u64]) -> Id {
-        g.add(Op::L0(L0::Leaf(LeafKind::Const {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Const {
             value: Splat::F32(1.0),
             shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
         })))
@@ -314,7 +305,7 @@ mod numeric {
         let a = param(&mut g, a_shape);
         let b = param(&mut g, b_shape);
         let y = g
-            .add(Op::L0(L0::Contract {
+            .add(Op::Logical(Logical::Contract {
                 spec,
                 acc: Dtype::F32,
                 a,

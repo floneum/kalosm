@@ -40,10 +40,6 @@ const SPEC3_OVERLAP: &[FuzzDim] = &[
     FuzzDim::Range(3, 5),
 ];
 
-// ---------------------------------------------------------------------------
-// Shape-generic host references
-// ---------------------------------------------------------------------------
-
 /// `(outer, along, inner)` element counts around `axis`, row-major.
 fn split(shape: &[u64], axis: usize) -> (usize, usize, usize) {
     let outer = shape[..axis].iter().product::<u64>() as usize;
@@ -129,10 +125,6 @@ fn ref_pad(d: &[f32], shape: &[u64], axis: usize, lo: usize, hi: usize) -> (Vec<
     out_shape[axis] += (lo + hi) as u64;
     (out_shape, out)
 }
-
-// ---------------------------------------------------------------------------
-// The single-input case body
-// ---------------------------------------------------------------------------
 
 /// Forward against the host reference, then a finite-difference backward.
 ///
@@ -515,8 +507,6 @@ pub fn cases() -> Cases {
 
     cases
 }
-
-// ---------------------------------------------------------------------------
 
 /// `cat` is `Scatter{Set}` into a constant, and its adjoint hands each input
 /// back its own slice of the gradient.

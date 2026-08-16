@@ -1,7 +1,6 @@
-//! Bind groups are **derived** from the emitted module's storage globals,
+//! Bind groups are derived from the emitted module's storage globals,
 //! sorted by binding, read-only from the absence of `StorageAccess::STORE`,
-//! zipped positionally with the builder's buffer list. Binding order and
-//! codegen therefore cannot drift.
+//! zipped positionally with the builder's buffer list.
 //!
 //! One `main`, one bind group, whole-buffer bindings. Binding 0 is always the
 //! `Uniforms` **storage** buffer — a uniform-address-space block would break
@@ -68,9 +67,8 @@ pub fn layout_entries(bindings: &[BindingDesc]) -> Vec<wgpu::BindGroupLayoutEntr
 
 /// Zip a derived binding list positionally with the caller's buffers.
 ///
-/// **Binding 0 is always the read-only `Uniforms` storage buffer.** A module
-/// whose binding 0 is writable is rejected here rather than at dispatch, and a
-/// length mismatch is a validation failure, never a silent truncation.
+/// Binding 0 must be the read-only `Uniforms` storage buffer; a writable
+/// binding 0 or a length mismatch is a validation error.
 pub fn zip_buffers<'a>(
     slots: &[BindingDesc],
     buffers: &'a [wgpu::Buffer],
@@ -155,7 +153,7 @@ mod tests {
         module
     }
 
-    /// Test 5 — derived, sorted, read-only inferred; mismatches rejected.
+    /// Derived, sorted, read-only inferred; mismatches rejected.
     #[test]
     fn bindings_sorted_and_read_only_derived() {
         // Declared out of order: 2 (writable), 0, 1.
@@ -201,8 +199,7 @@ mod tests {
         ));
     }
 
-    /// The length-mismatch half of test 5 needs live `wgpu::Buffer`s, so it
-    /// runs only when an adapter exists.
+    /// Needs live `wgpu::Buffer`s, so it runs only when an adapter exists.
     #[test]
     fn zip_length_mismatch_is_a_validation_error() {
         let Ok(gpu) = crate::device::gpu_blocking(&crate::device::DeviceOptions::default()) else {

@@ -15,10 +15,6 @@ use crate::tensor::Dyn;
 
 impl<const R: usize, T: Element> Tensor<R, T> {
     /// A value from a nested Rust array: `Tensor::new(&device, [[1., 2.]])`.
-    ///
-    /// The reason wrapping a runtime-rank value is spelled
-    /// [`Tensor::from_dyn`] rather than `new` is so a model that ports by
-    /// changing imports uses this one.
     #[track_caller]
     pub fn new<A: FromArray>(device: &Device, data: A) -> Self {
         Self::wrap("Tensor::new", Dyn::new(device.handle(), data))
@@ -47,14 +43,9 @@ impl<const R: usize, T: Element> Tensor<R, T> {
 
     /// Host bytes at a **runtime** dtype, at a known rank.
     ///
-    /// This is the weight-load constructor. A GGUF entry's dtype is data — it
-    /// is read from the file — while its rank is program structure the model
-    /// knows, which is exactly the pair the const-rank type expresses and the
-    /// `Dyn` layer does not. The bytes are interpreted at `dtype` and then
-    /// cast to `T` when the two differ, so
-    /// `Tensor::<2, f32>::from_raw_bytes(&d, raw.fmt, shape, &raw.bytes)`
-    /// loads an f16 checkpoint into an f32 graph without the caller writing
-    /// the cast at all 40 sites.
+    /// This is the weight-load constructor. The bytes are interpreted at
+    /// `dtype` and then cast to `T` when the two differ, so an f16 checkpoint
+    /// loads into an f32 graph.
     ///
     /// The extents are [`Dim`], not `usize`: a symbolic one is legal here.
     #[track_caller]
@@ -73,12 +64,10 @@ impl<const R: usize, T: Element> Tensor<R, T> {
 
     /// A step-local input buffer whose contents the caller sets each step.
     ///
-    /// The decode loop's spelling: one leaf per step-varying input, minted
-    /// once, then [`Tensor::set_bytes`]/[`Tensor::set_elements`] per step. The
-    /// node id never changes, which is what lets one resolved plan survive a
-    /// whole generation. Unlike [`Tensor::param`] it is not registered as a
-    /// parameter and carries no name — `Graph::leaf` discards the one it is
-    /// handed.
+    /// One leaf per step-varying input, minted once, then
+    /// [`Tensor::set_bytes`]/[`Tensor::set_elements`] per step. The node id
+    /// never changes, so one resolved plan survives a whole generation. It is
+    /// not registered as a parameter and carries no name.
     ///
     /// The extents are [`Dim`], not `usize`: a step input is exactly where a
     /// symbolic length shows up.
@@ -109,8 +98,7 @@ impl<T: Element> Tensor<1, T> {
 
     /// `[start, start + step, .., end)`.
     ///
-    /// The bounds are `impl Into<f64>` rather than `T`. `f64` is used because the
-    /// sequence is built **on the host** — these are not kernel literals.
+    /// The sequence is built on the host; the bounds are not kernel literals.
     #[track_caller]
     pub fn arange_step(
         device: &Device,
@@ -131,16 +119,8 @@ impl<T: Element> Tensor<1, T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Quantized weights
-// ---------------------------------------------------------------------------
-
 impl crate::quantized::QMatrix {
     /// The decoded `[rows, cols]` weight.
-    ///
-    /// Const-rank because a `QMatrix` *is* rank 2 — the type carried `rows`
-    /// and `cols` all along, so returning a runtime-rank value threw away
-    /// something already known.
     #[track_caller]
     pub fn to_tensor(&self) -> Tensor<2, f32> {
         Tensor::<2, f32>::wrap("QMatrix::to_tensor", self.dequantize())

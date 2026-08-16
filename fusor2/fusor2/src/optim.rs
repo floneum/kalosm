@@ -35,10 +35,8 @@ struct Schedule {
 
 /// Decoupled-weight-decay Adam.
 ///
-/// The defaults are the Adam paper's. The trainer configures `eps = 1e-7` and
-/// a non-zero `weight_decay` to match `tf.keras.optimizers.AdamW`; both are
-/// public fields, so that is a two-line change at the call site rather than a
-/// second constructor.
+/// The defaults are the Adam paper's; `eps` and `weight_decay` are public
+/// fields.
 pub struct AdamW {
     pub lr: f32,
     pub beta1: f32,
@@ -164,8 +162,7 @@ impl AdamW {
         for (i, (p, g)) in params.iter().zip(grads).enumerate() {
             let previous = self.state.get(i);
             // `m = beta1*m + (1-beta1)*g`, and likewise for `v` over `g^2`.
-            // On the first step the carried term is exactly zero, so it is
-            // dropped rather than emitted as a multiply against a splat.
+            // On the first step the carried term is exactly zero.
             let m = match previous {
                 Some(s) => s
                     .m
@@ -216,7 +213,7 @@ pub fn cosine_decay(step: u64, warmup: u64, total: u64, peak: f32, floor: f32) -
     floor + (peak - floor) * cosine
 }
 
-/// The L2 norm of every gradient taken together, as a rank-0 value.
+/// The Kernel norm of every gradient taken together, as a rank-0 value.
 ///
 /// A device reduction: nothing here reads a gradient back to the host, and
 /// the trainer logs this number every step.
@@ -251,15 +248,14 @@ pub fn global_norm(grads: &[Tensor]) -> Result<Tensor> {
 ///
 /// Exactly 1 below the threshold and exactly `max_norm / ||g||` above it, so
 /// the clip is a no-op inside the ball and lands the norm on the cap outside
-/// it. Split out from [`clip_global_norm`] because it is the whole policy;
-/// the rest is one multiply.
+/// it.
 fn clip_scale(grads: &[Tensor], max_norm: f32) -> Result<Tensor> {
     global_norm(grads)?
         .max_scalar(max_norm)?
         .rdiv_scalar(max_norm)
 }
 
-/// Scale every gradient so the global L2 norm is at most `max_norm`.
+/// Scale every gradient so the global Kernel norm is at most `max_norm`.
 ///
 /// One shared factor, so the direction is preserved. The factor is a rank-0
 /// device value and the scaling is a broadcast multiply against it.
@@ -346,7 +342,7 @@ mod tests {
     }
 
     /// The step size after bias correction is the learning rate, whatever the
-    /// gradient's scale — that is the whole point of folding the correction in.
+    /// gradient's scale.
     #[test]
     fn the_first_step_is_the_learning_rate_at_any_gradient_scale() {
         const LR: f32 = 0.05;

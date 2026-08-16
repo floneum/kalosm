@@ -10,10 +10,9 @@ use crate::{Error, Result, Tensor};
 
 /// `(x - mean) / sqrt(var + eps) * weight + bias` over the last axis.
 ///
-/// `N` is the **affine parameters'** rank and `T` their element type,
-/// matching the reference's `LayerNorm<const N: usize, D: SimdElement>`, and
-/// both default so that `LayerNorm` alone still names the rank-1 f32 case
-/// every checkpoint ships. The activation's rank is [`LayerNorm::forward`]'s.
+/// `N` is the **affine parameters'** rank and `T` their element type; both
+/// default so that `LayerNorm` alone still names the rank-1 f32 case every
+/// checkpoint ships. The activation's rank is [`LayerNorm::forward`]'s.
 pub struct LayerNorm<const N: usize = 1, T: Element = f32> {
     pub weight: Tensor<N, T>,
     pub bias: Option<Tensor<N, T>>,
@@ -25,9 +24,8 @@ impl<const N: usize, T: Element> LayerNorm<N, T> {
         Self { weight, bias, eps }
     }
 
-    /// `weight` is required and `bias` is optional, matching the reference's
-    /// `load_vector_f32` / `load_optional_vector_f32` pair. Both are squeezed
-    /// to rank 1 when the file writes them as `[1, n]`.
+    /// `weight` is required and `bias` is optional. Both are squeezed to
+    /// rank 1 when the file writes them as `[1, n]`.
     pub fn load(vb: &VarBuilder, graph: &crate::graph::GraphRef, eps: f32) -> Result<Self> {
         let w = crate::layers::load_dense(vb, graph, "weight")?;
         let w = crate::layers::as_vector(w, "weight")?;
@@ -43,8 +41,8 @@ impl<const N: usize, T: Element> LayerNorm<N, T> {
     }
 
     /// `(x - mean) / sqrt(var + eps) * weight + bias` over the last axis, with
-    /// the **biased** variance the reference uses — the divisor is the axis
-    /// extent, not `n - 1`. Rank-preserving.
+    /// the **biased** variance — the divisor is the axis extent, not `n - 1`.
+    /// Rank-preserving.
     #[track_caller]
     pub fn forward<const R: usize>(&self, x: &Tensor<R, T>) -> Tensor<R, T> {
         x.layer_norm(&self.weight, self.bias.as_ref(), self.eps, true)
@@ -54,8 +52,7 @@ impl<const N: usize, T: Element> LayerNorm<N, T> {
 /// Normalizes over the trailing `axes` rather than just the last one.
 ///
 /// The affine parameters may be shaped like the group — `[3, 4]` for
-/// `axes == 2` — which is why `N` is here too and why it is not pinned to 1
-/// the way the reference's `LayerNormNd<D>` pins it.
+/// `axes == 2`.
 pub struct LayerNormNd<const N: usize = 1, T: Element = f32> {
     pub inner: LayerNorm<N, T>,
     pub axes: u32,
@@ -71,8 +68,7 @@ impl<const N: usize, T: Element> LayerNormNd<N, T> {
     /// `a`, over all `b * c` elements.
     ///
     /// So this is the last-axis path over a reshaped view, and the affine
-    /// parameters flatten with it. No second normalization kernel exists and
-    /// none is wanted — the reshape is a `Restride`, which costs nothing.
+    /// parameters flatten with it.
     #[track_caller]
     pub fn forward<const R: usize>(&self, x: &Tensor<R, T>) -> Tensor<R, T> {
         Tensor::<R, T>::from_dyn(ok(
@@ -88,9 +84,9 @@ impl<const N: usize, T: Element> LayerNormNd<N, T> {
     }
 }
 
-/// The runtime-rank trailing-group forward. Unchanged; the typed `forward` is
-/// a wrapper, and the rank arithmetic below is why: the flattened view's rank
-/// is `R - (axes - 1)`, which no caller has a reason to name.
+/// The runtime-rank trailing-group forward. The typed `forward` wraps this
+/// because the flattened view's rank is `R - (axes - 1)`, which no caller has
+/// a reason to name.
 pub(crate) fn forward_nd_dyn(
     x: &Dyn,
     weight: &Dyn,
@@ -187,8 +183,7 @@ mod tests {
         assert_eq!(plain.id(), nd.id());
     }
 
-    /// The mean is removed and the variance is biased, which is what the
-    /// reference's `layer_norm(.., true)` means.
+    /// The mean is removed and the variance is biased.
     #[test]
     fn the_forward_is_the_centered_macro_op() {
         let g = graph();

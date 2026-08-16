@@ -1,4 +1,4 @@
-//! `KRegion`: the multi-output fusion primitive, several members run in one
+//! `Region`: the multi-output fusion primitive, several members run in one
 //! dispatch over one linearized index.
 //!
 //! ## The schedule
@@ -13,17 +13,13 @@ use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::NumericContract;
 use fusor2_ir::error::Error;
 use fusor2_ir::ir::Node;
-use fusor2_ir::ir::level1::{L1, MapDomain, MapTiling, SchedPoint, ScheduleDomain};
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::launch::{Launch, MapDomain, MapTiling, SchedPoint, ScheduleDomain};
+use fusor2_ir::ir::kernel::{
     Addr, ElementType, KernelIr, ScalarElement, Stmt, TileBinaryOp, TileCompareOp,
 };
 use fusor2_ir::target::LowerCtx;
 
 use crate::lower::{Ctx, DimBinding, distribute_workgroups};
-
-// ---------------------------------------------------------------------------
-// The schedule domain
-// ---------------------------------------------------------------------------
 
 /// The workgroup width for a linear body needing `lanes` lanes: a whole
 /// number of subgroups, never wider than the work and never wider than the
@@ -40,11 +36,9 @@ pub fn block_for(caps: &Caps, lanes: u64) -> u32 {
 
 /// Every tiling worth scoring over `elements` outputs.
 ///
-/// One call to [`MapDomain::linear`]: the body walks one linearized index,
-/// which is exactly the shape that generator describes, and it is the same
-/// call `rules::fusion` mints the node's `sched` with and `verify_l1` checks
-/// the node against. Two derivations of one domain is the drift this
-/// delegation exists to prevent.
+/// The body walks one linearized index; this is the same [`MapDomain::linear`]
+/// call `rules::fusion` mints the node's `sched` with and `verify_launch`
+/// checks the node against.
 pub fn linear_domain(caps: &Caps, elements: u64) -> ScheduleDomain {
     ScheduleDomain::Map(MapDomain::linear(caps, elements))
 }
@@ -58,13 +52,9 @@ pub fn region_domain(caps: &Caps, elements: u64) -> ScheduleDomain {
 
 /// Read the selected point.
 ///
-/// `Point` is the untiled member of this node's own domain: it is what a
-/// launch whose root extraction never scheduled falls back to
-/// (`Session::run` supplies it when `Extraction::theta` has no entry), and it
-/// is a real member of every domain [`MapDomain::linear`] generates, so the
-/// floor is a point the search could itself have picked rather than a
-/// geometry from outside the space. A `Map` point naming an axis is refused
-/// rather than silently ignored: this body has no axis to tile.
+/// `Point` is the untiled member of this node's own domain — the fallback
+/// `Session::run` supplies when `Extraction::theta` has no entry. A `Map`
+/// point naming an axis is refused: this body has no axis to tile.
 fn tiling_of(theta: SchedPoint) -> Result<MapTiling> {
     match theta {
         SchedPoint::Point => Ok(MapTiling {
@@ -88,25 +78,23 @@ fn tiling_of(theta: SchedPoint) -> Result<MapTiling> {
 
 /// Lowering entry point.
 pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
-    let fusor2_ir::ir::Op::L1(op) = &node.op else {
+    let fusor2_ir::ir::Op::Launch(op) = &node.op else {
         return Err(Error::Plan("region got a foreign node".into()));
     };
     let ctx = Ctx::new(caps, cx, DimBinding::new())?;
     match op {
-        L1::KRegion { .. } => lower_kregion(ctx, op, theta),
+        Launch::Region { .. } => lower_kregion(ctx, op, theta),
         _ => Err(Error::Plan("region got a foreign node".into())),
     }
 }
 
-/// A `KRegion` is the same rewrite as producer inlining, differing only in
-/// that it emits an extra buffer per `live_out`. One pass over the shared
-/// index space, several stores.
-pub fn lower_kregion(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<KernelIr> {
-    let L1::KRegion {
+/// One pass over the shared index space, one store per `live_out`.
+pub fn lower_kregion(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Result<KernelIr> {
+    let Launch::Region {
         members, live_outs, ..
     } = op
     else {
-        return Err(Error::Plan("lower_kregion on a non-KRegion node".into()));
+        return Err(Error::Plan("lower_kregion on a non-Region node".into()));
     };
     if members.is_empty() {
         return Err(Error::Plan("a region has no members".into()));
@@ -121,9 +109,8 @@ pub fn lower_kregion(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Ker
         .map_err(|_| Error::Plan("region output exceeds a u32 element count".into()))?
         .max(1);
 
-    // The members share one index space — that is what makes them a region —
-    // so the live-outs' element count is the domain the tiling is derived
-    // from.
+    // The members share one index space, so the live-outs' element count is
+    // the domain the tiling is derived from.
     let tm = tiling_of(theta)?.tm;
     let block = block_for(ctx.caps, u64::from(elements).div_ceil(u64::from(tm)));
     let per_group = block.saturating_mul(tm);
@@ -133,8 +120,7 @@ pub fn lower_kregion(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Ker
         limits.max_compute_workgroups_per_dimension,
     );
     let base = ctx.global_index(block, grid);
-    // At `tm == 1` a group covers exactly `block`, so the index expression is
-    // the one that shipped, unwrapped.
+    // At `tm == 1` a group covers exactly `block`.
     let tile_base = if tm == 1 {
         base
     } else {
@@ -171,12 +157,10 @@ pub fn lower_kregion(mut ctx: Ctx<'_>, op: &L1, theta: SchedPoint) -> Result<Ker
             .compare(TileCompareOp::Lt, index.clone(), bound.clone());
 
         // The shared value each member computes, read once into a register
-        // and written to every live-out. That register reuse is the whole
-        // point of a region: a later statement reads it without a second
-        // load.
+        // and written to every live-out.
         let zero = ctx.b.zero(zero_elem);
         let shared = ctx.b.load(
-            fusor2_ir::ir::level2::Source::Storage(out_view.clone()),
+            fusor2_ir::ir::kernel::Source::Storage(out_view.clone()),
             Addr::Linear(index.clone()),
             live.clone(),
             zero,
@@ -222,7 +206,7 @@ mod tests {
     use fusor2_ir::device::SubgroupWidths;
     use fusor2_ir::dtype::Dtype;
     use fusor2_ir::egraph::{EGraph, Id};
-    use fusor2_ir::ir::level2::{
+    use fusor2_ir::ir::kernel::{
         Builtin, TileExpr, TileExprKind, TileLiteral, WorkgroupAxis,
     };
     use fusor2_ir::shape::Dim;
@@ -253,8 +237,7 @@ mod tests {
             .collect()
     }
 
-    /// The whole point: a real region has something to decide. 8192 outputs
-    /// is four distinct register tiles, not one hardcoded 256-lane body.
+    /// 8192 outputs is four distinct register tiles.
     #[test]
     fn a_real_region_has_a_non_trivial_domain() {
         let caps = gpu_caps(32, 256);
@@ -266,8 +249,7 @@ mod tests {
         );
     }
 
-    /// And the negative half: a region with nothing to decide reports one
-    /// point, rather than offering a tiling that would launch empty lanes.
+    /// A region with nothing to decide reports one point.
     #[test]
     fn a_region_too_small_to_tile_reports_one_point() {
         let d = region_domain(&gpu_caps(32, 256), 4);
@@ -286,8 +268,7 @@ mod tests {
         assert_ne!(narrow, wide);
     }
 
-    /// The workgroup width was the constant this module existed to delete.
-    /// It is now a whole number of subgroups, bounded by the work and by the
+    /// The width is a whole number of subgroups, bounded by the work and the
     /// device.
     #[test]
     fn the_width_is_derived_from_the_work_and_the_caps() {
@@ -312,16 +293,14 @@ mod tests {
             }))
             .is_err()
         );
-        assert!(tiling_of(SchedPoint::Fold(fusor2_ir::ir::level1::FoldStrat::Subgroup)).is_err());
+        assert!(tiling_of(SchedPoint::Fold(fusor2_ir::ir::launch::FoldStrat::Subgroup)).is_err());
         // `Point` is the untiled member of the node's own domain.
         assert_eq!(tiling_of(SchedPoint::Point).unwrap().tm, 1);
     }
 
-    // -- lowering at a point ------------------------------------------------
-
     fn graph_with(dims: &[u64], count: usize) -> (EGraph, Vec<Id>) {
         use fusor2_ir::ir::Op;
-        use fusor2_ir::ir::level0::{BufferId, L0, LeafKind};
+        use fusor2_ir::ir::logical::{BufferId, Logical, LeafKind};
         use fusor2_ir::semantics::{CoreSemantics, SumArenaPlanner};
         use std::sync::Arc;
 
@@ -329,7 +308,7 @@ mod tests {
         let ids = (0..count)
             .map(|i| {
                 let shape: SmallVec<[Dim; 6]> = dims.iter().map(|d| Dim::Const(*d)).collect();
-                g.add(Op::L0(L0::Leaf(LeafKind::Buffer {
+                g.add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
                     name: BufferId(i as u32),
                     dtype: Dtype::F32,
                     shape,
@@ -342,7 +321,7 @@ mod tests {
 
     fn lower_root(g: &EGraph, root: Id, outs: &[Id], caps: &Caps, theta: SchedPoint) -> KernelIr {
         use fusor2_ir::cost::Picoseconds;
-        use fusor2_ir::extract::{BindKind, BindingPlan, Extraction, Launch, Plan, PlanHash};
+        use fusor2_ir::extract::{BindKind, BindingPlan, Extraction, Dispatch, Plan, PlanHash};
 
         let mut bindings = vec![BindingPlan {
             binding: 1,
@@ -358,7 +337,7 @@ mod tests {
         }
         let plan = Plan {
             extraction: Extraction::default(),
-            launches: vec![Launch {
+            launches: vec![Dispatch {
                 root,
                 members: smallvec::smallvec![root],
                 bindings,
@@ -387,7 +366,7 @@ mod tests {
         use fusor2_ir::ir::Op;
         let (mut g, members) = graph_with(dims, outs);
         let root = g
-            .add(Op::L1(L1::KRegion {
+            .add(Op::Launch(Launch::Region {
                 members: members.iter().copied().collect(),
                 live_outs: (0..outs as u32).collect(),
                 sched: linear_domain(caps, dims.iter().product()),
@@ -404,8 +383,6 @@ mod tests {
         })
     }
 
-    // -- the write set, evaluated out of the emitted body -------------------
-
     #[derive(Copy, Clone)]
     struct Thread {
         gx: u32,
@@ -414,10 +391,8 @@ mod tests {
         lane: u32,
     }
 
-    /// A closed evaluator over the index algebra these two bodies emit.
-    /// Anything else returns `None` and the caller fails loudly, so a body
-    /// that grows a term this cannot see is a test failure rather than a
-    /// silently weaker assert.
+    /// A closed evaluator over the index algebra these bodies emit. Anything
+    /// else returns `None` and the caller fails loudly.
     fn eval(e: &TileExpr, t: Thread) -> Option<u64> {
         use fusor2_ir::scalar::BinOp;
         Some(match e.kind() {
@@ -453,8 +428,7 @@ mod tests {
     }
 
     /// Every `(binding, address)` the kernel stores to, once per masked-in
-    /// lane. This is read out of the emitted `KernelIr`, not recomputed from
-    /// the parameters, so it is a statement about the shader.
+    /// lane, read out of the emitted `KernelIr`.
     fn write_set(ir: &KernelIr) -> Vec<(u32, u64)> {
         let mut out = Vec::new();
         for gz in 0..ir.grid[2] {
@@ -498,12 +472,9 @@ mod tests {
         );
     }
 
-    /// **The numerics assert.** Each body writes one value per output
-    /// element and the value at an element does not depend on the tiling, so
-    /// "the same set of addresses, each written exactly once" is the whole
-    /// of numeric equivalence here — and it is checked by evaluating the
-    /// emitted address and mask expressions over the whole emitted grid, not
-    /// by re-deriving them.
+    /// Each body writes one value per output element and the value does not
+    /// depend on the tiling, so "the same set of addresses, each written
+    /// exactly once" is the whole of numeric equivalence here.
     #[test]
     fn every_point_writes_every_element_exactly_once() {
         // 200 elements: not a multiple of any candidate width, so a
@@ -523,9 +494,8 @@ mod tests {
         one_write_per_element(&ir, &[2, 3], 200);
     }
 
-    /// Different points are different kernels — the geometry reaches the
-    /// dispatch, not just a comment. A wider tile means fewer workgroups and
-    /// more stores per lane.
+    /// Different points are different kernels: a wider tile means fewer
+    /// workgroups and more stores per lane.
     #[test]
     fn every_point_is_a_different_dispatch() {
         let mut seen: Vec<([u32; 3], u32, usize)> = Vec::new();
@@ -547,8 +517,7 @@ mod tests {
         assert_eq!(seen.len(), 4, "every point is a distinct dispatch");
     }
 
-    /// Small shapes stop launching a 256-lane workgroup for 8 stores. This
-    /// is the constant that was `BLOCK`.
+    /// Small shapes do not launch a 256-lane workgroup for 8 stores.
     #[test]
     fn a_small_region_no_longer_launches_a_full_workgroup() {
         let ir = region_ir(&[8], 2, SchedPoint::Point);
@@ -556,9 +525,8 @@ mod tests {
         assert_eq!(ir.grid, [1, 1, 1]);
     }
 
-    /// Every point the domain offers lowers to a kernel that passes the L2
-    /// verifier. A domain member that cannot be executed is worse than no
-    /// domain at all.
+    /// Every point the domain offers lowers to a kernel that passes the Kernel
+    /// verifier.
     #[test]
     fn every_point_the_domain_offers_lowers_and_verifies() {
         let caps = gpu_caps(32, 256);
@@ -566,7 +534,7 @@ mod tests {
         assert!(domain.len() > 1);
         for point in domain.iter() {
             let ir = region_ir(&[1024], 2, point);
-            fusor2_tile::verify_l2(&ir, &caps).expect("a domain member must be executable");
+            fusor2_tile::verify_kernel(&ir, &caps).expect("a domain member must be executable");
         }
     }
 

@@ -11,7 +11,7 @@ pub struct ValueFacts {
     pub numeric: NumericContract,
     pub persistence: Persistence,
     /// Result count for tuple-producing ops. `1` for ordinary values; a
-    /// value with `outs > 1` is only ever read through `L0::Project`.
+    /// value with `outs > 1` is only ever read through `Logical::Project`.
     pub outs: u8,
 }
 

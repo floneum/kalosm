@@ -33,15 +33,10 @@ impl PadWidths for (usize, usize) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Views
-// ---------------------------------------------------------------------------
-
 impl<const R: usize, T: Element> Tensor<R, T> {
-    /// Reshape against extents that may still be symbolic.
+    /// Reshape against extents that may still be symbolic, which is how the
+    /// decode loop keeps one plan across sequence lengths.
     ///
-    /// The 91 model call sites that spell `reshape_dims(&[b, Dim::Sym(seq),
-    /// h, d])` are the decode loop keeping one plan across sequence lengths.
     /// [`Tensor::reshape`] is the all-constant form and
     /// [`Tensor::reshape_extents`] the one with an inferred hole.
     #[track_caller]
@@ -145,10 +140,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Indexing
-// ---------------------------------------------------------------------------
-
 impl<const R: usize, T: Element> Tensor<R, T> {
     /// Row lookup: `[.., n]` of ids against a `[vocab, dim]` table gives
     /// `[.., n, dim]`, so `O = IDS + 1`.
@@ -178,10 +169,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         )
     }
 }
-
-// ---------------------------------------------------------------------------
-// Readback
-// ---------------------------------------------------------------------------
 
 impl<const R: usize, T: Element> Tensor<R, T> {
     /// Read back as `f32`, converting if the value is not already f32.
@@ -214,9 +201,8 @@ impl<const R: usize, T: Element> Tensor<R, T> {
 
     /// [`Tensor::to_vec_f32`] behind the future a runtime awaits.
     ///
-    /// Returns `Result` rather than panicking, unlike the rest of this
-    /// surface: an `await` point is exactly where a caller *does* have
-    /// somewhere to put the error, and `rbert` threads one.
+    /// Returns `Result`: an `await` point is where a caller has somewhere to
+    /// put the error.
     pub fn to_vec_f32_async(&self) -> impl Future<Output = Result<Vec<f32>>> + 'static {
         let slice: Result<TensorSlice> = self.as_dyn().as_slice();
         std::future::ready(slice.and_then(|s| s.to_vec_f32()))
@@ -233,8 +219,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
 impl<T: Element> Tensor<1, T> {
     /// The `k` largest values of a rank-1 value and the indices they sat at.
     ///
-    /// The pair is the sampler's contract: `top_k_pairs` is one kernel that
-    /// produces both, so asking for them separately would resolve twice.
+    /// `top_k_pairs` is one kernel that produces both.
     #[track_caller]
     pub fn top_k(&self, k: u32) -> (Tensor<1, T>, Tensor<1, u32>) {
         let (values, indices) = ok("top_k", crate::sampling::top_k_pairs(self.as_dyn(), k));

@@ -16,9 +16,9 @@ use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::{Dtype, Persistence};
 use fusor2_ir::egraph::{EGraph, Id, Rule, Saturate, SaturationBudget, SaturationDelta};
 use fusor2_ir::extract::{ExtractBudget, Extractor, Plan, ReplayKey};
-use fusor2_ir::ir::level0::{L0, LeafKind};
-use fusor2_ir::ir::level1::Effect;
-use fusor2_ir::ir::level2::ArenaPlanner;
+use fusor2_ir::ir::logical::{Logical, LeafKind};
+use fusor2_ir::ir::launch::Effect;
+use fusor2_ir::ir::kernel::ArenaPlanner;
 use fusor2_ir::ir::{Op, OpDefRegistry, Semantics};
 use fusor2_ir::saturate::Driver;
 use fusor2_ir::shape::Dim;
@@ -34,51 +34,26 @@ use crate::{Error, Result};
 mod explore;
 
 /// Submitted-but-unretired plans the session will let pile up before it
-/// blocks in `resolve`. Back-pressure is a **runtime policy the library
-/// owns** — the trainer's `--drain-every` counter disappears.
+/// blocks in `resolve`.
 pub const MAX_INFLIGHT_PLANS: u32 = 8;
 
 /// Contractions below this never pay for a measurement round. Override with
-/// `FUSOR2_AUTOTUNE_MIN_MACS`; `0` tunes everything, which is how the
-/// conformance suite is made to exercise the tuner.
+/// `FUSOR2_AUTOTUNE_MIN_MACS`; `0` tunes everything.
 pub const AUTOTUNE_MIN_MACS: u64 = 64 << 20;
-/// Runs per candidate: the first pays pipeline compilation, the second is the
-/// sample, and the minimum of the two is taken. A cold-path cost paid once
-/// per `ReplayKey`.
 /// Timed repeats per candidate, min taken.
-///
-/// Raised from 2 when tuning stopped being contraction-only. With every node
-/// family eligible, one plan can offer candidates at six launches instead of
-/// one, and each adoption is a chance for a lucky sample to displace a better
-/// plan. Measured at 2 repeats and a 3% margin, attention oscillated between
-/// 2.6 ms and 5.4 ms run to run on an unchanged graph; the winner was noise,
-/// not a decision. Four repeats and a wider margin make an adoption mean
-/// something. The extra timing is exactly what the per-machine cache exists to
-/// amortize.
 const TUNE_RUNS: usize = 4;
 /// How much better a candidate must be to displace the incumbent. Wide enough
-/// that run-to-run noise cannot drive an adoption — see [`TUNE_RUNS`].
+/// that run-to-run noise cannot drive an adoption.
 ///
-/// **Measured on the launch's own kernel span** wherever a device timer exists,
-/// and on the whole plan only when one does not. A candidate differs from the
-/// incumbent at exactly one launch, so on the plan sum the rule reads
-/// `s_c < s_b - m*sum_b`: the relative win demanded at that launch is
-/// `m*sum_b/s_b`, which makes any launch smaller than `m` of the plan
-/// unadoptable no matter what its field contains. A warming M2 Max moves a
-/// 2048-cube matmul 2-3% between back-to-back runs on the *wall clock* that
-/// this constant was originally sized against; a min over [`TUNE_RUNS`] GPU
-/// timestamp spans of one kernel is far tighter than that.
+/// Measured on the launch's own kernel span wherever a device timer exists,
+/// and on the whole plan only when one does not.
 const TUNE_MARGIN: f64 = 0.08;
 
 /// Class members the tune race has caught computing wrong values, process
 /// wide. Every entry is a live miscompile: a member of some e-class whose
-/// value disagrees with its siblings', which extraction could select on some
-/// machine. The race already detects these — it value-checks every candidate
-/// it times — and detection must be loud: a silent skip would let a wrong
-/// staged decode stay green for as
-/// long as no case's *selected* member happened to be the broken one. The
-/// conformance harness races every class member (`FUSOR2_VERIFY_MEMBERS`) and
-/// fails the run when this is nonzero.
+/// value disagrees with its siblings'. The conformance harness races every
+/// class member (`FUSOR2_VERIFY_MEMBERS`) and fails the run when this is
+/// nonzero.
 static WRONG_MEMBERS: AtomicU64 = AtomicU64::new(0);
 
 /// See [`WRONG_MEMBERS`].
@@ -87,9 +62,6 @@ pub fn wrong_member_count() -> u64 {
 }
 
 /// Proof that the holder owns a graph's `resolve_lock`.
-///
-/// Passed rather than taken by the `_locked` entry points, so "the caller
-/// already holds it" is checked by the borrow checker instead of by comment.
 pub(crate) type ResolveGuard<'a> = parking_lot::MutexGuard<'a, ()>;
 
 /// Which backend a session runs on.
@@ -134,11 +106,6 @@ impl Backend {
     }
 
     /// Upload host bytes into a fresh device buffer.
-    ///
-    /// `Target` deliberately exposes only `alloc`: a write path would have to
-    /// name a byte layout, and only the backend knows one. This is the one
-    /// place the session distinguishes the two backends, and it distinguishes
-    /// them on *upload* — never on lowering, cost or selection.
     pub(crate) fn upload(&self, bytes: &[u8], persistence: Persistence) -> Result<Buf> {
         match self {
             Self::Gpu(t) => t
@@ -189,13 +156,12 @@ pub struct SessionInner {
     semantics: Arc<dyn Semantics>,
     rules: Vec<Rule>,
     replay: ReplayMemo,
-    /// Recorded saturations. A tier *below* `replay`: it removes the work
+    /// Recorded saturations. A tier below `replay`: it removes the work
     /// that produces the graph a plan is extracted from, where `replay`
     /// removes the extraction itself.
     saturation: SaturationMemo,
-    /// What this machine has already learned about which kernels are cheap.
-    /// Persisted per caps fingerprint, so a second process starts from the
-    /// first one's measurements instead of re-timing them.
+    /// What this machine has already learned about which kernels are cheap,
+    /// persisted per caps fingerprint.
     tune: fusor2_cost::tune_cache::TuneCache,
     /// The online explorer's per-key state: deterministic resolve counters
     /// and the candidate arms production sampling is working through.
@@ -305,24 +271,17 @@ impl Session {
         }
 
         // Every requested value already has a device buffer: nothing to plan.
-        // Without this, a readback that follows a batched resolve re-enters
-        // saturation and extraction on the whole long-lived graph just to
-        // download bytes it already has.
         if values.iter().all(|v| graph.device_buf(v.id).is_some()) {
             return Ok(());
         }
 
-        // Own the back-pressure: the trainer's `--drain-every` is a runtime
-        // policy, not a counter in a training script.
         if self.inner.in_flight.load(Ordering::Relaxed) >= MAX_INFLIGHT_PLANS {
             self.wait()?;
         }
 
         let caps = self.caps();
-        // The key discriminates on *which* symbols are bound, never on their
-        // values: extraction reads the e-graph (symbols as symbols) and the
-        // device, so one plan serves the whole shape family and a decode
-        // step's length change replays instead of re-extracting. The values
+        // The key discriminates on which symbols are bound, never on their
+        // values: one plan serves the whole shape family, and the values
         // reach the dispatch through the uniform block and `grid_for`.
         let binding: Vec<Dim> = graph
             .dim_bindings()
@@ -332,10 +291,8 @@ impl Session {
 
         let (plan, roots, key, missed) = {
             let mut g = graph.egraph.lock();
-            // The root set is per-resolve: planning (and `verify_plan`'s
-            // clause 6) covers exactly the values this call requested.
-            // Carrying every historical root forward made each decode step
-            // replan and re-dispatch the whole generation history.
+            // The root set is per-resolve: planning covers exactly the values
+            // this call requested.
             g.clear_roots();
             for v in values {
                 g.add_root(v.id);
@@ -345,45 +302,30 @@ impl Session {
             // Saturation is a pure function of `(graph, caps, rules, budget)`
             // and a `Session` fixes the last three for its whole life, so a
             // graph in a pre-state seen before saturates to a graph seen
-            // before. Replaying that recording is the *same* answer the driver
-            // would compute, and the memo's validity check is an exact
-            // node-by-node comparison, not a fingerprint — a mismatch falls
-            // through to the driver, so a miss is slow and never wrong.
-            // Recording a saturation clones the whole node/facts/parent
-            // tables. On a decode loop's long-lived graph that is hundreds of
-            // MB of memcpy per token for a memo that can never hit (every
-            // step's pre-state differs), so model-scale graphs skip the memo
-            // entirely. The bound keeps every suite graph's behavior intact.
+            // before. The memo's validity check is an exact node-by-node
+            // comparison, so a miss is slow and never wrong. Recording clones
+            // the whole node/facts/parent tables, so model-scale graphs skip
+            // the memo entirely.
             const SATURATION_MEMO_MAX_NODES: usize = 50_000;
             // A graph whose node count is unchanged since its last completed
-            // saturation is *exactly* the graph saturation last ran on
+            // saturation is exactly the graph saturation last ran on
             // (`add` is the only structural mutation), so there is nothing
-            // to do. This is what makes a decode step whose rebuild was all
-            // hash-cons hits skip saturation outright.
+            // to do.
             let __skipped = g.saturated_at_len == Some(g.len());
             let memo_eligible = !__skipped && g.len() <= SATURATION_MEMO_MAX_NODES;
             let __replayed = memo_eligible && self.inner.saturation.replay(&mut g);
             if !__skipped && !__replayed {
                 let pre = memo_eligible.then(|| g.pre_saturation());
-                // `max_applications`' flat default is sized against suite
-                // graphs. A model-scale graph (a transformer forward is 40k+
-                // nodes) exhausts it mid-walk, so nodes past the exhaustion
-                // point never receive their `lower_*` kernel members and the
-                // extractor is left choosing among defn expansions only —
-                // which is how an 8B forward selected fold-over-materialized-
-                // dequant for every late-layer matmul. Scale the ceiling with
-                // the pre-saturation node count; suite-sized graphs keep the
-                // default exactly.
+                // A flat `max_applications` exhausts mid-walk on a model-scale
+                // graph, leaving nodes past the exhaustion point without their
+                // `lower_*` kernel members; scale the ceiling with the
+                // pre-saturation node count.
                 let mut budget = SaturationBudget::default();
                 budget.max_applications = budget
                     .max_applications
                     .max((g.len() as u32).saturating_mul(16));
                 Driver::new().saturate(&mut g, &caps, &self.inner.rules, budget)?;
-                // A budget sized off the *pre-growth* node count exhausts
-                // mid-walk on a model-scale graph, and every node past the
-                // exhaustion point never receives its `lower_*` members —
-                // the extractor is left picking defn expansions. The
-                // frontier below `len` is the driver's own exhaustion
+                // The frontier below `len` is the driver's own exhaustion
                 // signal: double and continue until every node has been
                 // offered every rule. Bounded, so a genuinely exploding
                 // graph still terminates.
@@ -416,8 +358,8 @@ impl Session {
                 device: self.inner.cost.facts().fingerprint(),
                 binding: fusor2_cost::replay::binding_hash(&binding),
             };
-            // Tuning is a cold-path cost: it happens on a memo miss and the
-            // winner is what every later resolve of this key replays.
+            // Tuning happens on a memo miss; the winner is what every later
+            // resolve of this key replays.
             let missed = self.inner.replay.get(key).is_none();
             let graph_ref: &EGraph = &g;
             let (plan, _unchanged) = self.inner.replay.get_or_extract(key, || {
@@ -429,14 +371,10 @@ impl Session {
                 )
             })?;
             let __t_verify = Instant::now();
-            // `verify_plan` is a pure function of the plan and the graph term
-            // it was extracted from, and `key` is that term's identity: the
-            // same key already decides *which* plan executes, so re-deriving
-            // the same verdict for the same (key, plan) every dispatch is
-            // pure repetition — 1.5 ms of every 45 ms decode token, all of it
-            // with the GPU idle. A plan reaching L2 for the first time is
-            // always verified, an entry replaced by a tuning winner is
-            // verified on its own hash, and the member sweep is untouched.
+            // `verify_plan` is a pure function of `(key, plan)`, so the same
+            // verdict is not re-derived every dispatch. A plan reaching
+            // Kernel for the first time is always verified, and an entry
+            // replaced by a tuning winner is verified on its own hash.
             if !self.inner.replay.is_verified(key, plan.hash) {
                 self.inner.extractor.verify_plan(graph_ref, &plan)?;
                 self.inner.replay.mark_verified(key, plan.hash);
@@ -471,10 +409,9 @@ impl Session {
         };
 
         // Online tuning: on a replay hit, occasionally substitute one legal
-        // arm for the incumbent (or re-sample the incumbent itself) and let
-        // this production dispatch's own GPU spans feed the tuner's windows.
-        // Every arm is a verify_plan-checked member plan — there is no
-        // correctness machinery here, only performance.
+        // arm for the incumbent and let this production dispatch's own GPU
+        // spans feed the tuner's windows. Every arm is a verify_plan-checked
+        // member plan.
         let explored = if !missed && matches!(self.inner.device, Backend::Gpu(_)) {
             self.explore_step(&graph, &roots, key, &plan)
         } else {
@@ -489,10 +426,8 @@ impl Session {
         };
 
         // Dumps the launch and incumbent signatures of the plan that actually
-        // *executes* (post prior-adoption, post explorer substitution) when
-        // `FUSOR2_DUMP_EXEC` is set, once per distinct plan hash, so
-        // per-dispatch span indices join to the executed kernel rather than to
-        // the extraction.
+        // executes when `FUSOR2_DUMP_EXEC` is set, once per distinct plan
+        // hash.
         if dump_exec() {
             use std::collections::HashSet;
             use std::sync::{Mutex as StdMutex, OnceLock};
@@ -579,12 +514,8 @@ impl Session {
     /// Bytes of an already-resolved value.
     ///
     /// `_resolving` is a witness that the caller holds the graph's
-    /// `resolve_lock`, not a parameter this reads. Downloading a buffer is
-    /// only meaningful while no other thread can be part-way through binding
-    /// and dispatching a plan that writes it, and taking the guard here
-    /// instead would leave a window open between a caller's `resolve` and its
-    /// read. Passing the guard makes "I already hold it" the only way to
-    /// call this.
+    /// `resolve_lock`: downloading a buffer is only meaningful while no other
+    /// thread can be part-way through dispatching a plan that writes it.
     pub(crate) fn read_bytes_locked(
         &self,
         _resolving: &ResolveGuard<'_>,
@@ -596,47 +527,25 @@ impl Session {
             .ok_or_else(|| Error::Plan(format!("{id} has no device buffer; resolve it first")))?;
         let facts = graph.facts(id);
         let elem = facts.dtype.byte_size();
-        // **No drain here.** `download` records its copy on the same queue the
+        // No drain here: `download` records its copy on the same queue the
         // plan was just submitted to and wgpu orders submissions, so the copy
-        // cannot observe an unfinished dispatch; the `map_async` inside
-        // `Launcher::readback` is what blocks, and wgpu defers that callback
-        // until the submission that wrote the staging buffer has retired.
-        //
-        // Draining first stalls the host until the GPU is *idle* and only then
-        // allocates staging, records the copy and commits it, so the readback
-        // command buffer pays a cold GPU wake-up every resolve. The reference
-        // does not: `fusor-ml`'s `Tensor::as_slice` goes through
-        // `materialize_with_tail(enqueue_download)`, which encodes
-        // `copy_buffer_to_buffer` into the *resolve's own* encoder and maps
-        // once. Two round trips became one.
-        //
-        // Measured round 7, Apple M2 Max, median ms: passthrough 2.83 -> 2.65,
-        // matmul 2048-cube 9.63 -> 8.72, matmul+epilogue 11.04 -> 10.42,
-        // elementwise x20 5.51 -> 5.04, attention [1,8,1024,64] 3.60 -> 3.48.
-        // Conformance failure list byte-identical before and after.
-        //
-        // `in_flight` is back-pressure bookkeeping only (`MAX_INFLIGHT_PLANS`),
-        // and the download on the next line blocks on the device regardless.
+        // cannot observe an unfinished dispatch. `in_flight` is back-pressure
+        // bookkeeping only, and the download blocks on the device regardless.
         self.inner.in_flight.store(0, Ordering::Relaxed);
 
         // A selected `Coop`/`Sgemm` geometry pads the output buffer to its
-        // tile multiple, so the bytes on the device are *not* the value's own
+        // tile multiple, so the bytes on the device are not the value's own
         // dense shape. Read the whole padded buffer and gather the value out
         // of it; a dense layout takes the straight path.
         //
-        // The registered layout is stated against the *selected member's*
+        // The registered layout is stated against the selected member's
         // shape, and the id being read may be a reshaped spelling of the same
-        // class — attention reads `[b, h, q, d]` off a contract whose padded
-        // buffer is `[b*h, m_pad, n_pad]`. Restating the layout over the
-        // reader's shape is exact (`restate_layout`); what is **not** allowed
-        // is dropping it. The old filter did exactly that on any rank
-        // mismatch, and a dense read of a padded buffer returns the top-left
-        // corner plus padding zeros as if they were the value.
+        // class, so the layout is restated over the reader's shape
+        // (`restate_layout`) — never dropped, because a dense read of a
+        // padded buffer returns padding zeros as if they were the value.
         // Padding lives in the strides, never in the shape: a padded buffer
-        // is detected by its strides departing from the row-major set (or a
-        // nonzero offset), not by its shape — the plan layout's shape *is*
-        // the logical shape. A shape mismatch still routes here: the reader
-        // may be a reshaped spelling of the selected member.
+        // is detected by its strides departing from the row-major set or a
+        // nonzero offset, not by its shape.
         let padded = graph
             .device_layout(id)
             .filter(|l| {
@@ -663,11 +572,9 @@ impl Session {
 
         let base = resolve_dim(layout.offset(), graph)?;
         let strides: Vec<u64> = resolve_strides(&layout, graph)?;
-        // The bytes to pull are the layout's *address span*, not its element
-        // count: a restated layout addresses far past `product(shape)` — the
-        // `[2,2,3,4]` read of a `[4,16,16]`-padded contract touches flat
-        // index 803 while holding 48 elements, and a short download gathers
-        // zeros for everything past its end.
+        // The bytes to pull are the layout's address span, not its element
+        // count: a restated layout addresses far past `product(shape)`, and a
+        // short download gathers zeros for everything past its end.
         let mut span = 1u64;
         for (d, s) in layout.shape().iter().zip(&strides) {
             span += resolve_dim(*d, graph)?.saturating_sub(1).saturating_mul(*s);
@@ -705,37 +612,23 @@ impl Session {
         Ok(out)
     }
 
-    // -----------------------------------------------------------------
-    // Running a plan
-    // -----------------------------------------------------------------
-
     /// The class member this plan selected for `id`.
     ///
-    /// `Extraction::sigma` is `ClassId -> Id`, so it only runs one way: from
-    /// the class a value belongs to, to the member the extractor picked. The
-    /// facade holds the `L0` id the user built; the plan names the selected
-    /// member. Those diverge the moment any rewrite fires, which is always.
+    /// The facade holds the `Logical` id the user built; the plan names the
+    /// selected member, and those diverge the moment any rewrite fires.
     fn selected(&self, graph: &GraphRef, plan: &Plan, id: Id) -> Id {
         let class = graph.egraph.lock().class_of(id);
         plan.extraction.selected(class).unwrap_or(id)
     }
 
-    /// Register `buf` under **every** id in `id`'s e-class, `Union` spine
+    /// Register `buf` under every id in `id`'s e-class, `Union` spine
     /// included.
     ///
-    /// Registering only the selected member is what left `read_bytes` looking
-    /// in a map its key was never inserted into. The class — not the member —
-    /// is the stable identity of a value: `sigma` is keyed by it, and which
+    /// The class — not the member — is the stable identity of a value: which
     /// member wins is an artifact of one extraction that a later resolve may
-    /// change. Writing the whole class also means a later extraction that
-    /// selects a different member overwrites every stale entry instead of
-    /// leaving one to shadow.
-    ///
-    /// `EGraph::members` is the *selectable* set and drops the `Union` nodes,
-    /// but `macro_op` hands the caller the id `union(defn, sugar)` returned —
-    /// so every sugared spelling (`softmax`, `rms_norm`, `rope`, `attention`,
-    /// every windowed view) names its value by a spine node. Binding only the
-    /// members left all of those unreadable.
+    /// change. `macro_op` hands the caller a `Union` spine node, so binding
+    /// only the selectable members would leave every sugared spelling
+    /// unreadable.
     fn bind_class(
         &self,
         graph: &GraphRef,
@@ -752,23 +645,16 @@ impl Session {
     }
 
     fn run(&self, graph: &GraphRef, plan: &Plan, values: &[Tensor]) -> Result<()> {
-        // What the extractor selected for each requested value. `sigma` is
-        // keyed by `ClassId`, so this is the only direction it runs in, and
-        // the id the user's `Tensor` holds is generally *not* it.
+        // What the extractor selected for each requested value.
         let wanted: Vec<Id> = values
             .iter()
             .map(|v| self.selected(graph, plan, v.id))
             .collect();
         // Every external leaf the plan reads, uploaded once. A `Persistent`
-        // leaf keeps its buffer across resolves, which is what makes an
-        // optimizer's state stay on device with no host round trip.
-        //
-        // The classification runs once over the *distinct* bound values under
-        // one lock apiece rather than per binding: the per-id `leaf_buffer`
-        // asks the e-graph "is this an external leaf?" and the leaf store "is
-        // it already on the device?" behind a mutex each, and a decode plan
-        // binds ~7,000 values a step. Only the handful that are genuinely
-        // unbacked reach `leaf_buffer` and upload.
+        // leaf keeps its buffer across resolves. The classification runs once
+        // over the distinct bound values under one lock apiece rather than
+        // per binding; only the values that are genuinely unbacked reach
+        // `leaf_buffer` and upload.
         let mut supplied: FxHashMap<Id, Buf> = FxHashMap::default();
         let mut bound: rustc_hash::FxHashSet<Id> = rustc_hash::FxHashSet::default();
         let mut distinct: Vec<Id> = Vec::with_capacity(plan.launches.len());
@@ -792,10 +678,8 @@ impl Session {
             }
         }
         // Root outputs are allocated here rather than inside the backend so
-        // the handle survives for readback. The root set is built once: the
-        // membership test is per buffer, and rescanning the launch list for
-        // each made this loop quadratic — 1,731 launches against as many
-        // buffers on a decode step.
+        // the handle survives for readback. The root set is built once;
+        // rescanning the launch list per buffer would be quadratic.
         let launch_roots: rustc_hash::FxHashSet<Id> =
             plan.launches.iter().map(|l| l.root).collect();
         let mut to_bind: Vec<(Id, Buf, Option<Arc<fusor2_ir::shape::Layout>>)> = Vec::new();
@@ -889,7 +773,7 @@ impl Session {
                 .theta
                 .get(&launch.root)
                 .copied()
-                .unwrap_or(fusor2_ir::ir::level1::SchedPoint::Point);
+                .unwrap_or(fusor2_ir::ir::launch::SchedPoint::Point);
             let cx = LowerCtx {
                 plan,
                 launch,
@@ -908,11 +792,10 @@ impl Session {
                 })?;
                 binds.push(buf);
             }
-            // **The kernel's own grid, not the plan's.** `Launch::grid` is the
-            // cost model's workgroup count, derived from the schedule point;
-            // `KernelIr::grid` is what the lowering actually indexed the body
-            // against. When they disagree the kernel silently computes a
-            // prefix of its output.
+            // The kernel's own grid, not the plan's: `Launch::grid` is the
+            // cost model's workgroup count; `KernelIr::grid` is what the
+            // lowering indexed the body against. When they disagree the
+            // kernel silently computes a prefix of its output.
             target.launch(&artifact, ir.grid, &binds, &uniforms)?;
         }
         Ok(())
@@ -963,7 +846,7 @@ impl Session {
         let leaf = {
             let g = graph.egraph.lock();
             match &g.node(id).op {
-                Op::L0(L0::Leaf(k @ (LeafKind::Const { .. } | LeafKind::Uniform { .. }))) => {
+                Op::Logical(Logical::Leaf(k @ (LeafKind::Const { .. } | LeafKind::Uniform { .. }))) => {
                     k.clone()
                 }
                 _ => return Ok(None),
@@ -996,9 +879,7 @@ impl Session {
     ///
     /// Coordinate descent, incumbent carried forward, so attention's two
     /// contractions are tuned against each other rather than in isolation.
-    /// **The measurement travels with the plan it measured**: a round-3 probe
-    /// kept them in parallel lists, desynced them, and applied a tile it had
-    /// not timed.
+    /// The measurement travels with the plan it measured.
     fn autotune(
         &self,
         guard: &ResolveGuard<'_>,
@@ -1008,9 +889,8 @@ impl Session {
         values: &[Tensor],
     ) -> Result<Arc<Plan>> {
         // Member verification: race every candidate of every launch so each
-        // gets value-checked, but adopt none — the sweep is for coverage, and
-        // a plan that changes under measurement would make every dispatch
-        // count in the suite nondeterministic.
+        // gets value-checked, but adopt none — a plan that changes under
+        // measurement would make suite dispatch counts nondeterministic.
         let verify_members = std::env::var_os("FUSOR2_VERIFY_MEMBERS").is_some();
         let min_macs = if verify_members {
             0
@@ -1019,13 +899,10 @@ impl Session {
         };
         let log = std::env::var_os("FUSOR2_AUTOTUNE_LOG").is_some();
 
-        // Timing a plan re-runs it — `TUNE_RUNS` samples per candidate, plus
-        // a value readback per run — and an in-place node makes a re-run
-        // destructive, so an impure plan is never *raced*. It is still tuned:
+        // Timing a plan re-runs it, and an in-place node makes a re-run
+        // destructive, so an impure plan is never raced. It is still tuned:
         // the production explorer substitutes one candidate exactly once, in
-        // place of the incumbent's own dispatch, which is the same effect
-        // either plan would have had. The decode plan (KV append is a
-        // `Scatter{Set}`) takes only that path.
+        // place of the incumbent's own dispatch.
         {
             let g = graph.egraph.lock();
             if base.launches.iter().any(|l| {
@@ -1037,10 +914,8 @@ impl Session {
             }
         }
 
-        // One probe pass over the base plan. `launch_variants` is where the
-        // work gate lives, so "every launch offered nothing" is "not worth
-        // tuning" — and neither the base measurement nor any candidate run
-        // may happen before it has answered.
+        // One probe pass over the base plan. `launch_variants` holds the work
+        // gate, so "every launch offered nothing" is "not worth tuning".
         let probe: Vec<Vec<(String, Plan)>> = {
             let g = graph.egraph.lock();
             (0..base.launches.len())
@@ -1060,10 +935,8 @@ impl Session {
             return Ok(base);
         }
 
-        // Every measurement below is scored on the kernel's own GPU span rather
-        // than on the whole plan's wall clock, which needs the per-dispatch
-        // timestamp path on for the duration of the pass and off again after
-        // it. A resolve that is not being tuned never allocates a query set.
+        // Measurements are scored on the kernel's own GPU span, which needs
+        // the per-dispatch timestamp path on for the pass and off after it.
         let _clock = TuningClock::new(&self.inner.device);
 
         let Some(reference) = self.timed_run(guard, graph, &base, values)? else {
@@ -1080,18 +953,17 @@ impl Session {
                 .collect::<Vec<_>>()
                 .join(";")
         };
-        // What this pass actually adopts, per launch, so the *combination* can
-        // be recorded rather than reassembled later from per-launch minima
-        // that were never measured together.
+        // What this pass actually adopts, per launch, so the combination can
+        // be recorded rather than reassembled from per-launch minima that
+        // were never measured together.
         let mut picks: Vec<Option<String>> = vec![None; base.launches.len()];
 
         let mut best = Arc::clone(&base);
         let base_ns = plan_ns(&reference);
         let mut best_ns = base_ns;
-        // The incumbent's own per-launch spans, plan order. A candidate differs
-        // from the incumbent at exactly one launch, so the plan difference
-        // between them *is* that launch's span difference — which makes the
-        // launch's own span, not the sum, the term `TUNE_MARGIN` belongs on.
+        // The incumbent's own per-launch spans, plan order. A candidate
+        // differs from the incumbent at exactly one launch, so the launch's
+        // own span — not the sum — is the term `TUNE_MARGIN` belongs on.
         let mut best_spans: Option<Vec<f64>> = reference.gpu_us.clone();
         if log {
             eprintln!(
@@ -1128,9 +1000,9 @@ impl Session {
             };
             // What this machine already knows about this launch decides where
             // the time goes: re-confirm a known incumbent, explore a bounded
-            // number of never-tried points, and do not rebuild the tail this
-            // device has already shown to be hopeless. The signature is
-            // structural, so it is the *same* key the previous process wrote.
+            // number of never-tried points, skip variants this device has
+            // already ruled out. The signature is structural, so it is the
+            // same key the previous process wrote.
             let sig = {
                 let g = graph.egraph.lock();
                 best.launches
@@ -1144,53 +1016,16 @@ impl Session {
                 Some(sig) => {
                     // Each candidate travels with the cost model's prior for
                     // the plan it denotes: on a cold signature the cache races
-                    // only the model's top-`RACE_TOP_K` picks, so a first
-                    // resolve is 3 races per launch instead of 16.
+                    // only the model's top-`RACE_TOP_K` picks.
                     let names: Vec<(String, u64)> = variants
                         .iter()
                         .map(|(n, p)| (n.clone(), p.cost.0))
                         .collect();
-                    // Nothing left to learn about this launch: apply the
-                    // accumulated winner instead of re-racing the field on this
-                    // run's clock. The minimum over every past run is a much
-                    // better estimate than one fresh noisy sample, and it is
-                    // the difference between converging on 2.58 ms and settling
-                    // at ~3.0 ms. Still timed and still value-checked — the
-                    // cache proposes, the measurement disposes.
-                    // A jointly-measured combination wins over anything
-                    // assembled per launch: replay this launch's pick from it.
-                    // `None` means the winning plan left this launch alone, so
-                    // there is nothing to try here at all.
-                    // **Replay only once there is nothing left to learn.**
-                    // A combination recorded while the space was still being
-                    // explored is just the best of the handful tried so far,
-                    // and replaying it unconditionally freezes that answer
-                    // forever — measured, attention locked at 4.2 ms because
-                    // run 1's bounded sweep was cached and never revisited.
-                    // So the combination is authoritative only when every
-                    // candidate for this launch has been measured; until then
-                    // exploration continues and the combination is rewritten
-                    // at the end of each pass.
-                    // **The cache orders and prunes; it never replaces the
-                    // race.** Two stronger uses were built and measured and
-                    // both lost time:
-                    //
-                    //  * applying each launch's cached arg-min — per-launch
-                    //    minima are scored in whatever context the descent was
-                    //    in when that launch's turn came, so assembling them
-                    //    produces a plan nobody ran (attention 4.2 ms against
-                    //    a 2.67 ms descent);
-                    //  * replaying the whole recorded winning combination —
-                    //    `launch_variants` re-derives against the carried
-                    //    incumbent, so a label does not name the same plan on
-                    //    the next pass, and the replay did not reproduce its
-                    //    own recording (4.2-5.5 ms against 2.67 ms).
-                    //
-                    // Ordering is sound because it changes only *which
-                    // candidate is tried first*, and every candidate is still
-                    // built, timed and value-checked. Making the cache
-                    // authoritative over the measurement is what broke; making
-                    // it a prior over the measurement is what works.
+                    // The cache orders and prunes; it never replaces the race.
+                    // Every candidate it hands back is still built, timed and
+                    // value-checked, and a recorded combination is
+                    // authoritative only once every candidate for the launch
+                    // has been measured.
                     let (run, skipped) = self.inner.tune.plan_candidates(sig, &names);
                     if log && !skipped.is_empty() {
                         eprintln!(
@@ -1216,48 +1051,28 @@ impl Session {
                 };
                 let sample_ns = plan_ns(&sample);
                 // A different tile is a different reduction order, so bit
-                // equality is the wrong test — but a *wrong kernel* is off by
-                // orders of magnitude. The round-3 probe found Sgemv
-                // returning 0.40 where the answer is 0.92 on a 2048-cube
-                // matmul, and 14x faster. This gate is not optional.
-                //
-                // **It runs before the cache write, not after.** A candidate
-                // differs from the incumbent at exactly one class, so a
-                // whole-plan disagreement is this variant's, and it is the
-                // single most important fact this device can remember about it.
+                // equality is the wrong test — but a wrong kernel is off by
+                // orders of magnitude. This runs before the cache write: a
+                // whole-plan disagreement is this variant's.
                 let ok = reference.bytes.len() == sample.bytes.len()
                     && reference
                         .bytes
                         .iter()
                         .zip(&sample.bytes)
                         .all(|((dt, a), (_, b))| agrees(*dt, a, b));
-                // `replan` rebuilds the *whole* plan from a one-node edit, so a
-                // per-launch quantity may be attributed to index `ix` only when
-                // every other launch is untouched. This licenses both the cache
-                // write below and the adoption test further down.
-                //
-                // Equal roots are not that guarantee. A launch is its root *and*
-                // its members, grid and block, and a replan can move a fused
-                // member across an existing launch boundary — or flip a
-                // neighbour between reading a materialized producer and
-                // recomputing it, which inlines that producer's members — while
-                // both roots and the launch count stay put. `gpu_us[ix]` is then
-                // small because this launch shed work onto its neighbour, and
-                // adopting on it buys a slower plan and files that span under
-                // this kernel's name for every later process.
+                // `replan` rebuilds the whole plan from a one-node edit, so a
+                // per-launch quantity may be attributed to index `ix` only
+                // when every other launch is untouched. Equal roots are not
+                // that guarantee: a replan can move a fused member across a
+                // launch boundary while both roots and the launch count stay
+                // put, leaving `gpu_us[ix]` small because the launch shed
+                // work onto its neighbour.
                 let aligned = plans_align(&candidate, &best, ix);
                 if let Some(sig) = &sig {
-                    // `sig` names *one launch*, so only a number that is a
-                    // property of that launch may be filed under it. That is
-                    // the launch's own kernel span, which the device timer
-                    // measures directly; the whole-plan wall clock is not one,
-                    // because coordinate descent carries an incumbent and the
-                    // same variant clocks differently depending on when its
-                    // turn came. Hence the `aligned` filter below: a *time* is
-                    // attributable only when index `ix` really is this launch.
-                    // A *wrong answer* needs no such guard — it is not a timing
-                    // property, it does not depend on a device timer, and it is
-                    // identical on the CPU target.
+                    // `sig` names one launch, so only a property of that
+                    // launch may be filed under it: its own kernel span,
+                    // hence the `aligned` filter. A wrong answer needs no
+                    // such guard — it is not a timing property.
                     let verdict = if !ok {
                         WRONG_MEMBERS.fetch_add(1, Ordering::Relaxed);
                         let detail = reference
@@ -1273,8 +1088,8 @@ impl Session {
                         let detail = detail.map_or_else(String::new, |(o, (i, p, q, w))| {
                             format!(" (out {o} elem {i}: incumbent {p} vs {q}, worst |d| {w})")
                         });
-                        // A tiny output is worth printing whole: the zero/wrong
-                        // *pattern* (a column, a row tail, a stripe) names the
+                        // A tiny output is worth printing whole: the wrong
+                        // pattern (a column, a row tail, a stripe) names the
                         // bug faster than any single element.
                         if let Some(((_, a), (_, b))) =
                             reference.bytes.first().zip(sample.bytes.first())
@@ -1296,13 +1111,10 @@ impl Session {
                              different values from the incumbent plan{detail}"
                         );
                         // Two members of one e-class disagreeing on bytes is
-                        // a violated compiler invariant, full stop. In
-                        // production that is an internal compiler error the
-                        // resolve fails loudly on — never a skip, never a
-                        // workaround; the kernel or rule gets fixed. Only
-                        // the CI member sweep (`FUSOR2_VERIFY_MEMBERS`)
-                        // records and continues, so one run can enumerate
-                        // every such bug and fail the suite at the end.
+                        // a violated compiler invariant. In production the
+                        // resolve fails loudly; only the CI member sweep
+                        // (`FUSOR2_VERIFY_MEMBERS`) records and continues,
+                        // so one run can enumerate every such bug.
                         if !verify_members {
                             return Err(Error::Plan(format!(
                                 "internal compiler error: class member `{label}` of launch \
@@ -1330,13 +1142,10 @@ impl Session {
                             None => None,
                         }
                     };
-                    // The member sweep races *every* member of every class
-                    // back to back with `min_macs` at zero, so its spans are
-                    // measured under contention and at sizes production never
-                    // tunes. A `Wrong` verdict is a property of the kernel and
-                    // is kept; a `Ran` time is a property of the sweep, and
-                    // filing it would let a CI run decide production's
-                    // incumbents from numbers production would never observe.
+                    // The member sweep's spans are measured under contention
+                    // at sizes production never tunes. A `Wrong` verdict is a
+                    // property of the kernel and is kept; a `Ran` time is a
+                    // property of the sweep and is dropped.
                     let keep = !verify_members || matches!(verdict, Some(Verdict::Wrong));
                     if let Some(verdict) = verdict.filter(|_| keep) {
                         self.inner.tune.record(sig, &label, verdict);
@@ -1356,16 +1165,10 @@ impl Session {
                         }
                     );
                 }
-                // Only launch `ix` differs, so `sum_c - sum_b == s_c - s_b`
-                // exactly and the launch's own span is what `TUNE_MARGIN`
-                // applies to. On the sum the rule reads `s_c < s_b - m*sum_b`:
-                // the required *relative* win at this launch is `m*sum_b/s_b`,
-                // so a launch under `m` of the plan total can never be adopted
-                // at all (attention: anything under 0.21 ms of its 2.65 ms) and
-                // even a launch at 1.0 ms of that plan must get 21% faster to
-                // clear an "8%" margin. Same quantity the cache records, so the
-                // ordering it hands back and the decision made on it finally
-                // agree.
+                // Only launch `ix` differs, so the launch's own span is what
+                // `TUNE_MARGIN` applies to; on the plan sum, a launch under
+                // the margin fraction of the total could never be adopted.
+                // Same quantity the cache records.
                 let improved = match (&best_spans, &sample.gpu_us) {
                     (Some(prev), Some(now))
                         if aligned && prev.len() == now.len() && ix < prev.len() =>
@@ -1379,9 +1182,8 @@ impl Session {
                 };
                 if ok && improved && !verify_members {
                     best_ns = sample_ns;
-                    // The adopted candidate *is* the new incumbent, so its
-                    // profile is the incumbent's profile for every later
-                    // launch's comparison.
+                    // The adopted candidate is the new incumbent, so its
+                    // profile serves every later launch's comparison.
                     if sample.gpu_us.is_some() {
                         best_spans = sample.gpu_us.clone();
                     }
@@ -1393,8 +1195,8 @@ impl Session {
             }
         }
         // Record the combination that actually won. A combination spans every
-        // launch, so unlike a per-launch record it stays a ratio against this
-        // pass's own base — that is what makes it comparable across runs.
+        // launch, so it stays a ratio against this pass's own base, which is
+        // what makes it comparable across runs.
         let combo_score = ratio_ppm(best_ns, base_ns);
         if !verify_members {
             self.inner.tune.record_combo(&plan_sig, picks, combo_score);
@@ -1459,7 +1261,7 @@ impl Session {
             let g = graph.egraph.lock();
             matches!(
                 &g.node(id).op,
-                Op::L0(L0::Leaf(
+                Op::Logical(Logical::Leaf(
                     LeafKind::Buffer { .. } | LeafKind::Param { .. } | LeafKind::Quantized { .. }
                 ))
             )
@@ -1511,9 +1313,7 @@ fn dump_exec() -> bool {
     *ON.get_or_init(|| std::env::var_os("FUSOR2_DUMP_EXEC").is_some())
 }
 
-/// Whether `FUSOR2_NO_SAT_MEMO` is set. The A/B switch that shows a
-/// suspected miscompile is or is not the saturation memo without a rebuild;
-/// read once, because `resolve` is the hot path.
+/// Whether `FUSOR2_NO_SAT_MEMO` is set; read once, `resolve` is the hot path.
 fn saturation_memo_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FUSOR2_NO_SAT_MEMO").is_some())
@@ -1521,11 +1321,9 @@ fn saturation_memo_disabled() -> bool {
 
 /// Recorded saturations, bounded and FIFO-evicted.
 ///
-/// Not keyed on a hash. [`EGraph::replay_saturation`] checks the *whole*
-/// pre-state by value, so this is a list to scan rather than a map to look
-/// up — and `could_apply_to` rejects on node count and symbol counter before
-/// a single node is compared, which is O(1) for every entry that is not the
-/// one wanted.
+/// [`EGraph::replay_saturation`] checks the whole pre-state by value, so this
+/// is a list to scan; `could_apply_to` rejects on node count and symbol
+/// counter before a single node is compared.
 #[derive(Default)]
 struct SaturationMemo(parking_lot::Mutex<Vec<Arc<SaturationDelta>>>);
 
@@ -1534,10 +1332,7 @@ struct SaturationMemo(parking_lot::Mutex<Vec<Arc<SaturationDelta>>>);
 const SATURATION_MEMO_CAPACITY: usize = 64;
 
 /// Nodes the whole memo may hold. A recording carries a copy of its graph, so
-/// the entry count alone is not a memory bound: a caller that *grows* one
-/// graph — a training loop building a longer tape every step — misses every
-/// time, and would otherwise leave 64 ever-larger recordings behind that can
-/// never be hit again. This is what keeps that case flat instead of linear.
+/// the entry count alone is not a memory bound.
 const SATURATION_MEMO_NODES: usize = 256 << 10;
 
 impl SaturationMemo {
@@ -1548,8 +1343,7 @@ impl SaturationMemo {
             return false;
         }
         // Cloned out of the lock: `replay_saturation` needs `&mut EGraph`
-        // and the delta at once, and the entries are `Arc`s precisely so
-        // that costs a refcount rather than a copy.
+        // and the delta at once.
         let candidates: Vec<Arc<SaturationDelta>> = {
             let entries = self.0.lock();
             entries
@@ -1566,8 +1360,7 @@ impl SaturationMemo {
         let mut entries = self.0.lock();
         entries.push(Arc::new(delta));
         // Oldest first, and never down to nothing: a single recording larger
-        // than the whole node budget is still worth keeping, because the
-        // caller that produced it is the one likeliest to ask again.
+        // than the whole node budget is still worth keeping.
         while entries.len() > 1
             && (entries.len() > SATURATION_MEMO_CAPACITY
                 || entries.iter().map(|d| d.prefix() + d.added()).sum::<usize>()
@@ -1578,8 +1371,7 @@ impl SaturationMemo {
     }
 }
 
-/// One candidate's measurement and the values it produced, together — never
-/// in parallel lists.
+/// One candidate's measurement and the values it produced, together.
 struct TuneSample {
     /// Wall clock around the whole `run`, in nanoseconds. Includes buffer
     /// allocation, binding, the plan-cache lookup, submission and the poll
@@ -1593,13 +1385,9 @@ struct TuneSample {
 }
 
 /// Whether `candidate` differs from `incumbent` at exactly launch `ix`, so a
-/// per-launch quantity may be attributed to that index and a variant swap is
-/// layout-compatible per launch. Equal roots are not that guarantee: a launch
-/// is its root *and* its members, grid and block, and a replan can move a
-/// fused member across a launch boundary while both roots and the launch
-/// count stay put — `gpu_us[ix]` is then small because launch `ix` shed work
-/// onto its neighbour. A candidate that fails this is compared and explored
-/// at whole-plan granularity instead.
+/// per-launch quantity may be attributed to that index. Equal roots are not
+/// that guarantee: a launch is its root *and* its members, grid and block. A
+/// candidate that fails this is compared at whole-plan granularity instead.
 fn plans_align(candidate: &Plan, incumbent: &Plan, ix: usize) -> bool {
     candidate.launches.len() == incumbent.launches.len()
         && candidate
@@ -1646,7 +1434,7 @@ fn batch_aligns(candidate: &Plan, incumbent: &Plan, swaps: &[(usize, String)]) -
 /// launches with equal keys are the same work on the same schedule. `Id`s are
 /// process-local, which is fine: a diff always compares two plans over the
 /// same graph.
-fn launch_key(launch: &fusor2_ir::extract::Launch) -> u64 {
+fn launch_key(launch: &fusor2_ir::extract::Dispatch) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
     launch.root.hash(&mut h);
@@ -1803,12 +1591,8 @@ impl Drop for TuningClock<'_> {
     }
 }
 
-/// Byte-identical, or — for f32 — within 1e-3 relative magnitude. NaN fails
-/// the comparison and is therefore rejected.
 /// The first disagreeing f32 element and the worst one, for the MISCOMPILE
-/// report: `(first_index, expected, got, worst_abs_diff)`. A miscompile
-/// message that names an element turns "run the sweep again with a debugger"
-/// into "read the line".
+/// report: `(first_index, expected, got, worst_abs_diff)`.
 fn first_mismatch(a: &[u8], b: &[u8]) -> Option<(usize, f32, f32, f32)> {
     let f = |s: &[u8]| {
         s.chunks_exact(4)
@@ -1946,33 +1730,15 @@ fn restate_layout(
             }
             strides.truncate(mark);
         }
-        // Padded run: one *or more* reader dims whose product fits inside the
+        // Padded run: one or more reader dims whose product fits inside the
         // extent, laid out row-major over the value's own extents and reading
-        // the unpadded prefix.
+        // the unpadded prefix. Shortest run first; longer runs are only
+        // reached once the singleton reading has failed the remainder.
         //
-        // `m = 3` inside `m_pad = 16` is the length-1 case. A leading batch
-        // axis in front of it is the length-2 one — whisper's cross-attention
-        // K/V is `[1, 1500, 384]` over a contract padded to `[1504, 384]`, so
-        // the reader dims `[1, 1500]` have to share the padded axis — and a
-        // singleton-only rule cannot state that at all: it spends the `1` on
-        // the padded axis and then finds `1500` will not fit in `384`. The
-        // readback failed outright, which is how a whisper decode step died
-        // re-leafing its caches.
-        //
-        // Shortest run first; the longer runs are only reached
-        // once the singleton reading has failed the remainder.
-        //
-        // A padded axis holds exactly **one** logical axis, so the run may
-        // contain at most one non-unit reader dim: whisper's `[1, 1500]` over
-        // a padded 1504 is one real axis behind a unit batch, and is real
-        // data — but `[1, 3, 4]` over a padded 16 nests a second real axis
-        // *inside* the padded one at its element stride, and elements 4..11
-        // of that reading are the padding between the logical extent and the
-        // block edge, returned as data. That parse also races the correct one
-        // (`[1, 1, 3]` on the padded m axis, `[4]` on n) in this backtracker,
-        // and whichever is tried first wins — which is how a coop-padded
-        // `[16, 16]` attention output read back as `[1, 1, 3, 4]` produced
-        // row 0 followed by zeros.
+        // A padded axis holds exactly one logical axis, so the run may
+        // contain at most one non-unit reader dim: a second real axis nested
+        // inside the padded one would read the padding between the logical
+        // extent and the block edge as data.
         let mut prod = 1u64;
         let mut non_unit = 0usize;
         for take in 1..=r_ext.len() {
@@ -2006,10 +1772,8 @@ fn restate_layout(
     if !assign(&l_ext, &l_str, &r_ext, &mut strides) {
         return None;
     }
-    // `FUSOR2_RESTATE_LOG` prints every non-trivial restatement: the padded
-    // parse is ambiguous in principle (only the producer knows its logical
-    // extents), so when a wrong read is suspected this is the record that
-    // shows which parse won.
+    // The padded parse is ambiguous in principle (only the producer knows its
+    // logical extents), so this records which parse won.
     if std::env::var_os("FUSOR2_RESTATE_LOG").is_some() {
         eprintln!("[restate] layout={l_ext:?}/{l_str:?} reader={r_ext:?} -> strides={strides:?}");
     }
@@ -2094,15 +1858,11 @@ mod tests {
     use super::*;
 
     /// `restate_layout` has to state a padded buffer over a reader shape whose
-    /// dims *share* the padded axis, not just one dim inside it.
+    /// dims share the padded axis, not just one dim inside it.
     ///
-    /// The failing shape is whisper's cross-attention K/V: the value is
-    /// `[1, 1500, 384]` and the contract that produced it padded its row axis
-    /// to `[1504, 384]`. Reader dims `[1, 1500]` both belong to the 1504 axis.
-    /// The singleton-only rule spent the `1` there and then could not fit
-    /// `1500` into `384`, so the readback errored and `detach` — the whole
-    /// re-leaf-the-cache step of a decode loop — died with "the shapes do not
-    /// factor".
+    /// The pinned shape is whisper's cross-attention K/V: `[1, 1500, 384]`
+    /// over a contract padded to `[1504, 384]`, where reader dims `[1, 1500]`
+    /// both belong to the 1504 axis.
     #[test]
     fn a_padded_axis_can_carry_a_run_of_reader_dims() {
         use crate::graph::Graph;

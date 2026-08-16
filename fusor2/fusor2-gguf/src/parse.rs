@@ -10,9 +10,6 @@ use std::io::{Read, Seek, SeekFrom, Write};
 
 /// GGUF wire format tags. Wider than [`QFmt`] because a file may name a
 /// format fusor2 does not ingest; [`Self::to_qfmt`] is the total gate.
-///
-/// A wire tag is a fact about the *file*, not about the IR, so it lives with
-/// the parser that reads it: nothing in the compiler crates names one.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[allow(non_camel_case_types)]
 #[repr(u32)]
@@ -86,10 +83,6 @@ pub const DEFAULT_ALIGNMENT: u64 = 32;
 fn io<E: std::fmt::Display>(e: E) -> Error {
     Error::Io(e.to_string())
 }
-
-// ---------------------------------------------------------------------------
-// Version and primitive reads
-// ---------------------------------------------------------------------------
 
 /// Container version. V1 length-prefixes with u32; V2 and V3 with u64.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
@@ -191,10 +184,6 @@ fn write_string<W: Write>(writer: &mut W, value: &str, version: GgufVersion) -> 
     write_array_length(writer, version, value.len())?;
     writer.write_all(value.as_bytes()).map_err(io)
 }
-
-// ---------------------------------------------------------------------------
-// Metadata values
-// ---------------------------------------------------------------------------
 
 /// Wire tag of a metadata value. The numbering is not contiguous — U64/I64/F64
 /// were appended after Bool/String/Array.
@@ -403,10 +392,6 @@ impl GgufValue {
     }
 }
 
-// ---------------------------------------------------------------------------
-// GGML type geometry and the ingest gate
-// ---------------------------------------------------------------------------
-
 /// Elements one block of this wire type holds.
 pub const fn ggml_block_elements(ty: GgmlType) -> u64 {
     match ty {
@@ -449,16 +434,11 @@ pub const fn ggml_block_bytes(ty: GgmlType) -> u64 {
 }
 
 /// The total ingest gate: F32, F16 and the six block formats fusor2 decodes
-/// end to end. Everything else is an error naming the tag — not a panic, and
-/// not a silent fallback.
+/// end to end. Everything else is an error naming the tag.
 pub fn ingest_qfmt(ty: GgmlType) -> Result<Dtype> {
     ty.to_dtype()
         .ok_or_else(|| Error::Dtype(format!("gguf type {ty:?} has no ingest path")))
 }
-
-// ---------------------------------------------------------------------------
-// Tensor directory
-// ---------------------------------------------------------------------------
 
 /// One tensor's directory entry. `shape` is **reversed at read**: GGUF stores
 /// dimensions fastest-varying first, fusor2 uses row-major.
@@ -487,15 +467,10 @@ impl GgufTensor {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The metadata table
-// ---------------------------------------------------------------------------
-
 /// Header, key-value table and tensor directory of one GGUF file.
 ///
-/// `entries` and `tensors` are ordered `Vec`s rather than maps: the write path
-/// must reproduce the read order for a byte-stable round trip, and both are
-/// small enough that a linear scan beats hashing.
+/// `entries` and `tensors` are ordered: the write path must reproduce the
+/// read order for a byte-stable round trip.
 #[derive(Clone, Debug, Default)]
 pub struct GgufMetadata {
     pub version: GgufVersion,
@@ -643,10 +618,6 @@ impl GgufMetadata {
     }
 }
 
-// ---------------------------------------------------------------------------
-// A whole file
-// ---------------------------------------------------------------------------
-
 enum Backing {
     Mapped(memmap2::Mmap),
     Owned(Box<[u8]>),
@@ -672,8 +643,7 @@ impl Gguf {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let file = std::fs::File::open(path.as_ref()).map_err(io)?;
         // SAFETY: mapping a file the caller named. The usual mmap caveat
-        // applies — concurrent truncation by another process would fault —
-        // and is the contract every mmap-based loader ships with.
+        // applies — concurrent truncation by another process would fault.
         let map = unsafe { memmap2::Mmap::map(&file) }.map_err(io)?;
         Self::with_backing(Backing::Mapped(map))
     }

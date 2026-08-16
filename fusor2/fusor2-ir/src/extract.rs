@@ -1,18 +1,16 @@
-//! The one extraction: node selection, materialization and schedule points,
-//! decided together against the exact global cost.
+//! Node selection, materialization and schedule points, decided together
+//! against the exact global cost.
 
 use crate::cost::{CostModel, Picoseconds};
 use crate::egraph::{ClassId, EGraph, Id};
 use crate::error::Result;
-use crate::ir::level1::SchedPoint;
+use crate::ir::launch::SchedPoint;
 use crate::shape::Dim;
 use fixedbitset::FixedBitSet;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-/// The complete extraction state. Cost is **not** defined per e-class: a
-/// shared value would be counted once per path (or once globally, both
-/// wrong), and materialization is not a property of any node. Cost is
+/// The complete extraction state. Cost is not defined per e-class; it is
 /// evaluated on the realized DAG under `(sigma, m, theta)`.
 #[derive(Clone, Debug, Default)]
 pub struct Extraction {
@@ -20,9 +18,7 @@ pub struct Extraction {
     pub sigma: FxHashMap<ClassId, Id>,
     /// The materialized set. A node in `M` pays one write and each consumer
     /// pays one read; a node outside `M` is inlined into every consumer,
-    /// paying its math once per consumer and no traffic. Rematerialization
-    /// is therefore priced exactly as
-    /// `saved_write + saved_reads - recompute * (consumers - 1)`.
+    /// paying its math once per consumer and no traffic.
     pub m: FixedBitSet,
     /// Schedule point per selected node carrying a `ScheduleDomain`.
     pub theta: FxHashMap<Id, SchedPoint>,
@@ -37,9 +33,9 @@ impl Extraction {
     }
 }
 
-/// The three moves local search makes. `Flip` is **refused when the node is
-/// pinned** — an `Effect::InPlace` node is pinned in `M`, because inlining
-/// an atomic scatter into two consumers doubles the embedding gradient.
+/// The three moves local search makes. `Flip` is refused when the node is
+/// pinned: an `Effect::InPlace` node is pinned in `M`, since inlining an
+/// atomic scatter into two consumers doubles the effect.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Move {
     Reselect(ClassId),
@@ -47,15 +43,14 @@ pub enum Move {
     Reschedule(Id),
 }
 
-/// Extraction limits. Deterministic: ties break by node id. **The full
-/// schedule domain stays reachable** and the accept test is always the exact
+/// Extraction limits. Deterministic: ties break by node id, the full
+/// schedule domain stays reachable, and the accept test is always the exact
 /// global cost.
 ///
-/// **No term is a clock.** The plan is the cache key and the cache is
-/// cross-process, so an extraction that stops when a deadline expires
-/// produces a different `PlanHash` on a loaded machine than on an idle one.
-/// Every move re-realizes the whole DAG, so the honest unit of search effort
-/// is *realized node visits*, which is what [`Self::max_move_work`] bounds.
+/// No term is a clock: the plan is the cache key and the cache is
+/// cross-process, so a deadline would produce a different `PlanHash` on a
+/// loaded machine than on an idle one. Search effort is bounded in realized
+/// node visits via [`Self::max_move_work`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ExtractBudget {
     pub moves_per_chain: u32,
@@ -68,61 +63,10 @@ pub struct ExtractBudget {
 impl Default for ExtractBudget {
     /// `64 * |chains|` moves, 90k realized node visits.
     ///
-    /// 90k is the deterministic restatement of the 2 ms wall clock it
-    /// replaces: at ~20 ns per realized node it is the same ~1.8 ms of
-    /// search on the 100-600 node graphs the suite is made of, and on the
-    /// 3,000-node step graph it admits the ~30 moves the clock did.
-    ///
-    /// # Raising it was measured and deliberately not landed
-    ///
-    /// **The measurement below is stale in its numbers and still correct in
-    /// its finding.** It was taken before `fusor2_cost::extract`'s
-    /// co-selection pass landed, which moved the same four shapes further than
-    /// raising this constant ever did (7/7, 8/8, 7/6, 29/19 -> 5/5, 6/6, 5/5,
-    /// 17/17) *at this budget*. The `1_000_000` figures below have not been
-    /// re-taken on top of it and should not be quoted as current. What has
-    /// been re-checked is the blocker: with co-selection landed,
-    /// `attention_causal_plan_is_no_worse_than_dense` passes at 90k. Whether
-    /// it still separates at convergence is an open question, and the
-    /// experiment is cheap.
-    ///
-    /// Recorded here so the experiment is not repeated blind. Two corrections
-    /// to the obvious reading of these numbers first:
-    ///
-    /// * **`max_move_work` is not the only binding term, and on the attention
-    ///   graphs it stops being the binding one almost immediately.** Measured
-    ///   on the square-attention graph `attention_causal_plan_is_no_worse_than_dense`
-    ///   builds: 605 nodes but only *15 e-classes*, so `by_chain` is
-    ///   `64 * 15 = 960`. At 90k `by_work` is `90_000 / 605 = 148` and binds;
-    ///   at 1M it is 1652 and `by_chain`'s 960 binds instead. Anything above
-    ///   ~600k therefore changes nothing on a graph this shape without also
-    ///   raising [`Self::moves_per_chain`].
-    /// * The four `launch_ceiling` shapes do improve. Measured cpu/gpu at
-    ///   `max_move_work = 1_000_000`: `attention_forward` 7/7 -> 6/7,
-    ///   `attention_with_lse` 8/8 -> 7/8, `attention_causal_forward` 7/6 ->
-    ///   6/6, `attention_grads_all_three` 29/19 -> 19/19. Since each ceiling
-    ///   is the larger of the two backends, only two ceilings actually move
-    ///   (causal 7 -> 6, grads 29 -> 19); the GPU plans are unchanged.
-    ///
-    /// What blocks it is `attention_causal_plan_is_no_worse_than_dense`, and
-    /// it is a real finding rather than a brittle assert. At 90k *both*
-    /// searches are truncated onto the same 7-launch / 2240-byte plan, so the
-    /// case passes because neither side got to search, not because the
-    /// invariant holds. Let both run to convergence (`moves_per_chain = 4096`,
-    /// `max_move_work = 10_000_000`, both `capped=false`) and they separate:
-    /// dense reaches 6 launches / 1600 bytes and causal 6 launches / 1840,
-    /// because dense finds a **40-element buffer where causal keeps a
-    /// 100-element one** — two slots of one 20-element carrier replacing a
-    /// whole `[B,H,Lq,Lk]` intermediate. The rules that fired are identical on
-    /// the two graphs (`STRIP` fires on neither), so this is not a missing
-    /// law: it is the causal graph's local optimum genuinely being worse. The
-    /// roofline costs agree and are 0.002% apart — the extractor is minimising
-    /// time and the case asserts bytes.
-    ///
-    /// So the budget is not the last blocker; the causal side's inability to
-    /// reach the two-slot carrier is. Raising this constant before that is
-    /// fixed trades one measured regression for two ceiling improvements, and
-    /// `git log` would record it as a green round. It is left at 90k.
+    /// Raising 90k regresses `attention_causal_plan_is_no_worse_than_dense`:
+    /// at convergence the causal graph's local optimum keeps a 100-element
+    /// buffer where dense finds a 40-element one, so both searches must stay
+    /// truncated until the causal side can reach the two-slot carrier.
     fn default() -> Self {
         Self {
             moves_per_chain: 64,
@@ -142,11 +86,10 @@ impl ExtractBudget {
     }
 }
 
-/// The extracted plan's identity. **The plan is the cache key**:
+/// The extracted plan's identity. The plan is the cache key:
 /// `hash(realized DAG term + M + theta + DeviceFacts::fingerprint)`.
 /// `Dim::Sym` and `Leaf::Uniform` hash as symbols, not values, so one plan
-/// serves a whole shape family. There is no `hash_kernel_fields`, no
-/// `structural_kernel_key` and no golden byte files.
+/// serves a whole shape family.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct PlanHash(pub u128);
 
@@ -166,10 +109,9 @@ pub struct BindingPlan {
     pub kind: BindKind,
 }
 
-/// One buffer the plan allocates. **Allocation is derived from the plan**:
+/// One buffer the plan allocates. Allocation is derived from the plan:
 /// the layout carries the padded strides the selected geometry needs,
-/// including split-K scratch slices, so the reference's exact-stride
-/// equality test and silent generic-reduce fallback become an invariant.
+/// including split-K scratch slices.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BufferPlan {
     pub value: Id,
@@ -182,7 +124,7 @@ pub struct BufferPlan {
 /// One dispatch in the extracted plan. `grid` is after the 3-D fold against
 /// `max_compute_workgroups_per_dimension`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub struct Launch {
+pub struct Dispatch {
     pub root: Id,
     pub members: SmallVec<[Id; 8]>,
     pub bindings: Vec<BindingPlan>,
@@ -195,7 +137,7 @@ pub struct Launch {
 #[derive(Clone, Debug)]
 pub struct Plan {
     pub extraction: Extraction,
-    pub launches: Vec<Launch>,
+    pub launches: Vec<Dispatch>,
     pub buffers: Vec<BufferPlan>,
     pub symbols: Vec<crate::shape::SymId>,
     pub hash: PlanHash,
@@ -204,15 +146,11 @@ pub struct Plan {
 
 /// The extraction interface. Object-safe. One implementation is the shipped
 /// local search; `fusor2-conformance` ships a debug ILP oracle behind the
-/// same trait that must agree with it on small graphs — a greedy search
-/// compared only against itself cannot distinguish "found the optimum" from
-/// "made the same mistake".
+/// same trait that must agree with it on small graphs.
 pub trait Extractor: Send + Sync {
     /// Admissible lower bound, bottom-up, `O(nodes)`: `min over n in c of
     /// (math_ps(n) + sum over *distinct* child chains lb(child))` — zero
-    /// traffic, free sharing, min over the schedule domain. A genuine
-    /// relaxation in both regimes, so it is a valid seed *and* a valid
-    /// branch-and-bound prune. Indexed by node id.
+    /// traffic, free sharing, min over the schedule domain. Indexed by node id.
     fn lower_bound(&self, graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds>;
 
     /// Seed, realize, cost exactly, then local-search under `budget`.
@@ -225,20 +163,18 @@ pub trait Extractor: Send + Sync {
     ) -> Result<Plan>;
 
     /// Hard conformance assert on the winner: every selected non-leaf is
-    /// L1; every geometry legal against the exact `ArenaPlan`; every
+    /// Launch; every geometry legal against the exact `ArenaPlan`; every
     /// operand access satisfiable; every buffer stride derivable; no
     /// `InPlace` node inlined. A failure is an error, never a fallback.
     fn verify_plan(&self, graph: &EGraph, plan: &Plan) -> Result<()>;
 
     /// Alternative plans for one launch of `base`: every `(class member,
     /// schedule point)` pair the launch root's class offers, each re-planned
-    /// whole. Family **and** geometry vary together, which is the only way a
-    /// single measurement can rank them — see the `candidate_geoms_for` doc
-    /// in `fusor2-tile`.
+    /// whole. Family and geometry vary together — see the
+    /// `candidate_geoms_for` doc in `fusor2-tile`.
     ///
-    /// Contractions below `min_macs` return nothing, so a suite of 3x4x2048
-    /// matmuls never pays for a measurement round. The default is "no
-    /// alternatives": an extractor that cannot replan is simply not tuned.
+    /// Contractions below `min_macs` return nothing. The default is "no
+    /// alternatives".
     fn launch_variants(
         &self,
         graph: &EGraph,
@@ -252,17 +188,13 @@ pub trait Extractor: Send + Sync {
         Vec::new()
     }
 
-    /// The **labels** [`Self::launch_variants`] would offer for one launch,
+    /// The labels [`Self::launch_variants`] would offer for one launch,
     /// without building a single plan.
     ///
-    /// A candidate plan is a whole-plan replan, and the caller that opens a
-    /// launch's candidate field runs at most one of them per step: naming
-    /// the field costs a walk over the root class's members, while building
-    /// it costs a replan apiece. The list is a superset of what
-    /// `launch_variants` returns — a label here may still fail to realize —
-    /// and is exactly the label space [`Self::replan_with_variants`]
-    /// resolves against, so a name from here always names the same
-    /// `(member, schedule point)` there.
+    /// The list is a superset of what `launch_variants` returns — a label
+    /// here may still fail to realize — and is exactly the label space
+    /// [`Self::replan_with_variants`] resolves against, so a name from here
+    /// always names the same `(member, schedule point)` there.
     fn launch_variant_labels(
         &self,
         graph: &EGraph,
@@ -274,16 +206,13 @@ pub trait Extractor: Send + Sync {
         Vec::new()
     }
 
-    /// Replan `base` with the **named** variant applied at each launch of
+    /// Replan `base` with the named variant applied at each launch of
     /// `swaps`, composed into one extraction and re-planned (and so
-    /// verified) once — the batch form of adopting `launch_variants`
-    /// winners one launch at a time, which costs one replan instead of
-    /// `swaps.len()` full variant sweeps. Labels are the strings
-    /// `launch_variants` returns; a launch whose label matches no member
-    /// point, or whose selection move is illegal, contributes nothing.
-    /// `None` when nothing applied or the composed plan failed to build —
-    /// the caller falls back to sequential adoption. The default is "no
-    /// batch": an extractor that cannot replan composes nothing.
+    /// verified) once. Labels are the strings `launch_variants` returns; a
+    /// launch whose label matches no member point, or whose selection move
+    /// is illegal, contributes nothing. `None` when nothing applied or the
+    /// composed plan failed to build — the caller falls back to sequential
+    /// adoption. The default is "no batch".
     fn replan_with_variants(
         &self,
         graph: &EGraph,
@@ -298,9 +227,8 @@ pub trait Extractor: Send + Sync {
     }
 }
 
-/// The replay memo, keyed on the *extraction inputs* rather than a
-/// structural fingerprint. Validity is "the inputs are identical", so a
-/// training loop can no longer freeze step 1's decisions forever.
+/// The replay memo, keyed on the extraction inputs. Validity is "the inputs
+/// are identical".
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReplayKey {
     pub l0_term: u64,

@@ -13,10 +13,8 @@ use fusor2_conformance::harness::{self, Outcome, sessions};
 
 fn main() -> ExitCode {
     // Race every class member of every launch, value-checking each against
-    // the selected plan. This is what makes a case cover the *class* rather
-    // than whichever member extraction happened to pick — the staged
-    // quantized decode was wrong for months behind cases that compared the
-    // materialize path against itself.
+    // the selected plan, so a case covers the *class* rather than whichever
+    // member extraction happened to pick.
     //
     // SAFETY: set before any thread reads the environment.
     unsafe { std::env::set_var("FUSOR2_VERIFY_MEMBERS", "1") };

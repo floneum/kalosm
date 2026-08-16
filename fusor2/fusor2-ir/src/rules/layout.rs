@@ -5,11 +5,11 @@
 //!
 //! Each rule mints **one** alternative of the *reading* node with **one**
 //! operand's access changed. `Rule::head` is a single tag, so the four rules
-//! are spread across the two most common readers: three on `KMap` and the
-//! pack rule on `KContract`.
+//! are spread across the two most common readers: three on `Map` and the
+//! pack rule on `Contract`.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
-use crate::ir::level1::{AccessPlan, ContractSide, L1, Operand};
+use crate::ir::launch::{AccessPlan, ContractSide, Launch, Operand};
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
 use crate::shape::{AxisGroup, Layout, MultiFlattenMap, SubAxis};
@@ -17,44 +17,44 @@ use smallvec::SmallVec;
 
 rule!(
     OPERAND_ALIAS,
-    level = Level::L1,
-    head = OpTag::KMap,
+    level = Level::Launch,
+    head = OpTag::LaunchMap,
     tag = RuleTag::Additive,
     apply = operand_alias,
 );
 
 rule!(
     OPERAND_GATHER,
-    level = Level::L1,
-    head = OpTag::KMap,
+    level = Level::Launch,
+    head = OpTag::LaunchMap,
     tag = RuleTag::Additive,
     apply = operand_gather,
 );
 
 rule!(
     OPERAND_PACK,
-    level = Level::L1,
-    head = OpTag::KContract,
+    level = Level::Launch,
+    head = OpTag::LaunchContract,
     tag = RuleTag::Additive,
     apply = operand_pack,
 );
 
 rule!(
     OPERAND_UNFLATTEN,
-    level = Level::L1,
-    head = OpTag::KMap,
+    level = Level::Launch,
+    head = OpTag::LaunchMap,
     tag = RuleTag::Additive,
     apply = operand_unflatten,
 );
 
-/// Rebuild a `KMap` with the first operand that `pick` rewrites replaced.
+/// Rebuild a `Map` with the first operand that `pick` rewrites replaced.
 fn remap_kmap(
     b: &mut Builder<'_>,
     id: Id,
     node: &Node,
     pick: impl Fn(&Operand) -> Option<Operand>,
 ) -> Option<Id> {
-    let Op::L1(L1::KMap {
+    let Op::Launch(Launch::Map {
         space,
         body,
         ops,
@@ -67,7 +67,7 @@ fn remap_kmap(
     let mut new_ops = ops.clone();
     new_ops[slot] = pick(&ops[slot])?;
     let alt = b
-        .add_l1(L1::KMap {
+        .add_launch(Launch::Map {
             space: space.clone(),
             body: body.clone(),
             ops: new_ops,
@@ -79,42 +79,23 @@ fn remap_kmap(
 
 /// Read this operand straight through its own strides.
 ///
-/// # The layout is not on its own the whole access
-///
 /// An `Alias` addresses through `layout`'s strides and nothing else, so
 /// re-spelling an edge as one is sound only when the plan it replaces
-/// addresses the same way. For a [`AccessPlan::Gather`] and a
-/// [`AccessPlan::Pack`] it always does — both derive their addresses from the
-/// layout, which is why [`operand_gather`] declines on a dense layout as a
-/// *canonicalization* — and for an [`AccessPlan::Unflatten`] minted by
-/// [`operand_unflatten`] it does too, since that map is `decompose(layout)`.
-///
-/// It does **not** for an `Unflatten` whose map was stated independently of
-/// the layout. `rules::sink::fold_operand_views` mints exactly that: the map
-/// carries the *view's* index arithmetic while the layout carries only the
-/// base's shape and the view's start offset, because a `MultiFlattenMap` has
-/// no constant slot. Dropping that map re-reads the base densely — the
-/// broadcast, transpose or window the view expressed is simply gone.
-///
-/// Measured, with a co-selection pass in `fusor2-cost::extract` letting the
-/// search reach these members: **29** conformance cases on wrong values, every
-/// `softmax`, `layer_norm` and `rms_norm` row plus `attention_qk_mask` and the
-/// attention gradients, on both backends. `softmax_rows_sum_to_one` reported a
-/// row summing to 1.13 because each element was divided by `l[i + j]` instead
-/// of `l[i]`. Disabling either this rule or `sink::FOLD_VIEWS_INTO_INDEX`
-/// alone made all 29 pass, which is the pair that has to agree.
-///
-/// The e-graph's invariant is that every member of a class computes the same
-/// value. This member has been unequal since the two rules first coexisted;
-/// only the extraction budget kept it unselected.
+/// addresses the same way. [`AccessPlan::Gather`] and [`AccessPlan::Pack`]
+/// always do, and so does an [`AccessPlan::Unflatten`] whose map is
+/// `decompose(layout)`. An `Unflatten` whose map was stated independently of
+/// the layout (`rules::sink::fold_operand_views` mints those) carries the
+/// view's index arithmetic while the layout carries only the base's shape;
+/// dropping that map re-reads the base densely and loses the broadcast,
+/// transpose or window the view expressed.
 pub fn operand_alias(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     remap_kmap(b, id, node, |o| {
         if matches!(o.access, AccessPlan::Alias) {
             return None;
         }
-        // `Operand::respell` is the address-preservation judgement this rule
-        // pinned: layout-derived plans move freely (which keeps a `Dim::Sym`
-        // edge rewritable), an independently-stated `Unflatten` map requires
+        // `Operand::respell` is the address-preservation judgement:
+        // layout-derived plans move freely (which keeps a `Dim::Sym` edge
+        // rewritable), an independently-stated `Unflatten` map requires
         // `AddressMap` equality and declines when undecidable.
         o.respell(AccessPlan::Alias)
     })
@@ -125,18 +106,14 @@ pub fn operand_alias(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -
 /// Only minted for a layout that is not already dense row-major: over a
 /// contiguous layout a gather and an alias name the *same* index map, so
 /// minting both would put one access in the graph twice under two spellings.
-/// That is canonicalization, not a judgement about which is faster.
 pub fn operand_gather(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     remap_kmap(b, id, node, |o| {
         if matches!(o.access, AccessPlan::Gather) || o.layout.is_contiguous() {
             return None;
         }
-        // Through `respell`, not a bare rebuild: a gather derives its
-        // addresses from the layout, so re-spelling an independently-stated
-        // `Unflatten` map would silently re-read the base densely — the
-        // hazard `operand_alias`'s doc records, on the gather spelling. The
-        // member it minted NaN'd `dequantize_defn_coop_shape_q5k_f32_scales`
-        // [cpu] the first time an extraction budget let it be selected.
+        // Through `respell`: a gather derives its addresses from the layout,
+        // so re-spelling an independently-stated `Unflatten` map would
+        // silently re-read the base densely (see `operand_alias`).
         o.respell(AccessPlan::Gather)
     })
 }
@@ -144,7 +121,7 @@ pub fn operand_gather(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) 
 /// Stage this operand into a dense tile first. Legal when the packed layout
 /// is contiguous and holds exactly as many elements as the operand does.
 pub fn operand_pack(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    let Op::L1(L1::KContract {
+    let Op::Launch(Launch::Contract {
         m,
         n,
         k,
@@ -169,16 +146,14 @@ pub fn operand_pack(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) ->
         if !into.is_contiguous() || elements(&into)? != elements(&o.layout)? {
             return None;
         }
-        // Packing stages the elements the *layout* addresses, so this is the
-        // same re-spelling judgement as `operand_gather`: an
-        // independently-stated `Unflatten` map must survive it or the rule
-        // declines.
+        // Packing stages the elements the *layout* addresses: an
+        // independently-stated `Unflatten` map must survive the re-spelling
+        // or the rule declines.
         o.respell(AccessPlan::Pack { into })
     };
     // Each operand of a side is loaded through its own access plan, so packing
     // one and aliasing its neighbour is sound. Exactly one alternative is
-    // minted per fire — the first packable operand in `children_of` order —
-    // and the rule being additive is what lets extraction see the rest.
+    // minted per fire — the first packable operand in `children_of` order.
     let pack_first = |side: &ContractSide| -> Option<ContractSide> {
         let (i, packed) = side.ops.iter().enumerate().find_map(|(i, o)| Some((i, repack(o)?)))?;
         let mut out = side.clone();
@@ -190,7 +165,7 @@ pub fn operand_pack(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) ->
         None => (a.clone(), pack_first(rhs)?),
     };
     let alt = b
-        .add_l1(L1::KContract {
+        .add_launch(Launch::Contract {
             m: *m,
             n: *n,
             k: *k,
@@ -208,7 +183,7 @@ pub fn operand_pack(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) ->
 
 /// Read this operand through an explicit index map. Legal only when the
 /// operand's layout decomposes into decidable `AxisGroup`s; when it does not,
-/// the alternative is simply not minted — there is no contiguous fallback.
+/// the alternative is simply not minted.
 ///
 /// A dense row-major layout decomposes into exactly the map an alias already
 /// implies, so it is skipped for the same canonicalization reason as
@@ -277,7 +252,7 @@ mod tests {
         (r.apply)(&mut b, id, &node, &facts)
     }
 
-    /// Test 14. One strided producer read by two nodes: one reader's class
+    /// One strided producer read by two nodes: one reader's class
     /// holds an `Alias` operand, the other's a `Pack`. Access is an edge
     /// attribute, so the two never contend.
     #[test]
@@ -300,7 +275,7 @@ mod tests {
             .into_iter()
             .find(|&i| i != reader_a)
             .unwrap();
-        let Op::L1(L1::KMap { ops, .. }) = &g.node(alias_alt).op else {
+        let Op::Launch(Launch::Map { ops, .. }) = &g.node(alias_alt).op else {
             panic!()
         };
         assert!(matches!(ops[0].access, AccessPlan::Alias));
@@ -323,7 +298,7 @@ mod tests {
             .into_iter()
             .find(|&i| i != reader_b)
             .unwrap();
-        let Op::L1(L1::KContract { a, .. }) = &g.node(pack_alt).op else {
+        let Op::Launch(Launch::Contract { a, .. }) = &g.node(pack_alt).op else {
             panic!()
         };
         assert!(matches!(a.primary().access, AccessPlan::Pack { .. }));
@@ -340,11 +315,7 @@ mod tests {
     /// for a broadcast: the layout carries the base's `[rows]` shape and the
     /// start offset, while the map carries `[rows, cols]` with the second axis
     /// at stride 0. Aliasing that drops the broadcast and reads the base
-    /// densely — 29 conformance cases' worth of wrong numbers, once extraction
-    /// searches far enough to select it. See this rule's own doc.
-    ///
-    /// Without the guard the first assert fails: the rule fired on anything
-    /// that was not already an `Alias`.
+    /// densely.
     #[test]
     fn operand_alias_refuses_a_map_its_layout_does_not_imply() {
         let rows = Dim::Const(3);
@@ -441,7 +412,7 @@ mod tests {
         let mut seen_gather = false;
         let mut seen_unflatten = false;
         for id in members {
-            if let Op::L1(L1::KMap { ops, .. }) = &g.node(id).op {
+            if let Op::Launch(Launch::Map { ops, .. }) = &g.node(id).op {
                 match &ops[0].access {
                     AccessPlan::Gather => seen_gather = true,
                     AccessPlan::Unflatten(map) => {

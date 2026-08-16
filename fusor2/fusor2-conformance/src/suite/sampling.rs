@@ -1,4 +1,4 @@
-//! Top-k and the two samplers, entering through `L1::Ext`.
+//! Top-k and the two samplers, entering through `Launch::Ext`.
 //!
 //! Sampling is the one area whose output is not a function of its input alone,
 //! so every case here pins something that *is* deterministic: the top-k
@@ -337,10 +337,6 @@ fn nucleus(values: &[f32], p: f32) -> Vec<u32> {
 }
 
 /// `min_p` drops every token whose probability is below `min_p * p_max`.
-///
-/// `StandardSamplerParams` now carries the knob, so this case requests the
-/// filter and checks the draw against the surviving set, the same shape as
-/// `top_p_filter`.
 fn min_p_filter(session: &Session, shape: &[u64], data_seed: u32) -> CaseResult {
     const MIN_P: f32 = 0.2;
     let vocab = shape[0] as usize;
@@ -539,9 +535,8 @@ fn pending_mirostat(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     check_pending(&pending.value)
 }
 
-/// The token tensor must be a `u32` scalar usable as an operand — the whole
-/// point of the pending form is that the id never round-trips through the
-/// host.
+/// The token tensor must be a `u32` scalar usable as an operand without a
+/// host round trip.
 fn check_pending(token: &Tensor) -> CaseResult {
     if token.dtype() != Dtype::U32 {
         return Err(format!("the pending token tensor is {:?}, want U32", token.dtype()).into());
@@ -553,8 +548,7 @@ fn check_pending(token: &Tensor) -> CaseResult {
         )
         .into());
     }
-    // Usable as an operand without a readback: this is the property that makes
-    // a zero-readback decode loop possible.
+    // Usable as an operand without a readback.
     token
         .add_scalar(0u32)
         .map_err(|e| -> CaseError { format!("the pending token is not an operand: {e}").into() })?;

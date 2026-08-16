@@ -1,11 +1,11 @@
-//! L2 [`ElementType`] -> naga types, and the workgroup/storage address-space
+//! Kernel [`ElementType`] -> naga types, and the workgroup/storage address-space
 //! declarations.
 //!
-//! Types are interned in a **fixed order** so the module's type arena is
+//! Types are interned in a fixed order so the module's type arena is
 //! deterministic: emitting the same IR twice must produce byte-identical
-//! debug output, which is what makes the plan hash a usable cache key.
+//! debug output.
 
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::kernel::{
     ArenaMode, BufferAccess, BufferDecl, ElementType, ScalarElement, TileDecl,
 };
 use fusor2_ir::target::EmitError;
@@ -34,11 +34,11 @@ pub struct Prelude {
     pub u32_vec3_ty: Handle<Type>,
 }
 
-/// The naga scalar for one L2 scalar element.
+/// The naga scalar for one Kernel scalar element.
 ///
 /// `BF16` has no naga 29 representation: it is a storage-only dtype whose
-/// compute form the `widen-compute` L1 rule produces, so it must never reach
-/// L2 as a value type.
+/// compute form the `widen-compute` Launch rule produces, so it must never reach
+/// Kernel as a value type.
 pub fn scalar_of(scalar: ScalarElement) -> Result<Scalar, EmitError> {
     Ok(match scalar {
         ScalarElement::F32 => Scalar::F32,
@@ -94,9 +94,9 @@ fn type_inner(element: ElementType) -> Result<TypeInner, EmitError> {
             rows: cooperative_size(rows)?,
             scalar: scalar_of(scalar)?,
             role: match role {
-                fusor2_ir::ir::level2::CoopMatrixRole::A => naga::CooperativeRole::A,
-                fusor2_ir::ir::level2::CoopMatrixRole::B => naga::CooperativeRole::B,
-                fusor2_ir::ir::level2::CoopMatrixRole::C => naga::CooperativeRole::C,
+                fusor2_ir::ir::kernel::CoopMatrixRole::A => naga::CooperativeRole::A,
+                fusor2_ir::ir::kernel::CoopMatrixRole::B => naga::CooperativeRole::B,
+                fusor2_ir::ir::kernel::CoopMatrixRole::C => naga::CooperativeRole::C,
             },
         },
     })
@@ -240,7 +240,7 @@ fn atomic_array_type(
 /// [`BufferDecl::access`] and is what [`crate::bindings`] reads back out.
 ///
 /// The array is typed `array<atomic<..>>` when the analysis found a
-/// [`fusor2_ir::ir::level2::Stmt::AtomicAdd`] on this binding.
+/// [`fusor2_ir::ir::kernel::Stmt::AtomicAdd`] on this binding.
 pub fn storage_global_with(
     module: &mut naga::Module,
     decl: &BufferDecl,
@@ -297,11 +297,7 @@ pub fn workgroup_global(
     ))
 }
 
-// ---------------------------------------------------------------------------
-// Emitter-driven declaration
-// ---------------------------------------------------------------------------
-
-/// Buffers in **binding order**, so the global-variable arena is independent
+/// Buffers in binding order, so the global-variable arena is independent
 /// of which statement touches which buffer first.
 pub fn create_storage_globals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
     let mut buffers = em.analysis.buffers.clone();
@@ -323,10 +319,9 @@ pub fn create_storage_globals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
 ///
 /// `ArenaMode::ByteArena` emits one `array<u32>` arena and indexes each tile
 /// from its packed byte offset. Released naga has no `WorkgroupAlias`
-/// decoration, so aliasing is expressed as index arithmetic instead; that
-/// restricts a byte-arena tile to 4-byte scalar elements, which is a footprint
-/// restriction, not a correctness one — a kernel that needs more falls back to
-/// `Regions`.
+/// decoration, so aliasing is expressed as index arithmetic, which restricts
+/// a byte-arena tile to 4-byte scalar elements; a kernel that needs more
+/// falls back to `Regions`.
 ///
 /// A tile with no placement gets its own allocation. An empty or partial plan
 /// is therefore always emittable, just larger.
@@ -380,8 +375,8 @@ pub fn create_workgroup_globals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
         }
         _ => {
             // Regions: one global per distinct byte offset, in offset order.
-            let mut groups: Vec<(u32, Vec<&fusor2_ir::ir::level2::Tile>)> = Vec::new();
-            let mut ungrouped: Vec<&fusor2_ir::ir::level2::Tile> = Vec::new();
+            let mut groups: Vec<(u32, Vec<&fusor2_ir::ir::kernel::Tile>)> = Vec::new();
+            let mut ungrouped: Vec<&fusor2_ir::ir::kernel::Tile> = Vec::new();
             for tile in &tiles {
                 match placements.get(&key(tile)) {
                     Some(&(offset, _)) => match groups.iter_mut().find(|(o, _)| *o == offset) {
@@ -438,7 +433,7 @@ pub fn create_workgroup_globals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
     Ok(())
 }
 
-fn standalone(em: &mut Emitter<'_>, tile: &fusor2_ir::ir::level2::Tile) -> Result<(), EmitError> {
+fn standalone(em: &mut Emitter<'_>, tile: &fusor2_ir::ir::kernel::Tile) -> Result<(), EmitError> {
     let global = workgroup_global(&mut em.module, tile, 0)?;
     em.tile_backing.insert(
         key(tile),
@@ -454,7 +449,7 @@ fn standalone(em: &mut Emitter<'_>, tile: &fusor2_ir::ir::level2::Tile) -> Resul
 /// The element a shared region is typed with. A homogeneous region keeps its
 /// own element; a heterogeneous one goes class-neutral u32 and bitcasts values
 /// at each access.
-fn canonical_element(members: &[&fusor2_ir::ir::level2::Tile]) -> Result<ElementType, EmitError> {
+fn canonical_element(members: &[&fusor2_ir::ir::kernel::Tile]) -> Result<ElementType, EmitError> {
     let first = members[0].element;
     if members.iter().all(|t| t.element == first) {
         return Ok(first);

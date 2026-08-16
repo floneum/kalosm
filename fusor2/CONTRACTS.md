@@ -56,7 +56,7 @@ feature per target), `naga 29`, `fearless_simd 0.4`.
 Fifteen modules, in `lib.rs` declaration order:
 
 ```
-error  dtype  shape  facts  scalar  ir{,::level0,::level1,::level2}
+error  dtype  shape  facts  scalar  ir{,::logical,::launch,::kernel}
 egraph  device  cost  extract  target  autograd
 carrier  contract_spec  semantics{,::children,::infer_l0,::infer_l1,::work}
 verify_l0  verify_l1  rule_macro  rules{,::*}  saturate
@@ -75,10 +75,10 @@ verify_l0  verify_l1  rule_macro  rules{,::*}  saturate
 | `ValueFacts`, `Work` | `facts` | |
 | `UnOp`(21), `BinOp`(15), `CmpOp`(6), `ScalarExpr`, `ScalarKind`, `Args` | `scalar` | `ScalarExpr::compose` **is** elementwise fusion |
 | `Level`, `Op`, `Node`, `Children`, `OpTag`, `Semantics`, `VerifyCtx`, `OpDef`, `OpDefRegistry` | `ir` | |
-| `L0` (10 nodes), `LeafKind`, `TiePolicy`, `EinSpec` | `ir::level0` | |
+| `Logical` (10 nodes), `LeafKind`, `TiePolicy`, `EinSpec` | `ir::logical` | |
 | `Carrier`, `SlotTy`, `Tupled`, `ArgRemap`, `HOM_TABLE`, `RETARGET_TABLE` | `carrier` | the fold algebra as data; **no named combine enum** |
-| `L1` (10 variants), `IndexSpace`, `Operand`, `AccessPlan`, `ScheduleDomain`, `SchedPoint`, `Effect` | `ir::level1` | |
-| the whole tile dialect + `ArenaPlanner` + `KernelIr` | `ir::level2` | |
+| `Launch` (10 variants), `IndexSpace`, `Operand`, `AccessPlan`, `ScheduleDomain`, `SchedPoint`, `Effect` | `ir::launch` | |
+| the whole tile dialect + `ArenaPlanner` + `KernelIr` | `ir::kernel` | |
 | `Id`, `ClassId`, `EGraph`, `Builder`, `Facts`, `Rule`, `RuleTag`, `Saturate` | `egraph` | |
 | `Caps`, `Limits`, `CoopKind`, `DeviceKind` | `device` | `Limits::default()` is the **WebGPU baseline** |
 | `Picoseconds`, `DeviceFacts`, `LaunchPlan`, `CostModel`, `ShapeStats` | `cost` | |
@@ -96,7 +96,7 @@ fn work(&self, op: &Op, ins: &[ValueFacts], out: &ValueFacts) -> Work;
 fn verify(&self, cx: &VerifyCtx<'_>) -> Result<()>;
 fn effect(&self, op: &Op) -> Effect;
 
-// ir::level2::ArenaPlanner — object-safe; one impl in fusor2-tile
+// ir::kernel::ArenaPlanner — object-safe; one impl in fusor2-tile
 fn arena_plan(&self, ir: &KernelIr, caps: &Caps) -> Result<ArenaPlan>;
 fn workgroup_bytes(&self, tiles: &Tiles, caps: &Caps) -> Result<u32>;
 fn barrier_suggestions(&self, ir: &KernelIr) -> Vec<BarrierSuggestion>;
@@ -135,7 +135,7 @@ fn alloc(&self, bytes: u64, persistence: Persistence) -> Result<Buf>;
 fn wait(&self) -> Result<()>;
 
 // autograd::Tape — object-safe; AdjointFn takes &mut dyn Tape
-fn add(&mut self, op: L0) -> Result<Val>;
+fn add(&mut self, op: Logical) -> Result<Val>;
 fn facts(&self, v: Val) -> &ValueFacts;
 fn zeros_like(&mut self, v: Val) -> Result<Val>;
 fn map(&mut self, expr: ScalarExpr, ins: &[Val]) -> Result<Val>;
@@ -185,7 +185,7 @@ because something *would not pay* is a bug in this design, not a shortcut.
 ```rust
 rule!(
     FOLD_SPLIT,
-    level = Level::L0,
+    level = Level::Logical,
     head  = OpTag::Fold,
     tag   = RuleTag::Additive,
     apply = fold_split,
@@ -222,7 +222,7 @@ pub struct Planner;                       // impl ArenaPlanner, memoized
 impl Planner { pub fn new() -> Self; pub fn shared() -> Arc<dyn ArenaPlanner>; }
 
 pub fn verify_l2(ir: &KernelIr) -> Result<()>;
-pub struct TileBuilder;                   // hash-consing L2 term builders
+pub struct TileBuilder;                   // hash-consing Kernel term builders
 
 pub mod liveness  { pub struct LiveRange; pub struct LivenessInfo;
                     pub fn analyze(&KernelIr) -> LivenessInfo; }
@@ -418,7 +418,7 @@ surgical; none changes semantics.
 
 9. **`CoreSemantics` gained `with_registry(Arc<dyn ArenaPlanner>, OpDefRegistry)`**
    alongside the stated `new(Arc<dyn ArenaPlanner>) -> Arc<dyn Semantics>`,
-   because `L1::Ext` needs a populated registry and `new` gives an empty one.
+   because `Launch::Ext` needs a populated registry and `new` gives an empty one.
 
 10. **Each `fusor2-gpu::lower::<family>` / `fusor2-cpu::lower::<family>`
     submodule's `lower` omits the `Id` parameter** that the top-level
@@ -426,8 +426,8 @@ surgical; none changes semantics.
     bought nothing.
 
 Everything else — every type, field, method name, trait method signature and
-constant in the contracts listing — is verbatim. In particular `L0`'s ten nodes,
-`L1`'s ten variants, the full L2 dialect, `Layout`'s private fields with derived
+constant in the contracts listing — is verbatim. In particular `Logical`'s ten nodes,
+`Launch`'s ten variants, the full Kernel dialect, `Layout`'s private fields with derived
 contiguity, `Splat`'s bitwise eq/hash, and
 `Limits::default()`'s WebGPU baseline are exactly as specified.
 
@@ -442,8 +442,8 @@ does not move to `fusor2-ir`. Delete it, mint the alternative unconditionally,
 and let the realized-DAG cost in `fusor2-cost` reject it. Those four gates are
 exactly the phase-ordering bugs this design exists to remove.
 
-**`arena_plan` must be the same function at L1 and L2.** `verify_l1`'s footprint
-check, the L1 occupancy term and the L2 emitter's layout all read
+**`arena_plan` must be the same function at Launch and Kernel.** `verify_l1`'s footprint
+check, the Launch occupancy term and the Kernel emitter's layout all read
 `Planner::arena_plan`, memoized on `(geom, dtype, caps)`. If you add an estimator
-anywhere, you have reintroduced "extraction commits a plan that fails L2
+anywhere, you have reintroduced "extraction commits a plan that fails Kernel
 verification and silently falls back".

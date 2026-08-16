@@ -24,15 +24,11 @@
 
 use fusor2_ir::Result;
 use fusor2_ir::error::Error;
-use fusor2_ir::ir::level2::{BarrierSuggestion, KernelIr, Stmt};
+use fusor2_ir::ir::kernel::{BarrierSuggestion, KernelIr, Stmt};
 use rustc_hash::FxHashSet;
 
 use crate::arena;
 use crate::liveness::{LivenessInfo, TileAccess, analyze};
-
-// ---------------------------------------------------------------------------
-// Elision
-// ---------------------------------------------------------------------------
 
 /// Remove every removable barrier from `ir`. Returns how many were removed.
 pub fn elide_barriers(ir: &mut KernelIr) -> usize {
@@ -188,10 +184,6 @@ fn remove_stmt(body: &mut Vec<Stmt>, path: &[u32]) {
         },
     }
 }
-
-// ---------------------------------------------------------------------------
-// Insertion
-// ---------------------------------------------------------------------------
 
 /// Workgroup bytes the arena needs, taking the smaller of the two packings.
 /// Mode availability is a device question the planner answers; a suggestion

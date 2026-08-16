@@ -3,10 +3,8 @@
 //!
 //! Two facts shape this area. There is **no Bool**: a comparison returns
 //! 1/0 in its operand's own dtype, so `eq` on a `U32` yields a `U32`. And
-//! `cast` is differentiable in both directions, which is what makes an f32
-//! master weight with an f16 compute region a routing decision rather than a
-//! separate training mode — the gradient has to arrive back in the master
-//! dtype or the master silently stops learning.
+//! `cast` is differentiable in both directions: the gradient has to arrive
+//! back in the master dtype or the master silently stops learning.
 //!
 //! A device without f16 or bf16 support cannot run those rows. They return
 //! [`crate::harness::skip`], so the run log says `skip` and names the missing
@@ -122,9 +120,7 @@ pub fn cases() -> Cases {
         }));
     }
 
-    // Every ordered pair of dense dtypes. The forward cast surface is the
-    // whole matrix, including the f32->u32 and f16->u32 pairs the reference
-    // left open.
+    // Every ordered pair of dense dtypes.
     for from in DENSE {
         for to in DENSE {
             if from == to {

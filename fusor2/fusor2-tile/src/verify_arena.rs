@@ -1,20 +1,14 @@
-//! The independent all-pairs arena recheck: every byte-overlapping tile pair
-//! must be separated by a *guaranteed uniform* barrier. Failing lowering beats
-//! racing.
-//!
-//! "Independent" is load-bearing — this recomputes [`LivenessInfo`] from the
-//! body rather than reusing the packer's conclusion, and it checks **all**
-//! pairs where the packer's placement loop checked incrementally.
+//! All-pairs arena recheck: every byte-overlapping tile pair must be separated
+//! by a guaranteed uniform barrier. Recomputes [`LivenessInfo`] from the body
+//! independently of the packer.
 
 use fusor2_ir::Result;
 use fusor2_ir::error::Error;
-use fusor2_ir::ir::level2::{ArenaPlan, KernelIr, LowerError, Placement};
+use fusor2_ir::ir::kernel::{ArenaPlan, KernelIr, LowerError, Placement};
 
 use crate::liveness::{LivenessInfo, tile_key};
 
-/// True when two placements share any byte. In both arena modes a placement's
-/// interval means "these bytes", so this one test covers Regions and
-/// ByteArena alike.
+/// True when two placements share any byte, in either arena mode.
 pub fn bytes_overlap(a: &Placement, b: &Placement) -> bool {
     a.byte_offset < b.byte_offset + b.byte_len && b.byte_offset < a.byte_offset + a.byte_len
 }
@@ -25,8 +19,7 @@ pub fn verify_arena(ir: &KernelIr, plan: &ArenaPlan) -> Result<()> {
     verify_placements(&live, &plan.placements)
 }
 
-/// The all-pairs core, split out so it can be driven from a hand-built
-/// [`LivenessInfo`].
+/// Checks all placement pairs against a [`LivenessInfo`].
 pub fn verify_placements(live: &LivenessInfo, placements: &[Placement]) -> Result<()> {
     for (index, a) in placements.iter().enumerate() {
         for b in &placements[index + 1..] {
@@ -74,7 +67,7 @@ fn hazard(msg: String) -> Error {
 mod tests {
     use super::*;
     use crate::liveness::{BarrierInfo, LiveRange, TileLiveness};
-    use fusor2_ir::ir::level2::{
+    use fusor2_ir::ir::kernel::{
         MemoryLevel, ScalarElement, Tile, TileDecl, TileLayout,
     };
     use rustc_hash::FxHashMap;

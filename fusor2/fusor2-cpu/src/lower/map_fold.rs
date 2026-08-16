@@ -1,7 +1,7 @@
-//! `KMap` and `KFold` as SIMD loop nests with a register accumulator tile.
+//! `Map` and `Fold` as SIMD loop nests with a register accumulator tile.
 //!
-//! `KMap` reads its register-reuse tiling off `SchedPoint::Map(MapTiling)`
-//! (`dim`, `tm`, `vector`); `KFold` reads its strategy off
+//! `Map` reads its register-reuse tiling off `SchedPoint::Map(MapTiling)`
+//! (`dim`, `tm`, `vector`); `Fold` reads its strategy off
 //! `SchedPoint::Fold(FoldStrat)` and lowers all three: `Subgroup` to a
 //! horizontal reduce, `WgTree` to a tree over a scratch tile, and
 //! `LoopThenTree` to per-lane loop accumulation followed by that tree.
@@ -9,8 +9,8 @@
 use fusor2_ir::device::Caps;
 use fusor2_ir::error::Error;
 use fusor2_ir::carrier::{Carrier, SlotTy};
-use fusor2_ir::ir::level1::{FoldStrat, L1, SchedPoint};
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::launch::{FoldStrat, Launch, SchedPoint};
+use fusor2_ir::ir::kernel::{
     Addr, Builtin, ElementType, KernelIr, LocalDecl, MemoryLevel, ReduceKind, ScalarElement,
     StorageView, Stmt, TileDecl, TileExpr, TileExprKind, TileLayout, TileReduceOp, WorkgroupAxis,
 };
@@ -29,11 +29,10 @@ use super::{
 ///
 /// The resolved point decides it: `FoldStrat::Subgroup` runs one SIMD group
 /// wide, the two tree strategies run their own `lane_group` floored by the
-/// domain's default width. It is then **narrowed** by the axis — a width past
-/// `axis_extent` rounded up to a power of two is idle lanes and scratch bytes
-/// that are never read — and floored at 4 so the tree always has levels to
-/// walk. Narrowing is safe in both directions: the per-lane strided loop
-/// (`passes`) covers whatever the width does not.
+/// domain's default width. It is then narrowed by the axis and floored at 4
+/// so the tree always has levels to walk. Narrowing is safe in both
+/// directions: the per-lane strided loop (`passes`) covers whatever the width
+/// does not.
 fn fold_block(strat: FoldStrat, caps: &Caps, axis_extent: u32) -> u32 {
     let wide = match strat {
         FoldStrat::Subgroup => caps
@@ -48,17 +47,17 @@ fn fold_block(strat: FoldStrat, caps: &Caps, axis_extent: u32) -> u32 {
 }
 
 pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
-    let Op::L1(op) = &node.op else {
-        return Err(Error::Legality("not an L1 node".into()));
+    let Op::Launch(op) = &node.op else {
+        return Err(Error::Legality("not an Launch node".into()));
     };
     match op {
-        L1::KMap { .. } => lower_map(caps, node, theta, cx),
-        L1::KFold { .. } => lower_fold(caps, node, theta, cx),
+        Launch::Map { .. } => lower_map(caps, node, theta, cx),
+        Launch::Fold { .. } => lower_fold(caps, node, theta, cx),
         _ => Err(Error::Legality("map_fold got a foreign node".into())),
     }
 }
 
-fn view(buf: &Arc<fusor2_ir::ir::level2::BufferDecl>) -> StorageView {
+fn view(buf: &Arc<fusor2_ir::ir::kernel::BufferDecl>) -> StorageView {
     StorageView {
         buffer: Arc::clone(buf),
         offset: 0,
@@ -70,11 +69,11 @@ fn view(buf: &Arc<fusor2_ir::ir::level2::BufferDecl>) -> StorageView {
 /// when the tiling says so, so the loop-invariant operands stay resident in
 /// registers across the `tm` outputs.
 fn lower_map(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
-    let Op::L1(L1::KMap {
+    let Op::Launch(Launch::Map {
         space, body, ops, ..
     }) = &node.op
     else {
-        return Err(Error::Legality("not a KMap".into()));
+        return Err(Error::Legality("not a Map".into()));
     };
     let binds = Binds::build(cx)?;
     let uniforms = binds.buffers.first().cloned();
@@ -132,7 +131,7 @@ fn lower_map(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> 
 /// and finished by the strategy `theta` selected. The epilogue fuses straight
 /// onto the reduced value, so nothing is materialized in between.
 fn lower_fold(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
-    let Op::L1(L1::KFold {
+    let Op::Launch(Launch::Fold {
         space,
         axis,
         vec_axes,
@@ -142,9 +141,9 @@ fn lower_fold(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) ->
         ..
     }) = &node.op
     else {
-        return Err(Error::Legality("not a KFold".into()));
+        return Err(Error::Legality("not a Fold".into()));
     };
-    if !vec_axes.is_empty() || fusor2_ir::ir::level2::fast_reduce_op(carrier).is_none() {
+    if !vec_axes.is_empty() || fusor2_ir::ir::kernel::fast_reduce_op(carrier).is_none() {
         return lower_fold_carrier(caps, node, theta, cx);
     }
     let pre = &carrier.lift[0];
@@ -161,9 +160,7 @@ fn lower_fold(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) ->
     let inner: u32 = extents[axis + 1..].iter().product::<u32>().max(1);
     let outer: u32 = extents[..axis].iter().product::<u32>().max(1);
     let rows = (outer as u64) * (inner as u64);
-    // The width is the resolved point's, not a written-in tile. A point that
-    // names no lane group (a floor `ScheduleDomain::Point`, or a composite's
-    // point handed down by `compose`) falls back to the domain's own default
+    // A point that names no lane group falls back to the domain's own default
     // width — the same `emitted_block` the fold domain prices with, so the
     // number the cost model charged and the number this allocates agree.
     let strat = match theta {
@@ -174,13 +171,11 @@ fn lower_fold(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) ->
     };
     let block = fold_block(strat, caps, axis_extent);
 
-    // **One pass of the block covers `block` elements of the axis.** A body
-    // that reads `k = lane` and nothing else therefore reduces only the first
-    // `block` of them: an 8192-element sum came back as the sum of its first
-    // 256. Longer axes need a per-lane strided loop, and its counter has to
-    // enter the address — `ReduceKind::Loop` re-evaluates the staging
-    // expression per iteration, so an index-free body just combined the same
-    // element `iterations` times.
+    // One pass of the block covers `block` elements of the axis, so longer
+    // axes need a per-lane strided loop, and its counter has to enter the
+    // address: `ReduceKind::Loop` re-evaluates the staging expression per
+    // iteration, so an index-free body would combine the same element
+    // `iterations` times.
     let passes = axis_extent.div_ceil(block).max(1);
     let loop_index = (passes > 1).then(|| Arc::new(LocalDecl::new(u32_ty())));
 
@@ -264,9 +259,7 @@ fn lower_fold(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) ->
     // The group is the whole block, never the strategy's `lane_group`: this
     // kernel launches one workgroup per output row and every lane of it walks
     // that row's axis, so a tree over fewer lanes would drop the rest. The
-    // strategy chooses the *shape* — a plain tree or a loop then a tree — and
-    // the trip count comes from the extent, so a schedule point cannot ask for
-    // fewer passes than the axis needs.
+    // strategy chooses the shape; the trip count comes from the extent.
     let kind = match (&loop_index, strat) {
         (Some(index), _) => ReduceKind::Loop {
             iterations: passes,
@@ -314,24 +307,23 @@ fn lower_fold(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) ->
     })
 }
 
-/// Lower a `KFold` whose carrier is **wider than one hardware operator**.
+/// Lower a `Fold` whose carrier is wider than one hardware operator.
 ///
 /// One accumulator per carrier lane, seeded from that lane's own identity,
 /// absorbed with the carrier's own `merge`, and closed by `Stmt::Reduce`'s N-ary
 /// tree over one scratch tile per lane. The output carries `carrier.lanes()`
-/// values per row, matching the trailing carrier axis `infer_l1` appends.
+/// values per row, matching the trailing carrier axis `infer_launch` appends.
 ///
 /// The SIMD butterfly folds one register with one operator, so there is no
-/// horizontal-reduce form for a multi-lane merge and this always closes with the
-/// scratch tree — the barrier the tree needs is the segment split, which
-/// `stmt::block` performs around every collective statement.
+/// horizontal-reduce form for a multi-lane merge and this always closes with
+/// the scratch tree.
 fn lower_fold_carrier(
     caps: &Caps,
     node: &Node,
     theta: SchedPoint,
     cx: &LowerCtx<'_>,
 ) -> Result<KernelIr> {
-    let Op::L1(L1::KFold {
+    let Op::Launch(Launch::Fold {
         space,
         axis,
         vec_axes,
@@ -341,7 +333,7 @@ fn lower_fold_carrier(
         ..
     }) = &node.op
     else {
-        return Err(Error::Legality("not a KFold".into()));
+        return Err(Error::Legality("not a Fold".into()));
     };
     let merges = carrier.merge_lanes().ok_or_else(|| {
         Error::Legality("this carrier's merge does not expand to one expression per lane".into())
@@ -371,7 +363,7 @@ fn lower_fold_carrier(
     }
     // A promoted nest: `space` is `free.. ++ vec.. ++ [reduced]`, so one output
     // row spans `vec_extent * axis_extent` consecutive elements and a `Vector`
-    // slot is `vec_extent` registers. `verify_l1` establishes the contiguous
+    // slot is `vec_extent` registers. `verify_launch` establishes the contiguous
     // block; the reduced axis being last is what makes the address below one
     // multiply.
     let vec_extent: u32 = vec_axes
@@ -381,7 +373,7 @@ fn lower_fold_carrier(
         .max(1);
     if !vec_axes.is_empty() && axis + 1 != extents.len() {
         return Err(Error::Legality(
-            "a promoted KFold whose reduced axis is not last is not lowered".into(),
+            "a promoted Fold whose reduced axis is not last is not lowered".into(),
         ));
     }
     if vec_axes.is_empty() && carrier.slots.iter().any(|s| *s != SlotTy::Scalar) {
@@ -404,9 +396,7 @@ fn lower_fold_carrier(
         .product::<u32>()
         .max(1);
     let rows = (outer as u64) * (inner as u64);
-    // Same rule as the single-slot body: the width comes off the resolved
-    // point, so a multi-lane carrier honors the schedule decision extraction
-    // made.
+    // The width comes off the resolved point, same as the single-slot body.
     let strat = match theta {
         SchedPoint::Fold(s) => s,
         _ => FoldStrat::WgTree {
@@ -426,15 +416,13 @@ fn lower_fold_carrier(
     let outer_idx = bin(BinOp::Div, row.clone(), lit_u32(inner), u32_ty());
     let inner_idx = bin(BinOp::Rem, row.clone(), lit_u32(inner), u32_ty());
 
-    // One lifted value per lane at element `k`, each guarded to **its own**
-    // identity outside the reduced extent. A shared identity would let a padding
-    // lane count in Welford's constant `1` slot.
+    // One lifted value per lane at element `k`, each guarded to its own
+    // identity outside the reduced extent: a shared identity would let a
+    // padding lane count in Welford's constant `1` slot.
     //
-    // **Per-position operand addressing.** Lane `(slot, p)` reads every operand
-    // at promoted position `p`. An operand invariant in the promoted axes is
-    // read at the same address for every position and the emitter's own CSE
-    // collapses it to one load; one that varies is read once per position, as
-    // it must be.
+    // Lane `(slot, p)` reads every operand at promoted position `p`. An
+    // operand invariant in the promoted axes is read at the same address for
+    // every position and the emitter's CSE collapses it to one load.
     let lift_at = |k: TileExpr| -> Result<Vec<TileExpr>> {
         let mask = cmp(CmpOp::Lt, k.clone(), lit_u32(axis_extent));
         let row_elems = axis_extent.saturating_mul(vec_extent);
@@ -523,7 +511,7 @@ fn lower_fold_carrier(
         args.extend(values);
         let mut accumulators = Vec::with_capacity(lanes);
         for slot in 0..lanes {
-            accumulators.push(fusor2_ir::ir::level2::Accumulator {
+            accumulators.push(fusor2_ir::ir::kernel::Accumulator {
                 local: Arc::clone(&locals[slot]),
                 init: lit_f32(splat_f32(lane_ident[slot])),
                 update: Translate {
@@ -585,7 +573,7 @@ fn lower_fold_carrier(
             group_size: block,
         }),
         values: partials.into_iter().collect(),
-        merge: Box::new(fusor2_ir::ir::level2::MergeBody {
+        merge: Box::new(fusor2_ir::ir::kernel::MergeBody {
             lhs,
             rhs,
             body: merge_body,
@@ -644,12 +632,12 @@ fn splat_f32(s: fusor2_ir::dtype::Splat) -> f32 {
     }
 }
 
-/// The hardware collective this carrier reduces with, or an honest `Err`.
+/// The hardware collective this carrier reduces with.
 ///
 /// `Carrier::kind()` — one scalar slot merged by a binop — mapped onto
 /// `TileReduceOp`. A multi-slot or promoted carrier needs N accumulators and
-/// an N-lane reduce, which this emitter does not have; refusing is the point,
-/// because reducing slot 0 and dropping the rest is a wrong answer.
+/// an N-lane reduce, which this emitter does not have, so it refuses rather
+/// than reducing slot 0 and dropping the rest.
 pub(crate) fn reduce_op(c: &Carrier) -> Result<TileReduceOp> {
     if c.width() != 1 || c.slots[0] != SlotTy::Scalar {
         return Err(Error::Legality(format!(
@@ -701,10 +689,10 @@ mod tests {
             .unwrap();
         assert!(reduce_op(&promoted).is_err());
     }
-    /// **A firing test on the runner, not just the lowering.** A three-slot
-    /// Welford carrier compiled through the CPU emitter and executed against a
-    /// two-pass variance: the merge tape has to run at every tree level, for
-    /// every lane, or `n` comes back plausible and `m2` comes back wrong.
+    /// A three-slot Welford carrier compiled through the CPU emitter and
+    /// executed against a two-pass variance: the merge tape has to run at
+    /// every tree level, for every lane, or `n` comes back plausible and `m2`
+    /// comes back wrong.
     #[test]
     fn a_three_slot_carrier_runs_and_matches_a_two_pass_variance() {
         use crate::alloc::AlignedBuf;
@@ -764,19 +752,16 @@ mod tests {
         }
     }
 
-    /// **A promoted nest, compiled and executed, against a host sum.**
+    /// A promoted nest, compiled and executed, against a host sum.
     ///
     /// `space = [rows, dh, k]` with `vec_axes = [1]` is the shape PROMOTE
     /// mints: the reduction runs over `k`, and the free axis `dh` has moved
-    /// out of the iteration domain into `dh` live accumulators. The value it
-    /// must produce is the ordinary `sum_k x[r, d, k]` — so this test says the
-    /// promoted spelling and the obvious one agree, which is the only thing
-    /// that makes the rebinding worth anything.
+    /// out of the iteration domain into `dh` live accumulators. The value must
+    /// be the ordinary `sum_k x[r, d, k]`.
     ///
-    /// The lift is `Arg(0)`, read **per position**: if the lowering addressed
-    /// its operand once per iteration step instead of once per (step,
-    /// position), every accumulator would receive position 0's data and `dh -
-    /// 1` of the `dh` outputs would be wrong while the first stayed right.
+    /// The lift is `Arg(0)`, read per position: if the lowering addressed its
+    /// operand once per iteration step instead of once per (step, position),
+    /// every accumulator would receive position 0's data.
     #[test]
     fn a_promoted_nest_runs_and_matches_a_host_sum() {
         use crate::alloc::AlignedBuf;
@@ -833,7 +818,7 @@ mod tests {
         fold_kernel_in(carrier, &[rows as u64, axis as u64], 1, &[])
     }
 
-    /// [`fold_kernel`] over an explicit space, so a **promoted** nest can be
+    /// [`fold_kernel`] over an explicit space, so a promoted nest can be
     /// compiled and run here too.
     fn fold_kernel_in(
         carrier: Carrier,
@@ -842,16 +827,16 @@ mod tests {
         vec_axes: &[u32],
     ) -> KernelIr {
         use fusor2_ir::egraph::EGraph;
-        use fusor2_ir::extract::{BindKind, BindingPlan, Extraction, Launch, Plan, PlanHash};
-        use fusor2_ir::ir::level0::{BufferId, L0, LeafKind};
-        use fusor2_ir::ir::level1::{AccessPlan, IndexSpace, Operand, ScheduleDomain};
+        use fusor2_ir::extract::{BindKind, BindingPlan, Extraction, Dispatch, Plan, PlanHash};
+        use fusor2_ir::ir::logical::{BufferId, Logical, LeafKind};
+        use fusor2_ir::ir::launch::{AccessPlan, IndexSpace, Operand, ScheduleDomain};
         use fusor2_ir::scalar::ScalarExpr;
         use fusor2_ir::semantics::{CoreSemantics, SumArenaPlanner};
         use fusor2_ir::shape::{Dim, Layout};
 
         let mut g = EGraph::new(CoreSemantics::new(Arc::new(SumArenaPlanner)));
         let x = g
-            .add(fusor2_ir::ir::Op::L0(L0::Leaf(LeafKind::Buffer {
+            .add(fusor2_ir::ir::Op::Logical(Logical::Leaf(LeafKind::Buffer {
                 name: BufferId(0),
                 dtype: Dtype::F32,
                 shape: dims.iter().map(|d| Dim::Const(*d)).collect(),
@@ -859,7 +844,7 @@ mod tests {
             .unwrap();
         let width = carrier.width();
         let k = g
-            .add(fusor2_ir::ir::Op::L1(L1::KFold {
+            .add(fusor2_ir::ir::Op::Launch(Launch::Fold {
                 space: IndexSpace::new(dims.iter().map(|d| Dim::Const(*d))),
                 axis,
                 vec_axes: vec_axes.iter().copied().collect(),
@@ -878,7 +863,7 @@ mod tests {
             .unwrap();
         let plan = Plan {
             extraction: Extraction::default(),
-            launches: vec![Launch {
+            launches: vec![Dispatch {
                 root: k,
                 members: smallvec::smallvec![k],
                 bindings: vec![

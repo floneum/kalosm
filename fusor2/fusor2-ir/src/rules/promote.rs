@@ -6,55 +6,38 @@
 //! `SlotTy::Scalar -> SlotTy::Vector(D_d)`.
 //!
 //! ```text
-//! KFold{space, axis a, vec_axes V, C}  ==  KFold{space, axis a, vec_axes V u {d}, C.promote(D_d)}
+//! Fold{space, axis a, vec_axes V, C}  ==  Fold{space, axis a, vec_axes V u {d}, C.promote(D_d)}
 //! ```
 //!
-//! `d` is *free*, which by definition means it carries no dependence, so
-//! nothing in the dependence graph changes and the rewrite is unconditionally
-//! value-preserving — on an f16 accumulator and under `NumericContract::STRICT`
-//! alike. **There is no `reassoc` guard here and requiring one would be a bug.**
-//! Only the footprint changes, and footprint is a legality guard against caps,
-//! not a cost term.
+//! `d` is free, so the rewrite is unconditionally value-preserving and
+//! carries no `reassoc` guard. Only the footprint changes, and footprint is a
+//! legality guard against caps, not a cost term.
 //!
-//! **The spelling is a rebinding, not a deletion.** `space` is unchanged as a
-//! list of dims; what moves is the partition point between iterated axes and
-//! accumulated axes. Operand address maps are stated against the full `space`
-//! and are untouched — that is the whole reason this spelling is correct, and
-//! it is why a positional term already written against the reduction's own
-//! space (a causal `select(IndexOf(lk) <= IndexOf(lq) + d, ..)`) survives with
-//! no renumbering at all. What *does* change is that the node's own
-//! expressions — `carrier.lift`, `carrier.merge`, `post` — are written against
-//! [`L1::iter_space`], so every `IndexOf(j)` with `j > d` renumbers down by
-//! one. The positionwise guard is exactly the statement that there is no
-//! `IndexOf(d)` to lose.
+//! The spelling is a rebinding, not a deletion: `space` is unchanged, only
+//! the partition point between iterated and accumulated axes moves. Operand
+//! address maps are stated against the full `space` and are untouched. The
+//! node's own expressions — `carrier.lift`, `carrier.merge`, `post` — are
+//! written against [`Launch::iter_space`], so every `IndexOf(j)` with `j > d`
+//! renumbers down by one; the positionwise guard is the statement that there
+//! is no `IndexOf(d)` to lose.
 //!
-//! **Repeated promotion coalesces in the algebra**: an existing `Vector(d0)`
-//! becomes `Vector(d0 * extent)`, row-major over `vec_axes` in ascending order,
-//! so `TM x TN` register tiling is two steps of exactly this rewrite. The
-//! *rule* mints the first step only; the note beside [`promote`] gives the
-//! measurement that stopped it there and what has to move for the rest.
+//! Repeated promotion coalesces in the algebra: an existing `Vector(d0)`
+//! becomes `Vector(d0 * extent)`, row-major over `vec_axes` in ascending
+//! order, so `TM x TN` register tiling is two steps of this rewrite. The rule
+//! mints the first step only; see the note beside [`promote`].
 //!
 //! The inverse — flattening a promoted slot back into a free axis — is minted
 //! too, so promotion and no promotion stay live in one class and compete on
 //! cost. Partial promotion needs no mode of its own: a strip-mine splits `D`
-//! into `(D/DB, DB)` and this law promotes the inner factor, so a head
-//! dimension too wide for registers degrades continuously instead of falling
-//! off a legality cliff.
+//! into `(D/DB, DB)` and this law promotes the inner factor.
 //!
-//! Nothing here mentions attention, a matmul, a lane tile or a scatter. The
-//! matcher is `L1::KFold` plus five decidable guards; every case in the design
-//! note — flash's output accumulator, SGEMM's `TN` / `TM x TN` register tile,
-//! the CPU's `f32xW` lane tile, a scatter's private per-bin accumulator, a
-//! `(value, index)` max-pool carrier — is the same firing at a different node.
-//!
-//! [`CORE_RULES`](crate::rules::CORE_RULES) registers `PROMOTE`;
-//! it does **not** register [`PROMOTE_FLATTEN`], because the table's length is
-//! fixed.
+//! [`CORE_RULES`](crate::rules::CORE_RULES) registers `PROMOTE`; it does not
+//! register [`PROMOTE_FLATTEN`].
 
 use crate::carrier::{Carrier, SlotTy};
 use crate::device::Caps;
 use crate::egraph::{Builder, Facts, Id, RuleTag};
-use crate::ir::level1::{IndexSpace, L1};
+use crate::ir::launch::{IndexSpace, Launch};
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
 use crate::scalar::{ScalarExpr, ScalarKind};
@@ -63,39 +46,31 @@ use smallvec::SmallVec;
 
 rule!(
     PROMOTE,
-    level = Level::L1,
-    head = OpTag::KFold,
+    level = Level::Launch,
+    head = OpTag::LaunchFold,
     tag = RuleTag::Additive,
     apply = promote,
 );
 
 rule!(
     PROMOTE_FLATTEN,
-    level = Level::L1,
-    head = OpTag::KFold,
+    level = Level::Launch,
+    head = OpTag::LaunchFold,
     tag = RuleTag::Additive,
     apply = promote_flatten,
 );
 
 /// Bytes one invocation may hold in private accumulator registers.
 ///
-/// **This belongs in `DeviceFacts` as a calibrated field**, beside `launch_ps`
-/// and `mac_per_us`; it is here because neither `Caps` nor `DeviceFacts`
-/// carries a register budget today, and a guard that reads a limit which does
-/// not exist is a guard that does not run. 256 B is 64 `f32` lanes: the widest
-/// accumulator the shipped geometries actually ask for (an 8x8 SGEMM register
-/// tile, a 64-wide head dimension, an `f32x8` lane tile times 8 unrolls), and
-/// small enough that a promotion which would spill declines instead of minting
-/// a plan the arena cannot place. Over budget the rule DECLINES; the continuous
-/// fallback is strip-then-promote, which the e-graph reaches on a later round.
+/// TODO: belongs in `DeviceFacts` as a calibrated field; neither `Caps` nor
+/// `DeviceFacts` carries a register budget today. 256 B is 64 `f32` lanes,
+/// the widest accumulator the shipped geometries ask for. Over budget the
+/// rule declines; the fallback is strip-then-promote, reached on a later
+/// round.
 pub fn private_acc_bytes(caps: &Caps) -> u64 {
     let _ = caps;
     256
 }
-
-// ---------------------------------------------------------------------------
-// The law
-// ---------------------------------------------------------------------------
 
 /// One promotion's worth of node state. `space`, `ops` and `sched` never
 /// change, which is the whole point of the rebinding spelling.
@@ -108,13 +83,12 @@ struct Promoted {
 
 /// Move the innermost free axis into the accumulator.
 ///
-/// `d` is position `axis - 1`, and the promoted nest joins the unpromoted one's
-/// class, so promotion and no promotion are both live and compete on cost.
-/// Which *other* free axis to promote instead stays reachable through the
-/// interchange the schedule domain carries; no rule here ranks them. Why one
-/// axis and not the whole chain is the note below.
+/// `d` is position `axis - 1`, and the promoted nest joins the unpromoted
+/// one's class, so promotion and no promotion are both live and compete on
+/// cost. Which other free axis to promote instead stays reachable through the
+/// interchange the schedule domain carries.
 pub fn promote(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::L1(L1::KFold {
+    let Op::Launch(Launch::Fold {
         space,
         axis,
         vec_axes,
@@ -127,7 +101,7 @@ pub fn promote(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Optio
     else {
         return None;
     };
-    // ONE axis per firing, and only out of a nest whose accumulator is still
+    // One axis per firing, and only out of a nest whose accumulator is still
     // wholly in the iteration domain. See the note below the function.
     if !vec_axes.is_empty() {
         return None;
@@ -144,11 +118,11 @@ pub fn promote(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Optio
     let next = promote_once(space, axis, *acc, &state, f)?;
     let got = fold_out_shape(space, axis, &next.vec_axes, &next.carrier)?;
     // The output shape is identical whenever the carrier appended nothing
-    // before; a carrier that already had a slot axis absorbs the promoted axis
-    // into it and a pure alias puts it back. Decide before minting.
+    // before; a carrier that already had a slot axis absorbs the promoted
+    // axis and a pure alias puts it back. Decide before minting.
     let view = recovery_view(carrier, &got, &want)?;
     let fold = b
-        .add_l1(L1::KFold {
+        .add_launch(Launch::Fold {
             space: space.clone(),
             axis: axis as u32,
             vec_axes: next.vec_axes,
@@ -161,52 +135,27 @@ pub fn promote(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Optio
         .ok()?;
     let value = apply_view(b, fold, &view)?;
 
-    // The invariant, checked against inference rather than assumed: **this law
-    // does not change the node's `ValueFacts` at all.** A botched renumbering
-    // or a mis-ordered recovery view shows up here as a shape mismatch instead
-    // of as a wrong number on a device.
+    // This law does not change the node's `ValueFacts` at all: a botched
+    // renumbering or mis-ordered recovery view shows up here as a shape
+    // mismatch instead of as a wrong number on a device.
     if !shapes_eq(&b.facts_of(value).shape, &want) {
         return None;
     }
     b.union(id, value).ok()
 }
 
-// ---------------------------------------------------------------------------
-// WHY ONE AXIS PER FIRING, and why a nest that is already promoted is not
-// promoted again.
-//
-// The law itself composes: `Carrier::promote` coalesces `Vector(d0)` into
-// `Vector(d0*e)` and `vec_axes` grows row-major, so `TM x TN` is two steps of
-// exactly this rewrite and the algebra is asserted in
-// `the_carrier_algebra_coalesces_to_tm_times_tn`. What does *not* compose is
-// the node's shape. Inference spells a `KFold`'s result as
-// `space - axis - vec_axes ++ [carrier.lanes()]`, so the FIRST promotion of a
-// single-slot carrier is shape-preserving — the axis leaves the free list and
-// comes straight back as the carrier's lanes — and every promotion after it
-// flattens two trailing axes into one. Recovering the original shape then
-// needs a reshape node, and that node is not free:
-//
-//   * on the chain `attention_defn` emits, minting the deeper promotions took
-//     saturation from 5 rounds to 7 against a shipped budget of 6, and the
-//     graph from 70 to 161 nodes — `attention_defn_saturates` fails on the GPU
-//     for that reason alone;
-//   * the three `attention_*_launch_ceiling` cases each gained two dispatches,
-//     because the extra alternatives crowd the extractor's move budget.
-//
-// Both are of *everyone's* budget, spent on an alternative neither backend can
-// lower today (`lower_kfold_carrier` and `lower_fold_carrier` refuse a
-// non-empty `vec_axes`). So the rewrite stops where the node's facts stop being
-// preserved, and `promote_declines_to_deepen_an_existing_promotion` pins the
-// limit rather than leaving it to be rediscovered. Re-enabling the chain is
-// deleting the `vec_axes.is_empty()` guard; what has to move first is the shape
-// convention, because a `KFold` that reported its promoted axes in place rather
-// than flattened into one carrier axis would make every step of the chain
-// shape-preserving and delete the reshape entirely.
+// One axis per firing: the first promotion of a single-slot carrier is
+// shape-preserving — the axis leaves the free list and comes straight back as
+// the carrier's lanes — but every promotion after it flattens two trailing
+// axes into one and needs a recovery reshape, which crowds the shared
+// saturation and extraction budgets on an alternative neither backend can
+// lower today. `promote_declines_to_deepen_an_existing_promotion` pins the
+// limit. Re-enabling the chain is deleting the `vec_axes.is_empty()` guard;
+// the shape convention has to move first.
 //
 // A multi-slot carrier's FIRST promotion does need the alias — its slot axis
 // was already there — and is minted, because there is one of those per nest
 // rather than one per axis.
-// ---------------------------------------------------------------------------
 
 /// One step: promote the innermost remaining free axis, or `None`.
 fn promote_once(
@@ -219,11 +168,9 @@ fn promote_once(
     let d = promotable_axis(space, axis, &state.vec_axes)?;
 
     // 1. Positionwise in `d`. No expression on the node may read `IndexOf(d)`,
-    //    and every `Arg` in a merge must be a slot reference. Carrier
-    //    expressions are built from Arg/Lit/Uniform/Bin/Un/Cmp/Select/Cast
-    //    alone, so this is a syntactic walk, not an analysis — and extending it
-    //    to `lift` and `post`, not `merge` alone, is what stops an ALiBi, rope
-    //    or positional term being silently detached from its coordinate.
+    //    and every `Arg` in a merge must be a slot reference. Checking `lift`
+    //    and `post` too, not `merge` alone, is what stops a positional term
+    //    being silently detached from its coordinate.
     //
     //    `d`'s iteration index *is* `d`: every already-promoted axis sits
     //    between `d` and `axis`, so removing them renumbers nothing at or
@@ -232,13 +179,12 @@ fn promote_once(
         return None;
     }
 
-    // 2. A constant extent. `Dim::Sym` declines honestly: a symbolic private
-    //    array is allocatable on neither backend, and a too-permissive guard
-    //    here is a crash, not a slow plan.
+    // 2. A constant extent: a symbolic private array is allocatable on
+    //    neither backend.
     let extent = *space.dims.get(d)?;
     let e = extent.as_const()?;
-    // A unit axis promotes to a `Vector(1)` slot: the same one register under a
-    // different name, so there is no alternative to mint.
+    // A unit axis promotes to a `Vector(1)` slot: the same one register under
+    // a different name, so there is no alternative to mint.
     if e <= 1 {
         return None;
     }
@@ -246,13 +192,12 @@ fn promote_once(
     // 3. `acc` is wide enough for the value's contract. Read on `own()`, never
     //    `numeric(0)`: `own().numeric` is the meet over every operand and a
     //    multi-operand fold makes the operand-0 accessor blind to the rest.
-    //    No `reassoc` guard: promotion reassociates nothing.
     if acc.accum_bits() < f.own().numeric.min_accum_bits {
         return None;
     }
 
     // 4. Every slot must carry the same lane count, which is what
-    //    `verify_l1`'s `lanes == positions * width` clause means and what
+    //    `verify_launch`'s `lanes == positions * width` clause means and what
     //    makes slot readback a single strided view.
     equal_slot_lanes(&state.carrier)?;
 
@@ -286,12 +231,11 @@ fn promote_once(
 /// The inverse: flatten the outermost promoted axis back into the iteration
 /// domain, so full, partial and no promotion all stay live in one class.
 ///
-/// Guarded on the same positionwise condition read backwards — the flattened
-/// axis's coordinate is one no expression referred to, because it was not in
-/// the iteration space, so the renumbering that reintroduces it is a pure
-/// shift up.
+/// The flattened axis's coordinate is one no expression referred to — it was
+/// not in the iteration space — so the renumbering that reintroduces it is a
+/// pure shift up.
 pub fn promote_flatten(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::L1(L1::KFold {
+    let Op::Launch(Launch::Fold {
         space,
         axis,
         vec_axes,
@@ -343,7 +287,7 @@ pub fn promote_flatten(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) 
         ..flattened
     };
     let fold = b
-        .add_l1(L1::KFold {
+        .add_launch(Launch::Fold {
             space: space.clone(),
             axis: axis as u32,
             vec_axes: new_vec,
@@ -359,10 +303,6 @@ pub fn promote_flatten(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) 
     }
     b.union(id, fold).ok()
 }
-
-// ---------------------------------------------------------------------------
-// Guards
-// ---------------------------------------------------------------------------
 
 /// The innermost free axis of a well-formed reduction nest, or `None`.
 ///
@@ -383,10 +323,8 @@ fn promotable_axis(space: &IndexSpace, axis: usize, vec_axes: &[u32]) -> Option<
 }
 
 /// No expression on the node reads `IndexOf(axis)`, and every `Arg` a merge
-/// reads is a slot of the accumulator.
-///
-/// This is the condition that correctly **refuses** to promote an axis the
-/// accumulator itself depends on positionally.
+/// reads is a slot of the accumulator — the condition that refuses to promote
+/// an axis the accumulator depends on positionally.
 fn positionwise_in(carrier: &Carrier, post: &[ScalarExpr], axis: u32) -> bool {
     if carrier.reads_index_of(axis) || post.iter().any(|e| reads_index_of(e, axis)) {
         return false;
@@ -398,7 +336,7 @@ fn positionwise_in(carrier: &Carrier, post: &[ScalarExpr], axis: u32) -> bool {
         .all(|m| max_arg(m).is_none_or(|a| a < 2 * w))
 }
 
-/// Every slot carries the same lane count — `verify_l1`'s
+/// Every slot carries the same lane count — `verify_launch`'s
 /// `lanes == positions * width` clause, checked before minting rather than
 /// after.
 fn equal_slot_lanes(carrier: &Carrier) -> Option<u64> {
@@ -410,11 +348,7 @@ fn equal_slot_lanes(carrier: &Carrier) -> Option<u64> {
         .then_some(first)
 }
 
-// ---------------------------------------------------------------------------
-// Shapes and the recovery view
-// ---------------------------------------------------------------------------
-
-/// The output shape of a `KFold`, spelled exactly as inference spells it: the
+/// The output shape of a `Fold`, spelled exactly as inference spells it: the
 /// space minus the reduced axis and every promoted axis, then the carrier's
 /// lane count appended.
 fn fold_out_shape(
@@ -465,11 +399,9 @@ type Recovery = SmallVec<[(u64, u32); 4]>;
 /// * `q == 1` — the slots were scalars, so the slot axis is the outermost
 ///   stride and the view transposes it past the promoted positions.
 ///
-/// With several slots that are *already* vectors the lane index needs a divmod
-/// of the wanted axis, which a `StrideSpec` vector cannot express, and the rule
-/// declines. Nothing on the design's case list needs it: promotion runs before
-/// tupling, so a carrier that is both wide and promoted is built by joining
-/// promoted carriers rather than by promoting a joined one.
+/// With several slots that are *already* vectors the lane index needs a
+/// divmod of the wanted axis, which a `StrideSpec` vector cannot express, and
+/// the rule declines.
 fn recovery_view(base: &Carrier, got: &[Dim], want: &[Dim]) -> Option<Recovery> {
     if shapes_eq(got, want) {
         return Some(Recovery::new());
@@ -513,21 +445,12 @@ fn recovery_view(base: &Carrier, got: &[Dim], want: &[Dim]) -> Option<Recovery> 
 /// Mint the recovery view, if any: the pure alias that reads the promoted
 /// node's flattened carrier axis back at the pre-promotion shape.
 ///
-/// **It is minted at L1, already lowered.** The obvious spelling is an
-/// `L0::Restride`, and the view *is* a restride — the specs are built here and
-/// handed to the same [`composed_layout`](crate::rules::composed_layout)
-/// `LOWER_RESTRIDE` uses, so the node is byte-for-byte the one that rule would
-/// have minted from it. What minting the L0 form costs is a round:
-/// `Restride -> KMap -> operand plans` is a three-round cascade, and on the
-/// chain `attention_defn` emits that pushed saturation from 5 rounds to 7
-/// against a shipped budget of 6 — measured, with the whole difference in
-/// `LOWER_RESTRIDE` firing 17 times instead of 2. A law is not entitled to two
-/// rounds of everyone else's budget to say "and here is the same value at its
-/// original shape".
-///
-/// The price is that L0 view algebra cannot compose with it. Nothing needs
-/// that: every `Restride` in the system reaches extraction as exactly this
-/// node, and `FOLD_VIEWS_INTO_INDEX` and `SINK_EPILOGUE` both act at L1.
+/// Minted at Launch, already lowered: the specs are handed to the same
+/// [`composed_layout`](crate::rules::composed_layout) `LOWER_RESTRIDE` uses,
+/// so the node is byte-for-byte the one that rule would have minted, without
+/// spending saturation rounds on the `Restride -> Map -> operand plans`
+/// cascade. Logical view algebra cannot compose with it; nothing needs to —
+/// `FOLD_VIEWS_INTO_INDEX` and `SINK_EPILOGUE` both act at Launch.
 fn apply_view(b: &mut Builder<'_>, fold: Id, view: &Recovery) -> Option<Id> {
     if view.is_empty() {
         return Some(fold);
@@ -550,10 +473,6 @@ fn apply_view(b: &mut Builder<'_>, fold: Id, view: &Recovery) -> Option<Id> {
     let out: Dims = specs.iter().map(|s| s.size).collect();
     crate::rules::lower_floor::floor_alias_map(b, fold, layout, &out, dtype)
 }
-
-// ---------------------------------------------------------------------------
-// Expression helpers
-// ---------------------------------------------------------------------------
 
 /// The inverse of [`Carrier::promote`] at one axis: `Vector(d0*e)` becomes
 /// `Vector(d0)`, or `Scalar` when the whole slot was that axis.
@@ -582,9 +501,8 @@ fn demote(c: &Carrier, e: u64) -> Option<Carrier> {
 }
 
 /// Renumber `IndexOf(j)` to `IndexOf(j + by)` for every `j > from` (shifting
-/// down, `by < 0`) or `j >= from` (shifting up). Every other node rides through
-/// untouched, which is what keeps an operand read and a literal exactly where
-/// they were.
+/// down, `by < 0`) or `j >= from` (shifting up). Every other node rides
+/// through untouched.
 fn shift_index_of(e: &ScalarExpr, from: u32, by: i32) -> ScalarExpr {
     use ScalarKind as K;
     let rec = |x: &ScalarExpr| shift_index_of(x, from, by);
@@ -653,17 +571,15 @@ mod tests {
     use super::*;
     use crate::carrier::SlotTy;
     use crate::dtype::{Dtype, Splat};
-    use crate::ir::level0::L0;
+    use crate::ir::logical::Logical;
     use crate::egraph::{EGraph, Rule, SaturationBudget, Saturate};
-    use crate::ir::level0::{EinSpec, Label};
-    use crate::ir::level1::{AccessPlan, Operand, ScheduleDomain, SgemmParams};
+    use crate::ir::logical::{EinSpec, Label};
+    use crate::ir::launch::{AccessPlan, Operand, ScheduleDomain, SgemmParams};
     use crate::rules::test_support as ts;
     use crate::rules::{CORE_RULES, alias_operand_of, ident_expr};
     use crate::saturate::CoreSaturate;
     use crate::scalar::{BinOp, CmpOp, UnOp};
     use smallvec::smallvec;
-
-    // ---- fixtures ------------------------------------------------------
 
     fn fire(g: &mut EGraph, id: Id, r: &Rule) -> Option<Id> {
         let caps = ts::caps();
@@ -677,7 +593,7 @@ mod tests {
         v.iter().copied().map(Dim::Const).collect()
     }
 
-    /// A `KFold` with an explicit `post` vector, which `ts::kfold` cannot
+    /// A `Fold` with an explicit `post` vector, which `ts::kfold` cannot
     /// spell because it takes one expression.
     #[allow(clippy::too_many_arguments)]
     fn kfold_n(
@@ -690,7 +606,7 @@ mod tests {
         post: &[ScalarExpr],
         ops: Vec<Operand>,
     ) -> Id {
-        g.add(Op::L1(L1::KFold {
+        g.add(Op::Launch(Launch::Fold {
             space: IndexSpace::new(space.iter().copied()),
             axis,
             vec_axes: vec_axes.iter().copied().collect(),
@@ -712,17 +628,17 @@ mod tests {
         )])
     }
 
-    fn kfold_of(g: &EGraph, id: Id) -> Option<L1> {
+    fn kfold_of(g: &EGraph, id: Id) -> Option<Launch> {
         match &g.node(id).op {
-            Op::L1(k @ L1::KFold { .. }) => Some(k.clone()),
+            Op::Launch(k @ Launch::Fold { .. }) => Some(k.clone()),
             _ => None,
         }
     }
 
-    /// The node an identity-bodied alias `KMap` reads — the shape this law
+    /// The node an identity-bodied alias `Map` reads — the shape this law
     /// mints its recovery view in.
     fn view_source(g: &EGraph, id: Id) -> Option<Id> {
-        let Op::L1(L1::KMap { body, ops, .. }) = &g.node(id).op else {
+        let Op::Launch(Launch::Map { body, ops, .. }) = &g.node(id).op else {
             return None;
         };
         let [op] = &ops[..] else { return None };
@@ -730,8 +646,8 @@ mod tests {
             .then_some(op.src)
     }
 
-    /// Every promoted `KFold` in `id`'s class, following a recovery view.
-    fn promoted_members(g: &EGraph, id: Id) -> Vec<(Id, L1)> {
+    /// Every promoted `Fold` in `id`'s class, following a recovery view.
+    fn promoted_members(g: &EGraph, id: Id) -> Vec<(Id, Launch)> {
         g.chain(id)
             .into_iter()
             .flat_map(|m| {
@@ -739,16 +655,16 @@ mod tests {
                 let viewed = view_source(g, m).and_then(|x| kfold_of(g, x).map(|k| (x, k)));
                 direct.into_iter().chain(viewed)
             })
-            .filter(|(_, k)| matches!(k, L1::KFold { vec_axes, .. } if !vec_axes.is_empty()))
+            .filter(|(_, k)| matches!(k, Launch::Fold { vec_axes, .. } if !vec_axes.is_empty()))
             .collect()
     }
 
     /// The nest with `n` axes promoted, following a recovery view when the
     /// carrier's own slot axis made one necessary.
-    fn promoted_at(g: &EGraph, id: Id, n: usize) -> Option<(Id, L1)> {
+    fn promoted_at(g: &EGraph, id: Id, n: usize) -> Option<(Id, Launch)> {
         promoted_members(g, id)
             .into_iter()
-            .find(|(_, k)| matches!(k, L1::KFold { vec_axes, .. } if vec_axes.len() == n))
+            .find(|(_, k)| matches!(k, Launch::Fold { vec_axes, .. } if vec_axes.len() == n))
     }
 
     /// **Every member of the class carries the same `ValueFacts`.** A promoted
@@ -762,8 +678,8 @@ mod tests {
         }
     }
 
-    fn lanes_of(k: &L1) -> u64 {
-        let L1::KFold { carrier, .. } = k else {
+    fn lanes_of(k: &Launch) -> u64 {
+        let Launch::Fold { carrier, .. } = k else {
             panic!("not a fold")
         };
         carrier.lanes().unwrap()
@@ -771,18 +687,18 @@ mod tests {
 
     /// A planner that admits everything. Every nest this law mints carries
     /// `ScheduleDomain::Point`, so the verifier never asks it for a byte
-    /// figure; it exists so this module can run the **real** `verify_l1` over
+    /// figure; it exists so this module can run the **real** `verify_launch` over
     /// the nodes the law mints rather than asserting they are well-formed.
     struct NullPlanner;
 
-    impl crate::ir::level2::ArenaPlanner for NullPlanner {
+    impl crate::ir::kernel::ArenaPlanner for NullPlanner {
         fn arena_plan(
             &self,
-            _ir: &crate::ir::level2::KernelIr,
+            _ir: &crate::ir::kernel::KernelIr,
             _caps: &Caps,
-        ) -> crate::error::Result<crate::ir::level2::ArenaPlan> {
-            Ok(crate::ir::level2::ArenaPlan {
-                mode: crate::ir::level2::ArenaMode::Regions,
+        ) -> crate::error::Result<crate::ir::kernel::ArenaPlan> {
+            Ok(crate::ir::kernel::ArenaPlan {
+                mode: crate::ir::kernel::ArenaMode::Regions,
                 total_bytes: 0,
                 placements: Default::default(),
                 barriers_inserted: Default::default(),
@@ -790,33 +706,33 @@ mod tests {
         }
         fn workgroup_bytes(
             &self,
-            _tiles: &crate::ir::level2::Tiles,
+            _tiles: &crate::ir::kernel::Tiles,
             _caps: &Caps,
         ) -> crate::error::Result<u32> {
             Ok(0)
         }
         fn barrier_suggestions(
             &self,
-            _ir: &crate::ir::level2::KernelIr,
-        ) -> Vec<crate::ir::level2::BarrierSuggestion> {
+            _ir: &crate::ir::kernel::KernelIr,
+        ) -> Vec<crate::ir::kernel::BarrierSuggestion> {
             Vec::new()
         }
         fn verify_arena(
             &self,
-            _ir: &crate::ir::level2::KernelIr,
-            _plan: &crate::ir::level2::ArenaPlan,
+            _ir: &crate::ir::kernel::KernelIr,
+            _plan: &crate::ir::kernel::ArenaPlan,
         ) -> crate::error::Result<()> {
             Ok(())
         }
         fn verify_uniformity(
             &self,
-            _ir: &crate::ir::level2::KernelIr,
+            _ir: &crate::ir::kernel::KernelIr,
         ) -> crate::error::Result<()> {
             Ok(())
         }
     }
 
-    /// Run the shipped `verify_l1` over one node of a graph.
+    /// Run the shipped `verify_launch` over one node of a graph.
     fn verify(g: &EGraph, id: Id) -> crate::error::Result<()> {
         let caps = ts::caps();
         let registry = crate::ir::OpDefRegistry::new();
@@ -835,37 +751,16 @@ mod tests {
             caps: &caps,
             registry: &registry,
         };
-        crate::verify_l1::verify_l1(&cx, &NullPlanner)
+        crate::verify_launch::verify_launch(&cx, &NullPlanner)
     }
 
-    // ---- 1. it fires on a real saturated graph -------------------------
-
-    /// The rule table plus this law, run by the shipped driver on a graph the
-    /// frontend spelling of a batched contraction produces. No hand-built L1
-    /// node: `LOWER_CONTRACT_GENERIC` mints the nest as `space = out ++ [k]`,
-    /// and the innermost free axis of *that* is the one this law moves.
+    /// This law's share of the shared saturation round budget, pinned as a
+    /// delta: the round count with the law may not exceed the count without
+    /// it by more than one, on the same graph.
     ///
-    /// `[B,H,Lq,Lk] x [B,H,Lk,Dh] -> [B,H,Lq,Dh]` is the shape an attention
-    /// output projection has, but nothing in the rule or the graph says so:
-    /// the same firing is asserted below on an SGEMM, on a lane tile and on a
-    /// max-pool.
-    /// **This law's share of the shared round budget, pinned.**
-    ///
-    /// Saturation is a fixpoint under a budget of six rounds, and every law
-    /// lands into the same one. A rule that mints a node needing three more
-    /// rounds of lowering does not cost its own graph two rounds — it costs
-    /// *everyone's*, and the symptom is a `saturated == false` in a case that
-    /// mentions no rule at all.
-    ///
-    /// The graph is the chain a fused attention frontend emits, built node for
-    /// node (`q.k`, scale, `max`, `sub`, `exp`, `sum`, `div`, `p.v`) because it
-    /// is the densest arrangement of reduction nests available in this crate:
-    /// four folds, two of them sharing an axis. Nothing in the law reads it.
-    ///
-    /// The assert is a *delta*: this law may not push the round count past the
-    /// shipped budget, measured against the same graph with the law removed.
-    /// It is what caught the `L0::Restride` spelling of the recovery view,
-    /// which cost two rounds and 91 nodes.
+    /// The graph is the chain a fused attention frontend emits (`q.k`, scale,
+    /// `max`, `sub`, `exp`, `sum`, `div`, `p.v`), the densest arrangement of
+    /// reduction nests available in this crate. Nothing in the law reads it.
     #[test]
     fn promote_does_not_overrun_the_shared_round_budget() {
         use crate::shape::BoundsProof;
@@ -894,7 +789,7 @@ mod tests {
                 scaled,
             );
             let bcast = |g: &mut EGraph, x: Id| {
-                g.add(Op::L0(L0::Restride {
+                g.add(Op::Logical(Logical::Restride {
                     specs: smallvec![
                         StrideSpec::dim(0, Dim::Const(b)),
                         StrideSpec::dim(1, Dim::Const(h)),
@@ -983,9 +878,8 @@ mod tests {
         let out = ts::contract(&mut g, spec, Dtype::F32, p, v);
         let before = g.facts(out).clone();
 
-        // The **shipped** table, which already registers this law, plus the
-        // inverse — which the table cannot hold, because its length is
-        // asserted and this file does not own it.
+        // The shipped table plus the inverse, which the table does not
+        // register.
         assert_eq!(crate::rules::rule_id("PROMOTE").map(|_| ()), Some(()));
         let mut rules: Vec<Rule> = CORE_RULES.to_vec();
         rules.push(PROMOTE_FLATTEN);
@@ -1005,7 +899,7 @@ mod tests {
         assert_eq!(promoted.len(), 1, "expected exactly one promoted nest");
         class_facts_agree(&g, out);
         let (pid, k) = &promoted[0];
-        let L1::KFold {
+        let Launch::Fold {
             space,
             axis,
             vec_axes,
@@ -1058,8 +952,6 @@ mod tests {
         assert_eq!(lanes_of(&k), 8);
         assert!(g.chain(fold).contains(&pid), "the nest is not in the class");
     }
-
-    // ---- 2. the register-tiling claim ---------------------------------
 
     /// **Three hand-enumerated register-tiling domains are one law.**
     ///
@@ -1138,7 +1030,7 @@ mod tests {
     /// coalesces into ONE `Vector(TM*TN)` slot, row-major, with the lift and
     /// merge untouched — so a register tile is not a second mechanism beside
     /// the lane tile, it is this one applied twice. The nest that carries it is
-    /// built here and put through the shipped `verify_l1`, which is what makes
+    /// built here and put through the shipped `verify_launch`, which is what makes
     /// "the algebra composes" a statement about a runnable node rather than
     /// about a struct.
     ///
@@ -1179,13 +1071,9 @@ mod tests {
         assert_eq!(&g.facts(tiled).shape[..], &dims(&[2, 3, tm * tn])[..]);
     }
 
-    /// **The limit, pinned.** The rule promotes one free axis and declines to
-    /// deepen an existing promotion, because the second step's shape is the
-    /// tile flattened into the carrier axis and the reshape that recovers it
-    /// costs two rounds of the shared saturation budget and three launch
-    /// ceilings. Measured; see the note beside `promote`.
-    ///
-    /// Delete this test with the `vec_axes.is_empty()` guard.
+    /// The rule promotes one free axis and declines to deepen an existing
+    /// promotion; see the note beside `promote`. Delete this test with the
+    /// `vec_axes.is_empty()` guard.
     #[test]
     fn promote_declines_to_deepen_an_existing_promotion() {
         let (tm, tn) = (4u64, 8u64);
@@ -1248,8 +1136,6 @@ mod tests {
             assert_eq!(lanes_of(&k), u64::from(w));
         }
     }
-
-    // ---- 3. the guards decline ----------------------------------------
 
     /// **Refuses to promote an axis the accumulator itself depends on.** One
     /// case per expression the guard covers; `merge` alone would let a
@@ -1444,8 +1330,6 @@ mod tests {
         assert!(fire(&mut g, fold, &PROMOTE).is_some());
     }
 
-    // ---- 4. the inverse ------------------------------------------------
-
     /// The inverse is minted, so full and no promotion both stay live in one
     /// class and compete on cost.
     #[test]
@@ -1470,10 +1354,10 @@ mod tests {
             .chain(promoted)
             .into_iter()
             .filter_map(|m| kfold_of(&g, m).map(|k| (m, k)))
-            .find(|(_, k)| matches!(k, L1::KFold { vec_axes, .. } if vec_axes.is_empty()))
+            .find(|(_, k)| matches!(k, Launch::Fold { vec_axes, .. } if vec_axes.is_empty()))
             .expect("a flattened alternative");
         assert_eq!(g.facts(flat.0), g.facts(promoted));
-        let L1::KFold { carrier, .. } = &flat.1 else {
+        let Launch::Fold { carrier, .. } = &flat.1 else {
             panic!()
         };
         assert_eq!(carrier.slots[..], [SlotTy::Scalar]);
@@ -1482,8 +1366,6 @@ mod tests {
         assert!(fire(&mut g, flat.0, &PROMOTE).is_some());
         assert!(g.chain(promoted).contains(&promoted));
     }
-
-    // ---- 5. numeric ----------------------------------------------------
 
     /// A host evaluator that also resolves `IndexOf`, so the tests do not
     /// borrow the carrier module's evaluator for the answer they are checking.
@@ -1676,8 +1558,6 @@ mod tests {
         assert!((got - want).abs() <= 1e-3 * want.abs(), "{got} vs {want}");
     }
 
-    // ---- 6. the generality case ---------------------------------------
-
     /// **A `(value, index)` max-pool carrier promoted over a channel block.**
     ///
     /// Nobody aimed a rule at this. It is a two-slot carrier whose index slot's
@@ -1728,7 +1608,7 @@ mod tests {
         assert!(fire(&mut g, fold, &PROMOTE).is_some());
         class_facts_agree(&g, fold);
         let (pid, promoted) = promoted_at(&g, fold, 1).unwrap();
-        let L1::KFold {
+        let Launch::Fold {
             carrier: pc,
             vec_axes,
             ..
@@ -1784,9 +1664,7 @@ mod tests {
         }
     }
 
-    // ---- 7. the minted nests verify ------------------------------------
-
-    /// Everything this law mints goes through the shipped `verify_l1`: the
+    /// Everything this law mints goes through the shipped `verify_launch`: the
     /// promoted-axis clauses (contiguity, `lanes == positions * width`), the
     /// write map, the operand access predicates and the fold-axis rank check.
     #[test]
@@ -1863,21 +1741,9 @@ mod tests {
         verify(&g, views[0]).expect("the readback view must verify");
     }
 
-    /// **A second known limitation in a file this law does not own**, pinned.
-    ///
-    /// `semantics::work`'s `KFold` row multiplies the product of the **full**
-    /// `space` by `carrier.lanes()`. `space` still contains the promoted axis —
-    /// that is the whole rebinding — so a nest that merges each element into
-    /// its own lane exactly once is priced `lanes` times over. The row's own
-    /// comment states the intent correctly ("the same total work, priced where
-    /// it actually happens"); reading `iter_space` for the per-lane term is the
-    /// fix.
-    ///
-    /// While it stands, extraction can never *select* a promotion: the
-    /// alternative is minted, verified and `D` times too expensive. That is why
-    /// registering this law moved no numeric conformance case — a fact worth
-    /// knowing before someone reads the launch counts as evidence the law is
-    /// inert.
+    /// Pins `semantics::work`'s residual over-count on a promoted nest: the
+    /// `e * lanes` term charges each output element `lanes` times, because a
+    /// multi-slot carrier's output shape already counts its lanes.
     ///
     /// Delete this test with the row.
     #[test]
@@ -1900,35 +1766,17 @@ mod tests {
 
         let work_of = |id: Id| {
             let node = g.node(id).clone();
-            let Op::L1(op) = &node.op else { panic!() };
+            let Op::Launch(op) = &node.op else { panic!() };
             let ins: Vec<crate::facts::ValueFacts> =
                 node.children.iter().map(|c| g.facts(*c).clone()).collect();
             crate::semantics::work::work_l1(op, &ins, g.facts(id))
         };
         let (plain, promoted) = (work_of(fold), work_of(pid));
 
-        // PROMOTE is exact and moves no arithmetic, so the honest row prices
-        // both identically. Two terms stood between here and that:
-        //
-        //   macs = ein * (lanes + lift) + e * (lanes + post)
-        //
-        // 1. `ein` used the FULL space product, so a promoted axis was counted
-        //    once in `ein` and again in `lanes` — the `lanes`-times over-count
-        //    this test was originally written to pin. That is fixed: `ein` now
-        //    filters `vec_axes`, giving 4*16 = 64 here against the plain
-        //    4*8*16 = 512, so `ein * lanes` is 512 on both sides.
-        //
-        // 2. `e * lanes` is still an over-count, and a PRE-EXISTING one that
-        //    has nothing to do with promotion: a multi-slot carrier appends its
-        //    lanes to the output shape, so `e` ALREADY counts them, and
-        //    multiplying by `lanes` charges each output element `lanes` times.
-        //    Correcting it makes both sides exactly 544. It is left alone here
-        //    because it moves the price of every multi-slot fold, promoted or
-        //    not, and that deserves its own measurement rather than riding in
-        //    on a promotion fix.
-        //
-        // So the residual is `e * (lanes - 1)` = 32 * 7, and no longer scales
-        // the whole nest.
+        // macs = ein * (lanes + lift) + e * (lanes + post). `ein` filters
+        // `vec_axes`, so `ein * lanes` is 512 on both sides; the residual is
+        // the `e * lanes` term, `e * (lanes - 1)` = 32 * 7 here, which no
+        // longer scales the whole nest.
         assert_eq!(plain.macs, 512 + 32, "plain: ein*1 + e*1");
         assert_eq!(promoted.macs, 512 + 32 * d, "promoted: ein*lanes + e*lanes");
         assert!(
@@ -1939,19 +1787,14 @@ mod tests {
 
     /// **A promoted carrier MAY read the reduced axis's coordinate.**
     ///
-    /// Every `ScalarExpr` on a `KFold` is written against `iter_space()`, so
+    /// Every `ScalarExpr` on a `Fold` is written against `iter_space()`, so
     /// the legal indices are `0..iter_rank` and a promoted axis is simply not
-    /// nameable — that is the content of the rebinding. `check_vec_axes` used
-    /// to ask instead whether an expression read `IndexOf(a)` for `a` a
-    /// **space** index, which is one renumbering behind: after one promotion
-    /// the reduced axis's iteration index equals the promoted axis's space
-    /// index, so the clause rejected precisely the nests whose lift reads the
-    /// reduction coordinate — a max-pool's index slot here, and the frontend's
-    /// causal `select(IndexOf(lk) <= ..)` in the case this law was written for.
-    ///
-    /// This test is the positive statement that replaced that tripwire: the
-    /// promoted nest verifies, and an expression naming a coordinate *outside*
-    /// the iteration domain is what is refused.
+    /// nameable. After one promotion the reduced axis's iteration index
+    /// equals the promoted axis's space index, so a clause phrased in space
+    /// indices would reject exactly the nests whose lift reads the reduction
+    /// coordinate — a max-pool's index slot, a causal
+    /// `select(IndexOf(lk) <= ..)`. The promoted nest verifies; only an
+    /// expression naming a coordinate outside the iteration domain is refused.
     #[test]
     fn a_promoted_carrier_may_read_the_reduced_axis() {
         let (c, k) = (3u64, 4u64);

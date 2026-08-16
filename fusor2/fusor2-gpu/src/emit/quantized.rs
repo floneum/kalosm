@@ -5,7 +5,7 @@
 //! `BlockDecodeArgs`. Adding Q4_1 is a table row over there, not a kernel here.
 
 use fusor2_gguf::blocks::{BlockDecodeArgs, BlockProgram};
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::kernel::{
     ElementType, QuantizedView, ScalarElement, TileExpr, TileExprKind, TileLiteral,
 };
 use fusor2_ir::target::EmitError;
@@ -24,7 +24,7 @@ impl Emitter<'_> {
         fusor2_gguf::block_spec(view.fmt, view.layout).decode
     }
 
-    /// One decoded element, addressed by L2 expressions.
+    /// One decoded element, addressed by Kernel expressions.
     pub(crate) fn decode_one(
         &mut self,
         out: &mut Block,
@@ -55,7 +55,7 @@ impl Emitter<'_> {
         // subexpressions are *structurally equal* and the emitter's memo
         // shares the loads — one word read per window, one scale decode per
         // group, with the block format never appearing in the rule.
-        let decoded = fusor2_ir::ir::level2::simplify_index(&decoded);
+        let decoded = fusor2_ir::ir::kernel::simplify_index(&decoded);
         if decoded.element() != f32_element() {
             return Err(EmitError::Unsupported(format!(
                 "{} decode returned {:?}, expected a scalar f32",
@@ -73,12 +73,12 @@ mod tests {
     use crate::emit::emit_module;
     use crate::emit::testkit::{self, *};
     use fusor2_ir::dtype::{QFmt, QLayout};
-    use fusor2_ir::ir::level2::{Addr, KernelIr, Source, Stmt, StorageView};
+    use fusor2_ir::ir::kernel::{Addr, KernelIr, Source, Stmt, StorageView};
 
     const LANES: u32 = 8;
     const COLS: u32 = 4;
 
-    fn qview(data: &fusor2_ir::ir::level2::Buffer) -> QuantizedView {
+    fn qview(data: &fusor2_ir::ir::kernel::Buffer) -> QuantizedView {
         QuantizedView {
             data: StorageView {
                 buffer: data.clone(),
@@ -87,8 +87,8 @@ mod tests {
                 // layout — the convention every contraction lowering emits —
                 // so the fixture carries the rank-2 element view, not the
                 // raw word stream it predated the convention with.
-                layout: fusor2_ir::ir::level2::TileLayout::contiguous(
-                    fusor2_ir::ir::level2::MemoryLevel::Storage,
+                layout: fusor2_ir::ir::kernel::TileLayout::contiguous(
+                    fusor2_ir::ir::kernel::MemoryLevel::Storage,
                     &[1, COLS * LANES],
                 ),
             },

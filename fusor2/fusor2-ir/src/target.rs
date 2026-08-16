@@ -4,10 +4,10 @@ use crate::cost::DeviceFacts;
 use crate::device::Caps;
 use crate::egraph::{Id, Rule};
 use crate::error::Result;
-use crate::extract::{Launch, Plan};
+use crate::extract::{Dispatch, Plan};
 use crate::ir::Node;
-use crate::ir::level1::SchedPoint;
-use crate::ir::level2::KernelIr;
+use crate::ir::launch::SchedPoint;
+use crate::ir::kernel::KernelIr;
 use crate::shape::SymId;
 use std::any::Any;
 use std::fmt;
@@ -91,12 +91,10 @@ impl fmt::Debug for Buf {
     }
 }
 
-/// The contents of binding 0. **Always a storage buffer**, holding
-/// `[u32 symbolic dims..., f32 uniform scalars...]`. That one buffer kills
-/// the trainer's constraints 1 and 2 together: `m * lr_f32` produces a
-/// `Uniform`, not a baked literal, and a sequence length is a `Sym` read
-/// from binding 0. A uniform-address-space block would break the
-/// derived-bind-group mechanism, which walks storage globals.
+/// The contents of binding 0. Always a storage buffer, holding
+/// `[u32 symbolic dims..., f32 uniform scalars...]`. A uniform-address-space
+/// block would break the derived-bind-group mechanism, which walks storage
+/// globals.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Uniforms {
     pub dims: Vec<u32>,
@@ -138,10 +136,10 @@ impl fmt::Display for EmitError {
 }
 impl std::error::Error for EmitError {}
 
-/// What a target needs to lower one selected node into L2.
+/// What a target needs to lower one selected node into Kernel.
 pub struct LowerCtx<'a> {
     pub plan: &'a Plan,
-    pub launch: &'a Launch,
+    pub launch: &'a Dispatch,
     pub graph: &'a crate::egraph::EGraph,
     pub symbols: &'a [SymId],
 }
@@ -160,10 +158,7 @@ impl LowerCtx<'_> {
     }
 }
 
-/// A compute backend. **Object-safe**: the session holds
-/// `Arc<dyn Target>`. A third backend is ~1,500 lines (facts, caps,
-/// emitter, launcher) and inherits every L0 rule, autograd, the cost model
-/// and the plan cache for free.
+/// A compute backend. Object-safe: the session holds `Arc<dyn Target>`.
 pub trait Target: Send + Sync {
     /// Stable name; keys `OpDef::lower_per_target` and the calibration
     /// cache.
@@ -175,11 +170,11 @@ pub trait Target: Send + Sync {
     /// Calibrated rates. Everything the cost model reads.
     fn facts(&self) -> &DeviceFacts;
 
-    /// Target-exclusive lowering rules (lane/subgroup geometry). Every L0
+    /// Target-exclusive lowering rules (lane/subgroup geometry). Every Logical
     /// rule is inherited.
     fn rules(&self) -> &'static [Rule];
 
-    /// Lower one selected L1 node at one schedule point into L2.
+    /// Lower one selected Launch node at one schedule point into Kernel.
     fn lower(&self, node: &Node, id: Id, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr>;
 
     fn emit(&self, ir: &KernelIr) -> std::result::Result<Artifact, EmitError>;

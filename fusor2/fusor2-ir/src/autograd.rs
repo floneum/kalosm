@@ -1,28 +1,26 @@
-//! Reverse mode as an L0 -> L0 transform. Seven adjoint entries.
+//! Reverse mode as an Logical -> Logical transform. Seven adjoint entries.
 
 use crate::dtype::Dtype;
 use crate::egraph::Id;
 use crate::error::Result;
 use crate::facts::ValueFacts;
 use crate::carrier::Carrier;
-use crate::ir::level0::{EinSpec, L0};
+use crate::ir::logical::{EinSpec, Logical};
 use crate::ir::{Node, OpTag};
 use crate::scalar::ScalarExpr;
 use smallvec::SmallVec;
 
 /// A value on the tape. Ids are e-graph ids: forward and backward are one
-/// graph with one root set, which is what makes gradient checkpointing the
-/// extractor's materialization bit rather than a pass anybody writes.
+/// graph with one root set.
 pub type Val = Id;
 
 /// One gradient per parent, `None` where a parent does not require grad.
 pub type Grads = SmallVec<[Option<Val>; 4]>;
 
-/// The L0 construction surface an adjoint rule writes into. Object-safe:
-/// [`AdjointFn`] takes `&mut dyn Tape`. There is no mutable closure tape,
-/// no `Arc<dyn Fn>`, no type-erased downcast and no self-`Arc` cycle.
+/// The Logical construction surface an adjoint rule writes into. Object-safe:
+/// [`AdjointFn`] takes `&mut dyn Tape`.
 pub trait Tape {
-    fn add(&mut self, op: L0) -> Result<Val>;
+    fn add(&mut self, op: Logical) -> Result<Val>;
     fn facts(&self, v: Val) -> &ValueFacts;
     fn zeros_like(&mut self, v: Val) -> Result<Val>;
     fn map(&mut self, expr: ScalarExpr, ins: &[Val]) -> Result<Val>;
@@ -79,8 +77,7 @@ pub trait Autograd: Send + Sync {
 
     /// Build the backward graph for `root` with respect to `wrt`, seeded
     /// with `seed`. The result is ingested **together with** the forward as
-    /// one graph with one root set. There is no separate tape, no
-    /// `replay_*`, and no user-written checkpointing pass.
+    /// one graph with one root set.
     fn backward(
         &self,
         tape: &mut dyn Tape,

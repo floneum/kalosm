@@ -7,7 +7,7 @@
 use fusor2_gguf::VarBuilder;
 use fusor2_ir::dtype::{Dtype, QFmt, QLayout};
 use fusor2_ir::ir::Op;
-use fusor2_ir::ir::level0::{L0, LeafKind};
+use fusor2_ir::ir::logical::{Logical, LeafKind};
 use fusor2_ir::shape::Dim;
 
 use crate::graph::{Graph, GraphRef};
@@ -29,11 +29,8 @@ impl QMatrix {
     /// is not one.
     ///
     /// Recovers `(fmt, layout, shape)` from the `LeafKind::Quantized` node
-    /// itself, so any quantized tensor — `Graph::quantized`, a GGUF load, a
-    /// concat — gets the same [`Self::dequantize`] class without its caller
-    /// having carried a `QMatrix` around. A quantized value that is not a
-    /// leaf (nothing mints one today) returns `None` and stays on the raw
-    /// path.
+    /// itself, so any quantized tensor gets the same [`Self::dequantize`]
+    /// class. A quantized value that is not a leaf returns `None`.
     pub fn of_tensor(t: &Tensor) -> Option<Self> {
         if !t.dtype().is_quantized() {
             return None;
@@ -42,7 +39,7 @@ impl QMatrix {
             .graph()
             .with_egraph(|g| {
                 Ok(match &g.node(t.id()).op {
-                    Op::L0(L0::Leaf(LeafKind::Quantized {
+                    Op::Logical(Logical::Leaf(LeafKind::Quantized {
                         fmt, layout, shape, ..
                     })) => Some((*fmt, *layout, shape.clone())),
                     _ => None,
@@ -61,11 +58,10 @@ impl QMatrix {
 
     /// A `QMatrix` over raw block bytes, with no file behind it.
     ///
-    /// `shape` is `[rows, cols]` **in elements**, not blocks; `bytes` is the
+    /// `shape` is `[rows, cols]` in elements, not blocks; `bytes` is the
     /// packed block stream for `(fmt, layout)` in row-major block order.
-    /// The byte count is checked against the format table rather than
-    /// trusted, because a short buffer decodes out of bounds on device with
-    /// no diagnostic.
+    /// The byte count is checked against the format table: a short buffer
+    /// decodes out of bounds on device with no diagnostic.
     pub fn from_raw_bytes(
         graph: &Graph,
         fmt: QFmt,
@@ -77,8 +73,7 @@ impl QMatrix {
     }
 
     /// [`QMatrix::from_raw_bytes`] against a graph handle rather than a
-    /// [`Graph`]. `concat_rows` builds its result in the graph its inputs
-    /// already live in, and a `QMatrix` only carries the handle.
+    /// [`Graph`].
     fn from_raw_bytes_in(
         graph: &GraphRef,
         fmt: QFmt,
@@ -105,7 +100,7 @@ impl QMatrix {
                 )));
             }
         }
-        let id = graph.add_l0(L0::Leaf(LeafKind::Quantized {
+        let id = graph.add_logical(Logical::Leaf(LeafKind::Quantized {
             name: graph.fresh_buffer_id(),
             fmt,
             layout,
@@ -127,9 +122,7 @@ impl QMatrix {
     /// fastest-varying-first dimension order at read (see
     /// [`fusor2_gguf::GgufTensor`]), so reversing again here would hand back
     /// a transposed matrix. A rank-1 tensor loads as a single row.
-    /// The layout is whatever the file holds, always [`QLayout::Native`];
-    /// moving to `F32Scales` is the priced `qrepack` rewrite and not a
-    /// loader decision.
+    /// The layout is whatever the file holds, always [`QLayout::Native`].
     pub fn load(vb: &VarBuilder, graph: &Graph, name: &str) -> Result<Self> {
         let raw = vb.get_raw(name)?;
         let Dtype::Q(fmt) = raw.fmt else {
@@ -165,14 +158,11 @@ impl QMatrix {
     /// for the `(fmt, layout)` pairs that still need a block program.
     pub fn dequantize(&self) -> Result<Tensor> {
         let graph = self.tensor.graph();
-        // The sugar is minted **first**, so it takes the lower id and lands in
-        // operand 0 of the `Union`. Every other composite does the reverse,
-        // and for the reverse reason: there only the `defn` is
-        // differentiable, whereas here it is the *sugar* that carries the
-        // intentional "quantized weights are not trainable" refusal. Building
-        // the defn first would silently route a gradient into the unpack
-        // `Map` and its `U32` leaves.
-        let sugar = graph.add_l0(L0::Dequant {
+        // The sugar is minted first, so it takes the lower id and lands in
+        // operand 0 of the `Union` — the node carrying the "quantized weights
+        // are not trainable" refusal. Building the defn first would silently
+        // route a gradient into the unpack `Map` and its `U32` leaves.
+        let sugar = graph.add_logical(Logical::Dequant {
             fmt: self.fmt,
             layout: self.layout,
             x: self.tensor.id(),
@@ -190,7 +180,7 @@ impl QMatrix {
         Ok(graph.tensor(root))
     }
 
-    /// The `Restride` + `Map` expansion alone, with no `L0::Dequant` in the
+    /// The `Restride` + `Map` expansion alone, with no `Logical::Dequant` in the
     /// class — the `*_slow` spelling [`crate::composite::core_op`] documents.
     ///
     /// The extractor has no alternative here, so a test against this proves
@@ -261,10 +251,10 @@ impl QMatrix {
     ///
     /// The fused form is a *member*, not a spelling: `GATHER_QUANTIZED_ROWS`
     /// matches this `Gather`-of-`Dequant` pair and mints a float-typed
-    /// [`GatherMode::QuantizedRows`] `KGather` reading the quantized leaf
+    /// [`GatherMode::QuantizedRows`] `Gather` reading the quantized leaf
     /// directly.
     ///
-    /// [`GatherMode::QuantizedRows`]: fusor2_ir::ir::level1::GatherMode::QuantizedRows
+    /// [`GatherMode::QuantizedRows`]: fusor2_ir::ir::launch::GatherMode::QuantizedRows
     pub fn index_select_rows_to(&self, idx: &Tensor, dtype: Dtype) -> Result<Tensor> {
         if idx.rank() != 1 {
             return Err(Error::Shape(format!(
@@ -474,13 +464,10 @@ mod tests {
     /// integer widened to f32 and multiplied by the block's f32 scale, which
     /// is bit-for-bit what the scalar reference decoder does.
     ///
-    /// Both layouts: an f16 scale is decoded by `f16_lane`'s bit arithmetic,
-    /// which is exact against `f16::to_f32`, so `Native` is held to the same
-    /// bit-for-bit bar. What is left of the old layout restriction is the
-    /// **block stride**: a decode reads the stream as `u32` words, so a block
-    /// whose stride is not a whole number of words has no expansion, and
-    /// `word_aligned` is that predicate. It is asserted in both directions so
-    /// a format silently losing its expansion fails here.
+    /// A decode reads the stream as `u32` words, so a block whose stride is
+    /// not a whole number of words has no expansion; `word_aligned` is that
+    /// predicate, asserted in both directions so a format silently losing
+    /// its expansion fails here.
     #[test]
     fn the_dequant_defn_decodes_exactly_as_the_reference_block_decoder() {
         let g = graph();
@@ -515,7 +502,7 @@ mod tests {
                     let ms = eg.members(eg.class_of(y.id()));
                     let sugars = ms
                         .iter()
-                        .filter(|m| matches!(eg.node(**m).op, Op::L0(L0::Dequant { .. })))
+                        .filter(|m| matches!(eg.node(**m).op, Op::Logical(Logical::Dequant { .. })))
                         .count();
                     let defns = ms.iter().filter(|m| eg.is_defn(**m)).count();
                     Ok((ms.len(), sugars, defns))
@@ -544,7 +531,7 @@ mod tests {
         let bare = native.dequantize().unwrap();
         g.handle()
             .with_egraph(|eg| {
-                assert!(matches!(eg.node(bare.id()).op, Op::L0(L0::Dequant { .. })));
+                assert!(matches!(eg.node(bare.id()).op, Op::Logical(Logical::Dequant { .. })));
                 Ok(())
             })
             .unwrap();
@@ -720,7 +707,7 @@ mod tests {
                 let class = eg.class_of(y.id());
                 let twin_class = eg.class_of(twin);
                 Ok(eg.class_ids(class).into_iter().any(|m| match &eg.node(m).op {
-                    fusor2_ir::ir::Op::L0(L0::Contract { b, .. }) => {
+                    fusor2_ir::ir::Op::Logical(Logical::Contract { b, .. }) => {
                         eg.class_of(*b) == twin_class
                     }
                     _ => false,

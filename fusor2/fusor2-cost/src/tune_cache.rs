@@ -1,50 +1,18 @@
 //! The per-machine tuning cache: what this device has already learned about
 //! which kernels are cheap.
 //!
-//! # What it is for
+//! The tuner writes down what it measured, keyed by device, and the next
+//! process starts from it. A variant already timed is never timed again; a
+//! variant caught computing a different function can never be the incumbent
+//! ([`Verdict::Wrong`]); untried variants are explored a few per resolve.
 //!
-//! Autotuning measures, and measuring costs a kernel run per candidate. Without
-//! memory that bill is paid *every process*: measured on this workspace's own
-//! benchmark, a cold matmul resolve spent ~2.3 s and a cold attention resolve
-//! ~3.1 s re-discovering, from scratch, facts the previous run had already
-//! established. That is fine for a training loop, where it amortises over
-//! thousands of steps, and unacceptable for anything short-lived.
+//! It never selects a plan on its own — it orders candidates and skips
+//! re-timing; plans are still built by the extractor and value-checked against
+//! the base before adoption. A stale, wrong or corrupt entry costs a worse
+//! starting order or a missed candidate, never a wrong answer.
 //!
-//! So the tuner writes down what it measured, keyed by device, and the next
-//! process starts from it.
-//!
-//! # Learning, not just caching
-//!
-//! A pure cache answers "have I seen this exact thing". This answers the more
-//! useful question — *which candidates are worth my time* — and gets better
-//! the more it is used:
-//!
-//! * A variant already timed is never timed again. Its score is read back.
-//! * A variant this device caught computing a *different function* is never
-//!   timed again either, and can never be the incumbent ([`Verdict::Wrong`]).
-//! * A variant known to be much slower than the entry's best is not even
-//!   built, let alone run ([`SKIP_RATIO`]).
-//! * Untried variants are explored a few per resolve ([`EXPLORE_PER_RESOLVE`]),
-//!   so a first run is not a full sweep and successive runs converge on the
-//!   optimum instead of re-measuring the incumbent.
-//!
-//! The result is a cost curve that falls with use: run 1 explores a handful,
-//! run N applies the winner and times almost nothing.
-//!
-//! # Why it is safe to trust
-//!
-//! It never selects a plan on its own. It **orders** candidates and **skips
-//! re-timing**; the plan is still built by the extractor and its outputs are
-//! still value-checked against the base before adoption. A stale, wrong or
-//! corrupt entry costs a worse starting order or a missed candidate — never a
-//! wrong answer. That is deliberate: this file is a heuristic store, and the
-//! measurement in `Session::autotune` is the authority.
-//!
-//! # Keyed per machine
-//!
-//! By `Caps::fingerprint()`, alongside `crate::cache`'s device facts, because a
-//! tile that wins on one GPU says nothing about another. A different device
-//! reads a different file; an unknown device reads nothing and tunes normally.
+//! Keyed by `Caps::fingerprint()`: a different device reads a different file;
+//! an unknown device reads nothing and tunes normally.
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
@@ -54,36 +22,25 @@ use std::path::{Path, PathBuf};
 /// Candidates whose recorded score is worse than `best * SKIP_RATIO` are not
 /// rebuilt on later resolves.
 ///
-/// Unbounded: a launch's candidate field cannot be narrowed on that launch's own
-/// score, because the plan optimum is not the per-launch argmin. Multi-launch
-/// plans have interdependent choices, so taking the per-launch minima independently
-/// assembles a configuration never actually run. This is why `Combo` records a
-/// *joint* measurement rather than assembling per-launch minima.
+/// Unbounded: a launch's candidate field cannot be narrowed on that launch's
+/// own score, because the plan optimum is not the per-launch argmin —
+/// multi-launch plans have interdependent choices.
 pub const SKIP_RATIO: f64 = f64::INFINITY;
 
 /// How many never-measured variants one tuning race will spend time on: the
-/// top-K of the *cost model's* ordering. A cold signature races 3 candidates,
-/// not the full 16 — the model orders, the measurement decides — and the rest
-/// of the field is explored later from production samples (see the session's
-/// epsilon explorer), where a sample costs one substituted dispatch instead of
-/// a `TUNE_RUNS`-deep race.
+/// top-K of the cost model's ordering. The rest of the field is explored later
+/// from production samples via the session's epsilon explorer.
 pub const RACE_TOP_K: usize = 3;
 
-/// Observations one `(launch, variant)` window holds. The stat every decision
-/// reads is the **minimum over the window** — timings are noisy upward, so the
-/// min is the kernel — and the window is what lets a stale record die: a
-/// fossil minimum from an older driver, thermal regime or build is not carried
-/// forever, it ages out after `WINDOW` fresh observations and the entry
-/// re-earns its rank or loses it. That is the re-race-on-loss decay the
-/// fossil semantics want, with no timestamped bookkeeping.
+/// Observations one `(launch, variant)` window holds. Every decision reads the
+/// minimum over the window — timings are noisy upward, so the min is the
+/// kernel — and a stale minimum ages out after `WINDOW` fresh observations.
 pub const WINDOW: usize = 8;
 
 /// How many already-known variants one resolve re-races, best-scored first.
 ///
-/// Unbounded: a launch's candidate field cannot be narrowed on that launch's own
-/// score, because the plan optimum is not the per-launch argmin. Multi-launch
-/// plans have interdependent choices; narrowing each launch's field independently
-/// denies the descent the combination that actually wins.
+/// Unbounded: narrowing each launch's field independently denies the descent
+/// the combination that actually wins.
 pub const RERACE_PER_RESOLVE: usize = usize::MAX;
 
 /// What this device learned about one `(launch, variant)` pair.
@@ -93,36 +50,21 @@ pub enum Verdict {
     Ran(u64),
     /// Measured, and its outputs disagreed with the base plan's.
     ///
-    /// **Deliberately not stored as a time.** A member that computes a
-    /// different function skips the work the right one must do, so it is
-    /// usually the *fastest* thing in the e-class: this device's own file had
-    /// `Sgemv(chunk 2, vector 4)` at 14_875 ns against a correct best of
-    /// 2_899_291 ns on the 2048-cube, which is 1,155 TFLOP/s on a 13 TFLOP/s
-    /// part. Filed as a duration it becomes [`TuneCache::best`], and every
-    /// finite [`SKIP_RATIO`] then prunes the *correct* candidates instead.
+    /// Not stored as a time: a member that computes a different function skips
+    /// work, so it is usually the fastest thing in the e-class. Filed as a
+    /// duration it would become [`TuneCache::best`] and prune the correct
+    /// candidates.
     Wrong,
 }
 
 /// One learned `(launch, variant)` pair: its observation window.
 ///
 /// `window` is `None` for a variant that disagreed with the base — see
-/// [`Verdict`] — and otherwise holds up to [`WINDOW`] samples, oldest first,
-/// each meaning one of two things, which [`FORMAT`] keeps out of the same
-/// file:
-///
-/// * **On a device that can time kernels** — this launch's own GPU span, in
-///   absolute nanoseconds, taken from the resolve's timestamp query set. Host
-///   cost, submission and inter-pass gaps are all excluded, so it is a property
-///   of the launch and comparable across processes: `launch_signature` pins
-///   family, dtype and shape, and the file is keyed by device.
-/// * **On a device with no kernel timer (the CPU target)** — parts-per-million
-///   of the base plan's time in the pass that measured it, so 1_000_000 means
-///   "no better than the base". A whole-plan wall clock is not comparable
-///   between passes; the ratio divides the context out, and it is the best a
-///   host clock supports.
-///
-/// The two units never share a file: a device that *can* time kernels but did
-/// not time a particular plan records nothing for it.
+/// [`Verdict`] — and otherwise holds up to [`WINDOW`] samples, oldest first.
+/// On a device that can time kernels a sample is the launch's GPU span in
+/// absolute nanoseconds; on a device with no kernel timer (the CPU target) it
+/// is parts-per-million of the base plan's time in the pass that measured it.
+/// The two units never share a file ([`FORMAT`]).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Record {
     launch: String,
@@ -152,15 +94,12 @@ impl Learned {
     }
 }
 
-/// A whole-plan outcome: the per-launch variants that were fastest **when
-/// measured together**.
+/// A whole-plan outcome: the per-launch variants that were fastest when
+/// measured together.
 ///
-/// Per-launch minima do not compose. Each `Record` above is scored in the
-/// context the coordinate descent happened to be in when its turn came, so
-/// taking the arg-min of each launch independently assembles a configuration
-/// that was never actually run — measured, that assembled plan clocked ~4.2 ms
-/// on attention where the descent's own winner was 2.75 ms. This is the
-/// combination that really won, stored whole.
+/// Per-launch minima do not compose — each `Record` is scored in whatever
+/// context the coordinate descent was in when its turn came — so the winning
+/// combination is stored whole.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Combo {
     plan: String,
@@ -170,10 +109,9 @@ struct Combo {
     score: u64,
 }
 
-/// The unit [`Record::nanos`] is written in. A file at a different format is
-/// read as an empty cache. Mismatch is never a wrong ordering, only a single
-/// re-tuning pass.
-pub const FORMAT: u32 = 5;
+/// The on-disk format version. A file at a different format is read as an
+/// empty cache: mismatch is never a wrong ordering, only a re-tuning pass.
+pub const FORMAT: u32 = 6;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Disk {
@@ -230,8 +168,8 @@ fn read_tables(
     (seen, combos)
 }
 
-/// What this device has learned. Cheap to clone-free share; all mutation is
-/// behind one lock because a resolve is already serialized.
+/// What this device has learned. All mutation is behind one lock because a
+/// resolve is already serialized.
 #[derive(Debug, Default)]
 pub struct TuneCache {
     path: Option<PathBuf>,
@@ -245,8 +183,7 @@ pub struct TuneCache {
 
 /// `$XDG_CACHE_HOME/fusor2/tune/<fingerprint>.json`, or `$HOME/.cache/...`.
 /// `FUSOR2_TUNE_CACHE` overrides the whole path; `FUSOR2_NO_TUNE_CACHE`
-/// disables persistence entirely, which is the A/B switch that shows whether a
-/// result came from the cache or from this run.
+/// disables persistence entirely.
 pub fn cache_path(caps_fingerprint: u64) -> Option<PathBuf> {
     if std::env::var_os("FUSOR2_NO_TUNE_CACHE").is_some() {
         return None;
@@ -341,18 +278,13 @@ impl TuneCache {
         let mut seen = self.seen.lock();
         let entry = seen.entry(launch.to_string()).or_default();
         match (entry.get_mut(variant), verdict) {
-            // Wrongness is a property of the kernel, not of the run: once this
-            // device has seen a variant disagree, no later timing of it means
-            // anything within this process, so `Wrong` is absorbing. (Across
-            // processes it is a fossil of a since-fixed compiler bug and
-            // re-races as unmeasured — see `plan_candidates`.)
+            // `Wrong` is absorbing within a process: once this device has seen
+            // a variant disagree, no later timing of it means anything. Across
+            // processes it re-races as unmeasured — see `plan_candidates`.
             (Some(slot), Verdict::Wrong) => *slot = Learned::Wrong,
             (Some(Learned::Wrong), Verdict::Ran(_)) => {}
-            // The window keeps the most recent `WINDOW` observations; every
-            // reader takes the min over it. A slow sample is contention, a
-            // fast one is the kernel — but a fast sample that `WINDOW` newer
-            // runs never reproduce ages out, which is how a stale record
-            // loses to fresh observations instead of pinning forever.
+            // The window keeps the most recent `WINDOW` observations; a fast
+            // sample that `WINDOW` newer runs never reproduce ages out.
             (Some(Learned::Window(w)), Verdict::Ran(ns)) => {
                 w.push(ns);
                 if w.len() > WINDOW {
@@ -389,16 +321,11 @@ impl TuneCache {
 
     /// Whether every candidate offered for this launch has already been
     /// measured here, so there is nothing left to learn. A variant proven to
-    /// compute the wrong function counts: it is still something this device has
-    /// nothing left to learn about.
+    /// compute the wrong function counts.
     ///
-    /// This is what turns the cache from "cheaper tuning" into "no tuning".
-    /// While an entry is still exploring, the tuner races candidates and picks
-    /// by *this run's* clock, which is noisy: measured, that re-selection
-    /// settled attention at ~3.0 ms when the accumulated best was 2.58 ms. Once
-    /// there is nothing new to try, the accumulated minimum over every past run
-    /// is a far better estimate than one fresh sample, so the tuner should
-    /// apply it rather than re-derive it.
+    /// Once there is nothing new to try, the accumulated minimum over every
+    /// past run is a better estimate than one fresh noisy sample, so the tuner
+    /// applies it rather than re-deriving it.
     pub fn converged(&self, launch: &str, candidates: &[String]) -> bool {
         let seen = self.seen.lock();
         let Some(entry) = seen.get(launch) else {
@@ -409,14 +336,11 @@ impl TuneCache {
 
     /// Split candidates into what to race and what to skip, best prior first.
     ///
-    /// Each candidate arrives with the **cost model's prior** for the plan it
-    /// denotes, in picoseconds. Returns `(to_measure, skipped)`. Ordering is:
+    /// Each candidate arrives with the cost model's prior for the plan it
+    /// denotes, in picoseconds. Returns `(to_measure, skipped)`. Ordering:
     /// measured variants by their window minimum (re-confirm the incumbent
     /// first), then never-measured ones by the model's prior, capped at
-    /// [`RACE_TOP_K`] — so a cold signature races the model's top-3 picks
-    /// rather than the full field, and the rest of the field is left to the
-    /// production explorer, which pays one substituted dispatch per sample
-    /// instead of a race. Ties break by name so a run is reproducible.
+    /// [`RACE_TOP_K`]. Ties break by name so a run is reproducible.
     pub fn plan_candidates<'a>(
         &self,
         launch: &str,
@@ -432,12 +356,11 @@ impl TuneCache {
 
         for (c, prior) in candidates {
             match entry.and_then(|e| e.get(c.as_str())) {
-                // A recorded `Wrong` names a **compiler bug that has since
-                // been fixed** — production halts on divergence before any
-                // verdict is written (see `Session::autotune`), so an entry
-                // can only be a fossil of an older build. Skipping on it
-                // would silently pin the repaired kernel out of selection
-                // forever; the entry is treated as unmeasured instead.
+                // A recorded `Wrong` can only be a fossil of an older build —
+                // production halts on divergence before any verdict is written
+                // (see `Session::autotune`) — so the entry is treated as
+                // unmeasured rather than pinning the repaired kernel out of
+                // selection forever.
                 Some(Learned::Wrong) => fresh.push((c, *prior)),
                 Some(Learned::Window(w)) => {
                     let ns = w.iter().copied().min().unwrap_or(u64::MAX);
@@ -453,13 +376,8 @@ impl TuneCache {
         }
         known.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
         // Stable by prior only: candidates arrive in the enumerator's offer
-        // order (round-robin over *belief-ordered* schedule domains), which
-        // is exactly as reproducible as a name sort and, unlike one, means
-        // something on a tie. The model prices every cell of a family
-        // identically, so with a name tie-break the race's one fresh sgemv
-        // slot went to whichever cell's `Debug` string sorted first —
-        // `chunk: 4` before `chunk: 8` — and the domain's believed-best cell
-        // was never cold-raced at all.
+        // order (round-robin over belief-ordered schedule domains), so a tie
+        // keeps the domain's believed-best cell first.
         fresh.sort_by(|a, b| a.1.cmp(&b.1));
 
         let mut out: Vec<&'a String> = known
@@ -626,12 +544,8 @@ mod tests {
         let _ = std::fs::remove_file(&p);
     }
 
-    /// A `Wrong` record never ranks — filed as a duration it would become
-    /// `best()` and prune the correct candidates — but it never *pins*
-    /// either. Production halts on divergence before writing a verdict, so
-    /// a stored `Wrong` can only be a fossil of a compiler bug that has
-    /// since been fixed; the variant is re-explored like an unmeasured one
-    /// rather than skipped forever.
+    /// A `Wrong` record never ranks, but it never pins either: the variant is
+    /// re-explored like an unmeasured one rather than skipped forever.
     #[test]
     fn a_wrong_variant_is_excluded_not_ranked() {
         let c = TuneCache::default();

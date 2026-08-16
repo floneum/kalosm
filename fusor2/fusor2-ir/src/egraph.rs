@@ -4,8 +4,8 @@
 use crate::device::Caps;
 use crate::error::{Error, Result};
 use crate::facts::ValueFacts;
-use crate::ir::level0::L0;
-use crate::ir::level1::L1;
+use crate::ir::logical::Logical;
+use crate::ir::launch::Launch;
 use crate::ir::{Children, Level, Node, Op, OpTag, Semantics};
 use crate::shape::SymId;
 use fixedbitset::FixedBitSet;
@@ -36,14 +36,9 @@ impl fmt::Display for Id {
 /// An e-class handle: the id of the topmost `Op::Union` node containing a
 /// value, or the value's own id when it has no alternatives.
 ///
-/// **This replaces the union-find handle.** There is no `UnionFind`, no
-/// rank, no path compression and no `rebuild()`. A class's identity is
-/// never a merge artifact, so max-rank can never stop preserving global
-/// acyclicity. The price, paid deliberately: **equality is not congruent** —
-/// unioning `a` and `b` does not union `f(a)` and `f(b)`. Alternatives are
-/// minted by rules *at the consumer*, and patterns may match a spine
-/// ([`Builder::trace_pure_views`]), which is what makes a consumer-rooted
-/// rewrite like `sink_epilogue` expressible with no multi-root rule form.
+/// Equality is not congruent — unioning `a` and `b` does not union `f(a)`
+/// and `f(b)`. Alternatives are minted by rules at the consumer, and
+/// patterns may match a spine ([`Builder::trace_pure_views`]).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClassId(pub Id);
 
@@ -60,11 +55,10 @@ pub struct NodeKey {
 pub struct EGraph {
     nodes: Vec<Node>,
     facts: Vec<ValueFacts>,
-    /// Shared with every [`SaturationDelta`] recorded off this graph, so a
-    /// replay is a refcount bump rather than a copy of the whole table.
-    /// `add` is the only writer and takes it back by `Arc::make_mut`, so a
-    /// graph that keeps growing after a replay still hash-conses against a
-    /// fully populated memo — copy-on-write, not a lazy rebuild.
+    /// Shared with every [`SaturationDelta`] recorded off this graph. `add`
+    /// is the only writer and takes it back by `Arc::make_mut`, so a graph
+    /// that keeps growing after a replay still hash-conses against a fully
+    /// populated memo.
     memo: Arc<FxHashMap<NodeKey, Id>>,
     parent: Vec<Option<Id>>,
     defns: FixedBitSet,
@@ -74,38 +68,25 @@ pub struct EGraph {
     /// Nodes below this index have already had every rule offered to them in
     /// a fully-saturated earlier pass. A rule's applicability is a function
     /// of `(node, child facts, caps)` — all immutable once minted — so
-    /// re-offering below the frontier can only re-mint (rules that allocate
-    /// fresh ids never hash-cons, which is how a decode loop's second resolve
-    /// doubled a 276k-node graph). Advanced by the saturation driver only
-    /// when a pass finishes unbudgeted.
+    /// re-offering below the frontier can only re-mint. Advanced by the
+    /// saturation driver only when a pass finishes unbudgeted.
     pub saturation_frontier: usize,
     /// The node count as of the last completed saturation on this graph.
-    /// `add` is the only structural mutation (a union mints an `Op::Union`
-    /// node through it), so `saturated_at_len == Some(len())` means the graph
-    /// is *exactly* the one that saturation last ran on — a decode step that
-    /// rebuilt only memo hits skips saturation outright. The session owns
-    /// setting it; rules and caps are fixed per session.
+    /// `add` is the only structural mutation, so `saturated_at_len ==
+    /// Some(len())` means the graph is exactly the one saturation last ran
+    /// on — a decode step that rebuilt only memo hits skips saturation. The
+    /// session owns setting it.
     pub saturated_at_len: Option<usize>,
     /// Memo for the replay key's whole-graph term hash: `(roots, len) ->
     /// hash`. Valid for the same reason as `saturated_at_len`.
     pub l0_term_memo: Option<(Vec<Id>, usize, u64)>,
-    /// Process-unique identity of this arena.
-    ///
-    /// An [`Id`] is an index into `nodes`, so it names a node only *together
-    /// with the graph it indexes*: every graph has an `Id(5)`. Anything that
-    /// caches per-node work keyed on ids across graphs — the GPU artifact
-    /// cache keys a lowering on its launch's root and bindings — has to carry
-    /// this, or it hands one graph's compiled kernel to another graph's
-    /// identically-numbered launch.
+    /// Process-unique identity of this arena. An [`Id`] names a node only
+    /// together with the graph it indexes, so anything that caches per-node
+    /// work keyed on ids across graphs has to carry this.
     arena: u64,
-    /// `(arena length, class root -> its id set)`.
-    ///
-    /// A class's ids change only when a node is appended — a union mints an
-    /// `Op::Union` node through `add` like everything else — so the arena
-    /// length is an exact validity stamp, the same argument
-    /// `saturated_at_len` rests on. Binding a resolve's outputs walks one
-    /// spine per plan buffer, ~1,700 of them over ~30,700 ids, and a decode
-    /// step re-walks the *same* spines of the *same* graph every token.
+    /// `(arena length, class root -> its id set)`. A class's ids change only
+    /// when a node is appended, so the arena length is an exact validity
+    /// stamp.
     class_ids_memo: (usize, FxHashMap<ClassId, Arc<[Id]>>),
 }
 
@@ -196,7 +177,7 @@ impl EGraph {
         let next = Id(self.nodes.len() as u32);
         if let Some(bad) = children.iter().find(|c| c.0 >= next.0) {
             return Err(Error::verify_global(
-                Level::L0,
+                Level::Logical,
                 format!("child {bad} is not strictly smaller than {next}"),
             ));
         }
@@ -227,8 +208,7 @@ impl EGraph {
         self.facts.push(facts);
         self.parent.push(None);
         // Copy-on-write: a no-op clone unless a `SaturationDelta` still holds
-        // the table, which is exactly the case where the copy is required for
-        // the delta to stay a faithful recording.
+        // the table.
         Arc::make_mut(&mut self.memo).insert(key, next);
         Ok(next)
     }
@@ -264,18 +244,15 @@ impl EGraph {
         self.members(self.class_of(id))
     }
 
-    /// Every id that resolves to `class`, **including the `Union` spine**.
+    /// Every id that resolves to `class`, including the `Union` spine.
     ///
-    /// [`members`](Self::members) answers "what may `sigma` select", so it
-    /// drops the `Union` nodes. A `Union` id is still a name a caller holds:
-    /// `macro_op` returns the id `union(defn, sugar)` produced, so the
-    /// `Tensor` the user reads back *is* the spine node. Anything keyed on
-    /// "this value" rather than "this candidate" has to use this.
+    /// A `Union` id is still a name a caller holds: `macro_op` returns the id
+    /// `union(defn, sugar)` produced, so the `Tensor` the user reads back is
+    /// the spine node. Anything keyed on "this value" rather than "this
+    /// candidate" has to use this.
     pub fn class_ids(&self, class: ClassId) -> Vec<Id> {
         let mut out = Vec::new();
-        // The spine is a DAG and a long-lived graph grows classes to
-        // thousands of ids, so the membership test is a set: scanning `out`
-        // made every `bind_class` quadratic in the class it binds.
+        // The spine is a DAG; a set membership test keeps this linear.
         let mut seen: FxHashSet<Id> = FxHashSet::default();
         let mut stack = vec![class.0];
         while let Some(cur) = stack.pop() {
@@ -292,10 +269,6 @@ impl EGraph {
     }
 
     /// [`Self::class_ids`], memoized against the arena length.
-    ///
-    /// Takes `&mut self` because the memo lives in the graph; every caller
-    /// already holds the graph's mutex, and a shared `Arc<[Id]>` return
-    /// costs the caller nothing to keep.
     pub fn class_ids_cached(&mut self, class: ClassId) -> Arc<[Id]> {
         if self.class_ids_memo.0 != self.nodes.len() {
             self.class_ids_memo = (self.nodes.len(), FxHashMap::default());
@@ -311,9 +284,8 @@ impl EGraph {
     /// Every non-`Union` member of an e-class, in creation order.
     pub fn members(&self, class: ClassId) -> Vec<Id> {
         let mut out = Vec::new();
-        // Set membership, not a linear scan of `out`, and the `Union` spine
-        // is marked too: it is a DAG, so re-descending a shared spine node
-        // re-walked its whole subtree for members `out` already held.
+        // The `Union` spine is a DAG, so shared spine nodes are marked seen
+        // to avoid re-descending their subtrees.
         let mut seen: FxHashSet<Id> = FxHashSet::default();
         let mut stack = vec![class.0];
         while let Some(cur) = stack.pop() {
@@ -343,13 +315,10 @@ impl EGraph {
         self.next_sym
     }
 
-    /// Capture everything saturation may **overwrite** rather than append.
+    /// Capture everything saturation may overwrite rather than append.
     ///
-    /// `nodes` and `facts` are push-only — `add` is the sole allocator and
-    /// nothing in this module ever assigns into either — so they are still
-    /// readable after saturation and are captured at record time instead.
-    /// `parent`, `defns`, `roots` and `next_sym` are not, so they are
-    /// captured here.
+    /// `nodes` and `facts` are push-only, so they are captured at record time
+    /// instead; `parent`, `defns`, `roots` and `next_sym` are captured here.
     pub fn pre_saturation(&self) -> PreSaturation {
         PreSaturation {
             len: self.nodes.len(),
@@ -362,22 +331,15 @@ impl EGraph {
 
     /// Record everything a saturation appended above `pre`.
     ///
-    /// Saturation is a pure function of `(graph, caps, rules, budget)` —
-    /// [`SaturationBudget`]'s doc says so and
-    /// `saturate::tests::saturation_is_deterministic_under_any_wall_time`
-    /// proves it — so a graph in exactly the state `pre` describes saturates
-    /// to exactly these nodes at exactly these ids. Replaying the recording
-    /// is therefore the same graph, not an approximation of one.
+    /// Saturation is a pure function of `(graph, caps, rules, budget)`, so a
+    /// graph in exactly the state `pre` describes saturates to exactly these
+    /// nodes at exactly these ids: replaying the recording is the same graph.
     pub fn record_saturation(&self, pre: PreSaturation) -> SaturationDelta {
         debug_assert!(pre.len <= self.nodes.len());
         SaturationDelta {
             nodes: self.nodes.clone(),
             facts: self.facts.clone(),
-            // Kept whole rather than as the appended entries alone —
-            // re-inserting the tail would rehash every `NodeKey`, and the tail
-            // is the overwhelming majority of the table. Sharing it is free:
-            // the next `add` on this graph is what pays for a private copy,
-            // and only if there ever is one.
+            // Kept whole: re-inserting the tail would rehash every `NodeKey`.
             memo: Arc::clone(&self.memo),
             parent: self.parent.clone(),
             defns: self.defns.clone(),
@@ -390,13 +352,10 @@ impl EGraph {
     /// Re-append a recorded saturation, or report `false` when this graph is
     /// not the one the delta was recorded against.
     ///
-    /// The validity check is **exact, not a fingerprint**: every pre-existing
+    /// The validity check is exact, not a fingerprint: every pre-existing
     /// node, every parent link, the `defn` set, the root set and the symbol
-    /// counter are compared by value. There is no collision to reason about —
-    /// either the graph is bit-for-bit the term the recording was taken from
-    /// and the replay is that same pure function's answer, or nothing is
-    /// touched and the caller saturates for real. Rejection is cheap: `len`
-    /// and `next_sym` reject a mismatch before any node is looked at.
+    /// counter are compared by value. `len` and `next_sym` reject a mismatch
+    /// before any node is looked at.
     pub fn replay_saturation(&mut self, delta: &SaturationDelta) -> bool {
         let pre = &delta.pre;
         if self.nodes.len() != pre.len
@@ -410,11 +369,9 @@ impl EGraph {
         if !self.defns.ones().map(|i| i as u32).eq(pre.defns.iter().copied()) {
             return false;
         }
-        // The prefix is already equal by the check above, so only the tail is
-        // copied. `memo` is not copied at all: the recording's table is the
-        // post-saturation table by construction, and `add` is its only reader
-        // and writer, so the graph adopts it and `Arc::make_mut` forks it if
-        // and only if this graph is later grown.
+        // The prefix is already equal, so only the tail is copied. The
+        // recording's memo is the post-saturation table by construction; the
+        // graph adopts it and `Arc::make_mut` forks it if later grown.
         self.nodes.extend_from_slice(&delta.nodes[pre.len..]);
         self.facts.extend_from_slice(&delta.facts[pre.len..]);
         self.memo = Arc::clone(&delta.memo);
@@ -427,9 +384,8 @@ impl EGraph {
     }
 
     /// The read-only legality view of `id`, as handed to a rule. The
-    /// returned [`Facts`] borrows **only** `caps`, never the graph, so a
-    /// driver can build it and then hand out a `&mut Builder` over the same
-    /// graph — that is what makes the four-argument [`RuleFn`] sound.
+    /// returned [`Facts`] borrows only `caps`, never the graph, so a driver
+    /// can build it and then hand out a `&mut Builder` over the same graph.
     pub fn facts_view<'c>(&self, id: Id, caps: &'c Caps) -> Facts<'c> {
         let node = &self.nodes[id.index()];
         Facts {
@@ -451,11 +407,9 @@ fn canonicalize(op: &Op, children: &mut Children) {
     }
 }
 
-/// The write side of the e-graph, handed to a rule. Deliberately exposes
-/// **no** consumer counts, no liveness, no cost and no extraction state.
-/// Guards written against a `Builder` and a [`Facts`] can only encode
-/// legality; profitability lives in the cost model or nowhere. That
-/// restriction is enforced by this API surface, not by convention.
+/// The write side of the e-graph, handed to a rule. Exposes no consumer
+/// counts, liveness, cost or extraction state: guards can only encode
+/// legality; profitability lives in the cost model.
 pub struct Builder<'a> {
     graph: &'a mut EGraph,
     caps: &'a Caps,
@@ -474,11 +428,11 @@ impl<'a> Builder<'a> {
     pub fn level_of(&self, id: Id) -> Level {
         self.graph.level(id)
     }
-    pub fn add_l0(&mut self, op: L0) -> Result<Id> {
-        self.graph.add(Op::L0(op))
+    pub fn add_logical(&mut self, op: Logical) -> Result<Id> {
+        self.graph.add(Op::Logical(op))
     }
-    pub fn add_l1(&mut self, op: L1) -> Result<Id> {
-        self.graph.add(Op::L1(op))
+    pub fn add_launch(&mut self, op: Launch) -> Result<Id> {
+        self.graph.add(Op::Launch(op))
     }
     pub fn add(&mut self, op: Op) -> Result<Id> {
         self.graph.add(op)
@@ -494,14 +448,12 @@ impl<'a> Builder<'a> {
         self.graph.mark_defn(id);
     }
 
-    /// Walk a chain of pure `Restride` views down to their base. This is
-    /// what makes `sink_epilogue` — the reference's self-declared "single
-    /// clearest structural gap" — a single-rooted rule.
+    /// Walk a chain of pure `Restride` views down to their base.
     pub fn trace_pure_views(&self, mut v: Id) -> ViewSpine {
         let mut views: SmallVec<[Id; 4]> = SmallVec::new();
         loop {
             match &self.graph.node(v).op {
-                Op::L0(L0::Restride { x, .. }) => {
+                Op::Logical(Logical::Restride { x, .. }) => {
                     views.push(v);
                     v = *x;
                 }
@@ -529,9 +481,8 @@ impl ViewSpine {
 
 /// The read-only capability token a rule's guards see. Borrows only
 /// [`Caps`], never the graph, so a rule can hold it across a `&mut Builder`
-/// call. It exposes types, shapes, numerics and device caps and
-/// **structurally does not expose** consumer counts, liveness, cost or
-/// extraction state.
+/// call. Exposes types, shapes, numerics and device caps; never consumer
+/// counts, liveness, cost or extraction state.
 pub struct Facts<'a> {
     caps: &'a Caps,
     level: Level,
@@ -581,8 +532,8 @@ pub enum RuleTag {
 /// the id the rule unioned into the chain; `None` means it did not apply.
 pub type RuleFn = fn(&mut Builder<'_>, Id, &Node, &Facts<'_>) -> Option<Id>;
 
-/// One rewrite rule. **Rule order carries no semantics**; the fixed order
-/// in a `RULES: &[Rule]` exists only for reproducibility.
+/// One rewrite rule. Rule order carries no semantics; the fixed order in a
+/// `RULES: &[Rule]` exists only for reproducibility.
 #[derive(Copy, Clone)]
 pub struct Rule {
     pub name: &'static str,
@@ -606,20 +557,17 @@ impl fmt::Debug for Rule {
 /// Saturation limits. Exhausting any of them degrades to
 /// [`RuleTag::StrictlyLowering`]; it is never an error.
 ///
-/// **Every term is a count, never a clock.** A wall-clock cutoff makes the
-/// set of alternatives — and therefore the extracted plan, and therefore the
-/// `PlanHash` the cross-process cache is keyed on — depend on how loaded the
-/// machine was. The shipped 2 ms deadline did bind: a five-line `rms_norm`
-/// truncated at 96 of its 134 nodes, at a different node each run.
+/// Every term is a count, never a clock: a wall-clock cutoff makes the set
+/// of alternatives — and therefore the extracted plan and its `PlanHash` —
+/// depend on how loaded the machine was.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SaturationBudget {
     /// `MAX_NODES = node_slope * initial + node_slack`.
     pub node_slope: u32,
     pub node_slack: u32,
     pub max_rounds: u32,
-    /// Rule bodies invoked. The `(rule, node)` fired set already bounds this
-    /// at `rules * nodes`; this is the term that keeps a pathological graph's
-    /// compile time bounded without reading a clock.
+    /// Rule bodies invoked; keeps a pathological graph's compile time bounded
+    /// without reading a clock.
     pub max_applications: u32,
 }
 
@@ -627,35 +575,13 @@ impl Default for SaturationBudget {
     /// The shipped budget: `8 * initial + 4096` nodes, 10 rounds, 200k rule
     /// applications.
     ///
-    /// 200k is ~40x the largest graph in the conformance suite and still
-    /// bounds a 3,000-node step graph's saturation, so in practice the node
-    /// ceiling and the round count are what bind.
+    /// A round count bounds chain depth; the deepest chain in the suite is
+    /// attention, whose slowest member first saturates at 9 rounds, so 10 is
+    /// the tightest value that clears all four variants with headroom.
     ///
-    /// **10 rounds, not 6.** A round count bounds chain *depth*, and the
-    /// deepest chain in the suite is attention. Measured by A/B on
-    /// `attention_rope::*_defn_saturates`'s own gate, which is the only
-    /// honest instrument — the budget is what the gate reads: first
-    /// saturation is at 9 rounds (CPU, non-causal), 8 (CPU, causal), 7 (GPU,
-    /// non-causal) and 6 (GPU, causal), which is exactly why causal-on-GPU
-    /// was the one member of that quartet passing at 6. The other three were
-    /// not observing a slow saturation, they were observing a budget shorter
-    /// than the graph.
-    ///
-    /// The chain converges rather than diverges, so the deeper budget is a
-    /// fixpoint and not a longer walk: CPU non-causal reports 472 nodes at 7
-    /// rounds, 484 at 8 and a fixpoint at 9. Ten is the tightest value that
-    /// clears all four with a round of headroom.
-    ///
-    /// **Measured against the `splice` widening, and it is why that widening
-    /// is not landed.** With `fusion::splice` restating an absorbed producer's
-    /// operands over a promoted `space`, the CPU attention graph goes 472 ->
-    /// 1352 nodes and the fixpoint moves to 12 rounds, so this would have to
-    /// become 13. That cost is not the reason the widening was dropped — see
-    /// `fusor2-conformance::launch_counts` — but it is part of its price.
-    ///
-    /// Raising this moves extraction across the whole suite and `PlanHash` is
-    /// a golden, so it is not a knob to turn without re-running both
-    /// `fusor2-conformance` and `cargo test --workspace`.
+    /// Raising any of these moves extraction across the whole suite and
+    /// `PlanHash` is a golden, so it is not a knob to turn without re-running
+    /// both `fusor2-conformance` and `cargo test --workspace`.
     fn default() -> Self {
         Self {
             node_slope: 8,
@@ -672,8 +598,7 @@ pub struct SaturationReport {
     pub initial_nodes: usize,
     pub final_nodes: usize,
     pub rounds: u32,
-    /// Wall time. **Observability only** — nothing in the driver reads it,
-    /// so two runs of one graph report different micros and the same graph.
+    /// Wall time. Observability only — nothing in the driver reads it.
     pub micros: u64,
     /// Rule bodies invoked, against `SaturationBudget::max_applications`.
     pub applications: u32,
@@ -709,10 +634,8 @@ impl PreSaturation {
 /// in the identical pre-state.
 ///
 /// Holds no [`Caps`], no rule table and no [`SaturationBudget`]: it is a
-/// recording of an *outcome*, and the caller is what guarantees the other
-/// three inputs are the ones that produced it. A `Session` fixes its device,
-/// its rules and the default budget for its whole life, which is exactly that
-/// guarantee.
+/// recording of an outcome, and the caller guarantees the other three inputs
+/// are the ones that produced it (a `Session` fixes all three for its life).
 #[derive(Clone, Debug)]
 pub struct SaturationDelta {
     pre: PreSaturation,

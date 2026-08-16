@@ -105,13 +105,8 @@ fn unlinearize(linear: u64, grid: [u32; 3]) -> [u32; 3] {
 }
 
 /// Chunk size handed to `parallel_for`, chosen so one chunk amortizes
-/// `thread_wake_ps`.
-///
-/// This is the whole of the "should we parallelize?" question on CPU, and it
-/// is a *cost* question, which is why `PARALLEL_THRESHOLD = 16_777_216` does
-/// not appear anywhere in this crate: the extractor prices an outer tile loop
-/// marked parallel against the measured pool-wake cost, and the launcher only
-/// has to pick a grain that keeps every worker fed.
+/// `thread_wake_ps`. The parallelize-or-not decision is the extractor's cost
+/// call; the launcher only picks a grain that keeps every worker fed.
 pub fn grain_for(total: u64, threads: u32) -> u64 {
     let threads = threads.max(1) as u64;
     if threads == 1 {

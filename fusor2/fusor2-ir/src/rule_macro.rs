@@ -1,9 +1,7 @@
 //! The `rule!` macro. Three syntactic forms: the declarative one, which names
 //! a rule and its `apply` function, and two structural-pattern forms that
-//! destructure an `Op::L0(L0::…)` / `Op::L1(L1::…)` head, bind its fields by
-//! name and emit an early `return None` on mismatch. **No proc macro**: four
-//! of the interesting rules enumerate integer tuples and a pattern DSL would
-//! not earn itself there.
+//! destructure an `Op::Logical(Logical::…)` / `Op::Launch(Launch::…)` head, bind its fields by
+//! name and emit an early `return None` on mismatch.
 
 /// Declare a `pub const` [`crate::egraph::Rule`].
 ///
@@ -12,7 +10,7 @@
 /// **Declarative** — the rule body is a free function elsewhere:
 ///
 /// ```ignore
-/// rule!(FOLD_SPLIT, level = Level::L0, head = OpTag::Fold,
+/// rule!(FOLD_SPLIT, level = Level::Logical, head = OpTag::Fold,
 ///       tag = RuleTag::Additive, apply = fold_split);
 /// ```
 ///
@@ -20,18 +18,18 @@
 /// implicit `return None` when the node is not that variant:
 ///
 /// ```ignore
-/// rule!(UNIT_FOLD_COLLAPSE, level = Level::L0, head = OpTag::Fold,
+/// rule!(UNIT_FOLD_COLLAPSE, level = Level::Logical, head = OpTag::Fold,
 ///       tag = RuleTag::Additive,
 ///       l0 = Fold { combine, axis, acc, carrier, x },
 ///       |b, id, node, f| { … Option<Id> });
 /// ```
 ///
-/// `l1 = KFold { … }` is the same against [`crate::ir::level1::L1`]. Bound
+/// `l1 = Fold { … }` is the same against [`crate::ir::launch::Launch`]. Bound
 /// fields are *references* into the node, because the driver hands the rule a
 /// borrowed `&Node`.
 ///
 /// The rule's `name` is the identifier, so a conformance case can assert it
-/// fired by string without a second registry.
+/// fired by string.
 #[macro_export]
 macro_rules! rule {
     (
@@ -60,7 +58,7 @@ macro_rules! rule {
     ) => {
         $crate::rule_structural!(
             $name, $level, $head, $tag,
-            $crate::ir::Op::L0($crate::ir::level0::L0::$variant { $($field,)* .. }),
+            $crate::ir::Op::Logical($crate::ir::logical::Logical::$variant { $($field,)* .. }),
             |$b, $id, $node, $f| $body
         );
     };
@@ -75,7 +73,7 @@ macro_rules! rule {
     ) => {
         $crate::rule_structural!(
             $name, $level, $head, $tag,
-            $crate::ir::Op::L1($crate::ir::level1::L1::$variant { $($field,)* .. }),
+            $crate::ir::Op::Launch($crate::ir::launch::Launch::$variant { $($field,)* .. }),
             |$b, $id, $node, $f| $body
         );
     };

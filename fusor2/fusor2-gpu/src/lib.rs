@@ -1,7 +1,7 @@
 //! `fusor2-gpu` — the wgpu [`Target`](fusor2_ir::target::Target) end to end.
 //!
 //! Adapter/capability probing against **WebGPU baseline limits** with
-//! per-kernel widening, L1+`SchedPoint` -> `KernelIr` lowering for every L1
+//! per-kernel widening, Launch+`SchedPoint` -> `KernelIr` lowering for every Launch
 //! node family, `KernelIr` -> naga `Module` emission with **derived** bind
 //! groups and a storage `Uniforms` block at binding 0, the pooled allocator
 //! with a platform memory ceiling, the plan cache (memory LRU + disk, salted

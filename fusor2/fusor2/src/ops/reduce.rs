@@ -1,11 +1,11 @@
-//! The reductions. `sum`, `max`, `min` and `product` are each one `L0::Fold`
+//! The reductions. `sum`, `max`, `min` and `product` are each one `Logical::Fold`
 //! at a different single-slot [`Carrier`]; `mean` and `var` are compositions of those and
 //! a `Map`. Nothing here chooses a reduction strategy — `fold_split` is the
 //! single rule that turns any of them into a two-stage reduction when the
 //! extractor decides the axis is long enough to pay for it.
 
 use fusor2_ir::carrier::Carrier;
-use fusor2_ir::ir::level0::{L0, TiePolicy};
+use fusor2_ir::ir::logical::{Logical, TiePolicy};
 use fusor2_ir::scalar::BinOp;
 use fusor2_ir::shape::Dim;
 
@@ -13,13 +13,11 @@ use crate::tensor::{Scalar, Tensor};
 use crate::{Error, Result};
 
 impl Tensor {
-    /// One `L0::Fold` over `axis` with a scalar carrier.
+    /// One `Logical::Fold` over `axis` with a scalar carrier.
     ///
     /// The accumulator is `dtype.compute_dtype()`, so an f16 reduction
-    /// accumulates — and therefore *results* — in f32. That is the
-    /// mixed-precision story the architecture asks for: `acc` is carried
-    /// separately from operand dtype, and narrowing back is an explicit
-    /// `cast` the caller writes.
+    /// accumulates — and therefore results — in f32; narrowing back is an
+    /// explicit `cast` the caller writes.
     fn fold(&self, op: BinOp, tie: Option<TiePolicy>, axis: usize) -> Result<Tensor> {
         self.require_dense("reduction")?;
         self.check_axis(axis, "reduction")?;
@@ -28,7 +26,7 @@ impl Tensor {
             .ok_or_else(|| Error::Dtype(format!("{op:?} has no identity in {acc:?}")))?;
         let mut carrier = Carrier::binop(op, ident, acc);
         carrier.tie = tie;
-        self.emit_here(L0::Fold {
+        self.emit_here(Logical::Fold {
             carrier,
             axis: axis as u32,
             acc,
@@ -36,7 +34,7 @@ impl Tensor {
         })
     }
 
-    /// One `L0::Fold` over `axis` at an **arbitrary** carrier.
+    /// One `Logical::Fold` over `axis` at an **arbitrary** carrier.
     ///
     /// The general form the fold laws mint: a multi-slot accumulator whose
     /// `lanes` are appended to the output shape as a trailing axis, so slot `k`
@@ -50,7 +48,7 @@ impl Tensor {
         self.require_dense("reduction")?;
         self.check_axis(axis, "reduction")?;
         let acc = self.dtype().compute_dtype();
-        self.emit_here(L0::Fold {
+        self.emit_here(Logical::Fold {
             carrier,
             axis: axis as u32,
             acc,
@@ -136,8 +134,6 @@ impl Tensor {
         self.var(axis)
     }
 
-    // -- whole-tensor folds ---------------------------------------------------
-
     /// Sum every element into a rank-0 value.
     pub fn sum_all(&self) -> Result<Tensor> {
         self.flatten_all()?.sum(0)
@@ -146,8 +142,6 @@ impl Tensor {
     pub fn mean_all(&self) -> Result<Tensor> {
         self.flatten_all()?.mean(0)
     }
-
-    // -- derived reductions ----------------------------------------------------
 
     /// `1` where any element along `axis` is nonzero.
     pub fn any(&self, axis: usize) -> Result<Tensor> {
@@ -174,7 +168,7 @@ impl Tensor {
 
     /// Index of the first maximum along `axis`, as `U32`.
     ///
-    /// L0 has no index-carrying fold, so this is the honest composition:
+    /// Logical has no index-carrying fold, so this is a composition:
     /// broadcast the extremum back, replace every non-extremal position with
     /// the `Min` identity, and fold `Min` over `IndexOf(axis)`. Exact for
     /// extents below `2^24` on an f32 tensor, where the index stops being
@@ -226,7 +220,7 @@ impl Divisor {
 mod tests {
     use fusor2_ir::carrier::{Carrier, probes_for};
     use fusor2_ir::dtype::Dtype;
-    use fusor2_ir::ir::level0::TiePolicy;
+    use fusor2_ir::ir::logical::TiePolicy;
     use fusor2_ir::scalar::BinOp;
 
     #[test]

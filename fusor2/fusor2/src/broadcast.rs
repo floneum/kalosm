@@ -2,13 +2,13 @@
 //! broadcasting**: this module resolves a binary op's operand shapes and emits
 //! the stride-0 `Restride` that `verify_l0` requires.
 //!
-//! There is exactly one broadcast rule and it lives in
-//! [`fusor2_ir::shape::broadcast_specs`] / [`fusor2_ir::shape::broadcast_shapes`];
-//! nothing here re-derives it. Right-aligned: a source dim is consumed when it
-//! equals the target or is 1 (stride 0); unmatched target dims are inserted
-//! with stride 0 at **any** position; an unconsumed source dim is an error.
+//! The broadcast rule lives in [`fusor2_ir::shape::broadcast_specs`] /
+//! [`fusor2_ir::shape::broadcast_shapes`]. Right-aligned: a source dim is
+//! consumed when it equals the target or is 1 (stride 0); unmatched target dims
+//! are inserted with stride 0 at **any** position; an unconsumed source dim is
+//! an error.
 
-use fusor2_ir::ir::level0::L0;
+use fusor2_ir::ir::logical::Logical;
 use fusor2_ir::shape::{Dim, Dims, broadcast_shapes, broadcast_specs};
 
 use crate::Result;
@@ -17,14 +17,12 @@ use crate::tensor::Tensor;
 impl Tensor {
     /// Lift this value to `target` by emitting one stride-0 `Restride`.
     ///
-    /// Always emits a node, even when the shapes already agree: the identity
-    /// restride is what keeps `Map`'s "all operands have the output shape"
-    /// invariant a *structural* property rather than a case analysis.
+    /// Always emits a node, even when the shapes already agree.
     pub fn broadcast_as(&self, target: &[Dim]) -> Result<Tensor> {
         let src = self.shape();
         let specs = broadcast_specs(&src, target)?;
         let bounds = crate::ops::view::bounds_for(&specs, &src);
-        self.emit_here(L0::Restride {
+        self.emit_here(Logical::Restride {
             specs,
             bounds,
             x: self.id,

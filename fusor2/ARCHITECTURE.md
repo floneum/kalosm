@@ -10,7 +10,7 @@ Every phase-ordering failure catalogued in fusor is one bug: **a decision writte
 
 fusor2 removes the possibility rather than managing it. There is one acyclic e-graph into which the frontend, autograd and every lowering rule only ever *add*. Kernel family, tile geometry, split-K, staging depth, epilogue fusion, horizontal merging, layout, materialization, rematerialization, allocation and shape specialization are all selections in **one extraction**, priced by **one scalar picosecond cost function evaluated on the realized DAG**.
 
-Three levels: **L0 `tensor`**, **L1 `nest`**, **L2 `tile`**. The e-graph spans L0 and L1. L2 is the per-kernel IR produced *after* extraction; it carries its own verifier and exactly two closed-form argmins (§1.3).
+Three levels: **Logical `tensor`**, **Launch `nest`**, **Kernel `tile`**. The e-graph spans Logical and Launch. Kernel is the per-kernel IR produced *after* extraction; it carries its own verifier and exactly two closed-form argmins (§1.3).
 
 The acceptance test is not elegance. It is that `trainer/` runs **unmodified** at >= 11,417 examples/sec epoch-average, teacher parity >= 0.9483, and a **byte-identical 47,840-byte MSQ1 export**, with all four of its documented workarounds deleted: no shape padding, no `[1]`-tensor scalars, no hand-written embedding backward, no reshape-as-maxpool.
 
@@ -18,12 +18,12 @@ The acceptance test is not elegance. It is that `trainer/` runs **unmodified** a
 
 ## 1. The levels
 
-### 1.1 L0 `tensor` — ten nodes
+### 1.1 Logical `tensor` — ten nodes
 
 Whole-tensor algebra. No index space, no loop, no device. Where the user's program arrives and where autograd runs.
 
 ```rust
-pub enum L0 {
+pub enum Logical {
     Leaf(LeafKind),   // Buffer | Param | Const(Splat) | Uniform(SymId) | Quantized(QFmt, QLayout)
     Map      { expr: ScalarExpr, ins: SmallVec<[Id; 4]>, outs: u8 },
     Fold     { carrier: Carrier, axis: u32, acc: Dtype, ins: SmallVec<[Id; 4]> },
@@ -72,23 +72,23 @@ Two widenings past the reference's `{f32, f16, u32}`, both paid for: **I32** (fl
 7. `Dequant`: `shape[-1] % fmt.block_elements == 0`.
 8. Every op supplies `fn work(&self, shapes) -> Work { macs, transcendentals, index_ops, wg_bytes }`. **The verifier rejects a registration whose `work` is a constant.** fusor's `Attention { materialized_bytes: 0, work: 1 }` placeholder cannot recur, and `index_ops` is exactly the term the view-fold-vs-gather tradeoff needs.
 
-**Only L0 can express:** adjoint generation, contraction reassociation, the fold-splitting law, and — the one that earns the level outright — **gradient checkpointing**, because once forward and backward are one L0 graph (§5) "save this activation" versus "recompute it" *is* the extractor's materialization bit.
+**Only Logical can express:** adjoint generation, contraction reassociation, the fold-splitting law, and — the one that earns the level outright — **gradient checkpointing**, because once forward and backward are one Logical graph (§5) "save this activation" versus "recompute it" *is* the extractor's materialization bit.
 
-### 1.2 L1 `nest` — index spaces, kernels, launches
+### 1.2 Launch `nest` — index spaces, kernels, launches
 
 ```rust
-pub enum L1 {
-    KMap      { space: IndexSpace, body: ScalarExpr, ops: Vec<Operand>, sched: ScheduleDomain },
-    KFold     { space, axis, vec_axes, carrier: Carrier, acc, post: SmallVec<[ScalarExpr; 4]>,
+pub enum Launch {
+    Launch::Map      { space: IndexSpace, body: ScalarExpr, ops: Vec<Operand>, sched: ScheduleDomain },
+    Launch::Fold     { space, axis, vec_axes, carrier: Carrier, acc, post: SmallVec<[ScalarExpr; 4]>,
                 ops, sched },
-    KContract { m: Dim, n: Dim, k: Dim, batch: Dim, family: Family,
+    Launch::Contract { m: Dim, n: Dim, k: Dim, batch: Dim, family: Family,
                 pre_a: ScalarExpr, pre_b: ScalarExpr, post: ScalarExpr,
                 acc: Dtype, a: Operand, b: Operand, sched: ScheduleDomain },
     KQContract{ fmt: QFmt, layout: QLayout, act: QAct, .. },
-    KGather   { space, mode: GatherMode },
-    KScatter  { space, mode: ScatterMode },
+    Launch::Gather   { space, mode: GatherMode },
+    Launch::Scatter  { space, mode: ScatterMode },
     KFlash    { causal: bool, mask: MaskKind, produce: FlashOut, .. },
-    KRegion   { members: Vec<L1>, live_outs: SmallVec<[u32; 4]> },
+    Launch::Region   { members: Vec<Launch>, live_outs: SmallVec<[u32; 4]> },
     Ext       { def: OpDefId, ops: Vec<Operand>, attrs: AttrId },
 }
 ```
@@ -97,33 +97,33 @@ pub enum L1 {
 
 `Operand { src: Id, layout: Layout, access: AccessPlan }` where `AccessPlan = Alias | Gather | Pack{into} | Unflatten(MultiFlattenMap)`. **Access is an attribute of the edge, not of the producing node** — so one consumer may alias a strided parameter slice while another packs it, which is exactly the trainer's flat-parameter / gradient-concat case (constraint 6) and the im2col operand case coexisting in one graph. `MultiFlattenMap` (one `AxisGroup` per logical axis, each a vector of `SubAxis { extent, stride }` decomposed most-significant-first by divmod, zero strides and colliding strides legal) is carried verbatim; plain per-axis strides cannot express a conv window operand.
 
-`ScheduleDomain` is the enumerable schedule-parameter space of one node — for `KContract{Coop}` that is `coop_tile_entries() × split_candidates × staging_depth ∈ {1,2}`, ~8,300 points. **It is not e-nodes.** §4 explains how it is resolved without a nested argmin.
+`ScheduleDomain` is the enumerable schedule-parameter space of one node — for `Launch::Contract{Coop}` that is `coop_tile_entries() × split_candidates × staging_depth ∈ {1,2}`, ~8,300 points. **It is not e-nodes.** §4 explains how it is resolved without a nested argmin.
 
 **verify_l1.**
 1. `Geom::legal(caps)`: `rg*cg*subgroup_width <= max_wg_lanes`; `tm | bm`, `tn | bn`; `bm % (COOP_DIM*rg) == 0`, `bn/n_passes % (COOP_DIM*cg) == 0`.
-2. Workgroup footprint is checked against the **exact** value from the shared pure function `arena_plan(tiles(geom, dtype), caps) -> ArenaPlan { total_bytes, placements }`, memoized on `(geom, dtype, caps)` — the *same* function the L2 emitter uses. There is no estimator, therefore no L1/L2 admission mismatch and no "extraction commits a plan that fails L2 verification and silently falls back" — which would be `hardware_matmul_prep`'s stride-equality bug moved one level down.
+2. Workgroup footprint is checked against the **exact** value from the shared pure function `arena_plan(tiles(geom, dtype), caps) -> ArenaPlan { total_bytes, placements }`, memoized on `(geom, dtype, caps)` — the *same* function the Kernel emitter uses. There is no estimator, therefore no Launch/Kernel admission mismatch and no "extraction commits a plan that fails Kernel verification and silently falls back" — which would be `hardware_matmul_prep`'s stride-equality bug moved one level down.
 3. **A nest's write map must be injective unless the nest declares `combine: Some(c)` with `c.associative`.** One invariant, three jobs: it is the legality rule for scatter-add; it separates the four `Scatter{Add}` lowerings from an illegal in-place write; and applied to a `Window`-derived nest it *is* the proof that a non-overlapping pool's adjoint is an elementwise mask.
 4. A `Fold` dim may not appear with nonzero stride in the write map (a fold dim indexing the output is a scatter, not a reduction).
 5. Every operand's `AccessPlan` satisfies that operand's access predicate. A failed access analysis disqualifies **this rewrite only**, never every tiled lowering of the expression.
-6. A composite node (`KRegion`) carries the linear `MapDomain` its members' shared index space implies, checked against the node's *own inferred shape* rather than against whatever the minting rule wrote — so the geometry is a property of the node instead of a field a rule may drift.
-7. Every node carries `Effect = Pure | InPlace(BufferRole)`. `KScatter{Atomic}` and in-place assign are `InPlace`.
-8. **Allocation is not described at L1.** Buffers are derived from the extracted plan (§4).
+6. A composite node (`Launch::Region`) carries the linear `MapDomain` its members' shared index space implies, checked against the node's *own inferred shape* rather than against whatever the minting rule wrote — so the geometry is a property of the node instead of a field a rule may drift.
+7. Every node carries `Effect = Pure | InPlace(BufferRole)`. `Launch::Scatter{Atomic}` and in-place assign are `InPlace`.
+8. **Allocation is not described at Launch.** Buffers are derived from the extracted plan (§4).
 
-**Only L1 can express:** fusion, tiling, split-K, layout alias-vs-gather, kernel family, horizontal merging, register tiling, rematerialization.
+**Only Launch can express:** fusion, tiling, split-K, layout alias-vs-gather, kernel family, horizontal merging, register tiling, rematerialization.
 
-### 1.3 L2 `tile` — one kernel body
+### 1.3 Kernel `tile` — one kernel body
 
-fusor's `tile-ir` near-verbatim — 14k proven lines with the best verifier in the reference — with five changes: `Shared` is **deleted** (structural sharing comes from hash-consing the whole L2 term, so two identical subtrees built separately merge, which `Rc::as_ptr` memoization structurally cannot); `AtomicAdd` is added for `ScatterMode::Atomic`; `Stmt::Reduce` is added as the N-ary reduction; `NumericContract` rides on `Unary`/`Binary`; `bf16` joins `ScalarElement`. Element type is runtime data on the node, never a Rust marker or const generic.
+fusor's `tile-ir` near-verbatim — 14k proven lines with the best verifier in the reference — with five changes: `Shared` is **deleted** (structural sharing comes from hash-consing the whole Kernel term, so two identical subtrees built separately merge, which `Rc::as_ptr` memoization structurally cannot); `AtomicAdd` is added for `ScatterMode::Atomic`; `Stmt::Reduce` is added as the N-ary reduction; `NumericContract` rides on `Unary`/`Binary`; `bf16` joins `ScalarElement`. Element type is runtime data on the node, never a Rust marker or const generic.
 
 **Reduction is N-ary, and the hardware fast path is a degenerate case *beside* it rather than a rewrite of it.** `TileExprKind::Reduce { op: TileReduceOp, kind, value }` survives verbatim as the one-value, one-operator form every subgroup collective and shared-memory tree is spelled with; the single-slot path carries every fold in the system and must keep emitting byte-identical code. `Stmt::Reduce { kind, values, merge: MergeBody, fast, outs, scratch }` is the general form: one partial, one merge expression, one output `Local` and one scratch tile per accumulator **lane** — a `SlotTy::Scalar` slot is one lane, a `SlotTy::Vector(d)` slot is `d`. `fast` is *computed* by the constructor, set exactly when there is one lane whose merge is `binary(op, lhs[0], rhs[0])`, so it can never drift from `merge`; both emitters open their arm with it and take the existing collective path unchanged. **The `accs[0]` bug is unrepresentable**: there is no single `TileReduceOp` to resolve for a whole fold, and `verify_l2` rejects a node whose `values`, `merge.body`, `merge.lhs`, `merge.rhs`, `outs` and `scratch` disagree in length, so `Fold{(max, sum)}` cannot compute `max(x)` and discard the sum — there is nowhere to discard it to. Cross-lane reads inside `merge` are **required**, not forbidden (flash's running sum and its output accumulator both read the running max); what is rejected is a read of anything outside the formals, because a merge that reads a lane id is not a merge. A multi-lane merge has no hardware collective at all, so it lowers to an explicit log-tree over `lanes * block` scratch with a barrier between levels — and `verify_uniformity` checks the *statement* that produces those barriers, since they are emitted rather than written.
 
 **verify_l2.** Retained verbatim: `verify_arena`'s independent all-pairs recheck that every byte-overlapping tile pair is separated by a *guaranteed uniform* barrier, failing lowering rather than racing. Added, because the reference asserts "guaranteed" with no analysis to establish it: **a `Barrier` may not appear under an `If` whose predicate is non-uniform over the group**, backed by a uniformity analysis. Plus: every `Load` masked or provably in range; every `Loop` accumulator declared; every `Stmt::Reduce` arity- and element-consistent across its lanes with a `merge` reading only its own formals; `cooperative_store_layout_supported` on every `CoopStore`; full expression type-check.
 
-**The cut.** Barrier elision and workgroup arena packing stay **closed-form argmins inside L2 with an independent verifier**, not e-graph alternatives. Both are argmins over <= ~20 tiles with explicit feasibility predicates; the reference already computes `barrier_suggestions`' `bytes_saved` and throws it away only for want of a caller. fusor2 gives it a caller: `arena_plan` runs `Regions`, `ByteArena` and the top-3 barrier insertions and takes the argmin of `total_bytes`. Because `arena_plan` is a pure memoized function of `(geom, dtype, caps)`, its result feeds `verify_l1` and the L1 occupancy term (`core_workgroup_slots`) exactly, closing the feedback loop that fusor leaves open — without paying e-graph machinery for one occupancy class in one kernel on one vendor.
+**The cut.** Barrier elision and workgroup arena packing stay **closed-form argmins inside Kernel with an independent verifier**, not e-graph alternatives. Both are argmins over <= ~20 tiles with explicit feasibility predicates; the reference already computes `barrier_suggestions`' `bytes_saved` and throws it away only for want of a caller. fusor2 gives it a caller: `arena_plan` runs `Regions`, `ByteArena` and the top-3 barrier insertions and takes the argmin of `total_bytes`. Because `arena_plan` is a pure memoized function of `(geom, dtype, caps)`, its result feeds `verify_l1` and the Launch occupancy term (`core_workgroup_slots`) exactly, closing the feedback loop that fusor leaves open — without paying e-graph machinery for one occupancy class in one kernel on one vendor.
 
 ### 1.4 Deleted levels
 
-The reference has five representations; two carry no optimization. The **execution graph** is a copy of the compute graph with recognizers applied. The **`Operation` trait** is a vtable, not a dialect. Both deleted. Also deleted before being built: an **affine/scf loop dialect** (interchange, unroll, peeling are L1 index-map algebra, decidable, not loop pattern matching) and a **target/WGSL dialect** (naga IR is already an IR; a dialect between L2 and naga would host zero rewrite rules).
+The reference has five representations; two carry no optimization. The **execution graph** is a copy of the compute graph with recognizers applied. The **`Operation` trait** is a vtable, not a dialect. Both deleted. Also deleted before being built: an **affine/scf loop dialect** (interchange, unroll, peeling are Launch index-map algebra, decidable, not loop pattern matching) and a **target/WGSL dialect** (naga IR is already an IR; a dialect between Kernel and naga would host zero rewrite rules).
 
 ---
 
@@ -133,7 +133,7 @@ The reference has five representations; two carry no optimization. The **executi
 
 ```rust
 pub struct Node { pub op: Op, pub level: Level, pub children: SmallVec<[Id; 4]> }
-pub enum Op { L0(L0), L1(L1), Union(Id, Id) }
+pub enum Op { Logical(Logical), Launch(Launch), Union(Id, Id) }
 ```
 
 **Acyclicity is structural, not checked.** `children` may only contain ids strictly smaller than the node's own id. `union(a, b)` allocates a *new* id `> max(a, b)` holding `Op::Union(a, b)`. There is no union-find, no `rebuild()`, no congruence closure, no cycle probe. The reference's `CAP = 512` bounded reachability probe in region growth — which turns a legal fusion into a rejection non-deterministically with respect to graph size — has nothing to check.
@@ -146,7 +146,7 @@ This is the decisive choice over attach-only-with-hash-consing (which has no cla
 
 **Canonicalization.** `FxHashMap<NodeKey, Id>` hash-consing on canonicalized children. Commutative ops sort children by `Id` at construction, so associativity and commutativity are a **canonical form, not a rule family** — removing the largest blowup source before saturation starts. The global hash-cons replaces, by construction, three reference mechanisms: `Rc::as_ptr`-keyed codegen CSE, `coalesce_equivalent_eclasses`' positional `split_first()` representative choice, and `FusionPlanMemo`'s bounded-depth window whose horizon-completeness was answerable only under `FUSOR_VERIFY_PLAN_SHARING`.
 
-**Budget.** Worklist in creation order; `FixedBitSet` over `(RuleId, Id)`. `MAX_NODES = 8*initial + 4096`, `MAX_ROUNDS = 6`, 2 ms wall. On exhaustion the driver offers only rules tagged `StrictlyLowering`, guaranteeing every chain provably reaches an L1 form — budget exhaustion yields a degraded-but-valid plan, never a hard error. `saturated: bool` and `truncated: Vec<Id>` are reported to conformance; truncation is never silent. Measured target for the trainer's ~3,000-node step graph: 1,900 initial nodes, ~7,400 after saturation, 1.4 ms. The graph stays small because **schedule parameters are not e-nodes** (§4).
+**Budget.** Worklist in creation order; `FixedBitSet` over `(RuleId, Id)`. `MAX_NODES = 8*initial + 4096`, `MAX_ROUNDS = 6`, 2 ms wall. On exhaustion the driver offers only rules tagged `StrictlyLowering`, guaranteeing every chain provably reaches an Launch form — budget exhaustion yields a degraded-but-valid plan, never a hard error. `saturated: bool` and `truncated: Vec<Id>` are reported to conformance; truncation is never silent. Measured target for the trainer's ~3,000-node step graph: 1,900 initial nodes, ~7,400 after saturation, 1.4 ms. The graph stays small because **schedule parameters are not e-nodes** (§4).
 
 ---
 
@@ -169,7 +169,7 @@ Two syntactic forms: a `rule!` `macro_rules!` for structural patterns, and a pla
 **R1 — algebraic: the fold-splitting law.** The reference's `fold.rs` names the law that split-K, online softmax and Welford are one fact, then implements all three separately.
 
 ```rust
-rule! { fold_split, L0, tag = Additive,
+rule! { fold_split, Logical, tag = Additive,
     Fold { carrier: c, axis: a, acc, ins: [x] }
       if c.associative && facts.own().numeric.reassoc && dim(x, a).at_least(4096) =>
     Fold { carrier: c.as_merge(), axis: a, acc,
@@ -182,13 +182,13 @@ At a `Contract`'s summed axis it *is* split-K; at a `(max, sum)` carrier it *is*
 **R2 — fusion: producer inlining, which is also region formation.**
 
 ```rust
-rule! { map_into_fold, L1, tag = Additive,
-    KFold { space, carrier, post, acc, x: KMap { body, ops, .. } }
+rule! { map_into_fold, Launch, tag = Additive,
+    Launch::Fold { space, carrier, post, acc, x: Launch::Map { body, ops, .. } }
       if space.covers(x.space) && ops.iter().all(|o| o.access.legal_in(space)) =>
-    KFold { space, carrier: carrier.with_lift(carrier.lift.compose(body)), post, acc, ops } }
+    Launch::Fold { space, carrier: carrier.with_lift(carrier.lift.compose(body)), post, acc, ops } }
 ```
 
-No consumer-count check. No duplication veto. If `x` has two consumers, both may inline it and the **cost model** charges the recompute once per consumer against the saved write plus the saved reads — exactly what the reference's `spike_dup_ledger` measures and then discards. `KRegion` is the same rewrite with `live_outs` non-empty: a multi-output node emitting an extra buffer. The reference's contradiction — the extractor vetoing precisely the fusions `form_elementwise_regions` then performs by a different rule — is unstateable.
+No consumer-count check. No duplication veto. If `x` has two consumers, both may inline it and the **cost model** charges the recompute once per consumer against the saved write plus the saved reads — exactly what the reference's `spike_dup_ledger` measures and then discards. `Launch::Region` is the same rewrite with `live_outs` non-empty: a multi-output node emitting an extra buffer. The reference's contradiction — the extractor vetoing precisely the fusions `form_elementwise_regions` then performs by a different rule — is unstateable.
 
 Note also that elementwise-into-elementwise fusion needs **no rule at all**: it is `pre.compose(body)`, a `ScalarExpr` tree substitution inside `Map`.
 
@@ -198,13 +198,13 @@ Note also that elementwise-into-elementwise fusion needs **no rule at all**: it 
 fn lower_family(b: &mut Builder, id: Id, n: &Node, f: &Facts, family: Family) -> Option<Id> {
     let dom = CoopDomain::legal(n, f.caps());      // filters by arena_plan bytes + lane limits
     if dom.is_empty() { return None }
-    b.union(id, L1::KContract { family, sched: ScheduleDomain::Coop(dom), .. })
+    b.union(id, Launch::Launch::Contract { family, sched: ScheduleDomain::Coop(dom), .. })
 }
 ```
 
 A separate `tile_contract` rule that upgraded a `ScheduleDomain::Point`
 contraction used to sit here. Nothing ever minted one: `lower_floor.rs` is the
-only source of `ScheduleDomain::Point` and it mints no `KContract`, so the rule
+only source of `ScheduleDomain::Point` and it mints no `Launch::Contract`, so the rule
 matched zero nodes over the whole conformance suite and every model, and it is
 deleted. The domain is attached where the family is chosen — the same "replaces
 `Point` instead of competing with it" rule `tile_gather`'s note states.
@@ -216,14 +216,14 @@ deleted. The domain is attached where the family is chosen — the same "replace
 **R4 — kernel selection: four independent, order-free rules.**
 
 ```rust
-rule! { lower_coop,    L0, tag = StrictlyLowering, Contract{..} if f.caps.coop_supported
-        => KContract { family: Coop,    sched: ScheduleDomain::Coop(..), .. } }
-rule! { lower_sgemm,   L0, tag = StrictlyLowering, Contract{..}
-        => KContract { family: Sgemm,   sched: .. } }
-rule! { lower_sgemv,   L0, tag = StrictlyLowering, Contract{..}
-        => KContract { family: Sgemv,   sched: .. } }
-rule! { lower_generic, L0, tag = StrictlyLowering, Contract{spec, acc, a, b}
-        => KFold { carrier: Carrier::binop(Add).with_lift(mul(Arg(0), Arg(1))), acc, .. } }
+rule! { lower_coop,    Logical, tag = StrictlyLowering, Contract{..} if f.caps.coop_supported
+        => Launch::Contract { family: Coop,    sched: ScheduleDomain::Coop(..), .. } }
+rule! { lower_sgemm,   Logical, tag = StrictlyLowering, Contract{..}
+        => Launch::Contract { family: Sgemm,   sched: .. } }
+rule! { lower_sgemv,   Logical, tag = StrictlyLowering, Contract{..}
+        => Launch::Contract { family: Sgemv,   sched: .. } }
+rule! { lower_generic, Logical, tag = StrictlyLowering, Contract{spec, acc, a, b}
+        => Launch::Fold { carrier: Carrier::binop(Add).with_lift(mul(Arg(0), Arg(1))), acc, .. } }
 ```
 
 `ShapeSelector`'s first-match ordering — in which a gemv-shaped contraction picks Coop, the tile scorer declines on its padding gate, and production silently runs a third path (the reference pins this as golden row `1x4096x4096 => Coop tile=None`) — is structurally impossible: all four coexist. The `padded_macs * 4 > useful_macs * 5` routing guard is **deleted**, because padded MACs already enter the issue term, so a badly padded coop tile simply loses to sgemv on cost instead of being routed around it. The nine `qmatmul_direct_selector` arms become nine independent rules with divisibility as a legality guard and `N >= 8192` / `K <= 1024` as cost terms, so N=8191 degrades continuously.
@@ -231,10 +231,10 @@ rule! { lower_generic, L0, tag = StrictlyLowering, Contract{spec, acc, a, b}
 **R5 — sinking, consumer-rooted.**
 
 ```rust
-rule! { sink_epilogue, L1, tag = Additive,
-    KMap { body, ops: [Operand { src: v, access: Alias, .. }] }
+rule! { sink_epilogue, Launch, tag = Additive,
+    Launch::Map { body, ops: [Operand { src: v, access: Alias, .. }] }
       if let Some((mm, views)) = b.trace_pure_views(v) =>
-    Restride { specs: views, x: KContract { post: post_of(mm).compose(body), ..mm } } }
+    Restride { specs: views, x: Launch::Contract { post: post_of(mm).compose(body), ..mm } } }
 ```
 
 **R6 — scatter-add, four lowerings.** `Atomic` (guarded on `caps.atomic_f32`), `SortSegment`, `WgPrivateMerge` (guarded on `rows*elem_bytes <= caps.max_wg_storage`), and `OneHotContract` — the last surviving only as the candidate the cost model rejects. At the trainer's batch-128 / 768-unit / K=3 shape, `OneHotContract` prices at 1.2 GB of traffic against `WgPrivateMerge`'s 96 KB private accumulator (1024 bins × 24 f32, fits threadgroup memory). The trainer's host-side three-level sorted gather-and-sum, its `ScatterShape` padding and its ~0.9 ms/batch host cost are all deleted.
@@ -280,7 +280,7 @@ Cost is evaluated on the **realized DAG** under `(sigma, m, theta)`:
 
 Consumer counts come from the DAG, so **rematerialization is priced exactly** as `saved_write + saved_reads - recompute*(consumers-1)`. The reference's `variant_duplicates_required_producer` hard veto — which makes the whole remat space unreachable — is deleted, not weakened.
 
-**Effect pinning.** A selected node with `Effect::InPlace` is **pinned in `M`**. Without this, toggling a two-consumer `KScatter{Atomic}` out of `M` inlines it into both consumers' kernels and the atomics apply twice, doubling the embedding gradient. Purity is thus a precondition of the materialization move, not an afterthought.
+**Effect pinning.** A selected node with `Effect::InPlace` is **pinned in `M`**. Without this, toggling a two-consumer `Launch::Scatter{Atomic}` out of `M` inlines it into both consumers' kernels and the atomics apply twice, doubling the embedding gradient. Purity is thus a precondition of the materialization move, not an afterthought.
 
 ### 4.2 The algorithm
 
@@ -289,13 +289,13 @@ Consumer counts come from the DAG, so **rematerialization is priced exactly** as
 3. **Exact cost** on the realized DAG.
 4. **Local search** over three moves: `RESELECT(c)` (change node), `FLIP(c)` (toggle `M`, refused when pinned), `RESCHEDULE(c)` (change schedule point). Each move's delta is recomputed over only the affected launches via a union-find over the realized cut. Accept strict improvements; ties by node id. `RESCHEDULE`'s move frontier is ordered by `score_fs` (Pareto top-k first) but **the full domain remains reachable and the accept test is always the exact global cost** — `score_fs` orders moves, it never gates candidates. Schedule cost is memoized on `(node, theta, context_hash)` where `context_hash` covers segment count, epilogue signature, operand layouts and the consumer demand set, which is what makes an ~8,300-point domain affordable.
 5. **Budget** `64*|chains|` moves or 2 ms, keeping best-so-far. Fully deterministic.
-6. **`verify_plan`** on the winner: every selected non-leaf is L1; every geometry legal against the exact `arena_plan`; every operand access satisfiable; every buffer stride derivable; no `InPlace` node inlined. A failure is a **hard conformance assert**, never a silent fallback.
+6. **`verify_plan`** on the winner: every selected non-leaf is Launch; every geometry legal against the exact `arena_plan`; every operand access satisfiable; every buffer stride derivable; no `InPlace` node inlined. A failure is a **hard conformance assert**, never a silent fallback.
 
 **Allocation is derived from the plan**: for each node in `M`, `buffer_layout(node, theta)` gives the padded strides the selected geometry needs, including split-K scratch slices. `hardware_matmul_prep`'s exact-stride equality test and its silent generic-reduce fallback become an invariant the extractor establishes.
 
 **The plan is the cache key.** `PlanHash = hash(realized DAG term + M + theta + DeviceFacts::fingerprint)`, where the fingerprint **includes `max_compute_workgroup_storage_size`** (the reference omits it while the coop legality filter reads it — a live staleness hazard). `Dim::Sym` and `Leaf::Uniform` hash as symbols, not values, so one plan serves a whole shape family. There is no `hash_kernel_fields`, no `kernel_cache_key_with_dispatch`, no `structural_kernel_key`, no golden byte files; the class of bug where a new decision variable must be threaded into four hash recipes cannot exist.
 
-**Replay.** The extraction memo is keyed on `(L0 term hash, DeviceFacts fingerprint, dim binding vector)`. On a miss we re-extract (~1.4 ms) and compare `PlanHash`; unchanged means nothing recompiles. Validity is *"the extraction inputs are identical"*, not *"a structural fingerprint matches"*, so a training loop can no longer freeze step 1's decisions forever. This is affordable precisely because the trainer reads nothing back and the host runs several steps ahead — re-extraction never lands on the critical path.
+**Replay.** The extraction memo is keyed on `(Logical term hash, DeviceFacts fingerprint, dim binding vector)`. On a miss we re-extract (~1.4 ms) and compare `PlanHash`; unchanged means nothing recompiles. Validity is *"the extraction inputs are identical"*, not *"a structural fingerprint matches"*, so a training loop can no longer freeze step 1's decisions forever. This is affordable precisely because the trainer reads nothing back and the host runs several steps ahead — re-extraction never lands on the critical path.
 
 **Verification of the heuristic.** `fusor2-conformance` ships a **debug ILP oracle** that must agree with the local search on small graphs, plus golden `PlanHash` tests over the calibration shape set and a `--exhaustive` mode. A greedy search compared only against itself cannot distinguish "found the optimum" from "made the same mistake as the reference."
 
@@ -303,9 +303,9 @@ Consumer counts come from the DAG, so **rematerialization is priced exactly** as
 
 ## 5. Autograd
 
-**An L0 → L0 transform in `fusor2-autograd`, run before ingestion, whose output is ingested together with the forward as one graph with one root set** (parameter gradients plus any requested loss).
+**An Logical → Logical transform in `fusor2-autograd`, run before ingestion, whose output is ingested together with the forward as one graph with one root set** (parameter gradients plus any requested loss).
 
-*Why L0*: adjoints are facts about tensor algebra. `d(Contract) = (grad @ Bᵀ, Aᵀ @ grad)` holds regardless of tile geometry; stating it at L1 would mean restating it per lowering.
+*Why Logical*: adjoints are facts about tensor algebra. `d(Contract) = (grad @ Bᵀ, Aᵀ @ grad)` holds regardless of tile geometry; stating it at Launch would mean restating it per lowering.
 *Why not as rewrite rules*: an adjoint is a directed transformation, not an equality; putting `grad` in the primal's chain is unsound.
 *Why one graph*: **gradient checkpointing is the extractor's `M` decision.** An activation alive for the backward is a node in `M`; recomputing it is dropping it. Nobody writes a checkpointing pass and there is no user annotation. `Persistence` tells the extractor which buffers it may recompute.
 
@@ -331,7 +331,7 @@ pub static ADJOINTS: &[Adjoint] = &[
 
 **`Window`'s structural adjoint is trainer constraint 4, solved by two integers.** From `(window, step)`: `step >= window` proves the adjoint is an elementwise mask-and-broadcast; overlapping windows give `Scatter{Add}`, itself a chain with four lowerings. This is why `Window` survives as a core op rather than collapsing into `Restride` with injectivity as a derived fact: under `Dim::Sym`, injectivity of a *relative* stride composition with symbolic extents and offsets is undecidable, the verifier must answer conservatively, and the trainer's non-overlapping max-pool would degrade to a scatter on exactly the symbolic-shape path the design exists to enable.
 
-**There is no `replay_*`.** `conv`, `grouped_conv`, `rms_norm`, `layer_norm`, `rope`, `attention`, `upsample`, `pool`, `q_mat_mul` are macro ops whose `defn` expansion into core L0 is present from node zero, so their adjoints are the composition of core adjoints, automatically. The reference's four replay combinators — build a throwaway `Graph` at backward time and re-differentiate — do not exist. Neither does the tape: no `Arc<dyn Fn>` closures, no type-erased `AnyTensorValue` downcasts with runtime rank-mismatch strings, no self-`Arc` cycle hazard.
+**There is no `replay_*`.** `conv`, `grouped_conv`, `rms_norm`, `layer_norm`, `rope`, `attention`, `upsample`, `pool`, `q_mat_mul` are macro ops whose `defn` expansion into core Logical is present from node zero, so their adjoints are the composition of core adjoints, automatically. The reference's four replay combinators — build a throwaway `Graph` at backward time and re-differentiate — do not exist. Neither does the tape: no `Arc<dyn Fn>` closures, no type-erased `AnyTensorValue` downcasts with runtime rank-mismatch strings, no self-`Arc` cycle hazard.
 
 The named risk is that the reference's **hand-fused backwards** (`attention_grads`, `rms_norm_fused`'s backward, the analytic softmax Jacobian) must be re-derived by rewrite rules from the composed backward. Mitigation is a tripwire, not hope: `KFlash` is minted by a rule matching the composed backward, and conformance asserts launch counts (`resolves_in::<N>`, carried over) for **eight named backward shapes**. A non-firing rule is a hard test failure, not a quiet 5-10× throughput regression. The trainer's `distillation_loss` becomes the plain taped softplus chain, with `softplus_bce_adjoint` rewriting its adjoint to the single-sigmoid form; QAT fake-quant is one `with_backwards` registration with zero user code. `with_backwards` survives verbatim — `Parent`, `GradientSlot` as a bare `NodeId` so a closure can never close an `Arc` cycle, and validation that every requires-grad parent receives a gradient — as the fallback, needed by nothing the trainer does.
 
@@ -339,9 +339,9 @@ The named risk is that the reference's **hand-fused backwards** (`attention_grad
 
 ## 6. Both backends
 
-**Shared:** L0, L1, L2, the e-graph, every L0 rule, autograd, the cost-model *shape*, the quantized decode tables, `arena_plan`, the plan cache, and the tile dialect itself. A WGSL `vec4`/`fma`/`dot` and a CPU `f32x4::mul_add` are the same primitive at different widths.
+**Shared:** Logical, Launch, Kernel, the e-graph, every Logical rule, autograd, the cost-model *shape*, the quantized decode tables, `arena_plan`, the plan cache, and the tile dialect itself. A WGSL `vec4`/`fma`/`dot` and a CPU `f32x4::mul_add` are the same primitive at different widths.
 
-**Target-specific:** `DeviceFacts` values, `Caps`, the L1 lowering rules that mention lane/subgroup geometry, and the L2 emitter.
+**Target-specific:** `DeviceFacts` values, `Caps`, the Launch lowering rules that mention lane/subgroup geometry, and the Kernel emitter.
 
 ```rust
 pub trait Target: Send + Sync {
@@ -353,7 +353,7 @@ pub trait Target: Send + Sync {
 }
 ```
 
-**GPU.** L2 → liveness → `arena_plan` → `verify_arena` → naga `Module` → validate → `create_shader_module_trusted`. Bind groups stay **derived** from the emitted module's storage globals, sorted by binding, read-only from the absence of `StorageAccess::STORE`, zipped positionally with the builder's buffer list — binding order and codegen cannot drift. One `main`, one bind group, whole-buffer bindings. **Binding 0 is always a `Uniforms` storage buffer** holding `[u32 symbolic dims..., f32 uniform scalars...]`. That one buffer kills trainer constraints 1 and 2 together: `m * lr_f32` produces a `Uniform`, not a baked literal, and a sequence length is a `Sym` read from binding 0. (A separate uniform-address-space block would break the derived-bind-group mechanism, which walks storage globals; that is why this is a storage buffer.)
+**GPU.** Kernel → liveness → `arena_plan` → `verify_arena` → naga `Module` → validate → `create_shader_module_trusted`. Bind groups stay **derived** from the emitted module's storage globals, sorted by binding, read-only from the absence of `StorageAccess::STORE`, zipped positionally with the builder's buffer list — binding order and codegen cannot drift. One `main`, one bind group, whole-buffer bindings. **Binding 0 is always a `Uniforms` storage buffer** holding `[u32 symbolic dims..., f32 uniform scalars...]`. That one buffer kills trainer constraints 1 and 2 together: `m * lr_f32` produces a `Uniform`, not a baked literal, and a sequence length is a `Sym` read from binding 0. (A separate uniform-address-space block would break the derived-bind-group mechanism, which walks storage globals; that is why this is a storage buffer.)
 
 Default build targets released **wgpu 29.x** with `naga-ir` and requests **WebGPU baseline limits**, widening only what a selected kernel's legality predicate proves it needs — so a plan legal on one device is legal on another and the cost model's filters mean the same thing everywhere. SUBGROUP, SHADER_F16, EXPERIMENTAL_COOPERATIVE_MATRIX, PIPELINE_CACHE and TIMESTAMP_QUERY are each probed with a working fallback (`WgTree` folds, f32, `Family::Sgemm`, cold compile, no profiling). The wgpu fork is one cargo feature, `fork-metal`, contributing exactly two capabilities — workgroup-alias byte-arena packing and mixed-precision cooperative store. Without it the arena falls back to per-stride-class regions and an f32-accumulated f16-output kernel pays a staging tile plus a per-lane cast: footprint and a staging pass, never correctness.
 
@@ -361,7 +361,7 @@ Buffers come from a pooled allocator keyed `(size, usage)` with `strong_count ==
 
 **CPU.** The same `KernelIr`, different emitter:
 
-| L2 concept | GPU | CPU |
+| Kernel concept | GPU | CPU |
 |---|---|---|
 | `grid` | `dispatch_workgroups` | `parallel_for(0..grid, grain)` on one persistent pool |
 | `block` lanes | invocations | `W` SIMD lanes × unroll; `W` from a cached `Level` |
@@ -374,9 +374,9 @@ Buffers come from a pooled allocator keyed `(size, usage)` with `strong_count ==
 
 The barrier mapping is not cosmetic. A block's 256 lanes become an inner loop of 32 iterations at `W = 8`; mapping `Barrier` to a no-op miscompiles every kernel that stages through workgroup memory — `Reduce{WgTree}`, packed-B GEMM tiles, and the flash-attention staging step — because iteration 0 reads tile slots iteration 31 has not written. Splitting the loop is the correct semantics, costs one lowering pass, and makes the arena separation predicate trivially true on CPU.
 
-`fearless_simd`'s statically-known `f32x4/f32x8/f32x16` is what makes a 4×4 register accumulator tile expressible at all; `pulp`'s width-erased `S::f32s` structurally cannot, which is the root cause of the reference's `[E; 64]` spill pattern in every comparison, every transcendental and every strided gather. `Level` is cached in a `OnceLock` and dispatched **once per kernel launch**, not per row. `pulp`, `gemm` and transitive `rayon` are dropped: an external BLAS in the critical path makes epilogue fusion structurally impossible. Matmul is a `KContract` lowered to L2 with real blocking, packing and a microkernel, so bias/gelu/dequant epilogues fuse into the k-loop. f16 and bf16 compute is the `widen-compute` **lowering rule** (widen to f32 registers, compute, narrow on store), not a one-lane `F16Scalar`. Non-contiguous access is four lowering alternatives — contiguous, broadcast/splat, unit-inner-stride sub-slice, general gather — plus a `Pack` operand access, never a per-vector runtime `is_contiguous()` branch. Parallelism is a scheduling attribute on an outer L1 tile loop priced against real pool-wake cost, deleting `PARALLEL_THRESHOLD = 16_777_216`.
+`fearless_simd`'s statically-known `f32x4/f32x8/f32x16` is what makes a 4×4 register accumulator tile expressible at all; `pulp`'s width-erased `S::f32s` structurally cannot, which is the root cause of the reference's `[E; 64]` spill pattern in every comparison, every transcendental and every strided gather. `Level` is cached in a `OnceLock` and dispatched **once per kernel launch**, not per row. `pulp`, `gemm` and transitive `rayon` are dropped: an external BLAS in the critical path makes epilogue fusion structurally impossible. Matmul is a `Launch::Contract` lowered to Kernel with real blocking, packing and a microkernel, so bias/gelu/dequant epilogues fuse into the k-loop. f16 and bf16 compute is the `widen-compute` **lowering rule** (widen to f32 registers, compute, narrow on store), not a one-lane `F16Scalar`. Non-contiguous access is four lowering alternatives — contiguous, broadcast/splat, unit-inner-stride sub-slice, general gather — plus a `Pack` operand access, never a per-vector runtime `is_contiguous()` branch. Parallelism is a scheduling attribute on an outer Launch tile loop priced against real pool-wake cost, deleting `PARALLEL_THRESHOLD = 16_777_216`.
 
-**A third backend** implements `Target` (~1,500 lines: facts, caps, emitter, launcher) and optionally contributes L1 rules. It inherits every L0 rule, autograd, the cost model and the plan cache for free.
+**A third backend** implements `Target` (~1,500 lines: facts, caps, emitter, launcher) and optionally contributes Launch rules. It inherits every Logical rule, autograd, the cost model and the plan cache for free.
 
 ---
 
@@ -387,7 +387,7 @@ The barrier mapping is not cosmetic. A block's 256 lanes become an inner loop of
 ```rust
 pub struct BlockSpec {
     pub elements: u16, pub bytes: u16,
-    pub decode: BlockProgram,           // a small L2 snippet, not a single ScalarExpr
+    pub decode: BlockProgram,           // a small Kernel snippet, not a single ScalarExpr
     pub native_f16_scales: bool,
     pub activation: &'static [QAct],
 }
@@ -399,7 +399,7 @@ pub struct BlockSpec {
 
 **Both quantized dot lowerings coexist**: `QAct::F32` (dequantize the block into registers, then FMA) and `QAct::Q8Dp4a` (`Pack4xI8Clamp` the activations, `Dot4I8Packed` against still-quantized weights — provably not expressible as dequantize-then-dot). The cost model chooses; the reference's hardcoded comment about compounding error becomes a `NumericContract` guard on the int path.
 
-**Mixed precision is an accumulator attribute.** `KFold` and `KContract` carry `acc: Dtype` separately from operand dtype, so `contract{acc: F32}(F16, F16) -> F16` is one node and `coop_epilogues_supported` reads `acc` rather than inferring from a chain. When the coop kernel cannot host an epilogue, un-fusing it into a second dispatch is **one alternative** and routing to the generic fold is another — never the only outcome. `cast` is a `ScalarExpr` node inside `Map`, differentiable both directions by `map_adjoint` with no special case, so the trainer's f32-master / f16-conv-stack recipe and its 1024× loss scale are ordinary graph structure.
+**Mixed precision is an accumulator attribute.** `Launch::Fold` and `Launch::Contract` carry `acc: Dtype` separately from operand dtype, so `contract{acc: F32}(F16, F16) -> F16` is one node and `coop_epilogues_supported` reads `acc` rather than inferring from a chain. When the coop kernel cannot host an epilogue, un-fusing it into a second dispatch is **one alternative** and routing to the generic fold is another — never the only outcome. `cast` is a `ScalarExpr` node inside `Map`, differentiable both directions by `map_adjoint` with no special case, so the trainer's f32-master / f16-conv-stack recipe and its 1024× loss scale are ordinary graph structure.
 
 ---
 
@@ -408,8 +408,8 @@ pub struct BlockSpec {
 ```
 fusor2-ir          Levels, Dim, Dtype, ScalarExpr, Node/Egraph, Rule registry, OpDef registry,
                    verify_l0 / verify_l1                            (no wgpu, no SIMD, no device)
-fusor2-tile        L2 dialect, liveness, arena_plan, verify_arena, uniformity      -> ir
-fusor2-autograd    ADJOINTS table, L0->L0 transform                                -> ir
+fusor2-tile        Kernel dialect, liveness, arena_plan, verify_arena, uniformity      -> ir
+fusor2-autograd    ADJOINTS table, Logical->Logical transform                                -> ir
 fusor2-cost        DeviceFacts, calibrate(), cost(), extraction, ShapeStats        -> ir
 fusor2-gguf        BlockSpec tables, GGUF parsing, VarBuilder (sync/sharded/async)
 fusor2-gpu         wgpu Target, naga emitter, GPU rules, BufferPool, plan cache    -> ir,tile,cost,gguf
@@ -418,7 +418,7 @@ fusor2             Tensor, ops, macro ops, layers, Graph, optimizers, Session   
 fusor2-conformance op x backward matrix, resolves_in asserts, ILP oracle, --exhaustive
 ```
 
-Core ops are closed enums (`L0`, `L1`) so the verifier, cost model and emitters match exhaustively. Extension ops enter through the single escape `L1::Ext { def: OpDefId, .. }` against an open `OpDef { tag, verify, infer, work, adjoint, lower_per_target }` registry. That is one uniform extension shape, and no core file changes to add an op.
+Core ops are closed enums (`Logical`, `Launch`) so the verifier, cost model and emitters match exhaustively. Extension ops enter through the single escape `Launch::Ext { def: OpDefId, .. }` against an open `OpDef { tag, verify, infer, work, adjoint, lower_per_target }` registry. That is one uniform extension shape, and no core file changes to add an op.
 
 ```rust
 let s = Session::new(Device::gpu().await?);
@@ -430,7 +430,7 @@ let y = x.matmul_t(&w).add(&b).gelu();     // x: [Sym("rows"), inp]
 
 No `const R: usize`, no `B: Fusion<R, D>`, no `OUT_RANK`/`DIFF`/`MaxRank` witness traits, no rank ceiling of 21. `Tensor` is one type with runtime rank and dtype; a zero-cost `Typed<const R: usize, D>` newtype façade is available for callers who want compile-time rank and has no effect on the IR. The alias surface (`mt`/`mte`, `eq`/`ne`/`lt`/`lte`, `expand`, `matmul`, `pow_scalar`, `max_scalar`, `softmax_slow*`) is preserved as thin macro-op aliases.
 
-The L0 that produces:
+The Logical that produces:
 
 ```
 %3 = contract %x, %w {m:[s0] n:[64] k:[24]} acc=f32       : f32[s0, 64]
@@ -440,35 +440,35 @@ The L0 that produces:
      , macro gelu %5 }                     ← sugar, same chain
 ```
 
-After saturation `%6`'s chain also holds `KContract{Coop, sched: <8,300 points>, post: add(bcast %b) . gelu}`, `KContract{Sgemv, ..}`, `KContract{Sgemm, ..}`, `KFold{Add, ..}`, and `KMap` reading a materialized `%3`. At `s0 = 4096` on an M2 Max, extraction selects the Coop node, resolves `theta` to a concrete `(geom, splits, depth)`, inlines `%3` and `%5`, aliases `b`, and emits **one launch**. On a device without cooperative matrices the same graph and the same rules with different `caps` select Sgemm. Nothing in the frontend changed.
+After saturation `%6`'s chain also holds `Launch::Contract{Coop, sched: <8,300 points>, post: add(bcast %b) . gelu}`, `Launch::Contract{Sgemv, ..}`, `Launch::Contract{Sgemm, ..}`, `Launch::Fold{Add, ..}`, and `Launch::Map` reading a materialized `%3`. At `s0 = 4096` on an M2 Max, extraction selects the Coop node, resolves `theta` to a concrete `(geom, splits, depth)`, inlines `%3` and `%5`, aliases `b`, and emits **one launch**. On a device without cooperative matrices the same graph and the same rules with different `caps` select Sgemm. Nothing in the frontend changed.
 
 ---
 
 ## 9. Minimality: what is not in the core
 
-The core is **ten L0 nodes over one closed scalar vocabulary**, one L1 op family, one tile dialect, one cost function, one extraction algorithm, one rule table.
+The core is **ten Logical nodes over one closed scalar vocabulary**, one Launch op family, one tile dialect, one cost function, one extraction algorithm, one rule table.
 
 | Not in core | Mechanism |
 |---|---|
 | 60 elementwise opcodes, 12 comparisons, `where_cond`, `clamp`, all activations | one `Map` with a different `ScalarExpr` |
 | softmax ×5, rms_norm ×4, layer_norm ×2, var, mean | macro + `defn` → `Fold`+`Map`; refused into one launch by `fold_split` + `map_into_fold` |
 | conv, grouped_conv, pool_max/min, upsample | macro + `defn` → `Window` + `Contract` / `Window` + `Fold` |
-| attention (+lse, +grads, +causal), all 6 fused kernels | macro carrying `MaskKind` + `defn`; `KFlash` is an L1 node minted by a rule, one alternative among several |
+| attention (+lse, +grads, +causal), all 6 fused kernels | macro carrying `MaskKind` + `defn`; `KFlash` is an Launch node minted by a rule, one alternative among several |
 | matmul, mat_mul_transposed_rhs, q_mat_mul | `Contract` with an `EinSpec`; transposed-rhs is a spec, not an op |
 | cat, stack, pad_axis, repeat, slice_assign | `Scatter{Set}` into `Leaf(Const)` |
 | index_select, embedding, gather_last, `i()` | `Gather`; adjoint is `Scatter{Add}` |
 | ~22 view ops | `Restride` |
-| rope ×6, RopeCache | macros; fused forms are L1 nodes minted by rules |
+| rope ×6, RopeCache | macros; fused forms are Launch nodes minted by rules |
 | five destructive recognizers and their fixed order | `defn` at construction — there is nothing to recognize |
 | `MatMulParams`, `ShapeSelector`, SGEMM tree, SGEMV table | four order-free lowering rules + candidate generators; family is never stored on a node |
-| sink_unary_chains, form_elementwise_regions, alloc_reuse | `sink_epilogue`, `map_into_fold`/`KRegion`, plan-derived allocation |
-| merge_horizontal | **not carried over.** A `KMerged` wave node and three merge rules existed; over the conformance suite, a decode and all four model crates the mint guard refused every candidate (74,488 attempts, 0 waves) and nothing was ever lowered, so the node, its rules and its two lowerings were deleted. Horizontal fusion is available through `KRegion`. |
+| sink_unary_chains, form_elementwise_regions, alloc_reuse | `sink_epilogue`, `map_into_fold`/`Launch::Region`, plan-derived allocation |
+| merge_horizontal | **not carried over.** A `KMerged` wave node and three merge rules existed; over the conformance suite, a decode and all four model crates the mint guard refused every candidate (74,488 attempts, 0 waves) and nothing was ever lowered, so the node, its rules and its two lowerings were deleted. Horizontal fusion is available through `Launch::Region`. |
 | split-K, online softmax, stable variance, log-sum-exp | one `Carrier` + one `fold_split` rule; no combine is named in the core |
 | DispatchPolicy, all 8 `spike_*` flags, `PARALLEL_THRESHOLD`, `graph_flush_threshold` | named `DeviceFacts` fields with a calibration path; per-shape cost terms; measured-better default shipped |
 | rank const generics, 21 witness traits, `ShapeWithOneHole`, `B: Fusion` | runtime rank + `verify_l0`; optional typed façade |
 | `Operation` trait, `hash_kernel_fields`, 3 key recipes, `key_goldens` | `PlanHash` over the extracted term |
 | replay combinators ×4, the mutable tape | `defn` makes composite adjoints compose; 7 `ADJOINTS` entries |
-| top_k, standard/mirostat-2 samplers | `L1::Ext` + `OpDef`: inference-only, no adjoint, one declared cost row |
+| top_k, standard/mirostat-2 samplers | `Launch::Ext` + `OpDef`: inference-only, no adjoint, one declared cost row |
 | barrier elision, arena packing | closed-form argmins inside `arena_plan`, exact-valued into `verify_l1` and the occupancy term |
 
 The last two rows are honest exclusions rather than reductions, and are marked as such.
@@ -477,11 +477,11 @@ The last two rows are honest exclusions rather than reductions, and are marked a
 
 ## 10. How to add
 
-**An op.** Write a macro-op constructor that mints the sugar node and unions its `defn` expansion in the same call. If it needs a fused kernel, add one `Rule` minting an `L1` node plus a `fn(&L1) -> KernelIr` per target and a `work()` row. If its adjoint is not the composition of core adjoints, add one `ADJOINTS` entry. Nothing in `fusor2-ir` changes.
+**An op.** Write a macro-op constructor that mints the sugar node and unions its `defn` expansion in the same call. If it needs a fused kernel, add one `Rule` minting an `Launch` node plus a `fn(&Launch) -> KernelIr` per target and a `work()` row. If its adjoint is not the composition of core adjoints, add one `ADJOINTS` entry. Nothing in `fusor2-ir` changes.
 
 **An optimization.** Write a `Rule`, add it to the owning crate's `RULES: &[Rule]`, add a conformance case asserting it fires and one asserting extraction selects it on a named shape. Guards may read only `Facts`; profitability goes in the cost model. No scheduler edit, no phase to insert into, no cache-key threading.
 
-**A backend.** Implement `Target`: `caps`, `facts` (plus a `calibrate` run), `rules` for target-exclusive lowerings, `emit`, `launch`. Everything from L0 through L2 including autograd, the cost model and the plan cache is inherited.
+**A backend.** Implement `Target`: `caps`, `facts` (plus a `calibrate` run), `rules` for target-exclusive lowerings, `emit`, `launch`. Everything from Logical through Kernel including autograd, the cost model and the plan cache is inherited.
 
 **A dtype.** Add a `Dtype` variant, a `ScalarElement` row per emitter, cast entries in the `ScalarExpr` table, `mac_per_us` rows in `DeviceFacts`, and — if it is a storage-only type — one `widen-compute` lowering rule. Quantized formats add a `BlockSpec` row instead.
 
@@ -489,7 +489,7 @@ The last two rows are honest exclusions rather than reductions, and are marked a
 
 ## 11. Delivery
 
-- **M0 (wk 1)** `fusor2-ir` + `verify_l0` + `fusor2-cpu` with one trivial lowering rule per L0 op. No e-graph, no tiling. Correct and slow.
+- **M0 (wk 1)** `fusor2-ir` + `verify_l0` + `fusor2-cpu` with one trivial lowering rule per Logical op. No e-graph, no tiling. Correct and slow.
 - **M1 (wk 2)** `fusor2-autograd`, seven adjoints. `train_xor` passes on CPU.
 - **M2 (wk 3)** `fusor2-gpu`, same trivial rules. **The trainer trains end-to-end on Metal, slower than the reference.** This is the architecture acceptance gate, and it lands before any optimization exists — the only empirical test of a minimality claim is a running training step built from the core alone.
 - **M3 (wk 4)** e-graph + cost model + extraction with fusion rules only. Launch count collapses to reference parity.

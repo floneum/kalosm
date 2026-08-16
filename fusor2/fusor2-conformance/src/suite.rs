@@ -1,10 +1,8 @@
 //! The case registry, by area.
 //!
-//! Every area file returns [`Cases`]; every case runs on **every** session in
+//! Every area file returns [`Cases`]; every case runs on every session in
 //! [`crate::harness::sessions`], so nothing in the suite mentions a concrete
-//! backend. The shared case shapes live in [`support`] below rather than in a
-//! new file, because a new file means a new `pub mod` line in a module list
-//! other agents may also be editing.
+//! backend.
 
 pub mod attention_rope;
 pub mod backward;
@@ -25,9 +23,6 @@ pub mod views;
 use crate::harness::Cases;
 
 /// Every case, in a fixed area order.
-///
-/// A function rather than a `static`: a [`crate::harness::Case`] owns a boxed
-/// closure, which cannot be built in a `const`.
 pub fn registry() -> Cases {
     let mut all = Cases::new();
     // First: nothing below is interpretable while these fail.
@@ -51,8 +46,6 @@ pub fn registry() -> Cases {
 
 /// The registry as a function pointer, which is what `lib.rs` re-exports.
 pub const REGISTRY: fn() -> Cases = registry;
-
-// ---------------------------------------------------------------------------
 
 /// Shared case shapes. Every area file is a table over these.
 pub mod support {
@@ -209,10 +202,8 @@ use fusor2::tensor::Dyn as Tensor;
     }
 
     /// The shape a plain elementwise case fuzzes over: rank 2, both extents
-    /// re-sampled per run. The ceiling is deliberately modest — every case
-    /// here also runs a finite-difference backward, which rebuilds the graph
-    /// once per element, so a big shape is minutes, not coverage. Wide
-    /// forward-only extents are other cases' business.
+    /// re-sampled per run. Extents stay small because every case also runs a
+    /// finite-difference backward, which rebuilds the graph once per element.
     pub const ELEMENTWISE_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(1, 16)];
 
     /// One unary elementwise case: forward parity plus a finite-difference
@@ -231,7 +222,7 @@ use fusor2::tensor::Dyn as Tensor;
         })
     }
 
-    /// One binary elementwise case over two same-shape operands. **Both**
+    /// One binary elementwise case over two same-shape operands. Both
     /// gradients are checked: a rule that forgets `d_rhs` still passes a
     /// forward-only comparison.
     pub fn binary_case(
@@ -244,9 +235,7 @@ use fusor2::tensor::Dyn as Tensor;
     ) -> Case {
         fuzz_case(area, name, spec, move |session, shape, seed| {
             let len = dense_len(&dims(shape));
-            // Offset the rhs stream far from the lhs stream: consecutive
-            // seeds are distinct by the LCG's own guarantee, but a wide
-            // offset keeps the pair visibly unrelated in a failure dump.
+            // Offset the rhs seed so the two operand streams are unrelated.
             let lhs = domain.sample(seed, len);
             let rhs = domain.sample(seed ^ 0x9e37_79b9, len);
             let dimv = dims(shape);
@@ -291,10 +280,8 @@ use fusor2::tensor::Dyn as Tensor;
     /// One comparison case.
     ///
     /// The forward is checked against a 1.0/0.0 reference in the operand's own
-    /// dtype, and the backward must produce a gradient that is **all zeros** —
-    /// not an absent rule. The tape validates that every requires-grad parent
-    /// receives a gradient, so "no rule" and "a zero rule" are different
-    /// outcomes and only one of them is correct.
+    /// dtype, and the backward must produce an all-zero gradient — not an
+    /// absent rule.
     pub fn comparison_case(
         area: &'static str,
         name: &'static str,
@@ -390,8 +377,7 @@ mod tests {
     #[test]
     fn the_registry_covers_the_reference_autograd_matrix() {
         // The acceptance bar is the ~181 tests in `fusor/src/autograd/tests.rs`
-        // reproduced forward and backward. Case count is a coarse proxy, but a
-        // registry that silently shrank is worth catching.
+        // reproduced forward and backward; catches a registry that silently shrank.
         let registry = registry();
         assert!(
             registry.len() >= 181,

@@ -1,19 +1,16 @@
 //! CPU-exclusive lowering rules.
 //!
-//! `widen-compute` is a **lowering rule**, not a one-lane `F16Scalar`: widen
-//! to f32 registers, compute, narrow on store. Non-contiguous access is four
-//! lowering alternatives — contiguous, broadcast/splat, unit-inner-stride
-//! sub-slice, general gather — plus a `Pack` operand access, never a
-//! per-vector runtime `is_contiguous()` branch.
+//! `widen-compute` widens f16/bf16 to f32 registers, computes, and narrows on
+//! store. Non-contiguous access is four lowering alternatives — contiguous,
+//! broadcast/splat, unit-inner-stride sub-slice, general gather — plus a
+//! `Pack` operand access.
 //!
 //! Every guard below reads only [`Facts`]: legality, never profitability.
-//! There is no consumer count, no liveness and no cost here, because the
-//! `Facts` API structurally cannot supply one.
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::Dtype;
 use fusor2_ir::egraph::{Builder, Facts, Id, Rule, RuleTag};
-use fusor2_ir::ir::level1::{AccessPlan, L1, MapDomain, MapTiling, Operand, ScheduleDomain};
+use fusor2_ir::ir::launch::{AccessPlan, Launch, MapDomain, MapTiling, Operand, ScheduleDomain};
 use fusor2_ir::ir::{Level, Node, Op, OpTag};
 use fusor2_ir::rule;
 use fusor2_ir::scalar::ScalarExpr;
@@ -21,62 +18,61 @@ use fusor2_ir::shape::{Layout, MultiFlattenMap};
 
 rule!(
     WIDEN_COMPUTE,
-    level = Level::L1,
-    head = OpTag::KMap,
+    level = Level::Launch,
+    head = OpTag::LaunchMap,
     tag = RuleTag::Additive,
     apply = widen_compute,
 );
 
 rule!(
     SELECT_VECTOR_WIDTH,
-    level = Level::L1,
-    head = OpTag::KMap,
+    level = Level::Launch,
+    head = OpTag::LaunchMap,
     tag = RuleTag::Additive,
     apply = select_vector_width,
 );
 
 rule!(
     ACCESS_CONTIGUOUS,
-    level = Level::L1,
-    head = OpTag::KMap,
+    level = Level::Launch,
+    head = OpTag::LaunchMap,
     tag = RuleTag::Additive,
     apply = access_contiguous,
 );
 
 rule!(
     ACCESS_BROADCAST,
-    level = Level::L1,
-    head = OpTag::KMap,
+    level = Level::Launch,
+    head = OpTag::LaunchMap,
     tag = RuleTag::Additive,
     apply = access_broadcast,
 );
 
 rule!(
     ACCESS_UNIT_INNER,
-    level = Level::L1,
-    head = OpTag::KMap,
+    level = Level::Launch,
+    head = OpTag::LaunchMap,
     tag = RuleTag::Additive,
     apply = access_unit_inner,
 );
 
 rule!(
     ACCESS_GATHER,
-    level = Level::L1,
-    head = OpTag::KMap,
+    level = Level::Launch,
+    head = OpTag::LaunchMap,
     tag = RuleTag::Additive,
     apply = access_gather,
 );
 
 rule!(
     PARALLEL_OUTER,
-    level = Level::L1,
-    head = OpTag::KMap,
+    level = Level::Launch,
+    head = OpTag::LaunchMap,
     tag = RuleTag::Additive,
     apply = parallel_outer,
 );
 
-/// Every rule this backend contributes, in a fixed order that carries no
-/// semantics.
+/// Every rule this backend contributes; the order carries no semantics.
 pub static CPU_RULES: &[Rule] = &[
     WIDEN_COMPUTE,
     SELECT_VECTOR_WIDTH,
@@ -87,17 +83,17 @@ pub static CPU_RULES: &[Rule] = &[
     PARALLEL_OUTER,
 ];
 
-fn as_kmap(node: &Node) -> Option<&L1> {
+fn as_kmap(node: &Node) -> Option<&Launch> {
     match &node.op {
-        Op::L1(l @ L1::KMap { .. }) => Some(l),
+        Op::Launch(l @ Launch::Map { .. }) => Some(l),
         _ => None,
     }
 }
 
-fn kmap_parts(node: &Node) -> Option<(&L1, &Vec<Operand>, &ScheduleDomain, &ScalarExpr)> {
+fn kmap_parts(node: &Node) -> Option<(&Launch, &Vec<Operand>, &ScheduleDomain, &ScalarExpr)> {
     match &node.op {
-        Op::L1(
-            l @ L1::KMap {
+        Op::Launch(
+            l @ Launch::Map {
                 ops, sched, body, ..
             },
         ) => Some((l, ops, sched, body)),
@@ -105,9 +101,9 @@ fn kmap_parts(node: &Node) -> Option<(&L1, &Vec<Operand>, &ScheduleDomain, &Scal
     }
 }
 
-fn rebuild(node: &Node, ops: Vec<Operand>, sched: ScheduleDomain, body: ScalarExpr) -> Option<L1> {
+fn rebuild(node: &Node, ops: Vec<Operand>, sched: ScheduleDomain, body: ScalarExpr) -> Option<Launch> {
     match &node.op {
-        Op::L1(L1::KMap { space, .. }) => Some(L1::KMap {
+        Op::Launch(Launch::Map { space, .. }) => Some(Launch::Map {
             space: space.clone(),
             body,
             ops,
@@ -144,7 +140,7 @@ pub fn widen_compute(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
         new_body = ScalarExpr::cast(out, new_body);
     }
     let alt = rebuild(node, ops.clone(), sched.clone(), new_body)?;
-    let new_id = b.add_l1(alt).ok()?;
+    let new_id = b.add_launch(alt).ok()?;
     b.union(id, new_id).ok()
 }
 
@@ -159,7 +155,7 @@ pub fn select_vector_width(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'
         // Give a schedule-less map a domain to start from.
         let dom = width_domain(f.caps(), None);
         let alt = rebuild(node, ops.clone(), ScheduleDomain::Map(dom), body.clone())?;
-        let new_id = b.add_l1(alt).ok()?;
+        let new_id = b.add_launch(alt).ok()?;
         return b.union(id, new_id).ok();
     };
     let widened = width_domain(f.caps(), Some(dom));
@@ -167,7 +163,7 @@ pub fn select_vector_width(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'
         return None;
     }
     let alt = rebuild(node, ops.clone(), ScheduleDomain::Map(widened), body.clone())?;
-    let new_id = b.add_l1(alt).ok()?;
+    let new_id = b.add_launch(alt).ok()?;
     b.union(id, new_id).ok()
 }
 
@@ -270,7 +266,7 @@ fn mint_access(
         return None;
     }
     let alt = rebuild(node, next, sched.clone(), body.clone())?;
-    let new_id = b.add_l1(alt).ok()?;
+    let new_id = b.add_launch(alt).ok()?;
     b.union(id, new_id).ok()
 }
 
@@ -287,7 +283,7 @@ pub fn parallel_outer(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -
     if f.caps().threads <= 1 {
         return None;
     }
-    let L1::KMap { space, .. } = as_kmap(node)? else {
+    let Launch::Map { space, .. } = as_kmap(node)? else {
         return None;
     };
     if space.rank() == 0 {
@@ -308,7 +304,7 @@ pub fn parallel_outer(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -
     }
     dom.tilings.push(t);
     let alt = rebuild(node, ops.clone(), ScheduleDomain::Map(dom), body.clone())?;
-    let new_id = b.add_l1(alt).ok()?;
+    let new_id = b.add_launch(alt).ok()?;
     b.union(id, new_id).ok()
 }
 
@@ -331,7 +327,7 @@ mod tests {
                 "PARALLEL_OUTER",
             ]
         );
-        assert!(CPU_RULES.iter().all(|r| r.level == Level::L1));
+        assert!(CPU_RULES.iter().all(|r| r.level == Level::Launch));
     }
 
     #[test]

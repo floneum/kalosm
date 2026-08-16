@@ -2,54 +2,54 @@
 //! accounting and the cost model all expect. The one place that order is
 //! written down.
 
-use crate::ir::level0::L0;
-use crate::ir::level1::L1;
+use crate::ir::logical::Logical;
+use crate::ir::launch::Launch;
 use crate::ir::{Children, Op};
 
 /// Operand ids of `op`. `Op::Union(a, b)` yields `[a, b]`.
 pub fn children_of(op: &Op) -> Children {
     match op {
-        Op::L0(o) => children_l0(o),
-        Op::L1(o) => children_l1(o),
+        Op::Logical(o) => children_logical(o),
+        Op::Launch(o) => children_launch(o),
         Op::Union(a, b) => Children::from_slice(&[*a, *b]),
     }
 }
 
-/// Operand ids of an L0 node.
-pub fn children_l0(op: &L0) -> Children {
+/// Operand ids of an Logical node.
+pub fn children_logical(op: &Logical) -> Children {
     match op {
-        L0::Leaf(_) => Children::new(),
-        L0::Map { ins, .. } => ins.iter().copied().collect(),
-        L0::Fold { ins, .. } => ins.iter().copied().collect(),
-        L0::Contract { a, b, .. } => Children::from_slice(&[*a, *b]),
-        L0::Restride { x, .. } => Children::from_slice(&[*x]),
-        L0::Window { x, .. } => Children::from_slice(&[*x]),
-        L0::Gather { x, idx, .. } => Children::from_slice(&[*x, *idx]),
-        L0::Scatter { base, idx, upd, .. } => Children::from_slice(&[*base, *idx, *upd]),
-        L0::Dequant { x, .. } => Children::from_slice(&[*x]),
-        L0::Project { x, .. } => Children::from_slice(&[*x]),
+        Logical::Leaf(_) => Children::new(),
+        Logical::Map { ins, .. } => ins.iter().copied().collect(),
+        Logical::Fold { ins, .. } => ins.iter().copied().collect(),
+        Logical::Contract { a, b, .. } => Children::from_slice(&[*a, *b]),
+        Logical::Restride { x, .. } => Children::from_slice(&[*x]),
+        Logical::Window { x, .. } => Children::from_slice(&[*x]),
+        Logical::Gather { x, idx, .. } => Children::from_slice(&[*x, *idx]),
+        Logical::Scatter { base, idx, upd, .. } => Children::from_slice(&[*base, *idx, *upd]),
+        Logical::Dequant { x, .. } => Children::from_slice(&[*x]),
+        Logical::Project { x, .. } => Children::from_slice(&[*x]),
     }
 }
 
-/// Operand ids of an L1 node, taken from its `Operand` lists. `KContract`
+/// Operand ids of an Launch node, taken from its `Operand` lists. `Contract`
 /// is its A-side operands followed by its B-side ones — one each in the
 /// two-buffer case that reads `[a.src, b.src]`, more once a multi-edge
 /// producer has been absorbed. A region is its members and a merged wave is
 /// its segments.
-pub fn children_l1(op: &L1) -> Children {
+pub fn children_launch(op: &Launch) -> Children {
     match op {
-        L1::KMap { ops, .. }
-        | L1::KFold { ops, .. }
-        | L1::KGather { ops, .. }
-        | L1::KScatter { ops, .. }
-        | L1::Ext { ops, .. } => ops.iter().map(|o| o.src).collect(),
-        L1::KContract { a, b, .. } => a
+        Launch::Map { ops, .. }
+        | Launch::Fold { ops, .. }
+        | Launch::Gather { ops, .. }
+        | Launch::Scatter { ops, .. }
+        | Launch::Ext { ops, .. } => ops.iter().map(|o| o.src).collect(),
+        Launch::Contract { a, b, .. } => a
             .ops
             .iter()
             .chain(b.ops.iter())
             .map(|o| o.src)
             .collect(),
-        L1::KRegion { members, .. } => members.iter().copied().collect(),
+        Launch::Region { members, .. } => members.iter().copied().collect(),
     }
 }
 
@@ -59,9 +59,9 @@ mod tests {
     use crate::dtype::Dtype;
     use crate::egraph::Id;
     use crate::carrier::Carrier;
-    use crate::ir::level0::{LeafKind, ScatterCombine, TiePolicy};
+    use crate::ir::logical::{LeafKind, ScatterCombine, TiePolicy};
     use crate::scalar::BinOp;
-    use crate::ir::level1::{
+    use crate::ir::launch::{
         AccessPlan, IndexSpace, Operand, ScheduleDomain,
     };
     use crate::scalar::ScalarExpr;
@@ -79,7 +79,7 @@ mod tests {
     #[test]
     fn l0_operand_order() {
         assert!(
-            children_l0(&L0::Leaf(LeafKind::Const {
+            children_logical(&Logical::Leaf(LeafKind::Const {
                 value: crate::dtype::Splat::F32(0.0),
                 shape: smallvec![],
             }))
@@ -87,7 +87,7 @@ mod tests {
         );
 
         assert_eq!(
-            &children_l0(&L0::Map {
+            &children_logical(&Logical::Map {
                 expr: ScalarExpr::arg(0, Dtype::F32),
                 ins: smallvec![Id(1), Id(2), Id(3)],
                 outs: 1,
@@ -96,7 +96,7 @@ mod tests {
         );
 
         assert_eq!(
-            &children_l0(&L0::Scatter {
+            &children_logical(&Logical::Scatter {
                 axis: 0,
                 combine: ScatterCombine::Add,
                 base: Id(7),
@@ -108,7 +108,7 @@ mod tests {
         );
 
         assert_eq!(
-            &children_l0(&L0::Gather {
+            &children_logical(&Logical::Gather {
                 axis: 0,
                 x: Id(4),
                 idx: Id(5)
@@ -117,7 +117,7 @@ mod tests {
         );
 
         assert_eq!(
-            &children_l0(&L0::Fold {
+            &children_logical(&Logical::Fold {
                 carrier: Carrier::binop(
                     BinOp::Max,
                     Carrier::binop_identity(BinOp::Max, Dtype::F32).unwrap(),
@@ -136,7 +136,7 @@ mod tests {
     fn l1_operand_order() {
         let ops = vec![operand(3), operand(4)];
         assert_eq!(
-            &children_l1(&L1::KMap {
+            &children_launch(&Launch::Map {
                 space: IndexSpace::new([Dim::Const(4)]),
                 body: ScalarExpr::arg(0, Dtype::F32),
                 ops,

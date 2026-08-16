@@ -18,7 +18,7 @@ use fusor2::composite::rope::{
 use fusor2::graph::GraphRef;
 use fusor2::{Dtype, Session, };
 use fusor2::tensor::Dyn as Tensor;
-use fusor2_ir::ir::level1::MaskKind;
+use fusor2_ir::ir::launch::MaskKind;
 
 use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fill_indices, from_u32, fuzz_case};
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
@@ -163,10 +163,6 @@ fn backend_of(session: &Session) -> &'static str {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Host attention
-// ---------------------------------------------------------------------------
-
 /// `[B, H, Lq, Dh]` output and `[B, H, Lq]` log-sum-exp.
 ///
 /// `heads_kv` may be smaller than `H`; query head `h` reads kv head
@@ -297,10 +293,6 @@ fn host_attention_grads(
     (dq, dk, dv)
 }
 
-// ---------------------------------------------------------------------------
-// Host rope
-// ---------------------------------------------------------------------------
-
 /// The sampled `[B, H, L, Dh]` a rope case rotates. `dh` is even.
 #[derive(Copy, Clone)]
 struct RopeDims {
@@ -390,10 +382,6 @@ fn rope_tables(dh: usize, max_len: usize) -> (Vec<f32>, Vec<f32>) {
     }
     (cos, sin)
 }
-
-// ---------------------------------------------------------------------------
-// Registration
-// ---------------------------------------------------------------------------
 
 pub fn cases() -> Cases {
     let mut cases = Cases::new();
@@ -509,8 +497,7 @@ pub fn cases() -> Cases {
         |s, shape, seed| attention_backward(s, dense_dims(shape), seed),
     ));
 
-    // RoPE. Every spelling is checked against the same host rotation, so an
-    // alias that quietly picked the other pairing is a value failure.
+    // Every rope spelling is checked against the same host rotation.
     cases.push_case(fuzz_case("attention_rope", "rope", ROPE_SPEC, |s, shape, seed| {
         rope_case(s, seed, "rope", rope_dims(shape), false, 0, rope)
     }));
@@ -634,10 +621,6 @@ pub fn cases() -> Cases {
     ));
     cases
 }
-
-// ---------------------------------------------------------------------------
-// Attention cases
-// ---------------------------------------------------------------------------
 
 type AttnBuild = fn(&Tensor, &Tensor, &Tensor) -> fusor2::Result<Tensor>;
 
@@ -852,8 +835,7 @@ fn grads_gqa_refused(session: &Session) -> CaseResult {
 }
 
 /// The taped backward of the composed attention must agree with the analytic
-/// adjoints. That agreement is what makes `attention_grads` an optimization
-/// rather than a second rule to keep in sync by hand.
+/// adjoints.
 fn attention_backward(session: &Session, d: AttnDims, seed: u32) -> CaseResult {
     let q_data = Domain::Wide.sample(seed, d.q_len());
     let k_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, d.kv_len());
@@ -887,10 +869,6 @@ fn attention_backward(session: &Session, d: AttnDims, seed: u32) -> CaseResult {
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// RoPE cases
-// ---------------------------------------------------------------------------
 
 type RopeBuild = fn(&Tensor, &Tensor, &Tensor, u64) -> fusor2::Result<Tensor>;
 type RopePairBuild =

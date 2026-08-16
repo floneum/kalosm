@@ -208,9 +208,7 @@ fn split_k_name(k: u64) -> &'static str {
 /// are declared value-equal only where `NumericContract::reassoc` holds, and
 /// the two orders differ in f32. The reference is accumulated in f64, so both
 /// forms are measured against the true sum rather than against one particular
-/// traversal order — a case that pinned a left-to-right f32 accumulation
-/// would go red the moment the schedule changed, which is the opposite of
-/// what it is for.
+/// traversal order.
 fn split_k(session: &Session, k: u64, shape: &[u64], seed: u32) -> CaseResult {
     let [m, n] = [shape[0], shape[1]];
     let a_data = Domain::Wide.sample(seed, (m * k) as usize);

@@ -124,13 +124,13 @@ mod tests {
     use fusor2_ir::dtype::{Dtype, RoundMode, Splat};
     use fusor2_ir::egraph::{EGraph, Id};
     use fusor2_ir::ir::Op;
-    use fusor2_ir::ir::level0::{BufferId, L0, LeafKind};
+    use fusor2_ir::ir::logical::{BufferId, Logical, LeafKind};
     use fusor2_ir::scalar::{ScalarExpr, UnOp};
     use fusor2_ir::shape::Dim;
 
     fn param(g: &mut EGraph, shape: &[u64]) -> Id {
         let n = g.len() as u32;
-        g.add(Op::L0(L0::Leaf(LeafKind::Param {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Param {
             name: BufferId(n),
             dtype: Dtype::F32,
             shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
@@ -139,7 +139,7 @@ mod tests {
     }
 
     fn ones(g: &mut EGraph, shape: &[u64]) -> Id {
-        g.add(Op::L0(L0::Leaf(LeafKind::Const {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Const {
             value: Splat::F32(1.0),
             shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
         })))
@@ -197,9 +197,9 @@ mod tests {
         let dx = got[0].unwrap();
         // The custom rule wins over the `Map` adjoint: `2 * seed`, not
         // `seed * exp(x)`.
-        assert!(matches!(g.node(dx).op, Op::L0(L0::Map { .. })));
+        assert!(matches!(g.node(dx).op, Op::Logical(Logical::Map { .. })));
         match &g.node(dx).op {
-            Op::L0(L0::Map { ins, .. }) => assert_eq!(ins.as_slice(), &[s]),
+            Op::Logical(Logical::Map { ins, .. }) => assert_eq!(ins.as_slice(), &[s]),
             _ => unreachable!(),
         }
     }
@@ -257,7 +257,7 @@ mod tests {
             backward_into_with(&mut g, &caps(), y, s, &[x], &CustomRegistry::new()).unwrap();
         assert!(matches!(
             g.node(got[0].unwrap()).op,
-            Op::L0(L0::Leaf(LeafKind::Const { .. }))
+            Op::Logical(Logical::Leaf(LeafKind::Const { .. }))
         ));
     }
 }

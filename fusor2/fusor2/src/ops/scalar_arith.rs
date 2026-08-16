@@ -3,7 +3,7 @@
 //! value — `m.mul_scalar(lr)` with `lr: Scalar::Uniform(..)` produces a
 //! `Uniform`, never a baked literal, which is trainer constraint 2.
 //!
-//! Every entry here is **one `L0::Map`** carrying a `Lit`/`Uniform` leaf, not
+//! Every entry here is **one `Logical::Map`** carrying a `Lit`/`Uniform` leaf, not
 //! a broadcast const tensor: `clamp` is a single `Min(Max(x, lo), hi)` node,
 //! not two.
 

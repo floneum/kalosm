@@ -2,14 +2,11 @@
 //!
 //! The oracle everywhere in this area is
 //! [`fusor2_gguf::blocks::cpu_dequantize_block`]: one raw block in, its
-//! elements out. Comparing a device dequantize against that scalar decoder is
-//! what makes "the GPU decode program and the CPU decode program agree" a
-//! statement about the format rather than about two implementations agreeing
-//! with each other.
+//! elements out.
 //!
-//! `QLayout` is deliberately *not* a property of a format: both layouts are
-//! legal inputs for all six, so every value case runs twice and the repack
-//! between them has to be byte-exact in both directions.
+//! Both layouts are legal inputs for all six formats, so every value case
+//! runs twice and the repack between them has to be byte-exact in both
+//! directions.
 
 use fusor2::{Dtype, QMatrix, Session};
 use fusor2_gguf::blocks::{block_fields, cpu_dequantize_block, word_aligned};
@@ -66,12 +63,8 @@ fn backend_of(session: &Session) -> &'static str {
 }
 
 /// A well-formed block: an explicit finite scale (and min, where the format
-/// carries one) plus a deterministic quant payload.
-///
-/// Random bytes would work for a decode comparison — the host oracle reads the
-/// same bytes — but a random f16 scale is NaN or Inf about 1 time in 2000, and
-/// a NaN compares unequal to itself. So the scale fields are written and the
-/// rest is filled.
+/// carries one) plus a deterministic quant payload. A random f16 scale is NaN
+/// or Inf about 1 time in 2000, and a NaN compares unequal to itself.
 fn make_block(fmt: QFmt, layout: QLayout, seed: u32) -> Vec<u8> {
     let fields = block_fields(fmt, layout);
     let bytes = fmt.block_bytes(layout) as usize;
@@ -163,12 +156,11 @@ pub fn cases() -> Cases {
         }
     }
     // The same decode forced through the `Restride` + `Map` expansion, with
-    // no `L0::Dequant` in the class for the extractor to fall back to. The
-    // sugared case above proves only that *some* class member is right.
-    // Both layouts wherever the block stride is a whole number of `u32` words,
-    // which is the one thing the expansion still needs: an f16 scale is now
-    // decoded by bit arithmetic, but a block that straddles a word is not
-    // addressable by a `Restride` over the word stream at all.
+    // no `Logical::Dequant` in the class for the extractor to fall back to;
+    // the sugared case above proves only that some class member is right.
+    // Only where the block stride is a whole number of `u32` words: a block
+    // that straddles a word is not addressable by a `Restride` over the word
+    // stream.
     for fmt in QFmt::ALL {
         for layout in [QLayout::Native, QLayout::F32Scales] {
             if !word_aligned(fmt, layout) {
@@ -254,11 +246,10 @@ pub fn cases() -> Cases {
 /// `QMatrix::load` of a `[rows, cols]` GGUF weight must agree with
 /// `from_raw_bytes` over the same block stream — shape included.
 ///
-/// The GGUF *parser* already reverses the file's fastest-varying-first
-/// extents into row-major at read, so the loader must not reverse again: a
-/// double reverse hands back a transposed `[cols, rows]` matrix whose block
-/// stream still decodes to the same flat values. Only the dims betray the
-/// swap, which is why this case asserts the shape and not just the bytes.
+/// The GGUF parser already reverses the file's fastest-varying-first extents
+/// into row-major at read, so the loader must not reverse again: a double
+/// reverse hands back a transposed `[cols, rows]` matrix whose block stream
+/// still decodes to the same flat values, and only the dims betray the swap.
 fn qmatrix_load_orientation(session: &Session) -> CaseResult {
     use fusor2::Dim;
     use fusor2_gguf::{Gguf, GgmlType, GgufMetadata, GgufTensor, VarBuilder};
@@ -329,18 +320,13 @@ fn qmatrix_load_orientation(session: &Session) -> CaseResult {
 }
 
 
-/// A quantized matmul at a shape the **cooperative-matrix** path can take.
+/// A quantized matmul at a shape the cooperative-matrix path can take; the
+/// small-shape cases all resolve to `Launch::KQContract` and say nothing
+/// about the dense-family path.
 ///
-/// Every other case in this file is `m=2, n=3, k=32`, which is far below any
-/// coop geometry, so they all resolve to `L1::KQContract` and say nothing about
-/// the dense-family path. That mattered the moment a quantized operand became
-/// admissible to `Family::Coop`: the decode moved into the coop staging fill,
-/// and nothing here would have caught it decoding to the wrong values.
-///
-/// The oracle is the *dequantized dense* matmul of the same weight, so this
-/// asserts the two paths agree rather than re-deriving the arithmetic. A
-/// mismatch means the staging-fill decode addresses the block differently from
-/// the reference decode.
+/// The oracle is the dequantized dense matmul of the same weight. A mismatch
+/// means the staging-fill decode addresses the block differently from the
+/// reference decode.
 fn qmatmul_coop_shape(session: &Session, fmt: QFmt) -> CaseResult {
     const M: u64 = 64;
     const N: u64 = 64;
@@ -351,9 +337,8 @@ fn qmatmul_coop_shape(session: &Session, fmt: QFmt) -> CaseResult {
     let k = be * 8;
 
     let graph = graph_of(session);
-    // Valid blocks, not random bytes: several formats carry f16 scales, and
-    // arbitrary bytes decode to NaN — which compares unequal to itself and
-    // fails the case for a reason that has nothing to do with the kernel.
+    // Valid blocks, not random bytes: arbitrary bytes decode f16 scales to
+    // NaN, which compares unequal to itself.
     let blocks = ((k / be) * N) as usize;
     let (bytes, _) = block_rows(fmt, layout, 3301, blocks);
     let w = graph
@@ -389,16 +374,10 @@ fn qmatmul_coop_shape(session: &Session, fmt: QFmt) -> CaseResult {
     Ok(())
 }
 
-/// The `Map`-spelled decode driven through a **cooperative** contraction.
-///
-/// [`qmatmul_coop_shape`] runs at `QLayout::Native`, where `dequant_defn`
-/// returns `None`, so it resolves to `L1::KQContract` and proves nothing at
-/// all about the definitional expansion — a decode rewritten there could pass
-/// it without ever executing. This is the `F32Scales` twin: `dequantize_slow`
-/// leaves the `Restride` + `Map` as the only member of the class, so the
-/// contraction has no quantization-aware node to fall back to and the unpack
-/// bit-arithmetic has to survive being substituted into the staging fill at a
-/// geometry several `bk` deep.
+/// The `Map`-spelled decode driven through a cooperative contraction:
+/// `dequantize_slow` leaves the `Restride` + `Map` as the only member of the
+/// class, so the unpack bit-arithmetic has to survive being substituted into
+/// the staging fill at a geometry several `bk` deep.
 ///
 /// The oracle is the host decode uploaded dense, so a mismatch means the
 /// staging fill addresses the block stream differently from
@@ -510,17 +489,10 @@ fn dequantize_case(
 }
 
 /// The decode spelled as a `Restride` over the block stream read as `u32`
-/// words plus a `Map` of unpack bit-arithmetic — `L0::Dequant`'s definitional
-/// expansion, with the sugar deliberately absent.
-///
-/// `dequantize` unions the two, and extraction is free to pick either, so the
-/// sugared case says nothing about which arithmetic ran. `dequantize_slow`
-/// builds the expansion alone, which is what makes this a statement about the
-/// bit arithmetic on **both** backends.
-///
-/// Both layouts have an expansion wherever the block stride is word-aligned:
-/// an f16 scale decodes through the same `Shr`/`BitAnd`/`Exp2` arithmetic as
-/// everything else in the block, so `Native` is held to the same bar.
+/// words plus a `Map` of unpack bit-arithmetic — `Logical::Dequant`'s
+/// definitional expansion, with the sugar absent. `dequantize` unions the
+/// two and extraction is free to pick either; `dequantize_slow` builds the
+/// expansion alone.
 fn dequantize_defn_case(session: &Session, fmt: QFmt, layout: QLayout) -> CaseResult {
     let (bytes, expected) = quantized_rows(fmt, layout);
     let graph = graph_of(session);
@@ -544,8 +516,8 @@ fn dequantize_defn_case(session: &Session, fmt: QFmt, layout: QLayout) -> CaseRe
 }
 
 /// An activation against a quantized weight. The result must equal the dense
-/// matmul against the *reference-decoded* weight — which program extraction
-/// picked is invisible here, which is the point.
+/// matmul against the reference-decoded weight, whichever program extraction
+/// picked.
 fn qmatmul_case(session: &Session, fmt: QFmt, shape: &[u64], seed: u32) -> CaseResult {
     let (batch, rows, blocks) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
     let layout = QLayout::Native;
@@ -583,15 +555,9 @@ fn qmatmul_case(session: &Session, fmt: QFmt, shape: &[u64], seed: u32) -> CaseR
 
 /// A quantized matvec whose output needs more workgroups than one dispatch
 /// dimension holds (65,535), so `distribute_workgroups` folds the grid onto a
-/// second slab.
-///
-/// An sgemv addressing that fold with a raw `ProgramId(X)` has every slab-1
-/// workgroup recompute slab 0's rows and never write any row past the fold
-/// — wrong values on exactly the lm_head-sized matvecs, format
-/// independent, from 65,536 rows up. The harness sets
-/// `FUSOR2_VERIFY_MEMBERS`, so this geometry races **every** contraction
-/// family and each one proves it linearizes the workgroup id against the grid
-/// it is actually dispatched with.
+/// second slab. An sgemv addressing that fold with a raw `ProgramId(X)` would
+/// recompute slab 0's rows and never write past the fold. The harness sets
+/// `FUSOR2_VERIFY_MEMBERS`, so this geometry races every contraction family.
 fn qgemv_grid_past_the_dimension_cap(session: &Session) -> CaseResult {
     // Two slabs, with a remainder so the fold is not exact: 65,792 groups
     // dispatch as [32896, 2, 1].
@@ -630,9 +596,8 @@ fn qgemv_grid_past_the_dimension_cap(session: &Session) -> CaseResult {
     Ok(())
 }
 
-/// Gradients flow to the activation only. The weight is quantized and
-/// non-trainable through this route — that is exactly why QAT keeps a separate
-/// f32 master rather than a quantized backward kernel.
+/// Gradients flow to the activation only; the quantized weight is
+/// non-trainable through this route (QAT keeps a separate f32 master).
 fn qmatmul_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (batch, rows, blocks) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
     let fmt = QFmt::Q8_0;
@@ -832,14 +797,11 @@ fn fields_tile(_session: &Session) -> CaseResult {
 
 /// A quantized embedding lookup. Row `i` of the result must be exactly what
 /// the scalar reference decodes source row `idx[i]` to — for every format and
-/// both layouts, with the picks out of order and one row repeated, so a
-/// lookup that quietly returned rows `0..n` would not survive.
+/// both layouts, with the picks out of order and one row repeated.
 ///
-/// The lookup is `Dequant` then `Gather`, and `GATHER_QUANTIZED_ROWS`
-/// mints the fused `GatherMode::QuantizedRows` member from exactly that
-/// pair — float-typed, reading the quantized leaf directly — so with
-/// `FUSOR2_VERIFY_MEMBERS` this case value-checks the fused kernel against
-/// the decode-then-pick members on every format and both layouts.
+/// The lookup is `Dequant` then `Gather`; with `FUSOR2_VERIFY_MEMBERS` this
+/// case value-checks the fused `GatherMode::QuantizedRows` member against the
+/// decode-then-pick members.
 fn index_select_rows(session: &Session) -> CaseResult {
     // Out of order, one repeat, and neither end of the table first.
     const PICKS: &[u32] = &[2, 0, 2, 1];
@@ -941,16 +903,12 @@ fn index_select_rows(session: &Session) -> CaseResult {
 /// Fused QKV projections concatenate three quantized weights row-wise without
 /// decoding them.
 ///
-/// Two claims. The block stream is row-major in blocks, so the concatenation
-/// is a byte append and the result must decode to the concatenation of the
-/// parts — checked for every format and both layouts. And the whole reason to
-/// concatenate is to issue one projection instead of three, so
-/// `q_mat_mul` against the concatenated weight must equal the three separate
-/// products stacked, and both must equal the host reference built from the
-/// reference decoder.
+/// Two claims: the byte-appended stream must decode to the concatenation of
+/// the parts, and `q_mat_mul` against the concatenated weight must equal the
+/// three separate products stacked — both against the host reference.
 fn concat_rows(session: &Session) -> CaseResult {
-    // Unequal row counts, because a QKV fusion with grouped-query attention
-    // has them: equal parts would hide an offset bug in the byte append.
+    // Unequal row counts: equal parts would hide an offset bug in the byte
+    // append.
     const PARTS: [(u32, usize); 3] = [(3_100, 3), (3_200, 2), (3_300, 4)];
     let total: u64 = PARTS.iter().map(|(_, r)| *r as u64).sum();
 
@@ -1016,9 +974,7 @@ fn concat_rows(session: &Session) -> CaseResult {
             at += rows;
         }
 
-        // Both against the reference-decoded weight. A quantized dot
-        // accumulates in f32 over up to 256 terms, so the bar is the one
-        // `qmatmul_case` uses.
+        // Both against the reference-decoded weight, at `qmatmul_case`'s bar.
         let mut expected = vec![0.0f32; BATCH * total as usize];
         for b in 0..BATCH {
             for r in 0..total as usize {

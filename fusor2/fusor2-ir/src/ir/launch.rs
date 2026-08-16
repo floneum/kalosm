@@ -1,7 +1,7 @@
-//! L1 `nest` — index spaces, kernels, launches. Only L1 can express fusion,
+//! Launch `nest` — index spaces, kernels, launches. Only Launch can express fusion,
 //! tiling, split-K, layout alias-vs-gather, kernel family, horizontal merging,
 //! register tiling and rematerialization. **Allocation is not described at
-//! L1**: buffers are derived from the extracted plan.
+//! Launch**: buffers are derived from the extracted plan.
 
 use crate::carrier::Carrier;
 use crate::dtype::Dtype;
@@ -11,10 +11,10 @@ use crate::scalar::ScalarExpr;
 use crate::shape::{Dim, Layout, MultiFlattenMap, SlidingWindow};
 use smallvec::SmallVec;
 
-/// The L1 op family.
+/// The Launch op family.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum L1 {
-    KMap {
+pub enum Launch {
+    Map {
         space: IndexSpace,
         body: ScalarExpr,
         ops: Vec<Operand>,
@@ -26,7 +26,7 @@ pub enum L1 {
     /// expression (`lift`, which is where the old `pre` went), the per-slot
     /// identities and the merge, so a multi-slot accumulator is expressible
     /// and there is no `TileReduceOp` to resolve for a whole fold.
-    KFold {
+    Fold {
         space: IndexSpace,
         axis: u32,
         /// Free axes living in the **accumulator's data space** rather than
@@ -34,7 +34,7 @@ pub enum L1 {
         /// `axis`, which is what makes the output shape identical before and
         /// after promotion. Operand address maps are stated against the full
         /// `space` and are never rewritten; every [`ScalarExpr`] on this node
-        /// is written against [`L1::iter_space`].
+        /// is written against [`Launch::iter_space`].
         vec_axes: SmallVec<[u32; 2]>,
         carrier: Carrier,
         acc: Dtype,
@@ -47,12 +47,12 @@ pub enum L1 {
     },
 
     /// Dense contraction. **`family` is a property of this node's lowering,
-    /// never a decision stored on an L0 op**: all four families coexist in
+    /// never a decision stored on an Logical op**: all four families coexist in
     /// one chain, so a gemv-shaped contraction cannot pick Coop, have the
     /// tile scorer decline, and silently run a third path. `acc` is
     /// independent of operand dtype, which is what makes
     /// `contract{acc: F32}(F16, F16) -> F16` one node.
-    KContract {
+    Contract {
         m: Dim,
         n: Dim,
         k: Dim,
@@ -65,7 +65,7 @@ pub enum L1 {
         sched: ScheduleDomain,
     },
 
-    KGather {
+    Gather {
         space: IndexSpace,
         axis: u32,
         mode: GatherMode,
@@ -74,11 +74,11 @@ pub enum L1 {
     },
 
     /// Scatter. Both lowerings coexist and compete on cost.
-    KScatter {
+    Scatter {
         space: IndexSpace,
         axis: u32,
         mode: ScatterMode,
-        combine: crate::ir::level0::ScatterCombine,
+        combine: crate::ir::logical::ScatterCombine,
         ops: Vec<Operand>,
         sched: ScheduleDomain,
     },
@@ -90,7 +90,7 @@ pub enum L1 {
     /// body — see [`MapDomain::linear_over`]. Without it the one node family
     /// the architecture calls its own fusion primitive would be the one whose
     /// geometry is not a selection.
-    KRegion {
+    Region {
         members: SmallVec<[Id; 8]>,
         live_outs: SmallVec<[u32; 4]>,
         sched: ScheduleDomain,
@@ -104,25 +104,25 @@ pub enum L1 {
     },
 }
 
-impl L1 {
+impl Launch {
     pub const fn tag(&self) -> OpTag {
         match self {
-            Self::KMap { .. } => OpTag::KMap,
-            Self::KFold { .. } => OpTag::KFold,
-            Self::KContract { .. } => OpTag::KContract,
-            Self::KGather { .. } => OpTag::KGather,
-            Self::KScatter { .. } => OpTag::KScatter,
-            Self::KRegion { .. } => OpTag::KRegion,
+            Self::Map { .. } => OpTag::LaunchMap,
+            Self::Fold { .. } => OpTag::LaunchFold,
+            Self::Contract { .. } => OpTag::LaunchContract,
+            Self::Gather { .. } => OpTag::LaunchGather,
+            Self::Scatter { .. } => OpTag::LaunchScatter,
+            Self::Region { .. } => OpTag::LaunchRegion,
             Self::Ext { .. } => OpTag::Ext,
         }
     }
 
     /// The domain this node's own expressions are written against: `space`
     /// minus any accumulator-resident axes. Equal to `space` for every node
-    /// but a promoted `KFold`.
+    /// but a promoted `Fold`.
     pub fn iter_space(&self) -> IndexSpace {
         match self {
-            Self::KFold {
+            Self::Fold {
                 space, vec_axes, ..
             } if !vec_axes.is_empty() => IndexSpace::new(
                 space
@@ -132,10 +132,10 @@ impl L1 {
                     .filter(|(i, _)| !vec_axes.contains(&(*i as u32)))
                     .map(|(_, d)| *d),
             ),
-            Self::KMap { space, .. }
-            | Self::KFold { space, .. }
-            | Self::KGather { space, .. }
-            | Self::KScatter { space, .. } => space.clone(),
+            Self::Map { space, .. }
+            | Self::Fold { space, .. }
+            | Self::Gather { space, .. }
+            | Self::Scatter { space, .. } => space.clone(),
             _ => IndexSpace::default(),
         }
     }
@@ -147,12 +147,12 @@ impl L1 {
     /// so its lowering is handed `SchedPoint::Point` and nothing else.
     pub fn schedule(&self) -> Option<&ScheduleDomain> {
         match self {
-            Self::KMap { sched, .. }
-            | Self::KFold { sched, .. }
-            | Self::KContract { sched, .. }
-            | Self::KGather { sched, .. }
-            | Self::KScatter { sched, .. }
-            | Self::KRegion { sched, .. } => Some(sched),
+            Self::Map { sched, .. }
+            | Self::Fold { sched, .. }
+            | Self::Contract { sched, .. }
+            | Self::Gather { sched, .. }
+            | Self::Scatter { sched, .. }
+            | Self::Region { sched, .. } => Some(sched),
             Self::Ext { .. } => None,
         }
     }
@@ -229,7 +229,7 @@ impl AccessPlan {
     }
 }
 
-/// One side of a [`L1::KContract`]: the buffers it reads and the elementwise
+/// One side of a [`Launch::Contract`]: the buffers it reads and the elementwise
 /// chain run per loaded element.
 ///
 /// # Why a side is a list
@@ -258,7 +258,7 @@ impl AccessPlan {
 /// admissibility, traffic) must range over all of [`Self::ops`].
 ///
 /// `ops` is non-empty. A side with no operand would make `pre` a constant,
-/// which is a `KMap` and not a contraction; `verify_l1` rejects it.
+/// which is a `Map` and not a contraction; `verify_launch` rejects it.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ContractSide {
     pub pre: ScalarExpr,
@@ -789,7 +789,7 @@ impl FoldStrat {
 /// floored by the lane group and clamped to the device, so a footprint filter
 /// that reads `lane_group` alone under-counts by up to 256x. `DEFAULT_BLOCK`
 /// is a *policy* constant, but it lives here rather than in `fusor2-tile`
-/// because `verify_l1` has to admit against the same number the domain
+/// because `verify_launch` has to admit against the same number the domain
 /// generator filters on and the emitters allocate — and it is `fusor2-ir`
 /// that verifies.
 pub fn emitted_block(lane_group: u32, caps: &crate::device::Caps) -> u32 {
@@ -804,7 +804,7 @@ pub fn emitted_block(lane_group: u32, caps: &crate::device::Caps) -> u32 {
 /// of `lanes` accumulator lanes at `acc_bytes` each.
 ///
 /// Both emitters allocate one scratch tile of [`emitted_block`] elements *per
-/// accumulator lane*. This is the quantity `verify_l1` admits against and the
+/// accumulator lane*. This is the quantity `verify_launch` admits against and the
 /// quantity the fold domain generator filters on; they are one function so
 /// they cannot drift.
 pub fn fold_scratch_bytes(
@@ -872,7 +872,7 @@ const LINEAR_TM_CHOICES: [u32; 3] = [2, 4, 8];
 
 impl MapDomain {
     /// Every tiling worth scoring for a body that walks **one linearized
-    /// index** over `elements` outputs — the shape [`L1::KRegion`] takes on
+    /// index** over `elements` outputs — the shape [`Launch::Region`] takes on
     /// either backend.
     ///
     /// `dim` is always `None` because there is no axis to name: `tm` is the
@@ -1012,7 +1012,7 @@ mod schedule_tests {
     #[test]
     fn every_node_but_ext_declares_a_schedule_domain() {
         let d = ScheduleDomain::Map(MapDomain::linear(&caps(32), 8192));
-        let region = L1::KRegion {
+        let region = Launch::Region {
             members: smallvec::smallvec![Id(1), Id(2)],
             live_outs: smallvec::smallvec![0],
             sched: d.clone(),
@@ -1020,7 +1020,7 @@ mod schedule_tests {
         assert_eq!(region.schedule(), Some(&d));
         assert!(region.schedule().unwrap().len() > 1);
 
-        let ext = L1::Ext {
+        let ext = Launch::Ext {
             def: crate::ir::OpDefId(0),
             ops: Vec::new(),
             attrs: crate::ir::AttrId(0),

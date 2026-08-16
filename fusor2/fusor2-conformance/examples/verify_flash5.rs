@@ -6,7 +6,7 @@ use fusor2::composite::attention::attention;
 use fusor2::{Session, };
 use fusor2::tensor::Dyn as Tensor;
 use fusor2_conformance::harness::{dims, is_gpu, sessions};
-use fusor2_ir::ir::level1::MaskKind;
+use fusor2_ir::ir::launch::MaskKind;
 
 fn data(shape: &[u64], seed: u32) -> Vec<f32> {
     let n: usize = shape.iter().product::<u64>() as usize;

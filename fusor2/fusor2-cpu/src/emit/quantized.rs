@@ -9,7 +9,7 @@
 //! consumer's tape.
 
 use fusor2_gguf::blocks::BlockDecodeArgs;
-use fusor2_ir::ir::level2::{ElementType, QuantizedView, ScalarElement, TileExpr};
+use fusor2_ir::ir::kernel::{ElementType, QuantizedView, ScalarElement, TileExpr};
 use fusor2_ir::target::EmitError;
 
 fn f32_ty() -> ElementType {

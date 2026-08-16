@@ -1,10 +1,8 @@
 //! `conv`, `grouped_conv`, the three pools and `upsample`.
 //!
-//! The case that earns this file is `pool_max_non_overlapping_adjoint_is_mask`:
-//! `Window`'s structural adjoint reads two integers, and `step >= window`
-//! proves the adjoint is an elementwise mask-and-broadcast. That proof is that
-//! the adjoint graph contains **no** `Scatter` node — not merely that the
-//! numbers come out right, which they would either way.
+//! `pool_max_non_overlapping_adjoint_is_mask` pins that `step >= window`
+//! proves the adjoint is an elementwise mask-and-broadcast, i.e. the adjoint
+//! graph contains no `Scatter` node.
 
 use fusor2::composite::pool::PoolSize;
 use fusor2::{Dim, Dtype, Session};
@@ -101,8 +99,6 @@ pub fn cases() -> Cases {
     cases
 }
 
-// ---------------------------------------------------------------------------
-
 /// `[batch, in_ch, len] * [out_ch, in_ch, k]` with `padding` and unit stride.
 #[allow(clippy::too_many_arguments)]
 fn host_conv1d(
@@ -179,9 +175,7 @@ fn conv1d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         &expected,
     )?;
 
-    // The bias gradient is one per output position per batch — the shape most
-    // likely to be wrong when conv is a `Window` + `Contract` composition
-    // rather than a hand-written kernel.
+    // The bias gradient is one per output position per batch.
     let d_bias = gradient_of(&graph, &y, &b)?;
     let want = (batch * out_len) as f32;
     for (i, v) in d_bias.iter().enumerate() {

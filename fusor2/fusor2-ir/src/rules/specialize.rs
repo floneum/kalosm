@@ -4,15 +4,15 @@
 //! After a binding recurs, this variant wins where specialization pays.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
-use crate::ir::level1::L1;
+use crate::ir::launch::Launch;
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
 use crate::shape::Dim;
 
 rule!(
     SPECIALIZE_DIM,
-    level = Level::L1,
-    head = OpTag::KContract,
+    level = Level::Launch,
+    head = OpTag::LaunchContract,
     tag = RuleTag::Additive,
     apply = specialize_dim,
 );
@@ -20,12 +20,11 @@ rule!(
 /// Mint the variant in which a `Dim::Sym` on the node is replaced by the
 /// `Dim::Const` an operand's own layout already proves it to be.
 ///
-/// This is a legality-only substitution: the symbol and the constant denote
-/// the same extent, because the operand layout the nest reads is where that
-/// extent comes from. Whether specializing pays is compile amortization, in
-/// the pricing crate, and both variants stay live either way.
+/// Legality-only substitution: the symbol and the constant denote the same
+/// extent. Whether specializing pays is decided by the pricing crate, and both
+/// variants stay live either way.
 pub fn specialize_dim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    let Op::L1(L1::KContract {
+    let Op::Launch(Launch::Contract {
         m,
         n,
         k,
@@ -65,7 +64,7 @@ pub fn specialize_dim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) 
     }
 
     let specialized = b
-        .add_l1(L1::KContract {
+        .add_launch(Launch::Contract {
             m: new_m.unwrap_or(*m),
             n: new_n.unwrap_or(*n),
             k: new_k.unwrap_or(*k),
@@ -87,7 +86,7 @@ mod tests {
     use crate::dtype::Dtype;
     use crate::rules::test_support as ts;
     use crate::rules::{alias_operand_of, ident_expr};
-    use crate::ir::level1::{ContractSide, Family, ScheduleDomain};
+    use crate::ir::launch::{ContractSide, Family, ScheduleDomain};
 
     #[test]
     fn specialize_dim_binds_a_symbolic_row_count() {
@@ -98,7 +97,7 @@ mod tests {
         let a = ts::buffer(&mut g, Dtype::F32, &a_shape);
         let bb = ts::buffer(&mut g, Dtype::F32, &b_shape);
         let c = g
-            .add(Op::L1(L1::KContract {
+            .add(Op::Launch(Launch::Contract {
                 m: Dim::Sym(rows),
                 n: Dim::Const(2),
                 k: Dim::Const(8),
@@ -121,14 +120,14 @@ mod tests {
         let members = g.chain(c);
         assert_eq!(members.len(), 2);
         let alt = members.into_iter().find(|&i| i != c).unwrap();
-        let Op::L1(L1::KContract { m, .. }) = &g.node(alt).op else {
+        let Op::Launch(Launch::Contract { m, .. }) = &g.node(alt).op else {
             panic!()
         };
         assert_eq!(*m, Dim::Const(4));
         // The generic variant survives, so a fresh binding still has a home.
         assert!(matches!(
             &g.node(c).op,
-            Op::L1(L1::KContract { m: Dim::Sym(_), .. })
+            Op::Launch(Launch::Contract { m: Dim::Sym(_), .. })
         ));
     }
 

@@ -1,6 +1,5 @@
 //! The byte-range source an [`crate::sharded::AsyncShardedVarBuilder`] reads
-//! through. Deliberately runtime-agnostic: one boxed future, no executor
-//! dependency anywhere in the compiler stack.
+//! through. Runtime-agnostic: one boxed future, no executor dependency.
 
 use fusor2_ir::Result;
 use fusor2_ir::error::Error;
@@ -17,14 +16,13 @@ pub type ReadFuture<'a> = Pin<Box<dyn Future<Output = Result<Vec<u8>>> + Send + 
 pub trait AsyncReadRange: Send + Sync {
     fn read_range(&self, start: u64, len: usize) -> ReadFuture<'_>;
 
-    /// Total length, when known. `None` forces the caller to trust the GGUF
-    /// directory instead.
+    /// Total length, when known.
     fn len(&self) -> Option<u64> {
         None
     }
 
-    /// `true` when the source is known to be empty. Present because clippy
-    /// asks for it next to `len`; a source of unknown length is not empty.
+    /// `true` when the source is known to be empty; a source of unknown
+    /// length is not empty.
     fn is_empty(&self) -> bool {
         self.len() == Some(0)
     }
@@ -52,9 +50,8 @@ impl AsyncReadRange for BytesRange {
 
 /// Smallest prefix we ask for when hunting for the end of a GGUF header.
 const HEADER_PROBE_BYTES: usize = 1 << 16;
-/// Largest prefix we will pull before giving up. A GGUF header is metadata
-/// plus a tensor directory; 64 MiB covers a tokenizer vocabulary with room to
-/// spare, and refusing past that keeps a corrupt file from pulling the whole
+/// Largest prefix we will pull before giving up. 64 MiB covers a tokenizer
+/// vocabulary; refusing past that keeps a corrupt file from pulling the whole
 /// model over the wire.
 const HEADER_LIMIT_BYTES: usize = 64 << 20;
 
@@ -86,10 +83,8 @@ pub async fn read_metadata(source: &dyn AsyncReadRange) -> Result<GgufMetadata> 
     }
 }
 
-/// A minimal executor for callers that have none — the sync-over-async escape
-/// hatch the sharded loader's tests use. Spins; only sensible for futures that
-/// never actually yield, which is every future this module produces from an
-/// in-memory source.
+/// A minimal executor for callers that have none. Spins; only sensible for
+/// futures that never actually yield.
 pub fn block_on<F: Future>(future: F) -> F::Output {
     use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
@@ -112,8 +107,7 @@ pub fn block_on<F: Future>(future: F) -> F::Output {
     }
 }
 
-/// Turn a short read into a typed error, so a truncated shard reports the
-/// tensor it failed on rather than panicking on a slice.
+/// Turn a short read into a typed error naming what failed.
 pub(crate) fn expect_len(bytes: Vec<u8>, want: usize, what: &str) -> Result<Vec<u8>> {
     if bytes.len() == want {
         Ok(bytes)

@@ -16,7 +16,7 @@ use fusor2_ir::cost::{CostModel, DeviceFacts, LaunchPlan, MacUnit, Picoseconds, 
 use fusor2_ir::dtype::Dtype;
 use fusor2_ir::extract::{Extraction, PlanHash};
 use fusor2_ir::facts::ValueFacts;
-use fusor2_ir::ir::level1::SchedPoint;
+use fusor2_ir::ir::launch::SchedPoint;
 use fusor2_ir::ir::Node;
 use fusor2_ir::shape::Dim;
 use parking_lot::RwLock;
@@ -114,9 +114,7 @@ impl Roofline {
     ///
     /// This is a *stand-in*. The authoritative `PlanHash` is
     /// `plan::plan_hash` over the whole realized term; a launch alone
-    /// cannot see that term. It is derived here rather than read off
-    /// [`LaunchPlan`] because that struct carries no hash — reported as a
-    /// contract gap.
+    /// cannot see that term.
     pub fn launch_plan_hash(&self, launch: &LaunchPlan<'_>, materialized: bool) -> PlanHash {
         let mut h = FxHasher::default();
         self.facts.fingerprint().hash(&mut h);
@@ -212,18 +210,13 @@ impl CostModel for Roofline {
     ) -> Picoseconds {
         let (unit, dtype) = unit_and_dtype(ins, out, theta);
         let mut work = fusor2_ir::semantics::work::work_of(&node.op, ins, out);
-        // A tiled point issues MACs on the *padded* tile. Without this the
-        // only theta-dependence here was the MAC unit, so any tiled point
-        // out-seeded every un-padded family at any shape — a `bm = 16` tile
-        // at `m = 1` ran 16x the useful MACs for free, and a 16x32 Sgemm
-        // tile at `m = n = 1` priced as 4,096 plain FMAs while the kernel
-        // issues the full 2M-MAC tile (measured 421 us against the generic
-        // fold's 44 us on the decode rmsnorm dot). Padding is real work the
-        // theta performs — both kernels stage zero-filled tiles and run the
-        // whole tile's MACs — so charging it keeps the bound admissible.
+        // A tiled point issues MACs on the *padded* tile. Padding is real
+        // work the theta performs — the kernels stage zero-filled tiles and
+        // run the whole tile's MACs — so charging it keeps the bound
+        // admissible.
         if let (
             Some(tile),
-            fusor2_ir::ir::Op::L1(fusor2_ir::ir::level1::L1::KContract {
+            fusor2_ir::ir::Op::Launch(fusor2_ir::ir::launch::Launch::Contract {
                 m, n, k, batch, ..
             }),
         ) = (
@@ -287,7 +280,7 @@ mod tests {
     use crate::facts::tests::gpu_caps;
     use fusor2_ir::egraph::Id;
     use fusor2_ir::facts::Work;
-    use fusor2_ir::ir::level1::{CoopGeom, SgemvParams};
+    use fusor2_ir::ir::launch::{CoopGeom, SgemvParams};
     use rustc_hash::FxHashMap;
     use std::cmp::Reverse;
 
@@ -420,7 +413,6 @@ mod tests {
         // T1's MAC count, on the *padded* tile. There is no routing guard:
         // an over-padded candidate simply prices high here.
         let macs = per_workgroup * bm * bn * bk;
-        // cost.rs:201-202, verbatim.
         let fragment_bytes =
             n_passes * subgroups * (tr + tc) * (bk / u64::from(COOP_DIM)) * 64 * elem_bytes;
         let stage_bytes = n_passes * (bm * bk + bk * bn_pass) * elem_bytes;
@@ -832,16 +824,13 @@ mod tests {
     /// and the padded tile. Points sharing `(family, bm, bn)` must price
     /// identically — split, staging, subgroup, `tm`/`tn`/`bk` and every
     /// sgemv axis never move the term. And a tiled point at `m = n = 1`
-    /// must charge its padded tile: the un-padded Sgemm price made a 16x32
-    /// tile on a 4,096-MAC dot look like plain FMA math, which (with the
-    /// budget-zeroed ties) seeded 65 decode rmsnorm dots as serial Coop
-    /// tiles measured at 573 us against the fold spelling's 44 us.
+    /// must charge its padded tile.
     #[test]
     fn node_math_is_a_function_of_unit_and_padded_tile() {
         use fusor2_ir::dtype::Dtype;
         use fusor2_ir::facts::ValueFacts;
-        use fusor2_ir::ir::level1::{
-            AccessPlan, ContractSide, Family, L1, Operand, ScheduleDomain, SgemmParams,
+        use fusor2_ir::ir::launch::{
+            AccessPlan, ContractSide, Family, Launch, Operand, ScheduleDomain, SgemmParams,
         };
         use fusor2_ir::ir::{Level, Node, Op};
         use fusor2_ir::scalar::ScalarExpr;
@@ -855,7 +844,7 @@ mod tests {
         };
         let ident = ScalarExpr::arg(0, Dtype::F32);
         let node = Node {
-            op: Op::L1(L1::KContract {
+            op: Op::Launch(Launch::Contract {
                 m: Dim::from(1u64),
                 n: Dim::from(1u64),
                 k: Dim::from(4_096u64),
@@ -867,7 +856,7 @@ mod tests {
                 b: ContractSide::one(ident, dot(Id(0))),
                 sched: ScheduleDomain::Point,
             }),
-            level: Level::L1,
+            level: Level::Launch,
             children: [Id(0), Id(0)].into_iter().collect(),
         };
         let facts = ValueFacts::new(

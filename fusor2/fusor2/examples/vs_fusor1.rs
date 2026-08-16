@@ -13,7 +13,7 @@
 use fusor2::tensor::Dyn as Tensor;
 use fusor2::{Graph, Session};
 use fusor2_ir::dtype::Dtype;
-use fusor2_ir::ir::level1::MaskKind;
+use fusor2_ir::ir::launch::MaskKind;
 use fusor2_ir::shape::Dim;
 use std::time::{Duration, Instant};
 
@@ -100,19 +100,22 @@ fn chain(x: &Tensor, y: &Tensor) -> Result<Tensor, String> {
 }
 
 fn main() {
-    let device = match fusor2::session::Backend::gpu_blocking() {
-        Ok(d) => d,
-        Err(e) => {
-            eprintln!("no gpu: {e}");
-            return;
+    let device = if std::env::var("FUSOR2_DEVICE").as_deref() == Ok("cpu") {
+        fusor2::session::Backend::cpu().expect("cpu backend")
+    } else {
+        match fusor2::session::Backend::gpu_blocking() {
+            Ok(d) => d,
+            Err(e) => {
+                eprintln!("no gpu: {e}");
+                return;
+            }
         }
     };
     let session = Session::new(device).expect("session");
     println!("# fusor2 on {}", session.device().name());
     println!("workload\tcold_ms\tmin_ms\tmedian_ms\tlaunches");
 
-    // ---- 0. upload + readback floor, no compute. Both sides move the same
-    //         bytes, so every row below is this plus its kernel. ----
+    // Upload + readback floor with no compute; every row below is this plus its kernel.
     {
         let n = 2048usize;
         let x = bytes_of(&make(n * n, 0.013, 0.9));
@@ -127,7 +130,6 @@ fn main() {
         row("passthrough_2048", &t);
     }
 
-    // ---- 1. matmul 1024^3 ----
     {
         let n = 2048usize;
         let a = bytes_of(&make(n * n, 0.013, 0.5));
@@ -148,7 +150,6 @@ fn main() {
         row("matmul_2048", &t);
     }
 
-    // ---- 2. matmul + bias + gelu (epilogue fusion) ----
     {
         let n = 2048usize;
         let a = bytes_of(&make(n * n, 0.013, 0.5));
@@ -176,7 +177,6 @@ fn main() {
         row("matmul_epilogue_2048", &t);
     }
 
-    // ---- 3. elementwise chain, 2048^2 ----
     {
         let n = 2048usize;
         let x = bytes_of(&make(n * n, 0.013, 0.9));
@@ -193,7 +193,6 @@ fn main() {
         row("elementwise_chain_2048", &t);
     }
 
-    // ---- 4. softmax last dim, 2048^2 ----
     {
         let n = 2048usize;
         let x = bytes_of(&make(n * n, 0.013, 2.0));
@@ -212,7 +211,6 @@ fn main() {
         row("softmax_2048", &t);
     }
 
-    // ---- 5. rms_norm, 2048^2 ----
     {
         let n = 2048usize;
         let x = bytes_of(&make(n * n, 0.013, 1.0));
@@ -235,7 +233,6 @@ fn main() {
         row("rms_norm_2048", &t);
     }
 
-    // ---- 6. attention forward, [1,8,512,64] ----
     {
         let shape = [1u64, 8, 1024, 64];
         let numel: usize = shape.iter().product::<u64>() as usize;
@@ -259,12 +256,11 @@ fn main() {
         row("attention_1x8x1024x64", &t);
     }
 
-    // ---- 7. quantized matmul, Q4K weights, LLM-decode shape ----
     {
         use fusor2_ir::dtype::{QFmt, QLayout};
         let fmt = QFmt::Q4K;
         let be = fmt.block_elements() as u64;
-        let (k, n, m) = (be * 16, 4096u64, 256u64); // k=4096
+        let (k, n, m) = (be * 16, 4096u64, 256u64);
         let blocks = (k / be) * n;
         let bytes = vec![0x11u8; (blocks * u64::from(fmt.block_bytes(QLayout::Native))) as usize];
         let act = bytes_of(&make((m * k) as usize, 0.013, 0.5));
@@ -288,7 +284,7 @@ fn main() {
         row("qmatmul_q4k_256x4096x4096", &t);
     }
 
-    // ---- 8. quantized matvec, Q4K weights, M=1: the LLM decode shape ----
+    // Quantized matvec at M=1, the LLM decode shape.
     {
         use fusor2_ir::dtype::{QFmt, QLayout};
         let fmt = QFmt::Q4K;

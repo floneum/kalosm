@@ -2,20 +2,16 @@
 //! from: a descending sort with the declared tie rule, prefix scans, and the
 //! weighted pick.
 //!
-//! # Why this is matmul and dense constants rather than broadcasts
+//! Every shape here is `[n, 1]`, `[1, n]` or `[n, n]`, and every "replicate a
+//! value across an axis" step goes through a `Contract` against a dense
+//! all-ones constant: both emitters index every operand with the flat output
+//! index and ignore `Operand.layout`, so a stride-0 broadcast operand reads
+//! the wrong element and runs off the end of its buffer. Until that is fixed
+//! in the two `lower` crates, anything built on `broadcast_as`, `expand` or
+//! `repeat` is silently wrong here.
 //!
-//! Every shape here is either `[n, 1]`, `[1, n]` or `[n, n]`, and every
-//! "replicate a value across an axis" step goes through a `Contract` against a
-//! dense all-ones constant. That is deliberate: both emitters currently index
-//! every operand with the flat output index and ignore `Operand.layout`, so a
-//! stride-0 broadcast operand reads the wrong element and runs off the end of
-//! its buffer. A `[3]` row broadcast to `[3,3]` and multiplied by its own
-//! transpose returns `[1,4,9,0,0,0,0,0,0]` instead of the outer product. Until
-//! that is fixed in the two `lower` crates, anything built on `broadcast_as`,
-//! `expand` or `repeat` is silently wrong, so nothing here uses them.
-//!
-//! The cost is `O(V^2)` work for a vocabulary of `V`. This works fine for
-//! the conformance vocabularies; see the module note on [`sort_desc`].
+//! The cost is `O(V^2)` work for a vocabulary of `V`; see the note on
+//! [`sort_desc`].
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock, Weak};
@@ -53,11 +49,9 @@ pub(crate) fn konst(g: &GraphRef, shape: &[u64], data: &[f32]) -> Result<Tensor>
 /// The fixed matrices a draw needs. None depends on the logits, so each is
 /// built once per graph and reused.
 ///
-/// This matters for more than speed. `Graph::constant_from_raw` mints a fresh
-/// buffer id every call, so two byte-identical constants are two leaves and
-/// two uploads; a sampler that rebuilds a dozen of them per draw grows the
-/// graph fast enough to walk into the planner cliff documented on
-/// [`cached`].
+/// `Graph::constant_from_raw` mints a fresh buffer id every call, so a
+/// sampler that rebuilds constants per draw grows the graph into the planner
+/// cliff documented on [`cached`].
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 enum Fixed {
     /// `[n, 1]` of ones.
@@ -110,19 +104,13 @@ type Constants = Mutex<Vec<(Weak<GraphInner>, HashMap<Fixed, Id>)>>;
 /// The per-graph constant pool.
 ///
 /// Keyed by graph so a constant is only ever reused inside the graph that owns
-/// it, and held as a `(Weak, Id)` pair rather than a `Tensor` so the pool never
-/// keeps a graph alive.
+/// it, and held as a `(Weak, Id)` pair so the pool never keeps a graph alive.
 ///
-/// # The cliff this mitigates but does not fix
-///
-/// Resolving the same growing graph over and over eventually returns wrong
-/// numbers: with one graph reused across draws, every draw up to the 76th is
-/// exact and every draw from the 77th on is wrong, in the same way (the
-/// one-hot selector reads as all-ones, so the token comes back as the sum of
-/// every id). The break is a function of accumulated graph size, not of
-/// anything the sampler varies — the 77th draw runs identical code to the
-/// first. That is a planner/extractor defect in `fusor2-cost`, not something
-/// this module can repair; pooling constants only moves the cliff further out.
+/// Pooling only mitigates a planner cliff, it does not fix it: resolving the
+/// same growing graph over and over eventually returns wrong numbers (with one
+/// graph reused across draws, every draw from the 77th on reads the one-hot
+/// selector as all-ones). The break is a function of accumulated graph size —
+/// a planner/extractor defect in `fusor2-cost`.
 fn constants() -> &'static Constants {
     static CONSTANTS: OnceLock<Constants> = OnceLock::new();
     CONSTANTS.get_or_init(|| Mutex::new(Vec::new()))
@@ -260,10 +248,9 @@ pub(crate) fn sanitized_column(x: &Tensor, n: u64) -> Result<Tensor> {
 /// **value descending, and on an exact tie the larger token id first**.
 ///
 /// The sort is a rank-by-counting: `rank[i]` is how many tokens beat token
-/// `i`, which is a full `n x n` comparison, and the sorted arrays are read out
-/// by contracting against the `rank == r` indicator. That is `O(n^2)` work and
-/// `O(n^2)` memory, against the reference's chunked bitonic sort. It is exact
-/// and it is device-resident, but it does not scale to a real vocabulary.
+/// `i`, a full `n x n` comparison, and the sorted arrays are read out by
+/// contracting against the `rank == r` indicator. `O(n^2)` work and memory —
+/// exact and device-resident, but it does not scale to a real vocabulary.
 pub(crate) fn sort_desc(x: &Tensor, n: u64) -> Result<(Tensor, Tensor)> {
     let g = x.graph();
     let col = sanitized_column(x, n)?; // [n,1], value[i]
@@ -342,15 +329,10 @@ pub(crate) fn as_token(value: &Tensor) -> Result<Tensor> {
     value.reshape_dims(&dims(&[1]))?.to_u32()
 }
 
-// ---------------------------------------------------------------------------
-// Seeded randomness
-// ---------------------------------------------------------------------------
-
 /// `splitmix64`, then the top 24 bits as a float in `[0, 1)`.
 ///
-/// Host-side on purpose: the reference also passes the draw in as a `random`
-/// uniform rather than generating it on device, so a seed fully determines the
-/// token without the logits ever leaving the device.
+/// Host-side: the reference also passes the draw in as a `random` uniform, so
+/// a seed fully determines the token without the logits leaving the device.
 pub(crate) fn unit_random(seed: u64) -> f32 {
     let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
     z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
@@ -365,16 +347,9 @@ pub(crate) fn unit_random_at(seed: u64, step: u64) -> f32 {
     unit_random(seed ^ step.wrapping_mul(0xD1B5_4A32_D192_ED03))
 }
 
-// ---------------------------------------------------------------------------
-// The repetition-penalty history
-// ---------------------------------------------------------------------------
-
-/// Tokens this process has already drawn, per graph.
-///
-/// `StandardSamplerParams` has nowhere to hand in a decode history and
-/// `sample` is a free function, so the penalty needs somewhere to remember
-/// what it drew. The scope is the [`crate::Graph`] the logits belong to, which
-/// for a decode loop is the loop itself.
+/// Tokens this process has already drawn, per graph. The scope is the
+/// [`crate::Graph`] the logits belong to, which for a decode loop is the loop
+/// itself.
 ///
 /// Entries hold the token's `Id` and a [`Weak`] graph handle rather than the
 /// `Tensor`: a `Tensor` owns a `GraphRef`, so parking one here would keep its

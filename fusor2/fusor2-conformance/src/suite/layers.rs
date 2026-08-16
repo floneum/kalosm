@@ -17,12 +17,11 @@ use fusor2::{Dtype, Session};
 use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fill_indices, from_u32, fuzz_case};
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
 
-/// A runtime-rank value as the const-rank one the layers now take.
+/// A runtime-rank value as the const-rank one the layers take.
 ///
-/// The suite uploads through `Dyn` on purpose — a case's shape is data it
-/// reads from its own table — and the layers are `Tensor<R, T>`, so the rank
-/// assertion happens here, once per case, instead of every case being
-/// rewritten around a const shape it does not have.
+/// The suite uploads through `Dyn` — a case's shape is data from its own
+/// table — and the layers are `Tensor<R, T>`, so the rank assertion happens
+/// here, once per case.
 fn t<const R: usize>(v: fusor2::tensor::Dyn) -> fusor2::Tensor<R, f32> {
     fusor2::Tensor::<R, f32>::from_dyn(v)
 }

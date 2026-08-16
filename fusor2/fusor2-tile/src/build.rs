@@ -1,5 +1,5 @@
-//! Hash-consed L2 term builders, shared by both emitters. Structural sharing
-//! comes from hash-consing the whole L2 term, so two identical subtrees built
+//! Hash-consed Kernel term builders, shared by both emitters. Structural sharing
+//! comes from hash-consing the whole Kernel term, so two identical subtrees built
 //! separately merge.
 //!
 //! **Declarations are not interned.** Two same-shaped tiles must stay distinct
@@ -7,7 +7,7 @@
 //! `alloc_buffer` each mint a fresh `Arc` and push it to an ordered list.
 
 use fusor2_ir::dtype::{NumericContract, RoundMode};
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::kernel::{
     Accumulator, Addr, Buffer, BufferAccess, BufferDecl, Builtin, CoopMatrixRole,
     CoopSrc, ElementType, KernelIr, Local, LocalDecl, ReduceKind, ScalarElement,
     Source, Stmt, StorageView, Tile, TileBinaryOp, TileCompareOp, TileDecl, TileExpr, TileExprKind,
@@ -54,7 +54,7 @@ fn tag_of(kind: &TileExprKind) -> DiscriminantTag {
 /// cached `structural_hash`, so hashing a node is O(1) in its children.
 pub type TileKey = (u64, ElementType, DiscriminantTag);
 
-/// Builds L2 terms with a hash-cons memo, so two identical subtrees built by
+/// Builds Kernel terms with a hash-cons memo, so two identical subtrees built by
 /// separate call sites are one node.
 #[derive(Default)]
 pub struct TileBuilder {
@@ -69,10 +69,6 @@ impl TileBuilder {
     pub fn new() -> Self {
         Self::default()
     }
-
-    // -----------------------------------------------------------------
-    // Declarations — never interned
-    // -----------------------------------------------------------------
 
     /// A fresh workgroup/private tile. Two same-shaped tiles stay distinct.
     pub fn alloc_tile(&mut self, element: ElementType, layout: TileLayout) -> Tile {
@@ -136,10 +132,6 @@ impl TileBuilder {
         self.exprs.len()
     }
 
-    // -----------------------------------------------------------------
-    // The hash-cons
-    // -----------------------------------------------------------------
-
     /// Intern one node. Collisions are resolved by comparing the full
     /// [`TileExprKind`]; the hash alone is never trusted.
     pub fn expr(&mut self, kind: TileExprKind, ty: ElementType) -> TileExpr {
@@ -157,18 +149,14 @@ impl TileBuilder {
         node
     }
 
-    /// Intern a node whose element type is derived by the L2 type rules. A
+    /// Intern a node whose element type is derived by the Kernel type rules. A
     /// malformed construction is not silently accepted: the fallback type
-    /// makes `verify_l2` reject the term.
+    /// makes `verify_kernel` reject the term.
     fn infer_expr(&mut self, kind: TileExprKind) -> TileExpr {
-        let ty = crate::verify_l2::infer_kind(&kind)
+        let ty = crate::verify_kernel::infer_kind(&kind)
             .unwrap_or(ElementType::Scalar(ScalarElement::F32));
         self.expr(kind, ty)
     }
-
-    // -----------------------------------------------------------------
-    // Typed value constructors
-    // -----------------------------------------------------------------
 
     pub fn lit(&mut self, value: TileLiteral) -> TileExpr {
         self.infer_expr(TileExprKind::Literal(value))
@@ -197,7 +185,7 @@ impl TileBuilder {
                 self.vec(scalar, parts)
             }
             // A cooperative fragment has no literal form; the scalar zero is
-            // the only sensible placeholder and `verify_l2` rejects it if a
+            // the only sensible placeholder and `verify_kernel` rejects it if a
             // caller actually stores one.
             ElementType::CoopMatrix { scalar, .. } => self.zero_scalar(scalar),
         }
@@ -304,19 +292,16 @@ impl TileBuilder {
         })
     }
 
-    /// The **N-ary** reduction, expressed as a carrier.
+    /// The N-ary reduction, expressed as a carrier.
     ///
-    /// When the carrier is one scalar slot merged by a binop this **delegates**
-    /// to [`Self::reduce`] and returns a one-element vector: the same
-    /// `TileExprKind::Reduce` node, hence the same hash-consed L2 term, hence
-    /// the same `KernelIr`, the same `PlanHash` and the same shader bytes. A
-    /// single-slot carrier cannot reach the new path at all.
+    /// When the carrier is one scalar slot merged by a binop this delegates
+    /// to [`Self::reduce`] and returns a one-element vector.
     ///
     /// Otherwise it allocates one scratch tile, one pair of merge formals and
-    /// one output local per accumulator **lane**, pushes a [`Stmt::Reduce`] into
+    /// one output local per accumulator lane, pushes a [`Stmt::Reduce`] into
     /// `out`, and returns the per-lane reads. `merge` builds lane `i`'s merged
-    /// expression from the formals; both emitters own the tree that evaluates
-    /// it. `values` must already be one partial per lane.
+    /// expression from the formals. `values` must already be one partial per
+    /// lane.
     ///
     /// `scratch_extents` is the tile shape one lane needs — the block width for
     /// a workgroup tree.
@@ -332,7 +317,7 @@ impl TileBuilder {
     where
         E: From<String>,
     {
-        if let Some(op) = fusor2_ir::ir::level2::fast_reduce_op(carrier)
+        if let Some(op) = fusor2_ir::ir::kernel::fast_reduce_op(carrier)
             && values.len() == 1
         {
             return Ok(vec![self.reduce(op, kind, values[0].clone())]);
@@ -348,7 +333,7 @@ impl TileBuilder {
                     tiles.push(self.alloc_tile_named(
                         values[0].element(),
                         TileLayout::contiguous(
-                            fusor2_ir::ir::level2::MemoryLevel::Workgroup,
+                            fusor2_ir::ir::kernel::MemoryLevel::Workgroup,
                             scratch_extents,
                         ),
                         "fold_scratch",
@@ -369,9 +354,9 @@ impl TileBuilder {
         out.push(Stmt::Reduce {
             kind: Box::new(kind),
             values: values.iter().cloned().collect(),
-            merge: Box::new(fusor2_ir::ir::level2::MergeBody { lhs, rhs, body }),
-            // Derived, never author-supplied: this arm is only reached when the
-            // carrier is *not* a single scalar binop slot.
+            merge: Box::new(fusor2_ir::ir::kernel::MergeBody { lhs, rhs, body }),
+            // This arm is only reached when the carrier is not a single
+            // scalar binop slot.
             fast: None,
             outs: outs.clone(),
             scratch,
@@ -400,10 +385,6 @@ impl TileBuilder {
         self.infer_expr(TileExprKind::CoopMma { a, b, c })
     }
 
-    // -----------------------------------------------------------------
-    // Statement constructors — plain data, never interned
-    // -----------------------------------------------------------------
-
     pub fn store(&self, dst: StorageView, addr: Addr, value: TileExpr, mask: TileExpr) -> Stmt {
         Stmt::Store {
             dst,
@@ -413,7 +394,7 @@ impl TileBuilder {
         }
     }
 
-    /// The `ScatterMode::Atomic` verb. Carries `Effect::InPlace` at L1.
+    /// The `ScatterMode::Atomic` verb. Carries `Effect::InPlace` at Launch.
     pub fn atomic_add(
         &self,
         dst: StorageView,
@@ -493,10 +474,6 @@ impl TileBuilder {
         Stmt::Barrier
     }
 
-    // -----------------------------------------------------------------
-    // Body assembly
-    // -----------------------------------------------------------------
-
     pub fn push(&mut self, stmt: Stmt) {
         self.body.push(stmt);
     }
@@ -536,7 +513,7 @@ impl TileBuilder {
 pub(crate) mod fixtures {
     use super::*;
     use fusor2_ir::device::{Caps, DeviceKind, Limits, SubgroupWidths};
-    use fusor2_ir::ir::level2::MemoryLevel;
+    use fusor2_ir::ir::kernel::MemoryLevel;
 
     /// Both tiles in one region: `max(256, 128)`.
     pub const SHARED: u32 = 256;
@@ -662,7 +639,7 @@ mod tests {
 
     #[test]
     fn atomic_add_is_a_first_class_verb() {
-        use fusor2_ir::ir::level2::{BufferAccess, MemoryLevel};
+        use fusor2_ir::ir::kernel::{BufferAccess, MemoryLevel};
         let mut b = TileBuilder::new();
         let buffer = b.alloc_buffer(
             0,
@@ -677,7 +654,7 @@ mod tests {
         let stmt = b.atomic_add(view, Addr::Linear(index), value, mask);
         b.push(stmt);
         let ir = b.finish([1, 1, 1], 64, "scatter-add");
-        crate::verify_l2::verify_l2(&ir, &fixtures::base_caps()).unwrap();
+        crate::verify_kernel::verify_kernel(&ir, &fixtures::base_caps()).unwrap();
     }
 
     #[test]
@@ -693,7 +670,7 @@ mod tests {
     fn declarations_are_not_interned() {
         let mut b = TileBuilder::new();
         let layout = TileLayout::contiguous(
-            fusor2_ir::ir::level2::MemoryLevel::Workgroup,
+            fusor2_ir::ir::kernel::MemoryLevel::Workgroup,
             &[8, 8],
         );
         let a = b.alloc_tile(ScalarElement::F32.element(), layout.clone());

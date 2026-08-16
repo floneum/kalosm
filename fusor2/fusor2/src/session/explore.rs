@@ -1,52 +1,30 @@
 //! Online tuning from production dispatches: the epsilon explorer.
 //!
-//! The cold race (`Session::autotune`) is deliberately shallow now — a cold
-//! signature races only the cost model's top-[`RACE_TOP_K`] picks — so the
-//! rest of every launch's candidate field is explored *here*, from the
-//! resolves production was going to pay for anyway. On a deterministic
-//! schedule (a per-key resolve counter, never an RNG), one replay-hit resolve
-//! in [`EXPLORE_EPSILON`] substitutes a single candidate plan for the
-//! incumbent, arms the per-dispatch timestamp path for that one resolve, and
-//! files the kernel's own GPU span into the tune cache's sliding windows.
-//! Adoption keeps the race's own hysteresis: a candidate displaces the
-//! incumbent in the replay memo only when its window minimum beats the
-//! incumbent's window minimum by [`TUNE_MARGIN`], on at least [`MIN_OBS`]
-//! samples.
+//! On a deterministic schedule (a per-key resolve counter, never an RNG), one
+//! replay-hit resolve in [`EXPLORE_EPSILON`] substitutes a single candidate
+//! plan for the incumbent, arms the per-dispatch timestamp path for that one
+//! resolve, and files the kernel's GPU span into the tune cache's sliding
+//! windows. A candidate displaces the incumbent in the replay memo only when
+//! its window minimum beats the incumbent's by [`TUNE_MARGIN`], on at least
+//! [`MIN_OBS`] samples.
 //!
-//! **Granularity follows layout.** A candidate that leaves every other launch
-//! untouched (`plans_align`) is a per-launch swap: its span is filed under the
-//! launch's own signature, ranked against the incumbent's span at that launch.
-//! A candidate that moves work across launch boundaries or changes the
-//! dispatch structure is comparable whole when the plan fits a query set —
-//! and on a plan too large for that, comparable at *diff* granularity when
-//! the changed launches on both sides form a small set ([`Gran::Diff`]): the
-//! arm's changed launches are timed together in one resolve and their sum is
-//! judged against the sum of the incumbent's own per-launch windows at its
-//! changed launches.
+//! Granularity follows layout. A candidate that leaves every other launch
+//! untouched (`plans_align`) is a per-launch swap: its span files under the
+//! launch's own signature. A restructuring candidate is timed whole when the
+//! plan fits a query set, or at diff granularity ([`Gran::Diff`]): the arm's
+//! changed launches are timed together and their sum is judged against the
+//! sum of the incumbent's per-launch windows at its changed launches.
 //!
-//! **No correctness machinery.** Every arm is a `verify_plan`-checked plan
-//! over members of the same e-classes, and every member of a class computes
-//! the same value — that is the compiler's invariant. Selection here is pure performance. This is also why a
-//! substitution is safe on an *impure* plan (the decode step's KV append):
-//! the arm runs once, **instead of** the incumbent, so the plan's one write
-//! happens exactly once either way — unlike the cold race, which re-runs a
-//! plan `TUNE_RUNS` times and must refuse impure plans.
+//! Every arm is a `verify_plan`-checked plan over members of the same
+//! e-classes, so selection is pure performance. A substitution is safe on an
+//! impure plan (the decode step's KV append): the arm runs once, instead of
+//! the incumbent, so the plan's one write happens exactly once either way.
 //!
-//! Why substitution is cheap enough for production: a replay-hit resolve is
-//! ~1.35 ms of host work; the substituted resolve additionally pays one
-//! timestamp readback and one candidate replan. **A step builds the one arm
-//! it runs and no others.** Opening a launch's candidate field *names* its
-//! candidates (`launch_variant_labels`) and builds none of them; a name
-//! becomes a plan in `materialize_arm`, for the single label the step
-//! selects. The eager spelling built the whole field — sixteen whole-plan
-//! replans, 47 ms with nothing submitted, to run one of them and, on a warm
-//! tune cache, discard all sixteen on the next step.
-//!
-//! The timestamp arming follows the same rule: a step times the launches its
-//! comparison reads, never the whole plan, unless the arm's granularity is
-//! the whole plan. On a backend that writes timestamps only at pass
-//! boundaries every timed dispatch takes its own compute pass, so timing a
-//! decode step whole is 1731 pass boundaries — 56 ms of submit against 1.7 ms.
+//! A step builds the one arm it runs and no others: opening a launch's
+//! candidate field names its candidates (`launch_variant_labels`); a name
+//! becomes a plan in `materialize_arm` for the single label the step selects.
+//! A step also times only the launches its comparison reads, unless the arm's
+//! granularity is the whole plan.
 
 use std::sync::Arc;
 
@@ -67,33 +45,26 @@ const EXPLORE_EPSILON: u64 = 16;
 
 /// Window samples an arm needs before its window-min may displace the
 /// incumbent, and before the explorer stops considering it under-explored.
-/// One sample is one production dispatch; two is the cheapest "not a fluke",
-/// and the race's own `TUNE_RUNS`-deep minimum is what seeds most windows
-/// anyway.
 const MIN_OBS: usize = 2;
 
 /// Keys tracked before the oldest is dropped. Matches the replay memo's
-/// capacity: an evicted plan's exploration state is dead weight.
+/// capacity.
 const KEY_CAP: usize = 64;
 
 /// Edit-distance cap for attributing a restructuring candidate to a changed
-/// launch window (see `plan_sparse_diff`). A member swap that materializes or
-/// drops a producer is 2–3 edits; anything wider is judged whole-plan or not
-/// at all.
+/// launch window (see `plan_sparse_diff`). Anything wider is judged
+/// whole-plan or not at all.
 const MAX_DIFF_EDITS: usize = 8;
 
 /// How many of the heaviest launches the persisted-prior scan builds
-/// *restructuring* variants for. Each variant is a full replan, so this is
-/// bounded tightly; the work ordering puts the launches whose restructurings
-/// matter (the lm_head-sized folds) first.
+/// restructuring variants for. Each variant is a full replan, so this is
+/// bounded tightly.
 const DIFF_SCAN_TOP_K: usize = 4;
 
 /// How much more step-transient memory an arm may allocate than the
-/// incumbent. An arm runs *in production, in place of* the incumbent, so its
-/// working set must stay near what production already survived: a
-/// dequantize-once candidate materializes a 2.1 GB weight matrix per step,
-/// and a few of those in flight is an allocation-ceiling crash mid-decode,
-/// not a measurement.
+/// incumbent. An arm runs in production in place of the incumbent, so its
+/// working set must stay near what production already survived; an
+/// over-budget arm is an allocation crash risk, not a measurement.
 const ARM_EXTRA_BYTES: u64 = 256 << 20;
 
 /// Step-transient bytes a plan allocates, over its constant-extent buffers.
@@ -133,9 +104,7 @@ fn tune_log() -> bool {
     *ON.get_or_init(|| std::env::var_os("FUSOR2_AUTOTUNE_LOG").is_some())
 }
 
-/// A short, process-stable key for whole-plan windows. The full plan
-/// signature is every launch signature joined — hundreds of bytes per launch
-/// on a decode plan — and it would be paid per record in the JSON file.
+/// A short, process-stable key for whole-plan windows.
 fn plan_key(plan_sig: &str) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
@@ -161,13 +130,11 @@ struct KeyState {
 
 /// The exploration frontier for one replay key's incumbent plan.
 struct ArmSet {
-    /// Which incumbent these arms and labels describe. A replay entry only
-    /// changes through adoption, but that is exactly when everything below
-    /// goes stale.
+    /// Which incumbent these arms and labels describe; everything below goes
+    /// stale on adoption.
     incumbent_hash: fusor2_ir::extract::PlanHash,
     /// `launch_signature` per launch, plan order: the field each per-launch
-    /// window lives in. Shared with the cold race, which is what makes race
-    /// results and production samples one prior.
+    /// window lives in. Shared with the cold race.
     launch_sigs: Vec<String>,
     /// The incumbent's own per-launch labels — the same `(family, schedule
     /// point)` strings its challengers get, so both rank in one field.
@@ -183,21 +150,11 @@ struct ArmSet {
     /// The incumbent's step-transient bytes: the memory bar arms are held to.
     step_bytes: u64,
     /// Per label, the smallest step-transient total any plan realizing it has
-    /// come out at against this incumbent.
-    ///
-    /// A label is offered by every launch whose root class carries the
-    /// member, and on a quantized decode plan the labels that *drop* the
-    /// fused quantized operand are offered by all thirty-odd weight
-    /// contractions — each one realizing that weight dequantized, each one
-    /// past [`ARM_EXTRA_BYTES`], each one discovered by a whole-plan replan.
-    /// Recording the cheapest realization seen means the bar is re-derived
-    /// once per label instead of once per launch: a label is skipped only
-    /// when even its cheapest realization is over budget, so a label that
-    /// has ever fit is never skipped.
+    /// come out at against this incumbent. A label is skipped only when even
+    /// its cheapest realization is over budget, so a label that has ever fit
+    /// is never skipped.
     over_budget: FxHashMap<String, u64>,
-    /// Arms of the launch currently being explored. One launch at a time:
-    /// candidate plans carry whole extractions, and holding every launch's
-    /// field at once on a decode-sized plan is real memory.
+    /// Arms of the launch currently being explored, one launch at a time.
     arms: Vec<Arm>,
 }
 
@@ -213,8 +170,7 @@ enum Gran {
     /// small set (`plan_sparse_diff`): the arm's changed launches are timed
     /// together and their summed span — filed under `field` — is judged
     /// against the sum of the incumbent's own per-launch window minimums at
-    /// its changed launches. This is how a plan too large to time whole
-    /// races a dequantize-once-vs-decode-in-the-fill restructuring at all.
+    /// its changed launches.
     Diff {
         cand: Vec<usize>,
         inc: Vec<usize>,
@@ -224,13 +180,8 @@ enum Gran {
 
 /// One candidate of the launch currently being explored.
 ///
-/// An arm is *named* by the label its offering class carries and only
-/// *built* on the step it runs. Building is a whole-plan replan; a launch's
-/// field holds up to `TUNE_MAX_VARIANTS` labels and a step runs one of them,
-/// so opening a field eagerly built sixteen plans, ran one, and — when the
-/// persisted windows already held every label's observation — threw all
-/// sixteen away on the next step. Measured on the 1731-launch decode plan:
-/// 47 ms of host work per exploration step, the GPU idle for all of it.
+/// An arm is named by the label its offering class carries and only built
+/// (a whole-plan replan) on the step it runs.
 struct Arm {
     ix: usize,
     label: String,
@@ -239,10 +190,7 @@ struct Arm {
     plan: Option<Arc<Plan>>,
     /// How the arm is measured. Known only once the plan exists — it is a
     /// property of how the candidate's launches line up against the
-    /// incumbent's. An unbuilt arm is read as [`Gran::Launch`]: that is the
-    /// field a candidate of one launch files under, and the only field a
-    /// restructuring arm's label could already hold observations in is its
-    /// own, which reads back empty and so keeps the arm unexplored.
+    /// incumbent's. An unbuilt arm is read as [`Gran::Launch`].
     gran: Option<Gran>,
 }
 
@@ -254,9 +202,9 @@ impl Arm {
 }
 
 /// The stats field a diff arm's summed window files under: stable across
-/// processes, derived from the plan field and the *incumbent-side* changed
-/// launches' signatures — so every restructuring that displaces the same
-/// incumbent work ranks in one market.
+/// processes, derived from the plan field and the incumbent-side changed
+/// launches' signatures, so every restructuring that displaces the same
+/// incumbent work ranks in one field.
 fn diff_field(plan_field: &str, launch_sigs: &[String], inc: &[usize]) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
@@ -281,10 +229,8 @@ impl ArmSet {
                 incumbent_signature(&g, incumbent, ix).unwrap_or_else(|| "base".to_string())
             })
             .collect();
-        // Heaviest work first: the frontier converges one launch per epsilon
-        // step, and the launches whose candidate fields matter (the big
-        // folds) must not wait behind two thousand element-wise maps.
-        // `pending` pops from the back, so it is stored ascending by work.
+        // Heaviest work first: `pending` pops from the back, so it is stored
+        // ascending by work.
         let mut pending: Vec<usize> = (0..incumbent.launches.len()).collect();
         let works: Vec<u64> = pending
             .iter()
@@ -306,17 +252,10 @@ impl ArmSet {
     }
 
     /// Whether a named candidate of launch `ix` is worth the whole-plan
-    /// replan that building it costs.
-    ///
-    /// Two things make it worth it: a window too thin to judge, or a window
-    /// thick enough to judge that says this label *wins* — an adoption. A
-    /// thick, losing label is neither. Re-running one only refreshes a
-    /// sliding window whose verdict is already in, and a warm tune cache
-    /// makes that the common case: every label of every heavy launch already
-    /// carries its `MIN_OBS` samples from past processes, so opening a field
-    /// means building sixteen candidates to re-measure sixteen
-    /// answers. The read is `launch_sigs[ix]` — an arm that turns out to
-    /// restructure files elsewhere, reads zero here, and so counts as thin.
+    /// replan that building it costs: a window too thin to judge, or a window
+    /// thick enough to judge that says this label wins. The read is
+    /// `launch_sigs[ix]` — an arm that turns out to restructure files
+    /// elsewhere, reads zero here, and so counts as thin.
     fn worth_building(
         &self,
         tune: &fusor2_cost::tune_cache::TuneCache,
@@ -432,9 +371,8 @@ impl ExploreRun {
 }
 
 impl Session {
-    /// Decide what this replay-hit resolve runs. `None` on the overwhelming
-    /// majority of resolves — not an epsilon step, or the explorer is off —
-    /// costs one counter increment.
+    /// Decide what this replay-hit resolve runs. `None` on most resolves —
+    /// not an epsilon step, or the explorer is off.
     pub(super) fn explore_step(
         &self,
         graph: &GraphRef,
@@ -449,15 +387,9 @@ impl Session {
         let mut state = self.inner.explore.lock();
         let ks = state.key_mut(key);
         ks.counter += 1;
-        // First replay hit of this key in this process: turn the *persisted*
+        // First replay hit of this key in this process: turn the persisted
         // windows into adoptions in one pass, before any sequential
-        // exploration. The frontier below converges one launch per epsilon
-        // step — sound, but a 2357-launch decode plan would take thousands of
-        // resolves to re-learn what past processes already measured. Every
-        // swap here clears the same bar `maybe_adopt` enforces (window-min
-        // win at `TUNE_MARGIN` on `MIN_OBS`+ samples, `launch_variants`-built
-        // and so `verify_plan`-checked, `plans_align`ed), so this is the
-        // stale-prior scan run eagerly and batched, not a new policy.
+        // exploration. Every swap clears the same bar `maybe_adopt` enforces.
         if ks.counter == 1 && self.adopt_persisted(graph, roots, key, incumbent) {
             // The next resolve replays the adopted plan; exploring the
             // displaced incumbent now would file arms against dead labels.
@@ -475,11 +407,9 @@ impl Session {
         {
             ks.arms = None;
         }
-        // Whether this plan can be timed whole. Past the query-set cap
-        // (2048 dispatches — the decode plan is larger) only a focused set
-        // of launches can be timed per resolve, which bounds this key's
-        // exploration to per-launch granularity: a plan-restructuring arm
-        // has no measurable number there, so it is never built.
+        // Whether this plan can be timed whole. Past the query-set cap only a
+        // focused set of launches can be timed per resolve, which bounds this
+        // key's exploration to per-launch granularity.
         let whole = match &self.inner.device {
             Backend::Gpu(t) => t.launcher().can_time_whole(incumbent.launches.len()),
             Backend::Cpu(_) => return None,
@@ -488,15 +418,11 @@ impl Session {
             .arms
             .get_or_insert_with(|| ArmSet::metadata(graph, incumbent));
 
-        // Adoption sweep over the current arms before anything else. An
-        // arm's own runs and the incumbent's window fills arrive on
-        // different steps, so the win often becomes visible on a step that
-        // runs *neither* — checking only after an arm's own run would let
-        // the frontier advance past a fully-measured winner and strand it.
-        // The winner is found from window lookups alone and built only if it
-        // is not built already: a label the persisted prior already ranks
-        // above the incumbent is an adoption, and an adoption is worth the
-        // one replan it costs.
+        // Adoption sweep over the current arms before anything else: an arm's
+        // own runs and the incumbent's window fills arrive on different
+        // steps, so the win often becomes visible on a step that runs
+        // neither. The winner is found from window lookups alone and built
+        // only if it is not built already.
         let winner = {
             let tune = &self.inner.tune;
             set.arms
@@ -542,10 +468,7 @@ impl Session {
 
         // Advance the frontier: when the current launch's field is explored
         // out (every arm has MIN_OBS window samples), open the next launch's.
-        // Opening a field *names* its candidates and builds none of them —
-        // the step below builds the single arm it runs. At most one launch's
-        // label sweep per step bounds the host cost of an exploration step;
-        // launches below the work gate name nothing and cost a scan.
+        // Opening a field names its candidates and builds none of them.
         if set
             .arms
             .iter()
@@ -581,15 +504,9 @@ impl Session {
         }
 
         // Least-observed arm first; ties break by label so a run is
-        // reproducible. The incumbent is itself an arm of the comparison:
-        // when its own window at the chosen granularity is thinner than the
-        // challenger's, sample it instead — adoption needs both sides.
-        //
-        // The chosen arm is built here and nowhere else: a candidate plan is
-        // a whole-plan replan, and this is the one the resolve will run. A
-        // label that cannot be realized (an illegal selection, a plan that
-        // fails to build, or a working set past the memory bar) is dropped
-        // and the next-least-observed label takes the step.
+        // reproducible. The chosen arm is built here and nowhere else; a
+        // label that cannot be realized is dropped and the
+        // next-least-observed label takes the step.
         let arm_ix = loop {
             let Some(i) = set
                 .arms
@@ -618,15 +535,10 @@ impl Session {
                 let (af, al) = set.arm_field(arm);
                 let arm_obs = self.inner.tune.observations(af, al);
                 let inc_obs = set.incumbent_obs(&self.inner.tune, arm);
-                // Only a whole-plan arm is judged by a number the whole plan
-                // produces; every other granularity reads a handful of spans.
                 let whole = matches!(arm.gran(), Gran::Whole);
                 if inc_obs < MIN_OBS && inc_obs <= arm_obs {
                     // Sample the incumbent at the launches under contest, so
-                    // both sides of the adoption comparison fill. For a diff
-                    // arm that is the incumbent's own changed set — its spans
-                    // file under their per-launch fields, which is exactly
-                    // where the diff comparison reads them back.
+                    // both sides of the adoption comparison fill.
                     let focus = match arm.gran() {
                         Gran::Diff { inc, .. } => inc.clone(),
                         _ => vec![arm.ix],
@@ -680,12 +592,8 @@ impl Session {
                 )
             }
         };
-        // Time exactly the launches the comparison reads. Timing the whole
-        // plan is not free on a backend whose timestamps only land on pass
-        // boundaries: every timed dispatch must then own its compute pass,
-        // and a decode step is 1731 of them — measured at 56 ms of submit
-        // against 1.7 ms unfocused. Only a whole-plan arm is worth that, and
-        // it asks for it by leaving the focus unset.
+        // Time exactly the launches the comparison reads; only a whole-plan
+        // arm leaves the focus unset.
         if !run.whole && let Backend::Gpu(t) = &self.inner.device {
             t.launcher().set_tuning_focus(Some(focus));
         }
@@ -708,9 +616,6 @@ impl Session {
     ) -> bool {
         let ix = set.arms[i].ix;
         let label = set.arms[i].label.clone();
-        // One named swap: the same extraction clone, the same two moves and
-        // the same verifying replan a variant sweep would have run for this
-        // label, for this label alone.
         let plan = {
             let g = graph.egraph.lock();
             self.inner.extractor.replan_with_variants(
@@ -727,8 +632,6 @@ impl Session {
         let entry = set.over_budget.entry(label.clone()).or_insert(bytes);
         *entry = (*entry).min(bytes);
         if bytes > set.step_bytes.saturating_add(ARM_EXTRA_BYTES) {
-            // The arm's working set is far past what production carries;
-            // running it is an allocation crash risk, not a measurement.
             return false;
         }
         let gran = if plans_align(&plan, incumbent, ix) {
@@ -751,7 +654,7 @@ impl Session {
             Gran::Diff { cand, inc, field }
         } else {
             // Restructured too widely to attribute a window, and the plan is
-            // too large to time whole: unmeasurable.
+            // too large to time whole.
             return false;
         };
         set.arms[i].plan = Some(Arc::new(plan));
@@ -811,12 +714,10 @@ impl Session {
                 if run.whole && total_ns > 0 {
                     tune.observe(&set.plan_field, &set.incumbent_plan_label, total_ns);
                 }
-                // Stale-prior scan: when the accumulated windows (this run's
-                // and every past process's) say some launch's best variant
-                // beats the incumbent's own kernel, re-open that launch so
-                // the arm gets rebuilt, re-observed and — if it holds up —
-                // adopted. This is how a persisted prior turns into an
-                // adoption without a cold race.
+                // Stale-prior scan: when the accumulated windows say some
+                // launch's best variant beats the incumbent's own kernel,
+                // re-open that launch so the arm gets rebuilt, re-observed
+                // and — if it holds up — adopted.
                 let reopen: Vec<usize> = (0..set.launch_sigs.len())
                     .filter(|&j| {
                         let inc = tune.window_min(&set.launch_sigs[j], &set.incumbent_labels[j]);
@@ -841,10 +742,9 @@ impl Session {
             Some(pick) => {
                 match &pick.gran {
                     Gran::Launch => {
-                        // A layout-compatible swap: launch `ix` ran the arm's
-                        // kernel, every other launch ran the incumbent's
-                        // (that is what `plans_align` established), so each
-                        // span files under the kernel that produced it.
+                        // Launch `ix` ran the arm's kernel, every other
+                        // launch ran the incumbent's, so each span files
+                        // under the kernel that produced it.
                         for (j, us) in spans_us.iter().enumerate() {
                             if *us <= 0.0 {
                                 continue;
@@ -861,8 +761,7 @@ impl Session {
                         }
                     }
                     Gran::Whole => {
-                        // The arm restructured the plan and the whole was
-                        // timed: only the whole is comparable.
+                        // Only the whole is comparable.
                         if run.whole && total_ns > 0 {
                             tune.observe(&set.plan_field, &pick.label, total_ns);
                         }
@@ -894,23 +793,18 @@ impl Session {
             }
         }
         // One atomic write per exploration step, a no-op when nothing new
-        // was measured. This is what makes the windows a *persisted* prior.
+        // was measured.
         tune.save();
     }
 
-    /// Adopt every launch whose **persisted** windows already hold a
-    /// qualifying winner, in one sequential pass. Returns whether the replay
-    /// memo was updated.
+    /// Adopt every launch whose persisted windows already hold a qualifying
+    /// winner, in one sequential pass. Returns whether the replay memo was
+    /// updated.
     ///
-    /// Each swap clears exactly the bar [`Self::maybe_adopt`] enforces — the
-    /// challenger's window minimum beats the incumbent's own kernel's by
-    /// [`TUNE_MARGIN`] on at least [`MIN_OBS`] real GPU spans, the arm is
-    /// rebuilt by `launch_variants` (so `verify_plan`-checked) and must
-    /// `plans_align` — but it runs off windows written by past processes and
-    /// past launches of the same signature, so a prior becomes a plan at the
-    /// first replay hit instead of after thousands of frontier steps. Later
-    /// launches replan against the already-adopted earlier swaps, exactly as
-    /// sequential adoption would have composed them.
+    /// Each swap clears exactly the bar [`Self::maybe_adopt`] enforces, but
+    /// runs off windows written by past processes, so a prior becomes a plan
+    /// at the first replay hit. Later launches replan against the
+    /// already-adopted earlier swaps.
     fn adopt_persisted(
         &self,
         graph: &GraphRef,
@@ -935,9 +829,8 @@ impl Session {
         };
         let mut current = Arc::clone(incumbent);
         let mut adopted = 0usize;
-        // The qualifying winners, from window lookups alone: launch `j`
-        // adopts `best_name` exactly when the sequential loop below would
-        // have (same window-min bar, same MIN_OBS floor).
+        // The qualifying winners, from window lookups alone: same window-min
+        // bar and MIN_OBS floor as the sequential loop below.
         let winners: Vec<(usize, String)> = (0..sigs.len())
             .filter_map(|j| {
                 let (best_name, best) = tune.best(&sigs[j])?;
@@ -949,12 +842,9 @@ impl Session {
             })
             .collect();
         // Batch first: every winner composed onto one extraction, one replan,
-        // one verify — instead of one full `launch_variants` sweep (a replan
-        // per variant) per adopted launch, which made this scan seconds of
-        // host work per process on the 2357-launch decode plan. The batch
-        // holds the same bar as the sequential path: each swapped launch must
-        // come out running its winner and nothing outside the swapped set may
-        // move; anything less falls back to the sequential loop.
+        // one verify. Each swapped launch must come out running its winner
+        // and nothing outside the swapped set may move; anything less falls
+        // back to the sequential loop.
         if !winners.is_empty() {
             let batch = {
                 let g = graph.egraph.lock();
@@ -1030,11 +920,9 @@ impl Session {
                 adopted += 1;
             }
         }
-        // Second pass: restructuring candidates for the heaviest launches.
-        // A plan too large to time whole races these at diff granularity
-        // (see `Gran::Diff`); when past processes already measured the
-        // arm's summed window, the persisted comparison is the same one
-        // `maybe_adopt` makes, so it too becomes a swap at first replay.
+        // Second pass: restructuring candidates for the heaviest launches,
+        // raced at diff granularity (see `Gran::Diff`) off the persisted
+        // windows.
         let mut rounds = 0usize;
         'diff: while rounds < DIFF_SCAN_TOP_K {
             rounds += 1;
@@ -1126,13 +1014,10 @@ impl Session {
     }
 
     /// Adopt the just-run arm if its window minimum beats the incumbent's by
-    /// the same hysteresis the cold race uses. Selection is pure performance
-    /// over correct-by-construction members; there is nothing else to check.
+    /// the same hysteresis the cold race uses.
     fn maybe_adopt(&self, run: &ExploreRun, ks: &mut KeyState) {
         let Some(pick) = &run.pick else { return };
         let Some(set) = ks.arms.as_ref() else { return };
-        // The arm that just ran; it is built by construction — the resolve
-        // ran its plan.
         let Some(arm) = set
             .arms
             .iter()

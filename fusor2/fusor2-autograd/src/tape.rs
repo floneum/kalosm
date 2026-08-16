@@ -1,5 +1,5 @@
 //! [`GraphTape`]: the [`Tape`] implementation over a `&mut EGraph`. Every
-//! method appends L0 nodes to the *same* graph the forward lives in, which is
+//! method appends Logical nodes to the *same* graph the forward lives in, which is
 //! what makes checkpointing an extraction decision.
 
 use fusor2_ir::autograd::{Tape, Val};
@@ -7,7 +7,7 @@ use fusor2_ir::dtype::{Dtype, Splat};
 use fusor2_ir::egraph::EGraph;
 use fusor2_ir::facts::ValueFacts;
 use fusor2_ir::carrier::Carrier;
-use fusor2_ir::ir::level0::{EinSpec, L0, LeafKind, ScatterCombine};
+use fusor2_ir::ir::logical::{EinSpec, Logical, LeafKind, ScatterCombine};
 use fusor2_ir::ir::{Children, Node, Op};
 use fusor2_ir::scalar::{BinOp, CmpOp, ScalarExpr, UnOp};
 use fusor2_ir::shape::{BoundsProof, Dim, Dims, StrideSpec, broadcast_specs};
@@ -42,11 +42,10 @@ impl<'a> GraphTape<'a> {
 
 }
 
-/// Construction helpers every adjoint uses, on **any** tape.
+/// Construction helpers every adjoint uses, on any tape.
 ///
-/// These live on an extension trait rather than on [`GraphTape`] because
-/// [`fusor2_ir::autograd::AdjointFn`] receives `&mut dyn Tape`: a blanket
-/// impl over `T: Tape + ?Sized` is what makes them callable there.
+/// [`fusor2_ir::autograd::AdjointFn`] receives `&mut dyn Tape`; the blanket
+/// impl over `T: Tape + ?Sized` is what makes these callable there.
 pub trait TapeExt: Tape {
     fn shape_of(&self, v: Val) -> Dims {
         self.facts(v).shape.clone()
@@ -77,7 +76,7 @@ pub trait TapeExt: Tape {
         self.map(body, &[a, b])
     }
 
-    /// Elementwise comparison; 1.0/0.0 in the operand dtype (no bool at L0).
+    /// Elementwise comparison; 1.0/0.0 in the operand dtype (no bool at Logical).
     fn compare(&mut self, op: CmpOp, a: Val, b: Val) -> Result<Val> {
         let body = ScalarExpr::cmp(op, self.arg_like(a, 0), self.arg_like(b, 1));
         self.map(body, &[a, b])
@@ -93,8 +92,7 @@ pub trait TapeExt: Tape {
         self.map(body, &[c, t, f])
     }
 
-    /// Numeric conversion. Differentiable both directions with no special
-    /// case; this one line is the whole f32-master / f16-compute recipe.
+    /// Numeric conversion. Differentiable in both directions.
     fn cast(&mut self, to: Dtype, v: Val) -> Result<Val> {
         if self.dtype_of(v) == to {
             return Ok(v);
@@ -118,7 +116,7 @@ pub trait TapeExt: Tape {
     fn splat_like(&mut self, v: Val, value: f32) -> Result<Val> {
         let dtype = self.dtype_of(v);
         let shape = self.shape_of(v);
-        self.add(L0::Leaf(LeafKind::Const {
+        self.add(Logical::Leaf(LeafKind::Const {
             value: splat_of(dtype, value)?,
             shape,
         }))
@@ -219,7 +217,7 @@ pub trait TapeExt: Tape {
 
     /// Gather rows of `x` along `axis` with a rank-1 index tensor.
     fn gather(&mut self, axis: u32, x: Val, idx: Val) -> Result<Val> {
-        self.add(L0::Gather { axis, x, idx })
+        self.add(Logical::Gather { axis, x, idx })
     }
 
     /// `Scatter{Set}`. Only ever used by the adjoint of a `Scatter{Set}`,
@@ -232,7 +230,7 @@ pub trait TapeExt: Tape {
         upd: Val,
         unique: bool,
     ) -> Result<Val> {
-        self.add(L0::Scatter {
+        self.add(Logical::Scatter {
             axis,
             combine: ScatterCombine::Set,
             base,
@@ -244,7 +242,7 @@ pub trait TapeExt: Tape {
 
     /// A constant tensor of `value`, dense `dtype`, shape `shape`.
     fn zeros_shaped(&mut self, dtype: Dtype, shape: &[Dim]) -> Result<Val> {
-        self.add(L0::Leaf(LeafKind::Const {
+        self.add(Logical::Leaf(LeafKind::Const {
             value: splat_of(dtype, 0.0)?,
             shape: shape.iter().copied().collect(),
         }))
@@ -262,8 +260,8 @@ pub trait TapeExt: Tape {
 impl<T: Tape + ?Sized> TapeExt for T {}
 
 impl Tape for GraphTape<'_> {
-    fn add(&mut self, op: L0) -> Result<Val> {
-        self.graph.add(Op::L0(op))
+    fn add(&mut self, op: Logical) -> Result<Val> {
+        self.graph.add(Op::Logical(op))
     }
 
     fn facts(&self, v: Val) -> &ValueFacts {
@@ -292,7 +290,7 @@ impl Tape for GraphTape<'_> {
                 )));
             }
         }
-        self.add(L0::Map {
+        self.add(Logical::Map {
             expr,
             ins: ins.iter().copied().collect(),
             outs: 1,
@@ -301,7 +299,7 @@ impl Tape for GraphTape<'_> {
 
     fn contract(&mut self, a: Val, b: Val, spec: EinSpec, acc: Dtype) -> Result<Val> {
         crate::contract::verify_spec(&spec)?;
-        self.add(L0::Contract {
+        self.add(Logical::Contract {
             spec,
             acc,
             a,
@@ -311,7 +309,7 @@ impl Tape for GraphTape<'_> {
     }
 
     fn fold(&mut self, carrier: Carrier, axis: u32, acc: Dtype, x: Val) -> Result<Val> {
-        self.add(L0::Fold {
+        self.add(Logical::Fold {
             carrier,
             axis,
             acc,
@@ -322,7 +320,7 @@ impl Tape for GraphTape<'_> {
     fn restride(&mut self, specs: &[StrideSpec], x: Val) -> Result<Val> {
         let shape = self.shape_of(x);
         let bounds = bounds_proof(specs, &shape);
-        self.add(L0::Restride {
+        self.add(Logical::Restride {
             specs: specs.iter().copied().collect(),
             bounds,
             x,
@@ -332,7 +330,7 @@ impl Tape for GraphTape<'_> {
     fn scatter_add(&mut self, axis: u32, base: Val, idx: Val, upd: Val) -> Result<Val> {
         // Never `Set`: duplicates must accumulate. The embedding table
         // receiving one token twice gets the summed gradient.
-        self.add(L0::Scatter {
+        self.add(Logical::Scatter {
             axis,
             combine: ScatterCombine::Add,
             base,
@@ -430,19 +428,18 @@ pub const fn accum_dtype(dtype: Dtype) -> Dtype {
 
 #[cfg(test)]
 pub(crate) mod testing {
-    //! The e-graph this crate's tests build against, plus a naive L0
+    //! The e-graph this crate's tests build against, plus a naive Logical
     //! interpreter so every adjoint can be checked against a central
     //! difference of the forward it claims to differentiate.
     //!
-    //! The `Semantics` is the **real** [`CoreSemantics`], not a stand-in.
-    //! That matters for dtype inference: `infer_fold` returns `acc`, and
-    //! `accum_dtype` floors every f16/bf16 fold at f32, so a `max` fold on
-    //! f16 really does hand its adjoint an f32 output — a stand-in inferring
-    //! the operand dtype would hide every narrow-float adjoint bug in this
-    //! crate. It also means `verify_l0` runs on every graph an adjoint builds.
+    //! The `Semantics` is the real [`CoreSemantics`]. That matters for dtype
+    //! inference: `infer_fold` returns `acc`, and `accum_dtype` floors every
+    //! f16/bf16 fold at f32, so a `max` fold on f16 really does hand its
+    //! adjoint an f32 output. It also means `verify_l0` runs on every graph
+    //! an adjoint builds.
     //!
-    //! [`SumArenaPlanner`] is the planner because this crate builds L0 only:
-    //! no L1 node is ever added, so no arena is ever planned.
+    //! [`SumArenaPlanner`] is the planner because this crate builds Logical only:
+    //! no Launch node is ever added, so no arena is ever planned.
 
     use super::*;
     use fusor2_ir::device::{Caps, DeviceKind, Limits};
@@ -453,7 +450,7 @@ pub(crate) mod testing {
         EGraph::new(CoreSemantics::new(Arc::new(SumArenaPlanner)))
     }
 
-    /// A capability set no adjoint reads: this crate builds L0 only.
+    /// A capability set no adjoint reads: this crate builds Logical only.
     pub fn caps() -> Caps {
         Caps {
             kind: DeviceKind::Cpu,
@@ -474,12 +471,8 @@ pub(crate) mod testing {
     }
 
 
-    // ------------------------------------------------------- L0 interpreter
-    //
-    // Dense, row-major, f32-valued, single-threaded and deliberately naive.
-    // Its only job is to let this crate's gradient tests be *numeric* — every
-    // adjoint checked against a central difference of the forward it claims
-    // to differentiate — without depending on a backend.
+    // A dense, row-major, f32-valued, single-threaded Logical interpreter so
+    // this crate's gradient tests are numeric without depending on a backend.
 
     use fusor2_ir::egraph::Id;
     use fusor2_ir::scalar::{CmpOp, ScalarKind};
@@ -643,9 +636,9 @@ pub(crate) mod testing {
         let n = numel(&shape);
         match &g.node(id).op {
             Op::Union(a, _) => eval_memo(g, *a, env, memo),
-            Op::L1(_) => panic!("the test interpreter is L0-only"),
-            Op::L0(l0) => match l0 {
-                L0::Leaf(LeafKind::Const { value, .. }) => {
+            Op::Launch(_) => panic!("the test interpreter is Logical-only"),
+            Op::Logical(l0) => match l0 {
+                Logical::Leaf(LeafKind::Const { value, .. }) => {
                     let v = match value {
                         Splat::F32(v) => *v,
                         Splat::F16(b) => half::f16::from_bits(*b).to_f32(),
@@ -655,11 +648,11 @@ pub(crate) mod testing {
                     };
                     vec![v; n]
                 }
-                L0::Leaf(_) => env
+                Logical::Leaf(_) => env
                     .get(&id)
                     .unwrap_or_else(|| panic!("no binding for leaf {id}"))
                     .clone(),
-                L0::Map { expr, ins, .. } => {
+                Logical::Map { expr, ins, .. } => {
                     let vals: Vec<Vec<f32>> =
                         ins.iter().map(|v| eval_memo(g, *v, env, memo)).collect();
                     let mut args = vec![0.0f32; vals.len()];
@@ -672,7 +665,7 @@ pub(crate) mod testing {
                         })
                         .collect()
                 }
-                L0::Fold {
+                Logical::Fold {
                     carrier, axis, ins, ..
                 } => {
                     let x = &ins[0];
@@ -704,7 +697,7 @@ pub(crate) mod testing {
                         })
                         .collect()
                 }
-                L0::Restride { specs, x, .. } => {
+                Logical::Restride { specs, x, .. } => {
                     let src = eval_memo(g, *x, env, memo);
                     let xst = strides(&shape_of(g, *x));
                     (0..n)
@@ -720,7 +713,7 @@ pub(crate) mod testing {
                         })
                         .collect()
                 }
-                L0::Window { specs, x } => {
+                Logical::Window { specs, x } => {
                     let src = eval_memo(g, *x, env, memo);
                     let xshape = shape_of(g, *x);
                     let xst = strides(&xshape);
@@ -741,7 +734,7 @@ pub(crate) mod testing {
                         })
                         .collect()
                 }
-                L0::Contract { spec, a, b, .. } => {
+                Logical::Contract { spec, a, b, .. } => {
                     let av = eval_memo(g, *a, env, memo);
                     let bv = eval_memo(g, *b, env, memo);
                     let ash = shape_of(g, *a);
@@ -793,7 +786,7 @@ pub(crate) mod testing {
                         })
                         .collect()
                 }
-                L0::Gather { axis, x, idx } => {
+                Logical::Gather { axis, x, idx } => {
                     let src = eval_memo(g, *x, env, memo);
                     let ind = eval_memo(g, *idx, env, memo);
                     let xst = strides(&shape_of(g, *x));
@@ -806,7 +799,7 @@ pub(crate) mod testing {
                         })
                         .collect()
                 }
-                L0::Scatter {
+                Logical::Scatter {
                     axis,
                     combine,
                     base,
@@ -831,7 +824,7 @@ pub(crate) mod testing {
                     }
                     out
                 }
-                L0::Dequant { x, .. } | L0::Project { x, .. } => eval_memo(g, *x, env, memo),
+                Logical::Dequant { x, .. } | Logical::Project { x, .. } => eval_memo(g, *x, env, memo),
             },
         }
     }
@@ -843,8 +836,7 @@ pub(crate) mod testing {
     }
 
     /// Compare every produced gradient against a central difference of
-    /// `sum(forward)` at `h = 1e-3`. This is the harness that makes the
-    /// adjoint table a claim about numbers rather than about node kinds.
+    /// `sum(forward)` at `h = 1e-3`.
     pub fn check_gradients(
         g: &EGraph,
         root: Id,
@@ -880,10 +872,10 @@ pub(crate) mod testing {
 mod tests {
     use super::testing::graph;
     use super::*;
-    use fusor2_ir::ir::level0::BufferId;
+    use fusor2_ir::ir::logical::BufferId;
 
     fn param(g: &mut EGraph, shape: &[u64]) -> Val {
-        g.add(Op::L0(L0::Leaf(LeafKind::Param {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Param {
             name: BufferId(0),
             dtype: Dtype::F32,
             shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
@@ -922,7 +914,7 @@ mod tests {
         let mut t = GraphTape::new(&mut g);
         let two = t.accumulate(a, a).unwrap();
         match &t.graph().node(two).op {
-            Op::L0(L0::Map { ins, .. }) => assert_eq!(ins.len(), 1),
+            Op::Logical(Logical::Map { ins, .. }) => assert_eq!(ins.len(), 1),
             other => panic!("expected a single-operand Map, got {other:?}"),
         }
     }
@@ -935,7 +927,7 @@ mod tests {
         let b = t.broadcast_axis(a, 0, Dim::Const(3)).unwrap();
         assert_eq!(t.shape_of(b), Dims::from_slice(&[Dim::Const(3), Dim::Const(4)]));
         match &t.graph().node(b).op {
-            Op::L0(L0::Restride { specs, .. }) => {
+            Op::Logical(Logical::Restride { specs, .. }) => {
                 assert!(specs[0].is_broadcast());
                 assert!(!specs[1].is_broadcast());
             }

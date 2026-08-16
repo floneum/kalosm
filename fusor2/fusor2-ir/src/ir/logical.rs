@@ -1,5 +1,5 @@
-//! L0 `tensor` — ten nodes of whole-tensor algebra. No index space, no loop,
-//! no device. Only L0 can express adjoint generation, contraction
+//! Logical `tensor` — ten nodes of whole-tensor algebra. No index space, no loop,
+//! no device. Only Logical can express adjoint generation, contraction
 //! reassociation, the fold-splitting law, and gradient checkpointing.
 
 use crate::carrier::Carrier;
@@ -10,15 +10,15 @@ use crate::scalar::ScalarExpr;
 use crate::shape::{BoundsProof, Dim, SlidingWindow, StrideSpec, SymId};
 use smallvec::SmallVec;
 
-/// The ten L0 nodes. Every elementwise unary, comparison, and activation
+/// The ten Logical nodes. Every elementwise unary, comparison, and activation
 /// is one `Map` with a different [`ScalarExpr`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum L0 {
+pub enum Logical {
     Leaf(LeafKind),
 
     /// Elementwise map. **No implicit broadcasting**: every operand has the
     /// output shape; the frontend emits `Restride { multiplier: 0 }`.
-    /// `outs > 1` produces a tuple read back through [`L0::Project`].
+    /// `outs > 1` produces a tuple read back through [`Logical::Project`].
     Map {
         expr: ScalarExpr,
         ins: SmallVec<[Id; 4]>,
@@ -57,7 +57,7 @@ pub enum L0 {
     },
 
     /// Sliding windows. Survives as a core op rather than collapsing into
-    /// [`L0::Restride`] because its adjoint is decided by two integers.
+    /// [`Logical::Restride`] because its adjoint is decided by two integers.
     Window {
         specs: SmallVec<[SlidingWindow; 3]>,
         x: Id,
@@ -69,7 +69,7 @@ pub enum L0 {
 
     /// Scatter into `base`. `cat`/`stack`/`pad_axis`/`repeat`/
     /// `slice_assign` are `Scatter{Set}` into a const leaf; the adjoint of
-    /// [`L0::Gather`] is `Scatter{Add}`. `unique` is caller-proved index
+    /// [`Logical::Gather`] is `Scatter{Add}`. `unique` is caller-proved index
     /// uniqueness: `verify_l0` rejects `Set` without it, while `Add` is
     /// always legal and duplicates accumulate (normative).
     Scatter {
@@ -91,7 +91,7 @@ pub enum L0 {
     Project { slot: u8, x: Id },
 }
 
-impl L0 {
+impl Logical {
     pub const fn tag(&self) -> OpTag {
         match self {
             Self::Leaf(_) => OpTag::Leaf,

@@ -9,35 +9,35 @@
 use crate::contract_spec;
 use crate::facts::{ValueFacts, Work};
 use crate::ir::Op;
-use crate::ir::level0::L0;
-use crate::ir::level1::{Family, L1, SchedPoint, ScheduleDomain};
-use crate::ir::level2::ScalarElement;
+use crate::ir::logical::Logical;
+use crate::ir::launch::{Family, Launch, SchedPoint, ScheduleDomain};
+use crate::ir::kernel::ScalarElement;
 use crate::scalar::{BinOp, ScalarExpr, ScalarKind};
 use crate::shape::Dim;
 use rustc_hash::FxHashSet;
 
 /// Work one op performs at these shapes.
 ///
-/// `L1::Ext` has no row here — its cost lives in the open registry, which
+/// `Launch::Ext` has no row here — its cost lives in the open registry, which
 /// only [`crate::CoreSemantics`] holds. This function reports the honest
 /// index-op floor for it; [`work_of_with`] uses the registered row.
 pub fn work_of(op: &Op, ins: &[ValueFacts], out: &ValueFacts) -> Work {
     match op {
-        Op::L0(o) => work_l0(o, ins, out),
-        Op::L1(o) => work_l1(o, ins, out),
+        Op::Logical(o) => work_l0(o, ins, out),
+        Op::Launch(o) => work_l1(o, ins, out),
         // A union node is a choice, not a computation.
         Op::Union(..) => Work::default(),
     }
 }
 
-/// [`work_of`] with the extension registry, so `L1::Ext` reports its own row.
+/// [`work_of`] with the extension registry, so `Launch::Ext` reports its own row.
 pub fn work_of_with(
     op: &Op,
     ins: &[ValueFacts],
     out: &ValueFacts,
     registry: &crate::ir::OpDefRegistry,
 ) -> Work {
-    if let Op::L1(L1::Ext { def, .. }) = op
+    if let Op::Launch(Launch::Ext { def, .. }) = op
         && let Some(d) = registry.get(*def)
     {
         return (d.work)(ins, out);
@@ -45,19 +45,11 @@ pub fn work_of_with(
     work_of(op, ins, out)
 }
 
-// ---------------------------------------------------------------------------
-// Scalar expression cost
-// ---------------------------------------------------------------------------
-
-/// `(arith, transcendental, index)` operation counts of one evaluation of
-/// `e`. The tree is hash-consed, so a shared subexpression is counted **once**
-/// — which is what a structurally-CSE'd emitter actually issues.
-///
-/// `UnOp::is_transcendental()` and `BinOp::Pow` are transcendental;
-/// `IndexOf` is an index op; everything else is arithmetic.
 /// `(arith, transcendental, index)` of evaluating every slot's lift once.
-/// Shared subexpressions across slots are counted once, which is what a
-/// structurally-CSE'd emitter actually issues.
+/// Shared subexpressions across slots are counted once, matching what a
+/// structurally-CSE'd emitter issues. `UnOp::is_transcendental()` and
+/// `BinOp::Pow` are transcendental; `IndexOf` is an index op; everything else
+/// is arithmetic.
 pub fn carrier_lift_cost(c: &crate::carrier::Carrier) -> (u64, u64, u64) {
     let mut seen: FxHashSet<u64> = FxHashSet::default();
     let mut acc = (0u64, 0u64, 0u64);
@@ -119,18 +111,14 @@ fn count(e: &ScalarExpr, seen: &mut FxHashSet<u64>, acc: &mut (u64, u64, u64)) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// L0 rows
-// ---------------------------------------------------------------------------
-
-pub fn work_l0(op: &L0, ins: &[ValueFacts], out: &ValueFacts) -> Work {
+pub fn work_l0(op: &Logical, ins: &[ValueFacts], out: &ValueFacts) -> Work {
     let e = elements(out);
     match op {
         // The two documented constant-work exemptions: a leaf reads a buffer
         // the plan already accounts for, and a projection is a relabelling.
-        L0::Leaf(_) | L0::Project { .. } => Work::default(),
+        Logical::Leaf(_) | Logical::Project { .. } => Work::default(),
 
-        L0::Map { expr, .. } => {
+        Logical::Map { expr, .. } => {
             let (arith, trans, index) = scalar_expr_cost(expr);
             Work {
                 macs: e.saturating_mul(arith),
@@ -140,10 +128,8 @@ pub fn work_l0(op: &L0, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             }
         }
 
-        // One merge per slot per element, plus the lift. `width` is what the
-        // deleted `Combine::arity` reported; it is now a property of the
-        // carrier's own slot list rather than of a name.
-        L0::Fold { carrier, .. } => {
+        // One merge per slot per element, plus the lift.
+        Logical::Fold { carrier, .. } => {
             let width = carrier.width() as u64;
             let ein = ins.first().map_or(0, elements);
             let (lift_a, lift_t, lift_i) = carrier_lift_cost(carrier);
@@ -157,7 +143,7 @@ pub fn work_l0(op: &L0, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             }
         }
 
-        L0::Contract { spec, .. } => {
+        Logical::Contract { spec, .. } => {
             let macs = match (ins.first(), ins.get(1)) {
                 (Some(a), Some(b)) => contract_spec::extents(spec, &a.shape, &b.shape)
                     .and_then(|ext| contract_spec::mnkb(spec, &ext))
@@ -176,36 +162,32 @@ pub fn work_l0(op: &L0, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             }
         }
 
-        L0::Restride { .. } | L0::Window { .. } => Work {
+        Logical::Restride { .. } | Logical::Window { .. } => Work {
             index_ops: e,
             ..Work::default()
         },
 
-        L0::Gather { .. } => Work {
+        Logical::Gather { .. } => Work {
             index_ops: e.saturating_mul(2),
             ..Work::default()
         },
 
-        L0::Scatter { .. } => Work {
+        Logical::Scatter { .. } => Work {
             index_ops: ins.get(2).map_or(0, elements).saturating_mul(2),
             ..Work::default()
         },
 
-        L0::Dequant { fmt, .. } => Work {
+        Logical::Dequant { fmt, .. } => Work {
             index_ops: e.saturating_mul(quant_decode_ops(*fmt)),
             ..Work::default()
         },
     }
 }
 
-// ---------------------------------------------------------------------------
-// L1 rows
-// ---------------------------------------------------------------------------
-
-pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
+pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
     let e = elements(out);
     match op {
-        L1::KMap { body, ops, .. } => {
+        Launch::Map { body, ops, .. } => {
             let (arith, trans, index) = scalar_expr_cost(body);
             let decode: u64 = ins
                 .iter()
@@ -222,12 +204,9 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             }
         }
 
-        // The carrier's `lift` is what the deleted `pre` was, and `width`
-        // merges run per element instead of one named combine's arity. A
-        // promoted axis leaves the iteration domain and reappears as carrier
-        // lanes, so the per-element merge count rises with `lanes()`: the same
-        // total work, priced where it actually happens.
-        L1::KFold {
+        // A promoted axis leaves the iteration domain and reappears as
+        // carrier lanes, so the per-element merge count rises with `lanes()`.
+        Launch::Fold {
             carrier,
             post,
             ops,
@@ -236,35 +215,17 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             ..
         } => {
             let lanes = carrier.lanes().unwrap_or(carrier.width() as u64);
-            // A promoted axis leaves the iteration domain and reappears as
-            // carrier lanes, so its extent is already counted in `lanes`.
-            // Multiplying the full `space` by `lanes` again charges a nest that
-            // merges each element into its own lane exactly once at `lanes`
-            // times its true cost, which is why a promoted `KFold` was never
-            // selected. Filtering `vec_axes` out is the correct row and is a
+            // A promoted axis's extent is already counted in `lanes`, so
+            // `vec_axes` must be filtered out of the iterated space or the
+            // nest is charged `lanes` times its true cost. The filter is a
             // no-op on every unpromoted node.
             //
             // A wrong value in `normalization::composed_backward_saturates
-            // [gpu]` (a layer_norm adjoint reading -2.0558887 where every
-            // entry must be zero) that surfaces with this row correct is
-            // **not** a defect in the promoted path. Measured:
-            //
-            //   - CPU selects a promoted nest here (vec_axes=[0], axis=1),
-            //     lowers it, and is CORRECT.
-            //   - GPU never lowers a promoted nest in this case at all, yet
-            //     changes answer. Dumping every lowered node with its schedule
-            //     point shows an identical node set both ways; the *only*
-            //     difference is that one `KContract` moves from
-            //     `Sgemm{bm:16,bn:32,bk:8,tm:2,tn:2}` to
-            //     `Coop{bm:16,bn:16,bk:8,n_passes:1,subgroups:1,rg:1,cg:1}`.
-            //   - Denying `Caps::coop_supported` with this row corrected makes
-            //     the case pass.
-            //
-            // So the wrong value is a defect in the GPU cooperative-matrix
-            // contraction at that geometry, which correcting
-            // this row merely perturbs extraction into selecting. Pricing
-            // promotion wrongly to avoid it would be
-            // a cost model encoding a legality decision.
+            // [gpu]` that surfaces with this row correct is a defect in the
+            // GPU cooperative-matrix contraction at
+            // `Coop{bm:16,bn:16,bk:8,n_passes:1,subgroups:1,rg:1,cg:1}`,
+            // which this row merely perturbs extraction into selecting —
+            // denying `Caps::coop_supported` makes the case pass.
             let ein = space
                 .dims
                 .iter()
@@ -278,11 +239,8 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
                 .map(scalar_expr_cost)
                 .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
             // The inline decode of a quantized operand, once per iterated
-            // element — the same schedule-independent floor `KMap` and
-            // `KContract` already price. Without it a fold reading a
-            // `Dtype::Q(_)` operand decoded for free, and extraction
-            // preferred the per-element-decode fold over a contraction
-            // family whose lane window amortizes the decode.
+            // element — the same schedule-independent floor `Map` and
+            // `Contract` price.
             let decode: u64 = ins
                 .iter()
                 .map(|f| decode_ops_of(f.dtype))
@@ -303,7 +261,7 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             }
         }
 
-        L1::KContract {
+        Launch::Contract {
             m,
             n,
             k,
@@ -321,11 +279,10 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
                 macs: b.saturating_mul(m).saturating_mul(n).saturating_mul(k),
                 ..Work::default()
             };
-            // A side's `pre` runs once per loaded element of *that side*.
-            // Operand index arithmetic is deliberately not priced here: it
-            // never was, and a contraction's traffic term dominates it. What
-            // multiplies with a multi-operand side is the *bytes*, which
-            // `fusor2_cost::realize` counts per operand.
+            // A side's `pre` runs once per loaded element of that side.
+            // Operand index arithmetic is not priced here: a contraction's
+            // traffic term dominates it, and `fusor2_cost::realize` counts
+            // the bytes per operand.
             w = w.add(epilogue_work(&a.pre, b.saturating_mul(m).saturating_mul(k)));
             w = w.add(epilogue_work(&rhs.pre, b.saturating_mul(k).saturating_mul(n)));
             // The staged decode of a quantized operand, once per element —
@@ -351,12 +308,12 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             w
         }
 
-        L1::KGather { ops, .. } => Work {
+        Launch::Gather { ops, .. } => Work {
             index_ops: e.saturating_mul(2).saturating_add(operand_index_ops(ops, e)),
             ..Work::default()
         },
 
-        L1::KScatter { ops, .. } => {
+        Launch::Scatter { ops, .. } => {
             let upd = ins.last().map_or(e, elements);
             Work {
                 index_ops: upd
@@ -370,7 +327,7 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
         // their *facts*, so this row is the shape-varying floor every member
         // pays to land its output; `fusor2-cost` sums the exact rows on the
         // realized DAG, where it has the member nodes ([`sum_work`]).
-        L1::KRegion { .. } => ins.iter().fold(Work::default(), |acc, f| {
+        Launch::Region { .. } => ins.iter().fold(Work::default(), |acc, f| {
             acc.add(Work {
                 index_ops: elements(f),
                 ..Work::default()
@@ -378,7 +335,7 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
         }),
 
         // Honest floor without the registry; see [`work_of_with`].
-        L1::Ext { ops, .. } => Work {
+        Launch::Ext { ops, .. } => Work {
             index_ops: e.saturating_add(operand_index_ops(ops, e)),
             ..Work::default()
         },
@@ -388,13 +345,12 @@ pub fn work_l1(op: &L1, ins: &[ValueFacts], out: &ValueFacts) -> Work {
 /// Arithmetic a backend's block-decode program spends per decoded element.
 ///
 /// The decode is invisible to the IR on two paths — `Source::Quantized` in a
-/// contraction's staging fill, and the identity `KMap` a materializing
-/// `L0::Dequant` lowers to, where the format program rides in the operand
+/// contraction's staging fill, and the identity `Map` a materializing
+/// `Logical::Dequant` lowers to, where the format program rides in the operand
 /// read — so it has to be priced from the format alone. Counts are the
 /// per-element share of each format's unpack: shift/mask the quant, decode
 /// the block scale (and minimum, and 6-bit group scales for the K formats),
-/// one fma. Underpricing these was what made decode-in-the-fill and
-/// decode-once indistinguishable to the extractor at every M.
+/// one fma.
 pub fn quant_decode_ops(fmt: crate::dtype::QFmt) -> u64 {
     use crate::dtype::QFmt;
     match fmt {
@@ -425,7 +381,7 @@ pub fn epilogue_work(expr: &ScalarExpr, iterations: u64) -> Work {
     }
 }
 
-fn operand_index_ops(ops: &[crate::ir::level1::Operand], iterations: u64) -> u64 {
+fn operand_index_ops(ops: &[crate::ir::launch::Operand], iterations: u64) -> u64 {
     ops.iter().fold(0u64, |acc, o| {
         acc.saturating_add(iterations.saturating_mul(o.access.index_ops()))
     })
@@ -433,7 +389,7 @@ fn operand_index_ops(ops: &[crate::ir::level1::Operand], iterations: u64) -> u64
 
 /// Bytes staged through workgroup memory by a cooperative geometry. This is
 /// the **traffic** term (`score_fs`'s T2), not a legality footprint: the
-/// allocation `verify_l1` admits against comes from the injected
+/// allocation `verify_launch` admits against comes from the injected
 /// `ArenaPlanner` and nowhere else.
 fn coop_staged_bytes(sched: &ScheduleDomain, elem: ScalarElement) -> u64 {
     if !matches!(sched, ScheduleDomain::Coop(_)) {
@@ -442,7 +398,7 @@ fn coop_staged_bytes(sched: &ScheduleDomain, elem: ScalarElement) -> u64 {
     let Some(SchedPoint::Coop { geom, staging, .. }) = sched.point(0) else {
         return 0;
     };
-    crate::verify_l1::coop_tiles(geom, elem, staging)
+    crate::verify_launch::coop_tiles(geom, elem, staging)
         .decls
         .iter()
         .map(|t| t.layout.element_count() * t.element.byte_size())
@@ -488,8 +444,8 @@ mod tests {
     use crate::dtype::{Dtype, Splat};
     use crate::egraph::Id;
     use crate::carrier::{ArgRemap, Carrier};
-    use crate::ir::level0::{EinSpec, Label};
-    use crate::ir::level1::{AccessPlan, IndexSpace, Operand};
+    use crate::ir::logical::{EinSpec, Label};
+    use crate::ir::launch::{AccessPlan, IndexSpace, Operand};
     use crate::scalar::UnOp;
     use crate::shape::Layout;
     use smallvec::smallvec;
@@ -535,7 +491,7 @@ mod tests {
     #[test]
     fn map_work_scales_with_elements() {
         let expr = ScalarExpr::un(UnOp::Exp, ScalarExpr::arg(0, Dtype::F32));
-        let op = L0::Map {
+        let op = Logical::Map {
             expr,
             ins: smallvec![Id(0)],
             outs: 1,
@@ -546,8 +502,6 @@ mod tests {
         assert_eq!(w.macs, 0);
     }
 
-    // ---- Test 3 ----------------------------------------------------------
-
     #[test]
     fn contract_macs_are_batch_m_n_k() {
         let spec = EinSpec {
@@ -555,7 +509,7 @@ mod tests {
             b: smallvec![Label(b'b'), Label(b'j'), Label(b'k')],
             out: smallvec![Label(b'b'), Label(b'i'), Label(b'j')],
         };
-        let op = L0::Contract {
+        let op = Logical::Contract {
             spec,
             acc: Dtype::F32,
             a: Id(0),
@@ -573,7 +527,7 @@ mod tests {
     #[test]
     fn fold_and_view_rows() {
         let sum = Carrier::binop(BinOp::Add, Splat::F32(0.0), Dtype::F32);
-        let fold = L0::Fold {
+        let fold = Logical::Fold {
             carrier: sum.clone(),
             axis: 0,
             acc: Dtype::F32,
@@ -584,7 +538,7 @@ mod tests {
 
         // A two-slot carrier does twice the merge work, and the row says so
         // without knowing what either slot means.
-        let two = L0::Fold {
+        let two = Logical::Fold {
             carrier: sum
                 .tuple(
                     &Carrier::binop(BinOp::Max, Splat::F32(f32::NEG_INFINITY), Dtype::F32),
@@ -600,14 +554,14 @@ mod tests {
             2 * 32 + 2 * 8
         );
 
-        let restride = L0::Restride {
+        let restride = Logical::Restride {
             specs: smallvec![crate::shape::StrideSpec::dim(0, Dim::Const(4))],
             bounds: crate::shape::BoundsProof::Static,
             x: Id(0),
         };
         assert_eq!(work_l0(&restride, &[f32s(&[4])], &f32s(&[4])).index_ops, 4);
 
-        let gather = L0::Gather {
+        let gather = Logical::Gather {
             axis: 0,
             x: Id(0),
             idx: Id(1),
@@ -617,15 +571,14 @@ mod tests {
             24
         );
 
-        let dequant = L0::Dequant {
+        let dequant = Logical::Dequant {
             fmt: crate::dtype::QFmt::Q4K,
             layout: crate::dtype::QLayout::Native,
             x: Id(0),
         };
         let w = work_l0(&dequant, &[f32s(&[512])], &f32s(&[512]));
         // Decode arithmetic is scalar-ALU shift/mask work: it prices as
-        // `index_ops` (`quant_decode_ops` per element), never as MACs — in
-        // `macs` a coop launch ran it at the MMA rate, i.e. for free.
+        // `index_ops`, never as MACs.
         assert_eq!(w.macs, 0);
         assert_eq!(w.index_ops, 512 * quant_decode_ops(crate::dtype::QFmt::Q4K));
     }
@@ -640,7 +593,7 @@ mod tests {
             },
             operand(1),
         ];
-        let op = L1::KMap {
+        let op = Launch::Map {
             space: IndexSpace::new([Dim::Const(4)]),
             body: ScalarExpr::arg(0, Dtype::F32),
             ops,
@@ -659,7 +612,7 @@ mod tests {
         );
         assert_eq!(
             work_of(
-                &Op::L0(L0::Project { slot: 0, x: Id(0) }),
+                &Op::Logical(Logical::Project { slot: 0, x: Id(0) }),
                 &[f32s(&[4])],
                 &f32s(&[4])
             ),

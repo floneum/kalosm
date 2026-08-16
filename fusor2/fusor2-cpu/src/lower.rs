@@ -1,5 +1,4 @@
-//! L1 node + `SchedPoint` -> `KernelIr` for the CPU backend. The same
-//! `KernelIr`, a different emitter.
+//! Launch node + `SchedPoint` -> `KernelIr` for the CPU backend.
 
 pub mod contract;
 pub mod gather_scatter;
@@ -9,8 +8,8 @@ use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::{Dtype, NumericContract, QLayout};
 use fusor2_ir::egraph::Id;
 use fusor2_ir::error::Error;
-use fusor2_ir::ir::level1::{Family, L1, Operand, SchedPoint};
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::launch::{Family, Launch, Operand, SchedPoint};
+use fusor2_ir::ir::kernel::{
     Addr, BufferAccess, BufferDecl, Builtin, ElementType, KernelIr, MemoryLevel, QuantizedView,
     ScalarElement, Source, StorageView, TileExpr, TileExprKind, TileLayout, TileLiteral,
     WorkgroupAxis,
@@ -23,11 +22,8 @@ use fusor2_ir::Result;
 use std::sync::Arc;
 
 /// Lanes per workgroup for a node whose schedule point names no lane group.
-///
-/// Not a written-in tile: `fusor2_tile::domains::emitted_block` is the one
-/// place the width is decided, shared with the fold domain that prices it and
-/// with the GPU backend. One grid point is one workgroup; `block` lanes are
-/// walked in chunks of the register width.
+/// One grid point is one workgroup; `block` lanes are walked in chunks of the
+/// register width.
 pub fn default_block(caps: &Caps) -> u32 {
     fusor2_tile::domains::emitted_block(1, caps)
 }
@@ -40,59 +36,36 @@ pub fn lower(
     cx: &LowerCtx<'_>,
 ) -> Result<KernelIr> {
     let _ = id;
-    let Op::L1(op) = &node.op else {
+    let Op::Launch(op) = &node.op else {
         return Err(Error::Legality(
-            "the CPU target can only lower L1 nodes".into(),
+            "the CPU target can only lower Launch nodes".into(),
         ));
     };
     match op {
-        L1::KMap { .. } | L1::KFold { .. } => map_fold::lower(caps, node, theta, cx),
-        L1::KContract { family, .. } => {
+        Launch::Map { .. } | Launch::Fold { .. } => map_fold::lower(caps, node, theta, cx),
+        Launch::Contract { family, .. } => {
             if *family == Family::Coop {
-                // Caps report no cooperative config, so this alternative is
-                // never selectable; refusing it is a legality answer, not a
-                // fallback.
+                // Caps report no cooperative config, so this alternative is never selectable
                 return Err(Error::Legality(
                     "Family::Coop is not lowerable on the CPU target".into(),
                 ));
             }
             contract::lower(caps, node, theta, cx)
         }
-        L1::KGather { .. } | L1::KScatter { .. } => gather_scatter::lower(caps, node, theta, cx),
-        L1::KRegion { members, .. } => compose(caps, members, theta, cx, "cpu_region"),
-        L1::Ext { def, .. } => ext::lower(*def, node, theta),
+        Launch::Gather { .. } | Launch::Scatter { .. } => gather_scatter::lower(caps, node, theta, cx),
+        Launch::Region { members, .. } => compose(caps, members, theta, cx, "cpu_region"),
+        Launch::Ext { def, .. } => ext::lower(*def, node, theta),
     }
 }
 
-// ---------------------------------------------------------------------------
-// Composite nodes: KRegion
-// ---------------------------------------------------------------------------
-
 /// One dispatch running several member kernels.
 ///
-/// A `KRegion` is a list of L1 nodes the plan asks for in **one** launch.
-/// Each member is lowered through the ordinary dispatch above — so a region
-/// over contractions is still the contraction lowering, not a second copy of
-/// it — and the bodies are then concatenated over one shared grid: one
-/// dispatch, several bodies, the same workgroup index.
-///
-/// Two things make the concatenation sound rather than a splice:
-///
-/// * **Each member's stores are redirected to that member's own buffer.** The
-///   single-node lowerings all write `binds.of(cx.launch.root)`, because a
-///   launch normally *is* one node. In a composite the root names the whole
-///   launch, so a member that the plan bound a buffer for writes that buffer
-///   and only the member standing for the composite's own value keeps the
-///   root's.
-/// * **A member whose own grid is shorter than the shared one is guarded.**
-///   `map_fold::lower_fold` addresses its output by raw workgroup id with no
-///   upper bound, because its grid is exactly its row count; running it over a
-///   longer grid without the guard would write past the buffer.
-///
-/// Members must agree on their lane count. When they do not (a `KRegion` over
-/// an elementwise producer and a fold, whose lane counts are 256 and the
-/// reduced extent) this refuses with a legality answer rather than emitting a
-/// kernel whose reduce scratch is shorter than its lane loop.
+/// Each member is lowered through the ordinary dispatch above and the bodies
+/// are concatenated over one shared grid. Each member's stores are redirected
+/// to that member's own buffer; only the member standing for the composite's
+/// own value keeps the root's. A member whose own grid is shorter than the
+/// shared one is guarded, or it would write past its buffer. Members must
+/// agree on their lane count; a mismatch is a legality error.
 fn compose(
     caps: &Caps,
     members: &[Id],
@@ -105,20 +78,9 @@ fn compose(
             "a composite node with no members has nothing to lower".into(),
         ));
     }
-    // **The composite's own point.** `L1::KRegion` carries the linear
-    // `MapDomain` of its members' shared index space, which describes
-    // the *GPU* body — one guarded pass over a linearized index, `tm` outputs
-    // per lane. This backend does not emit that body: it lowers each member
-    // through the ordinary dispatch and concatenates, so a register tile at
-    // the composite level has nowhere to land and every member already carries
-    // its own tiling in its own `SchedPoint`.
-    //
-    // The untiled point is therefore the only one this lowering can honor, and
-    // it is a genuine member of the node's domain rather than a geometry from
-    // outside it. Nothing selects another: `tm` moves exactly one term of the
-    // cost model — `realize::geometry` divides the workgroup count by it — and
-    // fewer resident lanes never scores better than more, so a wider tile is
-    // weakly dominated at every shape and ties break to domain index 0.
+    // A composite has no register tile of its own — every member carries its
+    // own tiling in its own `SchedPoint` — so the untiled point is the only
+    // one this lowering can honor.
     match theta {
         SchedPoint::Point => {}
         SchedPoint::Map(t) if t.dim.is_none() && t.tm <= 1 => {}
@@ -135,10 +97,7 @@ fn compose(
     for m in members {
         let selected = cx.selected(*m);
         let node = cx.graph.node(selected);
-        // **Each member's own point, not the composite's.** A member is a
-        // selected node in its own right and extraction scheduled it as one;
-        // handing it the wave's point would give a `KFold` a `Map` tiling and
-        // a `KContract` a point from a domain it never declared.
+        // Each member is scheduled at its own point, not the composite's.
         let member_theta = cx
             .plan
             .extraction
@@ -167,13 +126,12 @@ fn compose(
     });
 
     // Only a store aimed at the launch root is redirected: a member that
-    // already writes several distinct buffers (a scatter's base, a region's
-    // extra output) keeps every one of them.
+    // writes several distinct buffers keeps every one of them.
     let root_buffer = binds.of(cx.launch.root).ok();
     let mut body = Vec::new();
     for (id, kernel) in kernels {
-        // The member that owns no buffer of its own is the one standing for
-        // the composite's value; it keeps writing the launch root's buffer.
+        // A member with no buffer of its own stands for the composite's value
+        // and keeps writing the launch root's buffer.
         let own = binds.of(id).ok().map(|b| StorageView {
             layout: b.layout.clone(),
             buffer: b,
@@ -188,7 +146,7 @@ fn compose(
                 TileExprKind::Builtin(Builtin::ProgramId(WorkgroupAxis::X)),
                 u32_ty(),
             );
-            stmts = vec![fusor2_ir::ir::level2::Stmt::If {
+            stmts = vec![fusor2_ir::ir::kernel::Stmt::If {
                 condition: cmp(
                     fusor2_ir::scalar::CmpOp::Lt,
                     pid,
@@ -215,11 +173,11 @@ fn compose(
 /// instead, leaving addresses, masks and values alone. With `from` absent —
 /// the root owns no buffer — every store moves.
 fn redirect_stores(
-    stmts: &mut [fusor2_ir::ir::level2::Stmt],
+    stmts: &mut [fusor2_ir::ir::kernel::Stmt],
     from: Option<&Arc<BufferDecl>>,
     view: &StorageView,
 ) {
-    use fusor2_ir::ir::level2::Stmt;
+    use fusor2_ir::ir::kernel::Stmt;
     let hits = |dst: &StorageView| match from {
         Some(root) => Arc::ptr_eq(&dst.buffer, root),
         None => true,
@@ -241,35 +199,21 @@ fn redirect_stores(
     }
 }
 
-// ---------------------------------------------------------------------------
-// The extension seam
-// ---------------------------------------------------------------------------
-
-/// `L1::Ext` lowering: the one escape hatch out of the closed `L0`/`L1` enums.
+/// `Launch::Ext` lowering: the one escape hatch out of the closed `Logical`/`Launch` enums.
 pub mod ext {
     use super::*;
     use fusor2_ir::ir::{OpDefId, OpDefRegistry};
     use std::sync::RwLock;
 
-    /// The registry `L1::Ext` lowering resolves `OpDefId` against.
+    /// The registry `Launch::Ext` lowering resolves `OpDefId` against.
     ///
-    /// [`LowerCtx`] carries the plan, the launch, the graph and the symbol
-    /// list — not the [`OpDefRegistry`] the graph was built with — and
-    /// `Semantics`, which *does* hold one, exposes no accessor for it. So a
-    /// target handed one selected `L1::Ext { def }` has no way to reach that
-    /// def's `lower_per_target` row, and `OpDef::lower_per_target` has been
-    /// dead for exactly that reason.
-    ///
-    /// Until `LowerCtx` grows the field, the embedder installs the same
-    /// registry here that it installed on the e-graph's semantics. Registration
-    /// order is id order and must match, which is the same contract
-    /// `CoreSemantics::with_registry` already imposes.
+    /// The embedder installs the same registry here that it installed on the
+    /// e-graph's semantics. Registration order is id order and must match.
     static DEFS: RwLock<Option<OpDefRegistry>> = RwLock::new(None);
 
     /// Install the extension registry this process lowers against. Idempotent
-    /// and last-write-wins; a second install with a differently ordered
-    /// registry would silently rename every `OpDefId`, so callers pass the
-    /// registry the graph was built with, unchanged.
+    /// and last-write-wins; callers pass the registry the graph was built
+    /// with, unchanged, or every `OpDefId` silently renames.
     pub fn install(registry: OpDefRegistry) {
         *DEFS.write().expect("the OpDef registry lock is poisoned") = Some(registry);
     }
@@ -312,10 +256,6 @@ pub mod ext {
         lower(node, &theta)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Shared construction helpers
-// ---------------------------------------------------------------------------
 
 pub(crate) fn u32_ty() -> ElementType {
     ElementType::Scalar(ScalarElement::U32)
@@ -403,15 +343,11 @@ pub(crate) fn global_lane(block: u32) -> TileExpr {
     )
 }
 
-/// Hand back **the same `Arc`** for two structurally equal buffer decls.
+/// Hand back the same `Arc` for two structurally equal buffer decls.
 ///
 /// `emit::buffer_of` resolves a `StorageView` to a binding slot by
-/// `Arc::ptr_eq`, so a view built from one `Binds` cannot be emitted into a
-/// `KernelIr` whose table was built by a second, structurally identical
-/// `Binds`. That is exactly what happens the moment one launch holds more than
-/// one node — a `KRegion`, where every member lowers
-/// through its own `Binds::build(cx)`. Interning makes identity follow
-/// content, which is the property the emitter is really asking about.
+/// `Arc::ptr_eq`, and a `Region`'s members each build their own `Binds`;
+/// interning makes identity follow content.
 fn intern_decl(decl: BufferDecl) -> Arc<BufferDecl> {
     use std::sync::Mutex;
     use std::sync::OnceLock;
@@ -464,8 +400,7 @@ impl Binds {
             let facts = cx.graph.facts(b.value);
             // A quantized buffer is an opaque block stream: the decode program
             // addresses it as `u32` words, so it binds as u32 with the word
-            // count of its blocks rather than an element count it has no
-            // dense element type for.
+            // count of its blocks.
             let (element, extents) = match facts.dtype {
                 Dtype::Q(fmt) => {
                     let layout = qlayout_of(cx, b.value).unwrap_or(QLayout::Native);
@@ -486,13 +421,10 @@ impl Binds {
                 fusor2_ir::extract::BindKind::Read => BufferAccess::Read,
                 _ => BufferAccess::ReadWrite,
             };
-            // Keyed by every id in the value's class, not only by the
-            // selected one: an `Operand::src` names whichever id the rule
-            // author wrote, and they all denote the same buffer. `class_ids`
-            // rather than `chain`, because `chain` is the *selectable* set and
-            // drops the `Union` spine — and a macro op hands its caller the
-            // spine node, so `rope`, `attention` and every adjoint over them
-            // name their operands by one.
+            // Keyed by every id in the value's class: an `Operand::src` names
+            // whichever id the rule author wrote, and they all denote the same
+            // buffer. `class_ids` also covers the `Union` spine nodes macro
+            // ops hand their callers.
             let class = cx.graph.class_of(b.value);
             for member in cx.graph.class_ids(class) {
                 by_value.push((member, i + 1));
@@ -564,10 +496,8 @@ pub(crate) fn load(buffer: Arc<BufferDecl>, index: TileExpr, mask: TileExpr) -> 
 
 /// One operand's value at `index`.
 ///
-/// A `Leaf::Const` is **folded into the kernel**: no buffer, no binding, no
-/// traffic — which is exactly what `LeafRole::Free` means in the plan, so
-/// `derive_bindings` never emits a binding for one and loading it would look
-/// up a key that deliberately does not exist.
+/// A `Leaf::Const` is folded into the kernel: `derive_bindings` never emits a
+/// binding for one.
 pub(crate) fn operand_value(
     cx: &LowerCtx<'_>,
     binds: &Binds,
@@ -578,13 +508,9 @@ pub(crate) fn operand_value(
     Ok(operand_src(cx, binds, src)?.at(index, mask))
 }
 
-/// One operand's value at the reading kernel's **flat space index**.
-///
-/// The edge's `layout`/`access` is what says which storage element that is:
-/// a stride-0 broadcast axis, a transposed view, a narrowed slice and a conv
-/// window all disagree with the bare flat index. [`operand_value`] is the raw
-/// form for readers that have already computed a storage index themselves
-/// (gather, scatter, the contraction nests).
+/// One operand's value at the reading kernel's flat space index, mapped
+/// through the edge's `layout`/`access`. [`operand_value`] is the raw form for
+/// readers that have already computed a storage index themselves.
 pub(crate) fn operand_at(
     cx: &LowerCtx<'_>,
     binds: &Binds,
@@ -596,13 +522,11 @@ pub(crate) fn operand_at(
     operand_value(cx, binds, operand.src, address_of(operand, flat, space_total)?, mask)
 }
 
-/// A scatter's four extents, read off the *base operand* rather than off the
-/// index space.
+/// A scatter's four extents, read off the base operand.
 ///
-/// `KScatter::space` is the **update** iteration domain: rank of the base, but
-/// the scattered axis carries the index count. The destination geometry has to
-/// come from the base operand's own layout, or a scatter into a 1024-row table
-/// from 300 tokens would size itself 300 rows.
+/// `Scatter::space` is the update iteration domain; the destination geometry
+/// has to come from the base operand's own layout, or a scatter into a
+/// 1024-row table from 300 tokens would size itself 300 rows.
 pub(crate) struct ScatterGeometry {
     /// Product of the base extents before the scattered axis.
     pub outer: u32,
@@ -616,7 +540,7 @@ pub(crate) struct ScatterGeometry {
 
 pub(crate) fn scatter_geometry(
     cx: &LowerCtx<'_>,
-    space: &fusor2_ir::ir::level1::IndexSpace,
+    space: &fusor2_ir::ir::launch::IndexSpace,
     axis: u32,
     ops: &[Operand],
 ) -> Result<ScatterGeometry> {
@@ -624,8 +548,6 @@ pub(crate) fn scatter_geometry(
     let base = ops
         .first()
         .ok_or_else(|| Error::Legality("a scatter needs a base operand".into()))?;
-    // The operand's layout is the edge's view of the base; its shape is the
-    // destination shape whatever access the edge carries.
     let dest = const_extents(base.layout.shape())?;
     if axis >= dest.len() {
         return Err(Error::Legality(format!(
@@ -633,10 +555,9 @@ pub(crate) fn scatter_geometry(
             dest.len()
         )));
     }
-    // The index operand is rank 1 and its element count *is* the update
-    // count. Reading it there rather than off `space` is what keeps this
-    // correct under both minting conventions: `rules::lower_floor` hands the
-    // output space and `fusor2_tile::rules::scatter` hands the update space.
+    // The index operand is rank 1 and its element count is the update count;
+    // reading it there keeps this correct whether `space` is the output space
+    // or the update space.
     let idx = ops
         .get(1)
         .ok_or_else(|| Error::Legality("a scatter needs an index operand".into()))?;
@@ -731,15 +652,12 @@ pub(crate) fn operand_src(cx: &LowerCtx<'_>, binds: &Binds, src: Id) -> Result<O
 }
 
 /// The storage layout a quantized value carries, read off its `LeafKind`.
-///
-/// Layout is an operand attribute the extractor prices, never a device
-/// branch, so it is recovered from the leaf rather than assumed.
 pub(crate) fn qlayout_of(cx: &LowerCtx<'_>, value: Id) -> Option<QLayout> {
     let class = cx.graph.class_of(value);
     cx.graph.class_ids(class).into_iter().find_map(|m| {
         match &cx.graph.node(m).op {
-            Op::L0(fusor2_ir::ir::level0::L0::Leaf(
-                fusor2_ir::ir::level0::LeafKind::Quantized { layout, .. },
+            Op::Logical(fusor2_ir::ir::logical::Logical::Leaf(
+                fusor2_ir::ir::logical::LeafKind::Quantized { layout, .. },
             )) => Some(*layout),
             _ => None,
         }
@@ -747,8 +665,8 @@ pub(crate) fn qlayout_of(cx: &LowerCtx<'_>, value: Id) -> Option<QLayout> {
 }
 
 pub(crate) fn const_operand(cx: &LowerCtx<'_>, src: Id) -> Option<TileExpr> {
-    let fusor2_ir::ir::Op::L0(fusor2_ir::ir::level0::L0::Leaf(
-        fusor2_ir::ir::level0::LeafKind::Const { value, .. },
+    let fusor2_ir::ir::Op::Logical(fusor2_ir::ir::logical::Logical::Leaf(
+        fusor2_ir::ir::logical::LeafKind::Const { value, .. },
     )) = &cx.graph.node(cx.selected(src)).op
     else {
         return None;
@@ -766,7 +684,7 @@ pub(crate) fn const_operand(cx: &LowerCtx<'_>, src: Id) -> Option<TileExpr> {
     ))
 }
 
-/// Translate one `ScalarExpr` body into L2, with `args[i]` supplying operand
+/// Translate one `ScalarExpr` body into Kernel, with `args[i]` supplying operand
 /// `i` and `coords` supplying `IndexOf(axis)`.
 pub(crate) struct Translate<'a> {
     pub args: &'a [TileExpr],
@@ -794,8 +712,7 @@ impl Translate<'_> {
                 ty,
             ),
             // A runtime scalar is read from the uniform block, never baked
-            // into the kernel: that is what deletes the trainer's `[1]`-tensor
-            // scalars and its per-step recompiles.
+            // into the kernel, so changing it does not recompile.
             ScalarKind::Uniform(sym) => {
                 let ub = self
                     .uniforms
@@ -822,7 +739,7 @@ impl Translate<'_> {
             ),
             ScalarKind::Bin { op, a, b } => bin(*op, self.run(a)?, self.run(b)?, ty),
             ScalarKind::Cmp { op, a, b } => {
-                // Booleans are 1.0/0.0 in the operand dtype at L0, so a
+                // Booleans are 1.0/0.0 in the operand dtype at Logical, so a
                 // comparison consumed as a value materializes here.
                 let m = cmp(*op, self.run(a)?, self.run(b)?);
                 TileExpr::new(
@@ -959,22 +876,21 @@ mod tests {
     }
 }
 
-/// End-to-end cover for
-/// `L1::Ext` and `KRegion`. Every case lowers, compiles, runs on the worker
-/// pool and asserts the bytes that came back.
+/// End-to-end cover for `Launch::Ext` and `Region`: every case lowers,
+/// compiles, runs and asserts the bytes that came back.
 #[cfg(test)]
 mod composite_tests {
     use super::*;
     use fusor2_ir::device::Caps;
     use fusor2_ir::dtype::Persistence;
     use fusor2_ir::egraph::EGraph;
-    use fusor2_ir::extract::{BindKind, BindingPlan, Extraction, Launch, Plan, PlanHash};
+    use fusor2_ir::extract::{BindKind, BindingPlan, Extraction, Dispatch, Plan, PlanHash};
     use fusor2_ir::facts::{ValueFacts, Work};
-    use fusor2_ir::ir::level0::{BufferId, L0, LeafKind};
-    use fusor2_ir::ir::level1::{
+    use fusor2_ir::ir::logical::{BufferId, Logical, LeafKind};
+    use fusor2_ir::ir::launch::{
         AccessPlan, Effect, IndexSpace, ScheduleDomain,
     };
-    use fusor2_ir::ir::level2::Stmt;
+    use fusor2_ir::ir::kernel::Stmt;
     use fusor2_ir::ir::{AttrId, OpDef, OpDefId, OpDefRegistry, OpTag, VerifyCtx};
     use fusor2_ir::scalar::{BinOp, CmpOp};
     use fusor2_ir::semantics::{CoreSemantics, SumArenaPlanner};
@@ -998,7 +914,7 @@ mod composite_tests {
 
     fn buffer(g: &mut EGraph, n: u64) -> Id {
         let next = g.len() as u32;
-        g.add(Op::L0(L0::Leaf(LeafKind::Buffer {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
             name: BufferId(next),
             dtype: Dtype::F32,
             shape: smallvec::smallvec![Dim::Const(n)],
@@ -1016,7 +932,7 @@ mod composite_tests {
 
     fn kmap(g: &mut EGraph, n: u64, body: ScalarExpr, x: Id) -> Id {
         let ops = vec![alias(g, x)];
-        g.add(Op::L1(L1::KMap {
+        g.add(Op::Launch(Launch::Map {
             space: IndexSpace::new([Dim::Const(n)]),
             body,
             ops,
@@ -1028,7 +944,7 @@ mod composite_tests {
     fn plan_for(root: Id, bindings: Vec<BindingPlan>) -> Plan {
         Plan {
             extraction: Extraction::default(),
-            launches: vec![Launch {
+            launches: vec![Dispatch {
                 root,
                 members: smallvec::smallvec![root],
                 bindings,
@@ -1074,27 +990,18 @@ mod composite_tests {
             .unwrap();
     }
 
-    // -- L1::Ext ----------------------------------------------------------
-
-    /// A registered extension op's own `"cpu"` lowering: `y = 3 * x`.
-    ///
-    /// It builds its whole `KernelIr` — buffer decls included — from the node,
-    /// which is the entire contract `OpDef::lower_per_target` offers. Nothing
-    /// in `fusor2-cpu` knows what "triple" means.
-    ///
-    /// `theta` is checked rather than ignored: `L1::schedule()` returns `None`
-    /// for `Ext` — fusor2 cannot enumerate geometries for a lowering it did
-    /// not write — so `SchedPoint::Point` is the only point an extension op
-    /// can be handed, and anything else means extraction scheduled a node
-    /// against a domain that does not exist.
+    /// A registered extension op's own `"cpu"` lowering: `y = 3 * x`. It
+    /// builds its whole `KernelIr` from the node. `SchedPoint::Point` is the
+    /// only point an extension op can be handed, since `Ext` declares no
+    /// schedule domain.
     fn lower_triple(node: &Node, theta: &SchedPoint) -> Result<KernelIr> {
         if !matches!(theta, SchedPoint::Point) {
             return Err(Error::Legality(format!(
-                "an L1::Ext node declares no schedule domain, so {theta:?} names \
+                "an Launch::Ext node declares no schedule domain, so {theta:?} names \
                  a geometry nothing could have selected"
             )));
         }
-        let Op::L1(L1::Ext { ops, .. }) = &node.op else {
+        let Op::Launch(Launch::Ext { ops, .. }) = &node.op else {
             return Err(Error::Legality("triple got a foreign node".into()));
         };
         let shape = ops
@@ -1197,7 +1104,7 @@ mod composite_tests {
         let x = buffer(&mut g, 8);
         let ops = vec![alias(&g, x)];
         let e = g
-            .add(Op::L1(L1::Ext {
+            .add(Op::Launch(Launch::Ext {
                 def: OpDefId(0),
                 ops,
                 attrs: AttrId(0),
@@ -1238,16 +1145,15 @@ mod composite_tests {
             vec![3.0, 6.0, 9.0, 12.0, 15.0, 18.0, 21.0, 24.0]
         );
 
-        // And the negative half, in the same test because the registry is one
-        // process-global: an op that names no `"cpu"` row is a legality answer
-        // naming the op, never a panic and never a silent fallback.
+        // The negative half lives in the same test because the registry is
+        // process-global: an op with no `"cpu"` row is a legality error.
         let other = Node {
-            op: Op::L1(L1::Ext {
+            op: Op::Launch(Launch::Ext {
                 def: OpDefId(1),
                 ops: vec![alias(&g, x)],
                 attrs: AttrId(0),
             }),
-            level: fusor2_ir::ir::Level::L1,
+            level: fusor2_ir::ir::Level::Launch,
             children: smallvec::smallvec![x],
         };
         let err = lower(&caps, &other, x, SchedPoint::Point, &cx).unwrap_err();
@@ -1255,15 +1161,10 @@ mod composite_tests {
         assert!(msg.contains("gpu_only") && msg.contains("cpu"), "{msg}");
     }
 
-    // -- KRegion -----------------------------------------------------------
-
-    /// Two elementwise members, two live outputs, one dispatch. This is the
-    /// multi-output region the architecture calls "the same rewrite as
-    /// producer inlining, differing only in that it emits an extra buffer".
     /// The domain a composite landing `member`'s value carries — the same
-    /// call `rules::fusion` mints it with and `verify_l1` checks it against.
+    /// call `rules::fusion` mints it with and `verify_launch` checks it against.
     fn region_sched(g: &EGraph, member: Id) -> ScheduleDomain {
-        ScheduleDomain::Map(fusor2_ir::ir::level1::MapDomain::linear_over(
+        ScheduleDomain::Map(fusor2_ir::ir::launch::MapDomain::linear_over(
             crate::caps::cpu_caps(),
             &g.facts(member).shape,
         ))
@@ -1361,7 +1262,7 @@ mod composite_tests {
         let mut g = graph();
         let (x, doubled, plus_one) = two_member_graph(&mut g);
         let region = g
-            .add(Op::L1(L1::KRegion {
+            .add(Op::Launch(Launch::Region {
                 members: smallvec::smallvec![doubled, plus_one],
                 live_outs: smallvec::smallvec![0, 1],
                 sched: region_sched(&g, doubled),
@@ -1374,8 +1275,7 @@ mod composite_tests {
     }
 
     /// A composite whose members disagree on their lane count has no
-    /// single-kernel CPU lowering, and says so instead of emitting a kernel
-    /// whose reduce scratch is shorter than its lane loop.
+    /// single-kernel CPU lowering, and says so.
     #[test]
     fn mismatched_lane_counts_are_a_legality_answer() {
         let mut g = graph();
@@ -1383,7 +1283,7 @@ mod composite_tests {
         let m = kmap(&mut g, 8, ScalarExpr::arg(0, Dtype::F32), x);
         let ops = vec![alias(&g, x)];
         let f = g
-            .add(Op::L1(L1::KFold {
+            .add(Op::Launch(Launch::Fold {
                 space: IndexSpace::new([Dim::Const(8)]),
                 axis: 0,
                 vec_axes: smallvec::smallvec![],
@@ -1399,7 +1299,7 @@ mod composite_tests {
             }))
             .unwrap();
         let region = g
-            .add(Op::L1(L1::KRegion {
+            .add(Op::Launch(Launch::Region {
                 members: smallvec::smallvec![m, f],
                 live_outs: smallvec::smallvec![0],
                 sched: region_sched(&g, m),

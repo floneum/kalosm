@@ -1,11 +1,9 @@
 //! The rope sin/cos table.
 //!
 //! `[rows, head_dim / 2]`, the half-width table
-//! [`crate::composite::rope`] expands through its `table_expansion` gather —
-//! not a `[rows, head_dim]` table with every column duplicated.
+//! [`crate::composite::rope`] expands through its `table_expansion` gather.
 //! [`base_inverse_frequency`] is shared with the rope op itself, so the table
 //! and the kernel cannot drift apart.
-//!
 
 use fusor2_ir::dtype::Dtype;
 use fusor2_ir::shape::Dim;
@@ -35,9 +33,7 @@ pub struct RopeCache<T: Element = f32> {
 impl<T: Element> RopeCache<T> {
     /// A table covering `max_len` positions.
     ///
-    /// A symbolic `max_len` is refused rather than guessed: the *use* of the
-    /// table is symbolic (a narrow or a position gather, so a decode loop
-    /// recompiles nothing), but its contents are host-computed sines and
+    /// Refuses a symbolic `max_len`: the contents are host-computed sines and
     /// there is no length to compute them for until one is bound.
     pub fn new(graph: &Graph, head_dim: u32, max_len: Dim, theta: f32) -> Result<Self> {
         let Some(rows) = max_len.as_const() else {
@@ -133,8 +129,7 @@ fn build<T: Element>(
     let shape = [Dim::Const(rows), Dim::Const(half as u64)];
     let flat = |v: Vec<[u8; 4]>| -> Vec<u8> { v.into_iter().flatten().collect() };
     // The sines are computed in f64 and stored as f32 regardless of `T`, then
-    // cast once per upload. Building them at `T` directly would round the
-    // angle twice.
+    // cast once per upload.
     let upload = |bytes: Vec<u8>| -> Result<Tensor<2, T>> {
         let dense: Dyn = graph.tensor(Dtype::F32, &shape, &bytes)?;
         let dense = if T::DTYPE == Dtype::F32 {
@@ -215,11 +210,8 @@ mod tests {
         let g = graph();
         let c: RopeCache = RopeCache::new(&g, 4, Dim::Const(8), 10_000.0).unwrap();
         let (sin, cos) = c.slice(5, 2);
-        // The numbers a narrowed view reads back are `views::narrow`'s
-        // obligation, and that case is red for a reason that is not this
-        // cache: the emitters index every operand with the flat output index
-        // and drop `Operand::layout`'s offset. What is asserted here is the
-        // slice this cache asks for.
+        // The values a narrowed view reads back are `views::narrow`'s
+        // obligation; what is asserted here is the slice this cache asks for.
         assert_eq!(sin.shape(), [2, 2]);
         assert_eq!(cos.shape(), [2, 2]);
         // The whole table is a legal slice.

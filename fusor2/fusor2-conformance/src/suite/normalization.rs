@@ -35,10 +35,6 @@ type Build = fn(&Tensor, u64) -> fusor2::Result<Tensor>;
 /// A host reference over one row, producing that row's output.
 type RowRef = fn(&[f32]) -> Vec<f32>;
 
-// ---------------------------------------------------------------------------
-// Host references
-// ---------------------------------------------------------------------------
-
 fn host_softmax(row: &[f32]) -> Vec<f32> {
     let max = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
     let e: Vec<f32> = row.iter().map(|v| (v - max).exp()).collect();
@@ -98,10 +94,6 @@ fn affine(normalized: &[f32], weight: &[f32], bias: Option<&[f32]>) -> Vec<f32> 
         .map(|(i, v)| v * weight[i % width] + bias.map_or(0.0, |b| b[i % width]))
         .collect()
 }
-
-// ---------------------------------------------------------------------------
-// Cases
-// ---------------------------------------------------------------------------
 
 /// The single-input row programs: forward against a host reference, backward
 /// against central differences.

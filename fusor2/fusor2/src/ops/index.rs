@@ -1,5 +1,5 @@
 //! Indexing and scatter. `index_select`, `embedding` and `gather_last` are
-//! all one `L0::Gather`; its adjoint is `Scatter{Add}`, which has four
+//! all one `Logical::Gather`; its adjoint is `Scatter{Add}`, which has four
 //! coexisting lowerings the cost model chooses between.
 //!
 //! `Scatter{Set}` is the single write substrate: `slice_assign`, `cat`,
@@ -10,7 +10,7 @@
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 
 use fusor2_ir::dtype::Dtype;
-use fusor2_ir::ir::level0::{L0, ScatterCombine};
+use fusor2_ir::ir::logical::{Logical, ScatterCombine};
 use fusor2_ir::shape::Dim;
 
 use crate::ops::view::Extent;
@@ -18,8 +18,6 @@ use crate::tensor::Tensor;
 use crate::{Error, Result};
 
 impl Tensor {
-    // -- gather ---------------------------------------------------------------
-
     /// Gather rows along `dim` with a rank-1 `U32` index tensor.
     pub fn index_select(&self, dim: usize, idx: &Tensor) -> Result<Tensor> {
         self.check_axis(dim, "index_select")?;
@@ -35,7 +33,7 @@ impl Tensor {
                 idx.dtype()
             )));
         }
-        self.emit_here(L0::Gather {
+        self.emit_here(Logical::Gather {
             axis: dim as u32,
             x: self.id,
             idx: idx.id,
@@ -90,8 +88,6 @@ impl Tensor {
         self.flatten_all()?.index_select(0, &linear)
     }
 
-    // -- scatter --------------------------------------------------------------
-
     /// `Scatter{Add}`; duplicate indices accumulate, which is normative — an
     /// embedding table receiving one token twice gets the summed gradient.
     pub fn scatter_add(&self, axis: usize, idx: &Tensor, updates: &Tensor) -> Result<Tensor> {
@@ -119,8 +115,6 @@ impl Tensor {
         unique: bool,
     ) -> Result<Tensor> {
         self.check_axis(axis, "scatter")?;
-        // Enforce `Scatter{Set}` uniqueness here; the API-level proof is
-        // supplied at this function.
         if matches!(combine, ScatterCombine::Set) && !unique {
             return Err(Error::Shape(
                 "Scatter{Set} with possibly-duplicate indices; declare unique: true or use \
@@ -128,7 +122,7 @@ impl Tensor {
                     .into(),
             ));
         }
-        self.emit_here(L0::Scatter {
+        self.emit_here(Logical::Scatter {
             axis: axis as u32,
             combine,
             base: self.id,
@@ -138,8 +132,6 @@ impl Tensor {
         })
     }
 
-    // -- slice_assign, the write substrate ------------------------------------
-
     /// A copy of `self` with the region named by `ranges` overwritten by
     /// `value`.
     ///
@@ -147,9 +139,8 @@ impl Tensor {
     /// `Scatter{Set}` along that axis with an index vector as long as the
     /// written extent — the `cat`/`pad`/`stack` case. When two or more axes
     /// are narrowed there is no single-axis form, so the value is flattened
-    /// and scattered against an explicit index vector; that costs one
-    /// host-built `u32` per written element and is the honest general
-    /// lowering, not a fast path.
+    /// and scattered against an explicit index vector, at one host-built
+    /// `u32` per written element.
     pub fn slice_assign(&self, ranges: &[Range<usize>], value: &Tensor) -> Result<Tensor> {
         if ranges.len() != self.rank() {
             return Err(Error::Shape(format!(
@@ -216,8 +207,6 @@ impl Tensor {
         written.reshape_dims(&shape)
     }
 
-    // -- cat / stack ----------------------------------------------------------
-
     /// Concatenate along `dim`: one `Leaf(Const)` fill plus one
     /// `Scatter{Set}` per part.
     pub fn cat(parts: &[Tensor], dim: usize) -> Result<Tensor> {
@@ -228,8 +217,6 @@ impl Tensor {
     pub fn stack(parts: &[Tensor], dim: usize) -> Result<Tensor> {
         stack(parts, dim)
     }
-
-    // -- pad / repeat / resize --------------------------------------------------
 
     /// Zero-pad one axis.
     pub fn pad_axis(&self, axis: usize, padding: (usize, usize)) -> Result<Tensor> {
@@ -318,8 +305,6 @@ impl Tensor {
         let src = self.slice(&overlap)?;
         out.slice_assign(&overlap, &src)
     }
-
-    // -- i() -------------------------------------------------------------------
 
     /// PyTorch-style indexing. Exactly one component must be a bare `usize`,
     /// which removes that axis; the rest are ranges.
@@ -505,10 +490,6 @@ pub fn stack(parts: &[Tensor], dim: usize) -> Result<Tensor> {
         .collect::<Result<_>>()?;
     cat(&lifted, dim)
 }
-
-// ---------------------------------------------------------------------------
-// i() index descriptors
-// ---------------------------------------------------------------------------
 
 /// One component of an [`Tensor::i`] index tuple.
 #[derive(Clone, Debug, PartialEq, Eq)]

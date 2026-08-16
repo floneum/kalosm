@@ -2,8 +2,7 @@
 //! binaries, the std-ops surface, `where_cond` and all 12 comparisons.
 //!
 //! Every one of these is one `Map` with a different `ScalarExpr`, so this
-//! suite is really a `ScalarExpr` test. A table this wide passing is evidence
-//! that the scalar expression variants are working correctly.
+//! suite is really a `ScalarExpr` test.
 
 use fusor2::{Dtype, Session, };
 use fusor2::tensor::Dyn as Tensor;
@@ -19,22 +18,20 @@ use crate::suite::support::{
 };
 
 /// The forward-only rows take no gradient, so they can afford multi-workgroup
-/// extents. The floor is a real constraint: [`non_vacuous`] needs enough
-/// samples that a random draw cannot land entirely on the op's identity
-/// interval.
+/// extents. [`non_vacuous`] needs enough samples that a random draw cannot
+/// land entirely on the op's identity interval.
 const FORWARD_SPEC: &[FuzzDim] = &[FuzzDim::Range(4, 8), FuzzDim::Range(8, 64)];
 
-/// `(e^x - e^-x) / (e^x + e^-x)`, the form `tanh_exact` names. A separate
-/// expression from `tanh`, not an alias: the reference needs it where a
-/// driver's native tanh under-saturates the GELU tail.
+/// `(e^x - e^-x) / (e^x + e^-x)`, the form `tanh_exact` names. The reference
+/// needs it where a driver's native tanh under-saturates the GELU tail.
 fn tanh_exact_ref(x: f32) -> f32 {
     let (up, down) = (x.exp(), (-x).exp());
     (up - down) / (up + down)
 }
 
 /// The 21 unaries with an exact elementwise reference. `approximate_exp` and
-/// `less_approximate_exp` are the other two of the 23; they are deliberately
-/// *not* `exp`, so they get a relative bound instead.
+/// `less_approximate_exp` are the other two of the 23; they get a relative
+/// bound instead.
 #[rustfmt::skip]
 fn unaries() -> Vec<(&'static str, Domain, UnaryOp, fn(f32) -> f32)> {
     vec![
@@ -74,27 +71,18 @@ fn scalar_arith() -> Vec<(&'static str, Domain, UnaryOp, fn(f32) -> f32)> {
         ("div_scalar", Domain::Wide,     |x| x.div_scalar(2.0),  |v| v / 2.0),
         ("pow_scalar", Domain::Positive, |x| x.pow_scalar(1.5),  |v| v.powf(1.5)),
         // Sampled off the kink so finite differences agree with the adjoint.
-        // On [0.2, 1.5) all three of these are the IDENTITY, so these rows
-        // check the adjoint and nothing else — `forward_only()` below owns the
-        // half that distinguishes the op from a passthrough.
+        // On [0.2, 1.5) all three are the identity, so these rows check the
+        // adjoint only; `forward_only()` owns the clamping half.
         ("max_scalar", Domain::Custom(0.2, 1.5), |x| x.max_scalar(0.1), |v| v.max(0.1)),
         ("min_scalar", Domain::Custom(0.2, 1.5), |x| x.min_scalar(1.9), |v| v.min(1.9)),
         ("clamp",      Domain::Custom(0.2, 1.5), |x| x.clamp(0.1, 1.9), |v| v.clamp(0.1, 1.9)),
     ]
 }
 
-/// Forward-only rows, over domains that **straddle** the kink the tables above
-/// sample away from.
-///
-/// `abs`, `max_scalar` and `min_scalar` are sampled on `[0.2, 1.5)` up there so
-/// a central difference does not straddle a point where the adjoint is
-/// undefined — a real constraint, and the reason the choice was made. But every
-/// one of those three is exactly `|v| v` on that interval, so the forward half
-/// of those rows cannot tell the op from a passthrough: `abs` on a negative,
-/// and either clamp actually clamping, were verified nowhere in the suite.
-///
-/// These rows restore that coverage. No gradient is taken, so the kink is
-/// harmless; [`non_vacuous`] is what keeps the domain honest.
+/// Forward-only rows, over domains that straddle the kink the tables above
+/// sample away from: `abs` on a negative, and each clamp actually clamping.
+/// No gradient is taken, so the kink is harmless; [`non_vacuous`] keeps the
+/// domain honest.
 #[rustfmt::skip]
 fn forward_only() -> Vec<(&'static str, Domain, UnaryOp, fn(f32) -> f32)> {
     vec![
@@ -105,13 +93,8 @@ fn forward_only() -> Vec<(&'static str, Domain, UnaryOp, fn(f32) -> f32)> {
     ]
 }
 
-/// Refuse a row whose reference is the identity on its own sampled data.
-///
-/// A case that samples a domain where the op under test does nothing passes
-/// against a passthrough implementation and reports as coverage. That is how
-/// `abs`, `max_scalar` and `min_scalar` were green while their forward
-/// behaviour was unverified — the domains were chosen for the *backward* half
-/// and nobody re-checked what the forward half could still see.
+/// Refuse a row whose reference is the identity on its own sampled data:
+/// such a case passes against a passthrough implementation.
 fn non_vacuous(name: &str, data: &[f32], reference: fn(f32) -> f32) -> Result<(), CaseError> {
     if data.iter().all(|v| reference(*v) == *v) {
         return Err(format!(
@@ -247,10 +230,8 @@ pub fn cases() -> Cases {
         ));
     }
 
-    // The two GPU-approximate exponentials. Their point is that they are *not*
-    // `exp`, so they get a relative bound rather than an elementwise
-    // reference: an implementation that quietly aliased them to `exp` would
-    // pass a strict comparison and hide the missing expression.
+    // The two GPU-approximate exponentials get a relative bound rather than
+    // an elementwise reference.
     cases.push_case(fuzz_case(
         "elementwise",
         "approximate_exp",
@@ -284,9 +265,8 @@ pub fn cases() -> Cases {
         f32::min,
     ));
 
-    // The operator surface. Separate cases because a chained expression is a
-    // different `ScalarExpr::compose` shape than a single op, and composition
-    // *is* elementwise fusion.
+    // A chained expression is a different `ScalarExpr::compose` shape than a
+    // single op.
     cases.push_case(fuzz_case(
         "elementwise",
         "std_ops_add_sub",
@@ -328,8 +308,6 @@ pub fn cases() -> Cases {
     ));
     cases
 }
-
-// ---------------------------------------------------------------------------
 
 fn backend_of(session: &Session) -> &'static str {
     if is_gpu(session) { "gpu" } else { "cpu" }
@@ -376,11 +354,10 @@ fn tensor_comparison_case(
 
 /// A rank-2 activation against a rank-1 operand, right-aligned.
 ///
-/// No implicit broadcasting exists at L0 — the frontend emits
-/// `Restride { multiplier: 0 }` — so this is really a test that the frontend's
-/// right-aligned rules hold *and* that a stride-0 axis's adjoint is a sum over
-/// that axis. A rule that forgot the sum would hand a `[rows, cols]` gradient
-/// to a `[cols]` leaf.
+/// No implicit broadcasting exists at Logical — the frontend emits
+/// `Restride { multiplier: 0 }` — so this tests that the frontend's
+/// right-aligned rules hold and that a stride-0 axis's adjoint is a sum over
+/// that axis.
 fn broadcast_case(
     session: &Session,
     shape: &[u64],
@@ -463,11 +440,6 @@ fn expr_case(
 
 /// An approximate exponential: within `tol` of `exp` in relative terms, and
 /// differentiable to itself.
-///
-/// `fusor2::Tensor` does not expose `approximate_exp`/`less_approximate_exp`
-/// yet, so this case reports the missing entry point by name rather than
-/// aliasing to `exp` and passing vacuously — an alias would make the case
-/// green while the expression that justifies its existence was absent.
 fn approximate_exp_case(
     session: &Session,
     name: &'static str,
@@ -501,11 +473,8 @@ fn approximate_exp_case(
     Ok(())
 }
 
-/// Resolve the approximate-exponential entry point by name.
-///
-/// Both are their own `UnOp` (`UnOp::ApproximateExp` /
-/// `UnOp::LessApproximateExp`), not aliases for `exp` — the
-/// equivalence test below pins that they hash-cons to different nodes.
+/// Resolve the approximate-exponential entry point by name. Both are their
+/// own `UnOp`, not aliases for `exp`.
 fn approximate_exp_op(x: &Tensor, name: &str) -> Option<fusor2::Result<Tensor>> {
     match name {
         "approximate_exp" => Some(x.approximate_exp()),
@@ -581,8 +550,7 @@ mod tests {
         names.iter().any(|n| n == &format!("elementwise::{short}"))
     }
 
-    /// The guard has to fire on the exact configuration that was shipping
-    /// green, or it is decoration.
+    /// The guard fires on the exact domain `scalar_arith()` samples.
     #[test]
     fn non_vacuous_rejects_a_domain_where_the_op_is_the_identity() {
         let len = 96; // the largest shape `ELEMENTWISE_SPEC` can sample
@@ -600,8 +568,7 @@ mod tests {
         }
     }
 
-    /// ...and must not fire on the widened domains, or it would just be a
-    /// second way to fail.
+    /// The guard must not fire on the widened domains.
     #[test]
     fn every_forward_only_row_actually_exercises_its_op() {
         let len = 32; // the smallest shape `FORWARD_SPEC` can sample

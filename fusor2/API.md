@@ -69,7 +69,7 @@ Landed in this change:
 | `SymId` (root) | Off the root. Nothing in or out of this workspace imports it; `Dim` is the type callers name. |
 
 One item went the other way. `composite::attention::MaskKind` was a *private*
-`use` of `fusor2_ir::ir::level1::MaskKind`, so `attention_masked` took an
+`use` of `fusor2_ir::ir::launch::MaskKind`, so `attention_masked` took an
 argument no caller could spell — `segment-anything-rs` had two lines that
 could not compile against any version of this crate. It is a `pub use` now.
 
@@ -252,12 +252,12 @@ rank a step produced and is the one genuinely heterogeneous list in the crate.
 `Device::cpu()` is one per process **and so is its graph**: every test that
 builds a value on it adds nodes to one shared e-graph that is never reset.
 That is not inert. Extraction picks among cost-*identical* class members, and
-`L1::KScatter`'s four `ScatterMode`s are exactly that — an `OpDef`'s `work` is
+`Launch::Launch::Scatter`'s four `ScatterMode`s are exactly that — an `OpDef`'s `work` is
 a function of operand and output facts only, so `mode` is invisible to the cost
 model and all four price the same. One of them,
 `ScatterMode::OneHotContract`, has **no lowering on either backend**: both
 `fusor2-cpu` and `fusor2-gpu` return `Error::Plan("OneHotContract is present
-only as the candidate the cost model rejects; it lowers through KContract, not
+only as the candidate the cost model rejects; it lowers through Launch::Contract, not
 here")`. So `fusor2-tile`'s `SCATTER_ONE_HOT_CONTRACT` rule mints a candidate
 that the cost model provably cannot reject and that hard-errors if selected,
 and which member the tie-break lands on shifts with unrelated graph content.

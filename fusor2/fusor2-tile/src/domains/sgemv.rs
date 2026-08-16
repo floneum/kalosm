@@ -2,7 +2,7 @@
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::Dtype;
-use fusor2_ir::ir::level1::{SgemvDomain, SgemvParams};
+use fusor2_ir::ir::launch::{SgemvDomain, SgemvParams};
 use fusor2_ir::shape::Dim;
 use smallvec::SmallVec;
 
@@ -10,10 +10,9 @@ use crate::domains::{DomainCtx, UNMEASURED, sgemv_order};
 
 /// Lane k-window widths. The wide entries (32, 64) exist for quantized
 /// operands: a 32-element window amortizes one group-scale decode across the
-/// whole group instead of a quarter of it, and a 64-element window makes the
-/// lane consume **both** packed halves of every data word it touches, so no
-/// word is ever loaded by two lanes. Purely a schedule choice — the block
-/// decode itself is the operand's, shared through hash-consing.
+/// whole group, and a 64-element window makes the lane consume both packed
+/// halves of every data word it touches, so no word is ever loaded by two
+/// lanes.
 const VECTOR_CHOICES: [u32; 7] = [1, 2, 4, 8, 16, 32, 64];
 const SUBGROUP_CHOICES: [u32; 6] = [1, 2, 4, 8, 16, 32];
 /// Columns per workgroup. `1` is the whole-workgroup-per-element structure;
@@ -32,12 +31,10 @@ const MAX_UNROLL: u32 = 256;
 /// Runs a split lane window is laid out as (`1` = consecutive, the only
 /// structure the whole-workgroup path has). A split window revisits the same
 /// packed word of a bit-packed operand at several k offsets, so its word
-/// loads hash-cons to one evaluation — which offsets pay is the operand's
-/// business; the race finds out.
+/// loads hash-cons to one evaluation.
 const PARTS_CHOICES: [u32; 2] = [2, 4];
-/// K distances between a split window's runs. Pure schedule numbers like
-/// `vector`; the divisibility rules in the generator are what make each one
-/// tile the pass exactly.
+/// K distances between a split window's runs. The divisibility rules in the
+/// generator make each one tile the pass exactly.
 const GAP_CHOICES: [u32; 3] = [16, 32, 64];
 
 /// Measured cells, position = move-ordering rank. `sample_points` offers the
@@ -46,36 +43,26 @@ const GAP_CHOICES: [u32; 3] = [16, 32, 64];
 /// per key, the order only has to *reach* each winner, not rank one dtype
 /// over another.
 pub static SEED_CELLS: &[SgemvParams] = &[
-    // The round-5 FUSOR2_PIN_SGEMV sweep (M2 Max, six 8B-decode qgemv
-    // shapes, kernel spans, warm-cache runs only — a fresh tune cache
-    // re-fights the coop candidates and contaminates the pin): the
-    // 32-window / 4-runs-at-gap-32 gather from rounds 3-4 stands, but the
-    // *block* wants to be tiny. This kernel has no cross-subgroup sharing
-    // at all — no barrier, no workgroup scratch — so 8 subgroups per
-    // workgroup only coarsen the scheduler's packing granularity; 1-2
-    // subgroups at the same cps=2 beat the 256-thread blocks on all six
-    // shapes. cps=1 loses everywhere (halves activation reuse: 65/60 GB/s
-    // on attn) and cps=4 at small blocks spills; cps=2 is the ridge.
+    // Measured on M2 Max over six 8B-decode qgemv shapes; pin with
+    // warm-cache runs only — a fresh tune cache re-fights the coop
+    // candidates and contaminates the pin. This kernel has no
+    // cross-subgroup sharing (no barrier, no workgroup scratch), so small
+    // blocks at cps=2 beat 256-thread blocks; cps=1 halves activation
+    // reuse and cps=4 at small blocks spills.
     //
-    // (32,2,4,4,32): 64-thread block — gateup q4k 222, gateup q6k 201,
-    // down q6k 197 (prior best 218/197/178). Worst shape 169.8 (attn q6k).
+    // 64-thread block: best on gateup q4k/q6k and down q6k.
     w(32, 2, 4, 4, 32),
-    // (32,1,2,4,32): one subgroup per workgroup — attn q4k 197.5, attn
-    // q6k 175.2, down q4k 221.2 (prior best 189/166/214).
+    // One subgroup per workgroup: best on attn q4k/q6k and down q4k.
     w(32, 1, 2, 4, 32),
-    // (32,8,16,4,32): round 4's near-universal 256-thread cell, kept as
-    // the incumbent-safety while the small blocks re-earn their rank in
-    // production.
+    // Near-universal 256-thread cell, kept as incumbent safety.
     w(32, 8, 16, 4, 32),
-    // (16,8,32,4,32): attn-sized Q6K's round-4 winner (130.2; the
-    // 16-window keeps the Q6K decode inside the unroll budget where
-    // 32-windows spill).
+    // Attn-sized Q6K winner: the 16-window keeps the Q6K decode inside
+    // the unroll budget where 32-windows spill.
     w(16, 8, 32, 4, 32),
     // Unsplit multi-column: the structure for operands where a split window
-    // has nothing to hash-cons (round 2's all-round winner, worst 131 GB/s).
+    // has nothing to hash-cons.
     v(16, 8, 16),
-    // Runners-up of rounds 2-4, kept as explorer fodder past the race
-    // prefix.
+    // Runners-up, kept as explorer fodder past the race prefix.
     w(32, 8, 32, 4, 32),
     w(16, 8, 16, 4, 32),
     w(16, 8, 16, 2, 32),
@@ -87,8 +74,6 @@ pub static SEED_CELLS: &[SgemvParams] = &[
     v(8, 8, 32),
     v(8, 8, 8),
     v(8, 4, 16),
-    // The distinct cells of the deleted bucket table (deduped: with no
-    // chunk axis several collapsed into one another).
     v(4, 16, 1),
     v(4, 1, 1),
     v(4, 2, 1),
@@ -132,10 +117,9 @@ pub fn sgemv_domain(cx: &DomainCtx<'_>) -> SgemvDomain {
     // device pins its subgroup width.
     let fixed_subgroup = cx.caps.subgroups.is_some_and(|s| s.is_fixed());
 
-    // `FUSOR2_PIN_SGEMV="vector,subgroups,cols[,parts,gap]"` restricts
-    // the domain to one cell — the same measurement instrument as
-    // `FUSOR2_PIN_COOP`: it is how the per-shape kernel tables are measured
-    // without the adoption race in the loop. Ordinary runs never set it.
+    // `FUSOR2_PIN_SGEMV="vector,subgroups,cols[,parts,gap]"` restricts the
+    // domain to one cell for measuring per-shape kernel tables without the
+    // adoption race in the loop. Ordinary runs never set it.
     let pin: Option<SgemvParams> = std::env::var("FUSOR2_PIN_SGEMV").ok().and_then(|s| {
         let p: Vec<u32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
         match p.len() {
@@ -167,12 +151,11 @@ pub fn sgemv_domain(cx: &DomainCtx<'_>) -> SgemvDomain {
                 if pin.is_none_or(|p| p == cell) {
                     all.push(cell);
                 }
-                // Split lane windows: only on the multi-column
-                // structure, and only where runs, gap and width tile
-                // the subgroup's pass exactly (the same divisibility
-                // `verify_l1` holds every domain to). The loop body's
-                // size is unchanged — the window still holds `vector`
-                // elements — so the unroll bound above already applies.
+                // Split lane windows: only on the multi-column structure,
+                // and only where runs, gap and width tile the subgroup's
+                // pass exactly (the same divisibility `verify_launch` holds
+                // every domain to). The window still holds `vector`
+                // elements, so the unroll bound above already applies.
                 if cols <= 1 {
                     continue;
                 }
@@ -233,9 +216,8 @@ mod tests {
         }
     }
 
-    /// Every domain point is a distinct kernel: with the dead chunk axis
-    /// gone, nothing multiplies a cell into byte-identical copies that
-    /// would each claim a tune record and a race slot.
+    /// Every domain point is a distinct kernel: byte-identical copies would
+    /// each claim a tune record and a race slot.
     #[test]
     fn no_duplicate_cells() {
         let caps = apple_caps();
@@ -292,7 +274,7 @@ mod tests {
 
     #[test]
     fn every_point_round_trips() {
-        use fusor2_ir::ir::level1::ScheduleDomain;
+        use fusor2_ir::ir::launch::ScheduleDomain;
         let caps = apple_caps();
         let cx = DomainCtx::new(&caps, default_planner());
         let d = ScheduleDomain::Sgemv(sgemv_domain(&cx));

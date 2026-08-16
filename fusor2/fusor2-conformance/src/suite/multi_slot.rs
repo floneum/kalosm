@@ -1,15 +1,13 @@
 //! Multi-slot folds, on real hardware, on both backends.
 //!
 //! One accumulator per carrier slot, one `merge` per slot, and the answer
-//! compared against the two-pass algorithm the carrier replaces. This is the
-//! coverage that was missing, and it is why the `accs[0]` bug survived: the L2
-//! reduction resolved one `TileReduceOp` for a whole fold and updated only slot
-//! 0, so `Fold{(max, sum)}` computed `max(x)` and silently discarded the sum
-//! while every test in the suite passed.
+//! compared against the two-pass algorithm the carrier replaces. Pins the
+//! `accs[0]` bug: a Kernel reduction that resolves one `TileReduceOp` for a
+//! whole fold and updates only slot 0 computes `max(x)` and silently discards
+//! the sum.
 //!
-//! The two carriers are the demoted oracles from `fusor2_ir::carrier::oracle` —
-//! the same definitions that crate's unit tests run on the host evaluator, so
-//! there is one spelling of each algorithm and two independent executions of it.
+//! The two carriers are the oracles from `fusor2_ir::carrier::oracle` —
+//! the same definitions that crate's unit tests run on the host evaluator.
 
 use fusor2::{Dtype, Session};
 use fusor2::tensor::Dyn as Tensor;

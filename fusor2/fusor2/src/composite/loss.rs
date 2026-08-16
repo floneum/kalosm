@@ -1,13 +1,9 @@
 //! Losses. `softmax_cross_entropy` and the distillation loss are plain taped
 //! chains; `softplus_bce_adjoint` rewrites the backward to the single-sigmoid
-//! form, so nobody hand-writes a fused gradient.
+//! form.
 //!
-//! Nothing here is a kernel and nothing here declares an adjoint. Every loss
-//! is a composition of ops that already carry their own backward, which is
-//! why the trainer's hand-written `distillation_loss` backward — a
-//! `with_backwards` closure spelling `w * sigmoid(x) - z` — has no counterpart
-//! in this file. The rewrite recovers exactly that expression from the taped
-//! softplus chain.
+//! Nothing here is a kernel and nothing here declares an adjoint: every loss
+//! is a composition of ops that already carry their own backward.
 
 use crate::tensor::Tensor;
 use crate::{Error, Result};
@@ -55,10 +51,8 @@ fn require_pair(a: &Tensor, b: &Tensor, what: &str) -> Result<()> {
 /// against the smoothed distribution. `axis` is reduced away, so a
 /// `[rows, classes]` input with `axis = 1` yields one loss per row.
 ///
-/// Written as `log_softmax` then a weighted sum rather than as
-/// `log(softmax(..))`: the max-subtracted form is the numerically stable one,
-/// and its adjoint composes to `softmax - targets` without anybody spelling
-/// that out.
+/// The max-subtracted `log_softmax` form is the numerically stable one, and
+/// its adjoint composes to `softmax - targets`.
 pub fn softmax_cross_entropy(logits: &Tensor, targets: &Tensor, axis: u32) -> Result<Tensor> {
     require_pair(logits, targets, "softmax_cross_entropy")?;
     if axis as usize >= logits.rank() {
@@ -92,9 +86,7 @@ pub fn binary_cross_entropy_with_logits(logits: &Tensor, targets: &Tensor) -> Re
 /// ```
 ///
 /// The bracket is host data — [`BceTargets::fold`] — and the multiplier on
-/// the shared `softplus` term is [`BceTargets::softplus_weight`]. This is
-/// `trainer/src/batch.rs::fold_targets` and `trainer/src/main.rs`, moved onto
-/// this side of the API unchanged.
+/// the shared `softplus` term is [`BceTargets::softplus_weight`].
 #[derive(Copy, Clone, Debug, PartialEq)]
 pub struct BceTargets {
     /// Weight of the hard (argmax) term against the teacher's distribution.
@@ -129,9 +121,7 @@ impl BceTargets {
     /// One row of folded targets. `teacher` and `parent` are per-class
     /// probabilities; `label` indexes the hard target.
     ///
-    /// The hard term is scaled by the teacher's total in-head mass, which is
-    /// the trainer's `--mass-discounted-hard-labels` behaviour and is
-    /// unconditional there.
+    /// The hard term is scaled by the teacher's total in-head mass.
     pub fn fold(
         &self,
         teacher: &[f32],
@@ -176,7 +166,7 @@ impl BceTargets {
 /// `w` is [`BceTargets::softplus_weight`] and `z` is a row of
 /// [`BceTargets::fold`]. `rows` is the batch size the mean is taken over; it
 /// is a parameter rather than `logits.dim(0)` so a padded batch still divides
-/// by the live row count, which is what the trainer does.
+/// by the live row count.
 pub fn folded_bce_loss(
     logits: &Tensor,
     targets: &Tensor,
@@ -197,7 +187,7 @@ pub fn folded_bce_loss(
 
 /// Teacher/student distillation: the plain softplus chain.
 ///
-/// One-vs-all rather than softmax-KL, matching the trainer: the teacher's
+/// One-vs-all: the teacher's
 /// per-class probability at `temperature` is `sigmoid(teacher / T)`, and the
 /// student pays [`folded_bce_loss`] against it at the same temperature. The
 /// `T^2` factor restores the gradient scale the division removed, so the
@@ -278,10 +268,10 @@ mod tests {
 
     /// `d(loss)/d(wrt)` for a loss that is already rank 0.
     ///
-    /// Deliberately **not** `loss.sum_all()` first: `sum_all` on a rank-0
-    /// value is a reshape, and the reshape adjoint currently drops every
-    /// element but the first (see `remaining`). Seeding the rank-0 loss
-    /// directly measures this file rather than that bug.
+    /// Not `loss.sum_all()` first: `sum_all` on a rank-0 value is a reshape,
+    /// and the reshape adjoint currently drops every element but the first
+    /// (see `remaining`). Seeding the rank-0 loss directly measures this file
+    /// rather than that bug.
     fn scalar_gradient(g: &Graph, loss: &Tensor, wrt: &Tensor) -> Vec<f32> {
         let grads = g.backward_with(loss, std::slice::from_ref(wrt)).unwrap();
         read(&grads.get(wrt).expect("no gradient reached the input"))
@@ -344,8 +334,6 @@ mod tests {
         1.0 / (1.0 + (-z).exp())
     }
 
-    // -- softmax cross entropy ------------------------------------------------
-
     #[test]
     fn cross_entropy_reduces_the_axis_it_is_given() {
         let g = graph();
@@ -376,8 +364,6 @@ mod tests {
         close(-weighted, lse - row[2], 1e-6);
         close(lse - row[2], 0.232622, 1e-5);
     }
-
-    // -- binary cross entropy -------------------------------------------------
 
     #[test]
     fn bce_is_the_stable_softplus_form() {
@@ -419,8 +405,6 @@ mod tests {
         });
         assert_matches(&analytic, &numeric);
     }
-
-    // -- the folded target ----------------------------------------------------
 
     #[test]
     fn the_folded_target_is_the_trainers_bracket() {
@@ -492,8 +476,6 @@ mod tests {
         assert!(config.fold(&[0.5, 0.5, 0.0], None, 0, &mut short).is_err());
     }
 
-    // -- the folded loss ------------------------------------------------------
-
     #[test]
     fn the_folded_loss_is_the_row_mean_of_the_class_sum() {
         let g = graph();
@@ -557,8 +539,6 @@ mod tests {
         let l = upload(&g, &[6], &LOGITS);
         assert!(folded_bce_loss(&l, &l, 1.0, 0).is_err());
     }
-
-    // -- distillation ---------------------------------------------------------
 
     #[test]
     fn distillation_is_the_temperature_scaled_folded_bce() {
@@ -632,8 +612,6 @@ mod tests {
         assert!(warm < cold, "{warm} is not softer than {cold}");
     }
 
-    // -- mean squared error ---------------------------------------------------
-
     #[test]
     fn mse_is_the_mean_square_of_the_difference() {
         let g = graph();
@@ -678,8 +656,6 @@ mod tests {
         let loss = mse(&a, &upload(&g, &[6], &OTHER)).unwrap();
         close(read(&loss)[0], sum / 6.0, 1e-4);
     }
-
-    // -- refusals -------------------------------------------------------------
 
     #[test]
     fn a_loss_refuses_mismatched_shapes() {

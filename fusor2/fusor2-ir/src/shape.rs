@@ -137,7 +137,7 @@ impl StrideSpec {
     }
 }
 
-/// One windowed axis of an `L0::Window`. Kept separate from [`StrideSpec`]
+/// One windowed axis of an `Logical::Window`. Kept separate from [`StrideSpec`]
 /// because the adjoint needs `window` and `step` as *integers*: under
 /// `Dim::Sym`, injectivity of a relative stride composition is undecidable.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -331,10 +331,6 @@ pub fn singleton_spec(in_rank: usize, next_src: usize) -> StrideSpec {
     }
 }
 
-// ---------------------------------------------------------------------------
-// reshape spec derivation
-// ---------------------------------------------------------------------------
-
 /// Derive the spec vector for a reshape from `in_shape` to `out_shape`.
 ///
 /// The two shapes are walked in lockstep and split into minimal groups of
@@ -485,8 +481,7 @@ pub fn broadcast_shapes(a: &[Dim], b: &[Dim]) -> Result<Dims> {
 
 /// Whether a restride's bounds are decidable at compile time. `Const` dims
 /// are checked statically; a `Sym` records a runtime mask obligation on the
-/// node, discharged by codegen. There is no third case and no user
-/// `assume` — this preserves the invariant licensing trusted shader modules.
+/// node, discharged by codegen.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BoundsProof {
     Static,

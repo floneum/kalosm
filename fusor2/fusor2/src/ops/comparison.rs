@@ -1,7 +1,5 @@
 //! The 12 comparisons. Results are 1.0/0.0 in the operand dtype; there is no
-//! boolean dtype at L0, which is what preserves `where_cond` verbatim.
-//!
-//! `CmpOp::Ne` exists, so `ne` is one node.
+//! boolean dtype at Logical.
 
 use fusor2_ir::scalar::{CmpOp, ScalarExpr};
 
@@ -32,7 +30,7 @@ impl Tensor {
     pub fn eq_scalar(&self, s: impl Into<Scalar>) -> Result<Tensor> {
         self.cmp_scalar(CmpOp::Eq, s)
     }
-    /// `1` where `x != s`. One node: `CmpOp::Ne` is a primitive.
+    /// `1` where `x != s`.
     pub fn ne_scalar(&self, s: impl Into<Scalar>) -> Result<Tensor> {
         self.cmp_scalar(CmpOp::Ne, s)
     }

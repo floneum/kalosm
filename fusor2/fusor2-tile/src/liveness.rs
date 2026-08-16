@@ -1,4 +1,4 @@
-//! Workgroup-tile liveness over an L2 statement list. Feeds arena packing (two
+//! Workgroup-tile liveness over an Kernel statement list. Feeds arena packing (two
 //! tiles whose ranges do not overlap may share bytes) and the barrier argmin.
 //!
 //! Two workgroup tiles may share one allocation when their live ranges are
@@ -22,7 +22,7 @@
 
 use std::sync::Arc;
 
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::kernel::{
     Accumulator, Addr, CoopSrc, ElementType, KernelIr, MemoryLevel, ReduceKind, Stmt, Tile,
     TileExpr, TileExprKind, TileLiteral,
 };
@@ -95,7 +95,7 @@ pub struct TileAccess {
 /// Everything the packer and the verifier know about one tile.
 #[derive(Clone, Debug)]
 pub struct TileLiveness {
-    /// The declaration itself, so a [`fusor2_ir::ir::level2::Placement`] can
+    /// The declaration itself, so a [`fusor2_ir::ir::kernel::Placement`] can
     /// name it without a second lookup.
     pub tile: Tile,
     /// Live range after loop expansion.
@@ -349,11 +349,8 @@ pub fn analyze(ir: &KernelIr) -> LivenessInfo {
     LivenessInfo::compute(ir)
 }
 
-// ---------------------------------------------------------------------------
-// Expression traversal — shared with uniformity and the L2 verifier
-// ---------------------------------------------------------------------------
-
 /// Every tile an expression node touches directly, with how it touches it.
+/// Shared with uniformity and the Kernel verifier.
 pub fn for_each_tile(kind: &TileExprKind, f: &mut dyn FnMut(&Tile, TileUse)) {
     match kind {
         TileExprKind::LoadTile { tile, .. } => f(tile, TileUse::Read),
@@ -439,10 +436,6 @@ pub fn for_each_addr_expr(addr: &Addr, f: &mut dyn FnMut(&TileExpr)) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The walk
-// ---------------------------------------------------------------------------
-
 struct Walk {
     position: u32,
     tiles: FxHashMap<TileKeyPtr, TileLiveness>,
@@ -514,15 +507,10 @@ impl Walk {
     /// Record every tile one operand expression touches at the current
     /// position.
     ///
-    /// The expression is a **DAG**: one `TileExpr` is handed to every
-    /// consumer of its value, so a node is reached once per edge into it and
-    /// the walk is exponential in the sharing depth — a decode `sgemv_cols`
-    /// body, where one activation window feeds every column accumulator,
-    /// spent hundreds of microseconds here per lowering. Every visit of a
-    /// node at one position records the same `(tile, position, kind)`, and
-    /// duplicate accesses inform nothing downstream (the range is a min/max,
-    /// the hazard pairs dedupe on positions), so visiting each node once is
-    /// the same analysis.
+    /// The expression is a DAG, so a naive walk is exponential in the sharing
+    /// depth. Every visit of a node at one position records the same
+    /// `(tile, position, kind)` and duplicate accesses inform nothing
+    /// downstream, so visiting each node once is the same analysis.
     fn visit_expr(&mut self, expr: &TileExpr) {
         self.seen.clear();
         self.visit_expr_once(expr);
@@ -738,7 +726,7 @@ mod tests {
     use super::*;
     use crate::build::TileBuilder;
     use crate::build::fixtures;
-    use fusor2_ir::ir::level2::ScalarElement;
+    use fusor2_ir::ir::kernel::ScalarElement;
 
     #[test]
     fn top_level_barrier_separates() {
@@ -795,7 +783,7 @@ mod tests {
     #[test]
     fn a_barrier_under_an_if_is_never_recorded() {
         let mut b = TileBuilder::new();
-        let lane = b.builtin(fusor2_ir::ir::level2::Builtin::Lane);
+        let lane = b.builtin(fusor2_ir::ir::kernel::Builtin::Lane);
         let zero = b.lit_u32(0);
         let condition = b.compare(fusor2_ir::scalar::CmpOp::Gt, lane, zero);
         let guarded = b.if_then_else(condition, vec![Stmt::Barrier], Vec::new());

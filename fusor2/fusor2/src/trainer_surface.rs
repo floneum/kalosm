@@ -2,9 +2,8 @@
 //!
 //! `betlang-train` consumes fusor2 through exactly two `use` lines and never
 //! handles a `Result` from a tensor op. The shapes it depends on are restated
-//! here — the same turbofish arities, the same rank-generic helpers, the same
-//! operator expressions — and a regression is a compile error in this crate
-//! rather than in a downstream build.
+//! here — the same turbofish arities, rank-generic helpers, and operator
+//! expressions — so a regression is a compile error in this crate.
 //!
 //! Functions named `_compiles` are never called. They exist to be type-checked.
 
@@ -21,10 +20,6 @@ const EMBED: usize = 24;
 const HASH_COUNT: usize = 3;
 const POOLED: usize = 256;
 const CLASSES: usize = 48;
-
-// ---------------------------------------------------------------------------
-// model.rs
-// ---------------------------------------------------------------------------
 
 struct Params {
     flat: RawTensor<1, f32>,
@@ -240,10 +235,6 @@ fn hashed_embedding_compiles(
     })
 }
 
-// ---------------------------------------------------------------------------
-// main.rs
-// ---------------------------------------------------------------------------
-
 /// The folded distillation loss, written as one node with an analytic
 /// backward.
 fn distillation_loss_compiles(
@@ -361,10 +352,6 @@ fn profile_compiles(device: &Device) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// optim.rs
-// ---------------------------------------------------------------------------
-
 fn adamw_step_compiles(
     device: &Device,
     params: &mut Params,
@@ -412,10 +399,6 @@ fn adamw_step_compiles(
     params.flat = (decayed - update).into_concrete();
 }
 
-// ---------------------------------------------------------------------------
-// Spellings the brief enumerates that the bodies above do not reach
-// ---------------------------------------------------------------------------
-
 fn remaining_spellings_compile(device: &Device) {
     let a = RawTensor::<2, f32>::zeros(device, [2, 3]);
     let _: RawTensor<2, f32> = a.clamp(-1.0, 1.0);
@@ -449,16 +432,9 @@ fn remaining_spellings_compile(device: &Device) {
 mod tests {
     use super::*;
 
-    /// The root re-exports the trainer resolves against are now
-    /// unconditional, so the `use crate::{Device, Tensor as RawTensor, ToVec,
-    /// cat};` line at the top of this file *is* the check: delete either
-    /// re-export from `lib.rs` and this module stops compiling. Nothing is
-    /// left for a source-text pin to add — the previous one existed only
-    /// because the const-rank root sat behind a `cfg` no default build could
-    /// reach.
-    ///
-    /// What a text pin still buys: that the root exports live in `lib.rs`
-    /// rather than having migrated behind a feature again.
+    /// The `use crate::{Device, Tensor as RawTensor, ToVec, cat};` line at
+    /// the top of this file is the compile check; this text pin adds that the
+    /// root exports live in `lib.rs` rather than behind a feature.
     #[test]
     fn the_root_names_the_const_rank_tensor_unconditionally() {
         let src = include_str!("lib.rs");
@@ -540,26 +516,15 @@ mod tests {
         assert_eq!(row, [3.0, 4.0]);
     }
 
-    // -----------------------------------------------------------------------
-    // The mixed-precision half of the surface
-    //
-    // Everything above compiles the trainer's spellings. These *run* them, and
-    // they run the ones the f32 default never reaches. The `--f16` flag
-    // (`main.rs`, `config.dtype_f16`) puts the whole convolution stack in f16,
-    // and a fold on an f16 operand takes a code path a compile-only mirror
-    // cannot see: `crate::Tensor`'s folds and contractions accumulate in
-    // `Dtype::compute_dtype`, so they *return* f32 for an f16 operand and
-    // leave the narrowing cast to the caller. The const-rank facade is that
-    // caller. Before it wrote the cast, every one of these panicked.
-    // -----------------------------------------------------------------------
+    // `crate::Tensor`'s folds and contractions accumulate in
+    // `Dtype::compute_dtype`, so they return f32 for an f16 operand and leave
+    // the narrowing cast to the const-rank facade. These tests run that path.
 
     /// Every rank-reducing fold, every keepdim fold and both contractions,
     /// on an f16 operand: the result is f16, and it is the right f16.
     ///
-    /// The values are chosen to be exact in f16 (halves and small integers),
-    /// so this compares for equality rather than under a tolerance — the
-    /// question is whether the accumulator was narrowed, not whether f16
-    /// rounds.
+    /// The values are exact in f16 (halves and small integers), so this
+    /// compares for equality rather than under a tolerance.
     #[test]
     fn every_typed_fold_returns_the_operand_dtype_in_f16() {
         let _serial = crate::device::test_device_lock();
@@ -632,9 +597,8 @@ mod tests {
         assert_eq!(a.max::<1>(1usize).dtype(), crate::Dtype::BF16);
     }
 
-    /// Narrowing is exactly the accumulator promotion and nothing else: a
-    /// genuine dtype disagreement is still a panic naming both dtypes, not a
-    /// silent conversion.
+    /// A genuine dtype disagreement is still a panic naming both dtypes, not
+    /// a silent conversion.
     #[test]
     #[should_panic(expected = "value has dtype")]
     fn a_real_dtype_mismatch_is_still_reported() {
@@ -645,14 +609,9 @@ mod tests {
         let _: RawTensor<1, half::f16> = RawTensor::from_dyn(a.into_inner());
     }
 
-    /// The trainer's own `conv_stack_f16` — the literal function mirrored
-    /// from `model.rs`, not a paraphrase — run on real values.
-    ///
-    /// Its `pool` is `reshape(..).max::<3>(3)` on a `Tensor<3, half::f16>`,
-    /// which is the fold under test.
-    ///
-    /// The backward is tested too in
-    /// [`a_backward_through_the_f16_convolution_stack_reaches_the_weights`].
+    /// The trainer's own `conv_stack_f16` run on real values. Its `pool` is
+    /// `reshape(..).max::<3>(3)` on a `Tensor<3, half::f16>`, which is the
+    /// fold under test.
     #[test]
     fn the_trainers_f16_convolution_stack_computes() {
         let _serial = crate::device::test_device_lock();
@@ -731,15 +690,10 @@ mod tests {
         assert_eq!(rejoined.shape(), [1, 2, 1]);
     }
 
-    /// `betlang-train --f16`, the whole of it: the trainer's own
-    /// `conv_stack_f16` forward *and* the backward through it, landing on the
-    /// f32 masters. The pool is `reshape(..).max::<3>(3)` on an f16 operand,
-    /// so this exercises the `Max` fold adjoint.
-    ///
-    /// Gradients are compared with a wide band — three convolutions and three
-    /// gelus in f16, differentiated, compound the 11-bit mantissa a long way.
-    /// The point is that the backward exists, reaches every weight, and does not
-    /// come back zero.
+    /// The trainer's `conv_stack_f16` forward and the backward through it,
+    /// landing on the f32 masters. The pool is `reshape(..).max::<3>(3)` on
+    /// an f16 operand, so this exercises the `Max` fold adjoint. The point is
+    /// that the backward reaches every weight and does not come back zero.
     #[test]
     fn a_backward_through_the_f16_convolution_stack_reaches_the_weights() {
         let _serial = crate::device::test_device_lock();
@@ -814,8 +768,7 @@ mod tests {
 
     /// `half_weight::<R>` is `weight::<R>().cast::<f16>()`, and the cast is on
     /// the tape: a gradient taken through the f16 copy lands on the f32
-    /// master. This is the claim `model.rs` makes in a doc comment and that
-    /// the mixed-precision recipe rests on.
+    /// master.
     #[test]
     fn a_gradient_through_a_half_weight_lands_on_the_f32_master() {
         let _serial = crate::device::test_device_lock();

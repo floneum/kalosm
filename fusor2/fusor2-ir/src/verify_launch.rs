@@ -1,9 +1,9 @@
-//! `verify_l1` — the eight L1 invariants.
+//! `verify_launch` — the eight Launch invariants.
 //!
 //! 1. `Geom::legal(caps)`: lane limits and whole-fragment divisibility.
 //! 2. Workgroup footprint checked against the **exact** `arena_plan` value —
-//!    the same pure memoized function the L2 emitter uses, so there is no
-//!    estimator and therefore no L1/L2 admission mismatch.
+//!    the same pure memoized function the Kernel emitter uses, so there is no
+//!    estimator and therefore no Launch/Kernel admission mismatch.
 //! 3. A nest's write map must be injective unless the nest declares an
 //!    associative `combine`. One invariant, three jobs: scatter-add
 //!    legality, separating the four `Scatter{Add}` lowerings from an illegal
@@ -15,7 +15,7 @@
 //! 6. A composite node carries the linear schedule domain its members'
 //!    shared index space implies, rather than an unsearchable point.
 //! 7. Every node carries an `Effect`.
-//! 8. Allocation is *not* described at L1; a node claiming a buffer is an
+//! 8. Allocation is *not* described at Launch; a node claiming a buffer is an
 //!    error.
 
 use crate::carrier::SlotTy;
@@ -23,11 +23,11 @@ use crate::device::Caps;
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::ir::{Op, VerifyCtx};
-use crate::ir::level0::ScatterCombine;
-use crate::ir::level1::{
-    AccessPlan, CoopGeom, Effect, IndexSpace, L1, Operand, ScheduleDomain,
+use crate::ir::logical::ScatterCombine;
+use crate::ir::launch::{
+    AccessPlan, CoopGeom, Effect, IndexSpace, Launch, Operand, ScheduleDomain,
 };
-use crate::ir::level2::{
+use crate::ir::kernel::{
     ArenaPlanner, ElementType, MemoryLevel, ScalarElement, TileDecl, TileLayout, Tiles,
 };
 use crate::semantics::effect_of;
@@ -42,7 +42,7 @@ use std::sync::Arc;
 /// narrower memory needs the staging pass unless the device supports a
 /// mixed-precision cooperative store).
 ///
-/// **This is the single source of coop tile shapes.** `verify_l1` and
+/// **This is the single source of coop tile shapes.** `verify_launch` and
 /// `fusor2-tile`'s `domains::coop` both call it, so an admitted geometry and
 /// a planned one cannot disagree.
 pub fn coop_tiles(geom: CoopGeom, elem: ScalarElement, staging: u8) -> Tiles {
@@ -77,13 +77,13 @@ pub fn coop_tiles(geom: CoopGeom, elem: ScalarElement, staging: u8) -> Tiles {
     tiles
 }
 
-/// Verify one L1 node against `caps` and the exact arena plan.
-pub fn verify_l1(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<()> {
-    let Op::L1(op) = &cx.node.op else {
+/// Verify one Launch node against `caps` and the exact arena plan.
+pub fn verify_launch(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<()> {
+    let Op::Launch(op) = &cx.node.op else {
         return Err(Error::verify(
-            crate::ir::Level::L1,
+            crate::ir::Level::Launch,
             cx.id,
-            "verify_l1 applied to a node that is not L1",
+            "verify_launch applied to a node that is not Launch",
         ));
     };
 
@@ -121,18 +121,18 @@ pub fn verify_l1(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<()> {
             return Err(relabel(
                 cx,
                 format!(
-                    "operand {i} names a buffer offset ({}); allocation is not described at L1",
+                    "operand {i} names a buffer offset ({}); allocation is not described at Launch",
                     o.layout.offset()
                 ),
             ));
         }
     }
 
-    // The `verify_l0` constant-work tripwire, applied to the one L1 variant
+    // The `verify_l0` constant-work tripwire, applied to the one Launch variant
     // whose row comes from outside the crate. An `OpDef` registering
     // `Work { macs: 1, .. }` is exactly the reference's
     // `Attention { work: 1 }` placeholder wearing an extension hat.
-    if let L1::Ext { def, .. } = op
+    if let Launch::Ext { def, .. } = op
         && let Some(d) = cx.registry.get(*def)
     {
         let small = (d.work)(cx.operands, cx.result);
@@ -171,9 +171,9 @@ fn doubled(f: &crate::facts::ValueFacts) -> crate::facts::ValueFacts {
 /// Invariant 6: a composite node's schedule domain is the one its members'
 /// shared index space implies.
 ///
-/// A `KRegion` is a list of L1 nodes run in one dispatch over one linearized
+/// A `Region` is a list of Launch nodes run in one dispatch over one linearized
 /// index to both backends, so its geometry is
-/// [`crate::ir::level1::MapDomain::linear_over`] of the value they land, and
+/// [`crate::ir::launch::MapDomain::linear_over`] of the value they land, and
 /// nothing else. Checking it against the *node's own inferred shape* rather
 /// than against whatever the minting rule felt like is what makes the domain
 /// a property of the node instead of a field a rule may drift.
@@ -181,12 +181,12 @@ fn doubled(f: &crate::facts::ValueFacts) -> crate::facts::ValueFacts {
 /// The clause is exact rather than a bound: the mint site calls the same
 /// generator on the same facts, so an inequality is a rule that stopped
 /// deriving the domain, not a legal variation.
-fn check_composite_domain(cx: &VerifyCtx<'_>, op: &L1) -> Result<()> {
+fn check_composite_domain(cx: &VerifyCtx<'_>, op: &Launch) -> Result<()> {
     let sched = match op {
-        L1::KRegion { sched, .. } => sched,
+        Launch::Region { sched, .. } => sched,
         _ => return Ok(()),
     };
-    let want = ScheduleDomain::Map(crate::ir::level1::MapDomain::linear_over(
+    let want = ScheduleDomain::Map(crate::ir::launch::MapDomain::linear_over(
         cx.caps,
         &cx.result.shape,
     ));
@@ -205,7 +205,7 @@ fn check_composite_domain(cx: &VerifyCtx<'_>, op: &L1) -> Result<()> {
 /// as an error — but a domain *declared* empty on a node already in the
 /// graph is a legality failure, because nothing could ever select it.
 pub fn check_schedule_domain(
-    op: &L1,
+    op: &Launch,
     sched: &ScheduleDomain,
     caps: &Caps,
     planner: &dyn ArenaPlanner,
@@ -342,7 +342,7 @@ pub fn check_schedule_domain(
                     )));
                 }
                 if let Some((lanes, acc_bytes)) = carrier_lanes {
-                    let bytes = crate::ir::level1::fold_scratch_bytes(
+                    let bytes = crate::ir::launch::fold_scratch_bytes(
                         s,
                         lanes,
                         acc_bytes,
@@ -378,7 +378,7 @@ pub fn check_schedule_domain(
 /// "every surviving output-axis stride is nonzero and distinct" after
 /// dropping `Const(1)` axes, which cannot alias whatever their stride.
 pub fn check_write_injective(cx: &VerifyCtx<'_>) -> Result<()> {
-    let Op::L1(op) = &cx.node.op else {
+    let Op::Launch(op) = &cx.node.op else {
         return Ok(());
     };
     if declares_associative_combine(op) {
@@ -407,11 +407,11 @@ pub fn check_write_injective(cx: &VerifyCtx<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Invariant 4: a `KFold`'s reduced axis must be absent from the write map.
+/// Invariant 4: a `Fold`'s reduced axis must be absent from the write map.
 /// A fold dim indexing the output is a scatter, not a reduction, so the
 /// result rank has to be the space rank minus one, plus the carrier's axis.
-fn check_fold_axis_not_written(cx: &VerifyCtx<'_>, op: &L1) -> Result<()> {
-    let L1::KFold {
+fn check_fold_axis_not_written(cx: &VerifyCtx<'_>, op: &Launch) -> Result<()> {
+    let Launch::Fold {
         space,
         axis,
         carrier,
@@ -463,11 +463,11 @@ fn check_fold_axis_not_written(cx: &VerifyCtx<'_>, op: &L1) -> Result<()> {
 /// Invariant 5: each operand's `AccessPlan` satisfies its own predicate. A
 /// failure names the operand, so it disqualifies only the rewrite that
 /// produced it.
-pub fn check_operand_access(op: &L1) -> Result<()> {
+pub fn check_operand_access(op: &Launch) -> Result<()> {
     // A contraction side holds a list, and an empty one would make its `pre`
-    // a constant — a `KMap`, not a contraction, and a node the lowerings would
+    // a constant — a `Map`, not a contraction, and a node the lowerings would
     // read `ops[0]` off. `ContractSide::primary` is written against this.
-    if let L1::KContract { a, b, .. } = op {
+    if let Launch::Contract { a, b, .. } = op {
         for (side, which) in [(a, "a"), (b, "b")] {
             if side.is_empty() {
                 return Err(Error::Legality(format!(
@@ -522,15 +522,15 @@ pub fn check_operand_access(op: &L1) -> Result<()> {
     Ok(())
 }
 
-/// Invariant 7's classification: `KScatter` writing through operand 0 with
+/// Invariant 7's classification: `Scatter` writing through operand 0 with
 /// atomics or a `Set` combine mutates state; everything else is pure.
-fn expected_effect(op: &L1) -> Effect {
+fn expected_effect(op: &Launch) -> Effect {
     match op {
-        L1::KScatter { mode, combine, .. }
-            if matches!(mode, crate::ir::level1::ScatterMode::Atomic)
+        Launch::Scatter { mode, combine, .. }
+            if matches!(mode, crate::ir::launch::ScatterMode::Atomic)
                 || matches!(combine, ScatterCombine::Set) =>
         {
-            Effect::InPlace(crate::ir::level1::BufferRole(0))
+            Effect::InPlace(crate::ir::launch::BufferRole(0))
         }
         _ => Effect::Pure,
     }
@@ -610,7 +610,7 @@ fn check_vec_axes(
     // extent is 1. A `Vector` slot has a register per position and may read
     // anything. This is the clause that makes a mixed `[Scalar, Vector]`
     // accumulator safe to mint at all.
-    if let Op::L1(o) = &cx.node.op {
+    if let Op::Launch(o) = &cx.node.op {
         let ops = operands_of(o);
         let varies: Vec<bool> = ops
             .iter()
@@ -644,7 +644,7 @@ fn check_vec_axes(
 
     // No expression may name a coordinate outside the ITERATION domain.
     //
-    // Every `ScalarExpr` on a `KFold` is written against `iter_space()`, so the
+    // Every `ScalarExpr` on a `Fold` is written against `iter_space()`, so the
     // legal indices are `0..iter_rank` and a promoted axis is simply not
     // nameable — that is the content of the rebinding. Asking instead whether
     // an expression reads `IndexOf(a)` for `a` a **space** index is one
@@ -716,7 +716,7 @@ fn operand_varies_along(o: &Operand, space: &IndexSpace, axis: u32) -> Option<bo
 }
 
 fn cx_post_reads(cx: &VerifyCtx<'_>, axis: u32) -> bool {
-    let Op::L1(L1::KFold { post, .. }) = &cx.node.op else {
+    let Op::Launch(Launch::Fold { post, .. }) = &cx.node.op else {
         return false;
     };
     post.iter().any(|e| reads_index_of(e, axis))
@@ -741,23 +741,23 @@ fn reads_index_of(e: &crate::scalar::ScalarExpr, axis: u32) -> bool {
 }
 
 fn relabel(cx: &VerifyCtx<'_>, msg: String) -> Error {
-    Error::verify(crate::ir::Level::L1, cx.id, msg)
+    Error::verify(crate::ir::Level::Launch, cx.id, msg)
 }
 
-fn declares_associative_combine(op: &L1) -> bool {
+fn declares_associative_combine(op: &Launch) -> bool {
     match op {
         // Associativity is declared on the carrier, not derived from a name:
         // a non-associative carrier is legal but may not be tree-reduced.
-        L1::KFold { carrier, .. } => carrier.associative,
-        L1::KScatter { combine, .. } => matches!(combine, ScatterCombine::Add),
+        Launch::Fold { carrier, .. } => carrier.associative,
+        Launch::Scatter { combine, .. } => matches!(combine, ScatterCombine::Add),
         _ => false,
     }
 }
 
-fn write_layout(op: &L1, cx: &VerifyCtx<'_>) -> Layout {
+fn write_layout(op: &Launch, cx: &VerifyCtx<'_>) -> Layout {
     match op {
         // A scatter writes through its base operand's layout.
-        L1::KScatter { ops, .. } => ops
+        Launch::Scatter { ops, .. } => ops
             .first()
             .map(|o| o.layout.clone())
             .unwrap_or_else(|| Layout::contiguous(&cx.result.shape)),
@@ -765,48 +765,48 @@ fn write_layout(op: &L1, cx: &VerifyCtx<'_>) -> Layout {
     }
 }
 
-fn index_space_of(op: &L1) -> Option<&IndexSpace> {
+fn index_space_of(op: &Launch) -> Option<&IndexSpace> {
     match op {
-        L1::KMap { space, .. }
-        | L1::KFold { space, .. }
-        | L1::KGather { space, .. }
-        | L1::KScatter { space, .. } => Some(space),
+        Launch::Map { space, .. }
+        | Launch::Fold { space, .. }
+        | Launch::Gather { space, .. }
+        | Launch::Scatter { space, .. } => Some(space),
         _ => None,
     }
 }
 
 /// Every `Operand` a node carries, in `children_of` order.
-fn operands_of(op: &L1) -> Vec<Operand> {
+fn operands_of(op: &Launch) -> Vec<Operand> {
     match op {
-        L1::KMap { ops, .. }
-        | L1::KFold { ops, .. }
-        | L1::KGather { ops, .. }
-        | L1::KScatter { ops, .. }
-        | L1::Ext { ops, .. } => ops.clone(),
-        L1::KContract { a, b, .. } => a.ops.iter().chain(b.ops.iter()).cloned().collect(),
-        L1::KRegion { .. } => Vec::new(),
+        Launch::Map { ops, .. }
+        | Launch::Fold { ops, .. }
+        | Launch::Gather { ops, .. }
+        | Launch::Scatter { ops, .. }
+        | Launch::Ext { ops, .. } => ops.clone(),
+        Launch::Contract { a, b, .. } => a.ops.iter().chain(b.ops.iter()).cloned().collect(),
+        Launch::Region { .. } => Vec::new(),
     }
 }
 
 /// The element a node stores, which is what a staged coop tile holds.
-/// A `KFold`'s `(accumulator lanes, bytes per lane)`, or `None` when the node
+/// A `Fold`'s `(accumulator lanes, bytes per lane)`, or `None` when the node
 /// is not a fold or its carrier's lane count is symbolic.
 ///
 /// A symbolic `Vector` slot extent is allocatable on neither backend, and
 /// `verify_l0` clause 3 already rejects one, so `None` here means "not a
 /// fold" in every graph that got this far.
-fn fold_carrier_lanes(op: &L1) -> Option<(u64, u64)> {
+fn fold_carrier_lanes(op: &Launch) -> Option<(u64, u64)> {
     match op {
-        L1::KFold { carrier, acc, .. } => Some((carrier.lanes()?, acc.byte_size())),
+        Launch::Fold { carrier, acc, .. } => Some((carrier.lanes()?, acc.byte_size())),
         _ => None,
     }
 }
 
-fn store_dtype(op: &L1) -> Dtype {
+fn store_dtype(op: &Launch) -> Dtype {
     match op {
-        L1::KMap { body, .. } => body.dtype(),
-        L1::KFold { acc, .. } => *acc,
-        L1::KContract { post, .. } => post.dtype(),
+        Launch::Map { body, .. } => body.dtype(),
+        Launch::Fold { acc, .. } => *acc,
+        Launch::Contract { post, .. } => post.dtype(),
         _ => Dtype::F32,
     }
 }
@@ -830,10 +830,10 @@ mod tests {
     use crate::ir::OpDef;
     use crate::carrier::Carrier;
     use crate::scalar::BinOp;
-    use crate::ir::level1::{
+    use crate::ir::launch::{
         BufferRole, ContractSide, Family, MapDomain, ScatterMode,
     };
-    use crate::ir::level2::{ArenaMode, ArenaPlan, BarrierSuggestion, KernelIr};
+    use crate::ir::kernel::{ArenaMode, ArenaPlan, BarrierSuggestion, KernelIr};
     use crate::ir::{Level, Node, Op, OpDefRegistry};
     use crate::scalar::ScalarExpr;
     use smallvec::smallvec;
@@ -906,21 +906,21 @@ mod tests {
         }
     }
 
-    fn run(op: L1, operands: &[ValueFacts], result: &ValueFacts) -> Result<()> {
+    fn run(op: Launch, operands: &[ValueFacts], result: &ValueFacts) -> Result<()> {
         run_with(op, operands, result, &OpDefRegistry::new())
     }
 
     fn run_with(
-        op: L1,
+        op: Launch,
         operands: &[ValueFacts],
         result: &ValueFacts,
         registry: &OpDefRegistry,
     ) -> Result<()> {
         let caps = caps();
         let node = Node {
-            children: crate::semantics::children::children_l1(&op),
-            op: Op::L1(op),
-            level: Level::L1,
+            children: crate::semantics::children::children_launch(&op),
+            op: Op::Launch(op),
+            level: Level::Launch,
         };
         let cx = VerifyCtx {
             node: &node,
@@ -930,7 +930,7 @@ mod tests {
             caps: &caps,
             registry,
         };
-        verify_l1(&cx, &SumPlanner)
+        verify_launch(&cx, &SumPlanner)
     }
 
     /// **A `Scalar` slot may not read an operand that varies along a promoted
@@ -979,7 +979,7 @@ mod tests {
             layout: Layout::contiguous(&[Dim::Const(2), Dim::Const(3), Dim::Const(4)]),
             access: AccessPlan::Alias,
         };
-        let build = |lift0: ScalarExpr, ops: Vec<Operand>| L1::KFold {
+        let build = |lift0: ScalarExpr, ops: Vec<Operand>| Launch::Fold {
             space: space.clone(),
             axis: 2,
             vec_axes: smallvec![1],
@@ -1074,12 +1074,12 @@ mod tests {
             rg: 2,
             cg: 2,
         };
-        let domain = crate::ir::level1::CoopDomain {
+        let domain = crate::ir::launch::CoopDomain {
             geoms: smallvec![geom],
             splits: smallvec![1],
             staging: smallvec![1],
         };
-        let op = L1::KContract {
+        let op = Launch::Contract {
             m: Dim::Const(64),
             n: Dim::Const(64),
             k: Dim::Const(64),
@@ -1105,7 +1105,7 @@ mod tests {
 
     #[test]
     fn an_empty_schedule_domain_is_illegal() {
-        let op = L1::KContract {
+        let op = Launch::Contract {
             m: Dim::Const(4),
             n: Dim::Const(4),
             k: Dim::Const(4),
@@ -1134,13 +1134,13 @@ mod tests {
     fn a_promoted_fold_carrier_over_the_workgroup_limit_is_refused() {
         let caps = caps();
         let max_storage = u64::from(caps.limits.max_compute_workgroup_storage_size);
-        let strat = crate::ir::level1::FoldStrat::WgTree { lane_group: 32 };
-        let block = u64::from(crate::ir::level1::emitted_block(32, &caps));
+        let strat = crate::ir::launch::FoldStrat::WgTree { lane_group: 32 };
+        let block = u64::from(crate::ir::launch::emitted_block(32, &caps));
         // The exact number of f32 lanes that saturates the limit.
         let fits = max_storage / (block * 4);
         assert!(fits > 1, "the device must admit more than one lane");
 
-        let build = |lanes: u64| L1::KFold {
+        let build = |lanes: u64| Launch::Fold {
             space: IndexSpace::new([Dim::Const(4), Dim::Const(lanes), Dim::Const(8)]),
             axis: 2,
             vec_axes: smallvec![1],
@@ -1154,7 +1154,7 @@ mod tests {
             acc: Dtype::F32,
             post: smallvec::smallvec![ScalarExpr::arg(0, Dtype::F32)],
             ops: vec![operand(0, &[4, lanes, 8])],
-            sched: ScheduleDomain::Fold(crate::ir::level1::FoldDomain {
+            sched: ScheduleDomain::Fold(crate::ir::launch::FoldDomain {
                 strategies: smallvec![strat],
             }),
         };
@@ -1180,7 +1180,7 @@ mod tests {
     fn a_scalar_fold_carrier_is_unaffected_by_the_footprint_clause() {
         let caps = caps();
         for lane_group in [1u32, 32, 64, 256] {
-            let op = L1::KFold {
+            let op = Launch::Fold {
                 space: IndexSpace::new([Dim::Const(4), Dim::Const(8)]),
                 axis: 1,
                 vec_axes: smallvec::SmallVec::new(),
@@ -1192,8 +1192,8 @@ mod tests {
                 acc: Dtype::F32,
                 post: smallvec::smallvec![ScalarExpr::arg(0, Dtype::F32)],
                 ops: vec![operand(0, &[4, 8])],
-                sched: ScheduleDomain::Fold(crate::ir::level1::FoldDomain {
-                    strategies: smallvec![crate::ir::level1::FoldStrat::WgTree { lane_group }],
+                sched: ScheduleDomain::Fold(crate::ir::launch::FoldDomain {
+                    strategies: smallvec![crate::ir::launch::FoldStrat::WgTree { lane_group }],
                 }),
             };
             check_schedule_domain(&op, op.schedule().unwrap(), &caps, &SumPlanner)
@@ -1205,7 +1205,7 @@ mod tests {
 
     #[test]
     fn a_fold_axis_in_the_write_map_is_rejected() {
-        let good = L1::KFold {
+        let good = Launch::Fold {
             space: IndexSpace::new([Dim::Const(4), Dim::Const(8)]),
             axis: 1,
             vec_axes: smallvec::SmallVec::new(),
@@ -1229,9 +1229,9 @@ mod tests {
 
     #[test]
     fn write_map_injectivity() {
-        // A `KMap` whose result has two axes of the same extent is still
+        // A `Map` whose result has two axes of the same extent is still
         // injective: contiguous strides differ.
-        let op = L1::KMap {
+        let op = Launch::Map {
             space: IndexSpace::new([Dim::Const(4), Dim::Const(4)]),
             body: ScalarExpr::arg(0, Dtype::F32),
             ops: vec![operand(0, &[4, 4])],
@@ -1250,7 +1250,7 @@ mod tests {
             .unwrap(),
             access: AccessPlan::Alias,
         };
-        let scatter = L1::KScatter {
+        let scatter = Launch::Scatter {
             space: IndexSpace::new([Dim::Const(4), Dim::Const(4)]),
             axis: 0,
             mode: ScatterMode::SortSegment,
@@ -1268,7 +1268,7 @@ mod tests {
         );
 
         // The same non-injective write is legal under an associative combine.
-        let add = L1::KScatter {
+        let add = Launch::Scatter {
             space: IndexSpace::new([Dim::Const(4), Dim::Const(4)]),
             axis: 0,
             mode: ScatterMode::SortSegment,
@@ -1288,7 +1288,7 @@ mod tests {
 
     #[test]
     fn effect_classification() {
-        let atomic = L1::KScatter {
+        let atomic = Launch::Scatter {
             space: IndexSpace::new([Dim::Const(4)]),
             axis: 0,
             mode: ScatterMode::Atomic,
@@ -1297,18 +1297,18 @@ mod tests {
             sched: ScheduleDomain::Point,
         };
         assert_eq!(
-            effect_of(&Op::L1(atomic.clone())),
+            effect_of(&Op::Launch(atomic.clone())),
             Effect::InPlace(BufferRole(0))
         );
         run(atomic, &[f32s(&[4]), f32s(&[4]), f32s(&[4])], &f32s(&[4])).unwrap();
 
-        let map = L1::KMap {
+        let map = Launch::Map {
             space: IndexSpace::new([Dim::Const(4)]),
             body: ScalarExpr::arg(0, Dtype::F32),
             ops: vec![operand(0, &[4])],
             sched: ScheduleDomain::Point,
         };
-        assert_eq!(effect_of(&Op::L1(map)), Effect::Pure);
+        assert_eq!(effect_of(&Op::Launch(map)), Effect::Pure);
     }
 
     /// A composite whose domain is not the one its members' shared index
@@ -1318,14 +1318,14 @@ mod tests {
     #[test]
     fn a_composite_carrying_a_foreign_domain_is_refused() {
         let members = smallvec::smallvec![Id(1), Id(2)];
-        let good = L1::KRegion {
+        let good = Launch::Region {
             members: members.clone(),
             live_outs: smallvec::smallvec![0],
             sched: ScheduleDomain::Map(MapDomain::linear_over(&caps(), &f32s(&[4, 4]).shape)),
         };
         run(good, &[f32s(&[4, 4]), f32s(&[4, 4])], &f32s(&[4, 4])).unwrap();
 
-        let stale = L1::KRegion {
+        let stale = Launch::Region {
             members: members.clone(),
             live_outs: smallvec::smallvec![0],
             sched: ScheduleDomain::Point,
@@ -1335,7 +1335,7 @@ mod tests {
         // And a domain derived from the wrong extent: `[4, 4]` is 16
         // elements, which at a 32-wide subgroup affords no tile at all, so a
         // domain generated for 8192 offers points this node cannot fill.
-        let wrong_shape = L1::KRegion {
+        let wrong_shape = Launch::Region {
             members,
             live_outs: smallvec::smallvec![0],
             sched: ScheduleDomain::Map(MapDomain::linear(&caps(), 8192)),
@@ -1356,7 +1356,7 @@ mod tests {
                     .unwrap(),
             },
         };
-        let op = L1::KMap {
+        let op = Launch::Map {
             space: IndexSpace::new([Dim::Const(4)]),
             body: ScalarExpr::arg(0, Dtype::F32),
             ops: vec![packed],
@@ -1371,7 +1371,7 @@ mod tests {
             layout: Layout::contiguous(&[Dim::Const(4)]),
             access: AccessPlan::Unflatten(crate::shape::MultiFlattenMap::affine(&[2, 2], &[2, 1])),
         };
-        let op = L1::KMap {
+        let op = Launch::Map {
             space: IndexSpace::new([Dim::Const(4)]),
             body: ScalarExpr::arg(0, Dtype::F32),
             ops: vec![unflat],
@@ -1385,7 +1385,7 @@ mod tests {
             layout: Layout::contiguous(&[Dim::Const(9)]),
             access: AccessPlan::Gather,
         };
-        let op = L1::KMap {
+        let op = Launch::Map {
             space: IndexSpace::new([Dim::Const(4)]),
             body: ScalarExpr::arg(0, Dtype::F32),
             ops: vec![gather],
@@ -1430,7 +1430,7 @@ mod tests {
         let bad = registry.register(def("top_k_placeholder", constant));
         let good = registry.register(def("top_k", real));
 
-        let ext = |d| L1::Ext {
+        let ext = |d| Launch::Ext {
             def: d,
             ops: vec![operand(0, &[4])],
             attrs: crate::ir::AttrId(0),
@@ -1448,7 +1448,7 @@ mod tests {
             layout: Layout::from_parts(Dim::Const(64), &[Dim::Const(4)], &[Dim::Const(1)]).unwrap(),
             access: AccessPlan::Alias,
         };
-        let op = L1::KMap {
+        let op = Launch::Map {
             space: IndexSpace::new([Dim::Const(4)]),
             body: ScalarExpr::arg(0, Dtype::F32),
             ops: vec![offset],

@@ -9,7 +9,7 @@ pub mod gather;
 pub mod scatter;
 
 use fusor2_ir::egraph::{Builder, Facts, Id, Rule, RuleTag};
-use fusor2_ir::ir::level1::{L1, Operand, ScheduleDomain};
+use fusor2_ir::ir::launch::{Launch, Operand, ScheduleDomain};
 use fusor2_ir::ir::{Level, Node, Op, OpTag};
 use fusor2_ir::rule;
 
@@ -17,53 +17,44 @@ use crate::domains::{DomainCtx, default_planner, fold_domain_for, map_domain};
 
 rule!(
     TILE_FOLD,
-    level = Level::L1,
-    head = OpTag::KFold,
+    level = Level::Launch,
+    head = OpTag::LaunchFold,
     tag = RuleTag::Additive,
     apply = tile_fold,
 );
 
 rule!(
     TILE_GATHER,
-    level = Level::L1,
-    head = OpTag::KGather,
+    level = Level::Launch,
+    head = OpTag::LaunchGather,
     tag = RuleTag::Additive,
     apply = tile_gather,
 );
 
 rule!(
     TILE_SCATTER,
-    level = Level::L1,
-    head = OpTag::KScatter,
+    level = Level::Launch,
+    head = OpTag::LaunchScatter,
     tag = RuleTag::Additive,
     apply = tile_scatter,
 );
 
-/// Attach the complete legal reduction domain to a `KFold` that arrived
+/// Attach the complete legal reduction domain to a `Fold` that arrived
 /// carrying [`ScheduleDomain::Point`].
 ///
 /// The floor lowering (`fusor2-ir`) cannot generate one: schedule domains are
-/// filtered by the exact arena footprint, which lives here. So every fold in
-/// the system reaches extraction with **no schedule decision to make** unless
-/// this rule mints it — the reduction strategy and the lane-group width would
-/// be the emitter's default rather than a selection, which is the same failure
-/// as writing a decision into a data structure the next decision cannot
-/// un-write.
+/// filtered by the exact arena footprint, which lives here.
 ///
-/// The domain is generated for **this carrier's** lane count, so a wide
+/// The domain is generated for this carrier's lane count, so a wide
 /// accumulator is filtered by workgroup storage rather than admitted and
 /// crashed at `verify_plan`. An empty domain means the rule does not apply,
 /// never that the node is broken.
 ///
-/// **Promoted folds included.** `space = free.. ++ vec.. ++ [reduced]` — the
-/// shape PROMOTE mints and the one a multi-slot carrier lands in — is a fold
-/// like any other here; both backends lower it per promoted position, and its
-/// `lanes` is what the footprint clause reads. Measured on the conformance
-/// suite: 9,101 promoted folds now arrive at extraction with a 10- to
-/// 17-strategy domain instead of `ScheduleDomain::Point`.
+/// Promoted folds included: `space = free.. ++ vec.. ++ [reduced]` is a fold
+/// like any other here; both backends lower it per promoted position.
 pub fn tile_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::L1(l1) = &node.op else { return None };
-    let L1::KFold {
+    let Op::Launch(l1) = &node.op else { return None };
+    let Launch::Fold {
         space,
         axis,
         vec_axes,
@@ -75,20 +66,11 @@ pub fn tile_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opt
     else {
         return None;
     };
-    // The one precondition a promoted fold — one whose accumulator holds a
-    // free axis — still carries, stated exactly as both backends state it.
-    // `lower_kfold_carrier` and `lower_fold_carrier` now address operands per
-    // vector position, so a promoted nest lowers on both; what neither lowers
-    // is a promoted nest whose reduced axis is not last, because the address
-    // arithmetic reads one output row as `vec_extent * axis_extent`
-    // consecutive elements and that identity is what makes `space` be
-    // `free.. ++ vec.. ++ [reduced]`. Both refuse it with an honest `Err`
-    // ("a promoted KFold whose reduced axis is not last is not lowered").
-    //
-    // Declining there and pricing here is the failure mode gate 3 names —
-    // admissible on paper, unselectable in fact, except worse, because a
-    // priced schedule point makes extraction *prefer* the plan that then
-    // fails at lowering instead of at admission.
+    // Neither backend lowers a promoted nest whose reduced axis is not last:
+    // the address arithmetic reads one output row as
+    // `vec_extent * axis_extent` consecutive elements. Pricing a schedule
+    // point for it would make extraction prefer a plan that fails at
+    // lowering.
     if !vec_axes.is_empty() && *axis as usize + 1 != space.rank() {
         return None;
     }
@@ -107,10 +89,10 @@ pub fn tile_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opt
     }
 
     let mut rebuilt = l1.clone();
-    if let L1::KFold { sched, .. } = &mut rebuilt {
+    if let Launch::Fold { sched, .. } = &mut rebuilt {
         *sched = ScheduleDomain::Fold(dom);
     }
-    let new = b.add_l1(rebuilt).ok()?;
+    let new = b.add_launch(rebuilt).ok()?;
     b.union(id, new).ok()?;
     Some(new)
 }
@@ -118,34 +100,23 @@ pub fn tile_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opt
 /// The accesses of a node's operand list, as the map-domain generator reads
 /// them: a per-lane gather has no vector load to widen into, so it forbids a
 /// vectorized tiling. Legality, not preference.
-fn accesses(ops: &[Operand]) -> Vec<fusor2_ir::ir::level1::AccessPlan> {
+fn accesses(ops: &[Operand]) -> Vec<fusor2_ir::ir::launch::AccessPlan> {
     ops.iter().map(|o| o.access.clone()).collect()
 }
 
-/// Attach the elementwise tiling domain to a floor-lowered `KGather`,
-/// **without touching `mode`**.
+/// Attach the elementwise tiling domain to a floor-lowered `Gather`,
+/// without touching `mode`.
 ///
-/// `gather::GATHER_*` mint a mode and a domain together, so a plan that wants
-/// the floor's mode gets no domain at all: the mode and the schedule were one
-/// pre-committed choice. Splitting them is what makes both late decisions.
+/// `gather::GATHER_*` mint a mode and a domain together; splitting them makes
+/// both late decisions.
 ///
-/// **Why there is no `TILE_MAP` beside this.** A `KMap` is the most common
-/// node in every graph, and the same rewrite applied to it is a measured
-/// regression rather than a missing decision. On one five-root graph
-/// (softmax, rms_norm, a `[64,512]x[512,64]` matmul, an `index_select` and a
-/// `scatter_add`) the extracted plan went from **15 launches and 29,936 bytes
-/// to 19 launches and 38,128 bytes**, with graph nodes 637 -> 769 and rule
-/// applications 3,453 -> 4,580, on a graph that already does not saturate
-/// inside `MAX_ROUNDS`. The cause is structural: a schedule domain minted as
-/// an *additive alternative* is a second node in the class, so the extractor's
-/// fixed move budget is spent on `RESELECT` between two nodes that differ only
-/// in a field the `RESCHEDULE` move already ranges over. Gather and scatter
-/// are one node each per program and cost nothing measurable; a `KMap` domain
-/// has to be attached where the node is minted (`lower_floor.rs`) so it
-/// replaces `ScheduleDomain::Point` instead of competing with it.
+/// There is deliberately no `TILE_MAP` beside this: a `Map` domain minted as
+/// an additive alternative measurably regresses extraction, and has to be
+/// attached where the node is minted (`lower_floor.rs`) so it replaces
+/// `ScheduleDomain::Point` instead of competing with it.
 pub fn tile_gather(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::L1(l1) = &node.op else { return None };
-    let L1::KGather {
+    let Op::Launch(l1) = &node.op else { return None };
+    let Launch::Gather {
         space,
         ops,
         sched: ScheduleDomain::Point,
@@ -163,25 +134,22 @@ pub fn tile_gather(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> O
         return None;
     }
     let mut rebuilt = l1.clone();
-    if let L1::KGather { sched, .. } = &mut rebuilt {
+    if let Launch::Gather { sched, .. } = &mut rebuilt {
         *sched = ScheduleDomain::Map(dom);
     }
-    let new = b.add_l1(rebuilt).ok()?;
+    let new = b.add_launch(rebuilt).ok()?;
     b.union(id, new).ok()?;
     Some(new)
 }
 
-/// Attach the elementwise tiling domain to a floor-lowered `KScatter`,
-/// **without touching `mode`**.
+/// Attach the elementwise tiling domain to a floor-lowered `Scatter`,
+/// without touching `mode`.
 ///
-/// Same split as [`tile_gather`]: `scatter::SCATTER_*` mint one of the two
-/// modes together with a domain, so `ScatterMode` was a choice pre-committed
-/// on the node for anything that reached extraction on the floor's mode. Both
-/// lowerings still coexist and still compete on cost; this only stops the
-/// floor's mode from being the one alternative with no schedule.
+/// Same split as [`tile_gather`]: this only stops the floor's mode from
+/// being the one alternative with no schedule.
 pub fn tile_scatter(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::L1(l1) = &node.op else { return None };
-    let L1::KScatter {
+    let Op::Launch(l1) = &node.op else { return None };
+    let Launch::Scatter {
         space,
         ops,
         sched: ScheduleDomain::Point,
@@ -199,22 +167,19 @@ pub fn tile_scatter(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
         return None;
     }
     let mut rebuilt = l1.clone();
-    if let L1::KScatter { sched, .. } = &mut rebuilt {
+    if let Launch::Scatter { sched, .. } = &mut rebuilt {
         *sched = ScheduleDomain::Map(dom);
     }
-    let new = b.add_l1(rebuilt).ok()?;
+    let new = b.add_launch(rebuilt).ok()?;
     b.union(id, new).ok()?;
     Some(new)
 }
 
-/// Every rule `fusor2-tile` owns, in a fixed declaration order.
-/// **Order carries no semantics**; it exists only so a run is
-/// reproducible.
+/// Every rule `fusor2-tile` owns, in a fixed declaration order. Order carries
+/// no semantics; it exists only so a run is reproducible.
 pub static TILE_RULES: &[Rule] = &[
-    // reduction: the domain a floor-lowered fold arrives without
     TILE_FOLD,
-    // gather and scatter: the schedule, split from the mode. `KMap` is
-    // deliberately absent — see the note above `tile_gather`.
+    // `Map` is deliberately absent — see the note above `tile_gather`.
     TILE_GATHER,
     TILE_SCATTER,
     contract::LOWER_COOP,
@@ -245,11 +210,11 @@ pub(crate) mod testing {
     use fusor2_ir::dtype::Dtype;
     use fusor2_ir::egraph::{EGraph, Id};
     use fusor2_ir::facts::{ValueFacts, Work};
-    use fusor2_ir::ir::level0::{
-        BufferId, EinSpec, L0, Label, LeafKind, ScatterCombine,
+    use fusor2_ir::ir::logical::{
+        BufferId, EinSpec, Logical, Label, LeafKind, ScatterCombine,
     };
-    use fusor2_ir::ir::level1::{
-        Effect, L1, Operand, ScheduleDomain,
+    use fusor2_ir::ir::launch::{
+        Effect, Launch, Operand, ScheduleDomain,
     };
     use fusor2_ir::ir::{Children, Op, Semantics, VerifyCtx};
     use fusor2_ir::scalar::ScalarExpr;
@@ -267,31 +232,31 @@ pub(crate) mod testing {
         fn children(&self, op: &Op) -> Children {
             match op {
                 Op::Union(a, b) => smallvec![*a, *b],
-                Op::L0(l0) => match l0 {
-                    L0::Leaf(_) => Children::new(),
-                    L0::Map { ins, .. } | L0::Fold { ins, .. } => {
+                Op::Logical(l0) => match l0 {
+                    Logical::Leaf(_) => Children::new(),
+                    Logical::Map { ins, .. } | Logical::Fold { ins, .. } => {
                         ins.iter().copied().collect()
                     }
-                    L0::Restride { x, .. }
-                    | L0::Window { x, .. }
-                    | L0::Dequant { x, .. }
-                    | L0::Project { x, .. } => smallvec![*x],
-                    L0::Contract { a, b, .. } => smallvec![*a, *b],
-                    L0::Gather { x, idx, .. } => smallvec![*x, *idx],
-                    L0::Scatter {
+                    Logical::Restride { x, .. }
+                    | Logical::Window { x, .. }
+                    | Logical::Dequant { x, .. }
+                    | Logical::Project { x, .. } => smallvec![*x],
+                    Logical::Contract { a, b, .. } => smallvec![*a, *b],
+                    Logical::Gather { x, idx, .. } => smallvec![*x, *idx],
+                    Logical::Scatter {
                         base, idx, upd, ..
                     } => smallvec![*base, *idx, *upd],
                 },
-                Op::L1(l1) => match l1 {
-                    L1::KMap { ops, .. }
-                    | L1::KFold { ops, .. }
-                    | L1::KGather { ops, .. }
-                    | L1::KScatter { ops, .. }
-                    | L1::Ext { ops, .. } => ops_children(ops),
-                    L1::KContract { a, b, .. } => {
+                Op::Launch(l1) => match l1 {
+                    Launch::Map { ops, .. }
+                    | Launch::Fold { ops, .. }
+                    | Launch::Gather { ops, .. }
+                    | Launch::Scatter { ops, .. }
+                    | Launch::Ext { ops, .. } => ops_children(ops),
+                    Launch::Contract { a, b, .. } => {
                         a.ops.iter().chain(b.ops.iter()).map(|o| o.src).collect()
                     }
-                    L1::KRegion { members, .. } => members.iter().copied().collect(),
+                    Launch::Region { members, .. } => members.iter().copied().collect(),
                 },
             }
         }
@@ -300,36 +265,36 @@ pub(crate) mod testing {
             let first = || ins.first().cloned().unwrap_or(ValueFacts::new(Dtype::F32, []));
             Ok(match op {
                 Op::Union(..) => first(),
-                Op::L0(l0) => match l0 {
-                    L0::Leaf(LeafKind::Buffer { dtype, shape, .. })
-                    | L0::Leaf(LeafKind::Param { dtype, shape, .. }) => {
+                Op::Logical(l0) => match l0 {
+                    Logical::Leaf(LeafKind::Buffer { dtype, shape, .. })
+                    | Logical::Leaf(LeafKind::Param { dtype, shape, .. }) => {
                         ValueFacts::new(*dtype, shape.iter().copied())
                     }
-                    L0::Leaf(LeafKind::Const { value, shape }) => {
+                    Logical::Leaf(LeafKind::Const { value, shape }) => {
                         ValueFacts::new(value.dtype(), shape.iter().copied())
                     }
-                    L0::Leaf(LeafKind::Uniform { dtype, .. }) => ValueFacts::new(*dtype, []),
-                    L0::Leaf(LeafKind::Quantized { fmt, shape, .. }) => {
+                    Logical::Leaf(LeafKind::Uniform { dtype, .. }) => ValueFacts::new(*dtype, []),
+                    Logical::Leaf(LeafKind::Quantized { fmt, shape, .. }) => {
                         ValueFacts::new(Dtype::Q(*fmt), shape.iter().copied())
                     }
-                    L0::Map { expr, .. } => {
+                    Logical::Map { expr, .. } => {
                         ValueFacts::new(expr.dtype(), first().shape.iter().copied())
                     }
-                    L0::Fold { acc, axis, .. } => {
+                    Logical::Fold { acc, axis, .. } => {
                         let mut shape = first().shape;
                         if (*axis as usize) < shape.len() {
                             shape.remove(*axis as usize);
                         }
                         ValueFacts::new(*acc, shape)
                     }
-                    L0::Contract { spec, acc, .. } => {
+                    Logical::Contract { spec, acc, .. } => {
                         ValueFacts::new(*acc, out_shape(spec, ins))
                     }
-                    L0::Restride { specs, .. } => {
+                    Logical::Restride { specs, .. } => {
                         ValueFacts::new(first().dtype, specs.iter().map(|s| s.size))
                     }
-                    L0::Window { .. } | L0::Project { .. } => first(),
-                    L0::Gather { axis, .. } => {
+                    Logical::Window { .. } | Logical::Project { .. } => first(),
+                    Logical::Gather { axis, .. } => {
                         let x = first();
                         let mut shape = x.shape.clone();
                         if let (Some(slot), Some(idx)) =
@@ -340,16 +305,16 @@ pub(crate) mod testing {
                         }
                         ValueFacts::new(dense(x.dtype), shape)
                     }
-                    L0::Scatter { .. } => first(),
-                    L0::Dequant { .. } => {
+                    Logical::Scatter { .. } => first(),
+                    Logical::Dequant { .. } => {
                         ValueFacts::new(Dtype::F32, first().shape.iter().copied())
                     }
                 },
-                Op::L1(l1) => match l1 {
-                    L1::KMap { body, space, .. } => {
+                Op::Launch(l1) => match l1 {
+                    Launch::Map { body, space, .. } => {
                         ValueFacts::new(body.dtype(), space.dims.iter().copied())
                     }
-                    L1::KFold {
+                    Launch::Fold {
                         acc,
                         space,
                         axis,
@@ -371,14 +336,14 @@ pub(crate) mod testing {
                         }
                         ValueFacts::new(*acc, dims)
                     }
-                    L1::KContract {
+                    Launch::Contract {
                         m, n, batch, post, ..
                     } => ValueFacts::new(post.dtype(), [*batch, *m, *n]),
-                    L1::KGather { space, .. } => {
+                    Launch::Gather { space, .. } => {
                         ValueFacts::new(dense(first().dtype), space.dims.iter().copied())
                     }
-                    L1::KScatter { .. } => first(),
-                    L1::KRegion { .. } | L1::Ext { .. } => first(),
+                    Launch::Scatter { .. } => first(),
+                    Launch::Region { .. } | Launch::Ext { .. } => first(),
                 },
             })
         }
@@ -400,10 +365,10 @@ pub(crate) mod testing {
 
         fn effect(&self, op: &Op) -> Effect {
             match op {
-                Op::L1(L1::KScatter { mode, .. })
-                    if *mode == fusor2_ir::ir::level1::ScatterMode::Atomic =>
+                Op::Launch(Launch::Scatter { mode, .. })
+                    if *mode == fusor2_ir::ir::launch::ScatterMode::Atomic =>
                 {
-                    Effect::InPlace(fusor2_ir::ir::level1::BufferRole(0))
+                    Effect::InPlace(fusor2_ir::ir::launch::BufferRole(0))
                 }
                 _ => Effect::Pure,
             }
@@ -463,7 +428,7 @@ pub(crate) mod testing {
         pub fn buffer_dims(&mut self, dtype: Dtype, shape: &[Dim]) -> Id {
             let name = self.name();
             self.graph
-                .add(Op::L0(L0::Leaf(LeafKind::Buffer {
+                .add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
                     name,
                     dtype,
                     shape: shape.iter().copied().collect(),
@@ -473,7 +438,7 @@ pub(crate) mod testing {
 
         pub fn contract(&mut self, spec: EinSpec, acc: Dtype, a: Id, b: Id) -> Id {
             self.graph
-                .add(Op::L0(L0::Contract {
+                .add(Op::Logical(Logical::Contract {
                     spec,
                     acc,
                     a,
@@ -485,7 +450,7 @@ pub(crate) mod testing {
 
         pub fn gather(&mut self, axis: u32, x: Id, idx: Id) -> Id {
             self.graph
-                .add(Op::L0(L0::Gather { axis, x, idx }))
+                .add(Op::Logical(Logical::Gather { axis, x, idx }))
                 .expect("gather")
         }
 
@@ -498,7 +463,7 @@ pub(crate) mod testing {
             upd: Id,
         ) -> Id {
             self.graph
-                .add(Op::L0(L0::Scatter {
+                .add(Op::Logical(Logical::Scatter {
                     axis,
                     combine,
                     base,
@@ -509,7 +474,7 @@ pub(crate) mod testing {
                 .expect("scatter")
         }
 
-        /// A `KFold` that arrived carrying [`ScheduleDomain::Point`], which
+        /// A `Fold` that arrived carrying [`ScheduleDomain::Point`], which
         /// is what the floor lowering mints and what `TILE_FOLD` upgrades.
         pub fn point_fold(
             &mut self,
@@ -537,8 +502,8 @@ pub(crate) mod testing {
                 .map(|i| ScalarExpr::arg(i as u32, Dtype::F32))
                 .collect();
             self.graph
-                .add(Op::L1(L1::KFold {
-                    space: fusor2_ir::ir::level1::IndexSpace::new(dims.iter().copied()),
+                .add(Op::Launch(Launch::Fold {
+                    space: fusor2_ir::ir::launch::IndexSpace::new(dims.iter().copied()),
                     axis,
                     vec_axes: vec_axes.iter().copied().collect(),
                     carrier,
@@ -547,30 +512,30 @@ pub(crate) mod testing {
                     ops: vec![Operand {
                         src: x,
                         layout: Layout::contiguous(&dims),
-                        access: fusor2_ir::ir::level1::AccessPlan::Alias,
+                        access: fusor2_ir::ir::launch::AccessPlan::Alias,
                     }],
                     sched: ScheduleDomain::Point,
                 }))
                 .expect("point fold")
         }
 
-        /// A `KGather` at [`ScheduleDomain::Point`] carrying the floor's mode.
+        /// A `Gather` at [`ScheduleDomain::Point`] carrying the floor's mode.
         pub fn point_gather(
             &mut self,
             x: Id,
             idx: Id,
             out: &[u64],
-            mode: fusor2_ir::ir::level1::GatherMode,
+            mode: fusor2_ir::ir::launch::GatherMode,
         ) -> Id {
             let dims: Vec<Dim> = out.iter().map(|d| Dim::Const(*d)).collect();
             let alias = |src, layout| Operand {
                 src,
                 layout,
-                access: fusor2_ir::ir::level1::AccessPlan::Alias,
+                access: fusor2_ir::ir::launch::AccessPlan::Alias,
             };
             self.graph
-                .add(Op::L1(L1::KGather {
-                    space: fusor2_ir::ir::level1::IndexSpace::new(dims.iter().copied()),
+                .add(Op::Launch(Launch::Gather {
+                    space: fusor2_ir::ir::launch::IndexSpace::new(dims.iter().copied()),
                     axis: 0,
                     mode,
                     ops: vec![
@@ -582,25 +547,25 @@ pub(crate) mod testing {
                 .expect("point gather")
         }
 
-        /// A `KScatter` at [`ScheduleDomain::Point`] carrying the floor's mode.
+        /// A `Scatter` at [`ScheduleDomain::Point`] carrying the floor's mode.
         pub fn point_scatter(
             &mut self,
             base: Id,
             idx: Id,
             upd: Id,
             space: &[u64],
-            mode: fusor2_ir::ir::level1::ScatterMode,
+            mode: fusor2_ir::ir::launch::ScatterMode,
             combine: ScatterCombine,
         ) -> Id {
             let dims: Vec<Dim> = space.iter().map(|d| Dim::Const(*d)).collect();
             let alias = |src, layout| Operand {
                 src,
                 layout,
-                access: fusor2_ir::ir::level1::AccessPlan::Alias,
+                access: fusor2_ir::ir::launch::AccessPlan::Alias,
             };
             self.graph
-                .add(Op::L1(L1::KScatter {
-                    space: fusor2_ir::ir::level1::IndexSpace::new(dims.iter().copied()),
+                .add(Op::Launch(Launch::Scatter {
+                    space: fusor2_ir::ir::launch::IndexSpace::new(dims.iter().copied()),
                     axis: 0,
                     mode,
                     combine,
@@ -614,17 +579,17 @@ pub(crate) mod testing {
                 .expect("point scatter")
         }
 
-        /// Clone a `KContract` with a different post epilogue and union it
+        /// Clone a `Contract` with a different post epilogue and union it
         /// into the same chain.
         pub fn with_post(&mut self, id: Id, post: ScalarExpr) -> Id {
-            let Op::L1(l1) = &self.graph.node(id).op else {
-                panic!("not an L1 node");
+            let Op::Launch(l1) = &self.graph.node(id).op else {
+                panic!("not an Launch node");
             };
             let mut rebuilt = l1.clone();
-            if let L1::KContract { post: p, .. } = &mut rebuilt {
+            if let Launch::Contract { post: p, .. } = &mut rebuilt {
                 *p = post;
             }
-            let new = self.graph.add(Op::L1(rebuilt)).expect("post variant");
+            let new = self.graph.add(Op::Launch(rebuilt)).expect("post variant");
             self.graph.union(id, new).expect("union");
             new
         }
@@ -668,10 +633,10 @@ pub(crate) mod testing {
         }
     }
 
-    /// The L1 op a chain member holds, if it is one.
-    pub fn l1_of(fx: &Fixture, id: Id) -> Option<L1> {
+    /// The Launch op a chain member holds, if it is one.
+    pub fn l1_of(fx: &Fixture, id: Id) -> Option<Launch> {
         match &fx.graph.node(id).op {
-            Op::L1(l1) => Some(l1.clone()),
+            Op::Launch(l1) => Some(l1.clone()),
             _ => None,
         }
     }
@@ -716,14 +681,9 @@ mod tests {
         assert!(std::ptr::eq(SCHED_RULES, TILE_RULES));
     }
 
-    /// Every guard reads only `Facts` and `Builder::caps` — there is no
-    /// consumer count, liveness, cost or extraction state to read, and the
-    /// API surface is what enforces it. This pins the *table* shape that
-    /// makes that true: each rule declares one head tag and one tag.
-    /// Acceptance: applied to the trainer's conv-backward contraction
-    /// shapes, every contraction chain keeps at least four members and
-    /// every `Scatter{Add}` chain at least four. Four alternatives is what
-    /// makes the choice a cost decision rather than a routing decision.
+    /// Applied to the trainer's conv-backward contraction shapes, every
+    /// contraction chain keeps at least four members, which makes the choice
+    /// a cost decision rather than a routing decision.
     ///
     /// The shapes are the im2col forms of the wordseq student's three conv
     /// layers at batch 128 and the modal 768-unit bucket: `dWeight` is
@@ -734,7 +694,7 @@ mod tests {
         use crate::domains::testing::apple_caps;
         use crate::rules::testing::{Fixture, l1_of};
         use fusor2_ir::dtype::Dtype;
-        use fusor2_ir::ir::level0::{EinSpec, Label, ScatterCombine};
+        use fusor2_ir::ir::logical::{EinSpec, Label, ScatterCombine};
         use smallvec::smallvec;
 
         let spec = EinSpec {
@@ -769,12 +729,6 @@ mod tests {
         }
 
         // The embedding-gradient scatter: 1024 hash bins, 24 units wide.
-        // Two alternatives, not four: `WgPrivateMerge` and `OneHotContract`
-        // are deleted. Neither was ever selected, both priced identically to
-        // these two (the cost model does not read `mode`), and the second had
-        // no lowering on either backend — an alternative extraction can prefer
-        // and then fail on, which is the failure this test's own contraction
-        // half exists to prevent.
         let mut fx = Fixture::new(apple_caps());
         let base = fx.buffer(Dtype::F32, &[1024, 24]);
         let idx = fx.buffer(Dtype::U32, &[128 * 768 * 3]);
@@ -789,21 +743,14 @@ mod tests {
         assert!(members >= 2, "the scatter chain left only {members}");
     }
 
-    /// A floor-lowered `KFold` arrives with no schedule decision to make.
+    /// A floor-lowered `Fold` arrives with no schedule decision to make.
     /// After the table runs, the chain holds one whose domain is a real
     /// reduction domain — and the widest carrier that still fits keeps one.
     ///
-    /// **This fixture pins a node neither backend lowers, deliberately.** The
-    /// 3-lane leg is a `Vector` carrier slot with *empty* `vec_axes`, which
-    /// `check_vec_axes` admits (it returns early on empty) but which both
-    /// `lower_*_carrier` refuse: "a Vector carrier slot needs a promoted axis
-    /// to read its positions from". `tile_fold` prices a domain for it anyway.
-    /// Adding that mirror precondition to `tile_fold` is therefore a one-line
-    /// change that breaks *this test* and nothing else — the case was measured
-    /// at zero occurrences across a full conformance run, so the guard would
-    /// be dead code today. If you come here because you added it: the fixture
-    /// is what to change, to a genuine promoted nest as in
-    /// `tile_fold_schedules_a_promoted_nest`, not the rule you just wrote.
+    /// The 3-lane leg is a `Vector` carrier slot with empty `vec_axes`, which
+    /// `check_vec_axes` admits but neither `lower_*_carrier` lowers; if a
+    /// mirror precondition is ever added to `tile_fold`, change this fixture
+    /// to a genuine promoted nest, not the rule.
     #[test]
     fn tile_fold_upgrades_a_point_scheduled_reduction() {
         use crate::domains::testing::apple_caps;
@@ -827,7 +774,7 @@ mod tests {
                 .chain(fold)
                 .into_iter()
                 .filter_map(|m| match l1_of(&fx, m) {
-                    Some(L1::KFold { sched, .. }) => Some(sched.len()),
+                    Some(Launch::Fold { sched, .. }) => Some(sched.len()),
                     _ => None,
                 })
                 .collect();
@@ -838,21 +785,13 @@ mod tests {
         }
     }
 
-    /// **The promoted nest reaches extraction with a schedule decision.**
+    /// The promoted nest reaches extraction with a schedule decision:
+    /// `space = [rows, dh, k]` with `vec_axes = [1]` and the reduced axis
+    /// last is what PROMOTE mints and what both backends lower per promoted
+    /// position.
     ///
-    /// `space = [rows, dh, k]` with `vec_axes = [1]` and the reduced axis last
-    /// is what PROMOTE mints and what both backends lower per promoted
-    /// position (`fusor2-gpu/src/lower/map_fold.rs`,
-    /// `fusor2-cpu/src/lower/map_fold.rs`). A blanket
-    /// `!vec_axes.is_empty()` bail here
-    /// would send the whole point of PROMOTE to extraction
-    /// on `ScheduleDomain::Point`, getting the emitter's default lane group
-    /// rather than a selection.
-    ///
-    /// This asserts on the **rule**, not on the table, so it fails if
-    /// `tile_fold` declines further down at `carrier.lanes()` or on an empty
-    /// domain — a guard removed with no observable effect is not a gate
-    /// closed.
+    /// Asserts on the rule, not on the table, so it fails if `tile_fold`
+    /// declines further down at `carrier.lanes()` or on an empty domain.
     #[test]
     fn tile_fold_schedules_a_promoted_nest() {
         use crate::domains::testing::apple_caps;
@@ -880,7 +819,7 @@ mod tests {
             .apply_one(&TILE_FOLD, fold)
             .expect("TILE_FOLD declined a promoted nest whose reduced axis is last");
         match l1_of(&fx, new) {
-            Some(L1::KFold {
+            Some(Launch::Fold {
                 vec_axes,
                 sched: ScheduleDomain::Fold(d),
                 ..
@@ -896,13 +835,9 @@ mod tests {
         }
     }
 
-    /// The surviving precondition, stated the way both backends state it: a
-    /// promoted nest whose reduced axis is **not** last is the one form
-    /// neither lowers ("a promoted KFold whose reduced axis is not last is not
-    /// lowered"), because the address arithmetic reads one output row as
-    /// `vec_extent * axis_extent` consecutive elements. Pricing a schedule
-    /// point for it would make extraction prefer a plan that fails at
-    /// lowering instead of at admission.
+    /// A promoted nest whose reduced axis is not last is the one form neither
+    /// backend lowers; pricing a schedule point for it would make extraction
+    /// prefer a plan that fails at lowering.
     #[test]
     fn tile_fold_declines_a_promoted_nest_whose_axis_is_not_last() {
         use crate::domains::testing::apple_caps;
@@ -923,8 +858,7 @@ mod tests {
 
         let mut fx = Fixture::new(apple_caps());
         // `vec_axes = [1]` is still the contiguous block immediately before
-        // the reduced axis 2 — `verify_l1` admits this node — but axis 2 is
-        // not the last of a rank-4 space.
+        // the reduced axis 2, but axis 2 is not the last of a rank-4 space.
         let shape = [64, DH, 1024, 5];
         let x = fx.buffer(Dtype::F32, &shape);
         let fold = fx.promoted_fold(x, &shape, 2, &[1], promoted);
@@ -934,10 +868,8 @@ mod tests {
         );
     }
 
-    /// The footprint clause, on a real chain: a `Vector(128)` f32
-    /// accumulator wants 128 KiB of scratch against Apple's 32 KiB at every
-    /// lane group, so the rule **declines** rather than minting a domain
-    /// every point of which fails `verify_plan`.
+    /// The footprint clause: a `Vector(128)` f32 accumulator wants 128 KiB of
+    /// scratch against Apple's 32 KiB at every lane group.
     #[test]
     fn tile_fold_offers_only_row_per_lane_for_a_carrier_too_wide_to_close() {
         use crate::domains::testing::apple_caps;
@@ -959,18 +891,16 @@ mod tests {
         let fold = fx.point_fold(x, &[64, 1024], 1, wide);
         fx.apply_all(TILE_RULES, fold);
         // A 128-lane carrier cannot close across lanes on this device, but it
-        // can still run row-per-lane, so TILE_FOLD *does* attach a domain —
-        // every point of which must be a one-lane group. Declining outright
-        // here would make the node unschedulable and its class
-        // fall back to a `verify_plan` crash.
+        // can still run row-per-lane, so TILE_FOLD does attach a domain —
+        // every point of which must be a one-lane group.
         assert!(
             fx.chain(fold)
                 .into_iter()
                 .filter_map(|m| l1_of(&fx, m))
                 .all(|m| match m {
-                    L1::KFold { sched, .. } => sched
+                    Launch::Fold { sched, .. } => sched
                         .iter()
-                        .all(|p| !matches!(p, fusor2_ir::ir::level1::SchedPoint::Fold(s)
+                        .all(|p| !matches!(p, fusor2_ir::ir::launch::SchedPoint::Fold(s)
                             if s.lane_group(apple_caps().subgroup_width()) > 1)),
                     _ => true,
                 }),
@@ -978,19 +908,18 @@ mod tests {
         );
     }
 
-    /// Gather and scatter reach the floor at [`ScheduleDomain::Point`]. Each must
-    /// leave a chain member carrying a real domain **at the floor's own
-    /// mode**, because the mode and the schedule were one pre-committed choice
-    /// and splitting them is the point.
+    /// Gather and scatter reach the floor at [`ScheduleDomain::Point`]. Each
+    /// must leave a chain member carrying a real domain at the floor's own
+    /// mode.
     #[test]
     fn the_floor_scheduled_node_kinds_all_gain_a_domain() {
         use crate::domains::testing::apple_caps;
         use crate::rules::testing::{Fixture, l1_of};
         use fusor2_ir::dtype::Dtype;
-        use fusor2_ir::ir::level0::ScatterCombine;
-        use fusor2_ir::ir::level1::{GatherMode, ScatterMode};
+        use fusor2_ir::ir::logical::ScatterCombine;
+        use fusor2_ir::ir::launch::{GatherMode, ScatterMode};
 
-        // KGather, at the floor's own mode.
+        // Gather, at the floor's own mode.
         let mut fx = Fixture::new(apple_caps());
         let x = fx.buffer(Dtype::F32, &[512, 128]);
         let idx = fx.buffer(Dtype::U32, &[64]);
@@ -999,13 +928,13 @@ mod tests {
         assert!(
             fx.chain(g).into_iter().filter_map(|i| l1_of(&fx, i)).any(|l| matches!(
                 l,
-                L1::KGather { mode: GatherMode::RowPerGroup, sched: ScheduleDomain::Map(d), .. }
+                Launch::Gather { mode: GatherMode::RowPerGroup, sched: ScheduleDomain::Map(d), .. }
                     if d.tilings.len() > 1
             )),
-            "a floor-lowered KGather kept no schedule decision at its own mode"
+            "a floor-lowered Gather kept no schedule decision at its own mode"
         );
 
-        // KScatter, at the floor's own mode.
+        // Scatter, at the floor's own mode.
         let mut fx = Fixture::new(apple_caps());
         let base = fx.buffer(Dtype::F32, &[1024, 24]);
         let idx = fx.buffer(Dtype::U32, &[256]);
@@ -1015,10 +944,10 @@ mod tests {
         assert!(
             fx.chain(s).into_iter().filter_map(|i| l1_of(&fx, i)).any(|l| matches!(
                 l,
-                L1::KScatter { mode: ScatterMode::Atomic, sched: ScheduleDomain::Map(d), .. }
+                Launch::Scatter { mode: ScatterMode::Atomic, sched: ScheduleDomain::Map(d), .. }
                     if d.tilings.len() > 1
             )),
-            "a floor-lowered KScatter kept no schedule decision at its own mode"
+            "a floor-lowered Scatter kept no schedule decision at its own mode"
         );
     }
 
@@ -1031,7 +960,7 @@ mod tests {
         use crate::domains::testing::baseline_caps;
         use crate::rules::testing::{Fixture, l1_of};
         use fusor2_ir::dtype::Dtype;
-        use fusor2_ir::ir::level1::GatherMode;
+        use fusor2_ir::ir::launch::GatherMode;
 
         let mut fx = Fixture::new(baseline_caps());
         let x = fx.buffer(Dtype::F32, &[512]);
@@ -1042,7 +971,7 @@ mod tests {
             fx.chain(g)
                 .into_iter()
                 .filter_map(|i| l1_of(&fx, i))
-                .all(|l| matches!(l, L1::KGather { sched: ScheduleDomain::Point, .. })),
+                .all(|l| matches!(l, Launch::Gather { sched: ScheduleDomain::Point, .. })),
             "a one-point domain was minted anyway"
         );
     }
@@ -1054,7 +983,7 @@ mod tests {
         use crate::domains::testing::apple_caps;
         use crate::rules::testing::{Fixture, l1_of};
         use fusor2_ir::dtype::Dtype;
-        use fusor2_ir::ir::level1::GatherMode;
+        use fusor2_ir::ir::launch::GatherMode;
 
         let mut fx = Fixture::new(apple_caps());
         let x = fx.buffer(Dtype::F32, &[512, 64, 256]);
@@ -1063,7 +992,7 @@ mod tests {
         fx.apply_all(&[TILE_GATHER], g);
         let mut seen = 0;
         for l in fx.chain(g).into_iter().filter_map(|i| l1_of(&fx, i)) {
-            if let L1::KGather { sched, .. } = l
+            if let Launch::Gather { sched, .. } = l
                 && !matches!(sched, ScheduleDomain::Point)
             {
                 seen += 1;

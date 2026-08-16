@@ -1,8 +1,8 @@
 //! R6 — the two `Scatter` lowerings, both coexisting.
 
 use fusor2_ir::egraph::{Builder, Facts, Id, RuleTag};
-use fusor2_ir::ir::level0::{L0, ScatterCombine};
-use fusor2_ir::ir::level1::{IndexSpace, L1, ScatterMode, ScheduleDomain};
+use fusor2_ir::ir::logical::{Logical, ScatterCombine};
+use fusor2_ir::ir::launch::{IndexSpace, Launch, ScatterMode, ScheduleDomain};
 use fusor2_ir::ir::{Level, Node, Op, OpTag};
 use fusor2_ir::rule;
 
@@ -11,7 +11,7 @@ use crate::rules::contract::alias;
 
 rule!(
     SCATTER_ATOMIC,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Scatter,
     tag = RuleTag::StrictlyLowering,
     apply = scatter_atomic,
@@ -19,7 +19,7 @@ rule!(
 
 rule!(
     SCATTER_SORT_SEGMENT,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Scatter,
     tag = RuleTag::StrictlyLowering,
     apply = scatter_sort_segment,
@@ -35,7 +35,7 @@ struct Parts {
 
 fn parts(node: &Node) -> Option<Parts> {
     match &node.op {
-        Op::L0(L0::Scatter {
+        Op::Logical(Logical::Scatter {
             axis,
             combine,
             base,
@@ -71,7 +71,7 @@ fn mint(
         alias(p.idx, idx).access,
         alias(p.upd, upd).access,
     ];
-    let op = L1::KScatter {
+    let op = Launch::Scatter {
         space,
         axis: p.axis,
         mode,
@@ -79,7 +79,7 @@ fn mint(
         ops: vec![alias(p.base, base), alias(p.idx, idx), alias(p.upd, upd)],
         sched: ScheduleDomain::Map(map_domain(&upd.shape, &accesses, &cx)),
     };
-    let new = b.add_l1(op).ok()?;
+    let new = b.add_launch(op).ok()?;
     b.union(id, new).ok()?;
     Some(new)
 }
@@ -122,7 +122,7 @@ mod tests {
             .chain(id)
             .into_iter()
             .filter_map(|m| match l1_of(fx, m) {
-                Some(L1::KScatter { mode, .. }) => Some(mode),
+                Some(Launch::Scatter { mode, .. }) => Some(mode),
                 _ => None,
             })
             .collect();

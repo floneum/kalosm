@@ -1,24 +1,24 @@
 //! [`CoreSemantics`]: the single [`Semantics`] implementation covering the
-//! closed `L0`/`L1` enums plus the open [`OpDefRegistry`]. Total inference,
+//! closed `Logical`/`Launch` enums plus the open [`OpDefRegistry`]. Total inference,
 //! work rows, effects and the two level verifiers hang off this type.
 
 pub mod children;
-pub mod infer_l0;
-pub mod infer_l1;
+pub mod infer_logical;
+pub mod infer_launch;
 pub mod work;
 
 use crate::device::Caps;
 use crate::error::{Error, Result};
 use crate::facts::{ValueFacts, Work};
-use crate::ir::level0::ScatterCombine;
-use crate::ir::level1::{BufferRole, Effect, L1, ScatterMode};
-use crate::ir::level2::ArenaPlanner;
+use crate::ir::logical::ScatterCombine;
+use crate::ir::launch::{BufferRole, Effect, Launch, ScatterMode};
+use crate::ir::kernel::ArenaPlanner;
 use crate::ir::{Children, Level, Op, OpDefRegistry, Semantics, VerifyCtx};
 use std::sync::Arc;
 
-/// The core semantics. Holds the [`ArenaPlanner`] because `verify_l1` admits
+/// The core semantics. Holds the [`ArenaPlanner`] because `verify_launch` admits
 /// a geometry against the *exact* `arena_plan` bytes — the same pure
-/// memoized function the L2 emitter lays out with, so there is no L1/L2
+/// memoized function the Kernel emitter lays out with, so there is no Launch/Kernel
 /// admission mismatch.
 pub struct CoreSemantics {
     planner: Arc<dyn ArenaPlanner>,
@@ -27,8 +27,7 @@ pub struct CoreSemantics {
 
 impl CoreSemantics {
     /// Build the shared semantics object the e-graph is constructed with.
-    /// Returns `Arc<dyn Semantics>` rather than `Self` because the e-graph
-    /// only ever holds the trait object; that is the shared contract.
+    /// Returns `Arc<dyn Semantics>`: the e-graph only ever holds the trait object.
     #[allow(clippy::new_ret_no_self)]
     pub fn new(planner: Arc<dyn ArenaPlanner>) -> Arc<dyn Semantics> {
         Arc::new(Self {
@@ -61,8 +60,8 @@ impl Semantics for CoreSemantics {
 
     fn infer(&self, op: &Op, ins: &[ValueFacts]) -> Result<ValueFacts> {
         match op {
-            Op::L0(o) => infer_l0::infer_l0(o, ins),
-            Op::L1(o) => infer_l1::infer_l1_with(o, ins, &self.registry),
+            Op::Logical(o) => infer_logical::infer_logical(o, ins),
+            Op::Launch(o) => infer_launch::infer_l1_with(o, ins, &self.registry),
             // A union stands for alternatives that infer identically by
             // construction; pass the first through.
             Op::Union(..) => ins
@@ -78,8 +77,8 @@ impl Semantics for CoreSemantics {
 
     fn verify(&self, cx: &VerifyCtx<'_>) -> Result<()> {
         match cx.node.op {
-            Op::L0(_) => crate::verify_l0::verify_l0(cx),
-            Op::L1(_) => crate::verify_l1::verify_l1(cx, self.planner.as_ref()),
+            Op::Logical(_) => crate::verify_l0::verify_l0(cx),
+            Op::Launch(_) => crate::verify_launch::verify_launch(cx, self.planner.as_ref()),
             // A union carries no semantics of its own; its operands are
             // verified as their own nodes.
             Op::Union(..) => Ok(()),
@@ -93,28 +92,28 @@ impl Semantics for CoreSemantics {
 
 /// Purity of one operator.
 ///
-/// `KScatter` writing through operand 0 with atomics or a `Set` combine
+/// `Scatter` writing through operand 0 with atomics or a `Set` combine
 /// mutates state and is therefore **pinned in the materialized set**:
 /// without that, toggling a two-consumer atomic scatter out of `M` inlines it
 /// into both consumers' kernels and the atomics apply twice, doubling the
-/// embedding gradient. Everything else is pure — an L0 node describes a
+/// embedding gradient. Everything else is pure — an Logical node describes a
 /// value, not a write.
 pub fn effect_of(op: &Op) -> Effect {
     match op {
-        Op::L1(L1::KScatter { mode, combine, .. })
+        Op::Launch(Launch::Scatter { mode, combine, .. })
             if matches!(mode, ScatterMode::Atomic) || matches!(combine, ScatterCombine::Set) =>
         {
             Effect::InPlace(BufferRole(0))
         }
-        Op::L0(_) | Op::L1(_) | Op::Union(..) => Effect::Pure,
+        Op::Logical(_) | Op::Launch(_) | Op::Union(..) => Effect::Pure,
     }
 }
 
 /// Level of an operator, for callers that build a [`crate::ir::Node`] by hand.
 /// `Union` inherits its operands' level, which the e-graph resolves; here it
-/// defaults to `L0`.
+/// defaults to `Logical`.
 pub fn level_of(op: &Op) -> Level {
-    op.level().unwrap_or(Level::L0)
+    op.level().unwrap_or(Level::Logical)
 }
 
 /// A trivially-correct [`ArenaPlanner`] for callers that need a
@@ -127,18 +126,18 @@ pub struct SumArenaPlanner;
 impl ArenaPlanner for SumArenaPlanner {
     fn arena_plan(
         &self,
-        _ir: &crate::ir::level2::KernelIr,
+        _ir: &crate::ir::kernel::KernelIr,
         _caps: &Caps,
-    ) -> Result<crate::ir::level2::ArenaPlan> {
-        Ok(crate::ir::level2::ArenaPlan {
-            mode: crate::ir::level2::ArenaMode::Regions,
+    ) -> Result<crate::ir::kernel::ArenaPlan> {
+        Ok(crate::ir::kernel::ArenaPlan {
+            mode: crate::ir::kernel::ArenaMode::Regions,
             total_bytes: 0,
             placements: Default::default(),
             barriers_inserted: Default::default(),
         })
     }
 
-    fn workgroup_bytes(&self, tiles: &crate::ir::level2::Tiles, _caps: &Caps) -> Result<u32> {
+    fn workgroup_bytes(&self, tiles: &crate::ir::kernel::Tiles, _caps: &Caps) -> Result<u32> {
         Ok(tiles
             .decls
             .iter()
@@ -148,20 +147,20 @@ impl ArenaPlanner for SumArenaPlanner {
 
     fn barrier_suggestions(
         &self,
-        _ir: &crate::ir::level2::KernelIr,
-    ) -> Vec<crate::ir::level2::BarrierSuggestion> {
+        _ir: &crate::ir::kernel::KernelIr,
+    ) -> Vec<crate::ir::kernel::BarrierSuggestion> {
         Vec::new()
     }
 
     fn verify_arena(
         &self,
-        _ir: &crate::ir::level2::KernelIr,
-        _plan: &crate::ir::level2::ArenaPlan,
+        _ir: &crate::ir::kernel::KernelIr,
+        _plan: &crate::ir::kernel::ArenaPlan,
     ) -> Result<()> {
         Ok(())
     }
 
-    fn verify_uniformity(&self, _ir: &crate::ir::level2::KernelIr) -> Result<()> {
+    fn verify_uniformity(&self, _ir: &crate::ir::kernel::KernelIr) -> Result<()> {
         Ok(())
     }
 }
@@ -173,8 +172,8 @@ mod tests {
     use crate::dtype::{Dtype, QFmt, QLayout, Splat};
     use crate::egraph::Id;
     use crate::carrier::{Carrier, SlotTy};
-    use crate::ir::level0::{BufferId, EinSpec, L0, Label, LeafKind, TiePolicy};
-    use crate::ir::level1::{
+    use crate::ir::logical::{BufferId, EinSpec, Logical, Label, LeafKind, TiePolicy};
+    use crate::ir::launch::{
         AccessPlan, ContractSide, Family, IndexSpace, MapDomain, Operand, ScheduleDomain,
     };
     use crate::ir::{Node, OpTag};
@@ -208,7 +207,7 @@ mod tests {
     #[test]
     fn dispatch_routes_to_the_right_level() {
         let sem = semantics();
-        let leaf = Op::L0(L0::Leaf(LeafKind::Param {
+        let leaf = Op::Logical(Logical::Leaf(LeafKind::Param {
             name: BufferId(0),
             dtype: Dtype::F32,
             shape: smallvec![Dim::Const(8)],
@@ -217,12 +216,12 @@ mod tests {
         assert_eq!(facts.persistence, crate::dtype::Persistence::Persistent);
         assert_eq!(sem.effect(&leaf), Effect::Pure);
         assert!(sem.children(&leaf).is_empty());
-        assert_eq!(level_of(&leaf), Level::L0);
+        assert_eq!(level_of(&leaf), Level::Logical);
 
         let node = Node {
             children: Children::new(),
             op: leaf,
-            level: Level::L0,
+            level: Level::Logical,
         };
         let caps = caps();
         let registry = OpDefRegistry::new();
@@ -240,7 +239,7 @@ mod tests {
     #[test]
     fn effect_table() {
         let scatter = |mode, combine| {
-            Op::L1(L1::KScatter {
+            Op::Launch(Launch::Scatter {
                 space: IndexSpace::new([Dim::Const(4)]),
                 axis: 0,
                 mode,
@@ -262,7 +261,7 @@ mod tests {
             Effect::Pure
         );
         assert_eq!(
-            effect_of(&Op::L1(L1::KMap {
+            effect_of(&Op::Launch(Launch::Map {
                 space: IndexSpace::new([Dim::Const(4)]),
                 body: ScalarExpr::arg(0, Dtype::F32),
                 ops: vec![],
@@ -273,9 +272,7 @@ mod tests {
         assert_eq!(effect_of(&Op::Union(Id(0), Id(1))), Effect::Pure);
     }
 
-    // -----------------------------------------------------------------
     // Totality fuzz: 10,000 random ops at random shapes must never panic.
-    // -----------------------------------------------------------------
 
     /// xorshift64*, so the fuzz corpus is deterministic and dependency-free.
     struct Rng(u64);
@@ -370,9 +367,9 @@ mod tests {
         }
     }
 
-    fn rand_l0(rng: &mut Rng) -> L0 {
+    fn rand_l0(rng: &mut Rng) -> Logical {
         match rng.below(10) {
-            0 => L0::Leaf(match rng.below(5) {
+            0 => Logical::Leaf(match rng.below(5) {
                 0 => LeafKind::Buffer {
                     name: BufferId(0),
                     dtype: rand_dtype(rng),
@@ -398,12 +395,12 @@ mod tests {
                     shape: smallvec![rand_dim(rng), rand_dim(rng)],
                 },
             }),
-            1 => L0::Map {
+            1 => Logical::Map {
                 expr: rand_expr(rng, 3),
                 ins: (0..rng.below(4)).map(|i| Id(i as u32)).collect(),
                 outs: rng.below(3) as u8,
             },
-            2 => L0::Fold {
+            2 => Logical::Fold {
                 carrier: rand_carrier(rng),
                 axis: rng.below(5) as u32,
                 acc: rand_dtype(rng),
@@ -414,7 +411,7 @@ mod tests {
                     (0..n).map(|_| Label(rng.below(4) as u8)).collect()
                 };
                 let (na, nb, no) = (rng.below(4), rng.below(4), rng.below(4));
-                L0::Contract {
+                Logical::Contract {
                     spec: EinSpec {
                         a: pick(rng, na),
                         b: pick(rng, nb),
@@ -426,7 +423,7 @@ mod tests {
                     outs: rng.below(3) as u8,
                 }
             }
-            4 => L0::Restride {
+            4 => Logical::Restride {
                 specs: (0..rng.below(4))
                     .map(|_| StrideSpec {
                         input_dim: rng.below(6) as u32,
@@ -442,7 +439,7 @@ mod tests {
                 },
                 x: Id(0),
             },
-            5 => L0::Window {
+            5 => Logical::Window {
                 specs: (0..rng.below(3))
                     .map(|_| {
                         SlidingWindow::new(
@@ -454,12 +451,12 @@ mod tests {
                     .collect(),
                 x: Id(0),
             },
-            6 => L0::Gather {
+            6 => Logical::Gather {
                 axis: rng.below(5) as u32,
                 x: Id(0),
                 idx: Id(1),
             },
-            7 => L0::Scatter {
+            7 => Logical::Scatter {
                 axis: rng.below(5) as u32,
                 combine: if rng.below(2) == 0 {
                     ScatterCombine::Set
@@ -471,12 +468,12 @@ mod tests {
                 upd: Id(2),
                 unique: rng.below(2) == 0,
             },
-            8 => L0::Dequant {
+            8 => Logical::Dequant {
                 fmt: QFmt::ALL[rng.below(6) as usize],
                 layout: QLayout::Native,
                 x: Id(0),
             },
-            _ => L0::Project {
+            _ => Logical::Project {
                 slot: rng.below(4) as u8,
                 x: Id(0),
             },
@@ -517,17 +514,17 @@ mod tests {
         }
     }
 
-    fn rand_l1(rng: &mut Rng) -> L1 {
+    fn rand_l1(rng: &mut Rng) -> Launch {
         let space = IndexSpace::new((0..rng.below(4)).map(|_| rand_dim(rng)).collect::<Vec<_>>());
         let ops: Vec<Operand> = (0..rng.below(4)).map(|_| rand_operand(rng)).collect();
         match rng.below(7) {
-            0 => L1::KMap {
+            0 => Launch::Map {
                 space,
                 body: rand_expr(rng, 2),
                 ops,
                 sched: ScheduleDomain::Point,
             },
-            1 => L1::KFold {
+            1 => Launch::Fold {
                 space,
                 axis: rng.below(5) as u32,
                 vec_axes: smallvec![],
@@ -537,7 +534,7 @@ mod tests {
                 ops,
                 sched: ScheduleDomain::Point,
             },
-            2 => L1::KContract {
+            2 => Launch::Contract {
                 m: rand_dim(rng),
                 n: rand_dim(rng),
                 k: rand_dim(rng),
@@ -549,14 +546,14 @@ mod tests {
                 b: ContractSide::one(rand_expr(rng, 2), rand_operand(rng)),
                 sched: ScheduleDomain::Coop(Default::default()),
             },
-            3 => L1::KGather {
+            3 => Launch::Gather {
                 space,
                 axis: rng.below(4) as u32,
-                mode: crate::ir::level1::GatherMode::RowPerGroup,
+                mode: crate::ir::launch::GatherMode::RowPerGroup,
                 ops,
                 sched: ScheduleDomain::Point,
             },
-            4 => L1::KScatter {
+            4 => Launch::Scatter {
                 space,
                 axis: rng.below(4) as u32,
                 mode: ScatterMode::Atomic,
@@ -564,12 +561,12 @@ mod tests {
                 ops,
                 sched: ScheduleDomain::Point,
             },
-            5 => L1::KRegion {
+            5 => Launch::Region {
                 members: (0..rng.below(4)).map(|i| Id(i as u32)).collect(),
                 live_outs: (0..rng.below(3)).map(|i| i as u32).collect(),
                 sched: ScheduleDomain::Map(MapDomain::linear(&caps(), rng.below(4096) as u64)),
             },
-            _ => L1::Ext {
+            _ => Launch::Ext {
                 def: crate::ir::OpDefId(rng.below(3) as u32),
                 ops,
                 attrs: crate::ir::AttrId(0),
@@ -586,9 +583,9 @@ mod tests {
 
         for i in 0..10_000u32 {
             let op = if i % 2 == 0 {
-                Op::L0(rand_l0(&mut rng))
+                Op::Logical(rand_l0(&mut rng))
             } else {
-                Op::L1(rand_l1(&mut rng))
+                Op::Launch(rand_l1(&mut rng))
             };
             let n_ins = rng.below(4) as usize;
             let ins: Vec<ValueFacts> = (0..n_ins).map(|_| rand_facts(&mut rng)).collect();
@@ -596,7 +593,7 @@ mod tests {
             // Inference is total: `Ok` or a typed `Error`, never a panic.
             let inferred = sem.infer(&op, &ins);
 
-            let level = op.level().unwrap_or(Level::L0);
+            let level = op.level().unwrap_or(Level::Logical);
             let node = Node {
                 children: children::children_of(&op),
                 op,
@@ -628,9 +625,9 @@ mod tests {
         let mut seen: Vec<OpTag> = Vec::new();
         for _ in 0..2_000 {
             let op = if rng.below(2) == 0 {
-                Op::L0(rand_l0(&mut rng))
+                Op::Logical(rand_l0(&mut rng))
             } else {
-                Op::L1(rand_l1(&mut rng))
+                Op::Launch(rand_l1(&mut rng))
             };
             let tag = op.tag();
             if !seen.contains(&tag) {
@@ -638,7 +635,7 @@ mod tests {
             }
             let _ = children::children_of(&op);
         }
-        // 10 L0 tags + all 7 L1 tags.
+        // 10 Logical tags + all 7 Launch tags.
         assert!(seen.len() >= 17, "only saw {} tags", seen.len());
     }
 }

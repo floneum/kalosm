@@ -3,7 +3,7 @@
 //! `Reduce{Workgroup}` becomes a tree over the thread-local scratch tile,
 //! with the segment split supplying the barrier semantics.
 
-use fusor2_ir::ir::level2::TileReduceOp;
+use fusor2_ir::ir::kernel::TileReduceOp;
 
 use super::expr::Reg;
 
@@ -48,10 +48,6 @@ pub fn combine_reg<const W: usize>(op: TileReduceOp, a: Reg<W>, b: Reg<W>) -> Re
 
 /// Horizontal reduce of one register by `log2(W)` shuffle-reduce steps, with
 /// the result broadcast back across every lane.
-///
-/// The butterfly shape is what a subgroup collective does on GPU; keeping it
-/// here means `Reduce{Subgroup}` is one node with a strategy parameter on both
-/// backends rather than two different ops.
 #[inline(always)]
 pub fn horizontal<const W: usize>(op: TileReduceOp, v: Reg<W>) -> Reg<W> {
     let mut cur = v.to_f();

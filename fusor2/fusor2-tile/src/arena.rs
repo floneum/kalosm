@@ -17,14 +17,11 @@
 //! Sharing legality is [`LivenessInfo::can_follow_tiles`]. Both packers check
 //! **every** prior occupant, not just the most recent: the loop-phase arm does
 //! not compose transitively.
-//!
-//! This is a **closed-form argmin with an independent verifier**, not an
-//! e-graph alternative.
 
 use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
 use fusor2_ir::error::Error;
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::kernel::{
     ArenaMode, ArenaPlan, ElementType, KernelIr, Placement, ScalarElement, Tiles,
 };
 use smallvec::SmallVec;
@@ -117,10 +114,6 @@ pub fn all_packable(live: &LivenessInfo) -> bool {
     live.iter().all(|tile| stride_class(tile.element).is_some())
 }
 
-// ---------------------------------------------------------------------------
-// Regions
-// ---------------------------------------------------------------------------
-
 struct Region {
     canonical: ElementType,
     elements: u32,
@@ -137,10 +130,8 @@ impl Region {
 /// and no aliasing proof.
 pub fn regions(live: &LivenessInfo) -> ArenaPlan {
     let mut regions: Vec<Region> = Vec::new();
-    // Every occupant per region: the plain interval arm would be sound against
-    // only the most recent occupant (barrier transitivity), but the loop-phase
-    // arm does not compose — A->B and B->C do not imply the C->A wrap is
-    // covered. Regions hold a handful of tiles, so all-occupants costs nothing.
+    // Check every occupant per region: the loop-phase arm does not compose —
+    // A->B and B->C do not imply the C->A wrap is covered.
     let mut occupants: Vec<Vec<usize>> = Vec::new();
     // A coop-consumed occupant pins the region's type: widening the canonical
     // would retype the raw pointer its cooperative load/store sees.
@@ -214,10 +205,6 @@ pub fn regions(live: &LivenessInfo) -> ArenaPlan {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Byte arena
-// ---------------------------------------------------------------------------
-
 /// One byte arena, tiles at byte offsets by interval strip packing. Returns
 /// `None` when a tile cannot back an array.
 pub fn byte_arena(live: &LivenessInfo) -> Option<ArenaPlan> {
@@ -280,10 +267,6 @@ pub fn byte_arena(live: &LivenessInfo) -> Option<ArenaPlan> {
     })
 }
 
-// ---------------------------------------------------------------------------
-// Entry points
-// ---------------------------------------------------------------------------
-
 /// Pack under one mode. Fails when the result exceeds
 /// `caps.limits.max_compute_workgroup_storage_size`, or when `ByteArena` is
 /// requested without `caps.workgroup_alias`.
@@ -325,10 +308,10 @@ pub(crate) fn check_budget(plan: &ArenaPlan, ir: &KernelIr, caps: &Caps) -> Resu
 
 /// Bytes a declared tile set needs, without building a body. Delegates to the
 /// shared [`crate::planner::Planner`] so this is the **same** computation the
-/// emitters lay out with — there is no estimator and therefore no L1/L2
+/// emitters lay out with — there is no estimator and therefore no Launch/Kernel
 /// admission mismatch.
 pub fn workgroup_bytes(tiles: &Tiles, caps: &Caps) -> Result<u32> {
-    use fusor2_ir::ir::level2::ArenaPlanner;
+    use fusor2_ir::ir::kernel::ArenaPlanner;
     crate::planner::Planner::global().workgroup_bytes(tiles, caps)
 }
 

@@ -1,7 +1,7 @@
-//! `fusor2-autograd` — reverse mode as an L0 -> L0 transform whose output is
+//! `fusor2-autograd` — reverse mode as an Logical -> Logical transform whose output is
 //! ingested **together with the forward as one graph with one root set**.
 //!
-//! *Why L0*: adjoints are facts about tensor algebra. `d(Contract) =
+//! *Why Logical*: adjoints are facts about tensor algebra. `d(Contract) =
 //! (grad @ Bt, At @ grad)` holds regardless of tile geometry.
 //! *Why not rewrite rules*: an adjoint is a directed transformation, not an
 //! equality; putting `grad` in the primal's chain is unsound.

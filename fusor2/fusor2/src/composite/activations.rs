@@ -1,7 +1,5 @@
 //! `relu`, `sigmoid`, `silu`, `gelu`, `tanh_exact`, `softplus`. Each is one
 //! `Map` with a different `ScalarExpr`; none is a kernel.
-//!
-//! There is no activation opcode here and no activation node in the IR.
 
 use fusor2_autograd::tape::splat_of;
 use fusor2_ir::dtype::Dtype;
@@ -39,12 +37,8 @@ fn clamp(x: ScalarExpr, lo: ScalarExpr, hi: ScalarExpr) -> ScalarExpr {
     ScalarExpr::bin(BinOp::Min, ScalarExpr::bin(BinOp::Max, x, lo), hi)
 }
 
-// ---------------------------------------------------------------------------
-// Expression builders
-//
-// Public so a rewrite rule can recognize the exact tree the frontend emits
-// without re-deriving it, and so conformance can compare two spellings.
-// ---------------------------------------------------------------------------
+// The expression builders are public so a rewrite rule can recognize the
+// exact tree the frontend emits, and conformance can compare two spellings.
 
 /// `max(x, 0)`.
 pub fn relu_expr(dtype: Dtype) -> Result<ScalarExpr> {
@@ -69,12 +63,9 @@ pub fn silu_expr(dtype: Dtype) -> Result<ScalarExpr> {
     Ok(div(x, add(lit(dtype, 1.0)?, e)))
 }
 
-/// `(e^x - e^-x) / (e^x + e^-x)`, written out rather than lowered to the
-/// driver's `tanh`.
-///
-/// The reference keeps this as a separate opcode because WARP under-saturates
-/// the negative tail of the native `tanh` and the GELU tail depends on it.
-/// Here it is a different expression tree, which is the whole difference.
+/// `(e^x - e^-x) / (e^x + e^-x)`, written out instead of the driver's `tanh`:
+/// WARP under-saturates the negative tail of the native `tanh` and the GELU
+/// tail depends on it.
 pub fn tanh_exact_expr(dtype: Dtype) -> Result<ScalarExpr> {
     Ok(tanh_exact_of(ScalarExpr::arg(0, dtype)))
 }
@@ -91,9 +82,7 @@ fn tanh_exact_of(x: ScalarExpr) -> ScalarExpr {
 /// `0.5*x*(1 + clamp(tanh_exact(clamp(c*(x + k*x^3), -15, 15)), -1, 1))`,
 /// with `1 + tanh` clamped to `[0, 2]`.
 ///
-/// The clamps are what keep the value finite at +/-20 on every driver, and
-/// they are also why this is expression structure rather than a fused kernel:
-/// nothing here can become a routing decision.
+/// The clamps are what keep the value finite at +/-20 on every driver.
 pub fn gelu_expr(dtype: Dtype) -> Result<ScalarExpr> {
     let x = ScalarExpr::arg(0, dtype);
     let x3 = mul(x.clone(), mul(x.clone(), x.clone()));
@@ -109,10 +98,6 @@ pub fn gelu_expr(dtype: Dtype) -> Result<ScalarExpr> {
 
 /// `0.5 * x * (1 + erf(x / sqrt 2))` with erf from Abramowitz & Stegun 7.1.26
 /// (max absolute error 1.5e-7).
-///
-/// `erf` is not in the scalar vocabulary and does not earn a slot: it appears
-/// in exactly one expression, and a rational-times-exp is what a backend would
-/// emit for it anyway.
 pub fn gelu_exact_expr(dtype: Dtype) -> Result<ScalarExpr> {
     const P: f32 = 0.327_591_1;
     const A: [f32; 5] = [
@@ -174,10 +159,6 @@ pub fn leaky_relu_expr(dtype: Dtype, slope: f32) -> Result<ScalarExpr> {
     ))
 }
 
-// ---------------------------------------------------------------------------
-// The tensor surface
-// ---------------------------------------------------------------------------
-
 impl Tensor {
     fn activation(&self, build: impl FnOnce(Dtype) -> Result<ScalarExpr>) -> Result<Tensor> {
         let dtype = self.graph.facts(self.id).dtype;
@@ -230,9 +211,9 @@ impl Tensor {
 
 /// Evaluate a single-argument `ScalarExpr` on the host.
 ///
-/// This is the reference a backend is compared against — a plain tree walk,
-/// never a path a kernel takes. It is public because `fusor2-conformance`
-/// needs the same walk and duplicating it would let the two drift.
+/// The reference a backend is compared against — a plain tree walk, never a
+/// path a kernel takes. Public because `fusor2-conformance` uses the same
+/// walk.
 pub fn eval_host(expr: &ScalarExpr, arg: f32) -> f32 {
     use fusor2_ir::dtype::Splat;
     use fusor2_ir::scalar::ScalarKind;

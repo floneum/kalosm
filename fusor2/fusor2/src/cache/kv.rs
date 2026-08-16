@@ -15,7 +15,7 @@
 //!   leaf at the buffer the scatter produced (no host round trip).
 
 use fusor2_ir::dtype::Dtype;
-use fusor2_ir::ir::level0::{L0, LeafKind};
+use fusor2_ir::ir::logical::{Logical, LeafKind};
 use fusor2_ir::shape::{Dim, StrideSpec};
 use rustc_hash::FxHashMap;
 
@@ -43,9 +43,7 @@ struct FixedState {
     /// The last append's `(chunk width, scatter output)`, retained past the
     /// commit that cleared `out`. An append of the same width against the same
     /// store rebuilds exactly these nodes, so [`TensorCache::replay_append`]
-    /// re-arms them instead — which is what lets a decode loop skip rebuilding
-    /// the model graph entirely. Dropped on growth, which is a new store leaf
-    /// and therefore new nodes.
+    /// re-arms them instead. Dropped on growth, which mints a new store leaf.
     arm: Option<(u64, Dyn)>,
     /// `u32` write-index leaves, one per appended-chunk width, reused across
     /// steps with fresh bytes.
@@ -53,9 +51,8 @@ struct FixedState {
     /// The symbol the readable length is bound to, named once per store.
     sym: Option<fusor2_ir::shape::SymId>,
     /// The symbol's name. A [`KvCache`] hands both halves one name so the
-    /// K and V views carry the *same* symbol — attention contracts their
-    /// length axes against each other, and two symbols bound to one value
-    /// are still two extents to the shape checker.
+    /// K and V views carry the same symbol — attention contracts their
+    /// length axes against each other.
     sym_name: String,
 }
 
@@ -63,9 +60,7 @@ struct FixedState {
 ///
 /// `R` is the rank of the values it holds and `T` their element type.
 /// Both default to the decode shape — a rank-4 `[batch, heads, seq, dim]` f32
-/// cache — so `TensorCache` alone still names it. The axis is a runtime
-/// argument, not a const parameter: a cross-attention cache and a self-
-/// attention one differ in axis and not in type.
+/// cache — so `TensorCache` alone still names it.
 #[derive(Clone)]
 pub struct TensorCache<const R: usize = 4, T: Element = f32> {
     pub data: Option<Tensor<R, T>>,
@@ -137,9 +132,7 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
     /// root of the step's resolve so [`TensorCache::commit`] can adopt its
     /// buffer.
     ///
-    /// Runtime-rank: a resolve batch collects roots of every rank a step
-    /// produced, which is the one place this crate genuinely has a
-    /// heterogeneous list.
+    /// Runtime-rank: a resolve batch is a heterogeneous list of roots.
     pub fn pending(&self) -> Option<Dyn> {
         self.fixed.as_ref().and_then(|f| f.out.clone())
     }
@@ -178,19 +171,13 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
     }
 
     /// Append `value` along `axis` and return the whole cache, new part
-    /// included.
-    ///
-    /// The first append stores `value` itself: there is nothing to
-    /// concatenate it with, and a `cat` of one operand is a copy nobody
-    /// asked for.
+    /// included. The first append stores `value` itself.
     #[track_caller]
     pub fn append(&mut self, value: &Tensor<R, T>) -> Tensor<R, T> {
         Tensor::from_dyn(ok("TensorCache::append", self.append_dyn(value.as_dyn())))
     }
 
-    /// [`TensorCache::append`] at runtime rank. The whole body is here
-    /// because a fixed-mode append walks strides and mints leaves, none of
-    /// which the rank in the type would make any easier to write.
+    /// [`TensorCache::append`] at runtime rank.
     pub(crate) fn append_dyn(&mut self, value: &Dyn) -> Result<Dyn> {
         let axis = self.axis as usize;
         if axis >= value.rank() {
@@ -204,8 +191,7 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         }
         let added = value.dim(axis);
         // Every check runs before the cache is touched: a rejected append
-        // must leave the cache exactly as it was, or a caller that recovers
-        // from the error silently continues with an emptied cache.
+        // must leave the cache exactly as it was.
         let out = match self.current_dyn() {
             None => value.clone(),
             Some(prev) => {
@@ -354,14 +340,10 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         }
     }
 
-    /// Advance one append *without* touching the graph: an append of the same
+    /// Advance one append without touching the graph: an append of the same
     /// width against the same store hash-conses onto the nodes the last one
     /// minted, so the only real work is the write index's bytes and the length
     /// binding. The caller must have checked [`TensorCache::can_replay`].
-    ///
-    /// This is what makes a decode loop's graph build disappear: the model's
-    /// per-step rebuild exists only to re-derive nodes that already exist, and
-    /// this re-arms the one piece of per-step state hiding inside them.
     pub fn replay_append(&mut self, added: u64) -> Result<()> {
         if !self.can_replay(added) {
             return Err(Error::Shape(
@@ -398,8 +380,7 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         Ok(())
     }
 
-    /// Keep the newest `len` tokens and drop the oldest — the sliding-window
-    /// eviction the reference spells `narrow(dim, total - max, max)`.
+    /// Keep the newest `len` tokens and drop the oldest.
     #[track_caller]
     pub fn keep_last(&mut self, len: u64) -> Option<Tensor<R, T>> {
         ok("TensorCache::keep_last", self.keep_last_inner(len))
@@ -452,7 +433,7 @@ fn fresh_sym_name() -> String {
 /// An external leaf minted directly on the graph handle (the `Graph` facade
 /// is not reachable from a tensor).
 fn external_leaf(graph: &GraphRef, shape: &[Dim], dtype: Dtype) -> Result<Dyn> {
-    let id = graph.add_l0(L0::Leaf(LeafKind::Buffer {
+    let id = graph.add_logical(Logical::Leaf(LeafKind::Buffer {
         name: graph.fresh_buffer_id(),
         dtype,
         shape: shape.iter().copied().collect(),
@@ -462,7 +443,7 @@ fn external_leaf(graph: &GraphRef, shape: &[Dim], dtype: Dtype) -> Result<Dyn> {
 
 /// Double the store until `needed` fits and migrate the committed tokens on
 /// device: one `slice_assign` resolve, then the new leaf adopts its buffer.
-/// A new capacity is a new leaf shape — deliberately a new shape family.
+/// A new capacity is a new leaf shape and therefore a new shape family.
 fn grow(
     f: &mut FixedState,
     graph: &GraphRef,
@@ -521,9 +502,7 @@ fn add_dims(a: Dim, b: Dim) -> Dim {
 
 /// One layer's key and value caches.
 ///
-/// `R` and `T` are the cached values', and both default to the decode shape
-/// the reference pins outright — its `KvCache<D>` holds two
-/// `TensorCache<4, D>` — so a bare `KvCache` is a rank-4 f32 pair.
+/// `R` and `T` are the cached values'; a bare `KvCache` is a rank-4 f32 pair.
 #[derive(Clone)]
 pub struct KvCache<const R: usize = 4, T: Element = f32> {
     pub k: TensorCache<R, T>,
@@ -572,9 +551,6 @@ impl<const R: usize, T: Element> KvCache<R, T> {
     }
 
     /// Push this step's scatter outputs into a resolve batch.
-    ///
-    /// Runtime-rank, like [`TensorCache::pending`]: a resolve batch is a
-    /// heterogeneous list of roots.
     pub fn pending_into(&self, batch: &mut Vec<Dyn>) {
         if let Some(k) = self.k.pending() {
             batch.push(k);
@@ -613,8 +589,7 @@ impl<const R: usize, T: Element> KvCache<R, T> {
         self.v.replay_append(added)
     }
 
-    /// The cached keys, or `None` before the first append — the reference's
-    /// accessor spelling for the public `k` field.
+    /// The cached keys, or `None` before the first append.
     pub fn k(&self) -> Option<&Tensor<R, T>> {
         self.k.current()
     }
@@ -646,7 +621,7 @@ mod tests {
     use crate::session::{Backend, Session};
     use fusor2_ir::dtype::Dtype;
     use fusor2_ir::ir::Op;
-    use fusor2_ir::ir::level0::L0;
+    use fusor2_ir::ir::logical::Logical;
     use fusor2_ir::egraph::Id;
 
     fn graph() -> crate::Graph {
@@ -669,7 +644,7 @@ mod tests {
         let g = t.graph().egraph.lock();
         let mut out = Vec::new();
         for member in g.class_ids(g.class_of(t.id())) {
-            if let Op::L0(L0::Scatter { base, upd, .. }) = &g.node(member).op {
+            if let Op::Logical(Logical::Scatter { base, upd, .. }) = &g.node(member).op {
                 out.push(*base);
                 out.push(*upd);
             }
@@ -688,15 +663,13 @@ mod tests {
         let (ks, vs) = cache.append(&k0, &v0);
         assert_eq!(cache.len(), Dim::Const(2));
         assert_eq!(ks.extent(2usize), Dim::Const(2));
-        // The first append is the value itself, not a copy of it, so this
-        // readback is a straight upload/download and asserts real numbers.
+        // The first append is the value itself, not a copy of it.
         assert_eq!(ks.id(), k0.id());
         assert_eq!(ks.to_vec_f32(), vec![1.0, 2.0, 3.0, 4.0]);
         assert_eq!(vs.to_vec_f32(), vec![-1.0, -2.0, -3.0, -4.0]);
 
         // Step two: one more token. The cache grows along the cat axis only,
-        // and the *new* value is the second operand — appending is ordered,
-        // and reversing it silently corrupts a decode loop.
+        // and the new value is the second operand — appending is ordered.
         let k1: Tensor<4, f32> = typed(&g, &[1, 1, 1, 2], &[5.0, 6.0]);
         let v1: Tensor<4, f32> = typed(&g, &[1, 1, 1, 2], &[-5.0, -6.0]);
         let (ks2, vs2) = cache.append(&k1, &v1);
@@ -706,12 +679,8 @@ mod tests {
         assert_eq!(cache.k.current().unwrap().id(), ks2.id());
         assert_eq!(cache.v.current().unwrap().id(), vs2.id());
 
-        // Numerically this is `views::cat_dim*`'s obligation, and those cases
-        // are red for a reason that is not this cache: the emitters index
-        // every operand with the flat output index and ignore
-        // `Operand::layout`. What is asserted here is the part the cache
-        // owns — that the second step glues the *new* value on after the
-        // cached one, in that order.
+        // Asserted here: the part the cache owns — the second step glues the
+        // new value on after the cached one, in that order.
         let sources = cat_sources(ks2.as_dyn());
         assert!(
             sources.iter().any(|s| *s == k1.id()),
@@ -763,10 +732,8 @@ mod tests {
         assert!(cache.keep_last_inner(1).is_err());
     }
 
-    /// A rejected append reports rather than panicking *and* leaves the cache
-    /// exactly as it was. The typed `append` panics on the same conditions;
-    /// `append_dyn` is the layer that has an `Error` to put them in, so the
-    /// diagnoses are asserted there.
+    /// A rejected append reports rather than panicking and leaves the cache
+    /// exactly as it was.
     #[test]
     fn a_mismatched_append_is_an_error_not_a_panic() {
         let g = graph();
@@ -791,8 +758,7 @@ mod tests {
         );
     }
 
-    /// The rank and element type are parameters now, so a rank-2 f16 cache is
-    /// as ordinary as the rank-4 f32 default.
+    /// A rank-2 f16 cache is as ordinary as the rank-4 f32 default.
     #[test]
     fn a_cache_carries_its_rank_and_element_type() {
         let g = graph();
@@ -805,10 +771,9 @@ mod tests {
         assert_eq!(out.dtype(), Dtype::F16);
     }
 
-    /// The whole point of the replay: it re-arms *the same nodes* a rebuild
-    /// would have hash-consed onto, and advances the same state. If these two
-    /// ever diverge, a decode loop reusing a memoized graph reads the wrong
-    /// length or writes the wrong slot.
+    /// A replay re-arms the same nodes a rebuild would have hash-consed onto
+    /// and advances the same state; a divergence means a decode loop reads the
+    /// wrong length or writes the wrong slot.
     #[test]
     fn a_replayed_append_matches_the_append_it_stands_in_for() {
         let g = graph();

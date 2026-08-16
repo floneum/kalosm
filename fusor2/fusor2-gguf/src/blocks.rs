@@ -7,7 +7,7 @@
 
 use fusor2_ir::Result;
 use fusor2_ir::dtype::{QFmt, QLayout};
-use fusor2_ir::ir::level2::{StorageView, TileExpr};
+use fusor2_ir::ir::kernel::{StorageView, TileExpr};
 
 use crate::decode;
 use crate::decode_k;
@@ -203,10 +203,6 @@ pub const fn qh_width(fmt: QFmt) -> u32 {
 pub const fn word_aligned(fmt: QFmt, layout: QLayout) -> bool {
     fmt.block_bytes(layout).is_multiple_of(4)
 }
-
-// ---------------------------------------------------------------------------
-// Scalar reference decoder
-// ---------------------------------------------------------------------------
 
 /// Read the `scale`-shaped field at `offset` out of a raw block.
 fn read_scale(block: &[u8], offset: u32, is_f16: bool) -> f32 {

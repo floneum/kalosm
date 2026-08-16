@@ -1,7 +1,7 @@
 //! `fusor2-gguf` — quantized formats as data.
 //!
 //! Six ingestible GGUF block formats x two on-device storage layouts as table
-//! rows, each carrying a `BlockProgram` that emits an L2 decode snippet rather
+//! rows, each carrying a `BlockProgram` that emits an Kernel decode snippet rather
 //! than a kernel; the repack between layouts; GGUF file parsing; and the
 //! sync/sharded/async VarBuilders.
 //!

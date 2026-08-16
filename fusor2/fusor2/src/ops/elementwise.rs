@@ -1,7 +1,5 @@
-//! The 23 elementwise unaries and the 6 same-rank / 5 broadcasting
-//! binaries. Every one of these is **one `L0::Map` with a different
-//! `ScalarExpr`** — there is no 50-variant opcode enum whose discriminant
-//! ordering ends up load-bearing in a kernel cache key.
+//! The elementwise unaries and the same-rank / broadcasting binaries.
+//! Every one of these is one `Logical::Map` with a different `ScalarExpr`.
 
 use fusor2_ir::scalar::{BinOp, ScalarExpr, UnOp};
 
@@ -71,14 +69,10 @@ impl Tensor {
         self.map1(ScalarExpr::bin(BinOp::Sub, pos, neg))
     }
 
-    // L0 has no carrier for a per-node `NumericContract`.
-
     /// `exp` under a relaxed accuracy contract.
     ///
-    /// Its **own** [`UnOp`], not sugar for [`Tensor::exp`]: hash-consing would
-    /// otherwise merge a relaxed exponential with a strict one and a target
-    /// could never substitute a cheaper sequence for the first without
-    /// changing the second.
+    /// Its own [`UnOp`]: hash-consing must not merge a relaxed exponential
+    /// with a strict one.
     pub fn approximate_exp(&self) -> Result<Tensor> {
         self.map1(ScalarExpr::un(UnOp::ApproximateExp, self.arg0()))
     }
@@ -87,8 +81,6 @@ impl Tensor {
     pub fn less_approximate_exp(&self) -> Result<Tensor> {
         self.map1(ScalarExpr::un(UnOp::LessApproximateExp, self.arg0()))
     }
-
-    // -- same-rank binaries ---------------------------------------------------
 
     fn bin_same(&self, rhs: &Tensor, op: BinOp, what: &str) -> Result<Tensor> {
         if self.dtype() != rhs.dtype() {
@@ -140,8 +132,6 @@ impl Tensor {
     pub fn minimum(&self, rhs: &Tensor) -> Result<Tensor> {
         self.bin_same(rhs, BinOp::Min, "minimum")
     }
-
-    // -- broadcasting binaries -------------------------------------------------
 
     fn bin_broadcast(&self, rhs: &Tensor, op: BinOp, what: &str) -> Result<Tensor> {
         let (a, b, _) = crate::broadcast::broadcast_pair(self, rhs)?;
@@ -205,10 +195,6 @@ impl Tensor {
         Tensor::mapn(&self.graph, expr, &[self, on_true, on_false])
     }
 }
-
-// ---------------------------------------------------------------------------
-// std::ops, all four owned x ref combinations, panicking on the Result
-// ---------------------------------------------------------------------------
 
 macro_rules! std_binop {
     ($trait:ident, $method:ident, $call:ident) => {

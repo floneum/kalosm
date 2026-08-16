@@ -1,10 +1,9 @@
 //! Encoding, submission and telemetry.
 //!
-//! **Host syncs are exactly three**: explicit readback, explicit
+//! Host syncs are exactly three: explicit readback, explicit
 //! [`Target::wait`](fusor2_ir::target::Target::wait), and the allocator's cap
-//! retry. Back-pressure on in-flight submissions is a runtime policy here
-//! ([`GpuConfig::max_in_flight_submits`]), not a `--drain-every` counter in a
-//! training script.
+//! retry. Back-pressure on in-flight submissions is a runtime policy
+//! ([`GpuConfig::max_in_flight_submits`]).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -44,18 +43,11 @@ fn scopeguard<F: FnMut()>(f: F) -> ScopeGuard<F> {
     ScopeGuard(f)
 }
 
-// ---------------------------------------------------------------------------
-// Chunking policy
-// ---------------------------------------------------------------------------
-
 /// Dispatches packed into one compute pass.
 ///
-/// Consecutive dispatches share a pass until the queue gets long enough that
-/// one giant pass starts costing more in driver-side bookkeeping than the pass
-/// boundaries do. Past the threshold the pass is *chunked*, not dropped to a
-/// pass per dispatch: a Metal pass boundary costs on the order of a small
-/// kernel, and a 2357-launch decode plan spent ~10x its compute in boundary
-/// overhead when every dispatch owned a pass.
+/// Consecutive dispatches share a pass; past the threshold the pass is
+/// chunked, never dropped to a pass per dispatch — a Metal pass boundary
+/// costs on the order of a small kernel.
 pub const fn dispatches_per_pass(total: usize) -> usize {
     if total >= PASS_CHUNK_THRESHOLD {
         PASS_CHUNK
@@ -73,10 +65,6 @@ pub fn dispatches_per_submit(total: usize, backend: wgpu::Backend) -> usize {
         usize::MAX
     }
 }
-
-// ---------------------------------------------------------------------------
-// Telemetry
-// ---------------------------------------------------------------------------
 
 /// One kernel's aggregated timing across a resolve.
 #[derive(Clone, Debug, PartialEq)]
@@ -133,10 +121,6 @@ impl KernelProfile {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Command records
-// ---------------------------------------------------------------------------
-
 /// One recorded command, in exact plan order.
 pub enum CommandRecord {
     Dispatch {
@@ -164,11 +148,8 @@ impl CommandRecord {
 /// Which dispatches of a traced resolve get timestamp boundary pairs.
 ///
 /// A query set holds at most [`wgpu::QUERY_SET_MAX_QUERIES`] slots — 2048
-/// dispatch pairs — and a decode-sized plan is larger than that, so a plan
-/// that cannot be timed whole is timed *at one dispatch*: two slots around
-/// the live dispatch the tuner asked about. That is exactly the number a
-/// per-launch tuning window wants, and it is the only number such a plan can
-/// yield honestly.
+/// dispatch pairs — so a plan that cannot be timed whole is timed at one
+/// dispatch: two slots around the live dispatch the tuner asked about.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum TimingMode<'a> {
     /// Every live dispatch owns slot pair `(2i, 2i+1)`.
@@ -176,10 +157,7 @@ pub enum TimingMode<'a> {
     /// Only live dispatch `i` is timed, into slots `(0, 1)`.
     Focus(usize),
     /// The live dispatches named (ascending) own slot pairs in list order:
-    /// the `k`-th named dispatch writes `(2k, 2k+1)`. This is how a plan too
-    /// large for a full query set times a *restructuring* candidate: the
-    /// launches the candidate changed are timed together in one resolve and
-    /// judged as a summed window.
+    /// the `k`-th named dispatch writes `(2k, 2k+1)`.
     Sparse(&'a [usize]),
     /// Live dispatches
     /// `[start, start+n)` own slot pairs `(2(i-start), 2(i-start)+1)`, so a
@@ -216,10 +194,6 @@ pub struct GpuArtifact {
     pub block: u32,
 }
 
-// ---------------------------------------------------------------------------
-// Launcher
-// ---------------------------------------------------------------------------
-
 /// Owns the encoder, the in-flight submission window and the profile buffer.
 pub struct Launcher {
     device: Arc<wgpu::Device>,
@@ -231,13 +205,11 @@ pub struct Launcher {
     dispatches: AtomicU64,
     pipeline_compiles: AtomicU64,
     profiles: Mutex<Vec<KernelProfile>>,
-    /// Set for the duration of a tuning pass. A tuner needs a number that is a
-    /// property of one launch, which is what the timestamp path produces and
-    /// what a wall clock around the whole plan cannot.
+    /// Set for the duration of a tuning pass; turns on the per-launch
+    /// timestamp path.
     tuning: AtomicBool,
-    /// The most recent traced resolve's per-launch microseconds, in plan order.
-    /// Overwritten rather than queued, so draining it cannot steal a caller's
-    /// [`Self::take_kernel_profiles`] telemetry.
+    /// The most recent traced resolve's per-launch microseconds, in plan
+    /// order. Overwritten rather than queued.
     last_profile: Mutex<Option<Vec<f64>>>,
     /// The plan launch index the next traced resolve should time when the
     /// plan is too large for a full query set. Take-semantics: consumed by
@@ -245,15 +217,12 @@ pub struct Launcher {
     tuning_focus: Mutex<Option<Vec<usize>>>,
     /// Bind groups by `(artifact id, bound buffer addresses)`.
     ///
-    /// A bind group is a pure function of its layout and its buffers, and a
-    /// replayed plan binds the same pooled buffers to the same pipelines
-    /// every dispatch — so building 1,731 fresh ones a decode token was 1.3 ms
-    /// of host time per token with nothing submitted. Correctness rests on
-    /// the [`WeakBuf`]s stored beside the entry: an address identifies a
-    /// buffer only while that buffer is alive, so an entry whose weaks have
-    /// all survived was built from exactly these `Buf`s, and one that has
-    /// lost any is dropped rather than served. Weak handles do not hold the
-    /// buffer, so the pool's `strong_count == 1` recycling is unaffected.
+    /// Correctness rests on the [`WeakBuf`]s stored beside the entry: an
+    /// address identifies a buffer only while that buffer is alive, so an
+    /// entry whose weaks have all survived was built from exactly these
+    /// `Buf`s, and one that has lost any is dropped rather than served. Weak
+    /// handles do not hold the buffer, so the pool's `strong_count == 1`
+    /// recycling is unaffected.
     bind_groups: Mutex<lru::LruCache<BindGroupKey, BindGroupEntry>>,
 }
 
@@ -359,9 +328,8 @@ impl Launcher {
         self.encode_command_records(&[record], None, TimingMode::All)
     }
 
-    /// Upload binding 0. This is the whole of trainer constraints 1 and 2: the
-    /// learning rate and the sequence length are words here, so neither enters
-    /// a kernel's identity.
+    /// Upload binding 0. Scalars like the learning rate and sequence length
+    /// are uniform words here, so they never enter a kernel's identity.
     pub fn write_uniforms(&self, slot0: &Buf, uniforms: &Uniforms) -> Result<()> {
         let gpu = slot0
             .downcast_ref::<GpuBuffer>()
@@ -468,11 +436,9 @@ impl Launcher {
         let mut chunk: Vec<&CommandRecord> = Vec::new();
         let mut dispatches_in_chunk = 0usize;
         let mut submits = 0usize;
-        // Metal only: bound the in-flight working set between chunks of a
-        // giant graph. A *sliding window* over submission indices keeps at
-        // most [`METAL_INFLIGHT_CHUNKS`] chunks outstanding while the host
-        // keeps encoding — a full drain here left the GPU idle for every
-        // chunk's encode time, ~10 times per decode step.
+        // Metal only: a sliding window over submission indices keeps at most
+        // [`METAL_INFLIGHT_CHUNKS`] chunks outstanding while the host keeps
+        // encoding.
         let mut pending: std::collections::VecDeque<wgpu::SubmissionIndex> =
             std::collections::VecDeque::new();
 
@@ -544,12 +510,10 @@ impl Launcher {
                 TimingMode::Range { .. } => None,
             }
         };
-        // A pass writes exactly one boundary pair, so packing dispatches into
-        // one pass attributes all of their time to the first and leaves every
-        // later slot unwritten. Without in-pass writes, one dispatch per pass
-        // is what makes a sample a property of the kernel — but only for the
-        // dispatches actually being timed: under `Focus` every other dispatch
-        // batches as if untraced.
+        // A pass writes exactly one boundary pair, so without in-pass writes
+        // a timed dispatch needs its own pass. Only the dispatches actually
+        // being timed pay this: under `Focus` every other dispatch batches as
+        // if untraced.
         let per_pass = if timestamps.is_some()
             && !inside_passes
             && matches!(mode, TimingMode::All | TimingMode::Range { .. })
@@ -883,10 +847,6 @@ impl Launcher {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Parallel build cursor
-// ---------------------------------------------------------------------------
-
 /// A shared cursor a build cohort drains. Every compiled artifact lives behind
 /// a `OnceLock` on the cached kernel, so racing workers can only duplicate
 /// work, never observe a half-built pipeline.
@@ -905,18 +865,15 @@ impl BuildCursor {
     }
 }
 
-/// A DOT rendering of the realized launch DAG.
-///
-/// Nodes are launches, edges are the buffers one launch writes and another
-/// reads, so the picture is the plan the extractor committed to rather than an
-/// approximation of it.
+/// A DOT rendering of the realized launch DAG. Nodes are launches, edges are
+/// the buffers one launch writes and another reads.
 pub fn graphvis_dot(plan: &Plan) -> String {
     use std::fmt::Write as _;
     let mut out = String::from("digraph plan {\n  rankdir=TB;\n");
     for (i, launch) in plan.launches.iter().enumerate() {
         let _ = writeln!(
             out,
-            "  L{i} [label=\"{} root={} grid={:?} block={}\"];",
+            "  launch{i} [label=\"{} root={} grid={:?} block={}\"];",
             i, launch.root, launch.grid, launch.block
         );
     }
@@ -931,7 +888,7 @@ pub fn graphvis_dot(plan: &Plan) -> String {
                 .filter(|b| b.kind != fusor2_ir::extract::BindKind::Read)
             {
                 if consumer.bindings.iter().any(|r| r.value == w.value) {
-                    let _ = writeln!(out, "  L{i} -> L{j} [label=\"{}\"];", w.value);
+                    let _ = writeln!(out, "  launch{i} -> launch{j} [label=\"{}\"];", w.value);
                 }
             }
         }
@@ -940,9 +897,7 @@ pub fn graphvis_dot(plan: &Plan) -> String {
     out
 }
 
-/// The plan's cache key — the `gpu_key` / `key` replacement. The plan **is**
-/// the key, so there is no `hash_kernel_fields` to thread a new decision
-/// variable into.
+/// The plan's cache key: the plan is the key.
 pub const fn plan_key(plan: &Plan) -> PlanHash {
     plan.hash
 }
@@ -951,10 +906,7 @@ pub const fn plan_key(plan: &Plan) -> PlanHash {
 mod tests {
     use super::*;
 
-
-    // -----------------------------------------------------------------------
-    // Adapter-gated. These skip cleanly when no GPU is present.
-    // -----------------------------------------------------------------------
+    // Adapter-gated tests skip cleanly when no GPU is present.
 
     fn baseline_launcher() -> Option<Launcher> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
@@ -982,9 +934,9 @@ mod tests {
         ))
     }
 
-    /// Test 12: a resolve that reads nothing back records zero `poll_wait`
-    /// calls below the `max_in_flight_submits` threshold. Above it the
-    /// library — not the training script — applies back-pressure.
+    /// A resolve that reads nothing back records zero `poll_wait` calls below
+    /// the `max_in_flight_submits` threshold; above it the library applies
+    /// back-pressure.
     #[test]
     fn zero_readback_step_never_blocks() {
         let Some(launcher) = baseline_launcher() else {
@@ -1027,8 +979,8 @@ mod tests {
         );
     }
 
-    /// Test 13: 2048 dispatches on Metal encode as 2048 passes across 8
-    /// submits; 512 dispatches encode as one pass and one submit.
+    /// 2048 dispatches on Metal encode as chunked passes across 8 submits;
+    /// 512 dispatches encode as one pass and one submit.
     #[test]
     fn pass_and_submit_chunking() {
         assert_eq!(dispatches_per_pass(2048), PASS_CHUNK);
@@ -1116,8 +1068,8 @@ mod tests {
     #[test]
     fn graphvis_names_every_launch() {
         use fusor2_ir::egraph::Id;
-        use fusor2_ir::extract::{BindKind, BindingPlan, Launch};
-        let launch = |root: u32, value: u32, kind: BindKind| Launch {
+        use fusor2_ir::extract::{BindKind, BindingPlan};
+        let launch = |root: u32, value: u32, kind: BindKind| fusor2_ir::extract::Dispatch {
             root: Id(root),
             members: Default::default(),
             bindings: vec![BindingPlan {
@@ -1141,8 +1093,8 @@ mod tests {
         };
         let dot = graphvis_dot(&plan);
         assert!(dot.starts_with("digraph plan {"));
-        assert!(dot.contains("L0"));
-        assert!(dot.contains("L1"));
-        assert!(dot.contains("L0 -> L1"), "the write/read edge must appear");
+        assert!(dot.contains("launch0"));
+        assert!(dot.contains("launch1"));
+        assert!(dot.contains("launch0 -> launch1"), "the write/read edge must appear");
     }
 }

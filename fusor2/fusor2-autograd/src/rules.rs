@@ -1,21 +1,12 @@
-//! Rewrite rules that recover the reference's hand-fused backwards from the
-//! *composed* backward this crate generates.
+//! Rewrite rules that recover hand-fused backwards from the composed
+//! backward this crate generates.
 //!
-//! These are the L0 -> L0 half. The four `KFlash` rules the architecture names
-//! are L1 (`KFold`/`KContract`-headed) and therefore live in
-//! `fusor2-ir/src/rules/flash.rs`; autograd runs before saturation and cannot
-//! see an L1 node, so they could not be written here.
-//!
-//! All three are `Additive`. The composed chain always stays live in the same
-//! e-class; these rules only add, so extraction — not rule order — decides.
-//! Each reads only [`Facts`], and each takes `NumericContract::reassoc` as its
-//! legality guard, because every one of them re-associates float arithmetic.
-//!
-//! The `on_a_real_tape` module below verifies each rule fires on the nodes the
-//! adjoint walk emits, not just hand-built patterns.
+//! All three are `Additive`: the composed chain stays live in the same
+//! e-class and extraction decides. Each takes `NumericContract::reassoc` as
+//! its legality guard because every one re-associates float arithmetic.
 
 use fusor2_ir::egraph::{Builder, Facts, Id, Rule, RuleTag};
-use fusor2_ir::ir::level0::{EinSpec, L0, Label};
+use fusor2_ir::ir::logical::{EinSpec, Logical, Label};
 use fusor2_ir::ir::{Level, Node, Op, OpTag};
 use fusor2_ir::rule;
 use fusor2_ir::scalar::{BinOp, ScalarExpr, ScalarKind, UnOp};
@@ -23,7 +14,7 @@ use smallvec::SmallVec;
 
 rule!(
     SOFTPLUS_BCE_ADJOINT,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Map,
     tag = RuleTag::Additive,
     apply = softplus_bce_adjoint,
@@ -31,7 +22,7 @@ rule!(
 
 rule!(
     SOFTMAX_JACOBIAN,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Map,
     tag = RuleTag::Additive,
     apply = softmax_jacobian,
@@ -39,7 +30,7 @@ rule!(
 
 rule!(
     ATTENTION_BACKWARD,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Fold,
     tag = RuleTag::Additive,
     apply = attention_backward,
@@ -50,28 +41,20 @@ pub static ADJOINT_RULES: &[Rule] = &[SOFTPLUS_BCE_ADJOINT, SOFTMAX_JACOBIAN, AT
 
 /// Rewrite the taped softplus-BCE chain's adjoint to the single-sigmoid form.
 ///
-/// Differentiating `w*softplus(x) - x*z` leaves the logistic factor in the
-/// form `exp(u) / (1 + exp(u))`, which is `inf/inf = NaN` once `exp(u)`
-/// overflows. The mathematically identical `1 / (1 + exp(-u))` is not.
-/// Unioning it in is what lets the trainer's `distillation_loss` be the plain
-/// taped chain instead of a hand-written analytic node.
-///
-/// The differentiator does not hand that factor over bare. `d/dx log(1 + e)`
-/// with `e = exp(u)` comes out as `(g / (1 + e)) * e` — the incoming adjoint
-/// is *inside* the quotient and the `exp` is a separate factor outside it. A
-/// pattern that only matched `Div(exp(u), 1 + exp(u))` therefore never fired
-/// on a real tape; the scaled form is matched too, and rewrites to
-/// `g * (1 / (1 + exp(-u)))`.
+/// The composed adjoint leaves the logistic factor as `exp(u) / (1 + exp(u))`,
+/// which is `inf/inf = NaN` once `exp(u)` overflows; the mathematically
+/// identical `1 / (1 + exp(-u))` is not. The differentiator emits the scaled
+/// spelling `(g / (1 + e)) * e`, so both forms are matched.
 pub fn softplus_bce_adjoint(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     if !f.own().numeric.reassoc {
         return None;
     }
-    let Op::L0(L0::Map { expr, ins, outs }) = &node.op else {
+    let Op::Logical(Logical::Map { expr, ins, outs }) = &node.op else {
         return None;
     };
     let rewritten = rewrite(expr, &logistic_normalize)?;
     let alt = b
-        .add_l0(L0::Map {
+        .add_logical(Logical::Map {
             expr: rewritten,
             ins: ins.clone(),
             outs: *outs,
@@ -85,8 +68,7 @@ pub fn softplus_bce_adjoint(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<
 /// * `exp(u) / (1 + exp(u))`      -> `1 / (1 + exp(-u))`
 /// * `(g / (1 + exp(u))) * exp(u)` -> `g * (1 / (1 + exp(-u)))`
 ///
-/// with either operand order at every commutative position. The second is the
-/// one the map differentiator actually emits.
+/// with either operand order at every commutative position.
 fn logistic_normalize(e: &ScalarExpr) -> Option<ScalarExpr> {
     match e.kind() {
         ScalarKind::Bin {
@@ -169,22 +151,18 @@ fn sigmoid_of(one: &ScalarExpr, u: &ScalarExpr) -> ScalarExpr {
     )
 }
 
-/// Recover the analytic softmax Jacobian from the composed backward.
-///
-/// The composed form is `dS = P*dP - P*rowsum(dP*P)`, two multiplies over the
-/// full row. `dS = P * (dP - rowsum(dP*P))` is one, and is exactly the fused
-/// rule the reference hand-writes. Distributivity over a shared factor is the
-/// whole of it.
+/// Recover the analytic softmax Jacobian from the composed backward:
+/// `dS = P*dP - P*rowsum(dP*P)` -> `dS = P * (dP - rowsum(dP*P))`.
 pub fn softmax_jacobian(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     if !f.own().numeric.reassoc {
         return None;
     }
-    let Op::L0(L0::Map { expr, ins, outs }) = &node.op else {
+    let Op::Logical(Logical::Map { expr, ins, outs }) = &node.op else {
         return None;
     };
     let rewritten = rewrite(expr, &factor_shared)?;
     let alt = b
-        .add_l0(L0::Map {
+        .add_logical(Logical::Map {
             expr: rewritten,
             ins: ins.clone(),
             outs: *outs,
@@ -238,23 +216,14 @@ fn factor_shared(e: &ScalarExpr) -> Option<ScalarExpr> {
 }
 
 /// Recognize the composed contraction the attention backward (and every
-/// other matmul backward) is written as, and mint an `L0::Contract` beside it.
-///
-/// `dq = ds @ k`, `dk = ds^T @ q` and `dv = p^T @ grad_o` all arrive as
-/// `Fold{Add}(Map(Mul(a, b)))` over broadcast views of two lower-rank
-/// tensors. Left as a fold, each is a generic reduce; recognized as a
-/// contraction, each becomes one `KContract` chain with `Coop`, `Sgemm` and
-/// `Sgemv` all live in the same class — which is exactly what keeps the
-/// fused-backward tripwire from firing.
-///
-/// The `mul`+`fold` form stays in the class: this rule only adds, so a
-/// product node with two consumers keeps both options and the cost model,
-/// not a consumer count, decides.
+/// other matmul backward) is written as — `Fold{Add}(Map(Mul(a, b)))` over
+/// broadcast views of two lower-rank tensors — and mint a
+/// `Logical::Contract` beside it. The `mul`+`fold` form stays in the class.
 pub fn attention_backward(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     if !f.own().numeric.reassoc {
         return None;
     }
-    let Op::L0(L0::Fold {
+    let Op::Logical(Logical::Fold {
         carrier,
         axis,
         acc,
@@ -271,7 +240,7 @@ pub fn attention_backward(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_
     let &[x] = &fold_ins[..] else {
         return None;
     };
-    let Op::L0(L0::Map {
+    let Op::Logical(Logical::Map {
         expr,
         ins,
         outs: 1,
@@ -304,8 +273,7 @@ pub fn attention_backward(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_
         .filter(|i| *i != axis)
         .map(|i| Label(i as u8))
         .collect();
-    // Every surviving label must be read by at least one operand, or the
-    // spec would carry a label appearing only in `out`.
+    // Every surviving label must be read by at least one operand.
     if !out
         .iter()
         .all(|l| a_labels.contains(l) || b_labels.contains(l))
@@ -321,7 +289,7 @@ pub fn attention_backward(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_
     crate::contract::verify_spec(&spec).ok()?;
 
     let alt = b
-        .add_l0(L0::Contract {
+        .add_logical(Logical::Contract {
             spec,
             acc: *acc,
             a: base_a,
@@ -349,16 +317,14 @@ fn is_plain_product(expr: &ScalarExpr) -> bool {
 }
 
 /// The base tensor behind a broadcast view, plus the index labels it reads.
-/// `None` when the view is anything other than a pure right-order broadcast:
-/// a slice, a stride, a permutation or a reshape all disqualify *this*
-/// rewrite and nothing else.
+/// `None` when the view is anything other than a pure right-order broadcast.
 fn operand_labels(
     b: &Builder<'_>,
     v: Id,
     rank: usize,
 ) -> Option<(Id, SmallVec<[Label; 6]>)> {
     match &b.node(v).op {
-        Op::L0(L0::Restride { specs, x, .. }) => {
+        Op::Logical(Logical::Restride { specs, x, .. }) => {
             if specs.len() != rank {
                 return None;
             }
@@ -395,11 +361,8 @@ fn operand_labels(
     }
 }
 
-// ------------------------------------------------------------------ helpers
-
 /// Bottom-up rewrite: apply `f` at every node, innermost first. Returns
-/// `None` when nothing changed, so a rule that would union a node with
-/// itself simply does not fire.
+/// `None` when nothing changed.
 fn rewrite(
     e: &ScalarExpr,
     f: &dyn Fn(&ScalarExpr) -> Option<ScalarExpr>,
@@ -482,7 +445,7 @@ mod tests {
     use fusor2_ir::dtype::{Dtype, Splat};
     use fusor2_ir::egraph::EGraph;
     use fusor2_ir::carrier::Carrier;
-    use fusor2_ir::ir::level0::{BufferId, LeafKind};
+    use fusor2_ir::ir::logical::{BufferId, LeafKind};
 
     fn cbin(op: BinOp) -> Carrier {
         Carrier::binop(op, Carrier::binop_identity(op, Dtype::F32).unwrap(), Dtype::F32)
@@ -491,7 +454,7 @@ mod tests {
 
     fn param(g: &mut EGraph, shape: &[u64]) -> Id {
         let n = g.len() as u32;
-        g.add(Op::L0(L0::Leaf(LeafKind::Param {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Param {
             name: BufferId(n),
             dtype: Dtype::F32,
             shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
@@ -532,7 +495,7 @@ mod tests {
             ScalarExpr::bin(BinOp::Add, one(), e),
         );
         let m = g
-            .add(Op::L0(L0::Map {
+            .add(Op::Logical(Logical::Map {
                 expr: body,
                 ins: smallvec::smallvec![x],
                 outs: 1,
@@ -543,7 +506,7 @@ mod tests {
         assert!(class.contains(&m), "the composed form stays live");
         let alt = class.iter().copied().find(|c| *c != m).unwrap();
         match &g.node(alt).op {
-            Op::L0(L0::Map { expr, .. }) => {
+            Op::Logical(Logical::Map { expr, .. }) => {
                 // 1 / (1 + exp(-x))
                 let want = ScalarExpr::bin(
                     BinOp::Div,
@@ -571,7 +534,7 @@ mod tests {
             ScalarExpr::bin(BinOp::Add, e, one()),
         );
         let m = g
-            .add(Op::L0(L0::Map {
+            .add(Op::Logical(Logical::Map {
                 expr: body,
                 ins: smallvec::smallvec![x],
                 outs: 1,
@@ -586,7 +549,7 @@ mod tests {
         let x = param(&mut g, &[4]);
         let body = ScalarExpr::bin(BinOp::Add, arg(0), one());
         let m = g
-            .add(Op::L0(L0::Map {
+            .add(Op::Logical(Logical::Map {
                 expr: body,
                 ins: smallvec::smallvec![x],
                 outs: 1,
@@ -608,7 +571,7 @@ mod tests {
             ScalarExpr::bin(BinOp::Mul, arg(0), arg(2)),
         );
         let m = g
-            .add(Op::L0(L0::Map {
+            .add(Op::Logical(Logical::Map {
                 expr: body,
                 ins: smallvec::smallvec![p, dp, row],
                 outs: 1,
@@ -617,7 +580,7 @@ mod tests {
         let u = fire(&mut g, &SOFTMAX_JACOBIAN, m).expect("the rule must fire");
         let alt = members(&g, u).into_iter().find(|c| *c != m).unwrap();
         match &g.node(alt).op {
-            Op::L0(L0::Map { expr, .. }) => {
+            Op::Logical(Logical::Map { expr, .. }) => {
                 let want = ScalarExpr::bin(
                     BinOp::Mul,
                     arg(0),
@@ -642,7 +605,7 @@ mod tests {
             ScalarExpr::bin(BinOp::Mul, arg(2), arg(0)),
         );
         let m = g
-            .add(Op::L0(L0::Map {
+            .add(Op::Logical(Logical::Map {
                 expr: body,
                 ins: smallvec::smallvec![p, dp, row],
                 outs: 1,
@@ -659,7 +622,7 @@ mod tests {
         let bb = param(&mut g, &[3, 5]); // [k, n]
         // a -> [m, k, n] with n broadcast
         let va = g
-            .add(Op::L0(L0::Restride {
+            .add(Op::Logical(Logical::Restride {
                 specs: smallvec::smallvec![
                     StrideSpec::dim(0, Dim::Const(4)),
                     StrideSpec::dim(1, Dim::Const(3)),
@@ -671,7 +634,7 @@ mod tests {
             .unwrap();
         // b -> [m, k, n] with m broadcast
         let vb = g
-            .add(Op::L0(L0::Restride {
+            .add(Op::Logical(Logical::Restride {
                 specs: smallvec::smallvec![
                     StrideSpec::broadcast(Dim::Const(4)),
                     StrideSpec::dim(0, Dim::Const(3)),
@@ -682,14 +645,14 @@ mod tests {
             }))
             .unwrap();
         let prod = g
-            .add(Op::L0(L0::Map {
+            .add(Op::Logical(Logical::Map {
                 expr: ScalarExpr::bin(BinOp::Mul, arg(0), arg(1)),
                 ins: smallvec::smallvec![va, vb],
                 outs: 1,
             }))
             .unwrap();
         let folded = g
-            .add(Op::L0(L0::Fold {
+            .add(Op::Logical(Logical::Fold {
                 carrier: cbin(BinOp::Add),
                 axis: 1,
                 acc: Dtype::F32,
@@ -700,7 +663,7 @@ mod tests {
         let u = fire(&mut g, &ATTENTION_BACKWARD, folded).expect("the rule must fire");
         let alt = members(&g, u).into_iter().find(|c| *c != folded).unwrap();
         match &g.node(alt).op {
-            Op::L0(L0::Contract { spec, a: ca, b: cb, .. }) => {
+            Op::Logical(Logical::Contract { spec, a: ca, b: cb, .. }) => {
                 assert_eq!(*ca, a);
                 assert_eq!(*cb, bb);
                 assert_eq!(spec.a.as_slice(), &[Label(0), Label(1)]);
@@ -721,14 +684,14 @@ mod tests {
         let a = param(&mut g, &[4, 3]);
         let b2 = param(&mut g, &[4, 3]);
         let prod = g
-            .add(Op::L0(L0::Map {
+            .add(Op::Logical(Logical::Map {
                 expr: ScalarExpr::bin(BinOp::Mul, arg(0), arg(1)),
                 ins: smallvec::smallvec![a, b2],
                 outs: 1,
             }))
             .unwrap();
         let folded = g
-            .add(Op::L0(L0::Fold {
+            .add(Op::Logical(Logical::Fold {
                 carrier: cbin(BinOp::Add),
                 axis: 1,
                 acc: Dtype::F32,
@@ -736,8 +699,7 @@ mod tests {
             }))
             .unwrap();
         // Both operands read every axis, so every surviving label is a batch
-        // label and the "contraction" is a diagonal — a legal `EinSpec`, and
-        // one this rule is happy to mint.
+        // label and the "contraction" is a diagonal — a legal `EinSpec`.
         assert!(fire(&mut g, &ATTENTION_BACKWARD, folded).is_some());
     }
 
@@ -747,16 +709,16 @@ mod tests {
         let a = param(&mut g, &[4, 3]);
         let b2 = param(&mut g, &[4, 3]);
         let prod = g
-            .add(Op::L0(L0::Map {
+            .add(Op::Logical(Logical::Map {
                 expr: ScalarExpr::bin(BinOp::Mul, arg(0), arg(1)),
                 ins: smallvec::smallvec![a, b2],
                 outs: 1,
             }))
             .unwrap();
         let folded = g
-            .add(Op::L0(L0::Fold {
+            .add(Op::Logical(Logical::Fold {
                 carrier: cbin(BinOp::Max)
-                    .with_tie(fusor2_ir::ir::level0::TiePolicy::FirstWins),
+                    .with_tie(fusor2_ir::ir::logical::TiePolicy::FirstWins),
                 axis: 1,
                 acc: Dtype::F32,
                 ins: smallvec::smallvec![prod],
@@ -769,7 +731,7 @@ mod tests {
     fn all_three_rules_are_additive_and_level_zero() {
         assert_eq!(ADJOINT_RULES.len(), 3);
         for r in ADJOINT_RULES {
-            assert_eq!(r.level, Level::L0);
+            assert_eq!(r.level, Level::Logical);
             assert_eq!(r.tag, RuleTag::Additive);
         }
     }
@@ -777,10 +739,8 @@ mod tests {
 
 #[cfg(test)]
 mod on_a_real_tape {
-    //! The rules above are only worth having if they fire on what the
-    //! *adjoint walk* emits, not on a hand-built node in the shape the rule
-    //! was written for. These cases build a primal, differentiate it with
-    //! [`crate::backward`], and fire the rule on the node that comes out.
+    //! These cases build a primal, differentiate it with [`crate::backward`],
+    //! and fire the rule on the node the adjoint walk emits.
 
     use super::*;
     use crate::backward::backward_into;
@@ -790,7 +750,7 @@ mod on_a_real_tape {
     use fusor2_ir::autograd::Tape;
     use fusor2_ir::dtype::{Dtype, Splat};
     use fusor2_ir::egraph::EGraph;
-    use fusor2_ir::ir::level0::{BufferId, LeafKind};
+    use fusor2_ir::ir::logical::{BufferId, LeafKind};
     use fusor2_ir::shape::Dim;
     use rustc_hash::FxHashMap;
 
@@ -805,7 +765,7 @@ mod on_a_real_tape {
 
     fn f32_buffer(g: &mut EGraph, shape: &[u64]) -> Id {
         let n = g.len() as u32;
-        g.add(Op::L0(L0::Leaf(LeafKind::Buffer {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
             name: BufferId(n),
             dtype: Dtype::F32,
             shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
@@ -814,7 +774,7 @@ mod on_a_real_tape {
     }
 
     fn ones(g: &mut EGraph, shape: &[u64]) -> Id {
-        g.add(Op::L0(L0::Leaf(LeafKind::Const {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Const {
             value: Splat::F32(1.0),
             shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
         })))
@@ -844,8 +804,8 @@ mod on_a_real_tape {
         )
     }
 
-    /// The rule fires on the softplus adjoint the differentiator emits, and
-    /// the alternative it unions in computes the same numbers.
+    /// The rule fires on the taped softplus adjoint, and the alternative it
+    /// unions in computes the same numbers.
     #[test]
     fn softplus_bce_adjoint_fires_on_the_taped_adjoint() {
         let mut g = graph();
@@ -928,8 +888,7 @@ mod on_a_real_tape {
     }
 
     /// One pass reaches a fixed point: firing the rule on its own output
-    /// changes nothing, so saturation cannot union a class with itself
-    /// forever.
+    /// changes nothing.
     #[test]
     fn the_rewrite_is_idempotent() {
         let d = Dtype::F32;
@@ -944,10 +903,9 @@ mod on_a_real_tape {
         assert!(rewrite(&once, &logistic_normalize).is_none(), "and only once");
     }
 
-    /// The composed softmax backward is *not* one `Map` — every primitive
-    /// gets its own — so `softmax_jacobian`'s `p*dP - p*R` pattern cannot
-    /// appear until map-into-map fusion has merged them. This pins the
-    /// boundary rather than pretending the rule fires today.
+    /// The composed softmax backward is not one `Map` — every primitive gets
+    /// its own — so `softmax_jacobian`'s `p*dP - p*R` pattern cannot appear
+    /// until map-into-map fusion has merged them. This pins that boundary.
     #[test]
     fn the_softmax_jacobian_needs_map_fusion_that_does_not_run_yet() {
         let mut g = graph();
@@ -971,7 +929,7 @@ mod on_a_real_tape {
             .filter(|i| {
                 let op = g.node(Id(*i as u32)).op.clone();
                 match &op {
-                    Op::L0(L0::Map { expr, .. }) => rewrite(expr, &factor_shared).is_some(),
+                    Op::Logical(Logical::Map { expr, .. }) => rewrite(expr, &factor_shared).is_some(),
                     _ => false,
                 }
             })

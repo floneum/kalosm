@@ -12,7 +12,7 @@
 //!   [`MaskCache::materialized`] builds and what `entries` memoizes.
 
 use fusor2_ir::dtype::Dtype;
-use fusor2_ir::ir::level1::MaskKind;
+use fusor2_ir::ir::launch::MaskKind;
 use fusor2_ir::shape::Dim;
 use rustc_hash::FxHashMap;
 
@@ -36,7 +36,7 @@ pub enum AttentionMask<T: Element = f32> {
 
 impl<T: Element> AttentionMask<T> {
     /// The tensor this mask carries, if it carries one. A structural mask
-    /// deliberately has none.
+    /// has none.
     pub fn tensor(&self) -> Option<&Tensor<2, T>> {
         match self {
             Self::Structural(_) => None,
@@ -89,9 +89,8 @@ impl<T: Element> MaskCache<T> {
     /// The mask a `[q_len, k_len]` score block needs.
     ///
     /// Structural whenever the shape alone decides it, which is both cases a
-    /// decode loop ever hits. The rectangular case is reported as an error
-    /// rather than guessed at, because materializing it needs a graph:
-    /// [`MaskCache::materialized`] is that entry point.
+    /// decode loop ever hits. The rectangular case is an error: materializing
+    /// it needs a graph, which is [`MaskCache::materialized`]'s entry point.
     pub fn get(&mut self, q_len: Dim, k_len: Dim) -> Result<AttentionMask<T>> {
         Ok(AttentionMask::Structural(structural_kind(q_len, k_len).ok_or_else(
             || {

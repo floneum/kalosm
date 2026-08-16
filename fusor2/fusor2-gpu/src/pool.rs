@@ -70,12 +70,10 @@ pub struct BufferPool {
 /// A reusable upload staging buffer, kept mapped between uses.
 ///
 /// `queue.write_buffer_with`'s staging is a fresh allocation per call, so a
-/// large upload memcpy runs at page-fault speed — the kernel zero-fill
-/// serializes and neither thread count nor copy width moves it (9.4 MB Q4K
-/// weight: ~1.05 ms serial, ~0.78 ms with 3 threads, on an M2 Max). Writing
-/// into the *same* mapped buffer every time keeps the pages resident; the
-/// chunk is unmapped only for the instant its copy is in flight and
-/// `map_async` re-arms it during the resolve's own wait.
+/// large upload memcpy runs at page-fault speed. Writing into the same mapped
+/// buffer every time keeps the pages resident; the chunk is unmapped only
+/// while its copy is in flight and `map_async` re-arms it during the
+/// resolve's own wait.
 struct StagingChunk {
     buffer: wgpu::Buffer,
     size: u64,
@@ -265,17 +263,10 @@ impl BufferPool {
         let key = PoolKey { size, usage };
         let addr = buf.addr();
         // Everything this pool created is already tracked, so recycling is
-        // dropping the caller's clone. Only a foreign handle is adopted.
-        // The old `if buf.refcount() != 1 { return; }` guard is gone on
-        // purpose: a tracked buffer has refcount 2 (pool + caller) here, and
-        // a caller that still holds another clone simply fails `take_free`'s
-        // `refcount() == 1` test until it drops it.
-        //
-        // The old `else` arm here also locked `self.counters` twice inside one
-        // assignment — the RHS guard is still alive when the LHS locks, which
-        // is a hard `parking_lot` deadlock. It was unreachable only because
-        // `swap_remove` kept buckets under `FREE_PER_BUCKET`; retention makes
-        // that branch reachable, so it is gone.
+        // dropping the caller's clone; only a foreign handle is adopted. A
+        // tracked buffer has refcount 2 (pool + caller) here, and a caller
+        // that still holds another clone fails `take_free`'s `refcount() == 1`
+        // test until it drops it.
         let released = {
             let mut free = self.free.lock();
             let bucket = free.get_or_insert_mut(key, Vec::new);
@@ -353,9 +344,8 @@ impl BufferPool {
         let mut free = self.free.lock();
         let bucket = free.get_mut(&key)?;
         // The pool holds its own handle, so `refcount() == 1` is exactly "no
-        // caller has this one". Handing back a **clone** leaves the entry
-        // tracked, which is what makes a dropped buffer reusable with no
-        // `recycle` call at all.
+        // caller has this one". Handing back a clone leaves the entry tracked,
+        // which makes a dropped buffer reusable with no `recycle` call.
         bucket.iter().find(|b| b.refcount() == 1).cloned()
     }
 
@@ -375,12 +365,10 @@ impl BufferPool {
             self.poison_fill(&gpu);
         }
         let buf = Buf::new(gpu);
-        // **The pool keeps its own handle to everything it creates.** Without
-        // it, a buffer that is never explicitly `recycle`d is destroyed with
-        // its last caller handle and re-created from the driver next resolve
-        // — and nothing recycles a plan output (`GpuTarget::resolve` skips
-        // every value in `binds.buffers`, which `Session::run` fills with
-        // every launch root) or an uploaded leaf.
+        // The pool keeps its own handle to everything it creates. Without it,
+        // a buffer that is never explicitly `recycle`d is destroyed with its
+        // last caller handle and re-created from the driver next resolve —
+        // and nothing recycles a plan output or an uploaded leaf.
         let key = PoolKey {
             size,
             usage: usage.bits(),
@@ -442,15 +430,12 @@ fn prune_bucket(bucket: &mut Vec<Buf>) -> u64 {
     released
 }
 
-/// Round up to `wgpu::COPY_BUFFER_ALIGNMENT`, which every
-/// `copy_buffer_to_buffer` and `write_buffer_with` requires.
 /// Copy `src` into a staging view with one thread per ~4 MB chunk.
 ///
 /// A staging allocation is fresh pages, so a serial `copy_from_slice` runs at
-/// page-fault speed (~9 GB/s measured on an M2 Max for a 9.4 MB Q4K weight —
-/// over 1 ms, the single largest host cost of an upload-per-step workload).
-/// Page faults parallelize almost linearly; threads are only spawned past
-/// [`PARALLEL_COPY_CHUNK`], so small uploads never pay a spawn.
+/// page-fault speed. Page faults parallelize almost linearly; threads are
+/// only spawned past [`PARALLEL_COPY_CHUNK`], so small uploads never pay a
+/// spawn.
 fn parallel_copy(mut dst: wgpu::WriteOnly<'_, [u8]>, src: &[u8]) {
     const PARALLEL_COPY_CHUNK: usize = 2 << 20;
     let threads = if cfg!(target_arch = "wasm32") {
@@ -551,11 +536,8 @@ mod tests {
     use super::*;
 
 
-    // -----------------------------------------------------------------------
-    // Adapter-gated. These skip cleanly when no GPU is present.
-    // -----------------------------------------------------------------------
-
-    /// A raw wgpu device at WebGPU baseline limits.
+    /// A raw wgpu device at WebGPU baseline limits. Adapter-gated tests skip
+    /// cleanly when no GPU is present.
     fn baseline_device() -> Option<(Arc<wgpu::Device>, Arc<wgpu::Queue>)> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let adapter = pollster::block_on(
@@ -576,8 +558,8 @@ mod tests {
         Some((Arc::new(device), Arc::new(queue)))
     }
 
-    /// Test 10: allocate, drop, reallocate the same `(size, usage)` —
-    /// `created` increments once, `requested` twice.
+    /// Allocate, drop, reallocate the same `(size, usage)` — `created`
+    /// increments once, `requested` twice.
     #[test]
     fn pool_reuses_on_strong_count_one() {
         let Some((device, queue)) = baseline_device() else {
@@ -620,8 +602,8 @@ mod tests {
         drop((alias, b));
     }
 
-    /// Test 11: with the ceiling set just under the working set, the allocator
-    /// polls and retries at least once before erroring.
+    /// With the ceiling set just under the working set, the allocator polls
+    /// and retries at least once before erroring.
     #[test]
     fn pool_cap_polls_before_failing() {
         let Some((device, queue)) = baseline_device() else {

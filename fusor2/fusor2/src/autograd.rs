@@ -2,27 +2,19 @@
 //!
 //! [`Tensor<R, T>`] is a [`RawTensor<R, T>`](crate::tensor::typed::Tensor)
 //! plus the [`Graph`] it was built in. There is no separate tape: the e-graph
-//! *is* the tape, so a forward op and its adjoint are nodes in one arena and
-//! "save this activation or recompute it" stays the extractor's
-//! materialization bit rather than a pass anybody writes.
+//! is the tape, so a forward op and its adjoint are nodes in one arena and
+//! "save this activation or recompute it" is the extractor's materialization
+//! bit.
 //!
 //! # `with_backwards` and where a user rule runs
 //!
-//! [`fusor2_autograd::custom`] registers a rule as a bare `fn` whose gradients
-//! are slot-aligned to the node's **operands**. That is the right contract for
-//! a rule over an op, and the wrong one for what a model actually writes: a
-//! value computed with raw tensor ops, declared to have parents that are not
-//! its operands at all — a fake-quantized weight is a `constant_from_raw` with
-//! no operands whose parent is the master weight.
-//!
-//! So a rule registered here is not registered with the reverse walk. It is a
-//! **chain-rule boundary**: [`Tensor::backward_with`] runs the ordinary
-//! backward down to each boundary, hands the boundary's gradient to the user
-//! closure, and continues from whatever slots the closure names. That makes
-//! two things fall out rather than being worked around — the closure builds
-//! its nodes through the ordinary tensor API instead of through a `Tape`, and
-//! it can name any slot at all, because nothing assumed its parents were its
-//! operands.
+//! A rule registered here is a chain-rule boundary, not a node in the reverse
+//! walk: [`Tensor::backward_with`] runs the ordinary backward down to each
+//! boundary, hands the boundary's gradient to the user closure, and continues
+//! from whatever slots the closure names. The closure builds its gradients
+//! with the ordinary tensor API and may name parents that are not its
+//! operands — a fake-quantized weight is a `constant_from_raw` with no
+//! operands whose parent is the master weight.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -40,8 +32,8 @@ pub use fusor2_ir::autograd::{GradientSlot, Parent};
 
 /// How many boundary hops one backward may take before it is a cycle.
 ///
-/// A hop is either one user rule or one partial reverse walk, and the counter
-/// is a cycle guard rather than a budget.
+/// A hop is either one user rule or one partial reverse walk; the counter is
+/// a cycle guard.
 const MAX_BOUNDARY_HOPS: usize = 512;
 
 /// One gradient the user's [`Tensor::with_backwards`] rule produced, and the
@@ -167,10 +159,6 @@ impl Graph {
         ids
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tensor
-// ---------------------------------------------------------------------------
 
 /// A value on the tape.
 pub struct Tensor<const R: usize, T: Element = f32> {
@@ -426,10 +414,6 @@ impl Gradients {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Differentiable ops
-// ---------------------------------------------------------------------------
-
 /// Rank- and dtype-preserving unaries.
 macro_rules! same {
     ($($name:ident),* $(,)?) => {
@@ -506,10 +490,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     }
 
     /// Broadcasting `a + b`, output rank `O = max(R, R2)`.
-    ///
-    /// Two const parameters, matching the reference's tape-level binaries.
-    /// The raw tensor's take a third — the operand slot the reference spelled
-    /// `B: Fusion<R2, D>` — because that is what a raw call site turbofishes.
     #[track_caller]
     pub fn add_<const R2: usize, const O: usize>(&self, rhs: &Tensor<R2, T>) -> Tensor<O, T> {
         self.like(

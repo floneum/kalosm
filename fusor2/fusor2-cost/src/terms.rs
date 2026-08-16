@@ -12,8 +12,7 @@ use fusor2_ir::facts::Work;
 const PS_PER_US: u128 = 1_000_000;
 
 /// Floor of the `n`th root, by Newton iteration on integers so the argmin
-/// stays exactly reproducible across platforms. Ported verbatim from
-/// `cost.rs:295`.
+/// stays exactly reproducible across platforms.
 pub fn integer_root(value: u128, n: u32) -> u128 {
     if value < 2 {
         return value;
@@ -38,8 +37,6 @@ fn ps(value: u128) -> Picoseconds {
 /// mac_rate(Fma, U32)`. The last addend is the view-fold-vs-gather term: an
 /// aliased operand pays no index arithmetic, a gather pays one integer op
 /// per element, and an unflattened conv-window operand pays one per divmod.
-/// The reference has no equivalent, which is why its view folding is gated
-/// on a hardcoded reread threshold instead of priced.
 ///
 /// **No occupancy scaling and no traffic.** This is the term
 /// `CostModel::node_math` returns and the admissible lower bound is built
@@ -55,11 +52,10 @@ pub fn math_ps(facts: &DeviceFacts, work: Work, unit: MacUnit, dtype: Dtype) -> 
 
 /// T2: workgroup-memory traffic.
 ///
-/// `bytes` is `fragment_bytes + stage_bytes` as `cost.rs:201-202` computes
-/// them, summed over the whole launch — the caller supplies it from
-/// `Work::wg_bytes`, never from a re-estimate. `staging == 1` loses the
-/// load/MMA overlap the rates were fitted on and pays
-/// `single_buffered_traffic_pct`.
+/// `bytes` is `fragment_bytes + stage_bytes` summed over the whole launch —
+/// the caller supplies it from `Work::wg_bytes`, never from a re-estimate.
+/// `staging == 1` loses the load/MMA overlap the rates were fitted on and
+/// pays `single_buffered_traffic_pct`.
 pub fn wg_ps(facts: &DeviceFacts, bytes: u64, staging: u8) -> Picoseconds {
     let pct = if staging == 1 {
         u128::from(facts.single_buffered_traffic_pct)
@@ -82,9 +78,7 @@ pub fn wg_ps(facts: &DeviceFacts, bytes: u64, staging: u8) -> Picoseconds {
 /// the measured pair (halving the footprint at fixed tile, splits and grid)
 /// is 14%.
 ///
-/// `arena_bytes` is the exact `ArenaPlan::total_bytes`. Never re-estimate
-/// it — an estimator here is how the reference's packing result silently
-/// changes tile selection on the next build.
+/// `arena_bytes` is the exact `ArenaPlan::total_bytes`, never a re-estimate.
 pub fn drain_ps(
     facts: &DeviceFacts,
     padded_out_elems: u64,
@@ -108,9 +102,6 @@ pub fn drain_ps(
 /// cache. `bytes * (1 + (r - 1) * (bytes - llc) / bytes)` is exactly
 /// `bytes + (r - 1) * (bytes - llc)`, so it is computed that way and stays
 /// integral.
-///
-/// The reference's `DispatchPolicy::cache_resident` is a strict `<`, which
-/// makes one byte over 8 MiB flip the tiling plan. That cliff is deleted.
 pub fn effective_read_bytes(llc_bytes: u64, bytes: u64, rereads: u32) -> u128 {
     let bytes = u128::from(bytes);
     let rereads = u128::from(rereads.max(1));
@@ -121,9 +112,7 @@ pub fn effective_read_bytes(llc_bytes: u64, bytes: u64, rereads: u32) -> u128 {
     eff.clamp(bytes, bytes * rereads)
 }
 
-/// T4's input: **reads and writes** — the reference's read-traffic spike
-/// flag, shipped on by default. A write-only byte term makes producer
-/// inlining look free and mis-prices every fusion in the graph.
+/// T4: DRAM traffic, reads and writes.
 ///
 /// `reads` is one `(bytes, rereads)` pair per *distinct* operand, so a value
 /// two consumers share is counted once and its reread factor carries the
@@ -140,14 +129,12 @@ pub fn dram_ps(facts: &DeviceFacts, reads: &[(u64, u32)], writes: u64) -> Picose
 ///
 /// A grid short of the parallelism floor does not lose issue rate in
 /// proportion to the lanes it is missing: the lanes it does have keep more
-/// of the core's issue slots, its threadgroup port and its share of L2 to
-/// themselves. Measured on the split-K sweeps, where the split count is
-/// exactly a lane-count dial, a cube root reproduces the curves and a linear
-/// law over-splits every one of them by 2-4x.
+/// of the core's issue slots, its threadgroup port and its share of Kernel to
+/// themselves. Measured on the split-K sweeps, a cube root reproduces the
+/// curves.
 ///
-/// The target is `saturation_lanes / 2` — the reference's
-/// `prefetched_saturation_lanes`, whose only role is as a parallelism floor,
-/// never an execution width and never a MAC-equivalent.
+/// The target is `saturation_lanes / 2`, a parallelism floor — never an
+/// execution width and never a MAC-equivalent.
 pub fn occupancy_scale_num_den(facts: &DeviceFacts, resident_lanes: u64) -> (u128, u128) {
     let target = u128::from(facts.saturation_lanes / 2).max(1);
     let resident = u128::from(resident_lanes).max(1);
@@ -186,7 +173,6 @@ mod tests {
     use crate::facts::seed_facts;
     use crate::facts::tests::gpu_caps;
 
-    /// Test 8.
     #[test]
     fn integer_root_is_exact() {
         for n in [3u32, 4] {
@@ -211,7 +197,6 @@ mod tests {
         }
     }
 
-    /// Test 3.
     #[test]
     fn traffic_counts_reads_and_writes() {
         let f = seed_facts(&gpu_caps("dev"));
@@ -224,8 +209,8 @@ mod tests {
         assert_eq!(got.0, write_only.0 * 2);
     }
 
-    /// Test 4. Continuity at the watermark, monotonicity in both arguments,
-    /// and the large-working-set asymptote.
+    /// Continuity at the watermark, monotonicity in both arguments, and the
+    /// large-working-set asymptote.
     #[test]
     fn llc_reread_is_continuous() {
         let f = seed_facts(&gpu_caps("dev"));
@@ -257,9 +242,7 @@ mod tests {
         }
 
         // Asymptote. `eff = bytes + (r-1)*(bytes - llc)` is 9.4% short of a
-        // full `r * bytes` at 8x the cache and within 1% by ~75x. Both
-        // points are pinned here and the deviation is reported rather than
-        // papered over.
+        // full `r * bytes` at 8x the cache and within 1% by ~75x.
         let full = |b: u64, r: u32| {
             (u128::from(b) * u128::from(r) * PS_PER_US / u128::from(f.dram_bytes_per_us)) as f64
         };

@@ -1,9 +1,8 @@
-//! softmax, rms_norm and layer_norm. All macro ops over `Fold` + `Map`, refused
-//! into one launch by `fold_split` + `map_into_fold` rather than by a
-//! hand-written fused kernel.
+//! softmax, rms_norm and layer_norm. All macro ops over `Fold` + `Map`, fused
+//! into one launch by `fold_split` + `map_into_fold`.
 //!
 //! Every softmax spelling shares **one** `defn`, under a sugar node minted in
-//! the same call. There is no second kernel and no route to pick.
+//! the same call.
 
 use fusor2_autograd::tape::{GraphTape, TapeExt, accum_dtype};
 use fusor2_ir::autograd::{Tape, Val};
@@ -14,14 +13,8 @@ use crate::composite::{MacroAttr, MacroOp, NormKind, core_op, macro_op};
 use crate::graph::GraphRef;
 use crate::tensor::Tensor;
 
-// ---------------------------------------------------------------------------
-// Definitional expansions
-// ---------------------------------------------------------------------------
-
-/// `exp(x - max) / sum(exp(x - max))` over `axis`.
-///
-/// Every entry point shares this. One launch comes from `fold_split` plus
-/// `map_into_fold`, never from a kernel that spells softmax.
+/// `exp(x - max) / sum(exp(x - max))` over `axis`. Every entry point shares
+/// this.
 pub(crate) fn softmax_defn(t: &mut GraphTape<'_>, x: Val, axis: u32) -> Result<Val> {
     let shape = t.shape_of(x);
     let dtype = t.dtype_of(x);
@@ -61,8 +54,7 @@ pub(crate) fn log_softmax_defn(t: &mut GraphTape<'_>, x: Val, axis: u32) -> Resu
     t.binary(BinOp::Sub, centered, ls)
 }
 
-/// `sum(x, axis) / extent`. Errors on a symbolic extent: a normalization axis
-/// is a feature axis, and the symbolic one is the sequence.
+/// `sum(x, axis) / extent`. Errors on a symbolic extent.
 fn mean_axis(t: &mut GraphTape<'_>, x: Val, axis: u32) -> Result<Val> {
     let shape = t.shape_of(x);
     let extent = shape
@@ -81,9 +73,7 @@ fn mean_axis(t: &mut GraphTape<'_>, x: Val, axis: u32) -> Result<Val> {
     t.mul_scalar(s, 1.0 / n.max(1) as f32)
 }
 
-/// `x * broadcast(y)`, right-aligned. Every affine weight and bias goes
-/// through this rather than through an implicit broadcast, which the IR does
-/// not have.
+/// `x op broadcast(y)`, right-aligned; the IR has no implicit broadcast.
 fn broadcast_bin(t: &mut GraphTape<'_>, op: BinOp, x: Val, y: Val) -> Result<Val> {
     let shape = t.shape_of(x);
     let y = t.broadcast_to(y, &shape)?;
@@ -168,8 +158,8 @@ pub(crate) fn layer_norm_defn(
 }
 
 /// A `SymId` for one epsilon value, shared between two layers that use the
-/// same one. `eps` is a uniform because a literal would enter the kernel's
-/// identity and a `[1]` tensor would enter its binding list.
+/// same one. `eps` is a uniform so it stays out of the kernel's identity and
+/// binding list.
 pub(crate) fn eps_uniform(graph: &GraphRef, eps: f32) -> fusor2_ir::shape::SymId {
     let sym = graph.named_sym(&format!("eps#{:08x}", eps.to_bits()));
     graph.set_uniform(sym, eps);
@@ -182,10 +172,6 @@ fn last_axis(graph: &GraphRef, x: &Tensor) -> Result<u32> {
         .map(|a| a as u32)
         .ok_or_else(|| Error::Shape("a rank-0 value has no last axis".into()))
 }
-
-// ---------------------------------------------------------------------------
-// The tensor surface
-// ---------------------------------------------------------------------------
 
 impl Tensor {
     /// Softmax over `axis`, as a macro op: the sugar node carries the axis so
@@ -219,8 +205,7 @@ impl Tensor {
         self.rms_norm_inner(None, None, eps)
     }
 
-    /// [`Tensor::rms_norm`] with a learned shift as well as a scale. A distinct
-    /// node, not a `*_fused` spelling: `bias` is an operand the expansion reads.
+    /// [`Tensor::rms_norm`] with a learned shift as well as a scale.
     pub fn rms_norm_with_bias(&self, weight: &Tensor, bias: &Tensor, eps: f32) -> Result<Tensor> {
         self.rms_norm_inner(Some(weight), Some(bias), eps)
     }
@@ -333,7 +318,7 @@ mod tests {
     use crate::session::{Backend, Session};
     use fusor2_ir::dtype::Dtype;
     use fusor2_ir::ir::Op;
-    use fusor2_ir::ir::level1::L1;
+    use fusor2_ir::ir::launch::Launch;
     use fusor2_ir::shape::Dim;
 
     fn graph() -> Graph {
@@ -365,7 +350,7 @@ mod tests {
                 let ms = eg.members(eg.class_of(y.id()));
                 let sugars = ms
                     .iter()
-                    .filter(|m| matches!(eg.node(**m).op, Op::L1(L1::Ext { .. })))
+                    .filter(|m| matches!(eg.node(**m).op, Op::Launch(Launch::Ext { .. })))
                     .count();
                 let defns = ms.iter().filter(|m| eg.is_defn(**m)).count();
                 Ok((ms.len(), sugars, defns))

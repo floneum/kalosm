@@ -48,20 +48,15 @@ impl Default for StandardSamplerParams {
 /// The filters run in order: repetition penalty, temperature, sort, top-k,
 /// min-p, top-p, weighted pick.
 ///
-/// # Deviation from the reference
-///
-/// The reference kernel treats a temperature of `0` as "skip the division" and
-/// still draws randomly. Here `0` is greedy, which is what the conformance
-/// case `sample_standard_token_at_zero_temperature_is_the_argmax` and the
-/// usual meaning of the knob require. Because the argmax is rank `0` of the
-/// sorted order it survives every filter, so short-circuiting to it is
-/// equivalent to sampling a distribution collapsed onto one token.
+/// A temperature of `0` is greedy: the argmax is rank `0` of the sorted order
+/// and survives every filter, so short-circuiting to it is equivalent to
+/// sampling a distribution collapsed onto one token.
 pub fn sample(logits: &Tensor, params: StandardSamplerParams) -> Result<GpuSampledToken> {
     let n = row::row_len(logits)?;
     let graph = logits.graph().clone();
 
     // Repetition penalty, then temperature — both on the raw row, before the
-    // sort, exactly as `top_k_chunk` does them.
+    // sort.
     let column = row::sanitized_column(logits, n)?;
     let previous = if params.repetition_penalty > 1.0 {
         row::previous_tokens(&graph)
@@ -354,8 +349,7 @@ mod tests {
         assert!(pending.value.add_scalar(0u32).is_ok());
     }
 
-    /// The filters compose the way the reference nests them: min-p first, then
-    /// top-p over the surviving mass.
+    /// The filters compose: min-p first, then top-p over the surviving mass.
     #[test]
     fn min_p_and_top_p_compose() {
         let values = conformance_row();

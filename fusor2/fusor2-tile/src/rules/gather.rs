@@ -1,9 +1,9 @@
 //! The two gather lowerings. `index_select`, `embedding`, `gather_last`
-//! and `i()` are all one `L0::Gather`, so they share these two alternatives.
+//! and `i()` are all one `Logical::Gather`, so they share these two alternatives.
 
 use fusor2_ir::egraph::{Builder, Facts, Id, RuleTag};
-use fusor2_ir::ir::level0::L0;
-use fusor2_ir::ir::level1::{GatherMode, IndexSpace, L1, ScheduleDomain};
+use fusor2_ir::ir::logical::Logical;
+use fusor2_ir::ir::launch::{GatherMode, IndexSpace, Launch, ScheduleDomain};
 use fusor2_ir::ir::{Level, Node, Op, OpTag};
 use fusor2_ir::rule;
 use fusor2_ir::shape::Dim;
@@ -13,7 +13,7 @@ use crate::rules::contract::alias;
 
 rule!(
     GATHER_ROW_PER_GROUP,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Gather,
     tag = RuleTag::StrictlyLowering,
     apply = gather_row_per_group,
@@ -21,7 +21,7 @@ rule!(
 
 rule!(
     GATHER_QUANTIZED_ROWS,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Gather,
     tag = RuleTag::StrictlyLowering,
     apply = gather_quantized_rows,
@@ -30,7 +30,7 @@ rule!(
 
 fn parts(node: &Node) -> Option<(u32, Id, Id)> {
     match &node.op {
-        Op::L0(L0::Gather { axis, x, idx }) => Some((*axis, *x, *idx)),
+        Op::Logical(Logical::Gather { axis, x, idx }) => Some((*axis, *x, *idx)),
         _ => None,
     }
 }
@@ -44,14 +44,14 @@ fn mint(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>, mode: GatherMod
     let idx_op = alias(idx_id, idx);
     let cx = DomainCtx::new(f.caps(), default_planner());
     let accesses = [x_op.access.clone(), idx_op.access.clone()];
-    let op = L1::KGather {
+    let op = Launch::Gather {
         space: IndexSpace::new(out.iter().copied()),
         axis,
         mode,
         ops: vec![x_op, idx_op],
         sched: ScheduleDomain::Map(map_domain(&out, &accesses, &cx)),
     };
-    let new = b.add_l1(op).ok()?;
+    let new = b.add_launch(op).ok()?;
     b.union(id, new).ok()?;
     Some(new)
 }
@@ -66,19 +66,15 @@ pub fn gather_row_per_group(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<
     mint(b, id, node, f, GatherMode::RowPerGroup)
 }
 
-/// `Gather(Dequant(q), idx)` fused: a `KGather` whose source operand is the
+/// `Gather(Dequant(q), idx)` fused: a `Gather` whose source operand is the
 /// quantized leaf itself, addressed in its dense logical element space. Both
 /// backends' operand loaders run the format's decode program at the flat
-/// index (`load_operand` / `operand_src`), so only the gathered rows ever
-/// decode — the 2.1 GB dense table an 8B model's per-token embedding lookup
-/// re-materialized is exactly the launch this member lets the extractor
-/// delete.
+/// index, so only the gathered rows ever decode.
 ///
 /// Matched on the *pair*, never on a bare gather-of-quantized: the pair's
-/// class is float-typed, so the minted member is too ([`infer_l1`] gives
+/// class is float-typed, so the minted member is too ([`infer_launch`] gives
 /// `QuantizedRows` `F32`), and no consuming `Dequant` is left to decode
-/// twice — which is the wrong-values trap the `index_select_rows_to` doc
-/// recorded when this mode was minted from the leaf directly.
+/// twice.
 pub fn gather_quantized_rows(
     b: &mut Builder<'_>,
     id: Id,
@@ -103,7 +99,7 @@ pub fn gather_quantized_rows(
                 stack.push(*l);
                 stack.push(*r);
             }
-            Op::L0(L0::Dequant { x, .. }) => {
+            Op::Logical(Logical::Dequant { x, .. }) => {
                 if b.facts_of(*x).dtype.is_quantized() {
                     leaf = Some(*x);
                     break;
@@ -118,22 +114,22 @@ pub fn gather_quantized_rows(
     let out: Vec<Dim> = f.own().shape.iter().copied().collect();
     // The leaf operand is laid out over the *dense* element space the
     // decode-at-index loaders address, which is the dequant's shape.
-    let x_op = fusor2_ir::ir::level1::Operand {
+    let x_op = fusor2_ir::ir::launch::Operand {
         src: leaf,
         layout: fusor2_ir::shape::Layout::contiguous(&x.shape),
-        access: fusor2_ir::ir::level1::AccessPlan::Alias,
+        access: fusor2_ir::ir::launch::AccessPlan::Alias,
     };
     let idx_op = alias(idx_id, idx);
     let cx = DomainCtx::new(f.caps(), default_planner());
     let accesses = [x_op.access.clone(), idx_op.access.clone()];
-    let op = L1::KGather {
+    let op = Launch::Gather {
         space: IndexSpace::new(out.iter().copied()),
         axis,
         mode: GatherMode::QuantizedRows,
         ops: vec![x_op, idx_op],
         sched: ScheduleDomain::Map(map_domain(&out, &accesses, &cx)),
     };
-    let new = b.add_l1(op).ok()?;
+    let new = b.add_launch(op).ok()?;
     b.union(id, new).ok()?;
     Some(new)
 }
@@ -150,7 +146,7 @@ mod tests {
         fx.chain(id)
             .into_iter()
             .filter_map(|m| match l1_of(fx, m) {
-                Some(L1::KGather { mode, .. }) => Some(mode),
+                Some(Launch::Gather { mode, .. }) => Some(mode),
                 _ => None,
             })
             .collect()
@@ -167,7 +163,7 @@ mod tests {
 
         let modes = modes(&fx, g);
         assert!(modes.contains(&GatherMode::RowPerGroup));
-        // The L0 gather plus its one dense lowering.
+        // The Logical gather plus its one dense lowering.
         assert_eq!(fx.chain(g).len(), 2);
     }
 
@@ -179,14 +175,14 @@ mod tests {
     fn a_dequantized_table_gains_the_fused_quantized_member() {
         use fusor2_ir::dtype::QFmt;
         use fusor2_ir::dtype::QLayout;
-        use fusor2_ir::ir::level0::{L0, LeafKind};
+        use fusor2_ir::ir::logical::{Logical, LeafKind};
         use fusor2_ir::ir::Op;
 
         let mut fx = Fixture::new(apple_caps());
         let table = fx
             .graph
-            .add(Op::L0(L0::Leaf(LeafKind::Quantized {
-                name: fusor2_ir::ir::level0::BufferId(900),
+            .add(Op::Logical(Logical::Leaf(LeafKind::Quantized {
+                name: fusor2_ir::ir::logical::BufferId(900),
                 fmt: QFmt::Q8_0,
                 layout: QLayout::Native,
                 shape: [Dim::Const(1024), Dim::Const(64)].into_iter().collect(),
@@ -194,7 +190,7 @@ mod tests {
             .unwrap();
         let dense = fx
             .graph
-            .add(Op::L0(L0::Dequant {
+            .add(Op::Logical(Logical::Dequant {
                 fmt: QFmt::Q8_0,
                 layout: QLayout::Native,
                 x: table,
@@ -204,14 +200,14 @@ mod tests {
         let g = fx.gather(0, dense, idx);
         fx.apply_all(TILE_RULES, g);
 
-        let fused: Vec<L1> = fx
+        let fused: Vec<Launch> = fx
             .chain(g)
             .into_iter()
             .filter_map(|m| l1_of(&fx, m))
-            .filter(|l1| matches!(l1, L1::KGather { mode: GatherMode::QuantizedRows, .. }))
+            .filter(|l1| matches!(l1, Launch::Gather { mode: GatherMode::QuantizedRows, .. }))
             .collect();
         assert_eq!(fused.len(), 1, "exactly one fused member");
-        let L1::KGather { ops, .. } = &fused[0] else {
+        let Launch::Gather { ops, .. } = &fused[0] else {
             unreachable!()
         };
         assert_eq!(ops[0].src, table, "the source operand is the leaf itself");

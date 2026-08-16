@@ -11,7 +11,7 @@
 //! f32-accumulated f16-output kernel pays a staging tile plus a per-lane cast:
 //! footprint and a staging pass, never correctness.
 
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::kernel::{
     Addr, CoopMatrixRole, CoopSrc, ElementType, ScalarElement, StorageView, Tile, TileExpr,
     TileLayout, cooperative_store_layout_supported,
 };
@@ -134,11 +134,10 @@ impl Emitter<'_> {
                 col,
                 transposed,
             } => {
-                // The fragment's scalar and the tile's element are one memory
-                // reinterpretation apart: a `CoopLoad{scalar: F32}` off an f16
-                // tile reads the right addresses at twice the width and comes
-                // back with plausible garbage. Nothing downstream can see it,
-                // so it is checked where both are in hand.
+                // A `CoopLoad{scalar: F32}` off an f16 tile reads the right
+                // addresses at twice the width and comes back with plausible
+                // garbage, so the scalars are checked here where both are in
+                // hand.
                 fragment_scalar_matches(scalar, tile.element, "a workgroup tile")?;
                 let stride_u = row_major_tile_stride(tile)?;
                 let row_h = self.expr(row, out)?;
@@ -232,7 +231,7 @@ impl Emitter<'_> {
         // These stores bypass `Emitter::stmt`, so nothing else retires the
         // `LoadLocal`s they invalidate. Every deferred accumulator lands here.
         if wrote {
-            self.invalidate_mem(fusor2_ir::ir::level2::MemReads::LOCAL);
+            self.invalidate_mem(fusor2_ir::ir::kernel::MemReads::LOCAL);
         }
     }
 
@@ -507,7 +506,7 @@ mod tests {
     use crate::emit::testkit::{self, *};
     use fusor2_ir::device::CoopKind;
     use fusor2_ir::dtype::Dtype;
-    use fusor2_ir::ir::level2::{KernelIr, Source, Stmt, TileExprKind, TileLiteral};
+    use fusor2_ir::ir::kernel::{KernelIr, Source, Stmt, TileExprKind, TileLiteral};
 
     fn coop_caps(mixed: bool) -> fusor2_ir::device::Caps {
         let mut caps = caps(true, true);
@@ -558,11 +557,11 @@ mod tests {
     fn coop_kernel(dst_scalar: ScalarElement) -> KernelIr {
         let uni = testkit::buffer(0, u32e(), 4, false);
         let dst = testkit::buffer(1, ElementType::Scalar(dst_scalar), 64, true);
-        let dv = fusor2_ir::ir::level2::StorageView {
+        let dv = fusor2_ir::ir::kernel::StorageView {
             buffer: dst.clone(),
             offset: 0,
-            layout: fusor2_ir::ir::level2::TileLayout::contiguous(
-                fusor2_ir::ir::level2::MemoryLevel::Storage,
+            layout: fusor2_ir::ir::kernel::TileLayout::contiguous(
+                fusor2_ir::ir::kernel::MemoryLevel::Storage,
                 &[8, 8],
             ),
         };
@@ -748,11 +747,11 @@ mod tests {
         let bias = testkit::buffer(1, f32e(), 8, false);
         let dst = testkit::buffer(2, f32e(), 64, true);
         let bv = view(&bias, &[8]);
-        let dv = fusor2_ir::ir::level2::StorageView {
+        let dv = fusor2_ir::ir::kernel::StorageView {
             buffer: dst.clone(),
             offset: 0,
-            layout: fusor2_ir::ir::level2::TileLayout::contiguous(
-                fusor2_ir::ir::level2::MemoryLevel::Storage,
+            layout: fusor2_ir::ir::kernel::TileLayout::contiguous(
+                fusor2_ir::ir::kernel::MemoryLevel::Storage,
                 &[8, 8],
             ),
         };

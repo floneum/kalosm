@@ -2,9 +2,8 @@
 //!
 //! Launches are the connected components of the realized DAG cut at `M`
 //! boundaries and at forced boundaries (index-space mismatch, fold-to-fold
-//! dependency). Consumer counts come from the DAG,
-//! which is what makes rematerialization priced exactly as
-//! `saved_write + saved_reads - recompute * (consumers - 1)`.
+//! dependency). Consumer counts come from the DAG, so rematerialization is
+//! priced as `saved_write + saved_reads - recompute * (consumers - 1)`.
 
 use fusor2_ir::cost::{CostModel, LaunchPlan, Picoseconds};
 use fusor2_ir::device::Caps;
@@ -14,19 +13,17 @@ use fusor2_ir::error::{Error, Result};
 use fusor2_ir::extract::Extraction;
 use fusor2_ir::facts::{ValueFacts, Work};
 use fusor2_ir::ir::Op;
-use fusor2_ir::ir::level0::{L0, LeafKind};
-use fusor2_ir::ir::level1::{Effect, FoldStrat, IndexSpace, L1, SchedPoint, ScheduleDomain};
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::logical::{Logical, LeafKind};
+use fusor2_ir::ir::launch::{Effect, FoldStrat, IndexSpace, Launch, SchedPoint, ScheduleDomain};
+use fusor2_ir::ir::kernel::{
     ArenaPlanner, MemoryLevel, ScalarElement, Tile, TileDecl, TileLayout, Tiles,
 };
 use fusor2_ir::shape::Dim;
 use smallvec::SmallVec;
 use std::sync::Arc;
 
-/// Extent a `Dim::Sym` prices at. A symbolic plan still has to be *ranked*,
-/// and the whole design exists so one plan serves a shape family; pricing a
-/// symbolic extent at a nominal value keeps the ranking total without letting
-/// a concrete binding leak into the plan.
+/// Extent a `Dim::Sym` prices at: a nominal value keeps the ranking total
+/// without letting a concrete binding leak into the plan.
 pub const SYM_NOMINAL: u64 = 1024;
 
 /// What role a leaf plays in the realized DAG.
@@ -43,8 +40,6 @@ pub enum LeafRole {
 
 /// A dense map from [`Id`] to `T`. Ids are dense and monotone, so every
 /// per-node table in the realized DAG is an array lookup rather than a hash.
-/// On a 3,000-node step graph that is the difference between realizing
-/// inside the 2 ms extraction budget and not.
 #[derive(Clone, Debug, Default)]
 pub struct IdMap<T> {
     slots: Vec<Option<T>>,
@@ -154,11 +149,9 @@ pub struct Component {
 
 /// The DAG one `(sigma, m, theta)` denotes.
 ///
-/// The architecture sketch gives `Realized` an owned `launches:
-/// Vec<LaunchPlan<'_>>` field. `LaunchPlan` borrows its `members` and `reads`
-/// slices, so that field would make the struct self-referential; the launches
-/// are built on demand by [`Realized::launches`] from the owned
-/// [`Component`]s instead. Nothing else changes.
+/// `LaunchPlan` borrows its `members` and `reads` slices, so an owned launch
+/// list would make this struct self-referential; launches are built on demand
+/// by [`Realized::launches`] from the owned [`Component`]s.
 #[derive(Clone, Debug, Default)]
 pub struct Realized {
     /// Selected nodes in post-order, leaves included.
@@ -205,20 +198,15 @@ impl Realized {
 /// Math a cooperative contraction's staging fill re-executes beyond what the
 /// schedule-independent `work_of` row counts.
 ///
-/// The A tile is re-staged once per **n**-tile of the grid and the B tile
-/// once per **m**-tile, and each staging pass runs the side's `pre` per
-/// loaded element. `work_of` prices one execution per element, so the extra
-/// is `pre_work x (tiles - 1)` per side. For an identity `pre` this is
-/// exactly zero — a plain dense matmul is untouched — but for an absorbed
-/// block decode it is the term that makes decode-in-the-fill lose to
-/// dequantize-once at large M and win at M = 1, which is a *member* choice
-/// the tune race cannot correct: candidates that change the launch count are
-/// never raced, so this ranking has to come from the model.
+/// The A tile is re-staged once per n-tile of the grid and the B tile once
+/// per m-tile, and each staging pass runs the side's `pre` per loaded
+/// element. `work_of` prices one execution per element, so the extra is
+/// `pre_work x (tiles - 1)` per side; an identity `pre` contributes zero.
 fn staging_rework(graph: &EGraph, member: Id, theta: Option<SchedPoint>) -> Work {
     let Some(SchedPoint::Coop { geom, .. }) = theta else {
         return Work::default();
     };
-    let Op::L1(L1::KContract {
+    let Op::Launch(Launch::Contract {
         m, n, k, batch, a, b, ..
     }) = &graph.node(member).op
     else {
@@ -228,7 +216,7 @@ fn staging_rework(graph: &EGraph, member: Id, theta: Option<SchedPoint>) -> Work
     let (m, n, k, batch) = (priced(m), priced(n), priced(k), priced(batch));
     let tiles_m = m.div_ceil(u64::from(geom.bm.max(1))).max(1);
     let tiles_n = n.div_ceil(u64::from(geom.bn.max(1))).max(1);
-    let side_extra = |side: &fusor2_ir::ir::level1::ContractSide, elems: u64, tiles: u64| {
+    let side_extra = |side: &fusor2_ir::ir::launch::ContractSide, elems: u64, tiles: u64| {
         let mut w = fusor2_ir::semantics::work::epilogue_work(&side.pre, elems);
         for o in &side.ops {
             let d = fusor2_ir::semantics::work::decode_ops_of(graph.facts(o.src).dtype);
@@ -242,19 +230,13 @@ fn staging_rework(graph: &EGraph, member: Id, theta: Option<SchedPoint>) -> Work
 }
 
 /// MACs a cooperative geometry issues on tile padding beyond the useful
-/// `batch*m*n*k` that `work_of` prices.
-///
-/// There is no padding veto anywhere in this crate — an over-padded point is
-/// supposed to *price* high (`padded_coop_loses_to_sgemv_on_cost` states it
-/// as "priced through `Work::macs` rather than vetoed") — but the launch
-/// work summed only the unpadded row, so a `bm = 16` tile at `m = 1` issued
-/// 16x the useful MACs for free and extraction kept choosing it over the
-/// un-padded vector family.
+/// `batch*m*n*k` that `work_of` prices. Padding is priced through
+/// `Work::macs`, never vetoed.
 fn coop_padding(graph: &EGraph, member: Id, theta: Option<SchedPoint>) -> Work {
     let Some(SchedPoint::Coop { geom, .. }) = theta else {
         return Work::default();
     };
-    let Op::L1(L1::KContract { m, n, k, batch, .. }) = &graph.node(member).op else {
+    let Op::Launch(Launch::Contract { m, n, k, batch, .. }) = &graph.node(member).op else {
         return Work::default();
     };
     let priced = |d: &Dim| d.as_const().unwrap_or(1).max(1);
@@ -377,10 +359,9 @@ pub fn forced_boundary(
 /// an index-space mismatch, or a chained reduction (the consumer's first
 /// iteration needs the producer's whole axis to have landed).
 ///
-/// Split out because it is also the *materialization obligation*: an edge cut
-/// for one of these reasons puts producer and consumer in different launches,
-/// so the producer has to land in a buffer whatever the cost model would
-/// prefer. `verify_plan`'s clause 3 is exactly this statement.
+/// Also the materialization obligation: an edge cut for one of these reasons
+/// puts producer and consumer in different launches, so the producer has to
+/// land in a buffer. `verify_plan`'s clause 3 is this statement.
 pub fn structural_boundary(graph: &EGraph, producer: Id, consumer: Id) -> bool {
     if !index_space(graph, consumer).covers(&index_space(graph, producer)) {
         return true;
@@ -388,21 +369,19 @@ pub fn structural_boundary(graph: &EGraph, producer: Id, consumer: Id) -> bool {
     reduces(graph, producer) && reduces(graph, consumer)
 }
 
-/// True when `producer` **must** be in `M` for this edge to be runnable.
+/// True when `producer` must be in `M` for this edge to be runnable.
 ///
-/// Two reasons. Either the edge is a [`structural_boundary`], so producer and
-/// consumer land in different launches whatever `M` says. Or the consumer's
-/// own node never absorbed the producer: a launch is lowered from **one**
-/// node — `Target::lower` is handed the launch root and nothing else — so a
-/// producer can only share a kernel with its consumer where a *rule*
-/// (`map_into_fold`, `map_into_contract`, `sink_epilogue`, `KRegion`) already
-/// folded it into one node whose operands are the producer's. Inlining any other edge leaves the consumer's kernel reading
-/// an operand nothing ever wrote.
+/// Either the edge is a [`structural_boundary`], so producer and consumer
+/// land in different launches whatever `M` says. Or the consumer's own node
+/// never absorbed the producer: a launch is lowered from one node, so a
+/// producer can only share a kernel with its consumer where a rule already
+/// folded it into one node whose operands are the producer's. Inlining any
+/// other edge leaves the consumer's kernel reading an operand nothing ever
+/// wrote.
 ///
-/// This is a **materialization obligation, not a cut rule**: the cost model
-/// can still price an inlined producer (that is what `RESELECT`/`FLIP`
-/// explore and what `remat_prices_exactly` measures). It is the seed, the
-/// repair and the `FLIP` frontier that refuse to *ship* one.
+/// A materialization obligation, not a cut rule: the cost model can still
+/// price an inlined producer; the seed, the repair and the `FLIP` frontier
+/// refuse to ship one.
 pub fn needs_own_buffer(graph: &EGraph, producer: Id, consumer: Id) -> bool {
     structural_boundary(graph, producer, consumer) || !absorbs(graph, consumer, producer)
 }
@@ -412,16 +391,12 @@ pub fn needs_own_buffer(graph: &EGraph, producer: Id, consumer: Id) -> bool {
 fn absorbs(graph: &EGraph, consumer: Id, producer: Id) -> bool {
     let class = graph.class_of(producer);
     match &graph.node(consumer).op {
-        Op::L1(L1::KRegion { members, .. }) => {
+        Op::Launch(Launch::Region { members, .. }) => {
             members.iter().any(|m| graph.class_of(*m) == class)
         }
         _ => false,
     }
 }
-
-// ---------------------------------------------------------------------------
-// Shared queries
-// ---------------------------------------------------------------------------
 
 /// The member `sigma` selected for `id`'s class.
 pub fn select(graph: &EGraph, extraction: &Extraction, id: Id) -> Result<Id> {
@@ -435,8 +410,8 @@ pub fn select(graph: &EGraph, extraction: &Extraction, id: Id) -> Result<Id> {
 
 pub fn leaf_role(graph: &EGraph, id: Id) -> LeafRole {
     match &graph.node(id).op {
-        Op::L0(L0::Leaf(LeafKind::Const { .. } | LeafKind::Uniform { .. })) => LeafRole::Free,
-        Op::L0(L0::Leaf(_)) => LeafRole::External,
+        Op::Logical(Logical::Leaf(LeafKind::Const { .. } | LeafKind::Uniform { .. })) => LeafRole::Free,
+        Op::Logical(Logical::Leaf(_)) => LeafRole::External,
         _ => LeafRole::NotLeaf,
     }
 }
@@ -444,22 +419,22 @@ pub fn leaf_role(graph: &EGraph, id: Id) -> LeafRole {
 pub fn reduces(graph: &EGraph, id: Id) -> bool {
     matches!(
         graph.node(id).op,
-        Op::L1(L1::KFold { .. } | L1::KContract { .. })
-            | Op::L0(L0::Fold { .. } | L0::Contract { .. })
+        Op::Launch(Launch::Fold { .. } | Launch::Contract { .. })
+            | Op::Logical(Logical::Fold { .. } | Logical::Contract { .. })
     )
 }
 
-/// The iteration domain of one node. L1 nodes carry it; everything else is
+/// The iteration domain of one node. Launch nodes carry it; everything else is
 /// priced over its own shape.
 pub fn index_space(graph: &EGraph, id: Id) -> IndexSpace {
     match &graph.node(id).op {
-        Op::L1(
-            L1::KMap { space, .. }
-            | L1::KFold { space, .. }
-            | L1::KGather { space, .. }
-            | L1::KScatter { space, .. },
+        Op::Launch(
+            Launch::Map { space, .. }
+            | Launch::Fold { space, .. }
+            | Launch::Gather { space, .. }
+            | Launch::Scatter { space, .. },
         ) => space.clone(),
-        Op::L1(L1::KContract { batch, m, n, .. }) => IndexSpace::new([*batch, *m, *n]),
+        Op::Launch(Launch::Contract { batch, m, n, .. }) => IndexSpace::new([*batch, *m, *n]),
         _ => IndexSpace {
             dims: graph.facts(id).shape.clone(),
         },
@@ -514,15 +489,12 @@ pub const fn scalar_element(d: Dtype) -> ScalarElement {
 }
 
 /// The workgroup tiles a schedule point declares, fed straight into
-/// [`ArenaPlanner::workgroup_bytes`]. This is the *exact* planner, never an
-/// estimator — an estimate here would reintroduce "extraction commits a plan
-/// that fails L2 verification and silently falls back".
-/// `lanes` is the fold carrier's accumulator lane count, `1` for every other
-/// node. Both emitters allocate one scratch tile of
-/// [`fusor2_ir::ir::level1::emitted_block`] elements **per lane**, so a
-/// promoted carrier's scratch is `lanes` times a scalar fold's and a call that
-/// passes `1` under-counts it by exactly that factor. That under-count lets
-/// `verify_plan` admit a plan the GPU then refuses to lower.
+/// [`ArenaPlanner::workgroup_bytes`]. This is the exact planner, never an
+/// estimator. `lanes` is the fold carrier's accumulator lane count, `1` for
+/// every other node: both emitters allocate one scratch tile of
+/// [`fusor2_ir::ir::launch::emitted_block`] elements per lane, so passing `1`
+/// for a promoted carrier under-counts its scratch and lets `verify_plan`
+/// admit a plan the GPU then refuses to lower.
 pub fn tiles_for(
     theta: Option<SchedPoint>,
     elem: ScalarElement,
@@ -566,22 +538,18 @@ pub fn tiles_for(
         _ => {}
     }
     // A fold's cross-lane close is one scratch tile of `emitted_block`
-    // elements **per accumulator lane**, at whatever block the point implies —
-    // including a `Point`, which lowers at the default block rather than at no
-    // block at all. Both emitters do exactly this, so the arm has to be keyed
-    // on the node being a fold and not on the point being a fold strategy.
+    // elements per accumulator lane, at whatever block the point implies —
+    // including a `Point`, which lowers at the default block. This arm is
+    // keyed on the node being a fold, not on the point being a fold strategy.
     if let Some(lanes) = fold_lanes {
         let lane_group = fold_lane_group(theta, caps);
-        // **A one-lane group declares no tile**, because it stages nothing:
-        // every invocation owns a whole output row and reduces the axis into
-        // its own accumulator, so the cross-lane merge is an identity. Both
-        // emitters skip the close outright at `lane_group == 1` and
-        // `fusor2_ir::ir::level1::fold_scratch_bytes` reports 0 for the same
-        // strategy. All three statements of this footprint have to agree —
-        // this one is what the arena lays out, so a missing clause here admits
-        // a plan `verify_plan` then rejects.
+        // A one-lane group declares no tile: every invocation owns a whole
+        // output row, so the cross-lane merge is an identity. Both emitters
+        // skip the close at `lane_group == 1` and `fold_scratch_bytes`
+        // reports 0 for the same strategy; all three statements of this
+        // footprint have to agree.
         if lane_group > 1 {
-            let block = fusor2_ir::ir::level1::emitted_block(lane_group, caps);
+            let block = fusor2_ir::ir::launch::emitted_block(lane_group, caps);
             let extent = u32::try_from(lanes.max(1).saturating_mul(u64::from(block.max(1))))
                 .unwrap_or(u32::MAX);
             decls.push(tile("fold_scratch", elem, &[extent]));
@@ -596,15 +564,11 @@ pub fn tiles_for(
 fn fold_lane_group(theta: Option<SchedPoint>, caps: &Caps) -> u32 {
     match theta {
         Some(SchedPoint::Fold(s)) => s.lane_group(caps.subgroup_width()),
-        // **The emitters' default, which is the full block and not 1.** Both
-        // promoted lowerings read `_ => max_block` for a point that is not a
-        // fold strategy, so a `ScheduleDomain::Point` fold closes over the
-        // whole workgroup and stages `lanes * block * acc_bytes`. Reporting 1
-        // here — a one-lane group means "stages nothing" — would under-count
-        // a `Point` fold's footprint to zero and admit a
-        // plan the emitter cannot lay out. Over-counting on a subgroup device
-        // is the safe direction and costs only an unselected alternative.
-        _ => fusor2_ir::ir::level1::emitted_block(1, caps),
+        // The emitters' default is the full block, not 1: a `Point` fold
+        // closes over the whole workgroup and stages
+        // `lanes * block * acc_bytes`. Reporting 1 here would under-count its
+        // footprint to zero and admit a plan the emitter cannot lay out.
+        _ => fusor2_ir::ir::launch::emitted_block(1, caps),
     }
 }
 
@@ -653,12 +617,9 @@ pub fn geometry(theta: Option<SchedPoint>, space: &IndexSpace, caps: &Caps) -> G
             workgroups: m.div_ceil(p.bm.max(1) as u64) * n.div_ceil(p.bn.max(1) as u64) * batch,
         },
         // The grid `lower_sgemv` actually launches: one workgroup per output
-        // element at `cols == 1` (`batch * m * n` — this modeled
-        // `(m * batch) / chunk` workgroups once, a grid no kernel ever used:
-        // at m = 1 it priced the whole family as a single resident workgroup
-        // and the occupancy term buried it below any padded alternative), and
-        // one per `cols`-wide column group at `cols > 1`
-        // (`batch * m * ceil(n / cols)`, `lower_sgemv_subgroup_cols`).
+        // element at `cols == 1` (`batch * m * n`), one per `cols`-wide
+        // column group at `cols > 1` (`batch * m * ceil(n / cols)`,
+        // `lower_sgemv_subgroup_cols`).
         Some(SchedPoint::Sgemv(p)) => Geometry {
             block: (p.subgroups.max(1) * width).max(1),
             workgroups: m
@@ -706,10 +667,6 @@ pub fn distribute_workgroups(total: u64, max: u32) -> [u32; 3] {
     [x as u32, y as u32, z as u32]
 }
 
-// ---------------------------------------------------------------------------
-// Internals
-// ---------------------------------------------------------------------------
-
 enum Frame {
     Enter(Id),
     Exit(Id),
@@ -719,10 +676,8 @@ type Operands = IdMap<SmallVec<[Id; 4]>>;
 
 /// Why [`walk`] could not order the selected DAG.
 ///
-/// `Cycle` is separated from the general error because it is **repairable**:
-/// it names a class whose selected member closes a loop, and re-selecting that
-/// one class is what [`crate::extract`] does with it. Folding it into a
-/// message string would leave the seed's only recovery a whole-plan failure.
+/// `Cycle` is repairable: it names a class whose selected member closes a
+/// loop, and [`crate::extract`] re-selects that one class.
 enum WalkFail {
     Cycle(Id),
     Other(Error),
@@ -741,21 +696,11 @@ impl From<WalkFail> for Error {
 
 /// The node at which this selection closes a cycle, if it closes one.
 ///
-/// # The graph is acyclic; a *selection* over it need not be
-///
-/// `Id`'s allocator guarantees a node's children are strictly smaller than
-/// itself, so the node graph cannot contain a cycle. [`select`] composes that
-/// with class membership — an operand id is replaced by *its class's* selected
-/// member — and the composition drops the guarantee: the selected member may
-/// have a larger id than the consumer that reached it.
-///
-/// Two classes are enough. Given `y = view(x)` where a rewrite proves
-/// `view(view(x)) = view(x)` but not `view(x) = x`, the class of `x` holds a
-/// member reading `y` and the class of `y` holds a member reading `x`; picking
-/// both is a two-cycle in which neither member names its own class, so
-/// [`is_self_referential`] — which is the depth-1 case of exactly this — sees
-/// nothing. Both classes here also held acyclic members, so the selection was
-/// repairable and the plan failed anyway.
+/// The node graph is acyclic, but a selection over it need not be: [`select`]
+/// replaces an operand id by its class's selected member, which may have a
+/// larger id than the consumer that reached it. Two classes can form a cycle
+/// in which neither member names its own class, so [`is_self_referential`]
+/// (the depth-1 case) sees nothing.
 pub fn selection_cycle(graph: &EGraph, extraction: &Extraction, roots: &[Id]) -> Option<Id> {
     let resolved = roots
         .iter()
@@ -946,7 +891,7 @@ fn build_component(
             work = work.add(w);
         } else {
             // Inlined into every consumer: pays its math once per consumer
-            // and no traffic. This is the whole of the remat price.
+            // and no traffic.
             work = work.add(w.scale(consumers.copied(*m).unwrap_or(1).max(1) as u64));
         }
     }
@@ -1006,20 +951,15 @@ pub fn is_singleton(graph: &EGraph, class: ClassId) -> bool {
 }
 
 /// True when `id` is a node the plan may actually select: a `Leaf`, or
-/// anything at `Level::L1`.
+/// anything at `Level::Launch`.
 ///
 /// This is clause 1 of `verify_plan`, and every decision that writes `sigma`
-/// has to agree with it. The reason it cannot be left to the cost model is
-/// that a floor lowering is worse in *schedule*, not in *arithmetic*: an
-/// `L0::Map` and the `L1::KMap` `LOWER_MAP` mints report the same `work()`,
-/// so their lower bounds are equal to the picosecond. A `min_by_key` over all
-/// members therefore ties, and a tie broken by smaller `Id` always returns
-/// the un-lowered original — which the verifier then rejects. Restricting the
-/// candidate set is the fix; perturbing the cost of an L0 node would break
-/// the bound's admissibility.
+/// has to agree with it. It cannot be left to the cost model: a `Logical` node
+/// and its lowered `Launch` twin report the same `work()`, so cost ties and a
+/// tie broken by smaller `Id` returns the un-lowered original.
 pub fn is_runnable(graph: &EGraph, id: Id) -> bool {
-    if !matches!(graph.node(id).op, Op::L0(L0::Leaf(_)))
-        && graph.level(id) != fusor2_ir::ir::Level::L1
+    if !matches!(graph.node(id).op, Op::Logical(Logical::Leaf(_)))
+        && graph.level(id) != fusor2_ir::ir::Level::Launch
     {
         return false;
     }
@@ -1028,11 +968,9 @@ pub fn is_runnable(graph: &EGraph, id: Id) -> bool {
 
 /// True when `id` names its own e-class as an operand.
 ///
-/// Such a member cannot be selected *for* that class: the selection would
-/// denote "compute X by computing X", and [`walk`] reports it as a cycle
-/// rather than as a bad rewrite. This is the *independent* guard against a
-/// rule that mints one, because a rule bug must degrade the plan, never make
-/// a class unextractable.
+/// Such a member cannot be selected for that class: the selection would
+/// denote "compute X by computing X". A rule bug must degrade the plan, never
+/// make a class unextractable.
 pub fn is_self_referential(graph: &EGraph, id: Id) -> bool {
     let class = graph.class_of(id);
     graph
@@ -1042,53 +980,39 @@ pub fn is_self_referential(graph: &EGraph, id: Id) -> bool {
         .any(|c| graph.class_of(*c) == class)
 }
 
-/// The runnable members of `class`, or every member when none is runnable.
-///
-/// The fallback keeps the failure where it belongs: a class that never got
-/// lowered is a missing rule, and `verify_plan` names it precisely. Returning
-/// an empty candidate set here would surface it as an unselected class
-/// instead.
-///
-/// A self-referential member is dropped **before** the fallback, not by it: a
-/// class whose only L1 spelling names itself must degrade to its un-lowered
-/// L0 member and be reported by `verify_plan`, rather than be selected into a
-/// cycle that makes the whole extraction fail.
 /// A member's fold carrier footprint: accumulator lanes and accumulator bytes.
-/// `None` for anything that is not a `KFold`, and for a `KFold` whose slot
+/// `None` for anything that is not a `Fold`, and for a `Fold` whose slot
 /// extent is symbolic — an unallocatable carrier the fold domain generator
 /// already declines to score.
 pub fn fold_footprint(graph: &EGraph, id: Id) -> Option<(u64, u64)> {
     match &graph.node(id).op {
-        Op::L1(L1::KFold { carrier, acc, .. }) => Some((carrier.lanes()?, acc.byte_size())),
+        Op::Launch(Launch::Fold { carrier, acc, .. }) => Some((carrier.lanes()?, acc.byte_size())),
         _ => None,
     }
 }
 
 /// Whether this device can actually run `id` at `theta`.
 ///
-/// Only the fold clause is stated here, because it is the only one whose
-/// footprint depends on a *node* property the schedule domain was generated
-/// before knowing. `PROMOTE` rebinds a free axis into the accumulator and
-/// carries the pre-promotion domain over verbatim — that is deliberate, the
-/// promoted and unpromoted nests share a class and compete on cost — but the
-/// inherited strategies were admitted at one accumulator lane and the promoted
-/// nest holds `lanes` of them.
+/// Only the fold clause is stated here: it is the only one whose footprint
+/// depends on a node property the schedule domain was generated before
+/// knowing. `PROMOTE` carries the pre-promotion domain over verbatim, but the
+/// inherited strategies were admitted at one accumulator lane and the
+/// promoted nest holds `lanes` of them.
 pub fn point_is_legal(graph: &EGraph, id: Id, theta: SchedPoint, caps: &Caps) -> bool {
     let Some((lanes, acc_bytes)) = fold_footprint(graph, id) else {
         return true;
     };
-    // The same default [`fold_lane_group`] applies, and for the same reason:
-    // a point that is not a fold strategy lowers at the emitters' full block,
-    // not at a one-lane group. These two defaults have to be the same value or
-    // this predicate admits a node whose tiles the arena then rejects — which
-    // is the L1/L2 admission mismatch §4.2 turns into a hard failure.
+    // The same default as [`fold_lane_group`]: a point that is not a fold
+    // strategy lowers at the emitters' full block. The two defaults have to
+    // be the same value or this predicate admits a node whose tiles the arena
+    // then rejects.
     let strat = match theta {
         SchedPoint::Fold(s) => s,
         _ => FoldStrat::WgTree {
             lane_group: fold_lane_group(Some(theta), caps),
         },
     };
-    fusor2_ir::ir::level1::fold_scratch_bytes(
+    fusor2_ir::ir::launch::fold_scratch_bytes(
         &strat,
         lanes,
         acc_bytes,
@@ -1099,11 +1023,9 @@ pub fn point_is_legal(graph: &EGraph, id: Id, theta: SchedPoint, caps: &Caps) ->
 
 /// Whether `id`'s schedule domain offers a point this device can run.
 ///
-/// A node whose whole domain is illegal is **unselectable**, not merely
-/// expensive: §4.2 makes a lowering refusal a hard assert, so selecting one
-/// mints a crash rather than a slow plan. Every other member of the class
-/// stays available, which is why this belongs in the candidate set rather
-/// than in the cost model.
+/// A node whose whole domain is illegal is unselectable, not merely
+/// expensive: a lowering refusal is a hard assert, so selecting one mints a
+/// crash rather than a slow plan.
 pub fn has_legal_point(graph: &EGraph, id: Id, caps: &Caps) -> bool {
     let Some(domain) = domain_of(graph, id) else {
         return true;
@@ -1125,10 +1047,9 @@ pub fn selectable(graph: &EGraph, class: ClassId, caps: &Caps) -> Vec<Id> {
         .filter(|m| is_runnable(graph, *m))
         .collect();
     let pool = if runnable.is_empty() { pool } else { runnable };
-    // Schedulability filters *last* and falls back the same way the two
-    // filters above do: a class whose every member is unschedulable is a
-    // missing law, and `verify_plan` names it precisely. Emptying the
-    // candidate set here would surface it as an unselected class instead.
+    // Schedulability filters last and falls back the same way the two filters
+    // above do: a class whose every member is unschedulable is a missing
+    // rule, and `verify_plan` names it precisely.
     let schedulable: Vec<Id> = pool
         .iter()
         .copied()
@@ -1140,13 +1061,9 @@ pub fn selectable(graph: &EGraph, class: ClassId, caps: &Caps) -> Vec<Id> {
 /// The classes reachable from `roots`, ascending, plus a node mask covering
 /// every id those classes hold — members and `Union` spines both.
 ///
-/// Reachability is the children closure over **every member**: any member is
-/// a candidate `sigma` may select (`selectable` falls back to the full member
-/// list), so the closure covers everything selection, pricing or realization
-/// can touch. What it excludes is the ambient graph a long-lived session
-/// accumulates — detached decode history, dead branches of earlier resolves —
-/// which is what makes one resolve's cost proportional to the values it
-/// requested rather than to everything the graph remembers.
+/// Reachability is the children closure over every member, so it covers
+/// everything selection, pricing or realization can touch while excluding the
+/// ambient graph a long-lived session accumulates.
 ///
 /// The mask is closed: every child of every masked node resolves to a masked
 /// class whose ids are all masked, so a fixpoint over masked slots alone
@@ -1211,15 +1128,13 @@ pub fn classes(graph: &EGraph) -> Vec<ClassId> {
     out
 }
 
-/// True when every member of a schedule domain is legal at these caps.
+/// The schedule domain a launch node carries.
 pub fn domain_of(graph: &EGraph, id: Id) -> Option<&ScheduleDomain> {
     match &graph.node(id).op {
-        Op::L1(l1) => l1.schedule(),
+        Op::Launch(l1) => l1.schedule(),
         _ => None,
     }
 }
-
-// ---------------------------------------------------------------------------
 
 /// Test-only stand-ins: a total
 /// [`Semantics`], a trivial exact [`ArenaPlanner`] and a linear
@@ -1233,18 +1148,16 @@ pub(crate) mod testkit {
     use fusor2_ir::dtype::Persistence;
     use fusor2_ir::extract::PlanHash;
     use fusor2_ir::carrier::Carrier;
-    use fusor2_ir::ir::level0::BufferId;
+    use fusor2_ir::ir::logical::BufferId;
     use fusor2_ir::scalar::BinOp;
-    use fusor2_ir::ir::level1::{
+    use fusor2_ir::ir::launch::{
         AccessPlan, BufferRole, MapDomain, MapTiling, Operand, ScatterMode,
     };
-    use fusor2_ir::ir::level2::{ArenaMode, ArenaPlan, BarrierSuggestion, KernelIr, Placement};
+    use fusor2_ir::ir::kernel::{ArenaMode, ArenaPlan, BarrierSuggestion, KernelIr, Placement};
     use fusor2_ir::ir::{Children, Node, Semantics, VerifyCtx};
     use fusor2_ir::scalar::{ScalarExpr, UnOp};
     use fusor2_ir::shape::Layout;
     use std::sync::Arc;
-
-    // -- semantics ---------------------------------------------------------
 
     pub struct TestSem;
 
@@ -1255,39 +1168,39 @@ pub(crate) mod testkit {
                 out.push(*a);
                 out.push(*b);
             }
-            Op::L0(l0) => match l0 {
-                L0::Leaf(_) => {}
-                L0::Map { ins, .. } | L0::Fold { ins, .. } => {
+            Op::Logical(l0) => match l0 {
+                Logical::Leaf(_) => {}
+                Logical::Map { ins, .. } | Logical::Fold { ins, .. } => {
                     out.extend(ins.iter().copied())
                 }
-                L0::Restride { x, .. }
-                | L0::Window { x, .. }
-                | L0::Dequant { x, .. }
-                | L0::Project { x, .. } => out.push(*x),
-                L0::Contract { a, b, .. } => {
+                Logical::Restride { x, .. }
+                | Logical::Window { x, .. }
+                | Logical::Dequant { x, .. }
+                | Logical::Project { x, .. } => out.push(*x),
+                Logical::Contract { a, b, .. } => {
                     out.push(*a);
                     out.push(*b);
                 }
-                L0::Gather { x, idx, .. } => {
+                Logical::Gather { x, idx, .. } => {
                     out.push(*x);
                     out.push(*idx);
                 }
-                L0::Scatter { base, idx, upd, .. } => {
+                Logical::Scatter { base, idx, upd, .. } => {
                     out.push(*base);
                     out.push(*idx);
                     out.push(*upd);
                 }
             },
-            Op::L1(l1) => match l1 {
-                L1::KMap { ops, .. }
-                | L1::KFold { ops, .. }
-                | L1::KGather { ops, .. }
-                | L1::KScatter { ops, .. }
-                | L1::Ext { ops, .. } => out.extend(ops.iter().map(|o| o.src)),
-                L1::KContract { a, b, .. } => {
+            Op::Launch(l1) => match l1 {
+                Launch::Map { ops, .. }
+                | Launch::Fold { ops, .. }
+                | Launch::Gather { ops, .. }
+                | Launch::Scatter { ops, .. }
+                | Launch::Ext { ops, .. } => out.extend(ops.iter().map(|o| o.src)),
+                Launch::Contract { a, b, .. } => {
                     out.extend(a.ops.iter().chain(b.ops.iter()).map(|o| o.src))
                 }
-                L1::KRegion { members, .. } => out.extend(members.iter().copied()),
+                Launch::Region { members, .. } => out.extend(members.iter().copied()),
             },
         }
         out
@@ -1302,7 +1215,7 @@ pub(crate) mod testkit {
             let f = |dtype: Dtype, shape: &[Dim]| ValueFacts::new(dtype, shape.iter().copied());
             Ok(match op {
                 Op::Union(..) => ins[0].clone(),
-                Op::L0(L0::Leaf(k)) => match k {
+                Op::Logical(Logical::Leaf(k)) => match k {
                     LeafKind::Buffer { dtype, shape, .. } => f(*dtype, shape),
                     LeafKind::Param { dtype, shape, .. } => {
                         let mut v = f(*dtype, shape);
@@ -1313,27 +1226,27 @@ pub(crate) mod testkit {
                     LeafKind::Uniform { dtype, .. } => f(*dtype, &[]),
                     LeafKind::Quantized { fmt, shape, .. } => f(Dtype::Q(*fmt), shape),
                 },
-                Op::L0(L0::Map { expr, .. }) => {
+                Op::Logical(Logical::Map { expr, .. }) => {
                     let mut v = ins[0].clone();
                     v.dtype = expr.dtype();
                     v
                 }
-                Op::L0(L0::Fold { axis, acc, .. }) => {
+                Op::Logical(Logical::Fold { axis, acc, .. }) => {
                     let mut shape = ins[0].shape.clone();
                     if (*axis as usize) < shape.len() {
                         shape.remove(*axis as usize);
                     }
                     f(*acc, &shape)
                 }
-                Op::L0(other) => {
+                Op::Logical(other) => {
                     let mut v = ins.first().cloned().unwrap_or_else(|| f(Dtype::F32, &[]));
-                    if let L0::Dequant { .. } = other {
+                    if let Logical::Dequant { .. } = other {
                         v.dtype = Dtype::F32;
                     }
                     v
                 }
-                Op::L1(L1::KMap { space, body, .. }) => f(body.dtype(), &space.dims),
-                Op::L1(L1::KFold {
+                Op::Launch(Launch::Map { space, body, .. }) => f(body.dtype(), &space.dims),
+                Op::Launch(Launch::Fold {
                     space, axis, acc, ..
                 }) => {
                     let mut shape = space.dims.clone();
@@ -1342,41 +1255,41 @@ pub(crate) mod testkit {
                     }
                     f(*acc, &shape)
                 }
-                Op::L1(L1::KContract {
+                Op::Launch(Launch::Contract {
                     batch, m, n, acc, ..
                 }) => f(*acc, &[*batch, *m, *n]),
-                Op::L1(L1::KGather { .. } | L1::KScatter { .. }) => {
+                Op::Launch(Launch::Gather { .. } | Launch::Scatter { .. }) => {
                     let space = match op {
-                        Op::L1(L1::KGather { space, .. } | L1::KScatter { space, .. }) => {
+                        Op::Launch(Launch::Gather { space, .. } | Launch::Scatter { space, .. }) => {
                             space.dims.clone()
                         }
                         _ => ins[0].shape.clone(),
                     };
                     f(ins.first().map_or(Dtype::F32, |i| i.dtype), &space)
                 }
-                Op::L1(_) => ins.first().cloned().unwrap_or_else(|| f(Dtype::F32, &[])),
+                Op::Launch(_) => ins.first().cloned().unwrap_or_else(|| f(Dtype::F32, &[])),
             })
         }
 
         fn work(&self, op: &Op, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             let n = elements_of(out);
             match op {
-                Op::Union(..) | Op::L0(L0::Leaf(_)) => Work::default(),
-                Op::L1(L1::KMap { body, .. }) => Work {
+                Op::Union(..) | Op::Logical(Logical::Leaf(_)) => Work::default(),
+                Op::Launch(Launch::Map { body, .. }) => Work {
                     macs: n * expr_ops(body),
                     transcendentals: n * expr_trans(body),
                     index_ops: 0,
                     wg_bytes: 0,
                 },
-                Op::L1(L1::KFold { space, .. }) => Work {
+                Op::Launch(Launch::Fold { space, .. }) => Work {
                     macs: iterations_of(space),
                     ..Work::default()
                 },
-                Op::L1(L1::KContract { m, n: nn, k, .. }) => Work {
+                Op::Launch(Launch::Contract { m, n: nn, k, .. }) => Work {
                     macs: dim_extent(*m) * dim_extent(*nn) * dim_extent(*k),
                     ..Work::default()
                 },
-                Op::L1(L1::KScatter { space, .. }) => Work {
+                Op::Launch(Launch::Scatter { space, .. }) => Work {
                     macs: iterations_of(space),
                     index_ops: iterations_of(space),
                     ..Work::default()
@@ -1394,7 +1307,7 @@ pub(crate) mod testkit {
 
         fn effect(&self, op: &Op) -> Effect {
             match op {
-                Op::L1(L1::KScatter {
+                Op::Launch(Launch::Scatter {
                     mode: ScatterMode::Atomic,
                     ..
                 }) => Effect::InPlace(BufferRole(0)),
@@ -1433,10 +1346,8 @@ pub(crate) mod testkit {
         }
     }
 
-    // -- arena -------------------------------------------------------------
-
     /// Exact by construction: the sum of every tile's byte length, packed
-    /// end to end. Small, but it *is* the planner, never an estimator.
+    /// end to end.
     pub struct TestPlanner;
 
     impl ArenaPlanner for TestPlanner {
@@ -1467,8 +1378,6 @@ pub(crate) mod testkit {
         }
     }
 
-    // -- cost --------------------------------------------------------------
-
     pub struct TestCost {
         facts: DeviceFacts,
     }
@@ -1488,8 +1397,7 @@ pub(crate) mod testkit {
                     llc_bytes: 8 << 20,
                     wg_bytes_per_us: 700_000,
                     // ~5 TMAC/s: fast enough relative to DRAM that the
-                    // launches in these tests are bandwidth-bound, which is
-                    // the regime every fusion decision actually lives in.
+                    // launches in these tests are bandwidth-bound.
                     mac_per_us: [[5_000_000; RateDtype::COUNT]; 3],
                     trans_ps: 4_000,
                     store_ps_per_element: 2_000,
@@ -1533,24 +1441,17 @@ pub(crate) mod testkit {
             let base = (w.macs + w.index_ops) * 1_000_000
                 / self.facts.mac_rate(MacUnit::Fma, out.dtype)
                 + w.transcendentals * self.facts.trans_ps;
-            // A schedule point is a *discount* on the unscheduled cost: a
-            // larger tile issues fewer, wider instructions, a bigger split
-            // buys parallelism at the price of a combine pass. Keeping every
-            // point at or below the unscheduled figure is what makes the
-            // admissible bound admissible — `node_math` must never exceed
-            // the node's own contribution to `launch_cost`.
+            // A schedule point is a discount on the unscheduled cost:
+            // `node_math` must never exceed the node's own contribution to
+            // `launch_cost`, or the admissible bound stops being admissible.
             let discount = match theta {
                 Some(SchedPoint::Coop { geom, splits, .. }) => {
                     1_000 + 20 * geom.bm.max(1) as u64 / splits.max(1) as u64
                 }
                 Some(SchedPoint::Sgemm(p)) => 1_000 + 20 * p.bm.max(1) as u64,
-                // Uniform across sgemv points, deliberately: fresh
-                // candidates are stable-sorted by this prior, so any
-                // per-point variation reorders the belief-ordered offer
-                // ahead of measurement. `chunk` never reaches a lowering,
-                // so it must not vary this; 32 is what the whole
-                // seed front priced at,
-                // measured adopting the right cells.
+                // Uniform across sgemv points: fresh candidates are
+                // stable-sorted by this prior, so any per-point variation
+                // reorders the belief-ordered offer ahead of measurement.
                 Some(SchedPoint::Sgemv(_)) => 1_000 + 32,
                 Some(SchedPoint::Map(t)) => 1_000 + 1_000 * t.tm.max(1) as u64,
                 _ => 1_000,
@@ -1595,14 +1496,12 @@ pub(crate) mod testkit {
         }
     }
 
-    // -- graph builders ----------------------------------------------------
-
     pub fn new_graph() -> EGraph {
         EGraph::new(Arc::new(TestSem))
     }
 
     pub fn buffer(g: &mut EGraph, name: u32, shape: &[Dim]) -> Id {
-        g.add(Op::L0(L0::Leaf(LeafKind::Buffer {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
             name: BufferId(name),
             dtype: Dtype::F32,
             shape: shape.iter().copied().collect(),
@@ -1640,7 +1539,7 @@ pub(crate) mod testkit {
         for _ in 0..depth {
             body = ScalarExpr::un(UnOp::Exp, body);
         }
-        g.add(Op::L1(L1::KMap {
+        g.add(Op::Launch(Launch::Map {
             space: IndexSpace::new(shape.iter().copied()),
             body,
             ops: vec![operand(src, shape)],
@@ -1650,14 +1549,13 @@ pub(crate) mod testkit {
     }
 
     /// The same, with a non-transcendental body — a map whose arithmetic
-    /// does not swamp its bandwidth, which is the regime fusion decisions
-    /// live in.
+    /// does not swamp its bandwidth.
     pub fn kmap_neg(g: &mut EGraph, src: Id, shape: &[Dim], depth: u32) -> Id {
         let mut body = ScalarExpr::arg(0, Dtype::F32);
         for _ in 0..depth {
             body = ScalarExpr::un(UnOp::Neg, body);
         }
-        g.add(Op::L1(L1::KMap {
+        g.add(Op::Launch(Launch::Map {
             space: IndexSpace::new(shape.iter().copied()),
             body,
             ops: vec![operand(src, shape)],
@@ -1667,7 +1565,7 @@ pub(crate) mod testkit {
     }
 
     pub fn kfold(g: &mut EGraph, src: Id, shape: &[Dim], axis: u32) -> Id {
-        g.add(Op::L1(L1::KFold {
+        g.add(Op::Launch(Launch::Fold {
             space: IndexSpace::new(shape.iter().copied()),
             axis,
             vec_axes: smallvec::SmallVec::new(),
@@ -1679,7 +1577,7 @@ pub(crate) mod testkit {
             acc: Dtype::F32,
             post: smallvec::smallvec![ScalarExpr::arg(0, Dtype::F32)],
             ops: vec![operand(src, shape)],
-            sched: ScheduleDomain::Fold(fusor2_ir::ir::level1::FoldDomain {
+            sched: ScheduleDomain::Fold(fusor2_ir::ir::launch::FoldDomain {
                 strategies: smallvec::smallvec![
                     FoldStrat::Subgroup,
                     FoldStrat::WgTree { lane_group: 64 },
@@ -1690,11 +1588,11 @@ pub(crate) mod testkit {
     }
 
     pub fn kscatter(g: &mut EGraph, base: Id, idx: Id, upd: Id, shape: &[Dim]) -> Id {
-        g.add(Op::L1(L1::KScatter {
+        g.add(Op::Launch(Launch::Scatter {
             space: IndexSpace::new(shape.iter().copied()),
             axis: 0,
             mode: ScatterMode::Atomic,
-            combine: fusor2_ir::ir::level0::ScatterCombine::Add,
+            combine: fusor2_ir::ir::logical::ScatterCombine::Add,
             ops: vec![
                 operand(base, shape),
                 operand(idx, shape),
@@ -1762,16 +1660,10 @@ mod tests {
     use super::*;
     use crate::realize::testkit::{TestCost, TestPlanner, chain_graph, fork_graph, seed_for};
 
-    /// The cut still fuses a chain the *extraction* leaves out of `M` — that
-    /// is the model in §4.1 and it is unchanged. What changed is the seed:
-    /// [`needs_own_buffer`] makes it materialize a producer no rule folded
-    /// into its consumer, because a launch is lowered from one node and the
-    /// emitters cannot inline a second member.
-    ///
-    /// The seeded chain does **not** assert `components.len() == 1`: that
-    /// fusion goal is blocked on emitter-side inlining of a multi-member
-    /// launch. The first half of this test pins the cut semantics that do
-    /// hold; the second pins what the seed guarantees.
+    /// The cut fuses a chain the extraction leaves out of `M`; the seed,
+    /// via [`needs_own_buffer`], materializes every producer no rule folded
+    /// into its consumer. The first half pins the cut semantics; the second
+    /// pins what the seed guarantees.
     #[test]
     fn a_chain_of_maps_is_one_launch_when_m_allows_it() {
         let (graph, roots) = chain_graph(3);

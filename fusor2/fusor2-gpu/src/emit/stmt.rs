@@ -1,7 +1,7 @@
-//! L2 statements -> naga blocks. `Barrier` becomes `controlBarrier`;
+//! Kernel statements -> naga blocks. `Barrier` becomes `controlBarrier`;
 //! `AtomicAdd` becomes `atomicAdd`, or a bitcast compare-exchange loop on f32.
 
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::kernel::{
     Accumulator, Addr, ElementType, ScalarElement, Source, Stmt, StorageView, Tile, TileExpr,
 };
 use fusor2_ir::target::EmitError;
@@ -62,7 +62,7 @@ impl Emitter<'_> {
                 if is_coop
                     && matches!(
                         value.kind(),
-                        fusor2_ir::ir::level2::TileExprKind::CoopMma { .. }
+                        fusor2_ir::ir::kernel::TileExprKind::CoopMma { .. }
                     )
                 {
                     let next = self.expr(value, out)?;
@@ -188,8 +188,6 @@ impl Emitter<'_> {
         }
     }
 
-    // ---- stores ---------------------------------------------------------
-
     fn store(
         &mut self,
         out: &mut Block,
@@ -242,10 +240,8 @@ impl Emitter<'_> {
         Ok(())
     }
 
-    /// `AtomicAdd`. U32/I32 are one `atomicAdd`; **f32 is a bitcast
-    /// compare-exchange loop**, which is why `caps.atomic_f32` is true on every
-    /// GPU backend and what makes `ScatterMode::Atomic` a live candidate for
-    /// the embedding gradient.
+    /// `AtomicAdd`. U32/I32 are one `atomicAdd`; f32 is a bitcast
+    /// compare-exchange loop.
     fn atomic_add(
         &mut self,
         out: &mut Block,
@@ -359,8 +355,6 @@ impl Emitter<'_> {
         Ok(())
     }
 
-    // ---- loops ----------------------------------------------------------
-
     /// A counted loop with SSA-carried accumulators: each accumulator local is
     /// initialised in the surrounding scope, updated at the end of every
     /// iteration, and readable after the loop.
@@ -368,16 +362,14 @@ impl Emitter<'_> {
         &mut self,
         out: &mut Block,
         count: &TileExpr,
-        index: Option<&fusor2_ir::ir::level2::Local>,
+        index: Option<&fusor2_ir::ir::kernel::Local>,
         accumulators: &[Accumulator],
         body: &[Stmt],
     ) -> Result<(), EmitError> {
-        // **Every accumulator is read at the value it had entering the step,
-        // then all are written.** A loop carrying `(n, mean, m2)` has `mean`'s
-        // update read `n`; writing `n` first makes it read the *new* count, so
-        // the mean drifts and the variance comes back about half right — which
-        // is the worst kind of wrong. One accumulator is unaffected: evaluate,
-        // then store, in that order, exactly as before.
+        // Every accumulator is read at the value it had entering the step,
+        // then all are written: a loop carrying `(n, mean, m2)` has `mean`'s
+        // update read `n`, and writing `n` first would make it read the new
+        // count.
         let inits: Vec<Handle<Expression>> = accumulators
             .iter()
             .map(|acc| self.expr(&acc.init, out))
@@ -478,10 +470,8 @@ impl Emitter<'_> {
         Ok(())
     }
 
-    // ---- collective tile fill -------------------------------------------
-
-    /// `FillTile` is collective, not sugar: it is the only form whose
-    /// vectorized and guard-free variants the emitter can select. Lane
+    /// `FillTile` is collective: it is the only form whose vectorized and
+    /// guard-free variants the emitter can select. Lane
     /// enumeration order comes from
     /// [`fusor2_ir::shape::MultiFlattenMap::axis_unit_run`] — lanes advance
     /// along the axis whose unit-stride runs they can actually follow.
@@ -492,7 +482,7 @@ impl Emitter<'_> {
         value: &TileExpr,
         bounds: &[Option<TileExpr>; 2],
     ) -> Result<(), EmitError> {
-        let fusor2_ir::ir::level2::TileExprKind::Load { src, addr, .. } = value.kind() else {
+        let fusor2_ir::ir::kernel::TileExprKind::Load { src, addr, .. } = value.kind() else {
             return Err(EmitError::Unsupported(
                 "FillTile's value must be a Load".into(),
             ));
@@ -560,9 +550,7 @@ impl Emitter<'_> {
             // A block-quantized operand never reaches the collective fill:
             // `stage_operand_tile` stages it one lane at a time as a
             // `Load` + `StoreTile`, because `pre` has to run per element on
-            // the way in. Verified by probe at a shape that does select
-            // `Family::Coop` for a quantized operand (m=n=256, k=256): the
-            // arm this replaces was never entered.
+            // the way in.
             Source::Quantized(_) => Err(EmitError::Unsupported(
                 "FillTile's source must be dense storage: a quantized operand \
                  stages through per-lane Load + StoreTile"
@@ -775,7 +763,7 @@ mod tests {
     use super::*;
     use crate::emit::emit_module;
     use crate::emit::testkit::{self, *};
-    use fusor2_ir::ir::level2::{KernelIr, TileExprKind};
+    use fusor2_ir::ir::kernel::{KernelIr, TileExprKind};
 
     fn atomic_kernel(
         block: u32,
@@ -802,7 +790,7 @@ mod tests {
         }
     }
 
-    /// Test 10 — the f32 compare-exchange loop accumulates, and duplicate
+    /// The f32 compare-exchange loop accumulates, and duplicate
     /// indices sum rather than racing to a last write.
     #[test]
     fn atomic_add_f32_cas_accumulates() {
@@ -985,12 +973,9 @@ mod tests {
     /// write is a *different* value, and the hash-cons memo must not answer
     /// it with the first read.
     ///
-    /// The two `LoadTile(t, lane)` trees here are structurally equal, which
-    /// is the whole point: before `Stmt::writes` drove memo invalidation the
-    /// second one resolved to the first one's SSA handle and the second half
-    /// of the output came back holding the first half's values. Any lowering
-    /// that stages a tile, barriers, consumes it, and stages it again — every
-    /// blocked contraction — sits on this path.
+    /// The two `LoadTile(t, lane)` trees here are structurally equal: without
+    /// `Stmt::writes`-driven memo invalidation the second one resolves to the
+    /// first one's SSA handle. Every blocked contraction sits on this path.
     #[test]
     fn a_tile_reread_after_a_barrier_is_not_the_first_read() {
         let uni = testkit::buffer(0, u32e(), 4, false);

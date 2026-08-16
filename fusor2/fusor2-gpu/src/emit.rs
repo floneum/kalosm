@@ -1,12 +1,8 @@
 //! `KernelIr` -> naga `Module`.
 //!
-//! naga IR is already an IR, so there is no target dialect between L2 and it:
-//! a dialect there would host zero rewrite rules.
-//!
-//! Structure mirrors `tile-ir/src/lower/{mod,setup,block}.rs`: one up-front
-//! [`Analysis`] walk decides every capability the module will declare *before*
-//! a single expression is lowered. Gating f16 here rather than lazily is what
-//! makes an f16 handle on a non-f16 adapter fail with
+//! One up-front [`Analysis`] walk decides every capability the module will
+//! declare *before* a single expression is lowered. Gating f16 up front is
+//! what makes an f16 handle on a non-f16 adapter fail with
 //! [`EmitError::MissingCapability`] instead of mis-lowering.
 
 pub mod coop;
@@ -17,7 +13,7 @@ pub mod stmt;
 pub mod types;
 
 use fusor2_ir::device::Caps;
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::kernel::{
     Accumulator, Addr, ArenaPlan, Buffer, Builtin, CoopSrc, ElementType, KernelIr, Local, MemReads,
     ReduceKind, ScalarElement, Source, Stmt, Tile, TileExpr, TileExprKind,
 };
@@ -56,13 +52,13 @@ pub struct EmittedModule {
 /// Emit one kernel. The result is validated before
 /// `create_shader_module_trusted` is allowed anywhere near it.
 ///
-/// The workgroup-arena plan comes from the *same* memoized `arena_plan` the L1
+/// The workgroup-arena plan comes from the *same* memoized `arena_plan` the Launch
 /// footprint check and the occupancy term read, never a local estimator — that
-/// identity is what makes "extraction commits a plan that fails L2
+/// identity is what makes "extraction commits a plan that fails Kernel
 /// verification" unstateable.
 pub fn emit(ir: &KernelIr, caps: &Caps) -> Result<EmittedModule, EmitError> {
     let planner = fusor2_tile::Planner::shared();
-    let plan = <dyn fusor2_ir::ir::level2::ArenaPlanner>::arena_plan(&*planner, ir, caps)
+    let plan = <dyn fusor2_ir::ir::kernel::ArenaPlanner>::arena_plan(&*planner, ir, caps)
         .map_err(|e| EmitError::Unsupported(format!("arena_plan: {e}")))?;
     emit_module(ir, caps, &plan)
 }
@@ -75,10 +71,6 @@ pub fn emit_module(
 ) -> Result<EmittedModule, EmitError> {
     Emitter::new(ir, caps, plan)?.finish()
 }
-
-// ---------------------------------------------------------------------------
-// Analysis
-// ---------------------------------------------------------------------------
 
 /// Whether a `ReduceKind::Workgroup` tree at `group_size` on a `block`-lane
 /// kernel is emitted as the subgroup two-stage (one collective per subgroup,
@@ -478,7 +470,7 @@ impl Analysis {
         }
     }
 
-    fn quantized(&mut self, q: &fusor2_ir::ir::level2::QuantizedView, seen: &mut Seen) {
+    fn quantized(&mut self, q: &fusor2_ir::ir::kernel::QuantizedView, seen: &mut Seen) {
         self.note_buffer(&q.data.buffer, seen);
         // Native-layout scales are half floats read out of a u32 word with
         // `Unpack2x16Float`; that needs SHADER_FLOAT16_IN_FLOAT32, not
@@ -502,10 +494,6 @@ pub(crate) fn key<T>(v: &std::sync::Arc<T>) -> usize {
     std::sync::Arc::as_ptr(v) as *const () as usize
 }
 
-// ---------------------------------------------------------------------------
-// Scratch
-// ---------------------------------------------------------------------------
-
 /// Demand-allocated private scratch kinds, interned by
 /// `(kind, element, depth)`. Only keys that are actually used allocate.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -519,11 +507,7 @@ pub enum ScratchKind {
     Atomic,
 }
 
-// ---------------------------------------------------------------------------
-// Emitter
-// ---------------------------------------------------------------------------
-
-/// Per-kernel emission state: the naga arenas plus the L2 -> naga handle maps.
+/// Per-kernel emission state: the naga arenas plus the Kernel -> naga handle maps.
 pub struct Emitter<'a> {
     pub caps: &'a Caps,
     pub module: naga::Module,
@@ -546,13 +530,11 @@ pub struct Emitter<'a> {
     /// A backend inlines a single-use expression into its consumer, so a run
     /// of them nests one inside the next and Metal's front end refuses past
     /// 256 brackets. Naming one emits `const auto _n = <expr>;` — an SSA
-    /// binding, not a memory round trip, which is what makes it cheaper than
-    /// spilling through a [`Self::scratch`] local.
+    /// binding, not a memory round trip.
     pub(crate) forced_names: Vec<(naga::Handle<naga::Expression>, String)>,
     /// Hash-consed expression memo. `TileExpr: Hash + Eq` is O(1) through its
-    /// cached structural hash; this is precisely why the `Shared` node was
-    /// deleted — two identical subtrees built separately merge here, which
-    /// `Rc::as_ptr` memoization structurally cannot do.
+    /// cached structural hash, so two identical subtrees built separately
+    /// merge here.
     ///
     /// Each entry carries the [`Self::mem_epoch`] it was created at. A key
     /// that reads memory is a hit only while every space it reads is still at
@@ -561,7 +543,7 @@ pub struct Emitter<'a> {
     /// Write counter per memory space, indexed by [`MEM_SPACES`] order:
     /// storage, workgroup tile, private local.
     ///
-    /// **Monotonic, and deliberately not part of [`expr::Scope`].** A store
+    /// **Monotonic, and not part of [`expr::Scope`].** A store
     /// inside an `If` or a loop body must invalidate the *enclosing* block's
     /// memoized reads as well, and restoring a saved counter on scope exit
     /// would resurrect exactly the stale entries the store invalidated.
@@ -761,18 +743,13 @@ fn builtin_arg(ty: naga::Handle<naga::Type>, builtin: naga::BuiltIn) -> naga::Fu
     }
 }
 
-// ---------------------------------------------------------------------------
-// Test kit
-// ---------------------------------------------------------------------------
-
 /// Fixture builders and a minimal dispatcher, shared by every emit test in
-/// this crate. Test-only: nothing here is compiled into a release build, and
-/// the launcher proper lives in `crate::launch`.
+/// this crate. The launcher proper lives in `crate::launch`.
 #[cfg(test)]
 pub(crate) mod testkit {
     use super::*;
     use fusor2_ir::device::{Caps, DeviceKind, Limits, SubgroupWidths};
-    use fusor2_ir::ir::level2::{
+    use fusor2_ir::ir::kernel::{
         ArenaMode, BufferAccess, BufferDecl, LocalDecl, MemoryLevel, Placement, StorageView,
         TileDecl, TileLayout, TileLiteral,
     };
@@ -972,8 +949,6 @@ pub(crate) mod testkit {
             .count()
     }
 
-    // ---- live dispatch -------------------------------------------------
-
     /// A device probed exactly the way the shipped path probes it.
     pub fn gpu() -> Option<crate::device::GpuDevice> {
         crate::device::gpu_blocking(&crate::device::DeviceOptions::default()).ok()
@@ -1108,7 +1083,7 @@ mod tests {
     use super::testkit::*;
     use super::*;
     use fusor2_ir::dtype::NumericContract;
-    use fusor2_ir::ir::level2::{ArenaMode, ReduceKind, TileReduceOp};
+    use fusor2_ir::ir::kernel::{ArenaMode, ReduceKind, TileReduceOp};
     use fusor2_ir::scalar::{BinOp, UnOp};
 
     /// out[lane] = exp(in[lane]) + 1

@@ -9,7 +9,7 @@
 
 use fusor2_autograd::tape::{GraphTape, TapeExt, accum_dtype};
 use fusor2_ir::autograd::{Tape, Val};
-use fusor2_ir::ir::level0::L0;
+use fusor2_ir::ir::logical::Logical;
 use fusor2_ir::scalar::BinOp;
 use fusor2_ir::shape::SlidingWindow;
 use fusor2_ir::{Error, Result};
@@ -79,7 +79,7 @@ fn pool_defn(
     reduce: PoolReduce,
 ) -> Result<Val> {
     let dtype = t.dtype_of(x);
-    let windowed = t.add(L0::Window {
+    let windowed = t.add(Logical::Window {
         specs: specs.iter().copied().collect(),
         x,
     })?;
@@ -168,7 +168,7 @@ mod tests {
     use crate::session::{Backend, Session};
     use fusor2_ir::dtype::Dtype;
     use fusor2_ir::ir::Op;
-    use fusor2_ir::ir::level1::L1;
+    use fusor2_ir::ir::launch::Launch;
     use fusor2_ir::shape::Dim;
 
     fn graph() -> Graph {
@@ -222,7 +222,7 @@ mod tests {
                 let ms = eg.members(eg.class_of(y.id()));
                 let s = ms
                     .iter()
-                    .filter(|m| matches!(eg.node(**m).op, Op::L1(L1::Ext { .. })))
+                    .filter(|m| matches!(eg.node(**m).op, Op::Launch(Launch::Ext { .. })))
                     .count();
                 let d = ms.iter().filter(|m| eg.is_defn(**m)).count();
                 Ok((ms.len(), s, d))
@@ -243,7 +243,7 @@ mod tests {
             .with_egraph(|eg| {
                 let ms = eg.members(eg.class_of(y.id()));
                 Ok(ms.iter().find_map(|m| match &eg.node(*m).op {
-                    Op::L1(L1::Ext { attrs, .. }) => Some(*attrs),
+                    Op::Launch(Launch::Ext { attrs, .. }) => Some(*attrs),
                     _ => None,
                 }))
             })

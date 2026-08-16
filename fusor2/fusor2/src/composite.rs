@@ -1,9 +1,7 @@
-//! Macro ops. Every constructor here mints the sugar node **and unions its
-//! `defn` expansion into the same chain in the same call**, so there is
-//! nothing to recognize later: recognition ordering, sole-consumer gates and
-//! `spike_no_recognition` all evaporate, and the structural attributes a
-//! pattern match would have to re-derive (`MaskKind::Causal`) stay on the
-//! node.
+//! Macro ops. Every constructor here mints the sugar node and unions its
+//! `defn` expansion into the same chain in the same call, so there is nothing
+//! to recognize later and the structural attributes (`MaskKind::Causal`) stay
+//! on the node.
 
 pub mod activations;
 pub mod attention;
@@ -18,7 +16,7 @@ pub mod upsample;
 use fusor2_autograd::tape::GraphTape;
 use fusor2_ir::egraph::Id;
 use fusor2_ir::facts::{ValueFacts, Work};
-use fusor2_ir::ir::level1::{AccessPlan, Effect, L1, MaskKind, Operand};
+use fusor2_ir::ir::launch::{AccessPlan, Effect, Launch, MaskKind, Operand};
 use fusor2_ir::ir::{Op, OpDef, OpDefId, OpDefRegistry, OpTag, VerifyCtx};
 use fusor2_ir::shape::{Dim, Layout, SlidingWindow, SymId};
 use fusor2_ir::{Error, Result};
@@ -26,10 +24,6 @@ use smallvec::SmallVec;
 
 use crate::graph::GraphRef;
 use crate::tensor::Tensor;
-
-// ---------------------------------------------------------------------------
-// Attributes
-// ---------------------------------------------------------------------------
 
 /// Which reduction a normalization performs.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -120,10 +114,6 @@ pub enum AttentionOut {
     GradKV,
 }
 
-// ---------------------------------------------------------------------------
-// The op table
-// ---------------------------------------------------------------------------
-
 /// One row of [`MACRO_OPS`]. The discriminant **is** the `OpDefId`, because
 /// registration happens once at `Session::new` in table order and `PlanHash`
 /// reads registration order.
@@ -163,11 +153,9 @@ impl MacroOp {
 
 /// Every sugar op, in registration order.
 ///
-/// All eight declare `lower_per_target: &[]` — they are **unrunnable by
-/// construction**. They exist so rules can read the attributes a pattern
-/// match would otherwise have to re-derive; the `defn` in the same e-class is
-/// always the runnable floor, so a plan that selected a sugar node is
-/// unbuildable rather than merely unlikely.
+/// All eight declare `lower_per_target: &[]` — unrunnable by construction.
+/// They exist so rules can read attributes off them; the `defn` in the same
+/// e-class is always the runnable floor.
 pub static MACRO_OPS: &[OpDef] = &[
     OpDef {
         name: "softmax",
@@ -264,13 +252,8 @@ pub fn register_macro_ops(registry: &mut OpDefRegistry) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Registry rows
-// ---------------------------------------------------------------------------
-
-/// The last operand of every sugar node is its `defn`, which is what makes
-/// inference total without handing `OpDef::infer` the attribute blob: the
-/// definitional expansion already knows the answer.
+/// The last operand of every sugar node is its `defn`; inference reads it as
+/// the shape witness.
 fn witness(ins: &[ValueFacts]) -> Result<&ValueFacts> {
     ins.last()
         .ok_or_else(|| Error::Shape("a macro op carries its defn as its last operand".into()))
@@ -284,7 +267,7 @@ fn verify_witness(cx: &VerifyCtx<'_>) -> Result<()> {
     let w = witness(cx.operands)?;
     if w.dtype != cx.result.dtype || w.shape != cx.result.shape {
         return Err(Error::verify(
-            fusor2_ir::ir::Level::L1,
+            fusor2_ir::ir::Level::Launch,
             cx.id,
             "a macro op's facts must equal its defn's",
         ));
@@ -399,21 +382,17 @@ fn work_rope(_ins: &[ValueFacts], out: &ValueFacts) -> Work {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The one construction discipline
-// ---------------------------------------------------------------------------
-
 /// Build one macro op.
 ///
 /// Every macro op in this crate goes through exactly this function, and it
 /// always does the same five things:
 ///
-/// 1. build the `defn` — the definitional core-L0 expansion — **first**, so
+/// 1. build the `defn` — the definitional core-Logical expansion — **first**, so
 ///    its id is below the sugar's and the union's operand 0 is the defn (the
 ///    adjoint walk descends operand 0, and only the defn has an adjoint);
 /// 2. `mark_defn` it, so it is never evicted;
 /// 3. intern `attrs` into the `AttrId` side table;
-/// 4. add the sugar `L1::Ext { def, ops, attrs }`, whose last operand is the
+/// 4. add the sugar `Launch::Ext { def, ops, attrs }`, whose last operand is the
 ///    defn — its shape witness;
 /// 5. `union(defn, sugar)` and return a [`Tensor`] over the **union root**.
 ///
@@ -443,18 +422,17 @@ pub(crate) fn macro_op(
                 access: AccessPlan::Alias,
             });
         }
-        let sugar = g.add(Op::L1(L1::Ext {
+        let sugar = g.add(Op::Launch(Launch::Ext {
             def: def.def_id(),
             ops: operands,
             attrs,
         }))?;
         Ok((defn, sugar))
     })?;
-    // `union_stable`: the first build returns exactly the union root the
-    // plain `union` would (identical extraction inputs); a rebuild — a
-    // decode loop re-running the same model code next step — gets the same
-    // id back instead of the class's *moved* root, so downstream consumers
-    // hash-cons and the step graph stays node-identical.
+    // `union_stable`: a rebuild — a decode loop re-running the same model
+    // code next step — gets the same id back instead of the class's *moved*
+    // root, so downstream consumers hash-cons and the step graph stays
+    // node-identical.
     let root = graph.union_stable(defn, sugar)?;
     Ok(graph.tensor(root))
 }
@@ -471,18 +449,14 @@ pub(crate) fn core_op(
 }
 
 /// A const extent, or an error. Used only where an algorithm genuinely needs
-/// the integer (a window size, a kernel extent) rather than where a symbolic
-/// extent would do.
+/// the integer (a window size, a kernel extent).
 pub(crate) fn const_dim(d: Dim, what: &str) -> Result<u64> {
     d.as_const()
         .ok_or_else(|| Error::Shape(format!("{what} needs a decidable extent, got {d}")))
 }
 
-/// A rank-1 `u32` index leaf holding `values`.
-///
-/// Scatter and gather both take a real index tensor. A pad's run, an
-/// upsample's repeat and a concatenation's destination rows are all this — one
-/// small buffer uploaded once, never a special node kind.
+/// A rank-1 `u32` index leaf holding `values`: one small buffer uploaded
+/// once, fed to scatter and gather as a real index tensor.
 pub(crate) fn index_leaf(graph: &GraphRef, values: &[u32]) -> Result<Id> {
     let mut bytes = Vec::with_capacity(values.len() * 4);
     for v in values {
@@ -539,7 +513,7 @@ mod tests {
         }
     }
 
-    /// `verify_l1` rejects an `OpDef` whose `work` is constant in shape. Every
+    /// `verify_launch` rejects an `OpDef` whose `work` is constant in shape. Every
     /// row here must survive that tripwire.
     #[test]
     fn no_work_row_is_constant_in_shape() {
@@ -566,9 +540,6 @@ mod tests {
 mod constant_identity {
     use super::*;
     use crate::graph::Graph;
-    // The backend selector, by module path. The crate root's `Backend` is
-    // whichever of the two the `typed-api` feature selects; in-crate code
-    // names the one it means so it compiles under either root.
     use crate::session::{Backend, Session};
 
     fn graph() -> Graph {
@@ -612,7 +583,7 @@ mod constant_identity {
     #[test]
     fn uploads_and_constants_never_share_a_buffer_name() {
         use fusor2_ir::dtype::Dtype;
-        use fusor2_ir::ir::level0::{L0, LeafKind};
+        use fusor2_ir::ir::logical::{Logical, LeafKind};
 
         let g = graph();
         let h = g.handle();
@@ -631,7 +602,7 @@ mod constant_identity {
         ];
         for id in ids {
             h.with_egraph(|eg| {
-                if let fusor2_ir::ir::Op::L0(L0::Leaf(LeafKind::Buffer { name, .. })) =
+                if let fusor2_ir::ir::Op::Logical(Logical::Leaf(LeafKind::Buffer { name, .. })) =
                     &eg.node(id).op
                 {
                     names.push(*name);

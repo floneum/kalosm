@@ -1,11 +1,6 @@
 //! The 12 reductions, plus the two adjoints whose rule is not "broadcast the
 //! gradient": `max`/`min` split evenly among ties, and `product` is
 //! zero-aware in three branches.
-//!
-//! `Fold`'s structural adjoint reads `combine`, so these are the two rows of
-//! that table that can be wrong in an interesting way. A reduction whose
-//! split and unsplit forms disagree past tolerance means `fold_split` fired
-//! where `NumericContract::reassoc` forbade it.
 
 use fusor2::{Dtype, Session};
 use fusor2::tensor::Dyn as Tensor;
@@ -85,8 +80,7 @@ pub fn cases() -> Cases {
     }
 
     // A rank-4 reduction over an interior axis: the axis-removal bookkeeping
-    // is where a rank-generic `Fold` goes wrong, and the reference has a
-    // dedicated high-rank case for exactly that.
+    // is where a rank-generic `Fold` goes wrong.
     cases.push_case(fuzz_case(
         "reductions",
         "sum_high_rank",
@@ -105,10 +99,7 @@ pub fn cases() -> Cases {
         product_zero_aware,
     ));
 
-    // `fold_split` is only sound where `NumericContract::reassoc` allows it:
-    // without the guard the rule declares the split and unsplit forms
-    // value-equal, and extraction swaps them on cost, on an f16 accumulator,
-    // in a system whose acceptance test is a byte-identical QAT export.
+    // `fold_split` is only sound where `NumericContract::reassoc` allows it.
     cases.push_case(fuzz_case(
         "reductions",
         "fold_split_agrees_when_reassoc",
@@ -120,14 +111,8 @@ pub fn cases() -> Cases {
     cases
 }
 
-/// The generality half: programs the fold laws were **not** designed for.
-///
-/// A law that only derives its motivating example is a recognizer with extra
-/// steps, so each case here is a reduction nobody aimed a rule at — k-means
-/// assignment, quantization calibration, sampling temperature, a distillation
-/// loss, a single-bin DFT, a ragged batch — carrying an independent host
-/// oracle. The oracle is the load-bearing half: a firing assert with no number
-/// behind it is how flash attention was dead for a week.
+/// The generality half: programs the fold laws were not designed for, each
+/// carrying an independent host oracle.
 pub mod generality {
     use fusor2::{Dtype, Session};
     use fusor2_ir::carrier::{ArgRemap, Carrier};
@@ -227,12 +212,8 @@ pub mod generality {
     ];
 
     /// Nearest-centroid assignment: `min over M of sum over D of (a-b)^2`.
-    ///
-    /// This is `Fold{Min}(Fold{Add}((a-b)^2))` over `[N, D]` and `[M, D]`,
-    /// written with no attention, no softmax and no fold splitting anywhere.
-    /// It is bit-for-bit the same fact as never materializing an `[Lq, Lk]`
-    /// score matrix: the `[N, M]` distance matrix is an intermediate of a
-    /// reduction that covers it.
+    /// The `[N, M]` distance matrix is an intermediate of a reduction that
+    /// covers it and is never materialized.
     fn kmeans_assignment(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (n, m, d) = (shape[0], shape[1], shape[2]);
         let points = Domain::Wide.sample(seed, (n * d) as usize);
@@ -273,13 +254,10 @@ pub mod generality {
     /// A QAT fake-quant chain reduced by a plain `Fold{Add}`.
     ///
     /// `round(clamp(x/s, -lim, lim), HalfAwayFromZero) * s` carries
-    /// `NumericContract::STRICT`, so every *inexact* law must decline on it
-    /// while substitution into a lift — which reassociates nothing — must not.
-    /// The elementwise values are asserted **bit-identically** against the
-    /// host formula: that exactness is the whole content of the byte-identical
-    /// export, and an inexact rewrite firing here is exactly what would break
-    /// it. The sum is compared to tolerance, because a reduction's *order* is
-    /// a schedule decision and always was.
+    /// `NumericContract::STRICT`, so every inexact law must decline on it.
+    /// The elementwise values are asserted bit-identically against the host
+    /// formula; the sum is compared to tolerance, because a reduction's order
+    /// is a schedule decision.
     fn qat_fake_quant_chain(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (rows, cols) = (shape[0], shape[1]);
         const LEVELS: u32 = 127;
@@ -302,8 +280,7 @@ pub mod generality {
             })
             .collect();
         // Bit equality, with `-0.0 == 0.0`: the sign of a zero is not a
-        // numeric difference and no export reads it, but every other bit is
-        // exactly what "byte-identical" means.
+        // numeric difference and no export reads it.
         let same = |a: f32, b: f32| a.to_bits() == b.to_bits() || (a == 0.0 && b == 0.0);
         for (i, (got, want)) in quantized.iter().zip(&host).enumerate() {
             if !same(*got, *want) {
@@ -326,12 +303,9 @@ pub mod generality {
     /// `[rows, vocab]`. Forward only, bit-exact.
     const TEMPERATURE_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 4), FuzzDim::Range(8, 128)];
 
-    /// Sampling temperature: `argmax(logits / T)`.
-    ///
-    /// The `(*c)` row hoists `1/T` out of the reduction, deleting a full pass
-    /// of divides from every decode step. `T` is a literal, so the hoisted and
-    /// unhoisted forms agree **bit-exactly**: float division is monotone, so
-    /// the argmax is preserved, and the surviving divide is the same divide.
+    /// Sampling temperature: `argmax(logits / T)`. The `(*c)` row hoists `1/T`
+    /// out of the reduction; float division is monotone, so the argmax is
+    /// preserved.
     fn temperature(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (rows, vocab) = (shape[0], shape[1]);
         const T: f32 = 0.7;
@@ -353,11 +327,9 @@ pub mod generality {
             if c.to_bits() != want.to_bits() {
                 return Err(format!("row {r}: max {c} != host max {want}").into());
             }
-            // One ulp, not bit equality: division is monotone so the max is
-            // preserved, but the GPU backend compiles `/` under fast math,
-            // where a divide may land one ulp from the host's — an
-            // engine-wide precision property, not a reduction bug. The
-            // undivided max above stays bit-exact.
+            // One ulp, not bit equality: the GPU backend compiles `/` under
+            // fast math, where a divide may land one ulp from the host's.
+            // The undivided max above stays bit-exact.
             let want_hot = want / T;
             if h.to_bits().abs_diff(want_hot.to_bits()) > 1 {
                 return Err(format!(
@@ -386,8 +358,7 @@ pub mod generality {
     const HOIST_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(4, 64)];
 
     /// `max(x + bias) == max(x) + bias` for a bias invariant along the
-    /// reduced axis. Exact in float, and the only shape of rewrite in the
-    /// whole law set legal under `NumericContract::STRICT`.
+    /// reduced axis. Exact in float.
     fn shifted_max(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (rows, cols) = (shape[0], shape[1]);
         let data = Domain::Wide.sample(seed, (rows * cols) as usize);
@@ -415,8 +386,7 @@ pub mod generality {
         Ok(())
     }
 
-    /// `min(-x) == -max(x)`, exactly. The `Neg` row is total on every dtype,
-    /// which is why it ships where the partial monotones do not.
+    /// `min(-x) == -max(x)`, exactly. The `Neg` row is total on every dtype.
     fn negated_min(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (rows, cols) = (shape[0], shape[1]);
         let data = Domain::Wide.sample(seed, (rows * cols) as usize);
@@ -440,12 +410,8 @@ pub mod generality {
     const TUPLE_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 4), FuzzDim::Range(300, 2000)];
 
     /// Dynamic-range quantization calibration: the min and the max of one
-    /// tensor, in **one** traversal.
-    ///
-    /// `Carrier::tuple` is the tupling law's own constructor, and there is no
-    /// shared algebra between `Min` and `Max` for it to exploit — which is the
-    /// point. The joint fold is compared slot by slot against two separate
-    /// reductions of the same data.
+    /// tensor, in one traversal. The joint fold is compared slot by slot
+    /// against two separate reductions of the same data.
     fn min_and_max_one_pass(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (rows, cols) = (shape[0], shape[1]);
         let data = Domain::Wide.sample(seed, (rows * cols) as usize);
@@ -492,10 +458,6 @@ pub mod generality {
 
     /// A single-bin DFT: the real and imaginary projections of one windowed
     /// signal, over one axis, in one pass.
-    ///
-    /// Evidence the table is not exp-shaped. Nothing here is a softmax, a
-    /// normalization or an attention; it is two folds over the same operand
-    /// that a tupling law joins and a rotation row retargets.
     fn goertzel(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (rows, len) = (shape[0], shape[1]);
         let _ = seed; // the signal is the case: a sine at the probed bin.
@@ -552,12 +514,8 @@ pub mod generality {
     const DISTILLATION_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 4), FuzzDim::Range(8, 96)];
 
     /// Soft-label distillation loss: `-sum_c p_c * (x_c - lse(x))`.
-    ///
-    /// The trainer's own loss, written as an ordinary taped chain. The weights
-    /// make the module slot non-scalar, which is the clause that says
-    /// `(V, +)` is an arbitrary monoid rather than a running sum. The logits
-    /// sit at ~900, where a naive `sum(exp(x))` is `inf` and the loss is
-    /// `NaN` — so a finiteness check is a real assert, not decoration.
+    /// The logits sit at ~900, where a naive `sum(exp(x))` is `inf` and the
+    /// loss is `NaN`, so the finiteness check is a real assert.
     fn distillation(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (rows, classes) = (shape[0], shape[1]);
         let mut logits = Domain::Custom(-4.0, 4.0).sample(seed, (rows * classes) as usize);
@@ -628,13 +586,9 @@ pub mod generality {
     /// full rows, near-empty rows and everything between all occur.
     const RAGGED_SPEC: &[FuzzDim] = &[FuzzDim::Range(2, 6), FuzzDim::Range(8, 256)];
 
-    /// A ragged batch: `sum(select(position < valid_len, x, 0))`.
-    ///
-    /// Zero is the `Add` identity, so the padded tail contributes nothing by
-    /// the monoid law rather than by a padding flag on a node. Key-padding
-    /// masks, sliding windows, ALiBi with a cutoff and block-sparse attention
-    /// are all this same clause; nobody would write a `MaskKind` variant for
-    /// any of them.
+    /// A ragged batch: `sum(select(position < valid_len, x, 0))`. Zero is the
+    /// `Add` identity, so the padded tail contributes nothing by the monoid
+    /// law rather than by a padding flag on a node.
     fn ragged_padding(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (rows, cols) = (shape[0], shape[1]);
         let data = Domain::Wide.sample(seed, (rows * cols) as usize);
@@ -686,9 +640,7 @@ pub mod generality {
         let x = upload(graph.handle(), &dims(&[rows, cols]), &data)?;
         let total = x.sum(1).map_err(err)?;
         let actual = read(&total)?;
-        // f64 accumulation on the host: a multi-thousand-element f32 sum is
-        // exactly the case where the *order* matters, which is what the split
-        // changes.
+        // f64 accumulation on the host: at these lengths the f32 order matters.
         let expected: Vec<f32> = data
             .chunks(cols as usize)
             .map(|r| r.iter().map(|v| *v as f64).sum::<f64>() as f32)
@@ -698,8 +650,6 @@ pub mod generality {
         Ok(())
     }
 }
-
-// ---------------------------------------------------------------------------
 
 fn reduction_case(
     session: &Session,
@@ -792,10 +742,8 @@ fn sum_high_rank(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     Ok(())
 }
 
-/// Ties split evenly under `TiePolicy::SplitEvenly`, which is an explicit
-/// attribute rather than an implicit convention: the reference's
-/// `reduction_extrema_keepdim_grad` divides by the tie count, and matching a
-/// reference trainer's numerics has to be a declaration.
+/// Ties split evenly under `TiePolicy::SplitEvenly`: the gradient divides by
+/// the tie count.
 fn extrema_tie_case(session: &Session, is_max: bool) -> CaseResult {
     // Row 0 has a three-way tie at the extremum; row 1 and row 2 have a unique
     // extremum, so the case covers both branches at once.
@@ -939,9 +887,8 @@ fn fold_split_agrees(session: &Session, shape: &[u64], seed: u32) -> CaseResult 
         .map_err(|e| -> CaseError { e.to_string().into() })?;
     let actual = read_scalar(&y)?;
 
-    // f64-accumulated reference: the point is that a *split* fold and an
-    // unsplit one both land near the true sum, not that either matches a
-    // naive left-to-right f32 accumulation.
+    // f64-accumulated reference: a split fold and an unsplit one must both
+    // land near the true sum.
     let mut sum = 0.0f64;
     for v in &data {
         sum += *v as f64;
@@ -1030,20 +977,11 @@ mod tests {
         }
     }
 
-    /// The **negative half** of the homomorphism table, which is the half that
-    /// keeps a rewrite from turning a number into a NaN inside a byte-identical
-    /// export.
-    ///
-    /// `ValueFacts` is `{dtype, shape, numeric, persistence}` — there is no
-    /// sign or range lattice — so a row over a unary that is *partial* on the
-    /// operand dtype cannot be guarded. `Log : Mul -> Add` is false whenever
-    /// any element is negative (an even count of negatives gives a finite left
-    /// side and a NaN right side), and `MonotoneUp` over `Sqrt`, `Log`, `Asin`,
-    /// `Acos` or `Atanh` is the same hazard with `exact_in_float: true`, which
-    /// means it would fire under `NumericContract::STRICT`.
-    ///
-    /// A row returns when `ValueFacts` gains a sign lattice, and this test is
-    /// what will notice.
+    /// The negative half of the homomorphism table. `ValueFacts` has no sign
+    /// or range lattice, so a row over a unary that is partial on the operand
+    /// dtype cannot be guarded: `Log : Mul -> Add` is false whenever any
+    /// element is negative. A row returns when `ValueFacts` gains a sign
+    /// lattice, and this test is what will notice.
     #[test]
     fn the_homomorphism_table_admits_no_partial_unary() {
         use fusor2_ir::carrier::{HOM_TABLE, HomShape};

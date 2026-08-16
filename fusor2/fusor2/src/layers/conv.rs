@@ -11,10 +11,7 @@ use crate::{Result, Tensor};
 ///
 /// `W` is the **weight's** rank — `[out_ch, in_ch / groups, ...kernel]`, so
 /// `W - 2` is the number of spatial axes — and `T` its element type. Both
-/// default so that a bare `ConvNd` is the 2-d f32 case, which is what every
-/// vision model in this workspace loads. The reference has no `ConvNd` at all;
-/// the parameterization follows the other layers here rather than inventing a
-/// witness trait for the spatial rank.
+/// default so that a bare `ConvNd` is the 2-d f32 case.
 pub struct ConvNd<const W: usize = 4, T: Element = f32> {
     pub weight: Tensor<W, T>,
     pub bias: Option<Tensor<1, T>>,
@@ -25,12 +22,10 @@ pub struct ConvNd<const W: usize = 4, T: Element = f32> {
 }
 
 impl<const W: usize, T: Element> ConvNd<W, T> {
-    /// A convolution at the reference's `ConvNdConfig::default()`: unit
-    /// stride, no padding, one group. The spatial rank comes from the weight,
-    /// which is `[out_ch, in_ch / groups, ...kernel]`.
+    /// A convolution with unit stride, no padding, one group. The spatial
+    /// rank comes from the weight, `[out_ch, in_ch / groups, ...kernel]`.
     ///
-    /// Infallible. A weight of rank < 2 has no spatial axes at all; that is
-    /// refused by `forward`, which has somewhere to put the diagnosis.
+    /// Infallible; a weight of rank < 2 is refused by `forward`.
     pub fn new(weight: Tensor<W, T>, bias: Option<Tensor<1, T>>) -> Self {
         let spatial = W.saturating_sub(2);
         Self {
@@ -83,9 +78,8 @@ impl<const W: usize, T: Element> ConvNd<W, T> {
     /// `[batch, in_ch, ...spatial] -> [batch, out_ch, ...out_spatial]`.
     /// Rank-preserving.
     ///
-    /// One `Window` view plus one `Contract` that contracts the channel label
-    /// and every kernel label at once — there is no im2col reshape, so the
-    /// windowed operand never has to be materialized.
+    /// One `Window` view plus one `Contract` over the channel label and every
+    /// kernel label at once.
     #[track_caller]
     pub fn forward<const R: usize>(&self, x: &Tensor<R, T>) -> Tensor<R, T> {
         let spatial = match W.checked_sub(2) {
@@ -199,8 +193,7 @@ mod tests {
         assert_eq!(by_layer.id(), by_hand.id());
     }
 
-    /// A 2-d layer is the default parameterization, and it is what a vision
-    /// model writes as a bare `ConvNd`.
+    /// A bare `ConvNd` is the 2-d case.
     #[test]
     fn the_default_parameterization_is_the_two_dimensional_case() {
         let g = graph();

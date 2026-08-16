@@ -1,4 +1,4 @@
-//! L2 statements -> the loop nest.
+//! Kernel statements -> the loop nest.
 //!
 //! `Barrier` splits the lane loop into two loops over the lane range, ensuring
 //! iteration 0 does not read tile slots that a later iteration has not written.
@@ -10,7 +10,7 @@
 //! inside a uniform `If`/`Loop` splits that body's list, with the lane loops
 //! nested inside the `If`/`Loop`.
 
-use fusor2_ir::ir::level2::{ScalarElement, TileReduceOp};
+use fusor2_ir::ir::kernel::{ScalarElement, TileReduceOp};
 use fusor2_ir::target::EmitError;
 
 use super::expr::Slot;
@@ -171,8 +171,7 @@ pub struct LaneLoop {
 /// Partition a compiled statement list at every barrier, pushing the lane loop
 /// into each piece.
 ///
-/// A list with no barrier at any depth yields exactly one [`LaneLoop`]. This
-/// returning a *vector* is not incidental: it is the barrier split.
+/// A list with no barrier at any depth yields exactly one [`LaneLoop`].
 pub fn block(body: &[CStmt], lanes: u32, width: u32) -> Result<Vec<LaneLoop>, EmitError> {
     let mut out: Vec<LaneLoop> = Vec::new();
     let mut run: Vec<CStmt> = Vec::new();
@@ -202,7 +201,7 @@ pub fn block(body: &[CStmt], lanes: u32, width: u32) -> Result<Vec<LaneLoop>, Em
             } => {
                 if !*uniform {
                     // `verify_uniformity` guarantees a barrier only appears
-                    // under a uniform predicate; reaching here means the L2
+                    // under a uniform predicate; reaching here means the Kernel
                     // verifier was skipped.
                     return Err(EmitError::Validation(
                         "barrier under a divergent `If`".into(),

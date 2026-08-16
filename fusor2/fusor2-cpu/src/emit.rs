@@ -17,7 +17,7 @@ pub mod stmt;
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::NumericContract;
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::kernel::{
     Addr, ArenaPlanner, Builtin, BufferDecl, ElementType, KernelIr, LocalDecl, ScalarElement,
     Source, Stmt, Tile, TileExpr, TileExprKind, TileLiteral, TileReduceOp,
 };
@@ -31,10 +31,6 @@ use std::sync::Arc;
 use access::AccessForm;
 use expr::{Instr, NumTy, RKind, Reg, Slot, UniformSrc};
 use stmt::{CAcc, CStmt, LaneLoop};
-
-// ---------------------------------------------------------------------------
-// The compiled program
-// ---------------------------------------------------------------------------
 
 /// One workgroup tile's placement in the thread-local scratch arena.
 #[derive(Clone, Debug)]
@@ -118,10 +114,6 @@ impl CpuKernel {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Entry points
-// ---------------------------------------------------------------------------
-
 /// Emit a kernel for this device.
 pub fn emit(ir: &KernelIr, caps: &Caps) -> Result<CpuKernel, EmitError> {
     let artifact = compile(ir, caps, None)?;
@@ -137,11 +129,8 @@ pub fn emit(ir: &KernelIr, caps: &Caps) -> Result<CpuKernel, EmitError> {
 ///
 /// When a planner is supplied its `verify_uniformity` and `verify_arena` run
 /// **before** compilation and a failure is `EmitError::Validation`, never a
-/// silent fallback. Without one — the planner lives in `fusor2-tile` and is
-/// injected by [`crate::CpuTarget::with_planner`] — the arena falls back to a
-/// sequential packing, which is always legal on CPU because thread-local
-/// scratch aliases freely (`Caps::workgroup_alias`) and the separation
-/// predicate is therefore trivially true.
+/// silent fallback. Without one the arena falls back to a sequential packing,
+/// which is always legal on CPU because thread-local scratch aliases freely.
 pub fn compile(
     ir: &KernelIr,
     caps: &Caps,
@@ -197,7 +186,7 @@ pub fn compile(
     })
 }
 
-fn prog_arena(plan: &Option<fusor2_ir::ir::level2::ArenaPlan>, fallback: u32) -> u32 {
+fn prog_arena(plan: &Option<fusor2_ir::ir::kernel::ArenaPlan>, fallback: u32) -> u32 {
     plan.as_ref().map_or(fallback, |p| p.total_bytes.max(fallback))
 }
 
@@ -220,10 +209,6 @@ fn scalar_of(e: ElementType) -> std::result::Result<ScalarElement, EmitError> {
         ))),
     }
 }
-
-// ---------------------------------------------------------------------------
-// The compiler
-// ---------------------------------------------------------------------------
 
 struct Compiler<'a> {
     ir: &'a KernelIr,
@@ -263,9 +248,9 @@ impl<'a> Compiler<'a> {
         }
     }
 
-    /// Adopt the planner's placements, so the CPU arena and the L1 occupancy
+    /// Adopt the planner's placements, so the CPU arena and the Launch occupancy
     /// term read the same `arena_plan` value.
-    fn seed_arena(&mut self, plan: &fusor2_ir::ir::level2::ArenaPlan) {
+    fn seed_arena(&mut self, plan: &fusor2_ir::ir::kernel::ArenaPlan) {
         for p in &plan.placements {
             let key = Arc::as_ptr(&p.tile) as usize;
             if self.tile_index.contains_key(&key) {
@@ -331,9 +316,8 @@ impl<'a> Compiler<'a> {
             ElementType::Scalar(s) => s,
             _ => ScalarElement::F32,
         };
-        // Sequential packing: legal on CPU without further analysis because
-        // thread-local scratch aliases freely, so no two tiles need a
-        // separating barrier to share bytes — they simply do not share.
+        // Sequential packing: legal on CPU because thread-local scratch
+        // aliases freely.
         let offset = align_up(self.arena_bytes, 64);
         let len = elements * elem.byte_size() as u32;
         self.arena_bytes = offset + len;
@@ -377,8 +361,6 @@ impl<'a> Compiler<'a> {
         let out = self.slot();
         self.push(Instr::Const { out, bits })
     }
-
-    // -- statements ---------------------------------------------------------
 
     fn compile_stmts(&mut self, body: &[Stmt]) -> std::result::Result<Vec<CStmt>, EmitError> {
         let mut out = Vec::with_capacity(body.len());
@@ -557,15 +539,15 @@ impl<'a> Compiler<'a> {
                 scratch,
             } => {
                 let group = match &**kind {
-                    fusor2_ir::ir::level2::ReduceKind::Workgroup { group_size, .. } => *group_size,
-                    fusor2_ir::ir::level2::ReduceKind::Subgroup => {
+                    fusor2_ir::ir::kernel::ReduceKind::Workgroup { group_size, .. } => *group_size,
+                    fusor2_ir::ir::kernel::ReduceKind::Subgroup => {
                         return Err(EmitError::Unsupported(
                             "a multi-lane merge has no horizontal-reduce form: the SIMD \
                              butterfly folds one register with one operator"
                                 .into(),
                         ));
                     }
-                    fusor2_ir::ir::level2::ReduceKind::Loop { .. } => {
+                    fusor2_ir::ir::kernel::ReduceKind::Loop { .. } => {
                         return Err(EmitError::Unsupported(
                             "a multi-lane loop reduction seeds from the carrier's identities, \
                              which the lowering carries: build the per-lane loop with Stmt::Loop \
@@ -643,11 +625,11 @@ impl<'a> Compiler<'a> {
             return Ok(());
         };
         let (tile, group, iterations, index) = match &**kind {
-            fusor2_ir::ir::level2::ReduceKind::Workgroup {
+            fusor2_ir::ir::kernel::ReduceKind::Workgroup {
                 scratch,
                 group_size,
             } => (self.tile_of(scratch), *group_size, None, None),
-            fusor2_ir::ir::level2::ReduceKind::Loop {
+            fusor2_ir::ir::kernel::ReduceKind::Loop {
                 iterations,
                 index,
                 scratch,
@@ -661,7 +643,7 @@ impl<'a> Compiler<'a> {
                     Some(li),
                 )
             }
-            fusor2_ir::ir::level2::ReduceKind::Subgroup => return Ok(()),
+            fusor2_ir::ir::kernel::ReduceKind::Subgroup => return Ok(()),
         };
         let start = self.begin();
         let v = self.compile_expr(value)?;
@@ -691,9 +673,9 @@ impl<'a> Compiler<'a> {
         let g = TileExpr::new(TileExprKind::Literal(TileLiteral::U32(group)), u32_ty);
         let base = tile_bin(BinOp::Mul, tile_bin(BinOp::Div, lane, g.clone(), u32_ty), g, u32_ty);
         let tile_arc = Arc::clone(match &**kind {
-            fusor2_ir::ir::level2::ReduceKind::Workgroup { scratch, .. }
-            | fusor2_ir::ir::level2::ReduceKind::Loop { scratch, .. } => scratch,
-            fusor2_ir::ir::level2::ReduceKind::Subgroup => unreachable!(),
+            fusor2_ir::ir::kernel::ReduceKind::Workgroup { scratch, .. }
+            | fusor2_ir::ir::kernel::ReduceKind::Loop { scratch, .. } => scratch,
+            fusor2_ir::ir::kernel::ReduceKind::Subgroup => unreachable!(),
         });
         let read = TileExpr::new(
             TileExprKind::LoadTile {
@@ -706,11 +688,9 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    // -- expressions --------------------------------------------------------
-
     fn compile_addr(
         &mut self,
-        layout: &fusor2_ir::ir::level2::TileLayout,
+        layout: &fusor2_ir::ir::kernel::TileLayout,
         offset: u32,
         addr: &Addr,
     ) -> std::result::Result<Slot, EmitError> {
@@ -828,22 +808,22 @@ impl<'a> Compiler<'a> {
                     Builtin::Lane => self.push(Instr::LaneId { out }),
                     other => {
                         let which = match other {
-                            Builtin::ProgramId(fusor2_ir::ir::level2::WorkgroupAxis::X) => {
+                            Builtin::ProgramId(fusor2_ir::ir::kernel::WorkgroupAxis::X) => {
                                 UniformSrc::ProgramX
                             }
-                            Builtin::ProgramId(fusor2_ir::ir::level2::WorkgroupAxis::Y) => {
+                            Builtin::ProgramId(fusor2_ir::ir::kernel::WorkgroupAxis::Y) => {
                                 UniformSrc::ProgramY
                             }
-                            Builtin::ProgramId(fusor2_ir::ir::level2::WorkgroupAxis::Z) => {
+                            Builtin::ProgramId(fusor2_ir::ir::kernel::WorkgroupAxis::Z) => {
                                 UniformSrc::ProgramZ
                             }
-                            Builtin::NumWorkgroups(fusor2_ir::ir::level2::WorkgroupAxis::X) => {
+                            Builtin::NumWorkgroups(fusor2_ir::ir::kernel::WorkgroupAxis::X) => {
                                 UniformSrc::GridX
                             }
-                            Builtin::NumWorkgroups(fusor2_ir::ir::level2::WorkgroupAxis::Y) => {
+                            Builtin::NumWorkgroups(fusor2_ir::ir::kernel::WorkgroupAxis::Y) => {
                                 UniformSrc::GridY
                             }
-                            Builtin::NumWorkgroups(fusor2_ir::ir::level2::WorkgroupAxis::Z) => {
+                            Builtin::NumWorkgroups(fusor2_ir::ir::kernel::WorkgroupAxis::Z) => {
                                 UniformSrc::GridZ
                             }
                             Builtin::SubgroupId => UniformSrc::SubgroupId,
@@ -1027,12 +1007,7 @@ impl<'a> Compiler<'a> {
                 let t = self.compile_value(accept)?;
                 let f = self.compile_value(reject)?;
                 // A vector occupies `lanes` consecutive registers, so a
-                // vector-typed select is `lanes` selects. One `Instr::Select`
-                // wrote register `out` and left `out + 1 ..` untouched, and
-                // `VecComponent` then read uninitialized registers — every
-                // multi-lane block decode on this backend came back NaN past
-                // lane 0. (`fusor2-gguf`'s `finish` masks the decoded block
-                // with exactly this select.)
+                // vector-typed select is `lanes` selects.
                 match e.element() {
                     ElementType::Vector { lanes, .. } if lanes > 1 => {
                         let out = self.slots(lanes);
@@ -1080,7 +1055,7 @@ impl<'a> Compiler<'a> {
                 self.push(Instr::Dot { out, a, b, lanes })
             }
             K::Reduce { op, kind, value } => match &**kind {
-                fusor2_ir::ir::level2::ReduceKind::Subgroup => {
+                fusor2_ir::ir::kernel::ReduceKind::Subgroup => {
                     let x = self.compile_value(value)?;
                     let out = self.slot();
                     self.push(Instr::Reduce {
@@ -1168,10 +1143,8 @@ fn mul_operands(e: &TileExpr, outer: &NumericContract) -> Option<(TileExpr, Tile
     }
 }
 
-/// `seen` is not an optimization. An L2 term is a hash-consed **DAG**: a
-/// `tm x tn` accumulator tile shares one operand load across every register,
-/// so walking it as a tree is exponential in the sharing depth and a batched
-/// matmul never finishes emitting.
+/// `seen` is required for termination: a Kernel term is a hash-consed **DAG**,
+/// so walking it as a tree is exponential in the sharing depth.
 fn collect_group_reduces(
     e: &TileExpr,
     out: &mut Vec<TileExpr>,
@@ -1186,7 +1159,7 @@ fn collect_group_reduces(
         collect_group_reduces(&c, out, seen);
     }
     if let TileExprKind::Reduce { kind, .. } = e.kind() {
-        if !matches!(&**kind, fusor2_ir::ir::level2::ReduceKind::Subgroup)
+        if !matches!(&**kind, fusor2_ir::ir::kernel::ReduceKind::Subgroup)
             && !out.contains(e)
         {
             out.push(e.clone());
@@ -1229,10 +1202,9 @@ fn children_of(e: &TileExpr) -> Vec<TileExpr> {
     }
 }
 
-/// A one-lane `Stmt::Reduce` carrying a hardware operator **is** the expression
-/// form, so it is rewritten into it rather than reimplemented: the same
-/// `TileExprKind::Reduce` node goes down the same staging path and emits the
-/// same horizontal reduce or scratch tree. `None` when nothing is to rewrite.
+/// Rewrite a one-lane `Stmt::Reduce` carrying a hardware operator into the
+/// expression form, so it goes down the same staging path. `None` when nothing
+/// is to rewrite.
 fn desugar_fast_reduce(s: &Stmt) -> Option<Stmt> {
     let Stmt::Reduce {
         kind,
@@ -1331,10 +1303,6 @@ fn visit_stmt_exprs(s: &Stmt, f: &mut impl FnMut(&TileExpr)) {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The runner
-// ---------------------------------------------------------------------------
-
 /// A raw view of one bound buffer.
 #[derive(Copy, Clone)]
 pub struct RawBuf {
@@ -1343,7 +1311,7 @@ pub struct RawBuf {
 }
 
 // SAFETY: the launcher only hands a `RawBuf` to workers whose lane ranges write
-// disjoint elements — `verify_l1` invariant 3.
+// disjoint elements — `verify_launch` invariant 3.
 unsafe impl Send for RawBuf {}
 // SAFETY: as above.
 unsafe impl Sync for RawBuf {}
@@ -1805,11 +1773,8 @@ impl<'a, const W: usize> Exec<'a, W> {
                 body,
             } => {
                 self.eval(prep);
-                // **Every accumulator is read at the value it had entering the
-                // step, then all are written.** A loop carrying `(n, mean, m2)`
-                // has `mean`'s update read `n`; writing `n` first makes it read
-                // the *new* count, so the mean drifts and the variance comes
-                // back about half right. One accumulator is unaffected.
+                // Every accumulator is read at the value it had entering the
+                // step, then all are written.
                 let mut next: Vec<Reg<W>> = Vec::with_capacity(accs.len());
                 for a in accs {
                     self.eval(&a.init_prep);
@@ -2142,14 +2107,12 @@ pub fn run_workgroup<const W: usize>(
     }
 }
 
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::alloc::AlignedBuf;
     use fusor2_ir::dtype::RoundMode;
-    use fusor2_ir::ir::level2::{
+    use fusor2_ir::ir::kernel::{
         Accumulator, BufferAccess, LocalDecl, MemoryLevel, ReduceKind, StorageView, TileDecl,
         TileLayout, WorkgroupAxis,
     };
@@ -2267,8 +2230,6 @@ mod tests {
         bytemuck::cast_slice::<u8, f32>(ab.as_slice()).to_vec()
     }
 
-    // -- 1. the barrier split ------------------------------------------------
-
     #[test]
     fn barrier_splits_lane_loop() {
         const BLOCK: u32 = 256;
@@ -2342,8 +2303,6 @@ mod tests {
         assert_ne!(got[8], 0.0);
     }
 
-    // -- 2. numeric contract -------------------------------------------------
-
     fn fma_program(nc: NumericContract) -> Arc<Program> {
         let uni = decl(0, ScalarElement::U32, 1, false);
         let a = decl(1, ScalarElement::F32, 8, false);
@@ -2406,8 +2365,6 @@ mod tests {
         }
     }
 
-    // -- 3. the four access lowerings ---------------------------------------
-
     #[test]
     fn four_access_lowerings() {
         access::reset_form_counts();
@@ -2456,10 +2413,8 @@ mod tests {
 
     /// A vector-typed `Select` selects **every** lane.
     ///
-    /// One `Instr::Select` wrote register `out` only, so lanes 1.. of the
-    /// result were uninitialized registers. `fusor2-gguf`'s block decode masks
-    /// its whole `lanes`-wide block with exactly this select, so every
-    /// multi-lane dequantize on this backend came back NaN past lane 0.
+    /// Pins the regression where one `Instr::Select` wrote register `out`
+    /// only, leaving lanes 1.. uninitialized.
     #[test]
     fn a_masked_vector_select_writes_every_lane() {
         const LANES: u32 = 8;
@@ -2523,8 +2478,6 @@ mod tests {
         let got = run_f32(&ir, &[data.clone()], LANES as usize);
         assert_eq!(got, data, "every lane of the selected vector must survive");
     }
-
-    // -- 4. f16 / bf16 widen-compute ----------------------------------------
 
     #[test]
     fn f16_bf16_widen_compute() {
@@ -2607,8 +2560,6 @@ mod tests {
         }
     }
 
-    // -- 5. workgroup reduction ---------------------------------------------
-
     #[test]
     fn workgroup_reduce_sums_every_lane() {
         const BLOCK: u32 = 64;
@@ -2687,8 +2638,6 @@ mod tests {
         let got = run_f32(&ir, &[data], BLOCK as usize);
         assert!(got.iter().all(|v| *v == 7.5), "{got:?}");
     }
-
-    // -- 6. a loop with resident accumulators --------------------------------
 
     #[test]
     fn matmul_epilogue_fuses_in_the_k_loop() {
@@ -2777,8 +2726,6 @@ mod tests {
             assert!((got[j] - want).abs() < 1e-5, "col {j}: {} vs {want}", got[j]);
         }
     }
-
-    // -- 7. scatter-add ------------------------------------------------------
 
     #[test]
     fn scatter_add_accumulates_duplicates() {
@@ -2913,8 +2860,6 @@ mod tests {
         }
     }
 
-    // -- 8. determinism and dispatch accounting ------------------------------
-
     #[test]
     fn parallel_for_is_deterministic() {
         const N: u32 = 4096;
@@ -3000,8 +2945,6 @@ mod tests {
             N / 4
         );
     }
-
-    // -- 9. divergent control flow ------------------------------------------
 
     #[test]
     fn a_divergent_if_merges_both_arms_under_a_mask() {

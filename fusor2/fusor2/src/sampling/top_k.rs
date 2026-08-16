@@ -18,7 +18,7 @@ pub struct GpuSampledToken {
 }
 
 impl GpuSampledToken {
-    /// Read the token back. One of exactly three host syncs.
+    /// Read the token back; costs a host sync.
     pub fn to_u32(&self) -> Result<u32> {
         let v = self.value.to_vec_u32()?;
         v.first()

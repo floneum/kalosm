@@ -1,31 +1,31 @@
 //! Levels, the node type, op tags, op semantics and the open op registry.
 
-pub mod level0;
-pub mod level1;
-pub mod level2;
+pub mod logical;
+pub mod launch;
+pub mod kernel;
 
 use crate::egraph::Id;
 use crate::error::Result;
 use crate::facts::{ValueFacts, Work};
-use crate::ir::level0::L0;
-use crate::ir::level1::{Effect, L1};
+use crate::ir::logical::Logical;
+use crate::ir::launch::{Effect, Launch};
 use smallvec::SmallVec;
 use std::fmt;
 
 /// The three descending abstraction levels. Nothing skips a level.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Level {
-    L0,
-    L1,
-    L2,
+    Logical,
+    Launch,
+    Kernel,
 }
 
 impl fmt::Display for Level {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(match self {
-            Self::L0 => "l0",
-            Self::L1 => "l1",
-            Self::L2 => "l2",
+            Self::Logical => "logical",
+            Self::Launch => "launch",
+            Self::Kernel => "kernel",
         })
     }
 }
@@ -36,8 +36,8 @@ impl fmt::Display for Level {
 /// a property of the id allocator.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
-    L0(L0),
-    L1(L1),
+    Logical(Logical),
+    Launch(Launch),
     Union(Id, Id),
 }
 
@@ -45,8 +45,8 @@ impl Op {
     /// Level this operator belongs to; `Union` inherits its operands'.
     pub fn level(&self) -> Option<Level> {
         match self {
-            Self::L0(_) => Some(Level::L0),
-            Self::L1(_) => Some(Level::L1),
+            Self::Logical(_) => Some(Level::Logical),
+            Self::Launch(_) => Some(Level::Launch),
             Self::Union(..) => None,
         }
     }
@@ -54,8 +54,8 @@ impl Op {
     /// O(1) dispatch tag. Rules filter on this before any matching.
     pub fn tag(&self) -> OpTag {
         match self {
-            Self::L0(o) => o.tag(),
-            Self::L1(o) => o.tag(),
+            Self::Logical(o) => o.tag(),
+            Self::Launch(o) => o.tag(),
             Self::Union(..) => OpTag::Union,
         }
     }
@@ -66,8 +66,7 @@ pub type Children = SmallVec<[Id; 4]>;
 
 /// One hash-consed e-graph node. **Acyclicity is structural, not checked**:
 /// `children` may only contain ids strictly smaller than the node's own,
-/// and the only id allocator is `EGraph::add`. There is no union-find, no
-/// `rebuild()`, no congruence closure and no cycle probe.
+/// and the only id allocator is `EGraph::add`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Node {
     pub op: Op,
@@ -78,7 +77,7 @@ pub struct Node {
 /// Flat O(1) dispatch tag for the rule table.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum OpTag {
-    // L0
+    // Logical
     Leaf,
     Map,
     Fold,
@@ -89,13 +88,13 @@ pub enum OpTag {
     Scatter,
     Dequant,
     Project,
-    // L1
-    KMap,
-    KFold,
-    KContract,
-    KGather,
-    KScatter,
-    KRegion,
+    // Launch
+    LaunchMap,
+    LaunchFold,
+    LaunchContract,
+    LaunchGather,
+    LaunchScatter,
+    LaunchRegion,
     Ext,
     // structural
     Union,
@@ -113,9 +112,9 @@ impl OpTag {
             | Self::Gather
             | Self::Scatter
             | Self::Dequant
-            | Self::Project => Some(Level::L0),
+            | Self::Project => Some(Level::Logical),
             Self::Union => None,
-            _ => Some(Level::L1),
+            _ => Some(Level::Launch),
         }
     }
 }
@@ -132,9 +131,8 @@ pub struct VerifyCtx<'a> {
 
 /// Type inference, cost accounting, verification and effects for one
 /// operator. One implementation ([`crate::CoreSemantics`]) covers the
-/// closed `L0`/`L1` enums plus the open [`OpDefRegistry`]. **Object-safe**:
-/// the e-graph stores it as `Arc<dyn Semantics>`, so `fusor2-ir` is the
-/// only crate that has to know how the closed enums infer.
+/// closed `Logical`/`Launch` enums plus the open [`OpDefRegistry`].
+/// Object-safe: the e-graph stores it as `Arc<dyn Semantics>`.
 pub trait Semantics: Send + Sync {
     /// Operand ids of `op`, in the order every other method expects.
     fn children(&self, op: &Op) -> Children;
@@ -146,7 +144,7 @@ pub trait Semantics: Send + Sync {
     /// rejects a registration whose `work` is constant.
     fn work(&self, op: &Op, ins: &[ValueFacts], out: &ValueFacts) -> Work;
 
-    /// Level-local verification (`verify_l0` / `verify_l1`).
+    /// Level-local verification (`verify_l0` / `verify_launch`).
     fn verify(&self, cx: &VerifyCtx<'_>) -> Result<()>;
 
     /// Purity. An `InPlace` node is pinned in the materialized set.
@@ -162,9 +160,8 @@ pub struct OpDefId(pub u32);
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct AttrId(pub u32);
 
-/// The single escape hatch for ops outside the closed enums. Top-k and the
-/// two samplers enter this way: inference-only, no adjoint, one declared
-/// cost row. Adding one changes no core file.
+/// The single escape hatch for ops outside the closed enums:
+/// inference-only, no adjoint, one declared cost row.
 #[derive(Clone)]
 pub struct OpDef {
     pub name: &'static str,
@@ -175,7 +172,7 @@ pub struct OpDef {
     pub adjoint: Option<crate::autograd::AdjointKind>,
     /// Empty means "cannot run on any target"; `verify_plan` rejects
     /// selecting such a node.
-    pub lower_per_target: &'static [(&'static str, level2::LowerFn)],
+    pub lower_per_target: &'static [(&'static str, kernel::LowerFn)],
     pub effect: Effect,
 }
 

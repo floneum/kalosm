@@ -1,12 +1,11 @@
-//! The ~22 view ops. Every one is a vector of `StrideSpec`s over a single
-//! `L0::Restride` — there is no view-op zoo, and a shape is never padded to
-//! make one of them legal. `sliding_window_view` is the one exception: it
-//! mints `L0::Window`, because its adjoint is decided by two integers and
+//! The view ops. Every one is a vector of `StrideSpec`s over a single
+//! `Logical::Restride`. `sliding_window_view` is the one exception: it
+//! mints `Logical::Window`, because its adjoint is decided by two integers and
 //! injectivity of a relative stride composition is undecidable under `Sym`.
 
 use std::ops::Range;
 
-use fusor2_ir::ir::level0::L0;
+use fusor2_ir::ir::logical::Logical;
 use fusor2_ir::shape::{
     BoundsProof, Dim, Dims, Layout, SlidingWindow, StrideSpec, SymId, reshape_specs,
     singleton_spec,
@@ -51,44 +50,33 @@ impl From<()> for Extent {
     }
 }
 
-// ---------------------------------------------------------------------------
-// bounds
-// ---------------------------------------------------------------------------
-
 /// The [`BoundsProof`] a spec vector carries over `in_shape`.
 ///
-/// This is [`fusor2_autograd::tape::bounds_proof`] verbatim, deliberately: the
-/// frontend and the adjoint transform must agree on what a view proves, or a
-/// `Restride` and its own adjoint would carry different obligations. `Static`
-/// exactly when every extent, offset and stride is `Const` **and** the
-/// composed reach stays inside the input's element count; anything else is a
-/// runtime mask obligation, and there is no third case.
+/// This is [`fusor2_autograd::tape::bounds_proof`] verbatim: the frontend and
+/// the adjoint transform must agree on what a view proves. `Static` exactly
+/// when every extent, offset and stride is `Const` **and** the composed reach
+/// stays inside the input's element count; anything else is a runtime mask
+/// obligation.
 ///
-/// Note that the reach is composed over the *whole* input, not per axis, so an
+/// The reach is composed over the *whole* input, not per axis, so an
 /// axis-merging reshape (`[2,3] -> [6]` reads `dim_with(1, 6, 1)`, addressing
-/// six elements past a dim of extent three) is `Static` rather than rejected.
+/// six elements past a dim of extent three) is `Static`.
 pub fn bounds_for(specs: &[StrideSpec], in_shape: &[Dim]) -> BoundsProof {
     fusor2_autograd::tape::bounds_proof(specs, in_shape)
 }
 
-// ---------------------------------------------------------------------------
-// the primitive
-// ---------------------------------------------------------------------------
-
 impl Tensor {
     /// The one view primitive: a vector of relative [`StrideSpec`]s over a
-    /// single `L0::Restride`. Every other view op in this file builds a spec
+    /// single `Logical::Restride`. Every other view op in this file builds a spec
     /// vector and calls this.
     pub fn restride(&self, specs: &[StrideSpec]) -> Result<Tensor> {
         let bounds = bounds_for(specs, &self.shape());
-        self.emit_here(L0::Restride {
+        self.emit_here(Logical::Restride {
             specs: specs.iter().copied().collect(),
             bounds,
             x: self.id,
         })
     }
-
-    // -- reshape ------------------------------------------------------------
 
     /// Rank-changing reshape with at most one inferred [`Extent::Hole`].
     ///
@@ -153,8 +141,6 @@ impl Tensor {
             .collect())
     }
 
-    // -- axis permutation ---------------------------------------------------
-
     /// Swap two axes.
     pub fn transpose(&self, d0: usize, d1: usize) -> Result<Tensor> {
         self.check_axis(d0, "transpose")?;
@@ -202,8 +188,6 @@ impl Tensor {
             .collect();
         self.restride(&specs)
     }
-
-    // -- slicing ------------------------------------------------------------
 
     /// Rank-preserving sub-view, one range per axis.
     pub fn slice(&self, ranges: &[Range<usize>]) -> Result<Tensor> {
@@ -286,8 +270,6 @@ impl Tensor {
         Ok(out)
     }
 
-    // -- flatten ------------------------------------------------------------
-
     /// Reshape to rank 1.
     pub fn flatten_all(&self) -> Result<Tensor> {
         let n = self
@@ -354,8 +336,6 @@ impl Tensor {
         self.reshape(&target)
     }
 
-    // -- squeeze / unsqueeze -------------------------------------------------
-
     /// Remove one size-1 axis.
     pub fn squeeze(&self, dim: usize) -> Result<Tensor> {
         self.squeeze_dims(&[dim])
@@ -389,10 +369,9 @@ impl Tensor {
 
     /// Insert several size-1 axes, at the given positions of the output.
     ///
-    /// The inserted axis is an **ordinary size-1 axis** (`multiplier == 1`
-    /// against a neighbouring input dim), not a stride-0 broadcast axis. That
-    /// distinction is load-bearing for the restride adjoint: a stride-0 axis
-    /// reduces on the way back, a size-1 axis does not.
+    /// The inserted axis is an ordinary size-1 axis (`multiplier == 1`), not
+    /// a stride-0 broadcast axis; the restride adjoint reduces a stride-0
+    /// axis on the way back but not a size-1 axis.
     pub fn unsqueeze_dims(&self, axes: &[usize]) -> Result<Tensor> {
         let in_rank = self.rank();
         let out_rank = in_rank + axes.len();
@@ -420,9 +399,7 @@ impl Tensor {
         self.restride(&specs)
     }
 
-    // -- windows -------------------------------------------------------------
-
-    /// Zero-copy overlapping windows: one `L0::Window`.
+    /// Zero-copy overlapping windows: one `Logical::Window`.
     ///
     /// Each windowed axis `i` becomes `(extent - window) / step + 1`
     /// positions, and one new trailing axis of size `window` per spec.
@@ -457,7 +434,7 @@ impl Tensor {
                 )));
             }
         }
-        self.emit_here(L0::Window {
+        self.emit_here(Logical::Window {
             specs: specs.iter().copied().collect(),
             x: self.id,
         })
@@ -468,17 +445,15 @@ impl Tensor {
         self.sliding_window_view(&[SlidingWindow::new(axis, window, step)])
     }
 
-    // -- layout escape hatch --------------------------------------------------
-
     /// Set the view wholesale from a precomputed [`Layout`].
     ///
     /// This is `attention_grads`' dk/dv aliasing escape hatch. One
     /// [`StrideSpec`] is derived per output axis by finding an input axis
-    /// whose stride divides the target stride (`multiplier = target /
-    /// in_stride`); the offset delta is decomposed in the input's row-major
-    /// basis and attached to specs naming the corresponding axes. The input
-    /// is taken to be contiguous over its own shape — that is the only layout
-    /// the frontend knows, since the real one is an extraction decision.
+    /// whose stride divides the target stride; the offset delta is decomposed
+    /// in the input's row-major basis and attached to specs naming the
+    /// corresponding axes. The input is taken to be contiguous over its own
+    /// shape — the real layout is an extraction decision the frontend cannot
+    /// see.
     pub fn restride_layout(&self, target: &Layout) -> Result<Tensor> {
         let input = Layout::contiguous(&self.shape());
         let in_strides: Vec<u64> = input
@@ -644,9 +619,8 @@ mod tests {
 
     #[test]
     fn a_merge_is_in_range_against_the_whole_input() {
-        // [2,3] -> [6] reads six elements past a dim of extent three; that is
-        // exactly what makes a flatten a view, and the reach is composed over
-        // the whole input rather than per axis.
+        // [2,3] -> [6] reads six elements past a dim of extent three; the
+        // reach is composed over the whole input rather than per axis.
         let s = reshape_specs(&dims(&[2, 3]), &dims(&[6])).unwrap();
         assert_eq!(bounds_for(&s, &dims(&[2, 3])), BoundsProof::Static);
         // Seven would not be.

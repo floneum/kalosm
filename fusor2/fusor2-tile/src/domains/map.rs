@@ -2,7 +2,7 @@
 //! dim, plus untiled. Every eligible dim is a candidate.
 
 use fusor2_ir::device::Caps;
-use fusor2_ir::ir::level1::{AccessPlan, IndexSpace, MapDomain, MapTiling};
+use fusor2_ir::ir::launch::{AccessPlan, IndexSpace, MapDomain, MapTiling};
 use fusor2_ir::shape::Dim;
 use smallvec::SmallVec;
 
@@ -25,9 +25,7 @@ pub fn legal(space: &IndexSpace, caps: &Caps) -> MapDomain {
 /// the CPU backend and 1 on GPU.
 ///
 /// The innermost dim is excluded: a thread-local run along it breaks
-/// inter-thread store coalescing, which makes the resulting kernel *wrong
-/// in kind*, not merely slower. That is legality. Everything the reference
-/// decided by watermark is a candidate.
+/// inter-thread store coalescing.
 pub fn map_domain(shape: &[Dim], access: &[AccessPlan], cx: &DomainCtx<'_>) -> MapDomain {
     let widths: SmallVec<[u32; 3]> = if cx.caps.simd_widths.is_empty() {
         SmallVec::from_slice(&[1])
@@ -35,7 +33,7 @@ pub fn map_domain(shape: &[Dim], access: &[AccessPlan], cx: &DomainCtx<'_>) -> M
         cx.caps.simd_widths.clone()
     };
     // A per-lane gather has no vector load to widen into, so a vectorized
-    // tiling is unbuildable over one. Legality, not preference.
+    // tiling is unbuildable over one.
     let gathers = access.iter().any(|a| matches!(a, AccessPlan::Gather));
 
     let mut out: Vec<MapTiling> = Vec::new();
@@ -70,9 +68,8 @@ pub fn map_domain(shape: &[Dim], access: &[AccessPlan], cx: &DomainCtx<'_>) -> M
     }
 }
 
-/// Move-ordering seed. The reference shipped one tiling constant,
-/// `work_per_thread(RegPressure::ElementwiseFew) = 4`, and an untiled
-/// fallback; those two lead the frontier and everything else follows.
+/// Move-ordering seed: the untiled and `tm = 4` tilings lead the frontier,
+/// everything else follows.
 pub(crate) fn seed_rank(t: MapTiling) -> u8 {
     match (t.dim, t.tm) {
         (None, _) => 0,
@@ -166,7 +163,7 @@ mod tests {
 
     #[test]
     fn domain_is_capped_and_round_trips() {
-        use fusor2_ir::ir::level1::ScheduleDomain;
+        use fusor2_ir::ir::launch::ScheduleDomain;
         let mut caps = apple_caps();
         caps.simd_widths = SmallVec::from_slice(&[1, 4, 8]);
         let cx = DomainCtx::new(&caps, default_planner());

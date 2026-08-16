@@ -1,8 +1,5 @@
 //! Dtype conversion and rounding. `cast` is a `ScalarExpr` node inside a
-//! `Map`, differentiable both directions by `map_adjoint` with no special
-//! case — so the trainer's f32-master / f16-conv-stack recipe and its 1024x
-//! loss scale are ordinary graph structure rather than a supported
-//! configuration.
+//! `Map`, differentiable both directions by `map_adjoint`.
 //!
 //! Every pair among `{F32, F16, BF16, U32, I32}` is legal, and
 //! `round`/`floor`/`ceil`/`trunc` are real primitives.
@@ -66,17 +63,17 @@ impl Tensor {
 
     /// Round with an explicit mode.
     ///
-    /// **Known gap:** L0 has no carrier for a per-node `NumericContract`, so
+    /// **Known gap:** Logical has no carrier for a per-node `NumericContract`, so
     /// the "this value is `STRICT`, do not fast-math it" obligation currently
     /// rides on `ScalarKind::Round` itself and must be honoured by the
-    /// emitter. See the crate report.
+    /// emitter.
     pub fn round_mode(&self, mode: RoundMode) -> Result<Tensor> {
         self.require_dense("round")?;
         self.map1(ScalarExpr::round(mode, self.arg0()))
     }
 
-    /// Round half away from zero — the mode MSQ1 export idempotence depends
-    /// on, and the one `tf.round` disagrees with only on an exact `.5`.
+    /// Round half away from zero. MSQ1 export idempotence depends on this
+    /// mode; `tf.round` disagrees with it on an exact `.5`.
     pub fn round(&self) -> Result<Tensor> {
         self.round_mode(RoundMode::HalfAwayFromZero)
     }
@@ -97,18 +94,11 @@ impl Tensor {
     /// QAT fake-quant forward: `round(x / scale).clamp(-levels, levels) *
     /// scale`, with `scale` broadcast in.
     ///
-    /// **One `Map`, then one straight-through registration.** A four-node
-    /// chain would differentiate node by node, and the `round`
-    /// in the middle has a zero derivative everywhere, so the gradient would
-    /// die there and no QAT model could train. A straight-through rule routes the
-    /// incoming gradient to operand 0 unchanged — which requires operand 0 to
-    /// *be* `x`, hence the single fused map rather than the chain.
-    ///
-    /// The scale receives an explicit **zero**, not nothing: a straight-through
-    /// fake-quant is the assertion that the node behaves as `y = x` in the
-    /// backward pass, and `d x / d scale` is zero. Omitting it instead would
-    /// starve the scale's subgraph — the walk treats every float leaf as
-    /// trainable — and `validate_parents` would report the symptom.
+    /// One `Map` with a straight-through backward rule: the incoming gradient
+    /// routes to operand 0 unchanged, which requires operand 0 to *be* `x`.
+    /// The scale receives an explicit zero, not nothing — the walk treats
+    /// every float leaf as trainable, so omitting it would starve the scale's
+    /// subgraph.
     pub fn fake_quant(&self, levels: u32, scale: &Tensor) -> Result<Tensor> {
         if levels == 0 {
             return Err(Error::Shape("fake_quant needs levels > 0".into()));

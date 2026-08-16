@@ -14,8 +14,7 @@ use fusor2_ir::device::{Caps, DeviceKind};
 ///
 /// A GPU's half-precision FMA issues at twice the f32 rate, its integer
 /// multiply at half, its cooperative unit at twice its scalar unit, and its
-/// dp4a unit exists only for the two integer slots. One helper builds all
-/// three rows so a seed cannot disagree with itself about a ratio.
+/// dp4a unit exists only for the two integer slots.
 const fn gpu_mac_table(fma_f32: u64, dp4a: u64) -> [[u64; RateDtype::COUNT]; 3] {
     let half = fma_f32 * 2;
     let int = fma_f32 / 2;
@@ -71,10 +70,9 @@ pub fn seed_facts_gpu(caps: &Caps) -> DeviceFacts {
 /// so a 4-core laptop and a 64-core server get different facts without
 /// either being named.
 ///
-/// `launch_ps` is zero — a CPU kernel is a function call, and the pool-wake
-/// cost that *does* exist lives in `thread_wake_ps`, where the
-/// parallel-region decision can read it instead of a hardcoded
-/// `PARALLEL_THRESHOLD`. `wg_bytes_per_us` is L1 bandwidth, which is what a
+/// `launch_ps` is zero — a CPU kernel is a function call; the pool-wake cost
+/// lives in `thread_wake_ps`, where the parallel-region decision reads it.
+/// `wg_bytes_per_us` is Launch bandwidth, which is what a
 /// workgroup tile maps onto (thread-local 64-byte-aligned scratch).
 /// `store_ps_per_element` has no per-class CPU measurement; the GPU-class
 /// value seeds it and `bench_epilogue_occupancy` overwrites it.
@@ -96,11 +94,8 @@ pub fn seed_facts_cpu(caps: &Caps) -> DeviceFacts {
     }
 }
 
-/// The per-class seed, dispatched on `Caps::kind` and nothing else.
-///
-/// **Never on `Caps::name`.** Selecting a rate vector from an adapter string
-/// is the reference's single largest portability liability; the answer to a
-/// wrong seed is calibration, not a longer string table.
+/// The per-class seed, dispatched on `Caps::kind` and nothing else — never
+/// on `Caps::name`. The answer to a wrong seed is calibration.
 pub fn seed_facts(caps: &Caps) -> DeviceFacts {
     match caps.kind {
         DeviceKind::Gpu => seed_facts_gpu(caps),
@@ -161,9 +156,8 @@ pub(crate) mod tests {
         }
     }
 
-    /// Test 11. The seed is a function of `kind`, and on the GPU side of
-    /// `kind` alone. A `Caps` whose name says "Apple M2 Max" but whose kind
-    /// says CPU gets the CPU table.
+    /// The seed is a function of `kind` alone. A `Caps` whose name says
+    /// "Apple M2 Max" but whose kind says CPU gets the CPU table.
     #[test]
     fn seed_selected_by_kind_not_name() {
         let mislabelled = cpu_caps("Apple M2 Max", 8);
@@ -192,10 +186,9 @@ pub(crate) mod tests {
         assert_eq!(apple.thread_wake_ps, other.thread_wake_ps);
     }
 
-    /// Test 10. `DeviceFacts::fingerprint` hashes `Caps`, which carries
-    /// `Limits::max_compute_workgroup_storage_size` — the field the
-    /// reference omits from its disk-cache salt while the coop legality
-    /// filter reads it.
+    /// `DeviceFacts::fingerprint` hashes `Caps`, which carries
+    /// `Limits::max_compute_workgroup_storage_size` — the coop legality
+    /// filter reads that field, so the fingerprint must too.
     #[test]
     fn fingerprint_includes_workgroup_storage() {
         let mut a = gpu_caps("dev");

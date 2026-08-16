@@ -1,4 +1,4 @@
-//! L2 expressions -> SIMD lane operations at a statically-known width.
+//! Kernel expressions -> SIMD lane operations at a statically-known width.
 //!
 //! This is the SSA tape. One [`Instr`] per distinct `TileExprKind` node, one
 //! register slot per node; flattening the hash-consed DAG in topological order
@@ -8,11 +8,10 @@
 //! launch, so an `MxN` register accumulator tile is expressible.
 //!
 //! `ElementType::Scalar(F16|BF16)` loads widen to `F32` registers and stores
-//! narrow: that is the emitter half of the `widen-compute` rule, and it is why
-//! there is no one-lane `F16Scalar` here.
+//! narrow: the emitter half of the `widen-compute` rule.
 
 use fusor2_ir::dtype::RoundMode;
-use fusor2_ir::ir::level2::{ScalarElement, TileReduceOp};
+use fusor2_ir::ir::kernel::{ScalarElement, TileReduceOp};
 use fusor2_ir::scalar::{BinOp, CmpOp, UnOp};
 
 use super::access::AccessForm;
@@ -63,8 +62,7 @@ pub enum Instr {
     Uniform { out: Slot, which: UniformSrc },
     LoadLocal { out: Slot, local: u16 },
     /// Masked load. `index` is a per-lane element index; `form` is the access
-    /// lowering chosen **once at compile time** from the layout, never a
-    /// per-vector `is_contiguous()` branch.
+    /// lowering chosen once at compile time from the layout.
     Load {
         out: Slot,
         buf: u16,
@@ -93,7 +91,7 @@ pub enum Instr {
         b: Slot,
         ty: NumTy,
     },
-    /// A contracted `a * b + c`. Minted **only** when the operand's
+    /// A contracted `a * b + c`. Minted only when the operand's
     /// `NumericContract::contract` is set; a strict value emits separate
     /// `Bin{Mul}` and `Bin{Add}` instructions.
     Fma { out: Slot, a: Slot, b: Slot, c: Slot },
@@ -208,16 +206,11 @@ pub enum UniformSrc {
     SubgroupLane,
 }
 
-// ---------------------------------------------------------------------------
-// The register type
-// ---------------------------------------------------------------------------
-
 /// A `W`-lane register. Bits, so `Bitcast` is free and a mask is `0`/`!0`.
 ///
-/// `W` is a const generic, i.e. the lane count is in the type. That is the
-/// whole point: `[Reg<W>; M]` is a register accumulator tile, and every
-/// operation below is a plain elementwise loop over a statically-sized array,
-/// which lowers to whole vector instructions under the target features
+/// `W` is a const generic: `[Reg<W>; M]` is a register accumulator tile, and
+/// every operation below is a plain elementwise loop over a statically-sized
+/// array, which lowers to whole vector instructions under the target features
 /// `dispatch!` established.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 #[repr(align(32))]
@@ -314,10 +307,6 @@ impl<const W: usize> Reg<W> {
         Self(o)
     }
 }
-
-// ---------------------------------------------------------------------------
-// Vector math: real approximations, no per-lane libm call
-// ---------------------------------------------------------------------------
 
 const LN2_HI: f32 = 0.693_145_75;
 const LN2_LO: f32 = 1.428_606_8e-6;
@@ -651,8 +640,7 @@ pub fn tanhf(x: f32) -> f32 {
 
 #[inline(always)]
 pub fn sqrtf(x: f32) -> f32 {
-    // A single hardware instruction on every target fusor2 runs on, not a
-    // libm call.
+    // A single hardware instruction, not a libm call.
     x.sqrt()
 }
 
@@ -792,10 +780,8 @@ pub fn apply_un<const W: usize>(op: UnOp, ty: NumTy, x: Reg<W>) -> Reg<W> {
         // vector, not a scalar register.
         (UnOp::Unpack2x16Float, _) => x,
         (op, _) => x.mapf(|v| match op {
-            // Both approximate exponentials lower to the target's `exp`,
-            // as `nary_direct.rs:1126` does: the relaxed contract is a
-            // permission to substitute, and the SIMD path has nothing
-            // cheaper to substitute.
+            // Both approximate exponentials lower to the exact `exp`; the
+            // relaxed contract permits the substitution.
             UnOp::Exp | UnOp::ApproximateExp | UnOp::LessApproximateExp => expf(v),
             UnOp::Exp2 => exp2f(v),
             UnOp::Log => logf(v),
@@ -991,7 +977,7 @@ pub unsafe fn read_elem(elem: ScalarElement, base: *const u8, index: usize) -> u
 ///
 /// # Safety
 /// `index` must be inside the buffer `base` points at, and no other thread may
-/// be writing the same element (`verify_l1` invariant 3).
+/// be writing the same element (`verify_launch` invariant 3).
 #[inline(always)]
 pub unsafe fn write_elem(elem: ScalarElement, base: *mut u8, index: usize, bits: u32) {
     unsafe {

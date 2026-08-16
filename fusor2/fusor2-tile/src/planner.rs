@@ -3,15 +3,15 @@
 //! `arena_plan` is a **pure memoized function** of the ordered tile
 //! declaration list, the barrier and loop structure of the body, and
 //! `caps.fingerprint()`. `workgroup_bytes` synthesizes a minimal body over a
-//! candidate geometry's tiles and runs the *same* function, so `verify_l1`'s
-//! admission test, the L1 occupancy term and the L2 emitter's layout are
+//! candidate geometry's tiles and runs the *same* function, so `verify_launch`'s
+//! admission test, the Launch occupancy term and the Kernel emitter's layout are
 //! provably the same number.
 
 use std::sync::{Arc, OnceLock};
 
 use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::kernel::{
     Addr, ArenaMode, ArenaPlan, ArenaPlanner, BarrierSuggestion, Buffer, CoopSrc, KernelIr, Local,
     MergeBody, QuantizedView, ReduceKind, Source, Stmt, StorageView, Tile, TileExpr,
     TileExprKind, Tiles,
@@ -61,7 +61,7 @@ impl Planner {
         Arc::new(Self::new())
     }
 
-    /// The process-wide planner, so `verify_l2` and the emitters share one
+    /// The process-wide planner, so `verify_kernel` and the emitters share one
     /// memo instead of re-deriving every plan.
     pub fn global() -> &'static Self {
         GLOBAL.get_or_init(Self::new)
@@ -104,16 +104,14 @@ fn plan_key(ir: &KernelIr, live: &LivenessInfo, caps: &Caps) -> PlanKey {
         info.span.hash(&mut h);
         info.guaranteed_once().hash(&mut h);
     }
-    // The body term itself — barrier *insertion* candidates depend on the root
+    // The body term itself — barrier insertion candidates depend on the root
     // statement list, not only on the skeleton above.
     //
-    // Structurally, **not** via `Stmt`'s derived `Hash`: `StorageView::hash`
-    // hashes the buffer's address, `LocalDecl` and `TileDecl` hash their `id`,
-    // so the derived hash of two separately-built copies of the same kernel
-    // never agreed. That made this memo a total miss for every kernel holding
-    // a buffer or a local — i.e. all of them — and left only the tile-only
-    // test fixture hitting. `BodyHasher` substitutes each declaration's
-    // first-use ordinal for its address and is otherwise exact.
+    // Hashed structurally, not via `Stmt`'s derived `Hash`: `StorageView`
+    // hashes the buffer's address and `LocalDecl`/`TileDecl` hash their `id`,
+    // so two separately-built copies of the same kernel would never agree.
+    // `BodyHasher` substitutes each declaration's first-use ordinal for its
+    // address and is otherwise exact.
     BodyHasher::default().body(&ir.body, &mut h);
     PlanKey {
         body_hash: h.finish(),
@@ -121,23 +119,13 @@ fn plan_key(ir: &KernelIr, live: &LivenessInfo, caps: &Caps) -> PlanKey {
     }
 }
 
-/// Hashes an L2 body up to renaming of its buffer, tile and local
-/// declarations.
-///
-/// Every other field is folded in verbatim, so the key stays as exact as the
-/// derived `Hash` was — two bodies differing in an operator, a literal or a
-/// layout still hash apart. Only *which allocation* a leaf names is
-/// canonicalized, and that is precisely what `rebind` puts back on retrieval.
 /// A pointer-free identity for a whole kernel: name, block, arena token,
 /// declared buffers (by binding and contents) and the body up to renaming of
 /// its buffer, tile and local declarations.
 ///
-/// This exists because `TileExpr`'s cached digest — and therefore any hash
-/// derived from `Stmt` — folds in `Arc` addresses: two byte-identical
-/// lowerings never agree, and worse, a *recycled* allocation can make two
-/// different kernels agree. A pipeline cache keyed on the derived hash
-/// served the wrong compiled kernel depending on allocator behaviour —
-/// observed as nondeterministic wrong values across whole conformance runs.
+/// `TileExpr`'s cached digest — and therefore any hash derived from `Stmt` —
+/// folds in `Arc` addresses: two byte-identical lowerings never agree, and a
+/// recycled allocation can make two different kernels agree.
 pub fn kernel_identity(ir: &KernelIr) -> u128 {
     let mut lanes = [0u64; 2];
     for (seed, lane) in lanes.iter_mut().enumerate() {
@@ -170,12 +158,10 @@ struct BodyHasher {
     /// so expanding it as a tree is exponential in the sharing depth; the
     /// memo makes the identity a Merkle fold, one hash per distinct node.
     ///
-    /// Exact, not an approximation: a node's sub-hash is a function of its
-    /// subtree and of the leaf ordinals it names, and an ordinal is
-    /// `or_insert` — assigned on the first visit and stable afterwards — so
+    /// Exact: ordinals are assigned on first visit and stable afterwards, so
     /// recomputing at the second occurrence would reproduce the memoized
-    /// value byte for byte. Multiplicity survives, because the parent still
-    /// folds the sub-hash in once per edge.
+    /// value. Multiplicity survives because the parent folds the sub-hash in
+    /// once per edge.
     memo: FxHashMap<usize, u64>,
     /// Lane seed, mixed into every sub-hash so the two lanes of
     /// [`kernel_identity`] stay independent 64-bit hashes rather than
@@ -611,7 +597,7 @@ impl ArenaPlanner for Planner {
 /// The minimal body a declared tile set implies: every tile written, one
 /// barrier, every tile written again. Each tile's live range then spans the
 /// barrier, so no two can share and the footprint is the geometry's
-/// simultaneous demand — which is exactly what `verify_l1` must admit against.
+/// simultaneous demand — which is exactly what `verify_launch` must admit against.
 pub fn synth_ir(tiles: &Tiles) -> KernelIr {
     let mut builder = crate::build::TileBuilder::new();
     let mut body: Vec<Stmt> = Vec::with_capacity(tiles.decls.len() * 2 + 1);
@@ -638,7 +624,7 @@ mod tests {
     use super::*;
     use crate::build::TileBuilder;
     use crate::build::fixtures::{self, SHARED, UNSHARED};
-    use fusor2_ir::ir::level2::{MemoryLevel, ScalarElement, TileLayout};
+    use fusor2_ir::ir::kernel::{MemoryLevel, ScalarElement, TileLayout};
 
     fn caps() -> Caps {
         fixtures::caps_with(|_| {})
@@ -739,7 +725,7 @@ mod tests {
         let looped = b.loop_counted(
             Some(count),
             None,
-            vec![fusor2_ir::ir::level2::Accumulator {
+            vec![fusor2_ir::ir::kernel::Accumulator {
                 local,
                 init: zero.clone(),
                 update,
@@ -831,13 +817,9 @@ mod tests {
         let plan_b = planner.arena_plan(&ir_b, &caps()).unwrap();
         assert_eq!(planner.memo_len(), 1);
 
-        // The *layout* is identical — that is what "deterministic" claims.
-        //
-        // `assert_eq!(plan_a, plan_b)` would be wrong: `TileDecl` is
-        // identity-bearing, so two allocations of the same shape are two
-        // tiles and the two
-        // plans deliberately name different ones — as the `ptr_eq` check
-        // below demands.
+        // The layout is identical. `assert_eq!(plan_a, plan_b)` would be
+        // wrong: `TileDecl` is identity-bearing, so the two plans name
+        // different tiles — as the `ptr_eq` check below demands.
         assert_eq!(plan_a.mode, plan_b.mode);
         assert_eq!(plan_a.total_bytes, plan_b.total_bytes);
         assert_eq!(plan_a.barriers_inserted, plan_b.barriers_inserted);
@@ -854,18 +836,16 @@ mod tests {
         }
     }
 
-    fn second_tiles(ir: &KernelIr) -> Vec<fusor2_ir::ir::level2::Tile> {
+    fn second_tiles(ir: &KernelIr) -> Vec<fusor2_ir::ir::kernel::Tile> {
         analyze(ir).iter().map(|t| t.tile.clone()).collect()
     }
 
     /// A kernel holding a storage buffer and a private local memoizes across
     /// two independent builds.
     ///
-    /// This is the case the memo never served: `StorageView` hashes its
-    /// buffer's *address* and `LocalDecl` hashes its `id`, so `Stmt`'s derived
-    /// `Hash` gave two copies of one kernel two different keys. Every real
-    /// kernel holds a buffer, so the hit rate was zero and only the tile-only
-    /// fixture above ever exercised a hit.
+    /// Pins the address-hashing regression: `StorageView` hashes its buffer's
+    /// address and `LocalDecl` hashes its `id`, so `Stmt`'s derived `Hash`
+    /// gives two copies of one kernel two different keys.
     #[test]
     fn two_builds_of_one_kernel_with_a_buffer_and_a_local_share_a_plan() {
         fn build(b: &mut TileBuilder) -> KernelIr {
@@ -874,7 +854,7 @@ mod tests {
                 1,
                 ScalarElement::F32.element(),
                 TileLayout::contiguous(MemoryLevel::Storage, &[64]),
-                fusor2_ir::ir::level2::BufferAccess::Read,
+                fusor2_ir::ir::kernel::BufferAccess::Read,
             );
             let view = fixtures::whole_buffer_view(&src);
             let acc = b.alloc_local(ScalarElement::F32.element());
@@ -945,7 +925,7 @@ mod tests {
         });
         for seed in 0..20u32 {
             let mut b = TileBuilder::new();
-            let mut decls: SmallVec<[fusor2_ir::ir::level2::Tile; 8]> = SmallVec::new();
+            let mut decls: SmallVec<[fusor2_ir::ir::kernel::Tile; 8]> = SmallVec::new();
             let count = 1 + (seed % 4);
             for slot in 0..count {
                 let element = if (seed + slot) % 3 == 0 {

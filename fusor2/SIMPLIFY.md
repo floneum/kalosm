@@ -160,7 +160,7 @@ pattern and is **not** — see rejected leads.
   `welford_agrees_with_the_two_pass_variance`,
   `fold_split_agrees_when_reassoc` — tests real numeric properties, and
   `dequantize_slow` stays per the round-5 record (its class has no
-  `L0::Dequant` alternative, so the case tests arithmetic, not selection).
+  `Logical::Dequant` alternative, so the case tests arithmetic, not selection).
 * **The Dyn surface (angle 4)**: no Dyn method has count 1. Everything the
   typed facade doesn't wrap is called directly by conformance, the examples,
   or the models. Nothing to delete.
@@ -219,7 +219,7 @@ compiler, "never selected" does not mean safe to delete.** Union members are
 the extractor's choices; both of these were lowered zero times on every
 workload and both cost real throughput when removed.
 
-### `L1::Ext` and the `MacroOp` sugar-node layer — **REJECTED, do not retry**
+### `Launch::Ext` and the `MacroOp` sugar-node layer — **REJECTED, do not retry**
 
 > **The audit was right that `Ext` is never selected and wrong that deleting it
 > is free.** The whole layer was deleted (−2,059 code lines), every gate passed,
@@ -240,9 +240,9 @@ PROBE_EXT_SELECTED: 0   PROBE_EXT_LOWER_GPU: 0   PROBE_EXT_LOWER_CPU: 0
 **Why it cannot go.** `Ext` is dead as a *selectable node* and load-bearing as
 a *union partner*. `macro_op` ends with `union_stable(defn, sugar)` and hands
 the caller the **`Union` spine id**; with the sugar gone there is no second
-member, no union, and every composite hands back a bare `L0` member id
+member, no union, and every composite hands back a bare `Logical` member id
 instead. Fusion quality collapses on that difference. Isolated to that one
-line at `61a06c9`, with `L1::Ext` still minted and everything else untouched:
+line at `61a06c9`, with `Launch::Ext` still minted and everything else untouched:
 
 ```
 -    let root = graph.union_stable(defn, sugar)?;
@@ -250,7 +250,7 @@ line at `61a06c9`, with `L1::Ext` still minted and everything else untouched:
 +    Ok(graph.tensor(defn))
 ```
 
-| llama-3.1-8B-Q4_K_M, 63 tokens | tok/s | KMap | KFold | KContract | Sgemv | Sgemm | Coop |
+| llama-3.1-8B-Q4_K_M, 63 tokens | tok/s | Launch::Map | Launch::Fold | Launch::Contract | Sgemv | Sgemm | Coop |
 |---|---|---|---|---|---|---|---|
 | `61a06c9` unmodified | **19.99** | 4798 | 250 | 1144 | **572** | 0 | 0 |
 | one line above, nothing else | **6.46 / 6.57** | 6750 | 982 | 412 | 102 | 102 | 106 |
@@ -259,7 +259,7 @@ line at `61a06c9`, with `L1::Ext` still minted and everything else untouched:
 The last two rows are byte-identical histograms, which is the isolation:
 **none of the ~2,000 deleted lines cost anything; returning a member id
 instead of a spine id costs 3x.** The decode matmuls stop lowering as `Sgemv`
-— the right kernel at `M = 1` — and fall back to a generic `KFold`/`KMap`
+— the right kernel at `M = 1` — and fall back to a generic `Launch::Fold`/`Launch::Map`
 reduce plus some `Sgemm`/`Coop`, which at `M = 1` is pure waste. It is not
 compile-side: both binaries report `saturate (skipped) … replay hit` on every
 token, and the deletion *lowers* the node count (46,978 → 46,720).
@@ -272,7 +272,7 @@ Deleting `Ext` is blocked behind fixing *that* — make fusion match on class
 membership rather than on the caller's chosen id — which is a rewrite-layer
 change, not a deletion.
 
-### `L1::KRegion` — **DELETED, MEASURED, REVERTED — do not retry**
+### `Launch::Launch::Region` — **DELETED, MEASURED, REVERTED — do not retry**
 
 > The node is exactly as dead as the census said — proposed thousands of
 > times, lowered zero times — and deleting it is still a 3-10% decode
@@ -280,7 +280,7 @@ change, not a deletion.
 > 1,517 deletions; 1,441 net Rust lines).
 
 **The deadness claim is CONFIRMED**, re-proved with a fresh probe — a counter
-at `form_kregion` past its operand search and at both backends' `KRegion`
+at `form_kregion` past its operand search and at both backends' `Launch::Region`
 lowering arm:
 
 ```
@@ -319,7 +319,7 @@ universe (which member each launch adopts, or per-token host work) got worse.
 
 **The lesson, which generalizes.** A node can be lowered zero times and still
 be load-bearing as a **waypoint the extractor passes through** —
-`FORM_KREGION` unions a `KRegion { members: [producer, fused] }` into the
+`FORM_KREGION` unions a `Launch::Region { members: [producer, fused] }` into the
 fold's own class, so it is an alternative every `RESELECT`/`FLIP` move can see
 even though no plan ships it. **"Proposed but never selected" is not evidence
 that a node is free to delete.** Anything that mints e-graph members is gated

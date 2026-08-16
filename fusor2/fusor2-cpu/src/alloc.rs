@@ -76,15 +76,13 @@ impl AlignedBuf {
         self.ptr
     }
 
-    /// The aliasing escape hatch the launcher needs.
-    ///
-    /// A dispatch hands the same `&AlignedBuf` to every worker thread and each
-    /// writes its own disjoint slice. Disjointness is not a promise this type
-    /// can check; it is `verify_l1`'s invariant 3 — *a nest's write map must be
-    /// injective unless the nest declares an associative combine* — which the
-    /// planner has already discharged before a kernel reaches [`crate::launch`].
-    /// Every cross-lane accumulation instead goes through
-    /// [`crate::emit::Program`]'s private-accumulate-then-merge path.
+    /// Aliasing escape hatch for the launcher: a dispatch hands the same
+    /// `&AlignedBuf` to every worker thread and each writes its own disjoint
+    /// slice. Disjointness is discharged by `verify_launch` (a nest's write
+    /// map must be injective unless it declares an associative combine)
+    /// before a kernel reaches [`crate::launch`]. Cross-lane accumulation
+    /// goes through [`crate::emit::Program`]'s private-accumulate-then-merge
+    /// path.
     pub fn as_mut_ptr(&self) -> *mut u8 {
         self.ptr
     }

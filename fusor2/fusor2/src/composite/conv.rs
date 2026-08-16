@@ -2,12 +2,12 @@
 //!
 //! An `EinSpec` contracts over **several** labels directly, so the windowed view
 //! is contracted in place: `c` and every `k` label are contracted, `p` labels
-//! are free, and the operand's non-affine index map is the L1 lowering's
+//! are free, and the operand's non-affine index map is the Launch lowering's
 //! business.
 
 use fusor2_autograd::tape::{GraphTape, TapeExt};
 use fusor2_ir::autograd::{Tape, Val};
-use fusor2_ir::ir::level0::{EinSpec, L0, Label};
+use fusor2_ir::ir::logical::{EinSpec, Logical, Label};
 use fusor2_ir::scalar::BinOp;
 use fusor2_ir::shape::{Dim, SlidingWindow, StrideSpec};
 use fusor2_ir::{Error, Result};
@@ -45,17 +45,16 @@ pub fn pad_with_zeros(x: &Tensor, axis: u32, left: u64, right: u64) -> Result<Te
     Ok(x.graph.tensor(id))
 }
 
-/// Symmetric padding of one axis. Preserved spelling.
+/// Symmetric padding of one axis.
 pub fn pad_axis(x: &Tensor, axis: u32, padding: u64) -> Result<Tensor> {
     pad_with_zeros(x, axis, padding, padding)
 }
 
 /// Split axis `axis` of `v` into `(outer, inner)`.
 ///
-/// Always legal, at any strides: `Restride` composes **relative** to the
-/// current strides, so the outer axis is just the inner one's stride times the
-/// inner extent. This is why the channel split of a grouped convolution needs
-/// no contiguity proof.
+/// Always legal, at any strides: `Restride` composes relative to the current
+/// strides, so the outer axis is just the inner one's stride times the inner
+/// extent.
 fn split_axis(t: &mut GraphTape<'_>, v: Val, axis: usize, outer: u64, inner: u64) -> Result<Val> {
     let shape = t.shape_of(v);
     let mut specs: SmallVec<[StrideSpec; 6]> = SmallVec::new();
@@ -154,9 +153,8 @@ pub fn grouped_conv(
         )));
     }
     if dilation.iter().any(|d| *d != 1) {
-        // `SlidingWindow` carries `(window, step)` and nothing else, on
-        // purpose: two integers are what make the adjoint decidable. Dilation
-        // would be a third, and no caller in the parity surface uses one.
+        // `SlidingWindow` carries `(window, step)` only, which is what keeps
+        // the adjoint decidable.
         return Err(Error::Legality(
             "dilated convolution is not expressible as a SlidingWindow".into(),
         ));
@@ -181,7 +179,7 @@ pub fn grouped_conv(
         .collect::<Result<_>>()?;
 
     // Padding happens before the macro node so the scatter's index leaf is an
-    // ordinary operand rather than something the defn has to invent.
+    // ordinary operand.
     let mut padded = x.clone();
     for (i, p) in padding.iter().enumerate() {
         padded = pad_with_zeros(&padded, (2 + i) as u32, *p as u64, *p as u64)?;
@@ -223,7 +221,6 @@ fn conv_defn(
 ) -> Result<Val> {
     let grouped = groups > 1;
 
-    // ---- operands -------------------------------------------------------
     // x: [batch, in_ch, ...spatial] -> optionally [batch, g, cpg, ...spatial]
     let x = if grouped {
         let in_ch = const_dim(t.shape_of(x)[1], "conv in_channels")?;
@@ -233,7 +230,7 @@ fn conv_defn(
     };
     let channel_axis = if grouped { 2 } else { 1 };
     let first_spatial = channel_axis as u32 + 1;
-    let x = t.add(L0::Window {
+    let x = t.add(Logical::Window {
         specs: windows(kernel, stride, first_spatial)?,
         x,
     })?;
@@ -245,7 +242,6 @@ fn conv_defn(
         weight
     };
 
-    // ---- labels ---------------------------------------------------------
     // `b` and every `p` are free axes of the left operand, `o` is the free
     // axis of the right, and `c` plus every `k` are contracted. A group label
     // is a batch label — it is the only difference grouping makes.
@@ -294,7 +290,7 @@ fn conv_defn(
     let y = t.contract(x, weight, EinSpec { a, b, out }, acc)?;
     let y = t.cast(dtype, y)?;
 
-    // ---- back to [batch, out_ch, ...spatial] ----------------------------
+    // back to [batch, out_ch, ...spatial]
     let y = if grouped { merge_axes(t, y, 1)? } else { y };
 
     match bias {
@@ -323,7 +319,7 @@ mod tests {
     use crate::session::{Backend, Session};
     use fusor2_ir::dtype::Dtype;
     use fusor2_ir::ir::Op;
-    use fusor2_ir::ir::level1::L1;
+    use fusor2_ir::ir::launch::Launch;
 
     fn graph() -> Graph {
         Graph::new(&Session::new(Backend::cpu().unwrap()).unwrap())
@@ -387,7 +383,7 @@ mod tests {
                 let ms = eg.members(eg.class_of(y.id()));
                 let s = ms
                     .iter()
-                    .filter(|m| matches!(eg.node(**m).op, Op::L1(L1::Ext { .. })))
+                    .filter(|m| matches!(eg.node(**m).op, Op::Launch(Launch::Ext { .. })))
                     .count();
                 let d = ms.iter().filter(|m| eg.is_defn(**m)).count();
                 Ok((ms.len(), s, d))

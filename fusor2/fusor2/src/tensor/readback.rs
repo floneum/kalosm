@@ -170,8 +170,7 @@ impl TensorSlice {
     ///
     /// [`TensorSlice::to_flat`] is the *typed* accessor and refuses a dtype it
     /// was not asked for; this is the *numeric* one. An f16 activation and a
-    /// u32 token id both come back as the numbers they denote, because the
-    /// caller asked for numbers, not for a reinterpretation of the bytes. A
+    /// u32 token id both come back as the numbers they denote. A
     /// block-quantized value has no dense element and is still refused.
     pub fn to_vec_f32(&self) -> Result<Vec<f32>> {
         if self.dtype == Dtype::F32 {
@@ -224,10 +223,6 @@ impl<const N: usize> Index<[usize; N]> for TensorSlice {
             .expect("TensorSlice index out of range")
     }
 }
-
-// ---------------------------------------------------------------------------
-// Debug for ranks 0-3
-// ---------------------------------------------------------------------------
 
 /// A rank- and dtype-checked view of a [`TensorSlice`].
 #[derive(Copy, Clone)]
@@ -334,10 +329,6 @@ impl<const R: usize, D: Element + fmt::Debug> fmt::Debug for Ranked<'_, R, D> {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Tensor -> host
-// ---------------------------------------------------------------------------
 
 impl Tensor {
     /// Resolve the graph up to this value and copy it back.

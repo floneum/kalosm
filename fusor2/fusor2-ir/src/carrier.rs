@@ -1,20 +1,10 @@
 //! The generic fold algebra: an N-slot accumulator with a lift and an
 //! associative merge, both ordinary [`ScalarExpr`]s.
 //!
-//! This is what replaced named combine variants. `Combine::OnlineSoftmax` and
-//! `Combine::Welford` were recognizers wearing an enum's syntax — a fixed
-//! algorithm named in the core, which is precisely the shape of thing this
-//! design claims to have removed. Worse, naming them bought nothing: the GPU
-//! fold lowering reduced every slot with a single `TileReduceOp`, so a
-//! `Fold{OnlineSoftmax, Pair}` computed `max(x)` and silently discarded the
-//! sum. The name was in the type system and the algorithm was nowhere.
-//!
-//! Here a carrier is **data**: slot shapes, per-slot identities, and two
-//! expressions. Online softmax is then a *value* a rewrite rule constructs,
-//! not a variant the core has to know about — and the same machinery covers
-//! Welford, log-sum-exp, split-K and plain reductions with no extra rows.
-//! `Add`, `Mul`, `Max` and `Min` are [`Carrier::binop`] values, not a closed
-//! set the core enumerates.
+//! A carrier is data: slot shapes, per-slot identities, and two expressions.
+//! Online softmax, Welford, log-sum-exp, split-K and plain reductions are all
+//! values a rewrite rule constructs; `Add`, `Mul`, `Max` and `Min` are
+//! [`Carrier::binop`] values.
 //!
 //! # The laws that produce the interesting carriers
 //!
@@ -34,15 +24,13 @@
 //! module this is online softmax; at a `Vector(Dh)` module it is flash's output
 //! accumulator, with the *same* expression, because `(R^Dh, +)` is a monoid.
 //!
-//! The obligation every carrier owes, whoever minted it, is
-//! [`Carrier::identity_closed`]: `merge(identity, identity) == identity`. It is
-//! not decoration — a rescale spelled without [`Carrier::safe_delta`] computes
-//! `0 * exp((-inf) - (-inf)) = 0 * exp(NaN) = NaN`, and every workgroup-tree
-//! and subgroup schedule merges padded identity lanes on essentially every
-//! launch.
+//! Every carrier, however minted, owes [`Carrier::identity_closed`]:
+//! `merge(identity, identity) == identity`. A rescale spelled without
+//! [`Carrier::safe_delta`] computes `0 * exp((-inf) - (-inf)) = NaN`, and
+//! every workgroup-tree and subgroup schedule merges padded identity lanes.
 
 use crate::dtype::{Dtype, Splat};
-use crate::ir::level0::TiePolicy;
+use crate::ir::logical::TiePolicy;
 use crate::scalar::{BinOp, CmpOp, ScalarExpr, ScalarKind, UnOp};
 use crate::shape::Dim;
 use smallvec::{SmallVec, smallvec};
@@ -55,9 +43,8 @@ use smallvec::{SmallVec, smallvec};
 /// *same* carrier rather than a separate fold.
 ///
 /// A `Vector` extent should be [`Dim::Const`]: a symbolic private-array extent
-/// is allocatable on neither backend, so an unbounded-width slot mints crashes,
-/// not slow plans. [`Carrier::lanes`] returns `None` on a symbolic extent and
-/// every guard that reads it declines rather than guessing.
+/// is allocatable on neither backend. [`Carrier::lanes`] returns `None` on a
+/// symbolic extent and every guard that reads it declines.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SlotTy {
     Scalar,
@@ -77,7 +64,7 @@ impl SlotTy {
 /// accumulator, and an associative merge of two accumulators.
 ///
 /// * `lift[k]` is an expression over `Arg(0..n_ops)` — the fold's **operands**.
-///   This is the one place an element expression lives; `KFold` carries no
+///   This is the one place an element expression lives; `Fold` carries no
 ///   separate `pre`.
 /// * `merge[k]` is an expression over `Arg(0..w)` (the left accumulator) and
 ///   `Arg(w..2w)` (the right one), `w = slots.len()`. Cross-*slot* reads are
@@ -86,9 +73,7 @@ impl SlotTy {
 ///
 /// The element-absorption form used by a sequential inner loop is
 /// `merge(acc, lift(x))`; a tree reduction uses `merge` directly on partial
-/// accumulators. One definition serves both, which is what lets the schedule —
-/// sequential, subgroup collective, workgroup tree, split-K — be chosen by
-/// extraction rather than baked into the combine.
+/// accumulators.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Carrier {
     pub slots: SmallVec<[SlotTy; 4]>,
@@ -97,8 +82,7 @@ pub struct Carrier {
     pub merge: SmallVec<[ScalarExpr; 4]>,
     /// Declared associativity. A non-associative carrier is legal but may not
     /// be split or tree-reduced; `fold_split` and every collective strategy
-    /// guard on it, which is what keeps a float `Add` from being reassociated
-    /// under a `NumericContract` that forbids it.
+    /// guard on it.
     pub associative: bool,
     /// How an extremum reduction splits its gradient among tied elements. Read
     /// **only** by `fold_adjoint`: an autograd attribute, never a compiler
@@ -174,7 +158,7 @@ impl Carrier {
         }
     }
 
-    /// Single-slot binop recognition — the **only** thing L2's hardware fast
+    /// Single-slot binop recognition — the only thing Kernel's hardware fast
     /// path reads. `Some(op)` exactly when this carrier is one scalar slot
     /// merged by `op`, whatever its lift does, so a fold with a fused `pre`
     /// still emits `subgroupAdd`.
@@ -234,8 +218,8 @@ impl Carrier {
         }
     }
 
-    /// Replace the lift. This is where a `KFold`'s old `pre` went: an
-    /// element expression over the fold's operands, one per slot.
+    /// Replace the lift: an element expression over the fold's operands, one
+    /// per slot.
     #[must_use]
     pub fn with_lift(mut self, lift: impl IntoIterator<Item = ScalarExpr>) -> Self {
         self.lift = lift.into_iter().collect();
@@ -258,13 +242,12 @@ impl Carrier {
             .any(|e| reads_index_of(e, axis))
     }
 
-    /// **The tupling law**, with slot deduplication as *canonicalization*.
+    /// The tupling law, with slot deduplication as canonicalization.
     ///
     /// Two folds over the same axis of the same input are one fold over the
     /// concatenated accumulator. Slots equal in `(SlotTy, identity, lift,
     /// merge modulo slot renumbering and modulo commutation)` collapse to one,
-    /// so joining `(m, l)` with `(m, o)` yields three slots **by
-    /// construction** and no law has to enumerate spellings.
+    /// so joining `(m, l)` with `(m, o)` yields three slots.
     ///
     /// `remap` renumbers `other`'s lift onto the unified operand list. Merge
     /// expressions are renumbered by slot position and never see it.
@@ -272,9 +255,7 @@ impl Carrier {
     /// Deduplication is restricted to slots whose merge reads only their own
     /// position: such a slot's value is a function of its own history alone, so
     /// two structurally identical ones are equal at every point. A slot whose
-    /// merge reads a *sibling* is left alone — collapsing it would need the
-    /// sibling's identity too, which is exactly the "nearly right" failure a
-    /// drifting duplicated max produces.
+    /// merge reads a *sibling* is left alone.
     pub fn tuple(&self, other: &Carrier, remap: &ArgRemap) -> Tupled {
         let ns = self.width();
         let other_lift: SmallVec<[ScalarExpr; 4]> = other
@@ -351,13 +332,12 @@ impl Carrier {
         }
     }
 
-    /// The same algebra reading partial **accumulators** instead of elements:
+    /// The same algebra reading partial accumulators instead of elements:
     /// `lift[k] = Arg(k)`.
     ///
-    /// This is how the outer level of a split says "I am already an
-    /// accumulator". Without it the outer fold applies `lift` to a partial
-    /// max and silently computes a wrong value — the `accs[0]` bug one level
-    /// up. The resulting fold takes **one** operand carrying the inner fold's
+    /// The outer level of a split must use this: reusing the inner carrier
+    /// applies `lift` to a partial max and silently computes a wrong value.
+    /// The resulting fold takes ONE operand carrying the inner fold's
     /// trailing carrier axis, never `width` operands.
     pub fn as_merge(&self) -> Carrier {
         Carrier {
@@ -372,7 +352,7 @@ impl Carrier {
         }
     }
 
-    /// **Promotion**: every `Scalar` slot becomes `Vector(extent)`; an existing
+    /// Promotion: every `Scalar` slot becomes `Vector(extent)`; an existing
     /// `Vector(d)` becomes `Vector(d * extent)`, row-major over the promoted
     /// axes. Repeated promotion coalesces, so `TM x TN` register tiling is two
     /// firings.
@@ -398,11 +378,10 @@ impl Carrier {
 
     /// `Delta = select(a == b, identity, a - b)`.
     ///
-    /// **Not decoration.** Without it `merge(identity, identity)` on a shifted
-    /// carrier is `0 * exp((-inf) - (-inf)) = 0 * exp(NaN) = NaN`, and merging
-    /// `(-inf, NaN)` against a real partial propagates it. Every workgroup-tree
-    /// and subgroup schedule merges padded identity lanes on essentially every
-    /// launch, and a fully-masked causal row hits it too.
+    /// Without it `merge(identity, identity)` on a shifted carrier is
+    /// `0 * exp((-inf) - (-inf)) = NaN`, and merging `(-inf, NaN)` against a
+    /// real partial propagates it. Every workgroup-tree and subgroup schedule
+    /// merges padded identity lanes, and a fully-masked causal row hits it too.
     pub fn safe_delta(a: ScalarExpr, b: ScalarExpr, e: Splat) -> ScalarExpr {
         ScalarExpr::select(
             ScalarExpr::cmp(CmpOp::Eq, a.clone(), b.clone()),
@@ -411,7 +390,7 @@ impl Carrier {
         )
     }
 
-    /// **Retargeting**: carry the reference `rho` alongside the body and
+    /// Retargeting: carry the reference `rho` alongside the body and
     /// rescale by `T(rho_s - rho)`.
     ///
     /// ```text
@@ -423,9 +402,8 @@ impl Carrier {
     /// ```
     ///
     /// `ref_slot` names the slot of `stat` holding `rho`. One table row covers
-    /// **every** retargeted slot, which is exactly the statement that a
-    /// `Vector(Dh)` slot gets the same factor as a `Scalar` one — the module
-    /// axiom, spelled. `None` when `ref_slot` is out of range or the row's
+    /// every retargeted slot: a `Vector(Dh)` slot gets the same factor as a
+    /// `Scalar` one. `None` when `ref_slot` is out of range or the row's
     /// accumulation binop has no identity in `dtype`.
     ///
     /// The caller supplies `body.lift` already written at `rho := u`, which is
@@ -492,16 +470,14 @@ impl Carrier {
         })
     }
 
-    /// **The carrier obligation.** One check, at one place, for every carrier
-    /// however minted:
+    /// The carrier obligation:
     ///
-    /// * `merge(identity, identity) == identity` — the NaN this catches;
+    /// * `merge(identity, identity) == identity`;
     /// * `merge(identity, lift(x)) == lift(x)` over the probes;
     /// * `merge` is associative when `associative` is declared.
     ///
-    /// Conservative by construction: an expression the host evaluator does not
-    /// cover reports "unknown", and unknown passes. This is an obligation
-    /// check, not an analysis.
+    /// An expression the host evaluator does not cover reports "unknown", and
+    /// unknown passes.
     pub fn identity_closed(&self, probes: &[f32]) -> bool {
         let w = self.width();
         if self.identity.len() != w || self.lift.len() != w || self.merge.len() != w || w == 0 {
@@ -546,12 +522,11 @@ impl Carrier {
         true
     }
 
-    /// The `(slot, position)` each accumulator **lane** belongs to, in lane
+    /// The `(slot, position)` each accumulator lane belongs to, in lane
     /// order. A `Scalar` slot is one lane; a `Vector(d)` slot is `d`.
     ///
-    /// This is the coordinate system L2 reduces in: `Stmt::Reduce` carries one
-    /// value, one `merge` expression and one output `Local` per lane, never per
-    /// slot, because a promoted slot is `d` scalar registers on both backends.
+    /// This is the coordinate system Kernel reduces in: `Stmt::Reduce` carries
+    /// one value, one `merge` expression and one output `Local` per lane.
     pub fn lane_slots(&self) -> Option<Vec<(usize, u64)>> {
         let mut out = Vec::new();
         for (k, s) in self.slots.iter().enumerate() {
@@ -578,13 +553,12 @@ impl Carrier {
     /// of the right is `Arg(lanes + i)`, so a lowering evaluates each expression
     /// against `lhs_loads ++ rhs_loads` with no further renumbering.
     ///
-    /// A `Vector` slot's merge is **positionwise**: at position `p` a read of
-    /// another `Vector` slot resolves to that slot's position `p`, and a read of
-    /// a `Scalar` slot to its single lane — which is exactly how flash's
-    /// `Vector(Dh)` output slot reads the scalar running max. `None` when a
-    /// `Vector` extent is symbolic, when an `Arg` is out of range, or when two
-    /// `Vector` slots that read each other disagree in extent, because clamping
-    /// a position would silently compute the wrong element.
+    /// A `Vector` slot's merge is positionwise: at position `p` a read of
+    /// another `Vector` slot resolves to that slot's position `p`, and a read
+    /// of a `Scalar` slot to its single lane. `None` when a `Vector` extent is
+    /// symbolic, when an `Arg` is out of range, or when two `Vector` slots
+    /// that read each other disagree in extent, because clamping a position
+    /// would silently compute the wrong element.
     pub fn merge_lanes(&self) -> Option<Vec<ScalarExpr>> {
         let w = self.width();
         let lanes = self.lane_slots()?;
@@ -628,12 +602,11 @@ impl Carrier {
     /// **lane**, reading `Arg(0..lanes)`.
     ///
     /// This is [`Carrier::merge_lanes`]'s resolution over a single accumulator
-    /// instead of a pair, and it is what a `post` epilogue needs: `post[k]` is
-    /// written against slot values, while a lowering holds one register per
-    /// lane. At lane `(k, p)` a read of another `Vector` slot resolves to that
-    /// slot's position `p` and a read of a `Scalar` slot to its single lane, so
-    /// flash's `o / l` epilogue divides every output position by the one
-    /// running sum. `None` on the same disagreements `merge_lanes` refuses.
+    /// instead of a pair: `post[k]` is written against slot values, while a
+    /// lowering holds one register per lane. At lane `(k, p)` a read of
+    /// another `Vector` slot resolves to that slot's position `p` and a read
+    /// of a `Scalar` slot to its single lane. `None` on the same
+    /// disagreements `merge_lanes` refuses.
     pub fn expand_lanes(&self, per_slot: &[ScalarExpr]) -> Option<Vec<ScalarExpr>> {
         let w = self.width();
         if per_slot.len() != w {
@@ -702,10 +675,6 @@ pub fn probes_for(d: Dtype) -> &'static [f32] {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The two tables. Data, owned here, read by the rules.
-// ---------------------------------------------------------------------------
-
 /// The syntactic shape of a homomorphism `h` in [`HOM_TABLE`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum HomShape {
@@ -727,22 +696,18 @@ pub struct HomRow {
     pub h: HomShape,
     pub from: BinOp,
     pub to: BinOp,
-    /// Bit-exact under round-to-nearest, so the row fires with **no** reassoc
-    /// permission — the only rewrites in the whole law set legal on the
-    /// QAT/MSQ1 path where `NumericContract::STRICT` holds.
+    /// Bit-exact under round-to-nearest, so the row fires with no reassoc
+    /// permission, even where `NumericContract::STRICT` holds.
     pub exact_in_float: bool,
 }
 
-/// The homomorphism rows. Seven.
+/// The homomorphism rows.
 ///
-/// Deliberately **absent**, because `ValueFacts` carries no sign or range
-/// lattice: `Log : Mul -> Add` (false whenever any `x_i <= 0` — an even count
-/// of negatives gives a finite LHS and a NaN RHS), and the general
-/// monotone/antitone rows over *partial* unaries (`Sqrt`, `Log`, `Log2`,
-/// `Asin`, `Acos`, `Atanh`). A `TotalMonotone` row with `exact_in_float: true`
-/// fires under `STRICT` and could turn a number into a NaN inside the
-/// byte-identical export; the rows return when `ValueFacts` gains a sign
-/// lattice, not before. `Neg` is the only total unary in the vocabulary today.
+/// Absent, because `ValueFacts` carries no sign or range lattice:
+/// `Log : Mul -> Add` (false whenever any `x_i <= 0`), and the general
+/// monotone/antitone rows over partial unaries (`Sqrt`, `Log`, `Log2`,
+/// `Asin`, `Acos`, `Atanh`) — a row over a partial unary can turn a number
+/// into a NaN. `Neg` is the only total unary in the vocabulary today.
 pub const HOM_TABLE: &[HomRow] = &[
     HomRow { h: HomShape::MulByLit, from: BinOp::Add, to: BinOp::Add, exact_in_float: false },
     HomRow { h: HomShape::DivByLit, from: BinOp::Add, to: BinOp::Add, exact_in_float: false },
@@ -754,8 +719,7 @@ pub const HOM_TABLE: &[HomRow] = &[
 ];
 
 /// A unary total on `d`: defined for every value of the dtype, so a monotone
-/// row over it can never turn a number into a NaN. A per-`UnOp` bool, not an
-/// analysis.
+/// row over it can never turn a number into a NaN.
 pub const fn is_total_on(op: UnOp, d: Dtype) -> bool {
     match op {
         UnOp::Neg | UnOp::Abs => true,
@@ -766,12 +730,11 @@ pub const fn is_total_on(op: UnOp, d: Dtype) -> bool {
     }
 }
 
-/// One row of the retargeting law: how `T(delta)` acts on **one slot** of the
+/// One row of the retargeting law: how `T(delta)` acts on one slot of the
 /// module, and which binop accumulates it.
 ///
-/// `retarget` takes one call per slot and the **same** expression serves a
-/// `Scalar` and a `Vector` slot — that identity is the module axiom, and it is
-/// why flash's output accumulator needs no rule of its own.
+/// `retarget` takes one call per slot and the same expression serves a
+/// `Scalar` and a `Vector` slot.
 #[derive(Copy, Clone)]
 pub struct RetargetRow {
     pub name: &'static str,
@@ -818,17 +781,13 @@ macro_rules! shift_row {
 /// The retargeting rows.
 ///
 /// The four shift rows differ only in which exponential the emitter is
-/// permitted to use — at `h = exp` the derived carrier *is* online softmax,
-/// and nothing here mentions softmax or attention. `max-plus` is the same law
-/// over the `(R, max)` monoid, which is the evidence the table is not
-/// exp-shaped.
+/// permitted to use — at `h = exp` the derived carrier is online softmax.
+/// `max-plus` is the same law over the `(R, max)` monoid.
 ///
-/// Two rows named in the design are **not** here, honestly rather than fakely:
-/// the raw-moment row (whose `T` reads the two counts `n_a`, `n_b`, not the
-/// delta alone) and the Goertzel rotation row (whose `T` mixes two slots).
-/// Both need a wider `retarget` signature than one-slot-at-a-time; adding one
-/// is the RETARGET rule's work, and a row that pretended to fit this signature
-/// would compute the wrong number.
+/// The raw-moment row (whose `T` reads the two counts `n_a`, `n_b`, not the
+/// delta alone) and the Goertzel rotation row (whose `T` mixes two slots)
+/// need a wider `retarget` signature than one-slot-at-a-time, so they are
+/// absent.
 pub const RETARGET_TABLE: &[RetargetRow] = &[
     shift_row!("shift-exp", UnOp::Exp),
     shift_row!("shift-exp2", UnOp::Exp2),
@@ -841,10 +800,6 @@ pub const RETARGET_TABLE: &[RetargetRow] = &[
         accum: BinOp::Max,
     },
 ];
-
-// ---------------------------------------------------------------------------
-// Expression helpers
-// ---------------------------------------------------------------------------
 
 /// Rewrite every `Arg(i)` in `e` to `Arg(f(i))`, leaving all other nodes alone.
 pub fn map_args(e: &ScalarExpr, f: &dyn Fn(u32) -> u32) -> ScalarExpr {
@@ -868,7 +823,7 @@ pub fn map_args(e: &ScalarExpr, f: &dyn Fn(u32) -> u32) -> ScalarExpr {
 ///
 /// The floor lowering reads a fold's operands at the **operand** dtype and
 /// accumulates at `acc`, so a carrier's `lift` — the one expression that touches
-/// elements — is retyped on the way into L1 while `merge`, which reads
+/// elements — is retyped on the way into Launch while `merge`, which reads
 /// accumulators, rides through untouched.
 pub fn retype_args(e: &ScalarExpr, dtype: Dtype) -> ScalarExpr {
     use ScalarKind as K;
@@ -1049,13 +1004,11 @@ pub fn eval(e: &ScalarExpr, args: &[f32]) -> Option<f32> {
 
 #[doc(hidden)]
 pub mod oracle {
-    //! Two hand-written algorithms kept as **test fixtures**: the carriers
-    //! the laws derive must match them term for term.
+    //! Two hand-written algorithms kept as test fixtures: the carriers the
+    //! laws derive must match them term for term.
     //!
-    //! **Nothing in the compiler may call these.** They are `pub` only so that
-    //! `fusor2-conformance` runs the same two carriers on real hardware that
-    //! this crate's unit tests run on the host evaluator — one definition, two
-    //! callers, both tests.
+    //! Nothing in the compiler may call these. They are `pub` only so that
+    //! `fusor2-conformance` can run the same two carriers on real hardware.
 
     use super::*;
 
@@ -1195,7 +1148,7 @@ mod tests {
         assert_eq!(run(&max(), &XS)[0], 7.25);
     }
 
-    /// The one thing L2's hardware fast path reads. A fused `lift` must not
+    /// The one thing Kernel's hardware fast path reads. A fused `lift` must not
     /// change the answer, or every existing single-slot fold loses its
     /// collective.
     #[test]
@@ -1248,9 +1201,9 @@ mod tests {
         assert!(got[1].is_finite() && got[1] > 1.0, "{got:?}");
     }
 
-    /// **The obligation.** Merging two identity lanes must give the identity.
-    /// The unguarded rescale gives `0 * exp((-inf) - (-inf)) = NaN`, and every
-    /// workgroup-tree schedule merges padded lanes on essentially every launch.
+    /// Merging two identity lanes must give the identity. The unguarded
+    /// rescale gives `0 * exp((-inf) - (-inf)) = NaN`, and every
+    /// workgroup-tree schedule merges padded lanes.
     #[test]
     fn every_carrier_is_identity_closed() {
         let carriers = [
@@ -1275,8 +1228,8 @@ mod tests {
         }
     }
 
-    /// The unguarded spelling, kept as a negative control: this is the bug the
-    /// `safe_delta` guard exists for, and it is a NaN, not a rounding wobble.
+    /// Negative control: the unguarded spelling is the bug the `safe_delta`
+    /// guard exists for, and it is a NaN, not a rounding wobble.
     #[test]
     fn an_unguarded_rescale_is_not_identity_closed() {
         let d = Dtype::F32;
@@ -1375,10 +1328,9 @@ mod tests {
         assert!((got[2] - XS.iter().sum::<f32>()).abs() < 1e-5, "{got:?}");
     }
 
-    /// **Slot dedup.** Joining two carriers that share a slot must give three
-    /// slots, not four. If dedup is wrong the flash carrier gets two maxes that
-    /// drift apart under the rescale and the answer is *nearly* right, which is
-    /// the worst kind of wrong.
+    /// Joining two carriers that share a slot must give three slots, not
+    /// four. If dedup is wrong the flash carrier gets two maxes that drift
+    /// apart under the rescale.
     #[test]
     fn tupling_deduplicates_a_shared_slot() {
         let ml = oracle::shift_stabilized_sum(UnOp::Exp, Dtype::F32);
@@ -1453,10 +1405,9 @@ mod tests {
         );
     }
 
-    /// **The derivation, not the name.** Retargeting a plain `Add` body against
-    /// a running max at the `shift-exp` row reproduces the online-softmax
-    /// carrier the deleted `Combine::OnlineSoftmax` claimed to be — term for
-    /// term against the oracle, including the `safe_delta` guard.
+    /// Retargeting a plain `Add` body against a running max at the
+    /// `shift-exp` row reproduces the online-softmax carrier — term for term
+    /// against the oracle, including the `safe_delta` guard.
     #[test]
     fn retarget_derives_the_shift_stabilized_carrier() {
         let d = Dtype::F32;
@@ -1473,8 +1424,8 @@ mod tests {
         assert_eq!(got.merge, want.merge, "derived merge differs from the oracle");
     }
 
-    /// The same law over `(R, max)` instead of `(R, +)`: evidence the table is
-    /// not exp-shaped. `max_i(x_i + w_i)` computed against a running max.
+    /// The same law over `(R, max)` instead of `(R, +)`: `max_i(x_i + w_i)`
+    /// computed against a running max.
     #[test]
     fn retarget_at_the_max_plus_row_computes_a_tropical_reduction() {
         let d = Dtype::F32;
@@ -1520,13 +1471,9 @@ mod tests {
         }
         assert!(Carrier::binop_identity(BinOp::Add, Dtype::Q(crate::dtype::QFmt::Q4K)).is_none());
     }
-    // -----------------------------------------------------------------------
-    // Lane expansion — the coordinate system L2 reduces in
-    // -----------------------------------------------------------------------
 
     /// A single scalar slot expands to itself: `Arg(0)`/`Arg(1)` are already
-    /// lane 0 of each side, which is what keeps the fast path a renaming rather
-    /// than a rewrite.
+    /// lane 0 of each side.
     #[test]
     fn a_scalar_carrier_expands_to_its_own_merge() {
         let c = sum();
@@ -1548,10 +1495,8 @@ mod tests {
         assert_eq!(c.lane_slots().unwrap(), vec![(0, 0), (1, 0)]);
     }
 
-    /// **The positionwise law.** A `Vector(d)` slot is `d` lanes whose merge
-    /// reads its own position, and a `Scalar` sibling read resolves to that
-    /// sibling's single lane — which is exactly how a promoted output
-    /// accumulator reads the running max.
+    /// A `Vector(d)` slot is `d` lanes whose merge reads its own position,
+    /// and a `Scalar` sibling read resolves to that sibling's single lane.
     #[test]
     fn a_vector_slot_expands_positionwise_and_reads_a_scalar_sibling_at_lane_zero() {
         let d = Dtype::F32;

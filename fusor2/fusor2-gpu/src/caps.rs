@@ -27,9 +27,8 @@ pub const FORK_METAL: bool = false;
 ///
 /// Starts from wgpu's own spec defaults and then overwrites, field for field,
 /// the six limits the compiler actually reads from
-/// [`fusor2_ir::device::Limits::default()`]. Deriving them rather than
-/// re-typing them is what keeps the wgpu request and the IR's legality model
-/// from drifting apart.
+/// [`fusor2_ir::device::Limits::default()`], so the wgpu request and the IR's
+/// legality model cannot drift apart.
 pub fn baseline_limits() -> wgpu::Limits {
     let ir = Limits::default();
     let mut limits = wgpu::Limits::default();
@@ -182,19 +181,17 @@ pub fn needs_experimental(features: wgpu::Features) -> bool {
 
 /// Apple GPUs advertise a *range* of subgroup sizes even though every shipping
 /// part runs 32-wide. A ranged width makes [`SubgroupWidths::is_fixed`] false,
-/// which disables every cooperative tile and the qgemv fast path. Ported from
-/// `core/src/device.rs::apple_fixed_subgroup_size`.
+/// which disables every cooperative tile and the qgemv fast path.
 fn apple_fixed_subgroup_size(backend: wgpu::Backend, name: &str) -> Option<SubgroupWidths> {
     (backend == wgpu::Backend::Metal && name.starts_with("Apple"))
         .then_some(SubgroupWidths { min: 32, max: 32 })
 }
 
 /// Accept a cooperative-matrix property only in the one shape the lowerer can
-/// emit. Verbatim from `core/src/kernel_selection.rs`:
-/// `m == n == k == 8 && !saturating_accumulation`, F32/F32 always and F16/F16
-/// only with `SHADER_F16`. **Mixed F16-operand / F32-accumulator is rejected**
-/// even where the fork's MSL backend supports it — the cap model refuses it so
-/// a plan cannot depend on a fork-only numeric behaviour.
+/// emit: `m == n == k == 8 && !saturating_accumulation`, F32/F32 always and
+/// F16/F16 only with `SHADER_F16`. Mixed F16-operand / F32-accumulator is
+/// rejected even where the fork's MSL backend supports it, so a plan cannot
+/// depend on a fork-only numeric behaviour.
 pub fn coop_kinds(
     features: wgpu::Features,
     props: &[wgpu::CooperativeMatrixProperties],

@@ -1,4 +1,4 @@
-//! Total shape/dtype/numeric/persistence inference for the ten L0 nodes.
+//! Total shape/dtype/numeric/persistence inference for the ten Logical nodes.
 //! Never panics; every failure is an [`crate::Error`].
 
 use crate::carrier::Carrier;
@@ -6,25 +6,25 @@ use crate::contract_spec;
 use crate::dtype::{Dtype, NumericContract, Persistence};
 use crate::error::{Error, Result};
 use crate::facts::ValueFacts;
-use crate::ir::level0::{L0, LeafKind};
+use crate::ir::logical::{Logical, LeafKind};
 use crate::scalar::{ScalarExpr, ScalarKind};
 use crate::shape::{Dim, Dims, Layout, StrideSpec, SymId};
 use smallvec::SmallVec;
 
-/// Infer the result facts of an L0 node from its operands' facts.
+/// Infer the result facts of an Logical node from its operands' facts.
 ///
 /// `numeric` is the meet of the operands' contracts, never wider: the
 /// monotonicity that makes `fold_split` sound is established here.
 /// `persistence` is `Persistent` only for a `Param`/`Quantized` leaf and for
 /// pure views over one.
-pub fn infer_l0(op: &L0, ins: &[ValueFacts]) -> Result<ValueFacts> {
+pub fn infer_logical(op: &Logical, ins: &[ValueFacts]) -> Result<ValueFacts> {
     match op {
-        L0::Leaf(kind) => infer_leaf(kind),
-        L0::Map { expr, ins: _, outs } => infer_map(expr, ins, *outs),
-        L0::Fold {
+        Logical::Leaf(kind) => infer_leaf(kind),
+        Logical::Map { expr, ins: _, outs } => infer_map(expr, ins, *outs),
+        Logical::Fold {
             carrier, axis, acc, ..
         } => infer_fold(carrier, *axis, *acc, ins),
-        L0::Contract {
+        Logical::Contract {
             spec, acc, outs, ..
         } => {
             let (a, b) = two(ins, "Contract")?;
@@ -38,7 +38,7 @@ pub fn infer_l0(op: &L0, ins: &[ValueFacts]) -> Result<ValueFacts> {
                 outs: *outs,
             })
         }
-        L0::Restride { specs, .. } => {
+        Logical::Restride { specs, .. } => {
             let x = one(ins, "Restride")?;
             check_restride_specs(specs, x.rank())?;
             Ok(ValueFacts {
@@ -49,7 +49,7 @@ pub fn infer_l0(op: &L0, ins: &[ValueFacts]) -> Result<ValueFacts> {
                 outs: 1,
             })
         }
-        L0::Window { specs, .. } => {
+        Logical::Window { specs, .. } => {
             let x = one(ins, "Window")?;
             let (shape, _) = window_shape(specs, &x.shape)?;
             Ok(ValueFacts {
@@ -60,7 +60,7 @@ pub fn infer_l0(op: &L0, ins: &[ValueFacts]) -> Result<ValueFacts> {
                 outs: 1,
             })
         }
-        L0::Gather { axis, .. } => {
+        Logical::Gather { axis, .. } => {
             let (x, idx) = two(ins, "Gather")?;
             if !matches!(idx.dtype, Dtype::U32 | Dtype::I32) {
                 return Err(Error::Dtype(format!(
@@ -91,7 +91,7 @@ pub fn infer_l0(op: &L0, ins: &[ValueFacts]) -> Result<ValueFacts> {
                 outs: 1,
             })
         }
-        L0::Scatter { axis, .. } => {
+        Logical::Scatter { axis, .. } => {
             let (base, idx, upd) = three(ins, "Scatter")?;
             if !matches!(idx.dtype, Dtype::U32 | Dtype::I32) {
                 return Err(Error::Dtype(format!(
@@ -135,7 +135,7 @@ pub fn infer_l0(op: &L0, ins: &[ValueFacts]) -> Result<ValueFacts> {
             // The output *is* the base: a scatter writes through it.
             Ok(base.clone())
         }
-        L0::Dequant { fmt, .. } => {
+        Logical::Dequant { fmt, .. } => {
             let x = one(ins, "Dequant")?;
             if x.dtype != Dtype::Q(*fmt) {
                 return Err(Error::Dtype(format!(
@@ -151,7 +151,7 @@ pub fn infer_l0(op: &L0, ins: &[ValueFacts]) -> Result<ValueFacts> {
                 outs: 1,
             })
         }
-        L0::Project { slot, .. } => {
+        Logical::Project { slot, .. } => {
             let x = one(ins, "Project")?;
             if *slot >= x.outs {
                 return Err(Error::Shape(format!(
@@ -581,7 +581,7 @@ mod tests {
     use crate::dtype::Splat;
     use crate::egraph::Id;
     use crate::carrier::{ArgRemap, SlotTy};
-    use crate::ir::level0::{EinSpec, Label, ScatterCombine, TiePolicy};
+    use crate::ir::logical::{EinSpec, Label, ScatterCombine, TiePolicy};
 
     fn binop(op: BinOp) -> Carrier {
         Carrier::binop(op, Carrier::binop_identity(op, Dtype::F32).unwrap(), Dtype::F32)
@@ -629,16 +629,16 @@ mod tests {
             ScalarExpr::arg(0, Dtype::F32),
             ScalarExpr::arg(1, Dtype::F32),
         );
-        let op = L0::Map {
+        let op = Logical::Map {
             expr,
             ins: smallvec![Id(0), Id(1)],
             outs: 1,
         };
         assert!(matches!(
-            infer_l0(&op, &[f32s(&[4, 8]), f32s(&[8])]),
+            infer_logical(&op, &[f32s(&[4, 8]), f32s(&[8])]),
             Err(Error::Shape(_))
         ));
-        let ok = infer_l0(&op, &[f32s(&[4, 8]), f32s(&[4, 8])]).unwrap();
+        let ok = infer_logical(&op, &[f32s(&[4, 8]), f32s(&[4, 8])]).unwrap();
         assert_eq!(&ok.shape[..], &dims(&[4, 8])[..]);
         assert_eq!(ok.dtype, Dtype::F32);
     }
@@ -646,35 +646,35 @@ mod tests {
     #[test]
     fn map_checks_arg_dtypes_and_closedness() {
         let expr = ScalarExpr::arg(0, Dtype::F32);
-        let op = L0::Map {
+        let op = Logical::Map {
             expr,
             ins: smallvec![Id(0)],
             outs: 1,
         };
-        assert!(matches!(infer_l0(&op, &[u32s(&[4])]), Err(Error::Dtype(_))));
+        assert!(matches!(infer_logical(&op, &[u32s(&[4])]), Err(Error::Dtype(_))));
 
         // Zero operands: legal only for a closed expression.
-        let closed = L0::Map {
+        let closed = Logical::Map {
             expr: ScalarExpr::lit(Splat::F32(1.0)),
             ins: smallvec![],
             outs: 1,
         };
-        let facts = infer_l0(&closed, &[]).unwrap();
+        let facts = infer_logical(&closed, &[]).unwrap();
         assert_eq!(facts.rank(), 0);
 
-        let open = L0::Map {
+        let open = Logical::Map {
             expr: ScalarExpr::arg(0, Dtype::F32),
             ins: smallvec![],
             outs: 1,
         };
-        assert!(infer_l0(&open, &[]).is_err());
+        assert!(infer_logical(&open, &[]).is_err());
     }
 
     #[test]
     fn map_numeric_is_the_meet() {
         let mut strict = f32s(&[4]);
         strict.numeric = NumericContract::STRICT;
-        let op = L0::Map {
+        let op = Logical::Map {
             expr: ScalarExpr::bin(
                 BinOp::Add,
                 ScalarExpr::arg(0, Dtype::F32),
@@ -683,7 +683,7 @@ mod tests {
             ins: smallvec![Id(0), Id(1)],
             outs: 1,
         };
-        let facts = infer_l0(&op, &[strict, f32s(&[4])]).unwrap();
+        let facts = infer_logical(&op, &[strict, f32s(&[4])]).unwrap();
         assert!(!facts.numeric.reassoc);
         assert!(!facts.numeric.contract);
     }
@@ -697,14 +697,14 @@ mod tests {
             b: smallvec![Label(b'b'), Label(b'j'), Label(b'k')],
             out: smallvec![Label(b'b'), Label(b'i'), Label(b'j')],
         };
-        let op = L0::Contract {
+        let op = Logical::Contract {
             spec,
             acc: Dtype::F32,
             a: Id(0),
             b: Id(1),
             outs: 1,
         };
-        let facts = infer_l0(&op, &[f32s(&[2, 3, 4]), f32s(&[2, 5, 4])]).unwrap();
+        let facts = infer_logical(&op, &[f32s(&[2, 3, 4]), f32s(&[2, 5, 4])]).unwrap();
         assert_eq!(&facts.shape[..], &dims(&[2, 3, 5])[..]);
     }
 
@@ -722,33 +722,33 @@ mod tests {
         assert_eq!(out.shape(), &dims(&[3, 2])[..]);
         assert_eq!(out.strides(), &dims(&[4, 2])[..]);
 
-        let op = L0::Restride {
+        let op = Logical::Restride {
             specs: specs.iter().copied().collect(),
             bounds: BoundsProof::Static,
             x: Id(0),
         };
-        let facts = infer_l0(&op, &[f32s(&[2, 3, 4])]).unwrap();
+        let facts = infer_logical(&op, &[f32s(&[2, 3, 4])]).unwrap();
         assert_eq!(&facts.shape[..], &dims(&[3, 2])[..]);
     }
 
     #[test]
     fn restride_rejects_an_out_of_range_input_dim() {
-        let op = L0::Restride {
+        let op = Logical::Restride {
             specs: smallvec![StrideSpec::dim(9, Dim::Const(3))],
             bounds: BoundsProof::Static,
             x: Id(0),
         };
         assert!(matches!(
-            infer_l0(&op, &[f32s(&[2, 3])]),
+            infer_logical(&op, &[f32s(&[2, 3])]),
             Err(Error::Shape(_))
         ));
         // A pure broadcast spec names no input dim, so it is fine.
-        let bcast = L0::Restride {
+        let bcast = Logical::Restride {
             specs: smallvec![StrideSpec::broadcast(Dim::Const(3))],
             bounds: BoundsProof::Static,
             x: Id(0),
         };
-        assert!(infer_l0(&bcast, &[f32s(&[])]).is_ok());
+        assert!(infer_logical(&bcast, &[f32s(&[])]).is_ok());
     }
 
     // ---- Test 6 ----------------------------------------------------------
@@ -758,20 +758,20 @@ mod tests {
         let x = f32s(&[1, 24, 768]);
         let non_overlapping = SlidingWindow::new(2, 4, 4);
         assert!(non_overlapping.is_non_overlapping());
-        let op = L0::Window {
+        let op = Logical::Window {
             specs: smallvec![non_overlapping],
             x: Id(0),
         };
-        let facts = infer_l0(&op, std::slice::from_ref(&x)).unwrap();
+        let facts = infer_logical(&op, std::slice::from_ref(&x)).unwrap();
         assert_eq!(&facts.shape[..], &dims(&[1, 24, 192, 4])[..]);
 
         let overlapping = SlidingWindow::new(2, 4, 2);
         assert!(!overlapping.is_non_overlapping());
-        let op = L0::Window {
+        let op = Logical::Window {
             specs: smallvec![overlapping],
             x: Id(0),
         };
-        let facts = infer_l0(&op, &[x]).unwrap();
+        let facts = infer_logical(&op, &[x]).unwrap();
         assert_eq!(&facts.shape[..], &dims(&[1, 24, 383, 4])[..]);
     }
 
@@ -814,43 +814,43 @@ mod tests {
             .tuple(&binop(BinOp::Mul), &ArgRemap::identity(1))
             .carrier;
         assert_eq!(three.width(), 3);
-        let op = L0::Fold {
+        let op = Logical::Fold {
             carrier: three,
             axis: 1,
             acc: Dtype::F32,
             ins: smallvec![Id(0)],
         };
-        let facts = infer_l0(&op, &[f32s(&[4, 8, 16])]).unwrap();
+        let facts = infer_logical(&op, &[f32s(&[4, 8, 16])]).unwrap();
         assert_eq!(&facts.shape[..], &dims(&[4, 16, 3])[..]);
     }
 
     #[test]
     fn fold_scalar_and_vector_carriers() {
-        let scalar = L0::Fold {
+        let scalar = Logical::Fold {
             carrier: binop(BinOp::Add),
             axis: 0,
             acc: Dtype::F32,
             ins: smallvec![Id(0)],
         };
         assert_eq!(
-            &infer_l0(&scalar, &[f32s(&[6, 7])]).unwrap().shape[..],
+            &infer_logical(&scalar, &[f32s(&[6, 7])]).unwrap().shape[..],
             &dims(&[7])[..]
         );
 
-        let vector = L0::Fold {
+        let vector = Logical::Fold {
             carrier: binop(BinOp::Add).promote(Dim::Const(64)).unwrap(),
             axis: 0,
             acc: Dtype::F32,
             ins: smallvec![Id(0)],
         };
         assert_eq!(
-            &infer_l0(&vector, &[f32s(&[6, 7])]).unwrap().shape[..],
+            &infer_logical(&vector, &[f32s(&[6, 7])]).unwrap().shape[..],
             &dims(&[7, 64])[..]
         );
 
         // A symbolic slot extent is refused, not guessed: a private array of
         // unknown width is allocatable on neither backend.
-        let symbolic = L0::Fold {
+        let symbolic = Logical::Fold {
             carrier: Carrier {
                 slots: smallvec![SlotTy::Vector(Dim::Sym(SymId(9)))],
                 ..binop(BinOp::Add)
@@ -859,22 +859,22 @@ mod tests {
             acc: Dtype::F32,
             ins: smallvec![Id(0)],
         };
-        assert!(infer_l0(&symbolic, &[f32s(&[6, 7])]).is_err());
+        assert!(infer_logical(&symbolic, &[f32s(&[6, 7])]).is_err());
 
-        let out_of_range = L0::Fold {
+        let out_of_range = Logical::Fold {
             carrier: binop(BinOp::Add),
             axis: 4,
             acc: Dtype::F32,
             ins: smallvec![Id(0)],
         };
-        assert!(infer_l0(&out_of_range, &[f32s(&[6, 7])]).is_err());
+        assert!(infer_logical(&out_of_range, &[f32s(&[6, 7])]).is_err());
     }
 
     /// Every operand is read at one coordinate, exactly as a `Map` body is, so
     /// a fold whose operands disagree in shape is a typed error.
     #[test]
     fn a_multi_operand_fold_requires_agreeing_shapes() {
-        let op = L0::Fold {
+        let op = Logical::Fold {
             carrier: binop(BinOp::Add).with_lift([ScalarExpr::bin(
                 BinOp::Mul,
                 ScalarExpr::arg(0, Dtype::F32),
@@ -885,31 +885,31 @@ mod tests {
             ins: smallvec![Id(0), Id(1)],
         };
         assert_eq!(
-            &infer_l0(&op, &[f32s(&[4, 8]), f32s(&[4, 8])]).unwrap().shape[..],
+            &infer_logical(&op, &[f32s(&[4, 8]), f32s(&[4, 8])]).unwrap().shape[..],
             &dims(&[4])[..]
         );
-        assert!(infer_l0(&op, &[f32s(&[4, 8]), f32s(&[4, 9])]).is_err());
+        assert!(infer_logical(&op, &[f32s(&[4, 8]), f32s(&[4, 9])]).is_err());
     }
 
     // ---- gather / scatter / dequant / project ---------------------------
 
     #[test]
     fn gather_replaces_the_axis_extent() {
-        let op = L0::Gather {
+        let op = Logical::Gather {
             axis: 0,
             x: Id(0),
             idx: Id(1),
         };
-        let facts = infer_l0(&op, &[f32s(&[1024, 24]), u32s(&[300])]).unwrap();
+        let facts = infer_logical(&op, &[f32s(&[1024, 24]), u32s(&[300])]).unwrap();
         assert_eq!(&facts.shape[..], &dims(&[300, 24])[..]);
 
-        assert!(infer_l0(&op, &[f32s(&[1024, 24]), f32s(&[300])]).is_err());
-        assert!(infer_l0(&op, &[f32s(&[1024, 24]), u32s(&[3, 4])]).is_err());
+        assert!(infer_logical(&op, &[f32s(&[1024, 24]), f32s(&[300])]).is_err());
+        assert!(infer_logical(&op, &[f32s(&[1024, 24]), u32s(&[3, 4])]).is_err());
     }
 
     #[test]
     fn scatter_returns_the_base_facts() {
-        let op = L0::Scatter {
+        let op = Logical::Scatter {
             axis: 0,
             combine: ScatterCombine::Add,
             base: Id(0),
@@ -918,13 +918,13 @@ mod tests {
             unique: false,
         };
         let base = f32s(&[1024, 24]);
-        let facts = infer_l0(&op, &[base.clone(), u32s(&[300]), f32s(&[300, 24])]).unwrap();
+        let facts = infer_logical(&op, &[base.clone(), u32s(&[300]), f32s(&[300, 24])]).unwrap();
         assert_eq!(facts, base);
 
         // Update extent must match the index count.
-        assert!(infer_l0(&op, &[base.clone(), u32s(&[300]), f32s(&[299, 24])]).is_err());
+        assert!(infer_logical(&op, &[base.clone(), u32s(&[300]), f32s(&[299, 24])]).is_err());
         // Non-scattered axes must agree with the base.
-        assert!(infer_l0(&op, &[base, u32s(&[300]), f32s(&[300, 25])]).is_err());
+        assert!(infer_logical(&op, &[base, u32s(&[300]), f32s(&[300, 25])]).is_err());
     }
 
     #[test]
@@ -937,33 +937,33 @@ mod tests {
             persistence: Persistence::Persistent,
             outs: 1,
         };
-        let op = L0::Dequant {
+        let op = Logical::Dequant {
             fmt,
             layout: crate::dtype::QLayout::Native,
             x: Id(0),
         };
-        let facts = infer_l0(&op, std::slice::from_ref(&q)).unwrap();
+        let facts = infer_logical(&op, std::slice::from_ref(&q)).unwrap();
         assert_eq!(facts.dtype, Dtype::F32);
         assert_eq!(facts.persistence, Persistence::Persistent);
         // The format on the node must match the operand's.
-        let mismatched = L0::Dequant {
+        let mismatched = Logical::Dequant {
             fmt: crate::dtype::QFmt::Q6K,
             layout: crate::dtype::QLayout::Native,
             x: Id(0),
         };
-        assert!(infer_l0(&mismatched, &[q]).is_err());
+        assert!(infer_logical(&mismatched, &[q]).is_err());
 
         let mut pair = f32s(&[4]);
         pair.outs = 2;
-        assert!(infer_l0(&L0::Project { slot: 1, x: Id(0) }, std::slice::from_ref(&pair)).is_ok());
-        assert!(infer_l0(&L0::Project { slot: 2, x: Id(0) }, &[pair]).is_err());
+        assert!(infer_logical(&Logical::Project { slot: 1, x: Id(0) }, std::slice::from_ref(&pair)).is_ok());
+        assert!(infer_logical(&Logical::Project { slot: 2, x: Id(0) }, &[pair]).is_err());
     }
 
     #[test]
     fn leaf_persistence() {
-        let param = infer_l0(
-            &L0::Leaf(LeafKind::Param {
-                name: crate::ir::level0::BufferId(0),
+        let param = infer_logical(
+            &Logical::Leaf(LeafKind::Param {
+                name: crate::ir::logical::BufferId(0),
                 dtype: Dtype::F32,
                 shape: dims(&[8]),
             }),
@@ -972,9 +972,9 @@ mod tests {
         .unwrap();
         assert_eq!(param.persistence, Persistence::Persistent);
 
-        let buffer = infer_l0(
-            &L0::Leaf(LeafKind::Buffer {
-                name: crate::ir::level0::BufferId(1),
+        let buffer = infer_logical(
+            &Logical::Leaf(LeafKind::Buffer {
+                name: crate::ir::logical::BufferId(1),
                 dtype: Dtype::F32,
                 shape: dims(&[8]),
             }),
@@ -983,8 +983,8 @@ mod tests {
         .unwrap();
         assert_eq!(buffer.persistence, Persistence::Step);
 
-        let uniform = infer_l0(
-            &L0::Leaf(LeafKind::Uniform {
+        let uniform = infer_logical(
+            &Logical::Leaf(LeafKind::Uniform {
                 sym: SymId(2),
                 dtype: Dtype::F32,
             }),
@@ -998,13 +998,13 @@ mod tests {
     fn every_node_is_total_under_a_missing_operand() {
         // A malformed operand list must be a typed error, never a panic.
         let ops = [
-            L0::Fold {
+            Logical::Fold {
                 carrier: binop(BinOp::Add),
                 axis: 0,
                 acc: Dtype::F32,
                 ins: smallvec![Id(0)],
             },
-            L0::Contract {
+            Logical::Contract {
                 spec: EinSpec {
                     a: smallvec![Label(0)],
                     b: smallvec![Label(0)],
@@ -1015,12 +1015,12 @@ mod tests {
                 b: Id(1),
                 outs: 1,
             },
-            L0::Gather {
+            Logical::Gather {
                 axis: 0,
                 x: Id(0),
                 idx: Id(1),
             },
-            L0::Scatter {
+            Logical::Scatter {
                 axis: 0,
                 combine: ScatterCombine::Set,
                 base: Id(0),
@@ -1028,22 +1028,22 @@ mod tests {
                 upd: Id(2),
                 unique: true,
             },
-            L0::Project { slot: 0, x: Id(0) },
-            L0::Window {
+            Logical::Project { slot: 0, x: Id(0) },
+            Logical::Window {
                 specs: smallvec![SlidingWindow::new(0, 2, 1)],
                 x: Id(0),
             },
-            L0::Restride {
+            Logical::Restride {
                 specs: smallvec![StrideSpec::dim(0, Dim::Const(1))],
                 bounds: BoundsProof::Static,
                 x: Id(0),
             },
-            L0::Dequant {
+            Logical::Dequant {
                 fmt: crate::dtype::QFmt::Q4_0,
                 layout: crate::dtype::QLayout::Native,
                 x: Id(0),
             },
-            L0::Fold {
+            Logical::Fold {
                 carrier: binop(BinOp::Min).with_tie(TiePolicy::SplitEvenly),
                 axis: 0,
                 acc: Dtype::F32,
@@ -1051,7 +1051,7 @@ mod tests {
             },
         ];
         for op in &ops {
-            assert!(infer_l0(op, &[]).is_err(), "{op:?} should reject 0 operands");
+            assert!(infer_logical(op, &[]).is_err(), "{op:?} should reject 0 operands");
         }
     }
 }

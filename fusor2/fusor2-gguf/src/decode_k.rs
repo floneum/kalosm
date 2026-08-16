@@ -1,12 +1,8 @@
 //! Block decode programs for the 256-element K-quants.
-//!
-//! These are exactly why `decode` is a `BlockProgram` and not a `ScalarExpr`:
-//! Q6K's 210-byte non-word-aligned block with per-super-block group scales is
-//! not a per-element formula.
 
 use fusor2_ir::Result;
 use fusor2_ir::dtype::{QFmt, QLayout};
-use fusor2_ir::ir::level2::{TileCompareOp, TileExpr};
+use fusor2_ir::ir::kernel::{TileCompareOp, TileExpr};
 
 use crate::blocks::{BlockDecodeArgs, BlockFields, BlockProgram, block_fields};
 use crate::decode::{
@@ -19,9 +15,7 @@ use crate::decode::{
 ///
 /// Groups 0-3 take six bits from bytes `0..4` (scale) and `4..8` (offset).
 /// Groups 4-7 take bits 4-5 from the top two bits of those same bytes and bits
-/// 0-3 from the low / high nibble of bytes `8..12`. This is
-/// `unpack_k4_scales_offsets` evaluated at one dynamic group index, which is
-/// three byte loads instead of twelve.
+/// 0-3 from the low / high nibble of bytes `8..12`.
 fn k4_group_scale_min(
     args: &BlockDecodeArgs<'_>,
     base: &TileExpr,
@@ -55,10 +49,6 @@ fn k4_group_scale_min(
 
 /// The whole-word form of the same unpack: three packed words in, eight group
 /// scales and eight group offsets out.
-///
-/// Ported from the reference's `first_scales_min_k4` / `second_scales_min_k4`.
-/// Emitters that decode a whole super-block at once want this; the per-lane
-/// programs below use the group-indexed form instead.
 pub fn unpack_k4_scales_offsets(packed: [TileExpr; 3]) -> ([TileExpr; 8], [TileExpr; 8]) {
     const SIX_BITS: u32 = 0b0011_1111_0011_1111_0011_1111_0011_1111;
     const MSB_TWO: u32 = 0b1100_0000_1100_0000_1100_0000_1100_0000;
@@ -206,10 +196,6 @@ fn decode_q6k(args: &BlockDecodeArgs<'_>, want: QLayout, name: &'static str) -> 
     let (base, q) = block_base_and_q(args, QFmt::Q6K);
     Ok(finish(args, q6k_lane(args, &fields, &base, &q)))
 }
-
-// ---------------------------------------------------------------------------
-// The six programs
-// ---------------------------------------------------------------------------
 
 /// Q4K, raw GGUF bytes: f16 `d`, f16 `dmin`, 12 packed group scales, 128
 /// nibble bytes.

@@ -1,12 +1,11 @@
-//! The replay memo, keyed on the *extraction inputs* rather than a structural
-//! fingerprint. Validity is "the inputs are identical", not "a fingerprint
-//! matches".
+//! The replay memo, keyed on the extraction inputs. Validity is "the inputs
+//! are identical".
 
 use fusor2_ir::Result;
 use fusor2_ir::egraph::{EGraph, Id};
 use fusor2_ir::extract::{Plan, PlanHash, ReplayKey};
 use fusor2_ir::ir::Op;
-use fusor2_ir::ir::level0::{L0, LeafKind};
+use fusor2_ir::ir::logical::{Logical, LeafKind};
 use fusor2_ir::shape::Dim;
 use parking_lot::Mutex;
 use rustc_hash::FxHasher;
@@ -18,12 +17,8 @@ pub const CAPACITY: usize = 64;
 
 /// Bounded per-process memo from extraction inputs to a finished plan.
 ///
-/// A hit does **not** mean "skip extraction": [`Self::get_or_extract`] always
-/// runs the closure when the key is absent, and a caller that suspects an
-/// input changed simply builds a different key. Contrast the reference's
-/// `flush_replay`, whose validity condition is a structural fingerprint and
-/// which therefore freezes every decision a value (rather than a shape) should
-/// have driven.
+/// [`Self::get_or_extract`] always runs the closure when the key is absent; a
+/// caller that suspects an input changed builds a different key.
 #[derive(Default)]
 pub struct ReplayCache {
     entries: Mutex<Lru>,
@@ -43,10 +38,9 @@ struct Lru {
 /// the graph term the key names.
 struct Entry {
     plan: Arc<Plan>,
-    /// The plan hash last verified under this key. Carried per entry, not per
-    /// cache, so evicting the plan evicts the record with it — and so a
-    /// replacement plan (an adopted tuning winner) is verified on its own
-    /// merits rather than inheriting its predecessor's clearance.
+    /// The plan hash last verified under this key. Carried per entry so
+    /// evicting the plan evicts the record, and a replacement plan never
+    /// inherits its predecessor's clearance.
     verified: Option<PlanHash>,
 }
 
@@ -129,11 +123,9 @@ impl ReplayCache {
     /// Whether `hash` is the plan this key already put through `verify_plan`.
     ///
     /// `verify_plan` is a pure function of the plan and the graph term it was
-    /// extracted from, and a [`ReplayKey`] *is* that term's identity — it is
-    /// already what decides which plan executes, so a key precise enough to
-    /// choose the plan is precise enough to remember that the plan verified.
-    /// The plan hash is carried too, so an entry replaced by a tuning winner
-    /// never inherits the verdict of the plan it displaced.
+    /// extracted from, and a [`ReplayKey`] is that term's identity. The plan
+    /// hash is carried too, so a replaced entry never inherits the verdict of
+    /// the plan it displaced.
     pub fn is_verified(&self, key: ReplayKey, hash: PlanHash) -> bool {
         self.entries
             .lock()
@@ -181,23 +173,10 @@ impl ReplayCache {
 /// symbols as symbols**: two dispatches of one shape family produce the same
 /// value, so the key discriminates on the binding rather than on the shape.
 ///
-/// A leaf contributes its dtype and its shape, and a `Const` its value; what
-/// it does **not** contribute is its `BufferId`, so a re-upload into a fresh
-/// buffer replays.
-///
-/// Two regressions this fixes, both of them the same mistake — a key that is
-/// not injective over the thing a cached plan's `Id`s refer to, which is
-/// silent plan corruption that only `verify_plan` running again after the
-/// lookup turned into an error:
-///
-/// - the leaf arm hashed only `discriminant(kind)`, so two graphs differing
-///   *only* in a leaf's extents were one key. `cat_rank1` and `cat_rank2`
-///   collided and `cat_rank2` replayed `BufferPlan`s of rank 1 for its
-///   rank-2 values;
-/// - the walk covered only the root-reachable L0 spine and ignored the root
-///   set, so two graphs on one `Session` — and the conformance harness builds
-///   every case's graph on one shared `Session` — could share a key while
-///   their ids named different nodes.
+/// A leaf contributes its dtype and its shape, and a `Const` its value; it
+/// does not contribute its `BufferId`, so a re-upload into a fresh buffer
+/// replays. The key must be injective over everything a cached plan's `Id`s
+/// refer to: the whole graph and the root set, not only the rooted term.
 pub fn l0_term_hash(graph: &EGraph, roots: &[Id]) -> u64 {
     let mut h = FxHasher::default();
     // The roots are an extraction *input*: the same term rooted at one value
@@ -206,22 +185,17 @@ pub fn l0_term_hash(graph: &EGraph, roots: &[Id]) -> u64 {
     for r in roots {
         h.write_u32(r.0);
     }
-    // Every id, not only the root-reachable L0 spine. A cached plan's `Id`s
-    // are meaningful **only** in the graph it was extracted from, so the key
-    // has to determine that graph, and an id is determined by everything
-    // allocated before it — including nodes this term never reaches. Walking
-    // the spine alone is what let `attention_with_lse` and
-    // `welford_agrees_with_the_two_pass_variance` replay a plan from an
-    // earlier case on the same `Session`: both pass in isolation and fail in
-    // a full run, with `verify_plan` reporting an operand class the stale
-    // `sigma` has no entry for.
+    // Every id, not only the root-reachable Logical spine: a cached plan's
+    // `Id`s are meaningful only in the graph it was extracted from, and an id
+    // is determined by everything allocated before it — including nodes this
+    // term never reaches.
     //
     // `Hash for ScalarExpr` writes a cached digest, so this stays O(nodes).
     for i in 0..graph.len() {
         let v = Id(i as u32);
         let node = graph.node(v);
         node.op.tag().hash(&mut h);
-        if let Op::L0(L0::Leaf(k)) = &node.op {
+        if let Op::Logical(Logical::Leaf(k)) = &node.op {
             hash_leaf(&mut h, k);
         } else {
             node.op.hash(&mut h);

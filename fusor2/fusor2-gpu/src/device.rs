@@ -103,11 +103,9 @@ pub async fn request_device(opts: &DeviceOptions) -> Result<GpuDevice> {
     let adapter_limits = adapter.limits();
     let mut limits = caps::widen_limits(caps::baseline_limits(), opts.widen, &adapter_limits)?;
     // The two buffer-size ceilings are memory *capacity*, not occupancy
-    // legality: no kernel changes shape because the buffer holding a weight is
-    // bigger, and any 7B+ model has single weights past the WebGPU baseline's
-    // 256 MiB (a Q6K vocab projection is ~430 MB). Take the adapter's
-    // capacity; the workgroup/occupancy limits stay at the baseline so plan
-    // legality still means the same thing on every device.
+    // legality, and 7B+ models have single weights past the WebGPU baseline's
+    // 256 MiB. Take the adapter's capacity; the workgroup/occupancy limits
+    // stay at the baseline so plan legality means the same thing everywhere.
     limits.max_buffer_size = limits.max_buffer_size.max(adapter_limits.max_buffer_size);
     limits.max_storage_buffer_binding_size = limits
         .max_storage_buffer_binding_size
@@ -124,7 +122,7 @@ pub async fn request_device(opts: &DeviceOptions) -> Result<GpuDevice> {
             // SAFETY: the only experimental bit requested is
             // EXPERIMENTAL_COOPERATIVE_MATRIX, used exclusively through
             // naga's validated CooperativeLoad/MultiplyAdd/Store, whose
-            // operands the L2 verifier and the emitter both range-check.
+            // operands the Kernel verifier and the emitter both range-check.
             unsafe { wgpu::ExperimentalFeatures::enabled() }
         } else {
             wgpu::ExperimentalFeatures::disabled()

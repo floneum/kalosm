@@ -1,33 +1,19 @@
-//! `L0::Dequant`'s definitional expansion: a `Restride` over the block stream
-//! read as `u32` words, plus a `Map` of unpack bit-arithmetic.
-//!
-//! A block decode is bit arithmetic over a strided view of a byte buffer.
-//! Spelled that way it is two core nodes, and every mechanism that already
-//! exists — fusion, the contraction lowering, the cooperative staging fill,
-//! the cost model — consumes it with no quantization-aware code. `Dequant` was
-//! the one op in the tree with no `defn`, against the discipline
-//! [`crate::composite::macro_op`] states; this is that `defn`.
-//!
-//! **One fact bounds what is reachable, and it is about addresses, not about
-//! arithmetic.**
+//! `Logical::Dequant`'s definitional expansion: a `Restride` over the block
+//! stream read as `u32` words, plus a `Map` of unpack bit-arithmetic.
 //!
 //! The block stream is bound as a rank-1 `U32` leaf, so every field a decode
-//! reads has to be a whole `u32` word of it — which makes the block *stride*
-//! the gate. [`QLayout::F32Scales`] is universally word-aligned:
-//! 20/24/36/148/180/212 bytes. Of the native strides only Q4K's 144 and Q5K's
-//! 176 are; Q4_0's 18, Q5_0's 22, Q8_0's 34 and Q6K's 210 each leave two bytes
-//! over, so their blocks walk in and out of word phase and a `Restride` cannot
-//! address them. Those four keep their `BlockProgram` at `Native`, and
-//! `qrepack` — already priced — is the bridge. No byte-addressed load and no
-//! format-specific alignment code appears here.
+//! reads has to be a whole `u32` word of it — the block stride is the gate.
+//! [`QLayout::F32Scales`] is universally word-aligned; of the native strides
+//! only Q4K's 144 and Q5K's 176 are. Q4_0's 18, Q5_0's 22, Q8_0's 34 and
+//! Q6K's 210 each leave two bytes over, so their blocks walk in and out of
+//! word phase and a `Restride` cannot address them. Those four keep their
+//! `BlockProgram` at `Native`, with `qrepack` as the bridge.
 //!
-//! An f16 scale is **not** part of that gate: see [`f16_lane`], which decodes
-//! a half out of a word in pure `ScalarExpr` arithmetic. The half-word offset
-//! it needs is [`scale_field`], the 2-aligned counterpart of [`field_word`].
+//! An f16 scale is not part of that gate: [`f16_lane`] decodes a half out of
+//! a word in pure `ScalarExpr` arithmetic, offset via [`scale_field`].
 //!
 //! No format constant is written here. Block strides come from
-//! `QFmt::block_bytes`, field offsets from `fusor2_gguf::blocks::block_fields`
-//! — the crate that parses the files and is where format knowledge stops.
+//! `QFmt::block_bytes`, field offsets from `fusor2_gguf::blocks::block_fields`.
 
 use fusor2_autograd::tape::TapeExt;
 use fusor2_ir::Result;
@@ -42,8 +28,6 @@ use crate::quantized::QMatrix;
 
 /// Words one block occupies, or `None` when its stride is not a whole number
 /// of `u32` words.
-///
-/// **No format knowledge**: it is `bytes % 4`.
 fn block_words(fmt: QFmt, layout: QLayout) -> Option<u64> {
     let bytes = u64::from(fmt.block_bytes(layout));
     bytes.is_multiple_of(4).then(|| bytes / 4)
@@ -56,13 +40,10 @@ fn field_word(byte_offset: u32) -> Option<u64> {
 
 /// A scale-shaped field as `(word, lane)`: the `u32` word that holds it, and —
 /// when the layout stores it as an f16 — which 16-bit lane of that word it is.
-/// `None` for the lane means the field *is* the whole word, an f32.
+/// `None` for the lane means the field is the whole word, an f32.
 ///
-/// **No format knowledge**: it is `offset / 4` and `(offset % 4) / 2`. An f16
-/// field only has to be 2-aligned, which is why this is not [`field_word`];
-/// that difference is what keeps [`QLayout::Native`]
-/// reachable at the offset level, on top of the arithmetic reason
-/// [`f16_lane`] solves.
+/// An f16 field only has to be 2-aligned, which is why this is not
+/// [`field_word`].
 fn scale_field(byte_offset: u32, is_f16: bool) -> Option<(u64, Option<u32>)> {
     if is_f16 {
         byte_offset
@@ -118,15 +99,7 @@ fn scaled(q: ScalarExpr, bias: f32, scale_word: ScalarExpr) -> ScalarExpr {
 /// One IEEE-754 binary16 lane of `word`, as an `f32`, in pure scalar
 /// arithmetic.
 ///
-/// This is the `Map` spelling of an f16 scale — the thing that keeps a
-/// [`QLayout::Native`] row off a
-/// `BlockProgram`. The trick is reaching for
-/// the right primitive: `Unpack2x16Float` yields a two-lane *vector*, and
-/// picking a lane needs `VecComponent`, which exists only at L2; `ScalarExpr`
-/// is scalar by construction and has no projection.
-///
-/// But a half is just bits, and the decode is arithmetic the vocabulary already
-/// has. For a normal half `(-1)^s * 2^(e-15) * (1 + m/1024)`:
+/// For a normal half `(-1)^s * 2^(e-15) * (1 + m/1024)`:
 ///
 /// ```text
 ///   h = (word >> 16*lane) & 0xFFFF
@@ -134,22 +107,13 @@ fn scaled(q: ScalarExpr, bias: f32, scale_word: ScalarExpr) -> ScalarExpr {
 ///   value = (1 - 2s) * exp2(e - 15) * (1 + m * (1/1024))
 /// ```
 ///
-/// `Shr`/`BitAnd` are the mask-and-shift the algebra rules already read as
-/// their `Div`/`Rem` twins, and `Exp2` supplies the exponent — so this is one
-/// `Map`, visible to constant folding and to fusion, with no intrinsic and no
-/// new node.
+/// The `e == 0` branch is not optional: the normal formula at `h == 0` yields
+/// `2^-15`, not zero, and an all-zero block is ordinary. `e == 0` means
+/// `2^-14 * (m/1024)` with no implicit leading one, so the magnitude is a
+/// `select` on `e == 0` over the two rows.
 ///
-/// **The `e == 0` branch is not optional, and assuming it was is a bug this
-/// nearly shipped with.** The normal formula at `h == 0` yields
-/// `2^-15 * (1 + 0)` = 3.05e-5, not zero — and an all-zero block is an ordinary
-/// thing for a quantized file to contain. IEEE spells that row differently:
-/// `e == 0` means `2^-14 * (m/1024)` with no implicit leading one, which gives
-/// exactly `0.0` at `m == 0` and the correct value for every subnormal. So the
-/// magnitude is a `select` on `e == 0` over the two rows.
-///
-/// Checked exhaustively against `f16::from_bits` over all 63,488 finite halves:
-/// zero mismatches. Inf and NaN (`e == 31`) are not representable scales and are
-/// not special-cased; a file carrying one is already broken.
+/// Checked exhaustively against `f16::from_bits` over all finite halves. Inf
+/// and NaN (`e == 31`) are not representable scales and are not special-cased.
 fn f16_lane(word: ScalarExpr, lane: u32) -> ScalarExpr {
     let half = field(word, u(16 * lane), 0xFFFF);
     let sign = ScalarExpr::bin(BinOp::BitAnd, ScalarExpr::bin(BinOp::Shr, half.clone(), u(15)), u(1));
@@ -195,19 +159,14 @@ fn scaled_f16(q: ScalarExpr, bias: f32, scale_word: ScalarExpr, lane: u32) -> Sc
 }
 
 /// The definitional expansion of `Dequant(q)`, or `None` when this
-/// `(fmt, layout)` is not spelled as bit arithmetic yet.
-///
-/// `None` is what makes this additive: the class stays exactly as it is, and
-/// the pairs that still need a `BlockProgram` — the four `Native` rows whose
-/// block stride is not a whole number of words — keep it.
+/// `(fmt, layout)` is not spelled as bit arithmetic: the four `Native` rows
+/// whose block stride is not a whole number of words keep their
+/// `BlockProgram`.
 pub(crate) fn dequant_defn(q: &QMatrix) -> Result<Option<Id>> {
     let (Dim::Const(rows), Dim::Const(cols)) = (q.rows, q.cols) else {
         return Ok(None);
     };
     let (fmt, layout) = (q.fmt, q.layout);
-    // No layout guard: an f16 scale decodes through `f16_lane`, and what is
-    // left of the old restriction is exactly the alignment test below — which
-    // is a property of the block stride, not of the layout name.
     let Some(bw) = block_words(fmt, layout) else {
         return Ok(None);
     };
@@ -219,10 +178,9 @@ pub(crate) fn dequant_defn(q: &QMatrix) -> Result<Option<Id>> {
 
     let graph = q.tensor.graph();
     // The same block stream bound a second time as a rank-1 `U32` leaf,
-    // sharing the weight's own byte allocation. Keyed by the source leaf's
-    // id — a leaf's bytes are immutable, so the id names the content — and
-    // repeated `dequantize` calls on one weight share one node. An
-    // adjoint-minted quantized value has no host bytes, so it has no defn.
+    // sharing the weight's own byte allocation; repeated `dequantize` calls
+    // on one weight share one node. An adjoint-minted quantized value has no
+    // host bytes, so it has no defn.
     let Some(words) = graph.words_leaf_of(q.tensor.id())? else {
         return Ok(None);
     };
@@ -268,11 +226,9 @@ pub(crate) fn dequant_defn(q: &QMatrix) -> Result<Option<Id>> {
                 StrideSpec::broadcast(Dim::Const(8)),
                 StrideSpec::broadcast(Dim::Const(4)),
             ]);
-            // The byte selector as an *index leaf*, not `IndexOf`:
+            // The byte selector is an index leaf, not `IndexOf`:
             // `covers_for_substitution` refuses to substitute an
-            // `IndexOf`-reading body into any nest whose space is not exactly
-            // its own, which is the gate this decode must clear to reach a
-            // contraction's staging fill.
+            // `IndexOf`-reading body into a nest whose space is not its own.
             let shift = index_leaf(graph, &[0, 8, 16, 24])?;
             let shift_specs = [
                 StrideSpec::broadcast(Dim::Const(rows)),
@@ -407,20 +363,14 @@ pub(crate) fn dequant_defn(q: &QMatrix) -> Result<Option<Id>> {
         // Element `e = gp * 64 + parity * 32 + w * 4 + b`, so the group index
         // is `g = gp * 2 + parity` and the quant byte is `gp * 32 + w * 4 + b`
         // — one byte serving group `2 * gp` in its low nibble and `2 * gp + 1`
-        // in its high one, which is exactly `decode_k::k4_lane`'s
-        // `byte_index`. The reference's two branches, `lane = g & 3` and
-        // `high = g >= 4`, are then functions of `(gp, parity)` alone, so they
-        // become two eight-entry index leaves — the same device the nibble
-        // shift already uses, and for the same reason: an `IndexOf`-reading
-        // body is refused by `covers_for_substitution`.
+        // in its high one. `lane = g & 3` and `high = g >= 4` are functions of
+        // `(gp, parity)` alone, so they become two eight-entry index leaves.
         //
         // Q5K is 180 bytes = 45 words: the identical field set with a 32-byte
         // high-bit plane inserted ahead of the quants. Element `e`'s fifth bit
-        // is bit `g` of plane byte `in_group = w * 4 + b`, so its shift inside
-        // the word is `8 * b + g` — the plane word depends on `w` alone, and
-        // the shift is one more index leaf over `(gp, parity, b)`. Nothing else
-        // about the block differs, which is why it shares this arm rather than
-        // copying it.
+        // is bit `g` of plane byte `w * 4 + b`, so its shift inside the word
+        // is `8 * b + g` — the plane word depends on `w` alone, and the shift
+        // is one more index leaf over `(gp, parity, b)`.
         QFmt::Q4K | QFmt::Q5K => {
             let (Some((min_word, min_lane)), Some(gs_word)) = (
                 fields
@@ -493,8 +443,7 @@ pub(crate) fn dequant_defn(q: &QMatrix) -> Result<Option<Id>> {
                 ]);
                 extra.push((plane, words));
                 // `8 * b + g` for `g = 2 * gp + parity`, tabulated over
-                // `(gp, parity, b)` — an index leaf for the same reason the
-                // nibble shift is one.
+                // `(gp, parity, b)`.
                 let table: Vec<u32> = (0..4 * 2 * 4)
                     .map(|i| {
                         let (gp, parity, b) = (i / 8, (i / 4) % 2, i % 4);
@@ -563,9 +512,8 @@ pub(crate) fn dequant_defn(q: &QMatrix) -> Result<Option<Id>> {
             // the same restride and only the lane differs.
             let d = scale_of(arg(0), scale_lane);
             let dmin = scale_of(arg(1), min_lane);
-            // `k4_lane`'s exact operation order — `q * (gs * d) - (gm * dmin)`,
-            // not a reassociated equivalent — so this is bit-identical to
-            // `cpu_dequantize_block` rather than merely close.
+            // `k4_lane`'s exact operation order — `q * (gs * d) - (gm * dmin)`
+            // — so this is bit-identical to `cpu_dequantize_block`.
             let body = ScalarExpr::bin(
                 BinOp::Sub,
                 ScalarExpr::bin(
@@ -598,16 +546,8 @@ pub(crate) fn dequant_defn(q: &QMatrix) -> Result<Option<Id>> {
         // high-bit bytes in words 32..48, sixteen *signed* i8 group scales in
         // words 48..52, then the f32 super-block scale last, at word 52.
         //
-        // Q6K is the one format whose scale sits at the end, which is exactly
-        // why its native block is 210 bytes and not word-aligned. That is not
-        // a problem to solve here: a `Map` only ever sees `F32Scales` (f16
-        // scales have no lane projection at L0), and `F32Scales` widens the
-        // trailing scale to four bytes, making the block 53 whole words. The
-        // 210-byte stride is `qrepack`'s side of the bridge, and `qrepack` is
-        // already priced.
-        //
         // The reference walks `e = chunk * 128 + group * 32 + hb` with two
-        // terms that are *not* affine in `(chunk, group, hb)`: `group & 1`
+        // terms that are not affine in `(chunk, group, hb)`: `group & 1`
         // picks the 32-byte half of the low plane, and `hb >> 4` picks which
         // of the two group scales in that half applies. Splitting the two
         // indices at exactly those bits — `group = gh * 2 + gl` and
@@ -619,8 +559,6 @@ pub(crate) fn dequant_defn(q: &QMatrix) -> Result<Option<Id>> {
         //   qh word =  8 * chunk           + 4 * wh + wl
         //   gs word =  2 * chunk + gh    (byte `8 * chunk + 4 * gh + 2 * gl + wh`,
         //                                 and `2 * gl + wh < 4` never carries)
-        //
-        // so no byte-addressed load and no divmod appear anywhere.
         QFmt::Q6K => {
             let (Some(qh_word), Some(gs_word)) = (
                 fields.qh.and_then(field_word),
@@ -692,7 +630,7 @@ pub(crate) fn dequant_defn(q: &QMatrix) -> Result<Option<Id>> {
             let d = scale_of(arg(0), scale_lane);
             // `d * group_scale * q`'s exact association, as
             // `cpu_dequantize_block` writes it, so this is bit-identical to
-            // the oracle rather than merely close.
+            // the oracle.
             let body = ScalarExpr::bin(
                 BinOp::Mul,
                 ScalarExpr::bin(BinOp::Mul, d, group_scale),
@@ -730,18 +668,12 @@ mod tests {
     use crate::session::{Backend, Session};
     use half::f16;
 
-    /// [`f16_lane`] against `f16::from_bits`, for **every** finite half, in
-    /// both lanes, through the real evaluator.
-    ///
-    /// This is the claim the whole `Native` expansion rests on, so it is
-    /// checked exhaustively rather than on a sample: the decode is 63,488
-    /// separate pieces of arithmetic, and the subnormal row — which the normal
-    /// formula gets wrong at every one of its 2,048 inputs, `0.0` included —
-    /// is only 3% of them. A random-scale test would miss it about 97% of the
-    /// time.
+    /// [`f16_lane`] against `f16::from_bits`, for every finite half, in both
+    /// lanes, through the real evaluator. Exhaustive because the subnormal
+    /// row is only 3% of the inputs; a random-scale test would usually miss it.
     ///
     /// `e == 31` is Inf/NaN: not a representable scale, and NaN is unequal to
-    /// itself, so those 2,048 patterns are excluded rather than asserted on.
+    /// itself, so those patterns are excluded rather than asserted on.
     #[test]
     fn f16_lane_decodes_every_finite_half_exactly() {
         let session = Session::new(Backend::cpu().unwrap()).unwrap();

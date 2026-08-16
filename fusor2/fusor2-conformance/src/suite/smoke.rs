@@ -1,10 +1,8 @@
-//! The smoke cases the suite was missing: upload-and-read-back, one
-//! elementwise op, one matmul, one repeated read. Every other area assumes
-//! these work; when they do not, 600 rows all fail for the same plumbing
-//! reason and the real failure distribution is invisible.
+//! Smoke cases: upload-and-read-back, one elementwise op, one matmul, one
+//! repeated read. Every other area assumes these work, so they are registered
+//! first in `suite::registry`.
 //!
 //! Each asserts the actual numbers, on every backend `sessions()` offers.
-//! Registered first in `suite::registry` for the same reason.
 
 use fusor2::{Graph, Session};
 

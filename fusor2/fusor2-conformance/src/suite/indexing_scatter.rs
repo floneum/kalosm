@@ -1,14 +1,12 @@
 //! `Gather` and all four `Scatter{Add}` lowerings, including duplicate
 //! indices, which must accumulate.
 //!
-//! That is the load-bearing property in this area: `Scatter{Add}` is the
-//! declared adjoint of `Gather`, so one token appearing twice in a batch must
-//! receive the summed gradient. The duplicate cases draw their indices through
-//! a modulus below both the index count and the row extent, so every run has a
-//! repeated row *and* an unread row — an index set that happens to be a
-//! permutation cannot tell a correct scatter-add from a scatter-set, and one
-//! with full coverage cannot tell an explicit zero from a missing gradient.
-//! Table extents and index counts are re-sampled per run; every index comes
+//! `Scatter{Add}` is the declared adjoint of `Gather`, so one token appearing
+//! twice in a batch must receive the summed gradient. The duplicate cases draw
+//! their indices through a modulus below both the index count and the row
+//! extent, so every run has a repeated row and an unread row: a permutation
+//! index cannot tell scatter-add from scatter-set, and a fully covering one
+//! cannot tell an explicit zero from a missing gradient. Every index comes
 //! from `fill_indices` over a sampled extent, so it is always in bounds.
 
 use fusor2::{Dtype, Session};
@@ -580,10 +578,6 @@ fn scatter_set_unproven(session: &Session) -> CaseResult {
     }
     Ok(())
 }
-
-// ---------------------------------------------------------------------------
-// i() / TensorIndex
-// ---------------------------------------------------------------------------
 
 /// `i((p, ..))` on a rank-2: exactly one bare index, and it removes its axis.
 fn index_rank2(session: &Session, shape: &[u64], seed: u32) -> CaseResult {

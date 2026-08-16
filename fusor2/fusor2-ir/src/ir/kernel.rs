@@ -1,8 +1,8 @@
-//! L2 `tile` — one kernel body. Structural sharing is the hash-cons, so two
+//! Kernel `tile` — one kernel body. Structural sharing is the hash-cons, so two
 //! identical subtrees built separately merge. [`Stmt::AtomicAdd`] is supported.
 //! Element type is runtime data, never a marker type.
 //!
-//! L2 is produced *after* extraction and is not part of the e-graph. Barrier
+//! Kernel is produced *after* extraction and is not part of the e-graph. Barrier
 //! elision and arena packing stay closed-form argmins here with an independent
 //! verifier — an honest exclusion, marked as such.
 
@@ -27,7 +27,7 @@ pub enum ScalarElement {
     BF16,
     U32,
     I32,
-    /// Exists only at L2 — L0 encodes booleans as 1.0/0.0.
+    /// Exists only at Kernel — Logical encodes booleans as 1.0/0.0.
     Bool,
 }
 
@@ -51,7 +51,7 @@ pub enum CoopMatrixRole {
     C,
 }
 
-/// Runtime element type of an L2 value.
+/// Runtime element type of an Kernel value.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ElementType {
     Scalar(ScalarElement),
@@ -134,7 +134,7 @@ pub enum BufferAccess {
     ReadWrite,
 }
 
-/// A concrete L2 layout: extents plus a logical-to-storage index map.
+/// A concrete Kernel layout: extents plus a logical-to-storage index map.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileLayout {
     pub extents: SmallVec<[u32; 4]>,
@@ -180,7 +180,7 @@ pub struct BufferDecl {
 /// **Identity-bearing**, for the same reason [`LocalDecl`] is. Two tiles of
 /// the same element, shape and name are two *allocations*, which the arena
 /// may place at two different offsets and which a barrier may separate. Under
-/// structural equality they were one value to the L2 term memo, so a
+/// structural equality they were one value to the Kernel term memo, so a
 /// `LoadTile`/`CoopLoad` off the second folded into the first — a lowering
 /// that staged into two same-shaped buffers (double buffering, `staging: 2`)
 /// read one of them twice and never touched the other.
@@ -194,7 +194,7 @@ pub struct TileDecl {
 
 thread_local! {
     /// Decl ids are unique **within a kernel build** — that is the whole
-    /// contract (the L2 term memo is per builder, the arena per kernel).
+    /// contract (the Kernel term memo is per builder, the arena per kernel).
     /// They are thread-local and resettable rather than process-global so
     /// that two identical lowerings mint identical ids: the pipeline cache
     /// deduplicates compiled kernels on body identity, and a globally-unique
@@ -248,7 +248,7 @@ impl Hash for TileDecl {
 ///
 /// **Identity-bearing.** Two locals of the same element type are two
 /// registers, so `id` — not `element` — is what equality and hashing key on.
-/// Without it the L2 term memo folded `LoadLocal(a)` into `LoadLocal(b)`
+/// Without it the Kernel term memo folded `LoadLocal(a)` into `LoadLocal(b)`
 /// whenever they had the same type, and every kernel carrying more than one
 /// same-typed accumulator (a `tn`-wide register tile, a multi-slot fold
 /// carrier, a coop accumulator pair) read one register `tn` times.
@@ -403,7 +403,7 @@ pub enum Builtin {
     NumSubgroups,
 }
 
-/// A typed L2 literal.
+/// A typed Kernel literal.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TileLiteral {
     F32(u32),
@@ -478,13 +478,13 @@ pub enum CoopSrc {
 // Expressions
 // ---------------------------------------------------------------------------
 
-/// A hash-consed L2 value. Structural sharing *is* the hash-cons: two
+/// A hash-consed Kernel value. Structural sharing *is* the hash-cons: two
 /// identical subtrees built separately merge, which pointer-keyed
 /// memoization cannot do. `ty` and `hash` are cached at construction.
 #[derive(Clone, Debug)]
 pub struct TileExpr(Arc<TileNode>);
 
-/// An L2 node with its cached type, hash and memory-read set.
+/// An Kernel node with its cached type, hash and memory-read set.
 #[derive(Debug)]
 pub struct TileNode {
     pub kind: TileExprKind,
@@ -535,7 +535,7 @@ impl MemReads {
     }
 }
 
-/// The L2 value tree.
+/// The Kernel value tree.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TileExprKind {
     // leaves
@@ -613,7 +613,7 @@ pub enum TileExprKind {
     /// A `CoopMatrix` accumulator has to start somewhere, and a scalar zero is
     /// not that somewhere: `Stmt::Loop` requires `init.element() ==
     /// local.element`, so `lower_coop` initializing its C fragment with an
-    /// `f32` literal failed `verify_l2` on every device that selected the
+    /// `f32` literal failed `verify_kernel` on every device that selected the
     /// cooperative family. There is no arithmetic that produces a zero
     /// fragment from a scalar, so it is a leaf.
     CoopZero {
@@ -795,7 +795,7 @@ pub struct Accumulator {
 ///
 /// **Cross-lane reads are required, not forbidden.** `body[1]` may read
 /// `lhs[0]`: flash's running sum and its output accumulator both read the
-/// running max. What `verify_l2` rejects is a read of anything *outside*
+/// running max. What `verify_kernel` rejects is a read of anything *outside*
 /// `lhs`/`rhs` — a merge that reads a `Tile`, a `Builtin` or a lane id is not a
 /// merge, and a per-lane-independent merge would be the wrong abstraction.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -819,7 +819,7 @@ impl MergeBody {
     }
 }
 
-/// One ordered L2 statement. `FillTile` is not sugar: it is the only form
+/// One ordered Kernel statement. `FillTile` is not sugar: it is the only form
 /// whose vectorized and guard-free variants the lowerer can select.
 /// `CoopStore` is subgroup-collective, never a per-lane store;
 /// `CoopStoreTile` is the staging step attention needs between fragment
@@ -832,7 +832,7 @@ pub enum Stmt {
         value: TileExpr,
         mask: TileExpr,
     },
-    /// Added for `ScatterMode::Atomic`; carries `Effect::InPlace` at L1.
+    /// Added for `ScatterMode::Atomic`; carries `Effect::InPlace` at Launch.
     AtomicAdd {
         dst: StorageView,
         addr: Addr,
@@ -991,7 +991,7 @@ pub struct Tiles {
 
 /// The result of workgroup-arena planning. `arena_plan` is a **pure
 /// memoized function** of `(geom, dtype, caps)` and the *same* function
-/// `verify_l1` admits against and the L2 emitter lays out with. `total_bytes`
+/// `verify_launch` admits against and the Kernel emitter lays out with. `total_bytes`
 /// feeds both the footprint check and the occupancy term.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ArenaPlan {
@@ -1017,7 +1017,7 @@ pub trait ArenaPlanner: Send + Sync {
     fn arena_plan(&self, ir: &KernelIr, caps: &crate::device::Caps) -> Result<ArenaPlan>;
 
     /// Workgroup bytes a candidate geometry needs, without building the
-    /// body — the exact value `verify_l1` admits against.
+    /// body — the exact value `verify_launch` admits against.
     fn workgroup_bytes(&self, tiles: &Tiles, caps: &crate::device::Caps) -> Result<u32>;
 
     fn barrier_suggestions(&self, ir: &KernelIr) -> Vec<BarrierSuggestion>;
@@ -1032,7 +1032,7 @@ pub trait ArenaPlanner: Send + Sync {
     fn verify_uniformity(&self, ir: &KernelIr) -> Result<()>;
 }
 
-/// Why L2 lowering failed.
+/// Why Kernel lowering failed.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LowerError {
     BarrierHazard(String),
@@ -1055,8 +1055,8 @@ impl fmt::Display for LowerError {
 }
 impl std::error::Error for LowerError {}
 
-/// Per-target lowering of one [`crate::ir::OpDef`] into L2.
-pub type LowerFn = fn(&crate::ir::Node, &crate::ir::level1::SchedPoint) -> Result<KernelIr>;
+/// Per-target lowering of one [`crate::ir::OpDef`] into Kernel.
+pub type LowerFn = fn(&crate::ir::Node, &crate::ir::launch::SchedPoint) -> Result<KernelIr>;
 
 /// `CoopStore` requires an affine rank-2 destination with a unit stride on
 /// one side; anything else falls back to a per-lane store path.
@@ -1078,7 +1078,7 @@ mod local_identity_tests {
     use super::*;
 
     /// Two locals of the same element type are two registers. Before `id` they
-    /// were `==`, so the L2 term memo folded their `LoadLocal`s together and a
+    /// were `==`, so the Kernel term memo folded their `LoadLocal`s together and a
     /// kernel carrying `tn` same-typed accumulators read one register `tn`
     /// times — which is what made every register-tiled GEMM column identical.
     #[test]

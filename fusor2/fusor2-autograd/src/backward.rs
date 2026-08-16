@@ -2,10 +2,9 @@
 //! pending-children counter, dispatching each node through [`crate::ADJOINTS`]
 //! and accumulating into a per-value gradient slot.
 //!
-//! The walk needs the primal's *topology*, which [`Tape`] deliberately does
-//! not expose — a tape only writes. [`Reverse`] therefore carries a cheap
-//! snapshot taken with [`Reverse::over`]; [`backward_into`] is the one-call
-//! form every frontend should use.
+//! The walk needs the primal's topology, which [`Tape`] does not expose — a
+//! tape only writes. [`Reverse`] carries a snapshot taken with
+//! [`Reverse::over`]; [`backward_into`] is the one-call form.
 
 use crate::adjoints::adjoint_of;
 use crate::custom::CustomRegistry;
@@ -15,7 +14,7 @@ use fusor2_ir::autograd::{Adjoint, AdjointKind, Autograd, Grads, Tape, Val};
 use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::{Dtype, NumericContract};
 use fusor2_ir::egraph::{EGraph, Id};
-use fusor2_ir::ir::level0::{L0, LeafKind};
+use fusor2_ir::ir::logical::{Logical, LeafKind};
 use fusor2_ir::ir::{Children, Node, Op};
 use fusor2_ir::{Error, Result};
 use rustc_hash::FxHashMap;
@@ -47,7 +46,7 @@ impl Topology {
             let node = graph.node(id);
             let external = matches!(
                 &node.op,
-                Op::L0(L0::Leaf(LeafKind::Param { .. } | LeafKind::Buffer { .. }))
+                Op::Logical(Logical::Leaf(LeafKind::Param { .. } | LeafKind::Buffer { .. }))
             );
             // Only a float leaf is differentiable. An index buffer is `U32`
             // and `Gather`'s adjoint correctly hands it `None`; marking it
@@ -86,14 +85,11 @@ impl Topology {
         self.dtype[id.index()]
     }
 
-    /// An **externally supplied** leaf is where `requires_grad` originates;
+    /// An externally supplied leaf is where `requires_grad` originates;
     /// everything else is derived, never annotated.
     ///
-    /// A float `Buffer` or `Param` qualifies; only a `Leaf::Const` does not.
-    /// Restricting the origin to `Param` would make `d loss / d x` for any
-    /// uploaded input come back empty, which is every finite-difference
-    /// gradient check there is. An integer leaf is an index, never a
-    /// differentiable value.
+    /// A float `Buffer` or `Param` qualifies; a `Leaf::Const` does not. An
+    /// integer leaf is an index, never a differentiable value.
     pub fn is_param(&self, id: Val) -> bool {
         self.is_param[id.index()]
     }
@@ -209,8 +205,6 @@ pub fn reverse_order(root: Val, len: usize) -> Vec<Val> {
     (0..top).rev().map(|i| Id(i as u32)).collect()
 }
 
-// ----------------------------------------------------------------- the walk
-
 fn walk(
     topo: &Topology,
     custom: Option<&CustomRegistry>,
@@ -243,19 +237,13 @@ fn walk(
     // 2. `requires_grad` is derived, not annotated: a node requires grad iff
     //    it is a `Param` leaf, it is named in `wrt`, or any operand does.
     //    Children are strictly smaller, so one ascending pass is a fixpoint.
-    //
-    //    `wrt` seeds the set as much as `Param` does. Asking for `d loss/d x`
-    //    *is* the declaration that `x` requires a gradient — otherwise
-    //    `backward_with`'s explicit set could only ever name a subset of the
-    //    parameters and every gradient check against an uploaded input would
-    //    silently come back empty.
     let mut needs = vec![false; n];
     for w in wrt {
         if w.index() < n
             && reach[w.index()]
             && !matches!(
                 &topo.node(*w).op,
-                Op::L0(L0::Leaf(LeafKind::Const { .. } | LeafKind::Uniform { .. }))
+                Op::Logical(Logical::Leaf(LeafKind::Const { .. } | LeafKind::Uniform { .. }))
             )
         {
             needs[w.index()] = true;
@@ -325,18 +313,15 @@ fn walk(
         }
     }
 
-    // 5. Every requested value must have received a gradient, and it is
-    //    reported by name. `Option` in the return type is what let a missing
-    //    gradient look like a legitimate zero for as long as it did: the
-    //    caller sees `None`, cannot tell "this value is not on the tape" from
-    //    "a rule dropped this operand", and reads the second as the first.
+    // 5. Every requested value must have received a gradient, and a missing
+    //    one is reported by name: a `None` cannot distinguish "not on the
+    //    tape" from "a rule dropped this operand".
     if let Some(e) = first_missing(topo, &reach, &needs, wrt, &grads) {
         return Err(e);
     }
 
-    // Every *other* reachable requires-grad node must have one too: a rule
-    // that omits a requires-grad parent starves its whole subgraph, which is
-    // an error rather than a silent zero even when nobody asked for it.
+    // Every other reachable requires-grad node must have one too: a rule
+    // that omits a requires-grad parent starves its whole subgraph.
     for i in 0..n {
         let id = Id(i as u32);
         if reach[i] && needs[i] && !grads.contains_key(&id) {
@@ -373,7 +358,7 @@ fn why_no_gradient(topo: &Topology, reach: &[bool], needs: &[bool], w: Val) -> S
                 which is what detach() does and what an unused tensor looks like"
             .into();
     }
-    if let Op::L0(L0::Leaf(LeafKind::Const { .. } | LeafKind::Uniform { .. })) = &topo.node(w).op {
+    if let Op::Logical(Logical::Leaf(LeafKind::Const { .. } | LeafKind::Uniform { .. })) = &topo.node(w).op {
         return "it is a constant leaf; only Param and Buffer leaves carry a gradient".into();
     }
     if !topo.dtype(w).is_float() {
@@ -409,22 +394,22 @@ fn adjoint_of_node(
         // over operand 0.
         Op::Union(..) => Ok(smallvec::smallvec![Some(grad)]),
 
-        Op::L1(_) => Err(Error::Plan(format!(
-            "autograd is an L0 -> L0 transform and runs before saturation, \
-             but {id} is already at L1"
+        Op::Launch(_) => Err(Error::Plan(format!(
+            "autograd is an Logical -> Logical transform and runs before saturation, \
+             but {id} is already at Launch"
         ))),
 
-        Op::L0(l0) => match l0 {
+        Op::Logical(l0) => match l0 {
             // Terminates. A `Param` leaf's entry in `grads` is the answer.
-            L0::Leaf(_) => Ok(Grads::new()),
+            Logical::Leaf(_) => Ok(Grads::new()),
 
             // Routes the gradient into the tuple slot it read.
-            L0::Project { .. } => Ok(smallvec::smallvec![Some(grad)]),
+            Logical::Project { .. } => Ok(smallvec::smallvec![Some(grad)]),
 
             // A `Dequant`'s input is a quantized leaf, which is never
             // trainable: `q_mat_mul`'s gradient goes to the activation only
             // and QAT keeps a separate f32 master.
-            L0::Dequant { .. } => Err(Error::Plan(format!(
+            Logical::Dequant { .. } => Err(Error::Plan(format!(
                 "{id}: quantized weights are not trainable; QAT keeps an f32 master"
             ))),
 
@@ -448,13 +433,13 @@ mod tests {
     use crate::tape::TapeExt;
     use crate::tape::testing::{caps, graph};
     use fusor2_ir::dtype::Dtype;
-    use fusor2_ir::ir::level0::{BufferId, EinSpec, Label};
+    use fusor2_ir::ir::logical::{BufferId, EinSpec, Label};
     use fusor2_ir::scalar::{BinOp, ScalarExpr, UnOp};
     use fusor2_ir::shape::{Dim, Dims};
 
     fn param(g: &mut EGraph, shape: &[u64]) -> Id {
         let n = g.len() as u32;
-        g.add(Op::L0(L0::Leaf(LeafKind::Param {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Param {
             name: BufferId(n),
             dtype: Dtype::F32,
             shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
@@ -464,7 +449,7 @@ mod tests {
 
     fn buffer(g: &mut EGraph, shape: &[u64]) -> Id {
         let n = g.len() as u32;
-        g.add(Op::L0(L0::Leaf(LeafKind::Buffer {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
             name: BufferId(n),
             dtype: Dtype::F32,
             shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
@@ -473,7 +458,7 @@ mod tests {
     }
 
     fn ones(g: &mut EGraph, shape: &[u64]) -> Id {
-        g.add(Op::L0(L0::Leaf(LeafKind::Const {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Const {
             value: fusor2_ir::dtype::Splat::F32(1.0),
             shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
         })))
@@ -506,8 +491,8 @@ mod tests {
     #[test]
     fn a_constant_wrt_is_an_error_that_names_it() {
         let mut g = graph();
-        // `ones` is a `Leaf::Const` — the reference's `Graph::constant`, the
-        // one leaf spelling that carries `requires_grad = false`.
+        // `ones` is a `Leaf::Const`, the one leaf spelling that carries
+        // `requires_grad = false`.
         let x = ones(&mut g, &[2]);
         let y = {
             let mut t = GraphTape::new(&mut g);
@@ -612,8 +597,8 @@ mod tests {
         assert!(backward_into(&mut g, &caps(), x, s, &[]).unwrap().is_empty());
     }
 
-    /// The whole point of the `Err`: every entry the caller does get back is
-    /// populated, so `unwrap()` on it cannot hide a dropped adjoint.
+    /// Every entry the caller gets back is populated, so `unwrap()` on it
+    /// cannot hide a dropped adjoint.
     #[test]
     fn every_returned_entry_is_populated() {
         let mut g = graph();
@@ -653,7 +638,7 @@ mod tests {
         // The gradient reaching `x` is an accumulation of exactly two terms.
         let dx = got[0].unwrap();
         match &g.node(dx).op {
-            Op::L0(L0::Map { ins, .. }) => assert_eq!(ins.len(), 2),
+            Op::Logical(Logical::Map { ins, .. }) => assert_eq!(ins.len(), 2),
             other => panic!("expected an accumulating Map, got {other:?}"),
         }
     }
@@ -686,7 +671,7 @@ mod tests {
             out: [Label(0), Label(1)].into_iter().collect(),
         };
         let y = g
-            .add(Op::L0(L0::Contract {
+            .add(Op::Logical(Logical::Contract {
                 spec,
                 acc: Dtype::F32,
                 a: x,
@@ -721,7 +706,7 @@ mod tests {
         let dx = got[0].expect("starvation is impossible: a comparison yields zeros");
         assert!(matches!(
             g.node(dx).op,
-            Op::L0(L0::Leaf(LeafKind::Const { .. }))
+            Op::Logical(Logical::Leaf(LeafKind::Const { .. }))
         ));
     }
 
@@ -801,7 +786,7 @@ mod train_xor {
     use crate::tape::testing::{Env, caps, check_gradients, eval, graph};
     use crate::tape::GraphTape;
     use fusor2_ir::dtype::{Dtype, Splat};
-    use fusor2_ir::ir::level0::{BufferId, EinSpec, Label};
+    use fusor2_ir::ir::logical::{BufferId, EinSpec, Label};
     use fusor2_ir::scalar::{BinOp, UnOp};
     use fusor2_ir::shape::Dim;
     use rustc_hash::FxHashMap;
@@ -822,7 +807,7 @@ mod train_xor {
                 shape: dims.into_iter().collect(),
             }
         };
-        g.add(Op::L0(L0::Leaf(kind))).unwrap()
+        g.add(Op::Logical(Logical::Leaf(kind))).unwrap()
     }
 
     fn matmul(g: &mut EGraph, a: Id, b: Id) -> Id {
@@ -831,7 +816,7 @@ mod train_xor {
             b: [Label(2), Label(1)].into_iter().collect(),
             out: [Label(0), Label(1)].into_iter().collect(),
         };
-        g.add(Op::L0(L0::Contract {
+        g.add(Op::Logical(Logical::Contract {
             spec,
             acc: Dtype::F32,
             a,
@@ -872,7 +857,7 @@ mod train_xor {
         }
 
         let seed = g
-            .add(Op::L0(L0::Leaf(LeafKind::Const {
+            .add(Op::Logical(Logical::Leaf(LeafKind::Const {
                 value: Splat::F32(1.0),
                 shape: [Dim::Const(4), Dim::Const(1)].into_iter().collect(),
             })))

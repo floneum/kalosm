@@ -1,8 +1,7 @@
 //! Cross-lane reductions: subgroup collectives, shared-memory trees, and the
-//! loop-then-tree hybrid. The strategy is a parameter on the node, so it stays
-//! a late capability-driven choice rather than a construction-time one.
+//! loop-then-tree hybrid. The strategy is a parameter on the node.
 
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::kernel::{
     Builtin, ElementType, ReduceKind, ScalarElement, Tile, TileExpr, TileExprKind, TileReduceOp,
 };
 use fusor2_ir::target::EmitError;
@@ -123,7 +122,7 @@ impl Emitter<'_> {
         op: TileReduceOp,
         value: &TileExpr,
         iterations: u32,
-        index: &fusor2_ir::ir::level2::Local,
+        index: &fusor2_ir::ir::kernel::Local,
     ) -> Result<Handle<Expression>, EmitError> {
         let element = value.element();
         let depth = self.depth;
@@ -225,16 +224,14 @@ impl Emitter<'_> {
         self.load_tile_value(out, scratch, result_ptr)
     }
 
-    /// The whole-block tree on a fixed-subgroup-width device: **one collective
+    /// The whole-block tree on a fixed-subgroup-width device: one collective
     /// per subgroup, the per-subgroup partials staged through the first
     /// `block/width` scratch slots, and a serial fold every lane performs in
-    /// the same order** — two barriers total against the tree's
-    /// `2 + log2(block)`, which is the difference between a matvec row's
-    /// reduce tail and its whole k-loop on short reductions.
+    /// the same order — two barriers total against the tree's
+    /// `2 + log2(block)`.
     ///
     /// Every lane folds the identical slots in the identical order, so all
-    /// lanes hold the same total — the same guarantee tree lanes get from
-    /// reading `scratch[result_index]`. When one subgroup covers the block the
+    /// lanes hold the same total. When one subgroup covers the block the
     /// collective alone is the reduction: no scratch, no barriers.
     fn collective_tree_reduce(
         &mut self,
@@ -295,15 +292,13 @@ impl Emitter<'_> {
         Ok(total)
     }
 
-    /// The **N-ary** reduction: an explicit log-tree over `lanes * block`
+    /// The N-ary reduction: an explicit log-tree over `lanes * block`
     /// scratch, evaluating the carrier's `merge` at every level.
     ///
-    /// There is no hardware collective for a multi-lane merge — `subgroupAdd`
-    /// folds one value with one operator — so `Subgroup` is refused rather than
-    /// silently reducing lane 0 and dropping the rest. `Loop` is refused too:
-    /// per-lane accumulation needs the carrier's identities to seed from, which
-    /// live on `L1::KFold`, so the lowering builds that with `Stmt::Loop` and
-    /// closes with the tree.
+    /// `Subgroup` is refused: there is no hardware collective for a
+    /// multi-lane merge. `Loop` is refused too: per-lane accumulation needs
+    /// the carrier's identities, which live on `Launch::Fold`, so the
+    /// lowering builds that with `Stmt::Loop` and closes with the tree.
     ///
     /// Every `merge` expression reads only its formals, so all `lanes` merges
     /// are evaluated before any is written back and no level can read a slot its
@@ -312,9 +307,9 @@ impl Emitter<'_> {
         &mut self,
         kind: &ReduceKind,
         values: &[TileExpr],
-        merge: &fusor2_ir::ir::level2::MergeBody,
+        merge: &fusor2_ir::ir::kernel::MergeBody,
         scratch: &[Tile],
-        outs: &[fusor2_ir::ir::level2::Local],
+        outs: &[fusor2_ir::ir::kernel::Local],
         out: &mut Block,
     ) -> Result<(), EmitError> {
         let group_size = match kind {
@@ -455,7 +450,7 @@ mod tests {
     use super::*;
     use crate::emit::emit_module;
     use crate::emit::testkit::{self, *};
-    use fusor2_ir::ir::level2::{Addr, KernelIr, Stmt, TileExprKind};
+    use fusor2_ir::ir::kernel::{Addr, KernelIr, Stmt, TileExprKind};
 
     /// `out[0] = reduce(in[lane])`, written by lane 0.
     fn sum_kernel(block: u32, kind: ReduceKind, name: &'static str) -> KernelIr {
@@ -575,9 +570,8 @@ mod tests {
 
     /// The emitted WGSL for a plain single-slot fold, as text.
     ///
-    /// Set `FUSOR2_WGSL_DUMP=<dir>` to write the four shaders out; that is how
-    /// [`single_slot_reduce_wgsl_is_unchanged`]'s goldens were recorded from the
-    /// tree *before* the N-ary reduction landed.
+    /// Set `FUSOR2_WGSL_DUMP=<dir>` to write the four shaders out for
+    /// re-recording [`single_slot_reduce_wgsl_is_unchanged`]'s goldens.
     fn reduce_wgsl(name: &'static str, ir: &KernelIr) -> String {
         let emitted = emit_module(ir, &caps(false, true), &no_plan()).expect("emits");
         let mut flags = naga::back::wgsl::WriterFlags::empty();
@@ -590,22 +584,15 @@ mod tests {
         text
     }
 
-    /// **The fast path is byte-identical.** `TileReduceOp::{Sum,Max}` at one
-    /// scalar slot must keep emitting the same subgroup collective and the same
-    /// shared-memory tree it emitted before `Stmt::Reduce` existed. The assert is
-    /// textual equality of the shader, not numeric agreement: every one of the
-    /// passing folds in the suite goes down this path, and a diff here means the
-    /// N-ary form was built *in place of* the collective rather than beside it.
+    /// `TileReduceOp::{Sum,Max}` at one scalar slot must keep emitting the
+    /// subgroup collective and the shared-memory tree. The assert is textual
+    /// equality of the shader: a diff here means the N-ary form was built in
+    /// place of the collective rather than beside it.
     ///
-    /// The goldens are FNV-1a hashes of the exact shader text plus its length, so
-    /// a deliberate change is re-recorded by copying one line, and the failure
-    /// message prints the text.
+    /// The goldens are FNV-1a hashes of the exact shader text plus its
+    /// length; the failure message prints the text.
     #[test]
     fn single_slot_reduce_wgsl_is_unchanged() {
-        // Re-baselined when the whole-block tree on a fixed-subgroup-width
-        // device became the subgroup two-stage: the wgtree shaders lost the
-        // halving tree's eight barrier rounds and gained `subgroupAdd` plus
-        // the subgroup id/lane arguments (the block is 64 = two subgroups).
         let cases: [(&'static str, u64, usize); 4] = [
             ("sum_subgroup", 0x3b02_cd5a_329c_469b, 495),
             ("sum_wgtree", 0xa05e_220b_61a6_731a, 837),
@@ -708,13 +695,12 @@ mod tests {
         );
         emit_module(&ir, &caps(false, true), &no_plan()).expect("loop reduce lowers");
     }
-    /// **A hand-built one-lane `Stmt::Reduce` still emits the collective.** The
-    /// statement form is the general merge, but its fast field is the same
-    /// decision the expression form makes, so a node that reaches the emitter
-    /// this way emits `subgroupAdd` rather than a generic merge loop.
+    /// A hand-built one-lane `Stmt::Reduce` still emits the collective: the
+    /// statement form's fast field makes the same decision as the expression
+    /// form.
     #[test]
     fn a_one_lane_reduce_statement_emits_the_subgroup_collective() {
-        use fusor2_ir::ir::level2::{Local, LocalDecl, MergeBody};
+        use fusor2_ir::ir::kernel::{Local, LocalDecl, MergeBody};
         use fusor2_ir::scalar::BinOp;
         use std::sync::Arc;
 
@@ -774,7 +760,7 @@ mod tests {
         );
     }
 
-    fn load_src(sv: &fusor2_ir::ir::level2::StorageView) -> TileExpr {
+    fn load_src(sv: &fusor2_ir::ir::kernel::StorageView) -> TileExpr {
         load(sv, lane())
     }
 }

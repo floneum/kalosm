@@ -6,17 +6,15 @@
 //! directions, `round`, `relu`, `sigmoid`, `silu`, `gelu` and `tanh_exact`.
 //! There is no per-op `match` outside [`ScalarKind`].
 //!
-//! **Derivatives are written in terms of the operand, never the primal
-//! output.** `d(exp)/dx = s * exp(x)`, not `s * out`. The two are the same
-//! value; `ScalarExpr` is hash-consed, so the recomputed `exp(x)` is one
-//! term inside the same kernel body rather than an extra operand edge, and
-//! whether the forward `exp` is instead materialized and reread stays the
-//! extractor's materialization bit.
+//! Derivatives are written in terms of the operand, never the primal
+//! output: `d(exp)/dx = s * exp(x)`, not `s * out`. `ScalarExpr` is
+//! hash-consed, so the recomputed `exp(x)` is one term inside the same
+//! kernel body rather than an extra operand edge.
 
 use fusor2_ir::autograd::{Grads, Tape, Val};
 use fusor2_ir::dtype::{Dtype, Splat};
 use fusor2_ir::ir::Node;
-use fusor2_ir::ir::level0::L0;
+use fusor2_ir::ir::logical::Logical;
 use fusor2_ir::ir::Op;
 use fusor2_ir::scalar::{BinOp, CmpOp, ScalarExpr, ScalarKind, UnOp};
 use fusor2_ir::{Error, Result};
@@ -25,7 +23,7 @@ use smallvec::SmallVec;
 /// One partial per `Arg(i)` of the differentiated body.
 pub type Partials = SmallVec<[Option<ScalarExpr>; 4]>;
 
-/// Adjoint of `L0::Map`: differentiate the body once with respect to each
+/// Adjoint of `Logical::Map`: differentiate the body once with respect to each
 /// `Arg(i)`, then map the resulting expression over `(grad, inputs...)`.
 ///
 /// Inside [`differentiate`]'s result, `Arg(i)` still denotes primal operand
@@ -40,7 +38,7 @@ pub fn map_adjoint(
     ins: &[Val],
     _out: Val,
 ) -> Result<Grads> {
-    let Op::L0(L0::Map { expr, outs, .. }) = &node.op else {
+    let Op::Logical(Logical::Map { expr, outs, .. }) = &node.op else {
         return Err(Error::Plan(format!(
             "map_adjoint called on a non-Map node: {:?}",
             node.op
@@ -48,8 +46,7 @@ pub fn map_adjoint(
     };
     if *outs != 1 {
         // `ScalarExpr` has exactly one result, so a `Map` with `outs > 1`
-        // carries no body describing its extra slots and nothing in fusor2
-        // constructs one. Refusing is honest; a silent zero is not.
+        // carries no body describing its extra slots.
         return Err(Error::Plan(
             "multi-output Map has no per-slot body to differentiate".into(),
         ));
@@ -66,9 +63,7 @@ pub fn map_adjoint(
             grads.push(None);
             continue;
         };
-        // A structurally-zero partial is a zero tensor, not a kernel. This
-        // is what makes the twelve comparisons satisfy "every requires-grad
-        // parent receives a gradient" with no special case and no dispatch.
+        // A structurally-zero partial is a zero tensor, not a kernel.
         if is_zero(&partial) {
             grads.push(Some(tape.zeros_like(target)?));
             continue;
@@ -189,9 +184,8 @@ fn walk(expr: &ScalarExpr, seed: ScalarExpr, out: &mut Partials) {
             walk(b, db, out);
         }
 
-        // A comparison's derivative is identically zero in both operands.
-        // This is not decoration: the backward walk requires every
-        // requires-grad parent to receive a gradient, and zero satisfies it.
+        // A comparison's derivative is identically zero in both operands;
+        // every requires-grad parent must still receive a gradient.
         ScalarKind::Cmp { a, b, .. } => {
             walk(a, zero_like(a), out);
             walk(b, zero_like(b), out);
@@ -205,7 +199,6 @@ fn walk(expr: &ScalarExpr, seed: ScalarExpr, out: &mut Partials) {
             walk(f, select(c.clone(), zf, seed), out);
         }
 
-        // The whole f32-master / f16-compute recipe, in one line.
         ScalarKind::Cast { x, .. } => walk(x, ScalarExpr::cast(x.dtype(), seed), out),
         ScalarKind::Bitcast { x, .. } => walk(x, ScalarExpr::bitcast(x.dtype(), seed), out),
 
@@ -247,8 +240,7 @@ fn unary_derivative(op: UnOp, x: &ScalarExpr, s: &ScalarExpr) -> Option<ScalarEx
     let k = |v: f32| lit_of(dt, v);
     Some(match op {
         UnOp::Exp => mul(s.clone(), un(UnOp::Exp)),
-        // The adjoint of an approximate exponential is that same
-        // approximation, so the derivative stays as cheap as the forward.
+        // The adjoint of an approximate exponential is that same approximation.
         UnOp::ApproximateExp => mul(s.clone(), un(UnOp::ApproximateExp)),
         UnOp::LessApproximateExp => mul(s.clone(), un(UnOp::LessApproximateExp)),
         UnOp::Exp2 => mul(mul(s.clone(), un(UnOp::Exp2)), k(std::f32::consts::LN_2)),
@@ -338,7 +330,7 @@ fn binary_derivative(
             select(ScalarExpr::cmp(CmpOp::Lt, b.clone(), a.clone()), s.clone(), k(0.0)),
         ),
         // `a - floor(a/b)*b`: the b-partial is a.e. `-trunc(a/b)`, but `Rem`
-        // is only reachable on integers at L0, where no gradient flows.
+        // is only reachable on integers at Logical, where no gradient flows.
         BinOp::Rem => (s.clone(), lit_of(b.dtype(), 0.0)),
         BinOp::BitAnd
         | BinOp::BitOr
@@ -350,12 +342,9 @@ fn binary_derivative(
     }
 }
 
-// ------------------------------------------------------------- expr builders
-//
-// Every builder folds the literal identities it can prove, which is what
-// keeps a comparison's partial a single `Lit(0)` instead of a tree of
-// multiplies — and therefore what makes `map_adjoint` emit a zero `Const`
-// tensor rather than a kernel.
+// Every builder folds the literal identities it can prove, which keeps a
+// comparison's partial a single `Lit(0)` so `map_adjoint` emits a zero
+// `Const` tensor rather than a kernel.
 
 fn lit_of(dtype: Dtype, v: f32) -> ScalarExpr {
     let splat = match dtype {

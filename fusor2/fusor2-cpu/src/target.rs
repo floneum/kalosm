@@ -5,8 +5,8 @@ use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::Persistence;
 use fusor2_ir::egraph::{Id, Rule};
 use fusor2_ir::error::Error;
-use fusor2_ir::ir::level1::SchedPoint;
-use fusor2_ir::ir::level2::KernelIr;
+use fusor2_ir::ir::launch::SchedPoint;
+use fusor2_ir::ir::kernel::KernelIr;
 use fusor2_ir::ir::Node;
 use fusor2_ir::target::{Artifact, Buf, EmitError, LowerCtx, Target, Uniforms};
 use fusor2_ir::Result;
@@ -44,9 +44,7 @@ impl CpuTarget {
     }
 }
 
-/// The shipped rate table for a CPU, derived from [`Caps`] so the model stays
-/// coherent and physically dimensioned on a machine it has never seen, rather
-/// than degenerating into a routing constant.
+/// The shipped rate table for a CPU, derived from [`Caps`].
 fn seed_facts(caps: &Caps) -> DeviceFacts {
     let threads = caps.threads.max(1) as u64;
     let lanes = *caps.simd_widths.last().unwrap_or(&4) as u64;
@@ -124,7 +122,6 @@ impl Target for CpuTarget {
         let bytes = bytes.next_multiple_of(4);
         let mut pool = self.pool.lock();
         if let Some(free) = pool.get_mut(&bytes) {
-            // `strong_count == 1` means nothing else still holds it.
             if let Some(pos) = free.iter().position(|b| b.refcount() == 1) {
                 return Ok(free.swap_remove(pos));
             }

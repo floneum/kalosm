@@ -1,7 +1,7 @@
 //! Uniformity analysis. A bottom-up classification of every [`TileExpr`],
 //! then a statement walk carrying a predicate-uniformity stack. A `Barrier`
 //! (or `StorageBarrier`) under a non-uniform predicate is
-//! [`LowerError::NonUniformBarrier`][fusor2_ir::ir::level2::LowerError::NonUniformBarrier].
+//! [`LowerError::NonUniformBarrier`][fusor2_ir::ir::kernel::LowerError::NonUniformBarrier].
 //!
 //! The classification is conservative in the direction that fails lowering
 //! rather than racing: anything read from memory, any lane-indexed builtin,
@@ -9,7 +9,7 @@
 
 use fusor2_ir::Result;
 use fusor2_ir::error::Error;
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::kernel::{
     Accumulator, Builtin, KernelIr, Local, LowerError, ReduceKind, Stmt, TileExpr, TileExprKind,
 };
 use rustc_hash::FxHashMap;
@@ -159,8 +159,8 @@ fn collect_assignments(
 /// same reason a counted loop's index is.
 fn collect_reduce_counters(body: &[Stmt], counters: &mut Vec<LocalKey>) {
     let mut seen = rustc_hash::FxHashSet::default();
-    crate::verify_l2::for_each_root_expr(body, &mut |expr| {
-        crate::verify_l2::visit_unique(expr, &mut seen, &mut |node| {
+    crate::verify_kernel::for_each_root_expr(body, &mut |expr| {
+        crate::verify_kernel::visit_unique(expr, &mut seen, &mut |node| {
             if let TileExprKind::Reduce { kind, .. } = node.kind()
                 && let ReduceKind::Loop { index, .. } = kind.as_ref()
             {
@@ -170,7 +170,7 @@ fn collect_reduce_counters(body: &[Stmt], counters: &mut Vec<LocalKey>) {
     });
     // The N-ary form carries its kind on the statement, not inside an
     // expression, so the expression walk above cannot see its counter.
-    crate::verify_l2::for_each_stmt(body, &mut |stmt| {
+    crate::verify_kernel::for_each_stmt(body, &mut |stmt| {
         if let Stmt::Reduce { kind, .. } = stmt
             && let ReduceKind::Loop { index, .. } = kind.as_ref()
         {
@@ -291,7 +291,7 @@ fn render_path(path: &[u32]) -> String {
 mod tests {
     use super::*;
     use crate::build::TileBuilder;
-    use fusor2_ir::ir::level2::{ScalarElement, WorkgroupAxis};
+    use fusor2_ir::ir::kernel::{ScalarElement, WorkgroupAxis};
     use fusor2_ir::scalar::CmpOp;
 
     #[test]
@@ -354,17 +354,15 @@ mod tests {
     }
     /// A staged reduction emits a barrier between every tree level, so it may
     /// not sit under a divergent predicate any more than a written one may.
-    /// The barriers are produced by the emitter, not written in the body, which
-    /// is why the check is on the statement that produces them.
     #[test]
     fn a_staged_reduction_under_a_divergent_if_is_rejected() {
-        use fusor2_ir::ir::level2::{MergeBody, ReduceKind};
+        use fusor2_ir::ir::kernel::{MergeBody, ReduceKind};
         let mut b = TileBuilder::new();
         let f32e = ScalarElement::F32.element();
         let scratch = b.alloc_tile(
             f32e,
-            fusor2_ir::ir::level2::TileLayout::contiguous(
-                fusor2_ir::ir::level2::MemoryLevel::Workgroup,
+            fusor2_ir::ir::kernel::TileLayout::contiguous(
+                fusor2_ir::ir::kernel::MemoryLevel::Workgroup,
                 &[64],
             ),
         );

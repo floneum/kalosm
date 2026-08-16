@@ -1,21 +1,16 @@
-//! Attention: the macro node carrying `MaskKind`, plus its `defn` expansion,
-//! both present from node zero.
+//! Attention: the macro node carrying `MaskKind`, plus its `defn` expansion.
 //!
 //! `causal` is structural on the sugar node, so the compiler skips
-//! upper-triangle Q.K work **without loading a mask tensor** — while the
-//! decomposition is simultaneously present for algebra and autograd.
+//! upper-triangle Q.K work without loading a mask tensor.
 //!
-//! Grouped-query attention splits `q`'s head axis into `(Hkv, g)`, which is a
-//! legal restride at any strides, and `g` becomes a free axis of the contraction.
-//! The `EinSpec` does the rest.
+//! Grouped-query attention splits `q`'s head axis into `(Hkv, g)` — a legal
+//! restride at any strides — and `g` becomes a free axis of the contraction.
 
 use fusor2_autograd::tape::{GraphTape, TapeExt, accum_dtype, splat_of};
 use fusor2_ir::autograd::{Tape, Val};
-use fusor2_ir::ir::level0::{EinSpec, Label};
-/// Which structural mask an attention node carries. Re-exported rather than
-/// imported privately: `attention_masked` takes one, so a caller cannot spell
-/// the call without naming the type. `crate::cache::MaskKind` is the same item.
-pub use fusor2_ir::ir::level1::MaskKind;
+use fusor2_ir::ir::logical::{EinSpec, Label};
+/// Which structural mask an attention node carries.
+pub use fusor2_ir::ir::launch::MaskKind;
 use fusor2_ir::scalar::{BinOp, CmpOp, ScalarExpr, UnOp};
 use fusor2_ir::shape::{Dim, StrideSpec, SymId};
 use fusor2_ir::{Error, Result};
@@ -124,7 +119,7 @@ fn merge_heads(t: &mut GraphTape<'_>, v: Val, groups: u64) -> Result<Val> {
 /// `q . k^T * scale`, plus whatever the mask contributes.
 ///
 /// `MaskKind::Causal` compiles to an `IndexOf` comparison inside the scaling
-/// `Map`, so **no mask tensor is ever loaded** and no buffer is bound for it.
+/// `Map`, so no mask tensor is loaded and no buffer is bound for it.
 #[allow(clippy::too_many_arguments)]
 fn scores(
     t: &mut GraphTape<'_>,
@@ -155,8 +150,7 @@ fn scores(
     let s = t.contract(q, k, EinSpec { a, b, out }, acc)?;
     let s = t.cast(dtype, s)?;
 
-    // Scale and causal masking are one `Map`: a multiply by a uniform and,
-    // when causal, a select against two index coordinates.
+    // Scale and causal masking are one `Map`.
     let rank = t.rank_of(s);
     let (lq_axis, lk_axis) = ((rank - 2) as u32, (rank - 1) as u32);
     let score_shape = t.shape_of(s);
@@ -167,15 +161,9 @@ fn scores(
         ScalarExpr::uniform(scale, dtype),
     );
     let body = if matches!(mask, MaskKind::Causal) {
-        // Right-aligned: query `i` sees keys up to `i + (Lk - Lq)`.
-        //
-        // The reference's `attention_causal` masks `kv_pos <= q_pos` but
-        // *asserts* `q_seq_len == kv_seq_len`, so it defines causality only
-        // where the two conventions coincide. fusor2 accepts `Lq != Lk`, and
-        // the only meaning that has is decode against a KV cache, where the
-        // Lq queries are the *last* Lq of the Lk keys. Left-aligning there let
-        // query 0 see exactly one key, which is why a 3-query, 4-key row came
-        // back as `V[0]` instead of a two-key average.
+        // Right-aligned: query `i` sees keys up to `i + (Lk - Lq)`. When
+        // `Lq != Lk` the Lq queries are the last Lq of the Lk keys (decode
+        // against a KV cache).
         let bound = match (shape_lq.as_const(), shape_lk.as_const()) {
             (Some(lq), Some(lk)) if lk > lq => ScalarExpr::bin(
                 BinOp::Add,
@@ -202,8 +190,8 @@ fn scores(
             t.binary(BinOp::Add, s, m)
         }
         (MaskKind::BatchKeyMask, Some(m)) => {
-            // `[B, Lk]` needs an explicit shape: the batch axis is leading,
-            // so the right-aligned rule cannot place it.
+            // `[B, Lk]` needs explicit strides: the batch axis is leading, so
+            // the right-aligned rule cannot place it.
             let shape = t.shape_of(s);
             let mut specs: SmallVec<[StrideSpec; 6]> = SmallVec::new();
             specs.push(StrideSpec::dim(0, shape[0]));
@@ -311,10 +299,7 @@ pub fn attention_masked(
 /// shaped `[.., Lq]`.
 ///
 /// This is the statistic that lets probabilities be recomputed as
-/// `exp(s - lse)` without ever storing the `[Lq, Lk]` matrix. Written as a max
-/// fold plus a sum fold rather than as a fused `(max, sum)` carrier directly:
-/// the fold laws are what turn exactly this pair into the one-pass form, and
-/// spelling it here would be the same decision made early — and in the core.
+/// `exp(s - lse)` without ever storing the `[Lq, Lk]` matrix.
 pub fn attention_lse(
     q: &Tensor,
     k: &Tensor,
@@ -392,11 +377,10 @@ pub fn attention_with_lse(
 
 /// `(dq, dk, dv)`.
 ///
-/// `dk` and `dv` are `Restride` views of **one** `[B, H, 2*Lk, Dh]` buffer —
+/// `dk` and `dv` are `Restride` views of one `[B, H, 2*Lk, Dh]` buffer —
 /// dk rows then dv rows — so a paired streaming kernel can share the
-/// probability recomputation and the two halves cost nothing to hand back.
-/// Requires `H == Hkv`: grouped-query attention is expanded by the caller,
-/// exactly as in the reference.
+/// probability recomputation. Requires `H == Hkv`: grouped-query attention
+/// is expanded by the caller.
 #[allow(clippy::too_many_arguments)]
 pub fn attention_grads(
     q: &Tensor,
@@ -595,8 +579,8 @@ mod tests {
     use crate::session::{Backend, Session};
     use fusor2_ir::dtype::Dtype;
     use fusor2_ir::ir::Op;
-    use fusor2_ir::ir::level0::{L0, LeafKind};
-    use fusor2_ir::ir::level1::L1;
+    use fusor2_ir::ir::logical::{Logical, LeafKind};
+    use fusor2_ir::ir::launch::Launch;
 
     fn graph() -> Graph {
         Graph::new(&Session::new(Backend::cpu().unwrap()).unwrap())
@@ -658,7 +642,7 @@ mod tests {
                         continue;
                     }
                     seen[id.index()] = true;
-                    if matches!(&eg.node(id).op, Op::L0(L0::Leaf(LeafKind::Buffer { .. }))) {
+                    if matches!(&eg.node(id).op, Op::Logical(Logical::Leaf(LeafKind::Buffer { .. }))) {
                         count += 1;
                     }
                     stack.extend(eg.node(id).children.iter().copied());
@@ -689,7 +673,7 @@ mod tests {
                 let ms = eg.members(eg.class_of(o.id()));
                 let s = ms
                     .iter()
-                    .filter(|m| matches!(eg.node(**m).op, Op::L1(L1::Ext { .. })))
+                    .filter(|m| matches!(eg.node(**m).op, Op::Launch(Launch::Ext { .. })))
                     .count();
                 let d = ms.iter().filter(|m| eg.is_defn(**m)).count();
                 Ok((ms.len(), s, d))
@@ -733,7 +717,7 @@ mod tests {
             .handle()
             .with_egraph(|eg| {
                 let base = |t: &Tensor| match &eg.node(t.id()).op {
-                    Op::L0(L0::Restride { x, .. }) => Some(*x),
+                    Op::Logical(Logical::Restride { x, .. }) => Some(*x),
                     _ => None,
                 };
                 Ok(base(&dk) == base(&dv) && base(&dk).is_some())

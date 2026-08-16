@@ -2,7 +2,7 @@
 //! the `TileLayout` / `MultiFlattenMap`, never per vector. The form is a
 //! property of the emitted `Instr`, so the inner loop has no branch.
 
-use fusor2_ir::ir::level2::{Addr, Builtin, TileExpr, TileExprKind, TileLayout, TileLiteral};
+use fusor2_ir::ir::kernel::{Addr, Builtin, TileExpr, TileExprKind, TileLayout, TileLiteral};
 use fusor2_ir::scalar::BinOp;
 use fusor2_ir::shape::MultiFlattenMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -245,7 +245,7 @@ pub fn rc2_offset(map: &MultiFlattenMap, row: u32, col: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fusor2_ir::ir::level2::{ElementType, MemoryLevel, ScalarElement};
+    use fusor2_ir::ir::kernel::{ElementType, MemoryLevel, ScalarElement};
     use fusor2_ir::shape::{AxisGroup, SubAxis};
 
     fn lane() -> TileExpr {

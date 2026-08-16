@@ -1,6 +1,6 @@
 //! Block decode programs for the 32-element formats, in both storage layouts.
 //!
-//! A decode is a **block program**, not one scalar expression: it emits an L2
+//! A decode is a **block program**, not one scalar expression: it emits an Kernel
 //! snippet. `Unpack2x16Float` is how native-layout f16 scales are read without
 //! `SHADER_F16` — no `ScalarElement::F16` ever appears in an emitted term.
 //!
@@ -21,16 +21,12 @@
 
 use fusor2_ir::Result;
 use fusor2_ir::dtype::{NumericContract, QFmt, QLayout};
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::kernel::{
     Addr, ElementType, ScalarElement, Source, TileBinaryOp, TileCompareOp, TileExpr, TileExprKind,
     TileLiteral, TileUnaryOp,
 };
 
 use crate::blocks::{BlockDecodeArgs, BlockFields, BlockProgram, block_fields};
-
-// ---------------------------------------------------------------------------
-// Expression builders
-// ---------------------------------------------------------------------------
 
 pub(crate) const U32: ElementType = ElementType::Scalar(ScalarElement::U32);
 pub(crate) const I32: ElementType = ElementType::Scalar(ScalarElement::I32);
@@ -135,10 +131,6 @@ pub(crate) fn signed_byte_f32(byte: TileExpr) -> TileExpr {
     cast(sar, F32)
 }
 
-// ---------------------------------------------------------------------------
-// Block addressing
-// ---------------------------------------------------------------------------
-
 /// Byte base of the block holding the addressed element, and that element's
 /// index inside the block.
 pub(crate) fn block_base_and_q(args: &BlockDecodeArgs<'_>, fmt: QFmt) -> (TileExpr, TileExpr) {
@@ -168,9 +160,8 @@ pub(crate) fn load_word(args: &BlockDecodeArgs<'_>, word_index: TileExpr) -> Til
 /// Load one byte of a block: `(base + byte_offset + dynamic) >> 2` selects the
 /// word, `((base + byte_offset + dynamic) & 3) * 8` the shift.
 ///
-/// Byte addressing over a u32 buffer is not an optimisation choice — Native
-/// blocks are not word-aligned, so the containing word is the only thing the
-/// storage view can address.
+/// Native blocks are not word-aligned, so the containing word is the only
+/// thing the storage view can address.
 pub(crate) fn load_block_byte(
     args: &BlockDecodeArgs<'_>,
     base: &TileExpr,
@@ -268,10 +259,6 @@ pub(crate) fn expect_layout(
     }
 }
 
-// ---------------------------------------------------------------------------
-// Affine family per-lane formulas
-// ---------------------------------------------------------------------------
-
 /// `q & 15` addresses the byte; `q < 16` takes the low nibble and `q >= 16`
 /// the high nibble. This is llama.cpp's split-half order, not adjacent pairs.
 pub(crate) fn nibble_q4(
@@ -340,10 +327,6 @@ fn decode_affine(
     Ok(finish(args, value))
 }
 
-// ---------------------------------------------------------------------------
-// The six programs
-// ---------------------------------------------------------------------------
-
 /// Q4_0, raw GGUF bytes: f16 scale, 16 nibble-pair bytes, 18 bytes total.
 pub fn decode_q4_0_native(args: &BlockDecodeArgs<'_>) -> Result<TileExpr> {
     decode_affine(args, QFmt::Q4_0, QLayout::Native, "decode_q4_0_native")
@@ -399,15 +382,12 @@ pub const DECODE_Q8_0_F32: BlockProgram = BlockProgram {
     emit: decode_q8_0_f32,
 };
 
-// ---------------------------------------------------------------------------
-// A pure-Rust evaluator, for testing the emitted programs against the scalar
+// A pure-Rust evaluator for testing the emitted programs against the scalar
 // reference decoder. It covers exactly the node set these programs build.
-// ---------------------------------------------------------------------------
-
 #[cfg(test)]
 pub(crate) mod interp {
     use super::*;
-    use fusor2_ir::ir::level2::{BufferAccess, BufferDecl, MemoryLevel, StorageView, TileLayout};
+    use fusor2_ir::ir::kernel::{BufferAccess, BufferDecl, MemoryLevel, StorageView, TileLayout};
     use std::sync::Arc;
 
     /// A value the evaluator can hold. Vectors are always f32 here, which is
@@ -634,7 +614,7 @@ mod tests {
     use super::*;
     use crate::blocks::{BLOCK_SPECS, cpu_dequantize_block};
     use crate::repack::tests::lcg_blocks;
-    use fusor2_ir::ir::level2::TileLiteral;
+    use fusor2_ir::ir::kernel::TileLiteral;
 
     fn mask(v: bool) -> TileExpr {
         TileExpr::new(TileExprKind::Literal(TileLiteral::Bool(v)), BOOL)
@@ -733,9 +713,8 @@ mod tests {
         assert!(decode_q4_0_f32(&args).is_ok());
     }
 
-    /// No emitted node may carry an f16 element type: the whole point of
-    /// `Unpack2x16Float` is that a native-layout scale is read without
-    /// `SHADER_F16`.
+    /// No emitted node may carry an f16 element type: a native-layout scale
+    /// is read without `SHADER_F16`.
     #[test]
     fn no_f16_element_appears_in_an_emitted_program() {
         fn walk(e: &TileExpr, seen: &mut usize) {

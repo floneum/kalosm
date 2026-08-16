@@ -1,4 +1,4 @@
-//! `verify_l0` — the eight L0 invariants.
+//! `verify_l0` — the eight Logical invariants.
 //!
 //! 1. Inference is total.
 //! 2. **No implicit broadcasting**: all `Map` operands share the output shape.
@@ -21,13 +21,13 @@ use crate::contract_spec;
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::facts::{ValueFacts, Work};
-use crate::ir::level0::{L0, ScatterCombine};
+use crate::ir::logical::{Logical, ScatterCombine};
 use crate::ir::{Level, Op, VerifyCtx};
-use crate::semantics::infer_l0::infer_l0;
+use crate::semantics::infer_logical::infer_logical;
 use crate::semantics::work::work_of;
 use crate::shape::{BoundsProof, Dim, Dims};
 
-/// Clause 3, shared with inference and with `verify_l1`: is this carrier a
+/// Clause 3, shared with inference and with `verify_launch`: is this carrier a
 /// well-formed accumulator in `acc`?
 ///
 /// * the four slot vectors agree in length and are non-empty;
@@ -35,11 +35,10 @@ use crate::shape::{BoundsProof, Dim, Dims};
 ///   quantized value is not an accumulator);
 /// * every `Vector` slot has a constant extent, because a symbolic private
 ///   array is allocatable on neither backend;
-/// * **the carrier obligation**: `merge(identity, identity) == identity`.
-///   That last one is not decoration. A rescale spelled without
-///   `Carrier::safe_delta` computes `0 * exp((-inf) - (-inf)) = NaN`, and
-///   every workgroup-tree and subgroup schedule merges padded identity lanes
-///   on essentially every launch, so the NaN reaches real output.
+/// * the carrier obligation: `merge(identity, identity) == identity`. A
+///   rescale spelled without `Carrier::safe_delta` computes
+///   `0 * exp((-inf) - (-inf)) = NaN`, and every workgroup-tree and subgroup
+///   schedule merges padded identity lanes, so the NaN reaches real output.
 pub fn check_carrier(c: &Carrier, acc: Dtype) -> Result<()> {
     let w = c.slots.len();
     if w == 0 || c.identity.len() != w || c.lift.len() != w || c.merge.len() != w {
@@ -81,19 +80,19 @@ pub fn check_carrier(c: &Carrier, acc: Dtype) -> Result<()> {
     Ok(())
 }
 
-/// Verify one L0 node. A failure means a rule or the frontend built
+/// Verify one Logical node. A failure means a rule or the frontend built
 /// something illegal; it is never recoverable.
 pub fn verify_l0(cx: &VerifyCtx<'_>) -> Result<()> {
-    let Op::L0(op) = &cx.node.op else {
+    let Op::Logical(op) = &cx.node.op else {
         return Err(Error::verify(
-            Level::L0,
+            Level::Logical,
             cx.id,
-            "verify_l0 applied to a node that is not L0",
+            "verify_l0 applied to a node that is not Logical",
         ));
     };
 
     // 1. Inference is total and agrees with the recorded facts.
-    let inferred = infer_l0(op, cx.operands).map_err(|e| fail(cx, format!("{e}")))?;
+    let inferred = infer_logical(op, cx.operands).map_err(|e| fail(cx, format!("{e}")))?;
     if inferred != *cx.result {
         return Err(fail(
             cx,
@@ -109,7 +108,7 @@ pub fn verify_l0(cx: &VerifyCtx<'_>) -> Result<()> {
 
     match op {
         // 3.
-        L0::Fold {
+        Logical::Fold {
             carrier, axis, acc, ..
         } => {
             let rank = cx.operands.first().map_or(0, ValueFacts::rank);
@@ -123,7 +122,7 @@ pub fn verify_l0(cx: &VerifyCtx<'_>) -> Result<()> {
         }
 
         // 4.
-        L0::Contract { spec, acc, .. } => {
+        Logical::Contract { spec, acc, .. } => {
             contract_spec::partition(spec).map_err(|e| fail(cx, format!("{e}")))?;
             if let (Some(a), Some(b)) = (cx.operands.first(), cx.operands.get(1)) {
                 contract_spec::extents(spec, &a.shape, &b.shape)
@@ -143,7 +142,7 @@ pub fn verify_l0(cx: &VerifyCtx<'_>) -> Result<()> {
         }
 
         // 5.
-        L0::Restride { bounds, .. } => {
+        Logical::Restride { bounds, .. } => {
             let proved = check_restride_bounds(cx)?;
             if *bounds != proved {
                 return Err(fail(
@@ -154,7 +153,7 @@ pub fn verify_l0(cx: &VerifyCtx<'_>) -> Result<()> {
         }
 
         // 6.
-        L0::Scatter {
+        Logical::Scatter {
             combine: ScatterCombine::Set,
             unique: false,
             ..
@@ -166,7 +165,7 @@ pub fn verify_l0(cx: &VerifyCtx<'_>) -> Result<()> {
         }
 
         // 7.
-        L0::Dequant { fmt, .. } => {
+        Logical::Dequant { fmt, .. } => {
             let last = cx
                 .operands
                 .first()
@@ -205,7 +204,7 @@ pub fn verify_l0(cx: &VerifyCtx<'_>) -> Result<()> {
 /// Invariant 2, split out because the frontend calls it directly before
 /// emitting the stride-0 `Restride` that replaces implicit broadcasting.
 pub fn check_map_shapes(cx: &VerifyCtx<'_>) -> Result<()> {
-    let Op::L0(L0::Map { .. }) = &cx.node.op else {
+    let Op::Logical(Logical::Map { .. }) = &cx.node.op else {
         return Ok(());
     };
     let Some(first) = cx.operands.first() else {
@@ -237,11 +236,10 @@ pub fn check_map_shapes(cx: &VerifyCtx<'_>) -> Result<()> {
 /// A spec is statically decidable when its `size`, its `offset` and the
 /// input dim it references are all `Const`; then the last element it
 /// addresses, `offset + (size - 1) * multiplier`, must be inside that dim.
-/// Anything else is a runtime mask obligation — **there is no third case and
-/// no user `assume`**, which is exactly what preserves the invariant that
-/// licenses a trusted shader module.
+/// Anything else is a runtime mask obligation — there is no third case and
+/// no user `assume`.
 pub fn check_restride_bounds(cx: &VerifyCtx<'_>) -> Result<BoundsProof> {
-    let Op::L0(L0::Restride { specs, .. }) = &cx.node.op else {
+    let Op::Logical(Logical::Restride { specs, .. }) = &cx.node.op else {
         return Ok(BoundsProof::Static);
     };
     let in_shape: &Dims = match cx.operands.first() {
@@ -282,13 +280,12 @@ pub fn check_restride_bounds(cx: &VerifyCtx<'_>) -> Result<BoundsProof> {
 /// Invariant 8: `work` must vary with shape. Evaluate it at `cx`'s shapes and
 /// again with every `Const` dim doubled.
 ///
-/// Two documented exemptions: `Leaf` and `Project` are constant-work by
-/// design, and a node whose work is *zero* at both bindings (an identity
-/// `Map`, a `Restride` over an empty value) genuinely performs no
-/// arithmetic. The tripwire targets a **nonzero constant** — the reference's
-/// `Attention { work: 1 }`.
-fn check_work_varies(cx: &VerifyCtx<'_>, op: &L0) -> Result<()> {
-    if matches!(op, L0::Leaf(_) | L0::Project { .. }) {
+/// Two exemptions: `Leaf` and `Project` are constant-work, and a node whose
+/// work is zero at both bindings (an identity `Map`, a `Restride` over an
+/// empty value) genuinely performs no arithmetic. The tripwire targets a
+/// nonzero constant.
+fn check_work_varies(cx: &VerifyCtx<'_>, op: &Logical) -> Result<()> {
+    if matches!(op, Logical::Leaf(_) | Logical::Project { .. }) {
         return Ok(());
     }
     // Skip when there is no `Const` dim to double: a fully symbolic binding
@@ -326,7 +323,7 @@ fn doubled(f: &ValueFacts) -> ValueFacts {
 }
 
 fn fail(cx: &VerifyCtx<'_>, msg: impl Into<String>) -> Error {
-    Error::verify(Level::L0, cx.id, msg)
+    Error::verify(Level::Logical, cx.id, msg)
 }
 
 #[cfg(test)]
@@ -336,7 +333,7 @@ mod tests {
     use crate::dtype::{Dtype, NumericContract, QFmt, QLayout, Splat};
     use crate::egraph::Id;
     use crate::carrier::{ArgRemap, SlotTy};
-    use crate::ir::level0::{EinSpec, Label, LeafKind};
+    use crate::ir::logical::{EinSpec, Label, LeafKind};
     use crate::scalar::BinOp;
     use crate::ir::{Node, OpDef, OpDefRegistry, OpTag};
     use crate::scalar::ScalarExpr;
@@ -370,18 +367,18 @@ mod tests {
     }
 
     /// Build a node, infer its facts, and run the verifier.
-    fn check(op: L0, operands: &[ValueFacts]) -> Result<()> {
-        let result = infer_l0(&op, operands)?;
+    fn check(op: Logical, operands: &[ValueFacts]) -> Result<()> {
+        let result = infer_logical(&op, operands)?;
         check_with_result(op, operands, &result)
     }
 
-    fn check_with_result(op: L0, operands: &[ValueFacts], result: &ValueFacts) -> Result<()> {
+    fn check_with_result(op: Logical, operands: &[ValueFacts], result: &ValueFacts) -> Result<()> {
         let caps = caps();
         let registry = OpDefRegistry::new();
         let node = Node {
-            children: crate::semantics::children::children_l0(&op),
-            op: Op::L0(op),
-            level: Level::L0,
+            children: crate::semantics::children::children_logical(&op),
+            op: Op::Logical(op),
+            level: Level::Logical,
         };
         let cx = VerifyCtx {
             node: &node,
@@ -394,8 +391,6 @@ mod tests {
         verify_l0(&cx)
     }
 
-    // ---- Test 4 ----------------------------------------------------------
-
     #[test]
     fn contract_rejects_a_label_only_in_out_and_a_narrow_accumulator() {
         let bad_spec = EinSpec {
@@ -403,7 +398,7 @@ mod tests {
             b: smallvec![Label(b'n'), Label(b'k')],
             out: smallvec![Label(b'm'), Label(b'n'), Label(b'z')],
         };
-        let op = L0::Contract {
+        let op = Logical::Contract {
             spec: bad_spec,
             acc: Dtype::F32,
             a: Id(0),
@@ -418,7 +413,7 @@ mod tests {
             b: smallvec![Label(b'n'), Label(b'k')],
             out: smallvec![Label(b'm'), Label(b'n')],
         };
-        let op = L0::Contract {
+        let op = Logical::Contract {
             spec,
             acc: Dtype::F16,
             a: Id(0),
@@ -438,7 +433,7 @@ mod tests {
             b: smallvec![Label(b'n'), Label(b'k')],
             out: smallvec![Label(b'm'), Label(b'n')],
         };
-        let op = L0::Contract {
+        let op = Logical::Contract {
             spec,
             acc: Dtype::F32,
             a: Id(0),
@@ -448,11 +443,9 @@ mod tests {
         check(op, &[f32s(&[3, 4]), f32s(&[5, 4])]).unwrap();
     }
 
-    // ---- Test 8 ----------------------------------------------------------
-
     #[test]
     fn scatter_set_needs_unique_indices() {
-        let make = |combine, unique| L0::Scatter {
+        let make = |combine, unique| Logical::Scatter {
             axis: 0,
             combine,
             base: Id(0),
@@ -467,8 +460,6 @@ mod tests {
         check(make(ScatterCombine::Add, false), &ins).unwrap();
     }
 
-    // ---- Test 9 ----------------------------------------------------------
-
     #[test]
     fn dequant_block_divisibility() {
         let q = |fmt: QFmt, last: u64| ValueFacts {
@@ -478,7 +469,7 @@ mod tests {
             persistence: crate::dtype::Persistence::Persistent,
             outs: 1,
         };
-        let op = |fmt| L0::Dequant {
+        let op = |fmt| Logical::Dequant {
             fmt,
             layout: QLayout::Native,
             x: Id(0),
@@ -489,12 +480,10 @@ mod tests {
         assert!(check(op(QFmt::Q4_0), &[q(QFmt::Q4_0, 33)]).is_err());
     }
 
-    // ---- Invariant 5 -----------------------------------------------------
-
     #[test]
     fn restride_bounds_are_static_or_masked_and_never_both() {
         // In range and fully constant: the node must claim Static.
-        let ok = L0::Restride {
+        let ok = Logical::Restride {
             specs: smallvec![StrideSpec::dim(0, Dim::Const(3)).with_offset(Dim::Const(1))],
             bounds: BoundsProof::Static,
             x: Id(0),
@@ -502,7 +491,7 @@ mod tests {
         check(ok, &[f32s(&[4])]).unwrap();
 
         // Out of range: offset 2 + (3-1)*1 = 4 >= 4.
-        let oob = L0::Restride {
+        let oob = Logical::Restride {
             specs: smallvec![StrideSpec::dim(0, Dim::Const(3)).with_offset(Dim::Const(2))],
             bounds: BoundsProof::Static,
             x: Id(0),
@@ -511,22 +500,20 @@ mod tests {
 
         // Claiming Static under a Sym is an error; RuntimeMask is required.
         let sym = ValueFacts::new(Dtype::F32, [Dim::Sym(SymId(1))]);
-        let lying = L0::Restride {
+        let lying = Logical::Restride {
             specs: smallvec![StrideSpec::dim(0, Dim::Sym(SymId(1)))],
             bounds: BoundsProof::Static,
             x: Id(0),
         };
         assert!(check(lying, std::slice::from_ref(&sym)).is_err());
 
-        let honest = L0::Restride {
+        let honest = Logical::Restride {
             specs: smallvec![StrideSpec::dim(0, Dim::Sym(SymId(1)))],
             bounds: BoundsProof::RuntimeMask,
             x: Id(0),
         };
         check(honest, &[sym]).unwrap();
     }
-
-    // ---- Invariants 2 and 3 ---------------------------------------------
 
     #[test]
     fn map_shape_identity_and_fold_carrier() {
@@ -535,7 +522,7 @@ mod tests {
             ScalarExpr::arg(0, Dtype::F32),
             ScalarExpr::arg(1, Dtype::F32),
         );
-        let op = L0::Map {
+        let op = Logical::Map {
             expr,
             ins: smallvec![Id(0), Id(1)],
             outs: 1,
@@ -543,7 +530,7 @@ mod tests {
         assert!(check(op, &[f32s(&[4, 8]), f32s(&[8])]).is_err());
 
         let sum = Carrier::binop(BinOp::Add, Splat::F32(0.0), Dtype::F32);
-        let good = L0::Fold {
+        let good = Logical::Fold {
             carrier: sum.clone(),
             axis: 0,
             acc: Dtype::F32,
@@ -553,7 +540,7 @@ mod tests {
 
         // The slot vectors must agree in length: a carrier with three slots
         // and two merges is not an accumulator at all.
-        let ragged = L0::Fold {
+        let ragged = Logical::Fold {
             carrier: Carrier {
                 slots: smallvec![SlotTy::Scalar, SlotTy::Scalar],
                 ..sum.clone()
@@ -565,7 +552,7 @@ mod tests {
         assert!(check(ragged, &[f32s(&[8, 4])]).is_err());
 
         // The identity must be a value of the accumulator dtype.
-        let wrong_dtype = L0::Fold {
+        let wrong_dtype = Logical::Fold {
             carrier: sum.clone(),
             axis: 0,
             acc: Dtype::U32,
@@ -574,7 +561,7 @@ mod tests {
         assert!(check(wrong_dtype, &[f32s(&[8, 4])]).is_err());
 
         // A quantized value is never an accumulator.
-        let quantized = L0::Fold {
+        let quantized = Logical::Fold {
             carrier: sum.clone(),
             axis: 0,
             acc: Dtype::Q(crate::dtype::QFmt::Q4K),
@@ -583,11 +570,10 @@ mod tests {
         assert!(check(quantized, &[f32s(&[8, 4])]).is_err());
     }
 
-    /// **The carrier obligation, as a verifier clause.** A rescale spelled
-    /// without `Carrier::safe_delta` computes `0 * exp((-inf) - (-inf)) = NaN`
-    /// when two padded identity lanes merge, which every workgroup-tree and
-    /// subgroup schedule does on essentially every launch. `verify_l0` refuses
-    /// the node rather than letting the NaN reach real output.
+    /// A rescale spelled without `Carrier::safe_delta` computes
+    /// `0 * exp((-inf) - (-inf)) = NaN` when two padded identity lanes merge;
+    /// `verify_l0` refuses the node rather than letting the NaN reach real
+    /// output.
     #[test]
     fn a_carrier_that_is_not_identity_closed_is_rejected() {
         let d = Dtype::F32;
@@ -617,7 +603,7 @@ mod tests {
         };
         assert!(
             check(
-                L0::Fold {
+                Logical::Fold {
                     carrier: unguarded.clone(),
                     axis: 0,
                     acc: d,
@@ -663,7 +649,7 @@ mod tests {
             ..unguarded
         };
         check(
-            L0::Fold {
+            Logical::Fold {
                 carrier: guarded,
                 axis: 0,
                 acc: d,
@@ -674,8 +660,6 @@ mod tests {
         .unwrap();
         let _ = ArgRemap::identity(1);
     }
-
-    // ---- Test 10's first half -------------------------------------------
 
     #[test]
     fn constant_work_tripwire() {
@@ -719,7 +703,7 @@ mod tests {
             work: constant_work,
             adjoint: None,
             lower_per_target: &[],
-            effect: crate::ir::level1::Effect::Pure,
+            effect: crate::ir::launch::Effect::Pure,
         };
         assert!(!crate::semantics::work::work_is_shape_sensitive(
             def.work,
@@ -731,7 +715,7 @@ mod tests {
     #[test]
     fn a_real_l0_node_passes_the_work_tripwire() {
         let expr = ScalarExpr::un(crate::scalar::UnOp::Exp, ScalarExpr::arg(0, Dtype::F32));
-        let op = L0::Map {
+        let op = Logical::Map {
             expr,
             ins: smallvec![Id(0)],
             outs: 1,
@@ -741,7 +725,7 @@ mod tests {
 
     #[test]
     fn an_identity_map_is_exempt_because_its_work_is_zero() {
-        let op = L0::Map {
+        let op = Logical::Map {
             expr: ScalarExpr::arg(0, Dtype::F32),
             ins: smallvec![Id(0)],
             outs: 1,
@@ -751,7 +735,7 @@ mod tests {
 
     #[test]
     fn recorded_facts_must_match_inference() {
-        let op = L0::Leaf(LeafKind::Const {
+        let op = Logical::Leaf(LeafKind::Const {
             value: Splat::F32(0.0),
             shape: smallvec![Dim::Const(4)],
         });

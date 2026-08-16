@@ -29,7 +29,7 @@ pub enum Error {
     Budget(String),
     /// `verify_plan` rejected an extraction. A hard conformance assert.
     Plan(String),
-    Lower(crate::ir::level2::LowerError),
+    Lower(crate::ir::kernel::LowerError),
     Emit(crate::target::EmitError),
     Device(String),
     Io(String),
@@ -58,8 +58,8 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
-impl From<crate::ir::level2::LowerError> for Error {
-    fn from(e: crate::ir::level2::LowerError) -> Self {
+impl From<crate::ir::kernel::LowerError> for Error {
+    fn from(e: crate::ir::kernel::LowerError) -> Self {
         Self::Lower(e)
     }
 }

@@ -1,5 +1,4 @@
-//! `Linear`: `x @ Wt (+ b)`. The bias add is an epilogue the extractor fuses
-//! or does not, on cost.
+//! `Linear`: `x @ Wt (+ b)`.
 
 use fusor2_gguf::VarBuilder;
 use fusor2_ir::shape::Dim;
@@ -11,11 +10,8 @@ use crate::{Error, Result, Tensor};
 
 /// `x @ Wt (+ b)`.
 ///
-/// Generic over the element type, as the reference's `Linear<T: SimdElement>`
-/// is, and defaulting to `f32` so `Linear` alone still names the common case.
-/// There is no rank parameter: the weight is `[out, in]` by definition and the
-/// *activation's* rank is [`Linear::forward`]'s, so one loaded layer serves a
-/// rank-2 and a rank-3 call in the same model.
+/// The weight is `[out, in]`; the activation's rank is [`Linear::forward`]'s,
+/// so one loaded layer serves a rank-2 and a rank-3 call in the same model.
 pub struct Linear<T: Element = f32> {
     pub weight: Tensor<2, T>,
     pub bias: Option<Tensor<1, T>>,
@@ -28,9 +24,7 @@ impl<T: Element> Linear<T> {
 
     /// `weight` is `[out, in]` and `bias` is `[out]`, the GGUF layout.
     ///
-    /// A missing `bias` entry is an error when `bias` is true: a model that
-    /// declares a bias and does not ship it evaluates to a plausible but
-    /// wrong function, and quietly dropping it is how that goes unnoticed.
+    /// A missing `bias` entry is an error when `bias` is true.
     pub fn load(vb: &VarBuilder, graph: &crate::graph::GraphRef, bias: bool) -> Result<Self> {
         let w = crate::layers::load_dense(vb, graph, "weight")?;
         let weight = crate::layers::as_typed::<2, T>(w, "a Linear weight is [out, in]")?;
@@ -54,11 +48,6 @@ impl<T: Element> Linear<T> {
     }
 
     /// `x @ weight^T (+ bias)`. Rank-preserving.
-    ///
-    /// Transposed-rhs is an `EinSpec`, not a second op, so this is one
-    /// `L0::Contract` — and it is the transposed spelling specifically, so
-    /// `d_weight` lands in the weight's own `[out, in]` layout rather than in
-    /// a transposed view the optimizer would have to copy out of.
     #[track_caller]
     pub fn forward<const R: usize>(&self, x: &Tensor<R, T>) -> Tensor<R, T> {
         Tensor::<R, T>::from_dyn(ok(
@@ -72,7 +61,7 @@ impl<T: Element> Linear<T> {
     }
 }
 
-/// The runtime-rank forward. Unchanged; the typed `forward` is a wrapper.
+/// The runtime-rank forward.
 pub(crate) fn forward_dyn(weight: &Dyn, bias: Option<&Dyn>, x: &Dyn) -> Result<Dyn> {
     if weight.rank() != 2 {
         return Err(Error::Shape(format!(
@@ -86,9 +75,8 @@ pub(crate) fn forward_dyn(weight: &Dyn, bias: Option<&Dyn>, x: &Dyn) -> Result<D
             x.rank()
         )));
     }
-    // `Contract` has no implicit batch broadcast, so a rank-N activation
-    // meets the rank-2 weight through one stride-0 `Restride` over the
-    // leading axes rather than through a reshape that would need x dense.
+    // `Contract` has no implicit batch broadcast, so the weight is
+    // broadcast over the leading axes.
     let weight = if x.rank() == 2 {
         weight.clone()
     } else {
@@ -143,9 +131,7 @@ mod tests {
         );
     }
 
-    /// The layer owns no kernel: its forward must hash-cons to exactly the
-    /// composition its documentation names, or the launch the extractor sees
-    /// is not the one the parity list was written against.
+    /// The forward must hash-cons to exactly the composition it documents.
     #[test]
     fn the_forward_is_mat_mul_transposed_rhs_plus_a_broadcast_bias() {
         let g = graph();

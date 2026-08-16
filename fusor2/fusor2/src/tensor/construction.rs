@@ -1,12 +1,12 @@
 //! Constructing leaves: parameters, buffers, constants, uniforms and the
 //! shaped fills.
 //!
-//! `zeros`/`ones`/`splat`/`full` mint an `L0::Leaf(LeafKind::Const)` — **no
-//! upload and no kernel**. `arange` is built host-side and uploaded once.
+//! `zeros`/`ones`/`splat`/`full` mint a `Logical::Leaf(LeafKind::Const)` with no
+//! upload and no kernel. `arange` is built host-side and uploaded once.
 
 
 use fusor2_ir::dtype::{Dtype, Splat};
-use fusor2_ir::ir::level0::{L0, LeafKind};
+use fusor2_ir::ir::logical::{Logical, LeafKind};
 use fusor2_ir::shape::{Dim, SymId};
 
 use crate::graph::GraphRef;
@@ -18,7 +18,7 @@ use crate::{Error, Result};
 fn leaf_buffer_node(graph: &GraphRef, dtype: Dtype, shape: &[Dim]) -> Result<Tensor> {
     Tensor::emit(
         graph,
-        L0::Leaf(LeafKind::Buffer {
+        Logical::Leaf(LeafKind::Buffer {
             name: graph.fresh_buffer_id(),
             dtype,
             shape: shape.iter().copied().collect(),
@@ -43,11 +43,8 @@ pub(crate) fn upload(
 impl Tensor {
     /// Upload dense host bytes as a step-local buffer.
     ///
-    /// **One copy, into the transfer staging buffer.** Staging the caller's
-    /// slice in a host `Vec` first cost a second full allocation and memcpy
-    /// here, and a third when the resolve path cloned it back out again. The
-    /// reference (`fusor-ml` `TensorData::new_from_slice`) hands the caller's
-    /// slice straight to `create_buffer_init`; so does this.
+    /// One copy: the caller's slice goes straight into the transfer staging
+    /// buffer.
     pub fn from_slice(graph: &GraphRef, dtype: Dtype, shape: &[Dim], data: &[u8]) -> Result<Tensor> {
         let want = byte_len(dtype, shape)?;
         if data.len() as u64 != want {
@@ -79,7 +76,7 @@ impl Tensor {
     pub fn splat(graph: &GraphRef, value: Splat, shape: &[Dim]) -> Result<Tensor> {
         Tensor::emit(
             graph,
-            L0::Leaf(LeafKind::Const {
+            Logical::Leaf(LeafKind::Const {
                 value,
                 shape: shape.iter().copied().collect(),
             }),
@@ -115,7 +112,7 @@ impl Tensor {
     pub fn uninit(graph: &GraphRef, dtype: Dtype, shape: &[Dim]) -> Result<Tensor> {
         Tensor::emit(
             graph,
-            L0::Leaf(LeafKind::Buffer {
+            Logical::Leaf(LeafKind::Buffer {
                 name: graph.fresh_buffer_id(),
                 dtype,
                 shape: shape.iter().copied().collect(),
@@ -130,7 +127,7 @@ impl Tensor {
         let _ = name;
         Tensor::emit(
             graph,
-            L0::Leaf(LeafKind::Param {
+            Logical::Leaf(LeafKind::Param {
                 name: graph.fresh_buffer_id(),
                 dtype,
                 shape: shape.iter().copied().collect(),
@@ -138,11 +135,10 @@ impl Tensor {
         )
     }
 
-    /// A runtime scalar read from binding 0. **Not** a `[1]` tensor and not a
-    /// baked literal — this is what deletes the trainer's scalar-tensor
-    /// workaround. Rank 0.
+    /// A runtime scalar read from binding 0. Not a `[1]` tensor and not a
+    /// baked literal. Rank 0.
     pub fn uniform(graph: &GraphRef, dtype: Dtype, sym: SymId) -> Result<Tensor> {
-        Tensor::emit(graph, L0::Leaf(LeafKind::Uniform { sym, dtype }))
+        Tensor::emit(graph, Logical::Leaf(LeafKind::Uniform { sym, dtype }))
     }
 
     /// `[start, end)` with step 1, built host-side and uploaded.
@@ -164,10 +160,8 @@ impl Tensor {
     ) -> Result<Tensor> {
         let bytes = arange_bytes(dtype, start, end, step)?;
         let n = bytes.len() as u64 / dtype.byte_size().max(1);
-        // Deliberately `upload`, not `from_slice`: the sequence is built on the
-        // host and callers read it back through `leaf_bytes` without ever
-        // resolving, so this leaf must keep its host bytes. `from_slice` now
-        // goes straight to the device and keeps none.
+        // Callers read the sequence back through `leaf_bytes` without ever
+        // resolving, so this leaf must keep its host bytes.
         upload(graph, dtype, &[Dim::Const(n)], bytes)
     }
 }
@@ -232,10 +226,6 @@ fn push_scalar(out: &mut Vec<u8>, dtype: Dtype, v: f64) {
         Dtype::Q(_) => unreachable!("guarded by arange_bytes"),
     }
 }
-
-// ---------------------------------------------------------------------------
-// FromArray
-// ---------------------------------------------------------------------------
 
 /// Nested host data whose shape is inferred from its nesting. Implemented for
 /// arrays and `Vec`s up to depth 4 plus flat slices.

@@ -1,11 +1,10 @@
 //! Contractions. `matmul`, `mat_mul_transposed_rhs` and every batched form are
-//! one `L0::Contract` with a different `EinSpec` — **transposed-rhs is a spec,
-//! not an op**, and no `MatMulParams` is ever written onto a node. Kernel
-//! family, tile geometry, split-K and staging depth are all extraction
-//! decisions that do not exist yet at this level.
+//! one `Logical::Contract` with a different `EinSpec` — transposed-rhs is a
+//! spec, not an op. Kernel family, tile geometry, split-K and staging depth
+//! are all extraction decisions that do not exist yet at this level.
 
 use fusor2_ir::dtype::Dtype;
-use fusor2_ir::ir::level0::{EinSpec, L0, Label};
+use fusor2_ir::ir::logical::{EinSpec, Logical, Label};
 use smallvec::SmallVec;
 
 use crate::tensor::Tensor;
@@ -61,10 +60,9 @@ impl Tensor {
 
     fn contract_2d(&self, rhs: &Tensor, transposed_rhs: bool) -> Result<Tensor> {
         // A block-quantized weight is a legal contraction operand on exactly
-        // one side: an ordinary `KContract` decodes the blocks on the way into
+        // one side: an ordinary `Contract` decodes the blocks on the way into
         // its staging fill, and the extractor prices that against
-        // dequantize-then-contract. Two quantized sides is not a kernel
-        // anybody has.
+        // dequantize-then-contract.
         let (q_lhs, q_rhs) = (self.dtype().is_quantized(), rhs.dtype().is_quantized());
         if q_lhs && q_rhs {
             return Err(Error::Dtype(
@@ -110,7 +108,7 @@ impl Tensor {
         let spec = matmul_spec(batch, transposed_rhs)?;
 
         // A quantized side enters the contraction as its *dequantize class*,
-        // not its raw leaf. The class is `L0::Dequant` unioned with the
+        // not its raw leaf. The class is `Logical::Dequant` unioned with the
         // `Restride` + `Map` definitional expansion (see `QMatrix::dequantize`).
         // A quantized value that `QMatrix::of_tensor` cannot name falls back
         // to the raw operand. Both spellings enter the class so the extractor
@@ -155,7 +153,7 @@ impl Tensor {
 
     /// The general contraction escape hatch with an explicit accumulator.
     pub fn contract(&self, rhs: &Tensor, spec: EinSpec, acc: Dtype) -> Result<Tensor> {
-        self.emit_here(L0::Contract {
+        self.emit_here(Logical::Contract {
             spec,
             acc,
             a: self.id,

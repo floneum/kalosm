@@ -11,7 +11,7 @@ use fusor2::composite::attention::attention_masked;
 use fusor2::device::Device;
 use fusor2::tensor::Dyn as Tensor;
 use fusor2::{Dim, Dtype};
-use fusor2_ir::ir::level1::MaskKind;
+use fusor2_ir::ir::launch::MaskKind;
 use fusor2_ir::shape::StrideSpec;
 
 const CAP: u64 = 64; // capacity

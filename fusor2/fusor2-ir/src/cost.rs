@@ -7,7 +7,7 @@ use crate::egraph::Id;
 use crate::extract::{Extraction, PlanHash};
 use crate::facts::{ValueFacts, Work};
 use crate::ir::Node;
-use crate::ir::level1::SchedPoint;
+use crate::ir::launch::SchedPoint;
 use crate::shape::Dims;
 use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;

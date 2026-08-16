@@ -1,20 +1,20 @@
-//! `KGather` and `KScatter`.
+//! `Gather` and `Scatter`.
 //!
 //! Both `ScatterMode`s name one map and differ only in strategy. On a target
 //! with no f32 atomic they share one nest: one lane per output element, a
 //! counted loop over the updates. Every output element is written by exactly one
 //! lane, so no atomic is needed and the result is bit-reproducible.
 //!
-//! Both nests read their lane tiling off `theta`. `KGather` and `KScatter` carry
-//! the same elementwise `ScheduleDomain::Map` a `KMap` carries, and can use
+//! Both nests read their lane tiling off `theta`. `Gather` and `Scatter` carry
+//! the same elementwise `ScheduleDomain::Map` a `Map` carries, and can use
 //! `tm` elements per lane like the grid-strided register tile in `map_fold`,
 //! amortizing the index read in scatter workloads.
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::error::Error;
-use fusor2_ir::ir::level0::ScatterCombine;
-use fusor2_ir::ir::level1::{L1, SchedPoint, ScatterMode};
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::logical::ScatterCombine;
+use fusor2_ir::ir::launch::{Launch, SchedPoint, ScatterMode};
+use fusor2_ir::ir::kernel::{
     Accumulator, Addr, KernelIr, Local, LocalDecl, StorageView, Stmt, TileExpr, TileExprKind,
 };
 use fusor2_ir::ir::{Node, Op};
@@ -28,15 +28,15 @@ use super::{
 };
 
 pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
-    let Op::L1(op) = &node.op else {
-        return Err(Error::Legality("not an L1 node".into()));
+    let Op::Launch(op) = &node.op else {
+        return Err(Error::Legality("not an Launch node".into()));
     };
     let tm = lane_tile(theta)?;
     match op {
-        L1::KGather {
+        Launch::Gather {
             space, axis, ops, ..
         } => gather(caps, cx, space, *axis, ops, tm),
-        L1::KScatter {
+        Launch::Scatter {
             space,
             axis,
             mode,
@@ -50,20 +50,16 @@ pub fn lower(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> 
 
 /// How many output elements one lane owns, read off `theta`.
 ///
-/// [`SchedPoint::Point`] is the floor lowering's untiled point — the fallback
-/// that guarantees every chain reaches a valid L1 form when the saturation
-/// budget is exhausted — so it is answered with 1 rather than refused. Any
-/// other family on these nodes is a planner bug and says so.
+/// [`SchedPoint::Point`] is the floor lowering's untiled point, so it is
+/// answered with 1 rather than refused. Any other family on these nodes is a
+/// planner bug.
 ///
-/// `MapTiling::dim` does not enter: this backend tiles with a **grid stride**
+/// `MapTiling::dim` is ignored: this backend tiles with a grid stride
 /// (`flat + t * grid.x * block`), exactly as `lower_map` does, so one lane's
-/// elements are a fixed distance apart whatever axis the domain named. That
-/// keeps coverage a bijection with no divisibility side condition, at the
-/// price of not distinguishing two points that differ only in `dim`.
-/// `MapTiling::vector` does not enter either: `emit::pick_width` chooses the
-/// SIMD instantiation from `caps.simd_widths` and the block width, so a width
-/// asserted here would be a second, disagreeing decision rather than a
-/// consumed one.
+/// elements are a fixed distance apart whatever axis the domain named and
+/// coverage stays a bijection with no divisibility side condition.
+/// `MapTiling::vector` is ignored too: `emit::pick_width` chooses the SIMD
+/// instantiation from `caps.simd_widths` and the block width.
 fn lane_tile(theta: SchedPoint) -> Result<u32> {
     match theta {
         SchedPoint::Map(t) => Ok(t.tm.max(1)),
@@ -74,7 +70,7 @@ fn lane_tile(theta: SchedPoint) -> Result<u32> {
     }
 }
 
-fn view(buf: &Arc<fusor2_ir::ir::level2::BufferDecl>) -> StorageView {
+fn view(buf: &Arc<fusor2_ir::ir::kernel::BufferDecl>) -> StorageView {
     StorageView {
         buffer: Arc::clone(buf),
         offset: 0,
@@ -90,9 +86,9 @@ fn view(buf: &Arc<fusor2_ir::ir::level2::BufferDecl>) -> StorageView {
 fn gather(
     caps: &Caps,
     cx: &LowerCtx<'_>,
-    space: &fusor2_ir::ir::level1::IndexSpace,
+    space: &fusor2_ir::ir::launch::IndexSpace,
     axis: u32,
-    ops: &[fusor2_ir::ir::level1::Operand],
+    ops: &[fusor2_ir::ir::launch::Operand],
     tm: u32,
 ) -> Result<KernelIr> {
     if ops.len() < 2 {
@@ -109,11 +105,10 @@ fn gather(
     }
     let inner: u32 = extents[axis + 1..].iter().product::<u32>().max(1);
     let out_stride = extents[axis].max(1) * inner;
-    // The source's extent along the gathered axis, which is the *only* axis
-    // where source and output disagree. Scaling the source's outer coordinate
-    // by the output's stride reads the wrong row whenever the index vector is
-    // not exactly as long as the axis it indexes — the common case for a
-    // table expansion, an upsample run or a narrow.
+    // The source's extent along the gathered axis, the only axis where source
+    // and output disagree. Scaling the source's outer coordinate by the
+    // output's stride reads the wrong row whenever the index vector is not
+    // exactly as long as the axis it indexes.
     let src_shape = const_extents(ops[0].layout.shape())?;
     let src_axis = *src_shape
         .get(axis)
@@ -184,37 +179,34 @@ fn gather(
 
 /// `out = base` with `out[.., idx[u], ..] (combine)= upd[.., u, ..]`.
 ///
-/// **The nest walks the output, not the updates.** A `KScatter`'s value is its
+/// The nest walks the output, not the updates: a `Scatter`'s value is its
 /// *base* with the updates applied, and the plan gives that value its own
 /// buffer — nothing copies the base in beforehand — so a kernel that only
-/// visits the written elements leaves every other one undefined. That is what
-/// made `cat`, `stack`, `pad`, `repeat` and `slice_assign` come back as zeros.
+/// visits the written elements leaves every other one undefined.
 ///
 /// One lane per output element, a counted loop over the updates, and the
 /// accumulator carried in a register: the write map is not injective, so the
-/// nest declares an associative `combine` (`verify_l1` invariant 3) and
+/// nest declares an associative `combine` (`verify_launch` invariant 3) and
 /// discharges it by making each output element the *only* writer of itself.
 /// The accumulation order is therefore fixed and the result bit-reproducible
 /// at any thread count — no atomic, on a target that has none for f32.
 ///
-/// **`tm` output elements per lane, in one loop.** The counted loop costs one
-/// `idx[u]` read per output element per update; `tm` accumulators in the same
-/// loop share that read, so the index traffic that dominates the embedding
-/// gradient falls by `tm` while the arithmetic is unchanged.
+/// `tm` output elements per lane, in one loop: the loop costs one `idx[u]`
+/// read per output element per update, and `tm` accumulators in the same loop
+/// share that read.
 fn scatter(
     caps: &Caps,
     cx: &LowerCtx<'_>,
-    space: &fusor2_ir::ir::level1::IndexSpace,
+    space: &fusor2_ir::ir::launch::IndexSpace,
     axis: u32,
     _mode: ScatterMode,
     combine: ScatterCombine,
-    ops: &[fusor2_ir::ir::level1::Operand],
+    ops: &[fusor2_ir::ir::launch::Operand],
     tm: u32,
 ) -> Result<KernelIr> {
-    // Either mode names a *strategy* for the same map. This nest needs
-    // no atomic, so `Atomic{Add}` is legal here even though `caps.atomic_f32`
-    // is false: refusing it made every `Set` scatter unrunnable on the CPU,
-    // and refusing `Add` made embedding backward unrunnable.
+    // Either mode names a *strategy* for the same map. This nest needs no
+    // atomic, so `Atomic{Add}` is legal here even though `caps.atomic_f32`
+    // is false.
     if ops.len() < 3 {
         return Err(Error::Legality(
             "a scatter needs base, index and update operands".into(),
@@ -343,9 +335,9 @@ mod tests {
     use fusor2_ir::cost::Picoseconds;
     use fusor2_ir::dtype::Dtype;
     use fusor2_ir::egraph::{EGraph, Id};
-    use fusor2_ir::extract::{BindKind, BindingPlan, Extraction, Launch, Plan, PlanHash};
-    use fusor2_ir::ir::level0::{BufferId, LeafKind, L0};
-    use fusor2_ir::ir::level1::{
+    use fusor2_ir::extract::{BindKind, BindingPlan, Extraction, Dispatch, Plan, PlanHash};
+    use fusor2_ir::ir::logical::{BufferId, LeafKind, Logical};
+    use fusor2_ir::ir::launch::{
         AccessPlan, IndexSpace, MapTiling, Operand, ScheduleDomain,
     };
     use fusor2_ir::semantics::CoreSemantics;
@@ -361,7 +353,7 @@ mod tests {
     }
 
     fn leaf(g: &mut EGraph, id: u32, dtype: Dtype, shape: &[u64]) -> Id {
-        g.add(Op::L0(L0::Leaf(LeafKind::Buffer {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
             name: BufferId(id),
             dtype,
             shape: dims(shape),
@@ -394,7 +386,7 @@ mod tests {
         });
         Plan {
             extraction: Extraction::default(),
-            launches: vec![Launch {
+            launches: vec![Dispatch {
                 root,
                 members: smallvec::smallvec![root],
                 bindings,
@@ -453,7 +445,7 @@ mod tests {
         let idx = leaf(&mut g, 1, Dtype::U32, &[updates]);
         let upd = leaf(&mut g, 2, Dtype::F32, &[updates, inner]);
         let k = g
-            .add(Op::L1(L1::KScatter {
+            .add(Op::Launch(Launch::Scatter {
                 space: IndexSpace::new(dims(&[updates, inner]).into_iter()),
                 axis: 0,
                 mode: ScatterMode::SortSegment,
@@ -503,10 +495,10 @@ mod tests {
         let src = leaf(&mut g, 0, Dtype::F32, &[src_rows, width]);
         let idx = leaf(&mut g, 1, Dtype::U32, &[rows]);
         let k = g
-            .add(Op::L1(L1::KGather {
+            .add(Op::Launch(Launch::Gather {
                 space: IndexSpace::new(dims(&[rows, width]).into_iter()),
                 axis: 0,
-                mode: fusor2_ir::ir::level1::GatherMode::RowPerGroup,
+                mode: fusor2_ir::ir::launch::GatherMode::RowPerGroup,
                 ops: vec![operand(&g, src), operand(&g, idx)],
                 sched: ScheduleDomain::Point,
             }))
@@ -535,11 +527,8 @@ mod tests {
         SchedPoint::Map(MapTiling { dim, tm, vector })
     }
 
-    // -- the schedule point is read, and reading it changes nothing numeric --
-
-    /// The whole point of the change: `theta` is consumed, and every point of
-    /// the real domain computes the same answer. A tiling that is *read* but
-    /// wrong is worse than one that is ignored, so this runs the kernel.
+    /// `theta` is consumed, and every point of the real domain computes the
+    /// same answer.
     #[test]
     fn every_schedule_point_scatters_the_same_values() {
         let want = reference_scatter(64, 8, 32);
@@ -607,7 +596,7 @@ mod tests {
     /// treated as untiled.
     #[test]
     fn the_floor_point_is_answered_and_a_foreign_family_is_refused() {
-        use fusor2_ir::ir::level1::FoldStrat;
+        use fusor2_ir::ir::launch::FoldStrat;
         assert_eq!(lane_tile(SchedPoint::Point).expect("floor point"), 1);
         assert_eq!(lane_tile(map_point(Some(0), 8, 4)).expect("map point"), 8);
         assert!(lane_tile(SchedPoint::Fold(FoldStrat::Subgroup)).is_err());
@@ -616,7 +605,7 @@ mod tests {
     /// The domain these nodes carry is non-trivial on the trainer's embedding
     /// gradient — 1,024 bins x 768 units, 384 updates — so there is a real
     /// choice to make. `map_domain` is the generator the scatter rules feed
-    /// `KScatter::sched` from, read here on that exact shape.
+    /// `Scatter::sched` from, read here on that exact shape.
     #[test]
     fn the_embedding_gradient_scatter_carries_a_real_domain() {
         let caps = crate::caps::cpu_caps();
@@ -670,7 +659,7 @@ mod tests {
         let cx = fusor2_tile::domains::DomainCtx::new(caps, fusor2_tile::Planner::global());
         let long = fusor2_tile::domains::map_domain(&dims(&[384, 768]), &[], &cx);
         let short = fusor2_tile::domains::map_domain(&dims(&[3, 768]), &[], &cx);
-        let tms = |d: &fusor2_ir::ir::level1::MapDomain| {
+        let tms = |d: &fusor2_ir::ir::launch::MapDomain| {
             let mut v: Vec<u32> = d.tilings.iter().filter(|t| t.dim.is_some()).map(|t| t.tm).collect();
             v.sort_unstable();
             v.dedup();

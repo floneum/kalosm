@@ -1,19 +1,14 @@
-//! The cooperative-matrix schedule domain: `geoms x splits x staging`.
-//! Carried whole on the node and resolved by extraction — minting every
-//! point blows the graph to ~90k nodes on a 32-layer transformer, minting a
-//! locally-Pareto top-4 lets a cheap heuristic gate the real cost model, and
-//! a nested argmin inside the node's cost is circular because the geometry
-//! determines the output's padded strides and therefore every consumer's
-//! read traffic.
+//! The cooperative-matrix schedule domain: `geoms x splits x staging`,
+//! carried whole on the node and resolved by extraction.
 //!
 //! Every `(bm, bn, bk, subgroups, n_passes)` whose closed-form subgroup
-//! split exists, whose lanes fit, and whose *exact* arena footprint fits is
+//! split exists, whose lanes fit, and whose exact arena footprint fits is
 //! a candidate.
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::Dtype;
-use fusor2_ir::ir::level1::{CoopDomain, CoopGeom};
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::launch::{CoopDomain, CoopGeom};
+use fusor2_ir::ir::kernel::{
     ElementType, MemoryLevel, ScalarElement, TileDecl, TileLayout, Tiles,
 };
 use fusor2_ir::shape::Dim;
@@ -34,9 +29,8 @@ const SUBGROUP_CHOICES: [u32; 6] = [1, 2, 4, 8, 16, 32];
 /// columns, which bounds `n_passes` at `bn / 16`.
 const MIN_PASS_COLS: u32 = 16;
 
-/// Compatibility entry point kept for the scaffold's `domains::coop_legal`
-/// re-export. Delegates to [`coop_domain`] with `batch = 1` and the
-/// crate-default planner.
+/// Delegates to [`coop_domain`] with `batch = 1` and the crate-default
+/// planner.
 pub fn legal(m: Dim, n: Dim, k: Dim, operand: Dtype, acc: Dtype, caps: &Caps) -> CoopDomain {
     let cx = DomainCtx::new(caps, crate::domains::default_planner());
     coop_domain(m, n, k, Dim::Const(1), operand, acc, &cx)
@@ -55,19 +49,14 @@ pub fn coop_domain(
     acc: Dtype,
     cx: &DomainCtx<'_>,
 ) -> CoopDomain {
-    // `m`, `n` and `batch` price the domain; they do not filter it *by
-    // value*. Edge tiles fill zero past the logical extents, so no concrete
-    // shape is illegal for any geometry — that is what deletes the
-    // reference's padding gate.
+    // `m`, `n` and `batch` price the domain; they do not filter it by value.
+    // Edge tiles fill zero past the logical extents, so no concrete shape is
+    // illegal for any geometry.
     //
-    // A **symbolic** `m` or `n` is different in kind, not degree: the
-    // whole-block cooperative store requires the plan to deliver an output
-    // padded to the geometry's tile — a *layout* property `buffer_layout_for`
-    // states at plan time — and a padding of `Sym(s)` to a tile multiple is
-    // not expressible as a `Dim`. No point of this domain can honor the
-    // store contract, so the domain is empty: a legality bound, not a cost
-    // veto. Symbolic `k`/`batch` stay legal — they never enter the padded
-    // layout.
+    // A symbolic `m` or `n` empties the domain: the whole-block cooperative
+    // store requires an output padded to the geometry's tile, and a padding
+    // of `Sym(s)` to a tile multiple is not expressible as a `Dim`. Symbolic
+    // `k`/`batch` stay legal — they never enter the padded layout.
     let _ = batch;
     if m.as_const().is_none() || n.as_const().is_none() {
         return CoopDomain::default();
@@ -147,9 +136,8 @@ fn generate_geoms(operand: Dtype, cx: &DomainCtx<'_>) -> SmallVec<[CoopGeom; 16]
     let max_bytes = caps.limits.max_compute_workgroup_storage_size;
     let stage = stage_element(operand);
 
-    // `FUSOR2_PIN_COOP="bm,bn,bk"` restricts the domain to one geometry, which
-    // is how the table in this module's doc was measured and how the next
-    // round should re-measure it. Ordinary runs never set it.
+    // `FUSOR2_PIN_COOP="bm,bn,bk"` restricts the domain to one geometry, for
+    // measurement. Ordinary runs never set it.
     let pin: Option<(u32, u32, u32)> = std::env::var("FUSOR2_PIN_COOP").ok().and_then(|v| {
         let p: Vec<u32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
         (p.len() == 3).then(|| (p[0], p[1], p[2]))
@@ -184,10 +172,8 @@ fn generate_geoms(operand: Dtype, cx: &DomainCtx<'_>) -> SmallVec<[CoopGeom; 16]
 }
 
 /// One geometry, or `None` when no `(rg, cg)` factorization keeps both
-/// fragment sides whole multiples of [`CoopGeom::COOP_DIM`]. The
-/// reference's `(1, subgroups)` fallback is deleted: an unsplittable
-/// geometry is simply not a candidate, instead of reaching a kernel whose
-/// own divisibility asserts catch it at build time.
+/// fragment sides whole multiples of [`CoopGeom::COOP_DIM`]; an
+/// unsplittable geometry is simply not a candidate.
 fn geom_of(bm: u32, bn: u32, bk: u32, n_passes: u32, subgroups: u32) -> Option<CoopGeom> {
     let (rg, cg) = CoopGeom::subgroup_split(bm, bn, n_passes, subgroups)?;
     Some(CoopGeom {
@@ -236,10 +222,7 @@ pub fn coop_tiles(geom: CoopGeom, stage: ScalarElement) -> Tiles {
 }
 
 /// Never-split, plus every divisor of the K loop leaving at least two
-/// iterations per workgroup, capped at [`MAX_SPLITS`]. Verbatim
-/// `split_candidates` from `core/src/matmul/cost.rs`, minus the
-/// `has_epilogues` gate — whether an epilogue survives a split is
-/// `unfuse_coop_epilogue`'s business, not the split generator's.
+/// iterations per workgroup, capped at [`MAX_SPLITS`].
 ///
 /// A symbolic `k` cannot be divided at compile time, so it emits `[1]`.
 pub fn split_candidates(k: Dim, bk: u32) -> Vec<u32> {
@@ -320,13 +303,10 @@ mod tests {
         // Two rows spelled out. `64x128 / n_passes 2` gives a 64-wide pass,
         // so `(2, 4)` minimizes `cg*64 + rg*64` at 384 against `(1, 8)`'s
         // 576. `128x64 / n_passes 1` lands on `(4, 2)` at
-        // `2*128 + 4*64 = 512`, under `(2, 4)`'s 640 — the tie-break to the
-        // smaller `rg` never runs here, which is why it has to be the
-        // objective and not a table.
+        // `2*128 + 4*64 = 512`, under `(2, 4)`'s 640.
         assert_eq!(CoopGeom::subgroup_split(64, 128, 2, 8), Some((2, 4)));
         assert_eq!(CoopGeom::subgroup_split(128, 64, 1, 8), Some((4, 2)));
-        // No factorization keeps both sides whole: not a candidate, rather
-        // than the reference's `(1, subgroups)` fallback.
+        // No factorization keeps both sides whole: not a candidate.
         assert_eq!(CoopGeom::subgroup_split(16, 16, 1, 8), None);
     }
 
@@ -411,10 +391,8 @@ mod tests {
 
     #[test]
     fn padded_shapes_are_not_declined() {
-        // The reference pins `1x4096x4096 => Coop tile=None`: the family
-        // selector picks Coop, the tile scorer declines on its padding
-        // gate, and production silently runs a third path. Here Coop stays
-        // a live candidate and loses on cost or does not.
+        // For `1x4096x4096` Coop stays a live candidate and loses on cost
+        // or does not; there is no padding gate.
         let caps = apple_caps();
         let cx = ctx(&caps);
         let d = coop_domain(

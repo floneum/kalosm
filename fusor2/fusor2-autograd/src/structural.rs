@@ -1,13 +1,8 @@
 //! The five structural adjoints, each read off the primal op's own attributes.
 //!
-//! [`window_adjoint`] is trainer constraint 4, solved by two integers: from
-//! `(window, step)`, `step >= window` proves the adjoint is an elementwise
-//! mask-and-broadcast; overlapping windows give `Scatter{Add}`, itself a chain
-//! with four lowerings. This is why `Window` survives as a core op — under
-//! `Dim::Sym`, injectivity of a *relative* stride composition with symbolic
-//! extents and offsets is undecidable, so a `Restride`-based encoding would
-//! degrade a non-overlapping max-pool to a scatter on exactly the
-//! symbolic-shape path the design exists to enable.
+//! [`window_adjoint`] is solved by two integers: from `(window, step)`,
+//! `step >= window` proves the adjoint is an elementwise mask-and-broadcast;
+//! overlapping windows give `Scatter{Add}`.
 
 use crate::tape::{TapeExt, const_numel, const_row_major};
 use fusor2_ir::autograd::{Grads, Tape, Val};
@@ -15,8 +10,8 @@ use fusor2_ir::dtype::Dtype;
 use fusor2_ir::ir::Node;
 use fusor2_ir::ir::Op;
 use fusor2_ir::carrier::Carrier;
-use fusor2_ir::ir::level0::{L0, ScatterCombine, TiePolicy};
-use fusor2_ir::ir::level1::WindowAdjoint;
+use fusor2_ir::ir::logical::{Logical, ScatterCombine, TiePolicy};
+use fusor2_ir::ir::launch::WindowAdjoint;
 use fusor2_ir::scalar::{BinOp, CmpOp, ScalarExpr};
 use fusor2_ir::shape::{Dim, Dims, Layout, SlidingWindow, StrideSpec, reshape_specs};
 use fusor2_ir::{Error, Result};
@@ -31,18 +26,16 @@ pub fn structural_adjoint(
     out: Val,
 ) -> Result<Grads> {
     match &node.op {
-        Op::L0(L0::Restride { .. }) => restride_adjoint(tape, node, grad, ins, out),
-        Op::L0(L0::Window { .. }) => window_adjoint(tape, node, grad, ins, out),
-        Op::L0(L0::Gather { .. }) => gather_adjoint(tape, node, grad, ins, out),
-        Op::L0(L0::Scatter { .. }) => scatter_adjoint(tape, node, grad, ins, out),
-        Op::L0(L0::Fold { .. }) => fold_adjoint(tape, node, grad, ins, out),
+        Op::Logical(Logical::Restride { .. }) => restride_adjoint(tape, node, grad, ins, out),
+        Op::Logical(Logical::Window { .. }) => window_adjoint(tape, node, grad, ins, out),
+        Op::Logical(Logical::Gather { .. }) => gather_adjoint(tape, node, grad, ins, out),
+        Op::Logical(Logical::Scatter { .. }) => scatter_adjoint(tape, node, grad, ins, out),
+        Op::Logical(Logical::Fold { .. }) => fold_adjoint(tape, node, grad, ins, out),
         other => Err(Error::Plan(format!(
             "no structural adjoint for {other:?}"
         ))),
     }
 }
-
-// ---------------------------------------------------------------- Restride
 
 /// One input axis's contribution to the output index space.
 #[derive(Clone, Debug, Default)]
@@ -70,7 +63,7 @@ pub fn restride_adjoint(
     ins: &[Val],
     _out: Val,
 ) -> Result<Grads> {
-    let Op::L0(L0::Restride { specs, .. }) = &node.op else {
+    let Op::Logical(Logical::Restride { specs, .. }) = &node.op else {
         return Err(Error::Plan("restride_adjoint on a non-Restride node".into()));
     };
     let x = *ins
@@ -94,13 +87,10 @@ pub fn restride_adjoint(
         return Ok(smallvec::smallvec![Some(dx)]);
     }
 
-    // Stage 2b: a reshape. `invert_runs` works per input axis, and a *merge*
-    // names only the group's innermost input axis (`[2,3] -> [6]` is
-    // `dim_with(1, 6, 1)`), so the outer axes of the group look unread and it
-    // declines. But a spec vector whose composed layout is dense row-major
-    // over the whole input is the identity on flat indices — a pure reshape —
-    // and the adjoint of a reshape is the reshape back, which
-    // `reshape_specs` already spells in the same convention.
+    // Stage 2b: a reshape. A merge names only the group's innermost input
+    // axis, so `invert_runs` declines it; a spec vector whose composed layout
+    // is dense row-major over the whole input is the identity on flat
+    // indices, and its adjoint is the reshape back.
     let view_shape: Dims = kept.iter().map(|s| s.size).collect();
     if is_dense_reshape(&kept, &xshape, &view_shape) {
         let inverse = reshape_specs(&view_shape, &xshape)?;
@@ -221,17 +211,13 @@ fn restride_index_expr(kept: &[StrideSpec], xshape: &[Dim]) -> Result<ScalarExpr
     Ok(u32_sum(terms, constant))
 }
 
-// ------------------------------------------------------------------ Window
-
 /// Adjoint of `Window`.
 ///
-/// **Two integers decide it.** [`WindowAdjoint::of`] reads `(window, step)`
-/// off each spec: when every spec has `step == window` and tiles its axis
-/// exactly, the adjoint is a pure view — permute the trailing window axis
-/// next to its position axis and merge the two — and the emitted chain
-/// contains **no** `Scatter`. Otherwise the windows overlap or leave a tail,
-/// and the adjoint is the overlap-add `Scatter{Add}`, itself a chain with
-/// four lowerings the cost model picks between.
+/// [`WindowAdjoint::of`] reads `(window, step)` off each spec: when every
+/// spec has `step == window` and tiles its axis exactly, the adjoint is a
+/// pure view — permute the trailing window axis next to its position axis and
+/// merge the two. Otherwise the windows overlap or leave a tail, and the
+/// adjoint is the overlap-add `Scatter{Add}`.
 pub fn window_adjoint(
     tape: &mut dyn Tape,
     node: &Node,
@@ -239,7 +225,7 @@ pub fn window_adjoint(
     ins: &[Val],
     _out: Val,
 ) -> Result<Grads> {
-    let Op::L0(L0::Window { specs, .. }) = &node.op else {
+    let Op::Logical(Logical::Window { specs, .. }) = &node.op else {
         return Err(Error::Plan("window_adjoint on a non-Window node".into()));
     };
     let x = *ins
@@ -332,13 +318,9 @@ fn window_view_adjoint(
     Ok(Some(cur))
 }
 
-// ------------------------------------------------------------------ Gather
-
 /// Adjoint of `Gather` is `Scatter{Add}`; the index operand gets no gradient.
-///
-/// **Trainer constraint 3.** Duplicates accumulate, so the embedding table
-/// receiving one token twice gets the summed gradient. The adjoint is one of
-/// `Scatter{Add}`'s four lowerings, kept so the cost model can reject it.
+/// Duplicates accumulate, so an embedding table receiving one token twice
+/// gets the summed gradient.
 pub fn gather_adjoint(
     tape: &mut dyn Tape,
     node: &Node,
@@ -346,7 +328,7 @@ pub fn gather_adjoint(
     ins: &[Val],
     _out: Val,
 ) -> Result<Grads> {
-    let Op::L0(L0::Gather { axis, .. }) = &node.op else {
+    let Op::Logical(Logical::Gather { axis, .. }) = &node.op else {
         return Err(Error::Plan("gather_adjoint on a non-Gather node".into()));
     };
     let (x, idx) = match ins {
@@ -363,8 +345,6 @@ pub fn gather_adjoint(
     Ok(smallvec::smallvec![Some(dx), None])
 }
 
-// ----------------------------------------------------------------- Scatter
-
 /// Adjoint of `Scatter`: `Gather` for the update operand, masked
 /// pass-through for the base.
 ///
@@ -378,7 +358,7 @@ pub fn scatter_adjoint(
     ins: &[Val],
     _out: Val,
 ) -> Result<Grads> {
-    let Op::L0(L0::Scatter {
+    let Op::Logical(Logical::Scatter {
         axis,
         combine,
         unique,
@@ -409,8 +389,6 @@ pub fn scatter_adjoint(
     Ok(smallvec::smallvec![Some(d_base), None, Some(d_upd)])
 }
 
-// -------------------------------------------------------------------- Fold
-
 /// Adjoint of `Fold`, read off `combine`: `Add` broadcasts, `Mul` is the
 /// zero-aware product rule, `Max`/`Min` use the op's declared `TiePolicy`
 /// rather than an implicit even split.
@@ -424,7 +402,7 @@ pub fn fold_adjoint(
     ins: &[Val],
     out: Val,
 ) -> Result<Grads> {
-    let Op::L0(L0::Fold {
+    let Op::Logical(Logical::Fold {
         carrier, axis, acc, ..
     }) = &node.op
     else {
@@ -440,10 +418,9 @@ pub fn fold_adjoint(
         .ok_or_else(|| Error::Shape(format!("fold axis {axis} out of range")))?;
     let dtype = tape.dtype_of(x);
 
-    // The adjoint reads the carrier's own **merge**, not a variant name: a
-    // single scalar slot merged by `Add` broadcasts, `Mul` is the zero-aware
-    // product rule, `Max`/`Min` use the declared `TiePolicy`. A carrier that
-    // is not one of those has no analytic adjoint here and says so.
+    // The adjoint reads the carrier's own merge, not a variant name. A
+    // carrier that is not one of Add/Mul/Max/Min has no analytic adjoint
+    // here and says so.
     if ins.len() != 1 {
         return Err(Error::Numeric(
             "a multi-operand fold's adjoint is the composition of its lift's              adjoint with this one; autograd runs before fusion mints one"
@@ -470,18 +447,15 @@ pub fn fold_adjoint(
             )));
         }
     };
-    // A fold's output is at `acc`, and `accum_dtype` floors every narrow float
-    // there — an f16 `max` really does hand this adjoint an f32 output and an
-    // f32 incoming gradient. The adjoint of a value carries that value's own
-    // dtype, because two contributions to one value are summed by a `Map` that
-    // reads both at their declared width, so narrow back on the way out.
+    // A fold's output is at `acc`, so an f16 `max` hands this adjoint an f32
+    // output and an f32 incoming gradient. The adjoint of a value must carry
+    // that value's own dtype, so narrow back on the way out.
     let dx = cast_to(tape, dx, dtype)?;
     Ok(smallvec::smallvec![Some(dx)])
 }
 
 /// `v` at `dtype`, or `v` unchanged when it is already there. The identity
-/// case emits no node, so a graph in which nothing widens is byte-identical
-/// to one built before any of this existed.
+/// case emits no node.
 fn cast_to(tape: &mut dyn Tape, v: Val, dtype: Dtype) -> Result<Val> {
     if tape.dtype_of(v) == dtype {
         return Ok(v);
@@ -562,15 +536,13 @@ fn product_adjoint(
     tape.map(body, &[x, bg, bp, bzc])
 }
 
-/// Max/Min adjoint. The policy is read off the op — never assumed.
+/// Max/Min adjoint. The tie policy is read off the op, never assumed.
 ///
-/// The fold's own output lives at the accumulator width, which for f16/bf16
-/// is one step wider than the operand. Everything here is therefore built at
-/// **`out`'s** dtype rather than `x`'s: widening the operand into it is exact,
-/// and the extremum is by construction one of those widened operand values,
-/// so the equality test that finds the argmax stays exact too. `fold_adjoint`
-/// narrows the result back. Where the widths already agree — every f32 graph —
-/// no cast is emitted and the expression trees are unchanged.
+/// Everything is built at `out`'s dtype (the accumulator width): widening the
+/// operand into it is exact, and the extremum is one of those widened operand
+/// values, so the equality test that finds the argmax stays exact.
+/// `fold_adjoint` narrows the result back. When the widths already agree no
+/// cast is emitted.
 #[allow(clippy::too_many_arguments)]
 fn extremum_adjoint(
     tape: &mut dyn Tape,
@@ -653,8 +625,6 @@ fn sentinel(dtype: Dtype, extent: Dim) -> f32 {
     }
 }
 
-// ------------------------------------------------------------------ shared
-
 /// `Scatter{Add}` a gradient back through an arbitrary index map: flatten,
 /// scatter into a zero base, reshape. The index tensor is a `Map` of
 /// `IndexOf` terms — never a host loop.
@@ -719,11 +689,11 @@ mod tests {
     use crate::tape::testing::graph;
     use fusor2_ir::egraph::{EGraph, Id};
     use fusor2_ir::carrier::{ArgRemap, Carrier};
-    use fusor2_ir::ir::level0::{BufferId, LeafKind};
+    use fusor2_ir::ir::logical::{BufferId, LeafKind};
 
     fn param(g: &mut EGraph, shape: &[u64]) -> Val {
         let n = g.len() as u32;
-        g.add(Op::L0(L0::Leaf(LeafKind::Param {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Param {
             name: BufferId(n),
             dtype: Dtype::F32,
             shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
@@ -749,10 +719,10 @@ mod tests {
         out
     }
 
-    fn count<F: Fn(&L0) -> bool>(g: &EGraph, root: Id, f: F) -> usize {
+    fn count<F: Fn(&Logical) -> bool>(g: &EGraph, root: Id, f: F) -> usize {
         reachable(g, root)
             .into_iter()
-            .filter(|id| matches!(&g.node(*id).op, Op::L0(op) if f(op)))
+            .filter(|id| matches!(&g.node(*id).op, Op::Logical(op) if f(op)))
             .count()
     }
 
@@ -763,7 +733,7 @@ mod tests {
         let specs: SmallVec<[StrideSpec; 6]> =
             smallvec::smallvec![StrideSpec::broadcast(Dim::Const(3)), StrideSpec::dim(1, Dim::Const(4))];
         let y = g
-            .add(Op::L0(L0::Restride {
+            .add(Op::Logical(Logical::Restride {
                 specs,
                 bounds: fusor2_ir::shape::BoundsProof::Static,
                 x,
@@ -781,13 +751,13 @@ mod tests {
         assert_eq!(
             count(g, dx, |op| matches!(
                 op,
-                L0::Fold { carrier, .. } if carrier.kind() == Some(BinOp::Add)
+                Logical::Fold { carrier, .. } if carrier.kind() == Some(BinOp::Add)
             )),
             1,
             "sum-reduce over the one stride-0 axis, and nothing else"
         );
         assert_eq!(
-            count(g, dx, |op| matches!(op, L0::Scatter { .. })),
+            count(g, dx, |op| matches!(op, Logical::Scatter { .. })),
             0,
             "the broadcast backward is never a scatter"
         );
@@ -804,7 +774,7 @@ mod tests {
             StrideSpec::dim(0, Dim::Const(2)),
         ];
         let y = g
-            .add(Op::L0(L0::Restride {
+            .add(Op::Logical(Logical::Restride {
                 specs,
                 bounds: fusor2_ir::shape::BoundsProof::Static,
                 x,
@@ -818,14 +788,12 @@ mod tests {
             t.facts(dx).shape,
             Dims::from_slice(&[Dim::Const(2), Dim::Const(3), Dim::Const(4)])
         );
-        assert!(matches!(t.node(dx).op, Op::L0(L0::Restride { .. })));
+        assert!(matches!(t.node(dx).op, Op::Logical(Logical::Restride { .. })));
     }
 
-    /// `flatten_all` is `dim_with(inner, numel, 1)`, which names only the
-    /// innermost input axis. `invert_runs` sees the outer axes as unread and
-    /// declines; the reshape stage has to catch it, because falling through to
-    /// the index-tensor scatter is what made every `sum_all`-seeded gradient
-    /// wrong past element 0.
+    /// `flatten_all` names only the innermost input axis, so `invert_runs`
+    /// declines it; the reshape stage must catch it instead of falling
+    /// through to the index-tensor scatter.
     #[test]
     fn a_merging_reshape_inverts_into_one_restride() {
         for (xshape, view) in [
@@ -840,7 +808,7 @@ mod tests {
             let vdims: Vec<Dim> = view.iter().map(|d| Dim::Const(*d)).collect();
             let specs = reshape_specs(&xdims, &vdims).unwrap();
             let y = g
-                .add(Op::L0(L0::Restride {
+                .add(Op::Logical(Logical::Restride {
                     specs,
                     bounds: fusor2_ir::shape::BoundsProof::Static,
                     x,
@@ -856,12 +824,12 @@ mod tests {
                 "{xshape:?} -> {view:?}"
             );
             assert!(
-                matches!(t.node(dx).op, Op::L0(L0::Restride { .. })),
+                matches!(t.node(dx).op, Op::Logical(Logical::Restride { .. })),
                 "{xshape:?} -> {view:?} should invert into one Restride"
             );
             let gr = t.graph();
             assert_eq!(
-                count(gr, dx, |op| matches!(op, L0::Scatter { .. })),
+                count(gr, dx, |op| matches!(op, Logical::Scatter { .. })),
                 0,
                 "{xshape:?} -> {view:?}: a bijective reshape is never a scatter"
             );
@@ -875,7 +843,7 @@ mod tests {
         let specs: SmallVec<[StrideSpec; 6]> =
             smallvec::smallvec![StrideSpec::dim(0, Dim::Const(3)).with_offset(Dim::Const(2))];
         let y = g
-            .add(Op::L0(L0::Restride {
+            .add(Op::Logical(Logical::Restride {
                 specs,
                 bounds: fusor2_ir::shape::BoundsProof::Static,
                 x,
@@ -890,7 +858,7 @@ mod tests {
         assert_eq!(
             count(g, dx, |op| matches!(
                 op,
-                L0::Scatter {
+                Logical::Scatter {
                     combine: ScatterCombine::Add,
                     ..
                 }
@@ -900,7 +868,7 @@ mod tests {
     }
 
     fn window(g: &mut EGraph, x: Val, specs: &[SlidingWindow]) -> Val {
-        g.add(Op::L0(L0::Window {
+        g.add(Op::Logical(Logical::Window {
             specs: specs.iter().copied().collect(),
             x,
         }))
@@ -928,7 +896,7 @@ mod tests {
         );
         let g = t.graph();
         assert_eq!(
-            count(g, dx, |op| matches!(op, L0::Scatter { .. })),
+            count(g, dx, |op| matches!(op, Logical::Scatter { .. })),
             0,
             "pool_max with stride == window must produce no scatter"
         );
@@ -953,7 +921,7 @@ mod tests {
         assert_eq!(
             count(g, dx, |op| matches!(
                 op,
-                L0::Scatter {
+                Logical::Scatter {
                     combine: ScatterCombine::Add,
                     unique: false,
                     ..
@@ -972,7 +940,7 @@ mod tests {
         let node = g.node(y).clone();
         let gshape = g.facts(y).shape.clone();
         let grad = g
-            .add(Op::L0(L0::Leaf(LeafKind::Param {
+            .add(Op::Logical(Logical::Leaf(LeafKind::Param {
                 name: BufferId(99),
                 dtype: Dtype::F32,
                 shape: gshape,
@@ -985,7 +953,7 @@ mod tests {
             Dims::from_slice(&[Dim::Const(2), Dim::Const(4), Dim::Const(6)])
         );
         let g = t.graph();
-        assert_eq!(count(g, dx, |op| matches!(op, L0::Scatter { .. })), 0);
+        assert_eq!(count(g, dx, |op| matches!(op, Logical::Scatter { .. })), 0);
     }
 
     /// Trainer constraint 3: no one-hot matmul anywhere.
@@ -994,13 +962,13 @@ mod tests {
         let mut g = graph();
         let table = param(&mut g, &[1024, 24]);
         let idx = g
-            .add(Op::L0(L0::Leaf(LeafKind::Buffer {
+            .add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
                 name: BufferId(7),
                 dtype: Dtype::U32,
                 shape: smallvec::smallvec![Dim::Const(6)],
             })))
             .unwrap();
-        let y = g.add(Op::L0(L0::Gather { axis: 0, x: table, idx })).unwrap();
+        let y = g.add(Op::Logical(Logical::Gather { axis: 0, x: table, idx })).unwrap();
         let node = g.node(y).clone();
         let grad = param(&mut g, &[6, 24]);
         let mut t = GraphTape::new(&mut g);
@@ -1015,7 +983,7 @@ mod tests {
         assert_eq!(
             count(g, dx, |op| matches!(
                 op,
-                L0::Scatter {
+                Logical::Scatter {
                     combine: ScatterCombine::Add,
                     unique: false,
                     ..
@@ -1024,7 +992,7 @@ mod tests {
             1
         );
         assert_eq!(
-            count(g, dx, |op| matches!(op, L0::Contract { .. })),
+            count(g, dx, |op| matches!(op, Logical::Contract { .. })),
             0,
             "the one-hot matmul is structurally deleted"
         );
@@ -1036,14 +1004,14 @@ mod tests {
         let base = param(&mut g, &[8, 3]);
         let upd = param(&mut g, &[2, 3]);
         let idx = g
-            .add(Op::L0(L0::Leaf(LeafKind::Buffer {
+            .add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
                 name: BufferId(5),
                 dtype: Dtype::U32,
                 shape: smallvec::smallvec![Dim::Const(2)],
             })))
             .unwrap();
         let y = g
-            .add(Op::L0(L0::Scatter {
+            .add(Op::Logical(Logical::Scatter {
                 axis: 0,
                 combine: ScatterCombine::Set,
                 base,
@@ -1061,7 +1029,7 @@ mod tests {
         assert!(grads[1].is_none());
         assert!(matches!(
             t.node(d_base).op,
-            Op::L0(L0::Scatter {
+            Op::Logical(Logical::Scatter {
                 combine: ScatterCombine::Set,
                 ..
             })
@@ -1078,14 +1046,14 @@ mod tests {
         let base = param(&mut g, &[8]);
         let upd = param(&mut g, &[2]);
         let idx = g
-            .add(Op::L0(L0::Leaf(LeafKind::Buffer {
+            .add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
                 name: BufferId(5),
                 dtype: Dtype::U32,
                 shape: smallvec::smallvec![Dim::Const(2)],
             })))
             .unwrap();
         let y = g
-            .add(Op::L0(L0::Scatter {
+            .add(Op::Logical(Logical::Scatter {
                 axis: 0,
                 combine: ScatterCombine::Add,
                 base,
@@ -1110,7 +1078,7 @@ mod tests {
     }
 
     fn fold_tied(g: &mut EGraph, x: Val, carrier: Carrier, axis: u32) -> Val {
-        g.add(Op::L0(L0::Fold {
+        g.add(Op::Logical(Logical::Fold {
             carrier,
             axis,
             acc: Dtype::F32,
@@ -1133,7 +1101,7 @@ mod tests {
             Dims::from_slice(&[Dim::Const(3), Dim::Const(5)])
         );
         match &t.node(dx).op {
-            Op::L0(L0::Restride { specs, .. }) => assert!(specs[1].is_broadcast()),
+            Op::Logical(Logical::Restride { specs, .. }) => assert!(specs[1].is_broadcast()),
             other => panic!("expected a broadcast Restride, got {other:?}"),
         }
     }
@@ -1153,7 +1121,7 @@ mod tests {
         assert_eq!(
             count(g, dx, |op| matches!(
                 op,
-                L0::Fold { carrier, .. } if carrier.kind() == Some(BinOp::Mul)
+                Logical::Fold { carrier, .. } if carrier.kind() == Some(BinOp::Mul)
             )),
             1,
             "the zero-substituted product"
@@ -1161,7 +1129,7 @@ mod tests {
         assert_eq!(
             count(g, dx, |op| matches!(
                 op,
-                L0::Fold { carrier, .. } if carrier.kind() == Some(BinOp::Add)
+                Logical::Fold { carrier, .. } if carrier.kind() == Some(BinOp::Add)
             )),
             1,
             "the zero count"
@@ -1179,7 +1147,7 @@ mod tests {
             let mut t = GraphTape::new(&mut g);
             let dx = fold_adjoint(&mut t, &node, grad, &[x], y).unwrap()[0].unwrap();
             let g = t.graph();
-            let folds = count(g, dx, |op| matches!(op, L0::Fold { .. }));
+            let folds = count(g, dx, |op| matches!(op, Logical::Fold { .. }));
             assert_eq!(
                 folds,
                 1 + extra_folds,
@@ -1189,8 +1157,7 @@ mod tests {
     }
 
     /// A multi-slot carrier has no analytic adjoint here: those carriers are
-    /// minted by the fold laws *after* autograd, and the composed adjoint of
-    /// the chain they replaced is what carries the gradient. An honest `Err`,
+    /// minted by the fold laws after autograd, so this must be an `Err`,
     /// never a silently wrong slot-0 gradient.
     #[test]
     fn multi_slot_carrier_folds_are_refused() {
@@ -1238,12 +1205,12 @@ mod numeric {
     use fusor2_ir::scalar::UnOp;
     use fusor2_ir::egraph::{EGraph, Id};
     use fusor2_ir::carrier::Carrier;
-    use fusor2_ir::ir::level0::{BufferId, LeafKind};
+    use fusor2_ir::ir::logical::{BufferId, LeafKind};
     use rustc_hash::FxHashMap;
 
     fn param(g: &mut EGraph, shape: &[u64]) -> Id {
         let n = g.len() as u32;
-        g.add(Op::L0(L0::Leaf(LeafKind::Param {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Param {
             name: BufferId(n),
             dtype: Dtype::F32,
             shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
@@ -1253,7 +1220,7 @@ mod numeric {
 
     fn u32_buffer(g: &mut EGraph, len: u64) -> Id {
         let n = g.len() as u32;
-        g.add(Op::L0(L0::Leaf(LeafKind::Buffer {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
             name: BufferId(n),
             dtype: Dtype::U32,
             shape: smallvec::smallvec![Dim::Const(len)],
@@ -1262,7 +1229,7 @@ mod numeric {
     }
 
     fn ones(g: &mut EGraph, shape: &[u64]) -> Id {
-        g.add(Op::L0(L0::Leaf(LeafKind::Const {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Const {
             value: fusor2_ir::dtype::Splat::F32(1.0),
             shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
         })))
@@ -1306,7 +1273,7 @@ mod numeric {
         if let Some(t) = tie {
             carrier.tie = Some(t);
         }
-        g.add(Op::L0(L0::Fold {
+        g.add(Op::Logical(Logical::Fold {
             carrier,
             axis,
             acc,
@@ -1317,7 +1284,7 @@ mod numeric {
 
     fn param_dtype(g: &mut EGraph, shape: &[u64], dtype: Dtype) -> Id {
         let n = g.len() as u32;
-        g.add(Op::L0(L0::Leaf(LeafKind::Param {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Param {
             name: BufferId(n),
             dtype,
             shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
@@ -1326,7 +1293,7 @@ mod numeric {
     }
 
     fn splat_ones(g: &mut EGraph, shape: &[u64], dtype: Dtype) -> Id {
-        g.add(Op::L0(L0::Leaf(LeafKind::Const {
+        g.add(Op::Logical(Logical::Leaf(LeafKind::Const {
             value: crate::tape::splat_of(dtype, 1.0).unwrap(),
             shape: shape.iter().map(|d| Dim::Const(*d)).collect(),
         })))
@@ -1407,10 +1374,8 @@ mod numeric {
     }
 
     /// Every narrow float accumulates at `compute_dtype`, so a `max`/`min`
-    /// fold's own output — and the `sum_axis` count the `SplitEvenly` tie
-    /// divides by — come back one width wider than the operand. The adjoint
-    /// must read each operand at the dtype that operand actually has. This is
-    /// the whole of `betlang-train --f16`: its pool is a `max` fold on f16.
+    /// fold's output comes back one width wider than the operand. The adjoint
+    /// must read each operand at the dtype that operand actually has.
     #[test]
     fn the_extremum_adjoint_reads_a_wider_accumulator_at_its_own_width() {
         for dtype in [Dtype::F16, Dtype::BF16] {
@@ -1453,17 +1418,10 @@ mod numeric {
         }
     }
 
-    /// Every `Bin`/`Cmp` in `e` combines two operands of the same width, and
-    /// every `Select` offers two arms of the same width. Returns the first
-    /// violation.
-    ///
-    /// `check_arg_dtypes` cannot see any of this: it checks only that each
-    /// `Arg(i)` leaf is *declared* at operand `i`'s dtype, and a body reading
-    /// an f16 arg and an f32 arg satisfies that while still asking an emitter
-    /// to compare two different widths. `ScalarExpr::bin` and `::cmp` take
-    /// their result dtype from `a` alone and `::select` from `t` alone, so a
-    /// mixed-width node is silently constructible and then silently mistyped
-    /// downstream.
+    /// Returns the first `Bin`/`Cmp`/`Select` in `e` whose operands or arms
+    /// differ in width. `check_arg_dtypes` cannot see this: it only checks
+    /// that each `Arg(i)` leaf is declared at operand `i`'s dtype, so a
+    /// mixed-width node is silently constructible.
     fn width_mismatch(e: &ScalarExpr) -> Option<String> {
         use fusor2_ir::scalar::ScalarKind as K;
         let pair = |what: &str, a: &ScalarExpr, b: &ScalarExpr| {
@@ -1490,10 +1448,7 @@ mod numeric {
     }
 
     /// No adjoint this file builds may hand an emitter a mixed-width
-    /// expression. This is what the widening cast on the operand side buys:
-    /// the verifier only type-checks `Arg` leaves, so without it an f16 `x`
-    /// gets compared against an f32 fold output inside one `Cmp` and nothing
-    /// downstream of `check_arg_dtypes` objects.
+    /// expression.
     #[test]
     fn no_fold_adjoint_builds_a_mixed_width_expression() {
         for dtype in [Dtype::F16, Dtype::BF16, Dtype::F32] {
@@ -1509,7 +1464,7 @@ mod numeric {
                     // Every node up to `dx` — the adjoint chain is the tail of
                     // the graph, so scanning all of it also covers the forward.
                     for i in 0..=dx.0 {
-                        if let Op::L0(L0::Map { expr, .. }) = &g.node(Id(i)).op
+                        if let Op::Logical(Logical::Map { expr, .. }) = &g.node(Id(i)).op
                             && let Some(bad) = width_mismatch(expr)
                         {
                             panic!("{dtype:?}/{op:?}/{tie:?} built a Map body where {bad}");
@@ -1621,7 +1576,7 @@ mod numeric {
         let mut g = graph();
         let table = param(&mut g, &[4, 2]);
         let idx = u32_buffer(&mut g, 3);
-        let rows = g.add(Op::L0(L0::Gather { axis: 0, x: table, idx })).unwrap();
+        let rows = g.add(Op::Logical(Logical::Gather { axis: 0, x: table, idx })).unwrap();
         // Weight each gathered row differently so the two hits on bin 1 are
         // distinguishable in the sum.
         let w = param(&mut g, &[3, 2]);
@@ -1648,7 +1603,7 @@ mod numeric {
         let mut g = graph();
         let x = param(&mut g, &[1, 6]);
         let win = g
-            .add(Op::L0(L0::Window {
+            .add(Op::Logical(Logical::Window {
                 specs: smallvec::smallvec![SlidingWindow::new(1, 3, 3)],
                 x,
             }))
@@ -1667,7 +1622,7 @@ mod numeric {
         let mut g = graph();
         let x = param(&mut g, &[5]);
         let win = g
-            .add(Op::L0(L0::Window {
+            .add(Op::Logical(Logical::Window {
                 specs: smallvec::smallvec![SlidingWindow::new(0, 3, 1)],
                 x,
             }))
@@ -1687,7 +1642,7 @@ mod numeric {
         let upd = param(&mut g, &[2]);
         let idx = u32_buffer(&mut g, 2);
         let y = g
-            .add(Op::L0(L0::Scatter {
+            .add(Op::Logical(Logical::Scatter {
                 axis: 0,
                 combine: ScatterCombine::Set,
                 base,
@@ -1754,7 +1709,7 @@ mod numeric {
         let upd = param(&mut g, &[3]);
         let idx = u32_buffer(&mut g, 3);
         let y = g
-            .add(Op::L0(L0::Scatter {
+            .add(Op::Logical(Logical::Scatter {
                 axis: 0,
                 combine: ScatterCombine::Add,
                 base,

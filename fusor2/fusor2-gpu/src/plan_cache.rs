@@ -219,10 +219,6 @@ pub fn disk_salt(facts: &DeviceFacts) -> u64 {
     h.finish()
 }
 
-// ---------------------------------------------------------------------------
-// Disk tier
-// ---------------------------------------------------------------------------
-
 /// One file per [`PlanHash`] under `<dir>/fusor2/plans/<salt>/<hi><lo>.plan`.
 pub struct DiskPlanCache {
     root: PathBuf,
@@ -286,15 +282,6 @@ fn gc_stale_salts(plans: &Path, keep: &Path) {
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Codec
-// ---------------------------------------------------------------------------
-//
-// A hand-rolled little-endian codec rather than a serde dependency: the record
-// is six field kinds deep and the format version is the only compatibility
-// contract, so a derive would buy nothing and would pull a wire format into a
-// crate that has no other need for one.
 
 fn put_u32(out: &mut Vec<u8>, v: u32) {
     out.extend_from_slice(&v.to_le_bytes());
@@ -539,8 +526,7 @@ mod tests {
     }
 
     /// A kernel binding a buffer the caller did not present is skipped
-    /// silently, because a recorded template no caller can rebind is worse
-    /// than a miss.
+    /// silently; no caller could rebind such a template.
     #[test]
     fn record_plan_skips_internal_scratch() {
         let caller = vec![Buf::new(1u32), Buf::new(2u32)];

@@ -16,7 +16,7 @@ pub use rms_norm::RmsNorm;
 
 use fusor2_gguf::VarBuilder;
 use fusor2_ir::dtype::Dtype;
-use fusor2_ir::ir::level0::{L0, LeafKind};
+use fusor2_ir::ir::logical::{Logical, LeafKind};
 use fusor2_ir::shape::Dim;
 
 use crate::graph::GraphRef;
@@ -50,7 +50,7 @@ pub(crate) fn as_typed<const R: usize, T: Element>(
 /// already row-major: a `[out, in]` weight is `[out, in]` here, matching the
 /// reference's `weight.shape()[0] == out_features`.
 ///
-/// A block-quantized entry becomes a `Leaf(Quantized)` plus one `L0::Dequant`
+/// A block-quantized entry becomes a `Leaf(Quantized)` plus one `Logical::Dequant`
 /// — the decode is a device-side block program, never a host loop. `F16` and
 /// `BF16` entries are cast, which is what the reference's `dequantize()` does
 /// for every parameter it hands a layer.
@@ -97,7 +97,7 @@ pub(crate) fn load_dense(vb: &VarBuilder, graph: &GraphRef, name: &str) -> Resul
     }
     let leaf = Tensor::emit(
         graph,
-        L0::Leaf(LeafKind::Quantized {
+        Logical::Leaf(LeafKind::Quantized {
             name: graph.fresh_buffer_id(),
             fmt,
             layout: raw.layout,
@@ -107,7 +107,7 @@ pub(crate) fn load_dense(vb: &VarBuilder, graph: &GraphRef, name: &str) -> Resul
     graph.set_leaf_bytes(leaf.id(), raw.bytes.to_vec());
     Tensor::emit(
         graph,
-        L0::Dequant {
+        Logical::Dequant {
             fmt,
             layout: raw.layout,
             x: leaf.id(),

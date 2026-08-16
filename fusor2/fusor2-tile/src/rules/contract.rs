@@ -10,9 +10,9 @@ use fusor2_ir::dtype::Dtype;
 use fusor2_ir::egraph::{Builder, Facts, Id, RuleTag};
 use fusor2_ir::facts::ValueFacts;
 use fusor2_ir::carrier::Carrier;
-use fusor2_ir::ir::level0::{EinSpec, L0, Label};
-use fusor2_ir::ir::level1::{
-    AccessPlan, ContractSide, Family, IndexSpace, L1, Operand, ScheduleDomain,
+use fusor2_ir::ir::logical::{EinSpec, Logical, Label};
+use fusor2_ir::ir::launch::{
+    AccessPlan, ContractSide, Family, IndexSpace, Launch, Operand, ScheduleDomain,
 };
 use fusor2_ir::ir::{Level, Node, Op, OpTag};
 use fusor2_ir::rule;
@@ -26,7 +26,7 @@ use crate::domains::{
 
 rule!(
     LOWER_COOP,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Contract,
     tag = RuleTag::StrictlyLowering,
     apply = lower_coop,
@@ -34,7 +34,7 @@ rule!(
 
 rule!(
     LOWER_SGEMM,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Contract,
     tag = RuleTag::StrictlyLowering,
     apply = lower_sgemm,
@@ -42,7 +42,7 @@ rule!(
 
 rule!(
     LOWER_SGEMV,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Contract,
     tag = RuleTag::StrictlyLowering,
     apply = lower_sgemv,
@@ -50,7 +50,7 @@ rule!(
 
 rule!(
     LOWER_GENERIC,
-    level = Level::L0,
+    level = Level::Logical,
     head = OpTag::Contract,
     tag = RuleTag::StrictlyLowering,
     apply = lower_generic,
@@ -58,15 +58,11 @@ rule!(
 
 rule!(
     UNFUSE_COOP_EPILOGUE,
-    level = Level::L1,
-    head = OpTag::KContract,
+    level = Level::Launch,
+    head = OpTag::LaunchContract,
     tag = RuleTag::Additive,
     apply = unfuse_coop_epilogue,
 );
-
-// ---------------------------------------------------------------------------
-// Shared shape and expression helpers
-// ---------------------------------------------------------------------------
 
 /// The four extents a contraction kernel is parameterized by.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -180,11 +176,9 @@ pub fn alias(src: Id, facts: &ValueFacts) -> Operand {
     }
 }
 
-/// Port of `coop_epilogues_supported` (`core/src/matmul/kernel.rs:152`),
-/// verbatim: both pre chains dtype-preserving, the post chain reading the
-/// operand dtype, and writing either the operand dtype or — for f16
-/// operands — f32. A narrowing post would round the accumulator ahead of
-/// the chain.
+/// Both pre chains must be dtype-preserving, the post chain must read the
+/// operand dtype and write either the operand dtype or — for f16 operands —
+/// f32. A narrowing post would round the accumulator ahead of the chain.
 ///
 /// This is a *legality* predicate on the epilogue, never a routing
 /// decision: an epilogue the coop kernel cannot host un-fuses into a second
@@ -209,37 +203,22 @@ pub fn coop_epilogue_hostable(
 
 fn contract_parts(node: &Node) -> Option<(&EinSpec, Dtype, Id, Id)> {
     match &node.op {
-        Op::L0(L0::Contract { spec, acc, a, b, .. }) => Some((spec, *acc, *a, *b)),
+        Op::Logical(Logical::Contract { spec, acc, a, b, .. }) => Some((spec, *acc, *a, *b)),
         _ => None,
     }
 }
 
 /// Whether this family can address these operands.
 ///
-/// **A block-quantized operand is admitted to [`Family::Coop`] only.** The
-/// cooperative kernel stages both operands into workgroup tiles before the MMA,
-/// and `Source::Quantized` decodes at the `(row, col)` that staging fill
-/// already computes — so a quantized weight is the format's decode math on the
-/// way into shared memory and nothing else changes: same staging tile, same
-/// fragments, same MMA, same arena footprint, same epilogue, same schedule
-/// domain, same autotuner.
-///
-/// The other three families read operands element-wise from a dense layout with
-/// no staging step to decode in, so they still decline. A quantized operand
-/// they turn down still reaches a runnable form: `LOWER_DEQUANT` expands
-/// `L0::Dequant` into its defn, and the contraction then sees a dense operand
-/// like any other.
+/// A block-quantized operand is admitted to [`Family::Coop`] (which decodes
+/// during the staging fill into workgroup tiles) and, on GPU, to
+/// [`Family::Sgemv`] (which decodes per loaded element). The other families
+/// read operands element-wise from a dense layout with no staging step to
+/// decode in, so they decline; `LOWER_DEQUANT` still gets those operands to a
+/// runnable form.
 fn operands_addressable(f: &Facts<'_>, family: Family) -> bool {
-    // Sgemv joins Coop for quantized operands on the GPU. Its lowering is
-    // one subgroup per output element with lanes striding k and the block
-    // decode running per loaded element — the decode-shape (M = 1) kernel,
-    // where a coop tile wastes bm - 1 of its rows. This gate was opened
-    // once before and reverted on wrong values; both causes were kernel
-    // bugs since fixed (`lower_sgemv` wrote only column 0 of an n-wide
-    // output, and the staged decode ignored the view's element strides),
-    // not anything about the admission itself. The CPU nest reads buffers
-    // through plain collapsed strides and would read block words as
-    // floats, so it keeps the dense-only rule.
+    // The CPU nest reads buffers through plain collapsed strides and would
+    // read block words as floats, so it keeps the dense-only rule.
     let q_ok = |family: Family| {
         family == Family::Coop
             || (family == Family::Sgemv
@@ -258,35 +237,14 @@ fn compute_dtype(d: Dtype) -> Dtype {
     if d.is_quantized() { Dtype::F32 } else { d }
 }
 
-/// Whether the m/n/k kernels can address this spec's operands at all.
-///
-/// [`L1::KContract`] records four **extents** — `contract_mnk` takes the
-/// products of the m, n, k and batch labels — and its operands are plain
-/// contiguous layouts. That describes `a = [batch.., m.., k..]`,
-/// `b = [batch.., k.., n..]`, `out = [batch.., m.., n..]` and nothing else,
+/// Whether [`lower_generic`]'s `Fold` nest can address this spec: its
+/// operands are dense `[batch, m, k]` / `[batch, k, n]` aliases with no
+/// operand layout to permute, and [`Launch::Contract`] records extents only,
 /// so a spec in any other axis order is indistinguishable from the canonical
-/// one at this level. `mat_mul_transposed_rhs` differs from `matmul` *only*
-/// in that order, and the adjoint specs `d_lhs`/`d_rhs` are non-canonical by
-/// construction, which is how `dB` came to read a `[m, k]` activation as if
-/// it were `[k, m]`.
-///
-/// Declining leaves the contraction to `lower_contract_generic`, whose
-/// operands carry the spec's geometry explicitly. That is slower and correct.
-///
-/// **The m/n/k families no longer read this.** Teaching `KContract` to carry
-/// per-operand layouts — which is all `permuted_alias` does, since `Operand`
-/// already holds a strided `Layout` — keeps the fast path for exactly the
-/// shapes that would otherwise go to the floor, and it is where attention's cost
-/// was: `q @ k^T` is `bhqd,bhkd->bhqk`, non-canonical in `b`, so Coop, SGEMM
-/// and SGEMV all declined and the score matmul ran as a rank-5 generic reduce
-/// beside a `p @ v` that got Coop. On `[1,8,1024,64]` that was **26.0 ms ->
-/// 10.2 ms** end to end, with the score matmul becoming
-/// `KContract{m:1024, n:1024, k:64, batch:8}`.
-///
-/// What still reads it is [`lower_generic`], whose `KFold` nest really does
-/// address dense `[batch, m, k]` / `[batch, k, n]` aliases and has no operand
-/// layout to permute. `out` is still required canonical everywhere, because
-/// `KContract` does not parameterize its *write* map.
+/// one at this level. Declining leaves the contraction to
+/// `lower_contract_generic`, whose operands carry the spec's geometry
+/// explicitly. `out` is required canonical everywhere, because `Contract`
+/// does not parameterize its *write* map.
 fn canonical_for_mnk(spec: &EinSpec) -> bool {
     let Ok(part) = partition(spec) else {
         return false;
@@ -307,23 +265,8 @@ fn canonical_for_mnk(spec: &EinSpec) -> bool {
 }
 
 /// Read an operand in canonical label order **through its layout** rather than
-/// requiring the spec to have been written that way.
-///
-/// `L1::KContract` records four extents and addresses `a = [batch.., m.., k..]`,
-/// `b = [batch.., k.., n..]`. That does not oblige the *buffer* to be stored in
-/// that order — `Operand` carries a full strided `Layout`, and permuting the
-/// strides states exactly the same read. This is what the architecture means by
-/// "transposed-rhs is a spec, not an op": `mat_mul_transposed_rhs` differs from
-/// `matmul` only in axis order, so it differs only in this stride vector.
-///
-/// Requiring canonical order instead is what sent every non-canonical
-/// contraction to `lower_contract_generic`. Measured, and it is the whole of
-/// attention's cost on this half of the chain: `q @ k^T` is
-/// `bhqd,bhkd->bhqk`, whose `b` is `[batch, n, k]`, so **all three fast
-/// families declined** and the score matmul ran as a rank-5 generic reduce
-/// while `p @ v` next door — canonical — got `Family::Coop`. The adjoint specs
-/// `d_lhs`/`d_rhs` are non-canonical by construction and were in the same
-/// position.
+/// requiring the spec to have been written that way: `Operand` carries a full
+/// strided `Layout`, and permuting the strides states exactly the same read.
 ///
 /// Returns `None` when a label is missing or an extent is symbolic, in which
 /// case the caller declines and the generic fold still carries the value.
@@ -364,7 +307,7 @@ fn lower_family(
     let (spec, acc, a_id, b_id) = contract_parts(node)?;
     let (fa, fb) = (f.operand(0)?, f.operand(1)?);
     let operand_dtype = compute_dtype(fa.dtype);
-    // `out` still has to be canonical: `KContract` does not parameterize its
+    // `out` still has to be canonical: `Contract` does not parameterize its
     // *write* map, so an output in another axis order genuinely is a different
     // kernel. Both *reads* are a stride vector away from canonical, so they are
     // permuted rather than required.
@@ -407,7 +350,7 @@ fn lower_family(
         }
     };
 
-    let op = L1::KContract {
+    let op = Launch::Contract {
         m: mnk.m,
         n: mnk.n,
         k: mnk.k,
@@ -419,16 +362,12 @@ fn lower_family(
         b: ContractSide::one(identity(compute_dtype(fb.dtype)), b_op),
         sched,
     };
-    let new = b.add_l1(op).ok()?;
+    let new = b.add_launch(op).ok()?;
     b.union(id, new).ok()?;
     Some(new)
 }
 
-// ---------------------------------------------------------------------------
-// The rules
-// ---------------------------------------------------------------------------
-
-/// `Contract -> KContract { family: Coop }`. Guarded on a *fixed* subgroup
+/// `Contract -> Contract { family: Coop }`. Guarded on a *fixed* subgroup
 /// width, a reported cooperative configuration for this `(operand, acc)`
 /// pair, and a non-empty legal geometry set. Legality only: a badly padded
 /// coop tile is still a candidate and loses on cost.
@@ -441,18 +380,18 @@ pub fn lower_coop(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Op
     lower_family(b, id, node, f, Family::Coop)
 }
 
-/// `Contract -> KContract { family: Sgemm }`. Unguarded on shape.
+/// `Contract -> Contract { family: Sgemm }`. Unguarded on shape.
 pub fn lower_sgemm(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     lower_family(b, id, node, f, Family::Sgemm)
 }
 
-/// `Contract -> KContract { family: Sgemv }`. Unguarded on shape; a badly
+/// `Contract -> Contract { family: Sgemv }`. Unguarded on shape; a badly
 /// shaped gemv simply loses on cost.
 pub fn lower_sgemv(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     lower_family(b, id, node, f, Family::Sgemv)
 }
 
-/// `Contract -> KFold` at an `Add` carrier lifting `mul(Arg0, Arg1)`. The floor
+/// `Contract -> Fold` at an `Add` carrier lifting `mul(Arg0, Arg1)`. The floor
 /// that guarantees every contraction reaches a runnable form.
 pub fn lower_generic(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     // The generic-fold floor reads its operands element-wise from a dense
@@ -474,22 +413,16 @@ pub fn lower_generic(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
     let cx = DomainCtx::new(f.caps(), default_planner());
 
     let space = IndexSpace::new([mnk.batch, mnk.m, mnk.n, mnk.k]);
-    // **The operands are stated over the fold's own index space**, as
-    // stride-0 broadcast views: A is `[batch, m, n, k]` with strides
-    // `[m*k, k, 0, 1]`, B with `[k*n, 0, 1, n]`. `verify_l1`'s
-    // `check_operand_access` pins an `Alias` layout's rank and extents to
-    // the index space for exactly this reason: every lowering addresses a
-    // `KFold`'s operands through their own layout maps, so an operand
-    // stated over some *other* space (e.g. aliasing the value's
-    // own `[batch, m, k]` shape) is read at garbage addresses by every
-    // strategy of every backend — the member-race sweep caught the fold
-    // spelling of a `[2,3]x[3,2]` matmul returning `a[0,:]·b[0,:]`, the
-    // B walk collapsed onto its first row.
+    // The operands are stated over the fold's own index space as stride-0
+    // broadcast views: A is `[batch, m, n, k]` with strides `[m*k, k, 0, 1]`,
+    // B with `[k*n, 0, 1, n]`. Every lowering addresses a `Fold`'s operands
+    // through their own layout maps, so an operand stated over any other
+    // space is read at garbage addresses.
     //
     // The broadcast strides need constant `m`, `n`, `k`; a symbolic extent
     // has no spellable stride product, and a node whose operands cannot be
     // stated over its space must not be minted at all. The m/n/k
-    // `KContract` families keep the floor for those shapes.
+    // `Contract` families keep the floor for those shapes.
     let (m, n, k) = (
         mnk.m.as_const()?,
         mnk.n.as_const()?,
@@ -519,7 +452,7 @@ pub fn lower_generic(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
         ScalarExpr::arg(0, acc),
         ScalarExpr::arg(1, acc),
     );
-    let op = L1::KFold {
+    let op = Launch::Fold {
         space,
         axis: 3,
         vec_axes: smallvec::SmallVec::new(),
@@ -530,26 +463,25 @@ pub fn lower_generic(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
         ops: vec![a_op, b_op],
         sched: ScheduleDomain::Fold(fold_domain(mnk.k, &cx)),
     };
-    let new = b.add_l1(op).ok()?;
+    let new = b.add_launch(op).ok()?;
     b.union(id, new).ok()?;
     Some(new)
 }
 
 /// Split an epilogue the cooperative kernel cannot host into
-/// `KMap{body: post} . KContract{post: identity}`.
+/// `Map{body: post} . Contract{post: identity}`.
 ///
 /// A hostable epilogue fires no rule; `lower_generic`'s node is already the
 /// third alternative. This is what stops one unsupported activation from
-/// costing the whole coop speedup, which is what the reference's
-/// route-by-refusal does.
+/// costing the whole coop speedup.
 pub fn unfuse_coop_epilogue(
     b: &mut Builder<'_>,
     id: Id,
     node: &Node,
     f: &Facts<'_>,
 ) -> Option<Id> {
-    let Op::L1(l1) = &node.op else { return None };
-    let L1::KContract {
+    let Op::Launch(l1) = &node.op else { return None };
+    let Launch::Contract {
         m,
         n,
         batch,
@@ -573,16 +505,16 @@ pub fn unfuse_coop_epilogue(
 
     let (post, m, n, batch, acc) = (post.clone(), *m, *n, *batch, *acc);
     let mut inner_op = l1.clone();
-    if let L1::KContract { post: p, .. } = &mut inner_op {
+    if let Launch::Contract { post: p, .. } = &mut inner_op {
         *p = identity(acc);
     }
-    let inner = b.add_l1(inner_op).ok()?;
+    let inner = b.add_launch(inner_op).ok()?;
 
     let shape = [batch, m, n];
     let cx = DomainCtx::new(f.caps(), default_planner());
     let inner_facts = b.facts_of(inner).clone();
     let outer = b
-        .add_l1(L1::KMap {
+        .add_launch(Launch::Map {
             space: IndexSpace::new(shape),
             body: post,
             ops: vec![alias(inner, &inner_facts)],
@@ -600,7 +532,7 @@ mod tests {
     use crate::rules::TILE_RULES;
     use crate::rules::testing::{Fixture, l1_of};
     use fusor2_ir::dtype::Dtype;
-    use fusor2_ir::ir::level0::EinSpec;
+    use fusor2_ir::ir::logical::EinSpec;
     use smallvec::smallvec;
 
     fn matmul_spec() -> EinSpec {
@@ -646,12 +578,12 @@ mod tests {
         let mut folds = 0;
         for m in fx.chain(c) {
             match l1_of(&fx, m) {
-                Some(L1::KContract { family, .. }) => match family {
+                Some(Launch::Contract { family, .. }) => match family {
                     Family::Coop => coop += 1,
                     Family::Sgemm => sgemm += 1,
                     Family::Sgemv => sgemv += 1,
                 },
-                Some(L1::KFold { .. }) => folds += 1,
+                Some(Launch::Fold { .. }) => folds += 1,
                 _ => {}
             }
         }
@@ -660,11 +592,9 @@ mod tests {
 
     /// The generic fold's operands are stated **over the fold's own index
     /// space** as stride-0 broadcast views, because every lowering addresses
-    /// a `KFold`'s operands through their own layout maps. The old spelling
-    /// aliased each value's own `[m, k]` / `[k, n]` shape under the rank-4
-    /// space, and the member-race sweep caught it computing `a[0,:]·b[0,:]`
-    /// (the B walk collapsed onto its first row) on a `[2,3]x[3,2]` matmul —
-    /// on both backends, under every collective strategy.
+    /// a `Fold`'s operands through their own layout maps. Pins the regression
+    /// where operands aliased each value's own shape and the fold computed
+    /// `a[0,:]·b[0,:]`.
     #[test]
     fn the_generic_fold_states_its_operands_over_the_fold_space() {
         let caps = apple_caps();
@@ -679,7 +609,7 @@ mod tests {
             .into_iter()
             .filter_map(|m| l1_of(&fx, m))
             .find_map(|m| match m {
-                L1::KFold { space, ops, .. } => Some((space, ops)),
+                Launch::Fold { space, ops, .. } => Some((space, ops)),
                 _ => None,
             })
             .expect("the generic fold member exists");
@@ -712,8 +642,8 @@ mod tests {
         // A = [1,3,4] broadcast along n; B = [1,4,5] broadcast along m.
         assert_eq!(strides(0), [12, 4, 0, 1]);
         assert_eq!(strides(1), [20, 0, 1, 5]);
-        // And the invariant the plan verifier now enforces holds.
-        fusor2_ir::verify_l1::check_operand_access(&L1::KFold {
+        // The invariant the plan verifier enforces holds.
+        fusor2_ir::verify_launch::check_operand_access(&Launch::Fold {
             space: space.clone(),
             axis: 3,
             vec_axes: smallvec::SmallVec::new(),
@@ -739,11 +669,11 @@ mod tests {
         let c = fx.contract(matmul_spec(), Dtype::F32, a, b);
         fx.apply_all(TILE_RULES, c);
 
-        let members: Vec<L1> = fx.chain(c).into_iter().filter_map(|m| l1_of(&fx, m)).collect();
+        let members: Vec<Launch> = fx.chain(c).into_iter().filter_map(|m| l1_of(&fx, m)).collect();
         assert_eq!(members.len(), 3);
         assert!(!members.iter().any(|m| matches!(
             m,
-            L1::KContract {
+            Launch::Contract {
                 family: Family::Coop,
                 ..
             }
@@ -766,14 +696,14 @@ mod tests {
             .find(|m| {
                 matches!(
                     m,
-                    L1::KContract {
+                    Launch::Contract {
                         family: Family::Coop,
                         ..
                     }
                 )
             })
             .expect("a coop alternative");
-        let L1::KContract { sched, .. } = &coop else {
+        let Launch::Contract { sched, .. } = &coop else {
             unreachable!()
         };
         assert!(sched.len() > 1000, "domain has {} points", sched.len());
@@ -795,7 +725,7 @@ mod tests {
             .find(|m| {
                 matches!(
                     l1_of(&fx, *m),
-                    Some(L1::KContract {
+                    Some(Launch::Contract {
                         family: Family::Coop,
                         ..
                     })
@@ -807,7 +737,7 @@ mod tests {
         assert!(
             fx.chain(narrowed)
                 .into_iter()
-                .any(|m| matches!(l1_of(&fx, m), Some(L1::KMap { .. }))),
+                .any(|m| matches!(l1_of(&fx, m), Some(Launch::Map { .. }))),
             "a narrowing post must mint the un-fused pair"
         );
 
@@ -825,7 +755,7 @@ mod tests {
             .find(|m| {
                 matches!(
                     l1_of(&fx, *m),
-                    Some(L1::KContract {
+                    Some(Launch::Contract {
                         family: Family::Coop,
                         ..
                     })
@@ -837,7 +767,7 @@ mod tests {
         assert!(
             !fx.chain(widened)
                 .into_iter()
-                .any(|m| matches!(l1_of(&fx, m), Some(L1::KMap { .. }))),
+                .any(|m| matches!(l1_of(&fx, m), Some(Launch::Map { .. }))),
             "a hostable epilogue must fire no rule"
         );
     }

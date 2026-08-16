@@ -1,13 +1,11 @@
 //! `EinSpec` algebra: which labels are contracted, which are batch, and the
-//! `(m, n, k, batch)` a `KContract` lowering reads off a spec plus two shapes.
+//! `(m, n, k, batch)` a `Contract` lowering reads off a spec plus two shapes.
 //!
-//! Read by `infer_l0`, `verify_l0`, `fusor2-autograd`'s contraction adjoint and
-//! `fusor2-tile`'s contraction domains. `matmul`, `mat_mul_transposed_rhs` and
-//! every batched form differ only in the spec, so this module is the whole of
-//! "transposed-rhs is a spec, not an op".
+//! `matmul`, `mat_mul_transposed_rhs` and every batched form differ only in
+//! the spec.
 
 use crate::error::{Error, Result};
-use crate::ir::level0::{EinSpec, Label};
+use crate::ir::logical::{EinSpec, Label};
 use crate::shape::{Dim, Dims};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -115,9 +113,8 @@ pub fn partition(spec: &EinSpec) -> Result<EinPartition> {
 
 /// Bind every label to an extent by zipping each operand list positionally
 /// with that operand's shape. A label bound twice must be [`Dim::known_eq`]
-/// both times — a symbolic and a constant extent are *not* decidably equal
-/// and are rejected, which is what keeps a contraction from silently
-/// specialising a symbolic axis.
+/// both times — a symbolic and a constant extent are not decidably equal
+/// and are rejected.
 pub fn extents(spec: &EinSpec, a: &[Dim], b: &[Dim]) -> Result<FxHashMap<Label, Dim>> {
     let mut map: FxHashMap<Label, Dim> = FxHashMap::default();
     for (name, labels, shape) in [("a", &spec.a, a), ("b", &spec.b, b)] {
@@ -170,9 +167,7 @@ pub fn out_shape(spec: &EinSpec, extents: &FxHashMap<Label, Dim>) -> Result<Dims
 ///
 /// Product rule: drop `Const(1)`; all-`Const` ⇒ `Const(product)`; exactly one
 /// surviving `Sym` and nothing else ⇒ that `Sym`; empty group ⇒ `Const(1)`;
-/// two or more non-collapsible survivors ⇒ `Error::Shape`. A group that
-/// cannot collapse has no single extent for a tiled kernel to loop over, so
-/// this is a legality failure, not a fallback.
+/// two or more non-collapsible survivors ⇒ `Error::Shape`.
 pub fn mnkb(spec: &EinSpec, extents: &FxHashMap<Label, Dim>) -> Result<[Dim; 4]> {
     let part = partition(spec)?;
     Ok([
@@ -220,10 +215,6 @@ fn collapse(group: &[Label], extents: &FxHashMap<Label, Dim>, name: &str) -> Res
 /// Assert both adjoint specs of `spec` are themselves well-formed
 /// contractions, and that `d_lhs` really maps `out x b -> a` with the
 /// original's contracted set becoming `a`'s free set.
-///
-/// `verify_l0` calls this, so an unadjointable contraction is rejected at
-/// construction rather than at backward time — the one place the reference
-/// discovers it, several thousand kernels later.
 pub fn check_adjoint_specs(spec: &EinSpec) -> Result<()> {
     let original = partition(spec)?;
 
@@ -270,7 +261,7 @@ pub fn verify_spec(spec: &EinSpec) -> Result<()> {
     partition(spec).map(|_| ())
 }
 
-/// `(batch, m, n, k)` for a `KContract` lowering, from two operand shapes.
+/// `(batch, m, n, k)` for a `Contract` lowering, from two operand shapes.
 pub fn mnk(spec: &EinSpec, a: &[Dim], b: &[Dim]) -> Result<(Dim, Dim, Dim, Dim)> {
     let [m, n, k, batch] = mnkb(spec, &extents(spec, a, b)?)?;
     Ok((batch, m, n, k))
@@ -293,7 +284,7 @@ mod tests {
     fn batched() -> EinSpec {
         spec(b"bik", b"bjk", b"bij")
     }
-    // `mk,nk->mn` — the reference's `mat_mul_transposed_rhs`.
+    // `mk,nk->mn` — `mat_mul_transposed_rhs`.
     fn transposed_rhs() -> EinSpec {
         spec(b"mk", b"nk", b"mn")
     }
@@ -316,7 +307,7 @@ mod tests {
 
     #[test]
     fn a_label_only_in_out_errors() {
-        // Test 4's first half: `z` appears only in `out`.
+        // `z` appears only in `out`.
         let s = spec(b"mk", b"nk", b"mnz");
         assert!(matches!(role(&s, Label(b'z')), Err(Error::Shape(_))));
         assert!(partition(&s).is_err());
@@ -330,7 +321,7 @@ mod tests {
 
     #[test]
     fn extents_out_shape_and_mnkb() {
-        // Test 3: `bik,bjk->bij` on [2,3,4], [2,5,4].
+        // `bik,bjk->bij` on [2,3,4], [2,5,4].
         let s = batched();
         let a = [Dim::Const(2), Dim::Const(3), Dim::Const(4)];
         let b = [Dim::Const(2), Dim::Const(5), Dim::Const(4)];
@@ -413,7 +404,6 @@ mod tests {
 
     #[test]
     fn adjoint_specs_accepted() {
-        // Test 15.
         check_adjoint_specs(&batched()).unwrap();
         check_adjoint_specs(&transposed_rhs()).unwrap();
     }

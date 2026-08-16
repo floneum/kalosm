@@ -1,9 +1,9 @@
-//! L1 node + `SchedPoint` -> `KernelIr`, one module per node family.
+//! Launch node + `SchedPoint` -> `KernelIr`, one module per node family.
 //!
 //! Everything shared by the six family lowerings lives here: the grid fold,
-//! the 2-D matrix flattening of an N-D strided operand, the hash-consing L2
+//! the 2-D matrix flattening of an N-D strided operand, the hash-consing Kernel
 //! term builder, and the [`Ctx`] that turns `Plan`-carried buffer layouts into
-//! L2 storage views.
+//! Kernel storage views.
 //!
 //! **Operand layouts are never re-derived.** Every layout comes from
 //! `Plan::buffers[..].layout`, which the extractor established; a mismatch
@@ -19,8 +19,8 @@ use fusor2_ir::device::{Caps, Limits};
 use fusor2_ir::dtype::{Dtype, NumericContract, QLayout};
 use fusor2_ir::egraph::Id;
 use fusor2_ir::error::Error;
-use fusor2_ir::ir::level1::{ContractSide, IndexSpace, L1, Operand, SchedPoint};
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::launch::{ContractSide, IndexSpace, Launch, Operand, SchedPoint};
+use fusor2_ir::ir::kernel::{
     Addr, Buffer, BufferAccess, BufferDecl, Builtin, CoopMatrixRole, CoopSrc, ElementType, KernelIr,
     Local, LocalDecl, MemoryLevel, ReduceKind, ScalarElement, Source, Stmt, Tile, TileBinaryOp,
     TileCompareOp, TileDecl, TileExpr, TileExprKind, TileLayout, TileLiteral, TileReduceOp,
@@ -38,14 +38,6 @@ use crate::uniforms::UniformPack;
 /// Binding index of the always-present uniform block.
 pub const UNIFORM_BINDING: u32 = 0;
 
-/// The storage layout and dtype one launch binding reads or writes.
-///
-/// `Plan::buffers` covers only what the plan **produces**: an external leaf is
-/// supplied by the caller, so it deliberately has no `BufferPlan` and every
-/// table built solely from `plan.buffers` misses it. Where a `BufferPlan`
-/// exists it is authoritative — that is the padded stride set the extractor
-/// committed to and it is never re-derived. Where none exists the value is a
-/// leaf, and its own facts are the whole truth about it.
 /// One staged input of a contraction side: a memory source, or a `Const`
 /// leaf already folded to its literal.
 #[derive(Clone)]
@@ -84,7 +76,7 @@ fn layout_elements(binding: &DimBinding, layout: &Layout) -> Result<u64> {
 /// `arrayLength`, so nothing consumes this number for a symbolic buffer —
 /// and resolving it would bake the sequence length into the kernel's
 /// identity. An *unmasked* load through a symbolic view still fails
-/// `verify_l2` loudly, as it must.
+/// `verify_kernel` loudly, as it must.
 fn decl_elements(layout: &Layout) -> u64 {
     // Padding lives in the strides: the extent of the plan's row-major
     // layouts is `shape[0] * strides[0]`, and the shape product undercounts
@@ -103,10 +95,6 @@ fn decl_elements(layout: &Layout) -> u64 {
     });
     outer.saturating_mul(stride0).max(1)
 }
-
-// ---------------------------------------------------------------------------
-// Dim binding
-// ---------------------------------------------------------------------------
 
 /// Runtime extents for the plan's symbols. A plan is compiled once for a whole
 /// shape family, so the *grid* reads this and the *kernel body* reads binding 0
@@ -254,10 +242,6 @@ impl DimBinding {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Grid
-// ---------------------------------------------------------------------------
-
 /// Fold a 1-D workgroup count onto the 3-D dispatch grid.
 ///
 /// **Pick the slab count first**, then size `x` to the slab. Saturating `x`
@@ -314,10 +298,6 @@ pub fn grid_from(
     ))
 }
 
-// ---------------------------------------------------------------------------
-// Matrix flattening
-// ---------------------------------------------------------------------------
-
 /// An N-D strided operand seen as a 2-D matrix.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MatrixView {
@@ -336,9 +316,7 @@ pub struct MatrixView {
 /// per load. Extent-1 axes are dropped from the decomposition, saving a
 /// divmod per load.
 ///
-/// The reference returns `None` here and silently routes the whole
-/// contraction to a generic reduce. The plan guarantees these strides, so a
-/// failure is [`Error::Plan`].
+/// The plan guarantees these strides, so a failure is [`Error::Plan`].
 ///
 /// `row_dims` may be `0` or `rank`: a contraction whose `n` (or `k`) extent
 /// is 1 has *no* axes on that side, and its operand is a one-column (or
@@ -448,7 +426,7 @@ pub fn flatten_matrix_layout_split(
 /// The axis split that presents `layout` as exactly `rows` by `cols`
 /// elements.
 ///
-/// [`L1::KContract`](fusor2_ir::ir::level1::L1::KContract) records four
+/// [`Launch::Contract`](fusor2_ir::ir::launch::Launch::Contract) records four
 /// *extents* — `m`, `n`, `k`, `batch` — and not the label partition they came
 /// from, so the number of trailing `k` (resp. `n`) axes is not on the node.
 /// It is recoverable, because `canonical_for_mnk` admits only
@@ -456,13 +434,6 @@ pub fn flatten_matrix_layout_split(
 /// position whose prefix multiplies to `rows` and whose suffix multiplies to
 /// `cols`. The longest qualifying prefix is taken, which pins the choice when
 /// an extent-1 axis makes two positions equivalent.
-///
-/// Splitting at `rank - 1` instead — which is what every contraction lowering
-/// here did — is that position only when the contracted side occupies exactly
-/// one axis *and* there is no batch. A batched matmul therefore read A's
-/// batch axis as its row axis, and every `n = 1` contraction (which is what a
-/// row reduction of a product lowers to, so every rms_norm, layer_norm and
-/// variance) walked B down the row stride instead of the column stride.
 pub fn matrix_split_for(
     layout: &Layout,
     binding: &DimBinding,
@@ -487,10 +458,6 @@ pub fn matrix_split_for(
         })
 }
 
-// ---------------------------------------------------------------------------
-// Element types
-// ---------------------------------------------------------------------------
-
 /// `u32` words a block-quantized value of `elements` elements occupies.
 pub fn quantized_words(fmt: fusor2_ir::dtype::QFmt, layout: QLayout, elements: u64) -> u64 {
     let blocks = elements.div_ceil(u64::from(fmt.block_elements()).max(1));
@@ -506,14 +473,14 @@ pub fn qlayout_of(cx: &LowerCtx<'_>, value: Id) -> Option<QLayout> {
         .class_ids(class)
         .into_iter()
         .find_map(|m| match &cx.graph.node(m).op {
-            fusor2_ir::ir::Op::L0(fusor2_ir::ir::level0::L0::Leaf(
-                fusor2_ir::ir::level0::LeafKind::Quantized { layout, .. },
+            fusor2_ir::ir::Op::Logical(fusor2_ir::ir::logical::Logical::Leaf(
+                fusor2_ir::ir::logical::LeafKind::Quantized { layout, .. },
             )) => Some(*layout),
             _ => None,
         })
 }
 
-/// L0/L1 dtype to L2 element. Quantized weights bind as plain `u32` storage;
+/// Logical/Launch dtype to Kernel element. Quantized weights bind as plain `u32` storage;
 /// their decode is arithmetic over those words, never a buffer type.
 pub const fn scalar_element(dtype: Dtype) -> ScalarElement {
     match dtype {
@@ -525,33 +492,17 @@ pub const fn scalar_element(dtype: Dtype) -> ScalarElement {
     }
 }
 
-// ---------------------------------------------------------------------------
-// The hash-consing L2 builder
-// ---------------------------------------------------------------------------
-
-/// Hash-consing L2 term builder.
-///
-/// `Shared` is deleted from the dialect, so structural sharing *is* this memo:
-/// two identical subtrees built separately return the same `Arc`, which
-/// pointer-keyed memoization structurally cannot do.
-///
-/// This is a superset of `fusor2_tile::build::TileBuilder`'s surface (which
-/// covers only a subset of the nodes). When that builder grows the
-/// remaining constructors this type should become a thin alias for it; the
-/// memo semantics are identical because both key on
-/// [`TileExpr::structural_hash`].
+/// Hash-consing Kernel term builder: two identical subtrees built separately
+/// return the same `Arc`.
 #[derive(Default)]
-pub struct L2 {
+pub struct Kernel {
     memo: FxHashMap<u64, SmallVec<[TileExpr; 2]>>,
 }
 
 /// Clamp an infinite literal to the largest finite value WGSL can spell.
 ///
-/// **WGSL has no infinite literal**, and naga rejects a module holding one
-/// outright (`EntryPoint(Function(Expression(Literal(Infinity))))`). A
-/// causal attention mask is `select(kv <= q, scale*s, -inf)` and a
-/// `Fold{Max}` identity is `-inf`, so the frontend hands one down on every
-/// causal or softmax path; before this the whole module failed to emit.
+/// WGSL has no infinite literal, and naga rejects a module holding one; the
+/// frontend hands one down on every causal or softmax path.
 ///
 /// `-3.40282e38` is the same sentinel `emit::expr`'s reduce identities
 /// already use, and `exp(x - m)` underflows to zero against it exactly as
@@ -606,7 +557,7 @@ pub fn finite_bf16(bits: u16) -> u16 {
     }
 }
 
-impl L2 {
+impl Kernel {
     pub fn new() -> Self {
         Self::default()
     }
@@ -659,13 +610,11 @@ impl L2 {
     }
     /// The "smaller than anything real" sentinel a max carrier starts from.
     ///
-    /// **Finite, not `-inf`.** WGSL has no infinite literal, and naga rejects
-    /// a module holding one with `EntryPoint(Function(Expression(Literal(
-    /// Infinity))))` — so every kernel that reached for a true `-inf` failed
-    /// validation instead of running. These are the same values
-    /// `emit::expr`'s reduce identities already use, so a max started here and
-    /// a max started by a `Reduce` agree bit for bit, and `exp(x - m)`
-    /// underflows to zero exactly as it would against a real infinity.
+    /// Finite, not `-inf`: WGSL has no infinite literal and naga rejects a
+    /// module holding one. Same values as `emit::expr`'s reduce identities,
+    /// so a max started here and a max started by a `Reduce` agree bit for
+    /// bit, and `exp(x - m)` underflows to zero exactly as it would against
+    /// a real infinity.
     pub fn neg_inf(&mut self, elem: ScalarElement) -> TileExpr {
         match elem {
             ScalarElement::F16 => {
@@ -678,11 +627,9 @@ impl L2 {
         }
     }
 
-    /// The `Min` identity, the mirror of [`L2::neg_inf`]. WGSL has no infinite
-    /// literal and naga rejects a module holding one, so a `Fold{Min}` seed has
-    /// to be the largest finite magnitude — the same sentinel `emit::expr`'s
-    /// reduce identities use, so a min started here and a min started by a
-    /// `Reduce` agree bit for bit.
+    /// The `Min` identity, the mirror of [`Kernel::neg_inf`]: the largest
+    /// finite magnitude, matching `emit::expr`'s reduce identities bit for
+    /// bit.
     pub fn pos_inf(&mut self, elem: ScalarElement) -> TileExpr {
         match elem {
             ScalarElement::F16 => {
@@ -942,16 +889,12 @@ impl L2 {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Lowering context
-// ---------------------------------------------------------------------------
-
 /// Per-kernel lowering state: the buffer table in binding order, the uniform
-/// word layout, and the L2 builder.
+/// word layout, and the Kernel builder.
 pub struct Ctx<'a> {
     pub caps: &'a Caps,
     pub cx: &'a LowerCtx<'a>,
-    pub b: L2,
+    pub b: Kernel,
     pub binding: DimBinding,
     /// Binding order. Index 0 is always the uniform block.
     pub buffers: Vec<Buffer>,
@@ -978,13 +921,8 @@ impl<'a> Ctx<'a> {
 
     /// [`Self::new`] with the plan's binding-0 word layout supplied.
     ///
-    /// The pack is a function of the *plan* alone — [`UniformPack::new`] says
-    /// so, and the artifact cache keys on its digest for exactly that reason
-    /// — but it was derived here, inside the per-launch constructor, so every
-    /// lowering of every launch re-walked all of `Plan::buffers` (1,731 of
-    /// them on an 8B decode step, 64 relowers a token) to rebuild the same
-    /// word layout. A caller that lowers more than one launch of one plan
-    /// derives it once and hands it down.
+    /// The pack is a function of the plan alone, so a caller that lowers more
+    /// than one launch of one plan derives it once and hands it down.
     pub fn with_pack(
         caps: &'a Caps,
         cx: &'a LowerCtx<'a>,
@@ -994,7 +932,7 @@ impl<'a> Ctx<'a> {
         // Deterministic decl numbering per kernel build: a relower of the
         // same launch mints the same ids, so the pipeline cache's body-hash
         // dedup actually hits.
-        fusor2_ir::ir::level2::reset_decl_ids();
+        fusor2_ir::ir::kernel::reset_decl_ids();
         let uniform_words = (pack.byte_len() / 4).max(1) as u32;
         let mut buffers: Vec<Buffer> = vec![Arc::new(BufferDecl {
             binding: UNIFORM_BINDING,
@@ -1028,10 +966,7 @@ impl<'a> Ctx<'a> {
             // Keyed by every id in the value's class, not only by the
             // selected one: an `Operand::src` names whichever id the rule
             // author wrote, and they all denote the same buffer. `class_ids`
-            // rather than `chain`, because `chain` is the *selectable* set and
-            // drops the `Union` spine — and a macro op hands its caller the
-            // spine node, so `rope`, `attention` and every adjoint over them
-            // name their operands by one.
+            // includes the `Union` spine, which macro ops hand their callers.
             let class = cx.graph.class_of(plan_binding.value);
             for member in cx.graph.class_ids(class) {
                 slot_of.insert(member, buffers.len());
@@ -1047,7 +982,7 @@ impl<'a> Ctx<'a> {
         Ok(Self {
             caps,
             cx,
-            b: L2::new(),
+            b: Kernel::new(),
             binding,
             buffers,
             slot_of,
@@ -1076,10 +1011,10 @@ impl<'a> Ctx<'a> {
     }
 
     /// A flat rank-1 view of a value's buffer, for elementwise access.
-    pub fn linear_view(&self, value: Id) -> Result<fusor2_ir::ir::level2::StorageView> {
+    pub fn linear_view(&self, value: Id) -> Result<fusor2_ir::ir::kernel::StorageView> {
         let buffer = self.buffer(value)?;
         let layout = buffer.layout.clone();
-        Ok(fusor2_ir::ir::level2::StorageView {
+        Ok(fusor2_ir::ir::kernel::StorageView {
             buffer,
             offset: 0,
             layout,
@@ -1092,11 +1027,11 @@ impl<'a> Ctx<'a> {
         &self,
         operand: &Operand,
         row_dims: usize,
-    ) -> Result<fusor2_ir::ir::level2::StorageView> {
+    ) -> Result<fusor2_ir::ir::kernel::StorageView> {
         let layout = self.repad_operand_layout(operand)?;
         let view = flatten_matrix_layout_split(&layout, row_dims, &self.binding)?;
         let buffer = self.buffer(operand.src)?;
-        Ok(fusor2_ir::ir::level2::StorageView {
+        Ok(fusor2_ir::ir::kernel::StorageView {
             buffer,
             offset: view.offset,
             layout: view.layout,
@@ -1212,7 +1147,7 @@ impl<'a> Ctx<'a> {
     /// The [`Source`] a contraction stages one operand from.
     ///
     /// Dense operands read storage. A block-quantized operand reads
-    /// [`Source::Quantized`], whose decode program the L2 emitter runs at the
+    /// [`Source::Quantized`], whose decode program the Kernel emitter runs at the
     /// `(row, col)` the staging fill already computes — so a quantized weight
     /// costs the decode math on the way into shared memory and nothing else.
     /// The staging tile, the fragments, the MMA and the arena footprint are the
@@ -1220,13 +1155,13 @@ impl<'a> Ctx<'a> {
     pub fn contract_stage_source(
         &mut self,
         operand: &Operand,
-        view: &fusor2_ir::ir::level2::StorageView,
+        view: &fusor2_ir::ir::kernel::StorageView,
     ) -> Result<Source> {
         let Dtype::Q(fmt) = self.plan_dtype(operand.src)? else {
             return Ok(Source::Storage(view.clone()));
         };
         let qlayout = qlayout_of(self.cx, operand.src).unwrap_or(QLayout::Native);
-        Ok(Source::Quantized(fusor2_ir::ir::level2::QuantizedView {
+        Ok(Source::Quantized(fusor2_ir::ir::kernel::QuantizedView {
             data: view.clone(),
             fmt,
             layout: qlayout,
@@ -1268,7 +1203,7 @@ impl<'a> Ctx<'a> {
         operand: &Operand,
         rows: u32,
         cols: u32,
-    ) -> Result<fusor2_ir::ir::level2::StorageView> {
+    ) -> Result<fusor2_ir::ir::kernel::StorageView> {
         let split =
             matrix_split_for(&operand.layout, &self.binding, u64::from(rows), u64::from(cols))?;
         self.matrix_view(operand, split)
@@ -1276,7 +1211,7 @@ impl<'a> Ctx<'a> {
 
     /// Read a `u32` word out of binding 0.
     pub fn uniform_word(&mut self, slot: u32) -> TileExpr {
-        let view = fusor2_ir::ir::level2::StorageView {
+        let view = fusor2_ir::ir::kernel::StorageView {
             buffer: self.buffers[0].clone(),
             offset: 0,
             layout: self.buffers[0].layout.clone(),
@@ -1289,8 +1224,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// A `u32` expression for a dim: a literal when constant, a binding-0 word
-    /// when symbolic. **This is trainer constraint 1**: a sequence length is a
-    /// word, never a baked constant.
+    /// when symbolic. A sequence length is a word, never a baked constant.
     pub fn dim_expr(&mut self, dim: Dim) -> Result<TileExpr> {
         match dim {
             Dim::Const(v) => {
@@ -1308,9 +1242,8 @@ impl<'a> Ctx<'a> {
         }
     }
 
-    /// An `f32` expression for a runtime scalar. **This is trainer constraint
-    /// 2**: `m * lr` reads a word, so a learning-rate change recompiles
-    /// nothing.
+    /// An `f32` expression for a runtime scalar: `m * lr` reads a word, so a
+    /// learning-rate change recompiles nothing.
     pub fn scalar_expr(&mut self, sym: SymId) -> Result<TileExpr> {
         let slot = self
             .pack
@@ -1335,17 +1268,15 @@ impl<'a> Ctx<'a> {
     /// the tail of the output untouched — silently, for any launch over the
     /// per-dimension limit.
     pub fn global_index(&mut self, block: u32, grid: [u32; 3]) -> TileExpr {
-        use fusor2_ir::ir::level2::WorkgroupAxis;
+        use fusor2_ir::ir::kernel::WorkgroupAxis;
         let lane = self.b.builtin(Builtin::Lane);
         let gx = self.b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
         let gy = self.b.builtin(Builtin::ProgramId(WorkgroupAxis::Y));
         let gz = self.b.builtin(Builtin::ProgramId(WorkgroupAxis::Z));
         // group = gx + gy*X + gz*X*Y, exactly as the grid fold laid it out —
-        // with X and Y read from `@builtin(num_workgroups)`, never baked.
-        // A baked grid put the sequence length into every symbolic-space
-        // kernel's *body*, which cost one Metal compile per launch per decode
-        // step. `grid` still names the dispatch this lowering derived; only
-        // the linearization constants come from the builtin.
+        // with X and Y read from `@builtin(num_workgroups)`, never baked, so
+        // the extents never enter the body. `grid` still names the dispatch
+        // this lowering derived.
         let _ = grid;
         let x_e = self.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::X));
         let y_e = self.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::Y));
@@ -1408,11 +1339,11 @@ impl<'a> Ctx<'a> {
         Ok(coords)
     }
 
-    /// Translate a [`fusor2_ir::scalar::ScalarExpr`] body into L2.
+    /// Translate a [`fusor2_ir::scalar::ScalarExpr`] body into Kernel.
     ///
     /// `args` are the already-loaded operand values; `coords` are the index
     /// space coordinates `IndexOf` reads. Comparisons return 1.0/0.0 in the
-    /// operand's own dtype, matching L0 semantics — L2's `Bool` exists only
+    /// operand's own dtype, matching Logical semantics — Kernel's `Bool` exists only
     /// between the compare and the select.
     pub fn eval_scalar(
         &mut self,
@@ -1479,13 +1410,9 @@ impl<'a> Ctx<'a> {
                 let v = self.eval_scalar(x, args, coords)?;
                 self.b.bitcast(v, ElementType::Scalar(scalar_element(*to)))
             }
-            // A rounding mode is a real primitive, so the trainer's
-            // 14-chained-comparison `round_small` deletes. `reassoc: false`
-            // rides to WGSL as the emitter's obligation against Metal's
-            // default fast math folding `(x + 2^23) - 2^23` away.
-            // `Round` is its own L2 node rather than the `(x + 2^23) - 2^23`
-            // trick, so there is no arithmetic identity for Metal's default
-            // fast math to fold away and QAT cannot be silently disabled.
+            // `Round` is its own Kernel node, so there is no arithmetic
+            // identity for Metal's default fast math to fold away and QAT
+            // cannot be silently disabled.
             K::Round { mode, x } => {
                 let v = self.eval_scalar(x, args, coords)?;
                 self.b.round(*mode, v)
@@ -1534,7 +1461,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// Load one operand at the reading kernel's **flat space index**, running
-    /// it through the edge's [`fusor2_ir::ir::level1::AddressMap`] first.
+    /// it through the edge's [`fusor2_ir::ir::launch::AddressMap`] first.
     ///
     /// [`Ctx::load_operand`] is the raw form, for readers that have already
     /// computed a storage index themselves (gather, scatter, the contraction
@@ -1560,12 +1487,8 @@ impl<'a> Ctx<'a> {
     ) -> Result<TileExpr> {
         let Some(map) = operand.address_map() else {
             // A symbolic extent (or a stride past one) has no compile-time
-            // `AddressMap`. The address is still perfectly well defined —
-            // `offset + Σ ((flat / Π extents-right) % extent) * stride` — it
-            // just has to be computed with binding-0 words instead of
-            // literals. This is the general lowering the KV-cache decode
-            // path relies on: a sequence length is a word, never a baked
-            // constant, so a length change recompiles nothing.
+            // `AddressMap`; the address is computed with binding-0 words
+            // instead of literals, so a length change recompiles nothing.
             return self.symbolic_operand_address(operand, flat);
         };
         if map.is_identity_over(space_total) {
@@ -1621,7 +1544,7 @@ impl<'a> Ctx<'a> {
         operand: &Operand,
         flat: TileExpr,
     ) -> Result<TileExpr> {
-        if matches!(operand.access, fusor2_ir::ir::level1::AccessPlan::Unflatten(_)) {
+        if matches!(operand.access, fusor2_ir::ir::launch::AccessPlan::Unflatten(_)) {
             return Err(Error::Plan(format!(
                 "a symbolic Unflatten window is not lowerable; operand {} laid out {:?}",
                 operand.src, operand.layout
@@ -1695,16 +1618,10 @@ impl<'a> Ctx<'a> {
     ///
     /// `Plan::buffers` is authoritative about storage, and
     /// `fusor2_cost::plan::buffer_layout_for` pads a `Coop` contraction's
-    /// output to whole `bm x bn` blocks. Every other reader of that value
-    /// still names its elements densely — an `Operand`'s `layout`, its
-    /// `AccessPlan::Unflatten` map and the fold's row/lane arithmetic are all
-    /// stated over the logical shape — so without this step a `[16, 1]`
-    /// contraction padded to `[16, 16]` is read as the first sixteen elements
-    /// of row 0: one real value followed by fifteen zeros of padding. That is
-    /// how `sample_standard_token_respects_top_p` drew a token id of 120 out
-    /// of a 16-token vocabulary: the nucleus prefix scan read as all-zero, so
-    /// every candidate passed the filter and the one-hot selector summed to
-    /// `0 + 1 + .. + 15`.
+    /// output to whole `bm x bn` blocks, while every other reader of that
+    /// value names its elements densely over the logical shape. Without this
+    /// step a `[16, 1]` contraction padded to `[16, 16]` is read as the first
+    /// sixteen elements of row 0.
     ///
     /// Identity — and emitted as nothing — whenever the plan's layout is the
     /// logical dense one, which is every value the extractor did not pad.
@@ -1812,12 +1729,9 @@ impl<'a> Ctx<'a> {
             return Ok(lit);
         }
         // An `Operand`'s index arithmetic is stated over the producer's
-        // *logical* dense element space; the buffer it lands in is whatever
+        // logical dense element space; the buffer it lands in is whatever
         // the plan laid out. Those differ exactly when the producer's
-        // schedule point padded it — a `Coop` contraction pads `m` to `bm`
-        // and `n` to `bn` so its subgroup-collective store needs no mask —
-        // and then a dense read of element `i` lands `i` columns into row 0
-        // instead of on row `i`.
+        // schedule point padded it.
         let index = self.repad_index(operand.src, index)?;
         let buffer = self.buffer(operand.src)?;
         // A block-quantized operand has no dense element to load: reading
@@ -1840,8 +1754,8 @@ impl<'a> Ctx<'a> {
             let mask = self.b.compare(TileCompareOp::Lt, index.clone(), bound);
             let fill = self.b.f32(0.0);
             let layout = buffer.layout.clone();
-            let view = fusor2_ir::ir::level2::QuantizedView {
-                data: fusor2_ir::ir::level2::StorageView {
+            let view = fusor2_ir::ir::kernel::QuantizedView {
+                data: fusor2_ir::ir::kernel::StorageView {
                     buffer,
                     offset: 0,
                     layout,
@@ -1854,30 +1768,22 @@ impl<'a> Ctx<'a> {
                 .load(Source::Quantized(view), Addr::Linear(index), mask, fill));
         }
         let elem = buffer.element;
-        // `index` is a storage element index — `Addr::Linear` addresses the
-        // buffer directly — so the bound is the buffer's own extent. An
-        // `Unflatten`'s map describes the *reading* space, which after
-        // `operand_address` has already been consumed.
-        //
-        // The bound is built from the plan layout's `Dim`s — a literal when
-        // constant, binding-0 words when symbolic — never from the resolved
-        // decl extents, which would bake this dispatch's sequence length
-        // into the body and recompile the pipeline every step.
+        // `index` is a storage element index, so the bound is the buffer's
+        // own extent, built from the plan layout's `Dim`s — never from the
+        // resolved decl extents, which would bake this dispatch's sequence
+        // length into the body.
         let layout = buffer.layout.clone();
-        let view = fusor2_ir::ir::level2::StorageView {
+        let view = fusor2_ir::ir::kernel::StorageView {
             buffer,
             offset: 0,
             layout,
         };
-        // The buffer's extent is **not** the shape product: padding lives in
-        // the strides, so a padded plan layout keeps the logical shape and
-        // the shape product undercounts the buffer — `index` is a *storage*
-        // element index (`repad_index` above), and a logical-count bound
-        // masks every padded row past the first to `fill`. For the row-major
-        // layouts the plan emits (offset 0), the extent is
+        // The buffer's extent is not the shape product: padding lives in the
+        // strides, so the shape product undercounts a padded buffer. For the
+        // row-major layouts the plan emits (offset 0), the extent is
         // `shape[0] * strides[0]`; a `DERIVED_STRIDE` placeholder implies no
-        // padding (a padded layout with one is refused at plan derivation),
-        // so it resolves as the product of the remaining logical extents.
+        // padding and resolves as the product of the remaining logical
+        // extents.
         let (plan_layout, _) = bound_layout(self.cx, operand.src);
         let bound = match (plan_layout.shape().first(), plan_layout.strides().first()) {
             (Some(&outer), Some(&stride0)) => {
@@ -1923,8 +1829,8 @@ impl<'a> Ctx<'a> {
     /// The literal a `Leaf::Const` operand folds to, if it is one.
     pub(crate) fn const_operand(&mut self, src: Id) -> Option<TileExpr> {
         let selected = self.cx.selected(src);
-        let fusor2_ir::ir::Op::L0(fusor2_ir::ir::level0::L0::Leaf(
-            fusor2_ir::ir::level0::LeafKind::Const { value, .. },
+        let fusor2_ir::ir::Op::Logical(fusor2_ir::ir::logical::Logical::Leaf(
+            fusor2_ir::ir::logical::LeafKind::Const { value, .. },
         )) = &self.cx.graph.node(selected).op
         else {
             return None;
@@ -1946,7 +1852,7 @@ impl<'a> Ctx<'a> {
             block,
             body,
             byte_arena: if self.caps.workgroup_alias {
-                Some(fusor2_ir::ir::level2::ByteArenaToken)
+                Some(fusor2_ir::ir::kernel::ByteArenaToken)
             } else {
                 None
             },
@@ -1955,13 +1861,9 @@ impl<'a> Ctx<'a> {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Dispatch
-// ---------------------------------------------------------------------------
-
-/// Lower one selected L1 node at one schedule point.
+/// Lower one selected Launch node at one schedule point.
 ///
-/// One match over `L1` into the eight submodule entry points. Every arm gets a
+/// One match over `Launch` into the eight submodule entry points. Every arm gets a
 /// real body: there is no "unsupported, fall back" path, because the extractor
 /// already proved the node selectable on this target.
 pub fn lower_node(
@@ -1972,43 +1874,36 @@ pub fn lower_node(
     binding: DimBinding,
     pack: std::sync::Arc<UniformPack>,
 ) -> Result<Vec<KernelIr>> {
-    let Op::L1(op) = &node.op else {
+    let Op::Launch(op) = &node.op else {
         return Err(Error::Plan(format!(
-            "lowering was handed a {:?} node, but only L1 nodes are selectable",
+            "lowering was handed a {:?} node, but only Launch nodes are selectable",
             node.level
         )));
     };
     let ctx = Ctx::with_pack(caps, cx, binding, pack)?;
     match op {
-        L1::KMap { .. } => map_fold::lower_kmap(ctx, op, theta).map(|k| vec![k]),
-        L1::KFold { .. } => map_fold::lower_kfold(ctx, op, theta).map(|k| vec![k]),
-        L1::KContract { family, .. } => contract::lower_contract(ctx, op, *family, theta),
-        L1::KGather { .. } => gather_scatter::lower_kgather(ctx, op, theta).map(|k| vec![k]),
-        L1::KScatter { .. } => gather_scatter::lower_kscatter(ctx, op, theta),
-        L1::KRegion { .. } => region::lower_kregion(ctx, op, theta).map(|k| vec![k]),
-        L1::Ext { def, .. } => ext::lower(*def, node, theta).map(|k| vec![k]),
+        Launch::Map { .. } => map_fold::lower_kmap(ctx, op, theta).map(|k| vec![k]),
+        Launch::Fold { .. } => map_fold::lower_kfold(ctx, op, theta).map(|k| vec![k]),
+        Launch::Contract { family, .. } => contract::lower_contract(ctx, op, *family, theta),
+        Launch::Gather { .. } => gather_scatter::lower_kgather(ctx, op, theta).map(|k| vec![k]),
+        Launch::Scatter { .. } => gather_scatter::lower_kscatter(ctx, op, theta),
+        Launch::Region { .. } => region::lower_kregion(ctx, op, theta).map(|k| vec![k]),
+        Launch::Ext { def, .. } => ext::lower(*def, node, theta).map(|k| vec![k]),
     }
 }
 
-/// `L1::Ext` lowering: the one escape hatch out of the closed `L0`/`L1` enums.
+/// `Launch::Ext` lowering: the one escape hatch out of the closed `Logical`/`Launch` enums.
 pub mod ext {
     use super::*;
     use fusor2_ir::ir::{OpDefId, OpDefRegistry};
     use std::sync::RwLock;
 
-    /// The registry `L1::Ext` lowering resolves `OpDefId` against.
+    /// The registry `Launch::Ext` lowering resolves `OpDefId` against.
     ///
-    /// [`LowerCtx`] carries the plan, the launch, the graph and the symbol
-    /// list — not the [`OpDefRegistry`] the graph was built with — and
-    /// `Semantics`, which *does* hold one, exposes no accessor for it. So a
-    /// target handed one selected `L1::Ext { def }` has no way to reach that
-    /// def's `lower_per_target` row, and `OpDef::lower_per_target` has been
-    /// dead for exactly that reason.
-    ///
-    /// Until `LowerCtx` grows the field, the embedder installs the same
-    /// registry here that it installed on the e-graph's semantics. Registration
-    /// order is id order and must match, which is the same contract
-    /// `CoreSemantics::with_registry` already imposes.
+    /// [`LowerCtx`] does not carry the [`OpDefRegistry`] the graph was built
+    /// with, so until it grows the field the embedder installs the same
+    /// registry here that it installed on the e-graph's semantics.
+    /// Registration order is id order and must match.
     static DEFS: RwLock<Option<OpDefRegistry>> = RwLock::new(None);
 
     /// Install the extension registry this process lowers against. Idempotent
@@ -2058,7 +1953,7 @@ pub mod ext {
     }
 }
 
-/// Dispatch one selected L1 node to its family lowering.
+/// Dispatch one selected Launch node to its family lowering.
 ///
 /// The [`fusor2_ir::target::Target`] contract returns exactly one `KernelIr`
 /// per node; families that need two launches (split-K, sort-then-segment) are
@@ -2089,7 +1984,7 @@ pub fn lower(
 mod tests {
     use super::*;
 
-    /// Test 1: slack strictly under one slab, and `122_880` yields
+    /// Slack strictly under one slab, and `122_880` yields
     /// `[61440, 2, 1]`, not `[65535, 2, 1]`.
     #[test]
     fn distribute_workgroups_slack_under_one_slab() {
@@ -2160,8 +2055,7 @@ mod tests {
 
     /// WGSL has no infinite literal and naga rejects a module holding one,
     /// so every `-inf` the frontend hands down — a causal mask's reject arm, a
-    /// max fold's identity — has to arrive as the largest finite magnitude
-    /// instead. This is what made `attention_causal [gpu]` fail to emit at all.
+    /// max fold's identity — has to arrive as the largest finite magnitude.
     #[test]
     fn an_infinite_literal_is_clamped_to_something_wgsl_can_spell() {
         assert!(finite_f32(f32::NEG_INFINITY).is_finite());
@@ -2178,7 +2072,7 @@ mod tests {
 
         // The max-carrier sentinel agrees with `emit::expr`'s reduce identity,
         // so a max started by hand and one started by a `Reduce` match.
-        let mut b = L2::new();
+        let mut b = Kernel::new();
         let sentinel = b.neg_inf(ScalarElement::F32);
         let expected = b.f32(-crate::emit::expr::WGSL_SAFE_F32_MAX);
         assert_eq!(sentinel, expected);
@@ -2186,7 +2080,7 @@ mod tests {
 
     #[test]
     fn hash_consing_merges_separately_built_subtrees() {
-        let mut b = L2::new();
+        let mut b = Kernel::new();
         let a1 = {
             let x = b.f32(2.0);
             let y = b.f32(3.0);
@@ -2311,9 +2205,8 @@ mod tests {
         assert_eq!(grid_for(&space, 64, &bound, &limits).unwrap(), [8, 1, 1]);
     }
 
-    /// Test 4's grid half: the same plan at three sequence lengths produces
-    /// three grids and one kernel identity, because the extent never enters
-    /// the body.
+    /// The same plan at three sequence lengths produces three grids and one
+    /// kernel identity, because the extent never enters the body.
     #[test]
     fn sequence_length_only_moves_the_grid() {
         let limits = Limits::default();
@@ -2344,18 +2237,18 @@ mod ext_tests {
     use fusor2_ir::dtype::Persistence;
     use fusor2_ir::egraph::EGraph;
     use fusor2_ir::extract::{
-        BindKind, BindingPlan, Extraction, Launch, Plan, PlanHash,
+        BindKind, BindingPlan, Extraction, Dispatch, Plan, PlanHash,
     };
     use fusor2_ir::facts::{ValueFacts, Work};
-    use fusor2_ir::ir::level0::{BufferId, L0, LeafKind};
-    use fusor2_ir::ir::level1::{AccessPlan, Effect};
-    use fusor2_ir::ir::level2::{
+    use fusor2_ir::ir::logical::{BufferId, Logical, LeafKind};
+    use fusor2_ir::ir::launch::{AccessPlan, Effect};
+    use fusor2_ir::ir::kernel::{
         Addr, BufferAccess, BufferDecl, MemoryLevel, Source, StorageView, TileLayout,
     };
     use fusor2_ir::ir::{AttrId, OpDef, OpDefId, OpDefRegistry, OpTag, VerifyCtx};
     use fusor2_ir::semantics::{CoreSemantics, SumArenaPlanner};
     use fusor2_ir::shape::Layout;
-    use fusor2_ir::ir::level2::WorkgroupAxis;
+    use fusor2_ir::ir::kernel::WorkgroupAxis;
     use fusor2_ir::target::Target;
     use std::sync::Arc;
 
@@ -2365,7 +2258,7 @@ mod ext_tests {
     /// whole `KernelIr` from the node, which is all `lower_per_target` offers,
     /// and nothing in `fusor2-gpu` knows what "triple" means.
     ///
-    /// `theta` is read rather than dropped. `L1::schedule` returns `None` for
+    /// `theta` is read rather than dropped. `Launch::schedule` returns `None` for
     /// `Ext` — fusor2 cannot enumerate geometries for an `OpDef`-supplied
     /// lowering — so extraction owes this seam `SchedPoint::Point` and nothing
     /// else. Matching it states that contract instead of assuming it: an `Ext`
@@ -2378,7 +2271,7 @@ mod ext_tests {
                 format!("Ext lowerings take SchedPoint::Point; got {theta:?}").into(),
             ));
         };
-        let Op::L1(L1::Ext { ops, .. }) = &node.op else {
+        let Op::Launch(Launch::Ext { ops, .. }) = &node.op else {
             return Err(Error::Plan("triple got a foreign node".into()));
         };
         let n: u32 = ops
@@ -2407,7 +2300,7 @@ mod ext_tests {
         let input = decl(1, f32e, n, BufferAccess::Read);
         let output = decl(2, f32e, n, BufferAccess::ReadWrite);
 
-        let mut b = L2::new();
+        let mut b = Kernel::new();
         let block = 64u32;
         let gid = b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
         let lane = b.builtin(Builtin::Lane);
@@ -2486,7 +2379,7 @@ mod ext_tests {
             reg,
         ));
         let x = g
-            .add(Op::L0(L0::Leaf(LeafKind::Buffer {
+            .add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
                 name: BufferId(0),
                 dtype: fusor2_ir::dtype::Dtype::F32,
                 shape: smallvec::smallvec![Dim::Const(N as u64)],
@@ -2498,7 +2391,7 @@ mod ext_tests {
             access: AccessPlan::Alias,
         }];
         let e = g
-            .add(Op::L1(L1::Ext {
+            .add(Op::Launch(Launch::Ext {
                 def: OpDefId(0),
                 ops,
                 attrs: AttrId(0),
@@ -2507,7 +2400,7 @@ mod ext_tests {
 
         let plan = Plan {
             extraction: Extraction::default(),
-            launches: vec![Launch {
+            launches: vec![Dispatch {
                 root: e,
                 members: smallvec::smallvec![e],
                 bindings: vec![

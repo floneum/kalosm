@@ -1,5 +1,5 @@
 //! One persistent worker pool. Parallelism is a scheduling attribute on an
-//! outer L1 tile loop, priced against the real pool-wake cost
+//! outer Launch tile loop, priced against the real pool-wake cost
 //! (`DeviceFacts::thread_wake_ps`) — which deletes
 //! `PARALLEL_THRESHOLD = 16_777_216`.
 //!

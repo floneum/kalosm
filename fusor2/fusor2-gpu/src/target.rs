@@ -15,8 +15,8 @@ use fusor2_ir::egraph::{EGraph, Id, Rule};
 use fusor2_ir::error::Error;
 use fusor2_ir::extract::{Plan, PlanHash};
 use fusor2_ir::ir::Node;
-use fusor2_ir::ir::level1::SchedPoint;
-use fusor2_ir::ir::level2::KernelIr;
+use fusor2_ir::ir::launch::SchedPoint;
+use fusor2_ir::ir::kernel::KernelIr;
 use fusor2_ir::shape::SymId;
 use fusor2_ir::target::{Artifact, Buf, EmitError, LowerCtx, Target, Uniforms};
 use rustc_hash::{FxHashMap, FxHasher};
@@ -29,9 +29,7 @@ use crate::plan_cache::PlanCache;
 use crate::pool::BufferPool;
 use crate::uniforms::UniformPack;
 
-/// Runtime policy. Every field names a decision the library owns; none is read
-/// from the environment at point of use, and none gates an *optimizer*
-/// behaviour — those are all per-shape cost-model calls.
+/// Runtime policy.
 #[derive(Clone, Debug)]
 pub struct GpuConfig {
     /// Override the platform memory ceiling.
@@ -39,9 +37,8 @@ pub struct GpuConfig {
     /// Pre-fill fresh allocations with `0xCD` so a zero-init assumption fails
     /// loudly instead of reading the last tenant's bytes.
     pub poison_allocations: bool,
-    /// Back-pressure window. **This is the `--drain-every` replacement**: the
-    /// runtime blocks when more than this many submissions are outstanding, so
-    /// a training script never counts steps by hand.
+    /// Back-pressure window: the runtime blocks when more than this many
+    /// submissions are outstanding.
     pub max_in_flight_submits: usize,
     /// Allocate a timestamp query set and fold the samples into
     /// [`KernelProfile`]s.
@@ -75,12 +72,9 @@ fn default_cache_dir() -> Option<PathBuf> {
     })
 }
 
-/// Live compiled pipelines retained per target. Past it the LRU drops the
-/// coldest, which costs one rebuild and never correctness — but the capacity
-/// must sit above any one plan's whole launch set: a plan bigger than the
-/// cache evicts and recompiles every pipeline every resolve, which turns a
-/// decode loop quadratic in Metal compiles (measured: an 8B forward is
-/// ~2,400 launches against the old 1,024-entry cache).
+/// Live compiled pipelines retained per target. Must sit above any one plan's
+/// whole launch set: a plan bigger than the cache evicts and recompiles every
+/// pipeline every resolve.
 pub const ARTIFACT_CAPACITY: usize = 65_536;
 
 /// Everything the emitted kernel body depends on, *except* the dim binding.
@@ -91,40 +85,24 @@ pub const ARTIFACT_CAPACITY: usize = 65_536;
 ///
 /// * the `BufferPlan` of every value the launch binds, and of its root —
 ///   `lower::bound_layout` treats those as the authoritative padded stride
-///   set, and nothing outside the launch's own binding list is ever asked
-///   for one (a value with no `BufferPlan` is a leaf, answered from facts);
+///   set (a value with no `BufferPlan` is a leaf, answered from facts);
 /// * `theta[root]`, the schedule point `lower_node` is called at;
 /// * the [`UniformPack`] word layout, which bakes binding-0 slot indices.
 ///
-/// The whole plan is deliberately **not** here. A `PlanHash` in the key made
-/// every launch's identity a function of every other launch's: the online
-/// explorer substitutes one launch's arm and re-plans the plan whole, so a
-/// single tuning step turned all 1,731 decode launches cold and re-lowered
-/// bodies that came out byte-identical — 18-97 ms of host time per explore
-/// step with nothing submitted to the GPU, for two Metal compiles' worth of
-/// genuinely new code.
-///
-/// The binding is deliberately not here either: which of its values a
-/// lowering depends on is only known after lowering
-/// ([`DimBinding::consulted`]), so the cached [`ArtifactEntry`] carries that
-/// set and discriminates variants on those values alone. A launch that never
-/// consults a symbol has exactly one variant across every sequence length.
+/// The binding is not in the key: which of its values a lowering depends on
+/// is only known after lowering ([`DimBinding::consulted`]), so the cached
+/// [`ArtifactEntry`] carries that set and discriminates variants on those
+/// values alone.
 #[derive(Copy, Clone, PartialEq, Eq, Hash)]
 struct ArtifactKey {
     /// Which arena the ids below index. An `Id` names a node only together
-    /// with its graph — every graph has an `Id(5)` — and the suite resolves
-    /// hundreds of independent graphs against one target, so without this a
-    /// `sin` kernel is served to another graph's identically-numbered launch.
+    /// with its graph, and many graphs resolve against one target.
     arena: u64,
     launch: u64,
     context: u64,
 }
 
 /// Every launch's [`ArtifactKey`] for one plan, computed in one pass.
-///
-/// The buffer digests are taken once into a map and read per launch, so the
-/// pass is O(buffers + sum of binding counts) rather than the O(N^2) a
-/// per-launch scan of `plan.buffers` would cost on a 1,731-launch plan.
 fn plan_artifact_keys(plan: &Plan, pack: &UniformPack, arena: u64) -> Vec<ArtifactKey> {
     let mut digests: FxHashMap<fusor2_ir::egraph::Id, u64> =
         FxHashMap::with_capacity_and_hasher(plan.buffers.len(), Default::default());
@@ -168,10 +146,7 @@ struct ArtifactEntry {
     /// How that lowering folded its dispatch grid, when the fold is
     /// replayable. Present means the grid — and only the grid — moves with
     /// the binding, so a length change is answered by replaying the fold
-    /// rather than by re-lowering: on a decode step 96 of the 160 launches
-    /// that touch the KV length are byte-identical modules whose workgroup
-    /// count moved, and re-lowering them cost 9.6 ms of host time per token
-    /// with nothing submitted to the GPU.
+    /// rather than by re-lowering.
     grid_space: Option<crate::lower::GridSpec>,
     /// `hash(consulted syms + their bound values)` -> compiled kernel, the
     /// grid the lowering finished with, and the lowered body's identity hash
@@ -183,7 +158,7 @@ struct ArtifactEntry {
 /// active lengths (the racing autotuner's, plus the current one).
 const VARIANTS_PER_LAUNCH: usize = 8;
 
-/// One kernel body's `verify_l2` verdict, or the verify in flight for it.
+/// One kernel body's `verify_kernel` verdict, or the verify in flight for it.
 /// `true` once the body has passed; a failed verify leaves it `false`, so the
 /// next caller retries rather than inheriting an error it cannot clone.
 type VerifySlot = Arc<parking_lot::Mutex<bool>>;
@@ -217,16 +192,13 @@ fn gapstep() -> bool {
     *ON.get_or_init(|| std::env::var_os("FUSOR2_GAPSTEP").is_some())
 }
 
-/// Whether `FUSOR2_VERIFY_ARTIFACT_CACHE` is set. Read once: the probe asks
-/// this for every launch of every plan, and an `env::var_os` there is a
-/// process-environment lock and an allocation per dispatch.
+/// Whether `FUSOR2_VERIFY_ARTIFACT_CACHE` is set, read once.
 fn verify_artifact_cache() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FUSOR2_VERIFY_ARTIFACT_CACHE").is_some())
 }
 
-/// Whether `FUSOR2_NO_PIPELINE_SHARE` is set. Read once, for the same reason:
-/// every cold launch of every plan asks.
+/// Whether `FUSOR2_NO_PIPELINE_SHARE` is set, read once.
 fn no_pipeline_share() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FUSOR2_NO_PIPELINE_SHARE").is_some())
@@ -254,12 +226,11 @@ fn variant_hash(consulted: &[fusor2_ir::shape::SymId], binds: &BindingEnv) -> Op
 /// the `KernelIr` except the dispatch grid. Two lowerings at two sequence
 /// lengths produce byte-identical WGSL whenever the length only moved the
 /// grid, and the Metal compile happens once.
-fn pipeline_hash(ir: &fusor2_ir::ir::level2::KernelIr) -> u128 {
+fn pipeline_hash(ir: &fusor2_ir::ir::kernel::KernelIr) -> u128 {
     // Structural, pointer-free and 128-bit: the derived `Hash` of a `Stmt`
-    // folds in `Arc` addresses through `TileExpr`'s cached digest, so it
-    // neither matches across relowers nor is safe against allocator reuse —
-    // and this cache serves compiled *pipelines*, where a collision is a
-    // silent wrong kernel.
+    // folds in `Arc` addresses, so it neither matches across relowers nor is
+    // safe against allocator reuse, and a collision here is a silent wrong
+    // kernel.
     fusor2_tile::planner::kernel_identity(ir)
 }
 
@@ -272,42 +243,29 @@ pub struct GpuTarget {
     /// Compiled pipelines by kernel-body identity ([`pipeline_hash`]), shared
     /// across launches and bindings.
     ///
-    /// The slot is the *single-flight* claim, not just the answer. A decode
-    /// step's 32 layers lower one identical attention matvec body, and the
-    /// build cohort hands those 32 launches to as many threads as the machine
-    /// has: every one of them missed this cache in the same instant and put
-    /// the same Metal shader through the compiler — measured 11.6 compiles
-    /// per token where two distinct bodies existed. The claim is held across
-    /// the compile, so whoever takes it compiles and everyone else finds the
-    /// artifact. The cohort takes the claim with `try_lock` and moves on when
-    /// it is held (see `try_pipeline_for`); only the serial tail waits.
+    /// The slot is the *single-flight* claim, not just the answer: it is held
+    /// across the compile, so whoever takes it compiles and everyone else
+    /// finds the artifact. The cohort takes the claim with `try_lock` and
+    /// moves on when it is held (see `try_pipeline_for`); only the serial
+    /// tail waits.
     pipelines: parking_lot::Mutex<lru::LruCache<u128, PipelineSlot>>,
     /// Compiled pipelines by emitted-WGSL identity — the last-resort dedup,
-    /// keyed on the **full source text** so a collision is impossible. A
-    /// relower at a new sequence length can change the *IR* hash without
-    /// changing one byte of the emitted module; this tier catches exactly
-    /// that and skips the Metal compile.
+    /// keyed on the full source text so a collision is impossible. A relower
+    /// at a new sequence length can change the IR hash without changing one
+    /// byte of the emitted module; this tier catches that and skips the
+    /// Metal compile.
     pipelines_by_source: parking_lot::Mutex<lru::LruCache<String, Artifact>>,
-    /// Body identities already through [`fusor2_tile::verify_l2`] on this
+    /// Body identities already through [`fusor2_tile::verify_kernel`] on this
     /// target's caps.
     ///
-    /// `verify_l2` is a pure function of `(body, caps)` and this target's
-    /// caps are fixed for its life, so a body whose [`pipeline_hash`] is
-    /// here has already been verified — under the *same* pointer-free,
-    /// 128-bit identity the compiled pipeline is keyed on. It is never an
-    /// opt-out: a body reaching L2 for the first time is always verified,
-    /// and the sweep still races every member. A decode step relowers every
-    /// launch whose grid reads the KV length and all but a handful produce a
-    /// byte-identical body, so this is the difference between verifying a
-    /// hundred-odd kernels per token and verifying the ones that are new.
+    /// `verify_kernel` is a pure function of `(body, caps)` and this target's
+    /// caps are fixed for its life, so a body whose [`pipeline_hash`] is here
+    /// has already been verified. It is never an opt-out: a body reaching
+    /// Kernel for the first time is always verified.
     ///
-    /// The entry is a **slot claimed before the verify and held across it**,
-    /// exactly as [`Self::pipelines`] is: the cold set of one resolve is
-    /// lowered by a whole cohort of workers at once, and a check-then-insert
-    /// let all of them past an empty entry for the same body. Measured on an
-    /// 8B decode token, whose 64 relowers produce two distinct bodies:
-    /// `verify_l2` was 16.3 ms of CPU a token — more than the lowering and
-    /// the Metal compiles put together — for two bodies' worth of checking.
+    /// The entry is a slot claimed before the verify and held across it,
+    /// exactly as [`Self::pipelines`] is; a check-then-insert would let a
+    /// whole cohort past an empty entry for the same body.
     verified: parking_lot::Mutex<lru::LruCache<u128, VerifySlot>>,
     launcher: Launcher,
     config: GpuConfig,
@@ -378,9 +336,7 @@ impl GpuTarget {
         self.launcher.take_kernel_profiles()
     }
 
-    /// The plan **is** the cache key. There is no `hash_kernel_fields`, no
-    /// `kernel_cache_key_with_dispatch` and no golden byte file, so a new
-    /// decision variable cannot be forgotten in one of four hash recipes.
+    /// The plan is the cache key.
     pub const fn plan_key(&self, plan: &Plan) -> PlanHash {
         plan.hash
     }
@@ -399,52 +355,45 @@ impl GpuTarget {
     ///    0 is the uniform block), allocate outputs from `Plan::buffers`
     ///    through the pool, resolve grids.
     /// 2. **Parallel** — plan-cache lookup by [`PlanHash`], else lower, verify
-    ///    L2, emit and create the pipeline. A serial probe runs first so a warm
+    ///    Kernel, emit and create the pipeline. A serial probe runs first so a warm
     ///    cache never touches the thread pool.
     /// 3. **Serial, exact plan order** — push command records and release
     ///    consumed buffers.
     pub fn resolve(&self, plan: &Plan, graph: &EGraph, binds: &BindingEnv) -> Result<()> {
         let start = Instant::now();
-        // `FUSOR2_GAPSTEP` — the resolve-phase stopwatch. It exists because the
-        // decode token is host-serial in two windows the GPU sleeps through,
-        // and the only way to price them is to split one resolve into its
-        // phases. One line per resolve:
+        // `FUSOR2_GAPSTEP` — the resolve-phase stopwatch, one line per resolve:
         //
         // - `outside`  ms between the previous resolve returning and this one
-        //   starting: everything the caller does with the answer (graph
-        //   rebuild, sampling, readback) with nothing submitted.
+        //   starting.
         // - `p1`/`probe`/`build`/`bind`/`enc`/`tail`/`tot` the phases below,
         //   in order; `cold` is how many launches the warm probe missed and
         //   `build` therefore had to lower.
         // - `lowus`/`compus`/`verus`/`vern` CPU microseconds this resolve
-        //   spent lowering, in the Metal compiler, and in `verify_l2` (with
+        //   spent lowering, in the Metal compiler, and in `verify_kernel` (with
         //   the number of bodies verified) — summed across the build cohort,
         //   so they exceed `build` whenever the workers overlap.
-        // - `chunkwait`/`pollus` how long the host was *blocked on the GPU*
-        //   (chunked-submit backpressure, and `poll_wait`). Compare their sum
-        //   against the measured GPU busy time: the difference is queue idle.
+        // - `chunkwait`/`pollus` how long the host was blocked on the GPU
+        //   (chunked-submit backpressure, and `poll_wait`).
         let gap = gapstep();
         if gap {
             let prev = LAST_EXIT.lock().replace(start);
             let outside = prev.map(|p| start.duration_since(p).as_secs_f64() * 1e3);
             eprint!("GAPSTEP outside={:.2} ", outside.unwrap_or(0.0));
         }
-        // One pack for the whole resolve. It is a function of the plan, and
-        // every lowering this resolve drives needs it: deriving it per launch
-        // re-walked `Plan::buffers` once per dispatch.
+        // One pack for the whole resolve; every lowering this resolve drives
+        // needs it.
         let pack = Arc::new(UniformPack::new(plan));
         let uniforms = pack.fill(plan, &binds.dims, &binds.scalars)?;
 
-        // ---- Phase 1: serial, plan order --------------------------------
+        // Phase 1: serial, plan order.
         let uniform_buf = self
             .pool
             .alloc_with_usage(pack.byte_len(), crate::pool::TENSOR_USAGE)?;
         self.launcher.write_uniforms(&uniform_buf, &uniforms)?;
 
-        // `plan.buffers` deliberately excludes external leaves: allocation is
-        // derived from what the plan *produces*, and a leaf is supplied. Every
-        // binding must still resolve, so the caller-owned buffers seed the map
-        // before anything is allocated on top of them.
+        // `plan.buffers` excludes external leaves. Every binding must still
+        // resolve, so the caller-owned buffers seed the map before anything
+        // is allocated on top of them.
         let mut resolved: FxHashMap<Id, Buf> = binds.buffers.clone();
         for buffer in &plan.buffers {
             if resolved.contains_key(&buffer.value) {
@@ -510,21 +459,13 @@ impl GpuTarget {
         }
 
 
-        // ---- Phase 2: probe the cache, then build the cold set -----------
+        // Phase 2: probe the cache, then build the cold set.
         let __t_p1 = start.elapsed();
         let keys = plan_artifact_keys(plan, &pack, graph.arena_id());
         let queue_len = work.len();
-        // The probe *is* the partition. Every launch whose variant is already
-        // built finishes here with a hash lookup, and what is left is exactly
-        // the cold set — which then goes to the cohort whole.
-        //
-        // The previous shape timed a serial prefix instead: build in plan
-        // order until one build runs longer than a threshold, then
-        // parallelize the remainder. That charged the whole of the first cold
-        // build to the caller, and on a decode step the first cold build is a
-        // Metal shader compile — measured at 2.5-5.5 ms of the 7-9 ms this
-        // phase costs, every step, for 31 of 1,731 launches. Nothing about a
-        // build's duration was ever the question; whether it was cached was.
+        // The probe is the partition: every launch whose variant is already
+        // built finishes here with a hash lookup, and what is left is the
+        // cold set, which goes to the cohort whole.
         let mut cold: Vec<usize> = Vec::new();
         // One binding for the whole probe. Grid replay only *reads* it, and
         // the reads it records are the caller's, not a lowering's.
@@ -554,15 +495,11 @@ impl GpuTarget {
                 })
                 .collect();
 
-            // ---- Pass A: lower, and compile what nobody else is on -------
-            // Lowering and compiling interleave on the same cohort: a worker
+            // Pass A: lower, and compile what nobody else is on. A worker
             // that has just lowered a body claims its pipeline slot and
-            // compiles it there and then, so the compile of the first
-            // attention matvec overlaps the lowering of the other sixty-odd
-            // launches instead of following it. A slot another worker already
-            // holds is *skipped*, never waited on — waiting parks a core for
-            // the whole 5.8 ms of a Metal compile, and the 32 layers that
-            // share a body would park all of them.
+            // compiles it there and then, so compiles overlap the remaining
+            // lowerings. A slot another worker already holds is skipped,
+            // never waited on — waiting parks a core for the whole compile.
             let cursor = BuildCursor::new();
             let lowered: Vec<Mutexed<(Lowered, Option<Artifact>)>> =
                 (0..len).map(|_| Mutexed::default()).collect();
@@ -594,9 +531,9 @@ impl GpuTarget {
                 })
                 .collect::<Result<_>>()?;
 
-            // ---- Pass B: file every launch's variant ---------------------
-            // Whatever Pass A skipped is finished here, by which time the
-            // worker that claimed it has published the artifact.
+            // Pass B: file every launch's variant. Whatever Pass A skipped is
+            // finished here, by which time the worker that claimed it has
+            // published the artifact.
             for (j, (l, artifact)) in lowered.into_iter().enumerate() {
                 let artifact = match artifact {
                     Some(a) => a,
@@ -625,13 +562,12 @@ impl GpuTarget {
             }
         }
 
-        // ---- Phase 3: serial, exact plan order ---------------------------
+        // Phase 3: serial, exact plan order.
         let __t_p2 = start.elapsed();
         let total = work.len();
         // A plan too large for a full per-dispatch query set can still time
-        // *one* launch: the tuner names a plan index, and two slots bracket
-        // that dispatch alone. That is how the online explorer observes a
-        // decode-sized plan at all.
+        // one launch: the tuner names a plan index, and two slots bracket
+        // that dispatch alone.
         let focus_plan_ix = self.launcher.take_tuning_focus();
         let mut records = Vec::with_capacity(total);
         for item in &work {
@@ -679,13 +615,10 @@ impl GpuTarget {
             })
             .collect();
         let focus_live: Vec<usize> = focus_pairs.iter().map(|&(_, l)| l).collect();
-        // A named focus wins over whole-plan timing. Timing every dispatch
-        // is not the free superset it looks like: a backend without
+        // A named focus wins over whole-plan timing: a backend without
         // `TIMESTAMP_QUERY_INSIDE_PASSES` writes boundary samples only, so
-        // each timed dispatch takes its own compute pass, and a decode step
-        // is 1731 of them — 56 ms of `queue.submit` against 1.7 ms for the
-        // seven passes the same plan encodes untimed. A caller that named
-        // the launches it will read gets those and no others.
+        // each timed dispatch takes its own compute pass. A caller that
+        // named the launches it will read gets those and no others.
         let (query_set, mode) = if focus_pairs.len() == 1 {
             (
                 self.launcher.timestamp_query_set(1),
@@ -847,14 +780,7 @@ impl GpuTarget {
     /// The artifact this launch already carries under `binding`, or `None`
     /// when it has to be built.
     ///
-    /// Split out of [`Self::build_one`] so a resolve can partition its whole
-    /// queue on the cache before spending one compile. The probe is a hash
-    /// lookup; what it costs is nothing next to the lowering and the shader
-    /// compile it decides against.
-    ///
-    /// `binding` is the resolve's, built once and handed down: rebuilding it
-    /// here would cost a fresh `FxHashMap` and two `Arc<Mutex>` per *launch*,
-    /// 1,731 of them a decode token, to fold a grid.
+    /// `binding` is the resolve's, built once and handed down.
     fn cached_artifact(
         &self,
         plan: &Plan,
@@ -871,20 +797,15 @@ impl GpuTarget {
             .filter(|l| l.root == item.root)
             .ok_or_else(|| Error::Plan(format!("no launch roots at {}", item.root)))?;
         let key = keys[item.launch_ix];
-        // The grid fold happens under the lock: `grid_from` is a handful of
-        // divides, and the alternative is cloning the entry's `IndexSpace`
-        // out for every one of the plan's launches.
         let cached = {
             let mut lock = self.artifacts.lock();
             match lock.get_mut(&key) {
                 Some(entry) => match variant_hash(&entry.consulted, binds)
                     .and_then(|vh| entry.variants.get(&vh).cloned())
                 {
-                    // A replayable fold *is* the grid's dependence on the
-                    // binding. The stored grid belongs to the binding that
-                    // built the entry, so whenever a fold was recorded it is
-                    // replayed here rather than reused — the whole point of
-                    // keeping the entry across lengths.
+                    // The stored grid belongs to the binding that built the
+                    // entry, so whenever a fold was recorded it is replayed
+                    // here rather than reused.
                     Some((artifact, grid, ph)) => {
                         let grid = match &entry.grid_space {
                             Some(spec) => crate::lower::grid_from(
@@ -1038,12 +959,10 @@ impl GpuTarget {
             kernels.remove(0)
         };
         let ph = pipeline_hash(&ir);
-        // `verify_l2` is never optional and never a fallback: a failure is
-        // `Error::Lower`. It is, however, a pure function of the body and
-        // the device, and `ph` is that body's exact identity — so a body
-        // already verified on these caps is not verified twice, and the slot
-        // is held across the check so a cohort lowering the same body waits
-        // for the one verify instead of each running its own.
+        // `verify_kernel` is never optional: a failure is `Error::Lower`. A
+        // body already verified on these caps is not verified twice, and the
+        // slot is held across the check so a cohort lowering the same body
+        // waits for the one verify.
         let slot: VerifySlot = {
             let mut lock = self.verified.lock();
             Arc::clone(lock.get_or_insert(ph, VerifySlot::default))
@@ -1051,7 +970,7 @@ impl GpuTarget {
         let mut done = slot.lock();
         if !*done {
             let __tv = Instant::now();
-            fusor2_tile::verify_l2(&ir, self.caps())?;
+            fusor2_tile::verify_kernel(&ir, self.caps())?;
             VERIFY_US.fetch_add(
                 __tv.elapsed().as_micros() as u64,
                 std::sync::atomic::Ordering::Relaxed,
@@ -1063,13 +982,9 @@ impl GpuTarget {
         Ok(Lowered { ir, ph, binding })
     }
 
-    /// The compiled pipeline for one lowered body.
-    ///
-    /// Pipelines are deduplicated on the kernel body: when a sequence length
-    /// only moved the grid, the lowering produced a byte-identical body and
-    /// this is a lookup. The slot is claimed *before* the compile and held
-    /// across it, so a second caller on the same body waits for the first
-    /// instead of putting the same shader through the compiler again.
+    /// The compiled pipeline for one lowered body, deduplicated on the kernel
+    /// body. The slot is claimed before the compile and held across it, so a
+    /// second caller on the same body waits for the first.
     fn try_pipeline_for(&self, ir: &KernelIr, ph: u128) -> Result<Option<Artifact>> {
         if no_pipeline_share() {
             return self.compile_body(ir, ph).map(Some);
@@ -1124,11 +1039,10 @@ impl GpuTarget {
     ) -> Result<[u32; 3]> {
         let Lowered { ir, ph, binding } = lowered;
         let grid = ir.grid;
-        // The grid's dependence on the binding, separated from the body's.
-        // A fold that replays to the grid this lowering finished with is a
-        // formula the cache can evaluate at any later length; anything else
-        // and the grid's symbols stay in the variant key, so a grid nobody
-        // can recompute is never reused under a binding that would move it.
+        // A fold that replays to the grid this lowering finished with can be
+        // evaluated at any later length; otherwise the grid's symbols stay in
+        // the variant key, so a grid nobody can recompute is never reused
+        // under a binding that would move it.
         let grid_space = binding.grid_derivation(grid, &self.caps().limits);
         let consulted = binding.body_consulted(grid_space.is_some());
         let vh = variant_hash(&consulted, binds).ok_or_else(|| {
@@ -1235,8 +1149,8 @@ impl GpuTarget {
             immediate_size: 0,
         });
         // SAFETY: every load this compiler emits is masked or provably in
-        // range and every loop is counted — `verify_l2` establishes both
-        // before emission, which is exactly what licenses the trusted path.
+        // range and every loop is counted — `verify_kernel` establishes both
+        // before emission.
         let module = unsafe {
             device.create_shader_module_trusted(
                 wgpu::ShaderModuleDescriptor {
@@ -1339,8 +1253,8 @@ mod tests {
 
     #[test]
     fn the_cache_dir_is_platform_shaped() {
-        // Not asserting a specific path: only that a home-relative default
-        // exists wherever HOME does, so the disk tier is on by default.
+        // Only asserts that a home-relative default exists wherever HOME
+        // does, so the disk tier is on by default.
         if std::env::var_os("HOME").is_some() || std::env::var_os("XDG_CACHE_HOME").is_some() {
             assert!(default_cache_dir().is_some());
         }

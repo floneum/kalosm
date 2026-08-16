@@ -306,9 +306,9 @@ mod tests {
         }
     }
 
-    /// Test 2: three syms and two uniform scalars produce 20 bytes, dims at
-    /// words 0..3 as LE u32 and scalars at words 3..5 as LE f32, with
-    /// `dim_slot`/`scalar_slot` agreeing with `plan.symbols` order.
+    /// Three syms and two uniform scalars: dims as LE u32 words, then derived
+    /// strides, then scalars as LE f32, with `dim_slot`/`scalar_slot` agreeing
+    /// with `plan.symbols` order.
     #[test]
     fn uniform_block_layout() {
         let (s0, s1, s2) = (SymId(0), SymId(1), SymId(2));
@@ -348,8 +348,7 @@ mod tests {
         assert_eq!(&bytes[24..28], &1024.0f32.to_le_bytes());
     }
 
-    /// The exact 20-byte shape the spec's test names: three syms and two
-    /// scalars with no derived strides in play.
+    /// Three syms and two scalars with no derived strides in play: 20 bytes.
     #[test]
     fn uniform_block_layout_without_derived_strides() {
         let (s0, s1, s2) = (SymId(0), SymId(1), SymId(2));

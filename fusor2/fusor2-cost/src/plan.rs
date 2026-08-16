@@ -12,11 +12,11 @@ use crate::realize::{self, Component, Realized};
 use fusor2_ir::Result;
 use fusor2_ir::cost::DeviceFacts;
 use fusor2_ir::egraph::{EGraph, Id};
-use fusor2_ir::extract::{BindKind, BindingPlan, BufferPlan, Extraction, Launch, Plan, PlanHash};
+use fusor2_ir::extract::{BindKind, BindingPlan, BufferPlan, Extraction, Dispatch, Plan, PlanHash};
 use fusor2_ir::facts::ValueFacts;
 use fusor2_ir::ir::Op;
-use fusor2_ir::ir::level0::{L0, LeafKind};
-use fusor2_ir::ir::level1::{AccessPlan, Effect, IndexSpace, L1, Operand, SchedPoint};
+use fusor2_ir::ir::logical::{Logical, LeafKind};
+use fusor2_ir::ir::launch::{AccessPlan, Effect, IndexSpace, Launch, Operand, SchedPoint};
 use fusor2_ir::scalar::{ScalarExpr, ScalarKind};
 use fusor2_ir::shape::{Dim, Dims, Layout, SymId};
 use rustc_hash::FxHasher;
@@ -43,7 +43,7 @@ pub fn derive_plan(
 
     let mut launches = Vec::with_capacity(realized.components.len());
     for c in &realized.components {
-        launches.push(Launch {
+        launches.push(Dispatch {
             root: c.root,
             members: c.members.iter().copied().collect(),
             bindings: derive_bindings(graph, extraction, realized, c)?,
@@ -165,14 +165,12 @@ pub fn derive_bindings(
 /// (`shape[0] * strides[0]` for these row-major layouts), never from the
 /// shape product, which undercounts a padded buffer.
 ///
-/// **`Sgemm` pads nothing.** Padding exists so a kernel may write a whole
-/// block without a bounds test, and only the cooperative store does that: the
-/// SGEMM body masks every store with `row < batch * m && col < n`. Padding it
-/// anyway was not merely wasteful, it was unsound — this function pads the
-/// output's last *two axes*, which are the `m` and `n` axes only when each
-/// occupies exactly one, and a contraction with `n = 1` (every row reduction
-/// of a product: rms_norm, layer_norm, variance) has none. Its `[rows, cols]`
-/// output was being padded along two batch axes instead.
+/// `Sgemm` pads nothing. Padding exists so a kernel may write a whole block
+/// without a bounds test, and only the cooperative store does that: the SGEMM
+/// body masks every store with `row < batch * m && col < n`. Padding here
+/// acts on the output's last two axes, which are the `m` and `n` axes only
+/// when each occupies exactly one — a contraction with `n = 1` has none, so
+/// padding it would pad batch axes instead.
 pub fn buffer_layout_for(facts: &ValueFacts, theta: Option<SchedPoint>) -> Result<(Layout, Dim)> {
     let shape = &facts.shape;
     let (bm, bn, splits) = match theta {
@@ -307,7 +305,7 @@ pub fn symbols_of(graph: &EGraph, realized: &Realized) -> Vec<SymId> {
 pub fn plan_hash(
     graph: &EGraph,
     extraction: &Extraction,
-    launches: &[Launch],
+    launches: &[Dispatch],
     symbols: &[SymId],
     facts: &DeviceFacts,
 ) -> PlanHash {
@@ -330,12 +328,11 @@ pub fn plan_hash(
                 h.write_u32(member.0);
                 hash_op(h, &sm, &graph.node(*member).op);
                 // Leaf operands are never launch members, so their kind
-                // would otherwise never reach the hash. Their *name* stays
-                // out: buffer identity is deliberately absent from the key,
-                // which is what lets a bufferless template rebind
-                // positionally.
+                // would otherwise never reach the hash. Their name stays out:
+                // buffer identity is absent from the key, which lets a
+                // bufferless template rebind positionally.
                 for child in graph.node(*member).children.iter() {
-                    if let Op::L0(L0::Leaf(kind)) = &graph.node(*child).op {
+                    if let Op::Logical(Logical::Leaf(kind)) = &graph.node(*child).op {
                         hash_leaf_ref(h, &sm, kind);
                     }
                 }
@@ -353,10 +350,6 @@ pub fn plan_hash(
     }
     PlanHash(((lanes[0].finish() as u128) << 64) | lanes[1].finish() as u128)
 }
-
-// ---------------------------------------------------------------------------
-// Symbol-aware structural hashing
-// ---------------------------------------------------------------------------
 
 struct SymMap<'a> {
     symbols: &'a [SymId],
@@ -558,14 +551,14 @@ fn hash_op<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &Op) {
             h.write_u32(a.0);
             h.write_u32(b.0);
         }
-        Op::L0(l0) => hash_l0(h, sm, l0),
-        Op::L1(l1) => hash_l1(h, sm, l1),
+        Op::Logical(l0) => hash_l0(h, sm, l0),
+        Op::Launch(l1) => hash_l1(h, sm, l1),
     }
 }
 
-fn hash_l0<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L0) {
+fn hash_l0<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &Logical) {
     match op {
-        L0::Leaf(k) => match k {
+        Logical::Leaf(k) => match k {
             LeafKind::Buffer { name, dtype, shape } | LeafKind::Param { name, dtype, shape } => {
                 name.hash(h);
                 dtype.hash(h);
@@ -593,14 +586,14 @@ fn hash_l0<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L0) {
                 hash_dims(h, sm, shape);
             }
         },
-        L0::Map { expr, ins, outs } => {
+        Logical::Map { expr, ins, outs } => {
             hash_scalar(h, sm, expr);
             for i in ins {
                 h.write_u32(i.0);
             }
             h.write_u8(*outs);
         }
-        L0::Fold {
+        Logical::Fold {
             carrier,
             axis,
             acc,
@@ -613,7 +606,7 @@ fn hash_l0<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L0) {
                 h.write_u32(i.0);
             }
         }
-        L0::Contract {
+        Logical::Contract {
             spec,
             acc,
             a,
@@ -626,7 +619,7 @@ fn hash_l0<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L0) {
             h.write_u32(b.0);
             h.write_u8(*outs);
         }
-        L0::Restride { specs, bounds, x } => {
+        Logical::Restride { specs, bounds, x } => {
             h.write_usize(specs.len());
             for s in specs {
                 h.write_u32(s.input_dim);
@@ -637,16 +630,16 @@ fn hash_l0<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L0) {
             bounds.hash(h);
             h.write_u32(x.0);
         }
-        L0::Window { specs, x } => {
+        Logical::Window { specs, x } => {
             specs.hash(h);
             h.write_u32(x.0);
         }
-        L0::Gather { axis, x, idx } => {
+        Logical::Gather { axis, x, idx } => {
             h.write_u32(*axis);
             h.write_u32(x.0);
             h.write_u32(idx.0);
         }
-        L0::Scatter {
+        Logical::Scatter {
             axis,
             combine,
             base,
@@ -661,12 +654,12 @@ fn hash_l0<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L0) {
             h.write_u32(upd.0);
             h.write_u8(u8::from(*unique));
         }
-        L0::Dequant { fmt, layout, x } => {
+        Logical::Dequant { fmt, layout, x } => {
             fmt.hash(h);
             layout.hash(h);
             h.write_u32(x.0);
         }
-        L0::Project { slot, x } => {
+        Logical::Project { slot, x } => {
             h.write_u8(*slot);
             h.write_u32(x.0);
         }
@@ -674,8 +667,8 @@ fn hash_l0<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L0) {
 }
 
 /// A carrier enters the plan hash as data: slot shapes, identities, and both
-/// expression vectors. Two folds that differ only in their merge are different
-/// kernels, and nothing about that is derivable from a name any more.
+/// expression vectors. Two folds that differ only in their merge are
+/// different kernels.
 fn hash_carrier<H: Hasher>(h: &mut H, sm: &SymMap<'_>, c: &fusor2_ir::carrier::Carrier) {
     h.write_usize(c.slots.len());
     for s in &c.slots {
@@ -712,16 +705,16 @@ fn collect_carrier(
     }
 }
 
-fn hash_l1<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L1) {
+fn hash_l1<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &Launch) {
     match op {
-        L1::KMap {
+        Launch::Map {
             space, body, ops, ..
         } => {
             hash_space(h, sm, space);
             hash_scalar(h, sm, body);
             hash_operands(h, sm, ops);
         }
-        L1::KFold {
+        Launch::Fold {
             space,
             axis,
             vec_axes,
@@ -743,7 +736,7 @@ fn hash_l1<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L1) {
             }
             hash_operands(h, sm, ops);
         }
-        L1::KContract {
+        Launch::Contract {
             m,
             n,
             k,
@@ -773,7 +766,7 @@ fn hash_l1<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L1) {
                 hash_operand(h, sm, o);
             }
         }
-        L1::KGather {
+        Launch::Gather {
             space,
             axis,
             mode,
@@ -785,7 +778,7 @@ fn hash_l1<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L1) {
             mode.hash(h);
             hash_operands(h, sm, ops);
         }
-        L1::KScatter {
+        Launch::Scatter {
             space,
             axis,
             mode,
@@ -799,7 +792,7 @@ fn hash_l1<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L1) {
             combine.hash(h);
             hash_operands(h, sm, ops);
         }
-        L1::KRegion {
+        Launch::Region {
             members, live_outs, ..
         } => {
             for m in members {
@@ -807,17 +800,13 @@ fn hash_l1<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &L1) {
             }
             live_outs.hash(h);
         }
-        L1::Ext { def, ops, attrs } => {
+        Launch::Ext { def, ops, attrs } => {
             def.hash(h);
             hash_operands(h, sm, ops);
             attrs.hash(h);
         }
     }
 }
-
-// ---------------------------------------------------------------------------
-// Symbol collection
-// ---------------------------------------------------------------------------
 
 fn collect_dims(dims: &[Dim], out: &mut Vec<SymId>) {
     for d in dims {
@@ -866,34 +855,34 @@ fn collect_ops(ops: &[Operand], dims: &mut Vec<SymId>) {
 fn collect_op(op: &Op, dims: &mut Vec<SymId>, scalars: &mut Vec<SymId>) {
     match op {
         Op::Union(..) => {}
-        Op::L0(l0) => match l0 {
-            L0::Leaf(LeafKind::Uniform { sym, .. }) => scalars.push(*sym),
-            L0::Leaf(
+        Op::Logical(l0) => match l0 {
+            Logical::Leaf(LeafKind::Uniform { sym, .. }) => scalars.push(*sym),
+            Logical::Leaf(
                 LeafKind::Buffer { shape, .. }
                 | LeafKind::Param { shape, .. }
                 | LeafKind::Const { shape, .. },
             ) => collect_dims(shape, dims),
-            L0::Leaf(LeafKind::Quantized { shape, .. }) => collect_dims(shape, dims),
-            L0::Map { expr, .. } => collect_scalar(expr, scalars),
-            L0::Fold { carrier, .. } => {
+            Logical::Leaf(LeafKind::Quantized { shape, .. }) => collect_dims(shape, dims),
+            Logical::Map { expr, .. } => collect_scalar(expr, scalars),
+            Logical::Fold { carrier, .. } => {
                 collect_carrier(carrier, dims, scalars);
             }
-            L0::Restride { specs, .. } => {
+            Logical::Restride { specs, .. } => {
                 for s in specs {
                     collect_dims(&[s.size, s.offset], dims);
                 }
             }
             _ => {}
         },
-        Op::L1(l1) => match l1 {
-            L1::KMap {
+        Op::Launch(l1) => match l1 {
+            Launch::Map {
                 space, body, ops, ..
             } => {
                 collect_dims(&space.dims, dims);
                 collect_scalar(body, scalars);
                 collect_ops(ops, dims);
             }
-            L1::KFold {
+            Launch::Fold {
                 space,
                 carrier,
                 post,
@@ -907,7 +896,7 @@ fn collect_op(op: &Op, dims: &mut Vec<SymId>, scalars: &mut Vec<SymId>) {
                 }
                 collect_ops(ops, dims);
             }
-            L1::KContract {
+            Launch::Contract {
                 m,
                 n,
                 k,
@@ -924,12 +913,12 @@ fn collect_op(op: &Op, dims: &mut Vec<SymId>, scalars: &mut Vec<SymId>) {
                 collect_ops(&a.ops, dims);
                 collect_ops(&b.ops, dims);
             }
-            L1::KGather { space, ops, .. } | L1::KScatter { space, ops, .. } => {
+            Launch::Gather { space, ops, .. } | Launch::Scatter { space, ops, .. } => {
                 collect_dims(&space.dims, dims);
                 collect_ops(ops, dims);
             }
-            L1::Ext { ops, .. } => collect_ops(ops, dims),
-            L1::KRegion { .. } => {}
+            Launch::Ext { ops, .. } => collect_ops(ops, dims),
+            Launch::Region { .. } => {}
         },
     }
 }
@@ -939,7 +928,7 @@ mod tests {
     use super::*;
     use crate::realize::testkit::{TestCost, TestPlanner, seed_for};
     use fusor2_ir::dtype::Dtype;
-    use fusor2_ir::ir::level1::CoopGeom;
+    use fusor2_ir::ir::launch::CoopGeom;
 
     fn f32_facts(shape: &[Dim]) -> ValueFacts {
         ValueFacts::new(Dtype::F32, shape.iter().copied())
@@ -1016,9 +1005,7 @@ mod tests {
         assert_eq!(layout.shape()[0], Dim::Const(100));
         assert_eq!(layout.shape()[1], Dim::Const(64));
         assert_eq!(elements, Dim::Const(128 * 64));
-        // The consumer reads a row every `padded_n` elements — exactly, not
-        // "close enough": the reference's stride-equality test is this
-        // invariant, established rather than checked.
+        // The consumer reads a row every `padded_n` elements exactly.
         assert_eq!(layout.strides()[0], Dim::Const(64));
         assert_eq!(layout.strides()[1], Dim::Const(1));
     }
@@ -1044,8 +1031,6 @@ mod tests {
         assert!(l.is_contiguous());
         assert_eq!(l.shape()[0], Dim::Const(100));
     }
-
-    // -- PlanHash ---------------------------------------------------------
 
     /// `leaf[rows, 64] -> map -> map`, with `rows` supplied by the caller.
     fn family_graph(rows: Dim) -> (fusor2_ir::egraph::EGraph, Vec<Id>) {
@@ -1104,8 +1089,8 @@ mod tests {
         use crate::extract::LocalSearch;
         use crate::realize::testkit::{buffer, new_graph, operand, test_caps};
         use fusor2_ir::extract::{ExtractBudget, Extractor};
-        use fusor2_ir::ir::level0::LeafKind;
-        use fusor2_ir::ir::level1::{IndexSpace, L1};
+        use fusor2_ir::ir::logical::LeafKind;
+        use fusor2_ir::ir::launch::{IndexSpace, Launch};
         use fusor2_ir::scalar::{BinOp, ScalarExpr};
 
         // Two graphs differing only in which symbol the runtime scalar is
@@ -1116,7 +1101,7 @@ mod tests {
             let shape = [Dim::Const(1024)];
             let x = buffer(&mut g, 0, &shape);
             let u = g
-                .add(Op::L0(L0::Leaf(LeafKind::Uniform {
+                .add(Op::Logical(Logical::Leaf(LeafKind::Uniform {
                     sym,
                     dtype: Dtype::F32,
                 })))
@@ -1127,7 +1112,7 @@ mod tests {
                 ScalarExpr::uniform(sym, Dtype::F32),
             );
             let m = g
-                .add(Op::L1(L1::KMap {
+                .add(Op::Launch(Launch::Map {
                     space: IndexSpace::new(shape),
                     body,
                     ops: vec![operand(x, &shape), operand(u, &[])],

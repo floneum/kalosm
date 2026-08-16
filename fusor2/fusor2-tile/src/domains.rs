@@ -21,12 +21,12 @@ pub use sgemm::sgemm_domain;
 pub use sgemv::sgemv_domain;
 
 use fusor2_ir::device::Caps;
-use fusor2_ir::ir::level1::{FoldStrat, MapTiling, SgemmParams, SgemvParams};
-use fusor2_ir::ir::level2::ArenaPlanner;
+use fusor2_ir::ir::launch::{FoldStrat, MapTiling, SgemmParams, SgemvParams};
+use fusor2_ir::ir::kernel::ArenaPlanner;
 
 /// Everything a generator reads. `planner` is the *exact* footprint
 /// function — never an estimator, because a geometry admitted here must
-/// pass `verify_l1` unchanged.
+/// pass `verify_launch` unchanged.
 pub struct DomainCtx<'a> {
     pub caps: &'a Caps,
     pub planner: &'a dyn ArenaPlanner,
@@ -38,21 +38,15 @@ impl<'a> DomainCtx<'a> {
     }
 }
 
-/// Hard ceiling on split-K candidates, matching the reference's
-/// `split_candidates` bound. Bounds the candidate count; it is not a
-/// profitability judgement.
+/// Hard ceiling on split-K candidates. Bounds the candidate count; it is not
+/// a profitability judgement.
 pub const MAX_SPLITS: u32 = 64;
 
 /// A process-wide memo for a shape-independent candidate table.
 ///
 /// The heavy generators (`coop::candidate_geoms_for`, `sgemm::sgemm_domain`)
-/// are pure functions of `(Caps, element, planner)` — no extent reaches them,
-/// which is the whole point of carrying a domain instead of a chosen point.
-/// Regenerating them per contraction cost 2.3 ms for coop and 0.33 ms for
-/// sgemm, so a graph with two matmuls could not saturate inside *any*
-/// sensible budget and the driver truncated at a wall-clock-dependent point.
-/// Memoizing makes the enumeration lazy in the only sense that matters:
-/// once per device, not once per node.
+/// are pure functions of `(Caps, element, planner)` — no extent reaches them
+/// — so the enumeration runs once per device, not once per node.
 pub(crate) struct DomainMemo<K, V> {
     slots: std::sync::Mutex<Vec<(K, V)>>,
 }
@@ -90,9 +84,8 @@ pub(crate) fn planner_id(planner: &dyn ArenaPlanner) -> usize {
     std::ptr::from_ref(planner) as *const () as usize
 }
 
-/// Rank of a point no bench has ever visited. Deliberately far from the
-/// measured band and deliberately below 255, so a future seed table can
-/// still order below it.
+/// Rank of a point no bench has ever visited. Far from the measured band and
+/// below 255, so a future seed table can still order below it.
 pub(crate) const UNMEASURED: u8 = 200;
 
 /// Ascending-tuple tiebreak for the sgemm cap.
@@ -122,15 +115,10 @@ pub(crate) fn map_order(t: &MapTiling) -> (u32, u32, u32) {
     (t.dim.map_or(u32::MAX, |d| d), t.tm, t.vector)
 }
 
-// ---------------------------------------------------------------------------
-// The planner the L1 rules reach for when the caller supplies none
-// ---------------------------------------------------------------------------
-
 /// The [`ArenaPlanner`] the rules in [`crate::rules`] reach for: the one
-/// memoized [`crate::Planner`], the same object `verify_l1` admits against
-/// and the L2 emitter lays out with. A geometry this crate admits therefore
-/// passes `verify_l1` unchanged, because both read the same number from the
-/// same function.
+/// memoized [`crate::Planner`], the same object `verify_launch` admits against
+/// and the Kernel emitter lays out with, so a geometry this crate admits
+/// passes `verify_launch` unchanged.
 pub fn default_planner() -> &'static dyn ArenaPlanner {
     crate::Planner::global()
 }

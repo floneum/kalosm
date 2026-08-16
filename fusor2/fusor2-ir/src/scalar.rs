@@ -106,7 +106,7 @@ impl BinOp {
 }
 
 /// The 6 comparisons. Results are 1.0/0.0 in the operand dtype — there is
-/// no boolean dtype at L0.
+/// no boolean dtype at Logical.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CmpOp {
     Lt,
@@ -139,11 +139,10 @@ pub struct ScalarNode {
 /// their cached `structural_hash`, so hashing is O(1) per node.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ScalarKind {
-    /// Operand `i` of the enclosing `Map`/`KMap` body.
+    /// Operand `i` of the enclosing `Map`/`Map` body.
     Arg(u32),
     Lit(Lit),
-    /// A runtime scalar read from the uniform block. Never baked into a
-    /// kernel — this is what deletes the trainer's `[1]`-tensor scalars.
+    /// A runtime scalar read from the uniform block; never baked into a kernel.
     Uniform(SymId),
     /// The current coordinate along `axis` of the enclosing index space.
     IndexOf(u32),

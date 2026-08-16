@@ -2,10 +2,8 @@
 //! report rather than panic.
 //!
 //! Cases return `Err` instead of asserting because the browser conformance
-//! runner cannot recover from a wasm panic, and because a half-built backend
-//! should surface as a named failure rather than aborting the whole matrix.
-//! That is also why [`run_one`] wraps each case in `catch_unwind`: an
-//! unfinished op in a dependency is one red row, not a dead run.
+//! runner cannot recover from a wasm panic. [`run_one`] wraps each case in
+//! `catch_unwind` so a panicking op is one red row, not a dead run.
 
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
@@ -16,12 +14,7 @@ use fusor2::session::Backend;
 use fusor2::{Dim, Dtype, Session};
 use fusor2::tensor::Dyn as Tensor;
 
-// ---------------------------------------------------------------------------
-// Case results and the `ensure!` family
-// ---------------------------------------------------------------------------
-
-/// Error returned by a conformance case. Boxed so a case can return a
-/// comparison mismatch or a free-form message uniformly.
+/// Error returned by a conformance case.
 pub type CaseError = Box<dyn std::error::Error>;
 
 /// Result of a conformance case.
@@ -98,12 +91,8 @@ macro_rules! ensure_ne {
     }};
 }
 
-// ---------------------------------------------------------------------------
-// Cases
-// ---------------------------------------------------------------------------
-
-/// The body of a case. `Fn` rather than `FnOnce` so one case runs on every
-/// session in [`sessions`] without being rebuilt per backend.
+/// The body of a case. `Fn` so one case can run on every session in
+/// [`sessions`].
 pub type CaseFn = Box<dyn Fn(&Session) -> CaseResult + Send + Sync>;
 
 /// One conformance case, named `area::case`.
@@ -183,8 +172,7 @@ impl Cases {
         self.0.iter()
     }
 
-    /// The names, in registration order. The acceptance bar is "every case in
-    /// the named list is present", so this is asserted on directly.
+    /// The names, in registration order.
     pub fn names(&self) -> Vec<&str> {
         self.0.iter().map(|c| c.name.as_str()).collect()
     }
@@ -198,7 +186,7 @@ impl IntoIterator for Cases {
     }
 }
 
-/// Build one case per row of a table. The shape every area file uses.
+/// Build one case per row of a table.
 pub fn cases_from_rows<T: Send + Sync + 'static>(
     area: &'static str,
     rows: impl IntoIterator<Item = (&'static str, T)>,
@@ -210,10 +198,6 @@ pub fn cases_from_rows<T: Send + Sync + 'static>(
     }
     cases
 }
-
-// ---------------------------------------------------------------------------
-// Sessions
-// ---------------------------------------------------------------------------
 
 fn require_gpu() -> bool {
     std::env::var("FUSOR2_CONFORMANCE_REQUIRE_GPU")
@@ -239,12 +223,9 @@ fn acquire_gpu() -> Option<Backend> {
 
 /// Acquire the GPU device; `None` means none is available.
 ///
-/// In the browser the full suite runs hundreds of cases that each ask for a
-/// device, and acquiring a fresh wgpu device per case is prohibitively slow,
-/// so the handle is memoized for the life of the page. Natively the cache is
-/// skipped: a thread-local holding a wgpu `Device` panics when dropped during
-/// thread teardown (wgpu's `Drop` touches already-destroyed thread-locals),
-/// and re-acquiring per run is cheap enough off the web.
+/// The browser memoizes the handle for the life of the page. Natively there
+/// is no cache: a thread-local holding a wgpu `Device` panics when dropped
+/// during thread teardown.
 #[cfg(not(target_arch = "wasm32"))]
 fn cached_gpu() -> Option<Backend> {
     acquire_gpu()
@@ -265,7 +246,7 @@ fn cached_gpu() -> Option<Backend> {
 }
 
 /// Always CPU, plus GPU when one is available. Every case runs on every
-/// session returned here; nothing in the suite mentions a concrete backend.
+/// session returned here.
 pub fn sessions() -> Vec<Session> {
     let mut out = Vec::new();
     if let Ok(cpu) = Backend::cpu()
@@ -294,28 +275,19 @@ pub fn gpu_test_guard() -> MutexGuard<'static, ()> {
     GUARD
         .get_or_init(|| Mutex::new(()))
         .lock()
-        // A previous case that panicked poisoned the mutex; the guard exists
-        // for serialization, not for data integrity, so recover.
+        // The guard exists for serialization, not data integrity, so recover
+        // from poisoning.
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-// ---------------------------------------------------------------------------
-// Deterministic data
-// ---------------------------------------------------------------------------
-
-/// The LCG every golden depends on. Changing a single constant here
-/// invalidates every recorded output hash, which is why it lives in exactly
-/// one place and is never re-derived.
+/// The LCG every golden depends on. Changing a constant here invalidates
+/// every recorded output hash.
 ///
 /// `state = state * 6364136223846793005 + 1442695040888963407`, value
 /// `((state >> 33) as f32 / 2^31) - 0.5`.
 ///
-/// The seed enters the state unmodified. Forcing the low bit (`seed | 1`)
-/// would fold every even seed onto its odd successor, so `fill(4, ..)` and
-/// `fill(5, ..)` would be the same stream — and a case table that draws its
-/// two operands from consecutive seeds would silently be testing `f(x, x)`.
-/// The increment is nonzero, so state 0 is not a fixed point and needs no
-/// special casing.
+/// The seed must enter the state unmodified: masking bits folds distinct
+/// seeds onto the same stream.
 pub fn fill(seed: u32, len: usize) -> Vec<f32> {
     let mut state = seed as u64;
     (0..len)
@@ -346,14 +318,10 @@ pub fn fill_indices(seed: u32, len: usize, modulus: u32) -> Vec<u32> {
         .collect()
 }
 
-// ---------------------------------------------------------------------------
-// Shape fuzzing
-// ---------------------------------------------------------------------------
-
 /// How many times a fuzzed case re-samples its shapes and data. Every run of
 /// one case sees a different size, so an op that is correct only at its
 /// authoring shape fails by the second run. `FUSOR2_CONFORMANCE_RUNS`
-/// overrides, and `1` degenerates to fusor1's single-sample style.
+/// overrides.
 pub fn runs() -> u32 {
     static RUNS: OnceLock<u32> = OnceLock::new();
     *RUNS.get_or_init(|| {
@@ -366,9 +334,8 @@ pub fn runs() -> u32 {
 }
 
 /// The seed a case's run draws everything from: FNV-1a over the case name
-/// plus the run index. Deterministic and distinct per (case, run), so a
-/// failure report naming the case and run reproduces the exact shapes and
-/// data with no state carried between cases.
+/// plus the run index. Deterministic per (case, run), so a failure report
+/// naming the case and run reproduces the exact shapes and data.
 pub fn case_seed(name: &str, run: u32) -> u32 {
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for b in name.bytes().chain(run.to_le_bytes()) {
@@ -380,8 +347,8 @@ pub fn case_seed(name: &str, run: u32) -> u32 {
 }
 
 /// A deterministic RNG over the same LCG as [`fill`], for shape sampling.
-/// Kept separate from the data stream so adding a dimension to a spec does
-/// not shift every operand's values.
+/// Separate from the data stream so adding a dimension to a spec does not
+/// shift every operand's values.
 pub struct Rng {
     state: u64,
 }
@@ -468,8 +435,8 @@ pub fn fuzz_case(
             let seed = case_seed(name, run);
             let shape = sample_shape(&mut Rng::new(seed), spec);
             body(session, &shape, seed).map_err(|e| -> CaseError {
-                // A skip must stay a skip: the marker is a prefix, so the run
-                // context goes after it, not in front of it.
+                // A skip must stay a skip: the run context goes after the
+                // marker, not in front of it.
                 let message = e.to_string();
                 match message.strip_prefix(SKIP_PREFIX) {
                     Some(why) => skip(format!("run {run} at shape {shape:?}: {why}")),
@@ -483,9 +450,8 @@ pub fn fuzz_case(
     })
 }
 
-/// Element count of a fully constant shape. Panics on a symbolic extent: the
-/// host-side references need a concrete length, and a `Dim::Sym` here is a
-/// bug in the case rather than in the compiler.
+/// Element count of a fully constant shape. Panics on a symbolic extent: a
+/// `Dim::Sym` here is a bug in the case.
 pub fn dense_len(shape: &[Dim]) -> usize {
     shape
         .iter()
@@ -496,13 +462,12 @@ pub fn dense_len(shape: &[Dim]) -> usize {
         .product()
 }
 
-/// `Dim::Const` extents from plain integers, which is what every case wants.
+/// `Dim::Const` extents from plain integers.
 pub fn dims(shape: &[u64]) -> Vec<Dim> {
     shape.iter().map(|n| Dim::Const(*n)).collect()
 }
 
-/// Upload f32 host data. `Tensor::from_slice` takes bytes, so this is the one
-/// place the little-endian encoding lives.
+/// Upload f32 host data as little-endian bytes.
 pub fn from_f32(graph: &GraphRef, shape: &[Dim], data: &[f32]) -> fusor2::Result<Tensor> {
     let mut bytes = Vec::with_capacity(data.len() * 4);
     for v in data {
@@ -519,10 +484,6 @@ pub fn from_u32(graph: &GraphRef, shape: &[Dim], data: &[u32]) -> fusor2::Result
     }
     Tensor::from_slice(graph, Dtype::U32, shape, &bytes)
 }
-
-// ---------------------------------------------------------------------------
-// Running
-// ---------------------------------------------------------------------------
 
 /// Outcome of one case on one backend.
 #[derive(Clone, Debug, PartialEq)]
@@ -545,14 +506,8 @@ impl Outcome {
 }
 
 /// The marker a case body puts at the front of its error to say "this device
-/// cannot run this row" rather than "this row is wrong".
-///
-/// A case returns `Result<(), CaseError>` and has no third variant, so the
-/// alternative would be for every capability-gated row to return `Ok(())` on a
-/// device that never ran it — and a skipped f16 matrix would read as a passing
-/// one. Prefixing instead keeps the case signature and lets [`guard`] sort the
-/// two apart, so a run on a device without bf16 reports `skip`, not `ok` and
-/// not `FAILED`.
+/// cannot run this row" rather than "this row is wrong". [`guard`] turns a
+/// prefixed error into [`Outcome::Skipped`].
 pub const SKIP_PREFIX: &str = "skipped: ";
 
 /// Build the `Err` that [`guard`] turns into [`Outcome::Skipped`].
@@ -588,8 +543,7 @@ fn backend_name(session: &Session) -> &'static str {
 /// Run a case body, converting a panic into a failure message and a
 /// [`SKIP_PREFIX`] error into [`Outcome::Skipped`].
 ///
-/// A panic is never a skip, however it is worded: an unfinished op elsewhere
-/// in the workspace must stay one red row.
+/// A panic is never a skip, however it is worded.
 pub fn guard(body: impl FnOnce() -> CaseResult) -> Outcome {
     let hushed = std::panic::take_hook();
     std::panic::set_hook(Box::new(|_| {}));
@@ -702,8 +656,7 @@ impl Harness {
         out
     }
 
-    /// Per-dtype absolute/relative tolerance. Delegates to the one table in
-    /// [`crate::compare::DTYPE_TOL`] so nothing carries a second copy.
+    /// Per-dtype absolute/relative tolerance, from [`crate::compare::DTYPE_TOL`].
     pub fn tolerance(dtype: Dtype) -> (f32, f32) {
         crate::compare::tol_for(dtype)
     }
@@ -728,9 +681,7 @@ pub fn summarize(reports: &[Report]) -> usize {
             }
         }
     }
-    // A skip is reported separately, never folded into the pass count: a
-    // suite that skipped the whole f16 matrix must not read as one that ran
-    // it.
+    // A skip is never folded into the pass count.
     let skipped = reports.iter().filter(|r| r.outcome.is_skipped()).count();
     let passed = reports.iter().filter(|r| r.outcome.is_pass()).count();
     println!(
@@ -746,9 +697,7 @@ mod tests {
 
     #[test]
     fn fill_is_the_exact_reference_generator() {
-        // Hand-evaluated from the documented recurrence: seed 1 forces
-        // state = 1, so the first value is ((s0 >> 33) / 2^31) - 0.5 with
-        // s0 = 1 * 6364136223846793005 + 1442695040888963407.
+        // Hand-evaluated from the documented recurrence at seed 1.
         let s0 = 1u64
             .wrapping_mul(6364136223846793005)
             .wrapping_add(1442695040888963407);
@@ -764,10 +713,9 @@ mod tests {
 
     #[test]
     fn no_two_seeds_share_a_stream() {
-        // The regression this guards: `seed | 1` folded every even seed onto
-        // its odd successor, so `fill(4, ..)` and `fill(5, ..)` were the same
-        // numbers and a case table drawing two operands from consecutive
-        // seeds was silently testing `f(x, x)`.
+        // Regression: `seed | 1` folded every even seed onto its odd
+        // successor, so two operands drawn from consecutive seeds were
+        // silently testing `f(x, x)`.
         let mut streams: Vec<Vec<u32>> = (0..256)
             .map(|seed| fill(seed, 4).iter().map(|v| v.to_bits()).collect())
             .collect();
@@ -779,8 +727,8 @@ mod tests {
 
     #[test]
     fn the_seeds_the_suite_actually_uses_are_distinct() {
-        // Area files draw operands from nearby primes and from adjacent
-        // small integers; both must separate.
+        // Area files draw operands from nearby primes and adjacent small
+        // integers; both must separate.
         for pair in [
             (11u32, 23),
             (307, 311),
@@ -829,8 +777,7 @@ mod tests {
 
     #[test]
     fn guard_turns_a_panic_into_a_named_failure() {
-        // The whole reason `guard` exists: an unfinished op elsewhere in the
-        // workspace must be one red row, not a dead run.
+        // An unfinished op must be one red row, not a dead run.
         let outcome = guard(|| panic!("todo!(\"conv\")"));
         match outcome {
             Outcome::Fail(message) => assert!(message.contains("conv"), "{message}"),
@@ -846,8 +793,8 @@ mod tests {
 
     #[test]
     fn a_skip_is_neither_a_pass_nor_a_failure() {
-        // The whole point: a device that cannot run a row must not report it
-        // as `ok`, and must not report it as broken either.
+        // A device that cannot run a row must not report it as `ok` or as
+        // broken.
         let outcome = guard(|| Err(skip("this adapter has no bf16 support")));
         match &outcome {
             Outcome::Skipped(why) => assert_eq!(why, "this adapter has no bf16 support"),
@@ -860,8 +807,8 @@ mod tests {
 
     #[test]
     fn a_panic_is_never_a_skip_however_it_is_worded() {
-        // An unfinished op must stay one red row even if its message happens
-        // to start with the marker.
+        // A panic must stay a failure even if its message starts with the
+        // marker.
         let outcome = guard(|| panic!("skipped: not yet implemented"));
         assert!(outcome.is_fail(), "{outcome:?}");
     }
@@ -942,8 +889,7 @@ mod tests {
 
     #[test]
     fn a_failing_fuzz_run_names_its_run_and_shape() {
-        // The whole point of deriving everything from (name, run): the report
-        // line alone reproduces the failure.
+        // The report line alone must reproduce the failure.
         let case = fuzz_case("demo", "boom", &[FuzzDim::Range(1, 4)], |_, shape, _| {
             Err(format!("bad at {shape:?}").into())
         });
@@ -962,9 +908,8 @@ mod tests {
 
     #[test]
     fn a_skip_survives_the_fuzz_wrapper() {
-        // A device that cannot run a row must stay a skip when the row is
-        // fuzzed: burying the marker under the run context turned the whole
-        // bf16 matrix into failures.
+        // Regression: burying the marker under the run context turned the
+        // whole bf16 matrix into failures.
         let case = fuzz_case("demo", "no_bf16", &[FuzzDim::Fixed(2)], |_, _, _| {
             Err(skip("this adapter has no bf16 support"))
         });

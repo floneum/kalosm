@@ -8,10 +8,6 @@ use crate::tensor::typed::Element;
 use crate::{Error, Result, Tensor};
 
 /// A `[num_embeddings, embedding_dim]` lookup table.
-///
-/// Generic over the element type, as the reference's `Embedding<T>` is. The
-/// table's rank is fixed at 2 by what an embedding *is*, so it is not a
-/// parameter; the ids' rank is [`Embedding::forward`]'s.
 pub struct Embedding<T: Element = f32> {
     pub table: Tensor<2, T>,
 }
@@ -41,9 +37,9 @@ impl<T: Element> Embedding<T> {
 
     /// `[..ids] -> [..ids, embedding_dim]`, so the output rank is `O = R + 1`.
     ///
-    /// One `L0::Gather` over the flattened index run, reshaped back. There is
-    /// no backward here: `Gather`'s declared adjoint is a `Scatter{Add}`, so a
-    /// token appearing twice accumulates without this layer knowing.
+    /// One `Logical::Gather` over the flattened index run, reshaped back.
+    /// `Gather`'s declared adjoint is a `Scatter{Add}`, so a token appearing
+    /// twice accumulates.
     #[track_caller]
     pub fn forward<const R: usize, const O: usize>(&self, ids: &Tensor<R, u32>) -> Tensor<O, T> {
         if R == 0 {
@@ -79,8 +75,8 @@ mod tests {
         assert_eq!(y.shape(), [2, 2, 3]);
     }
 
-    /// One `Gather`, nothing else: the layer must not mint a second node the
-    /// adjoint would then have to know about.
+    /// The layer must not mint a second node the adjoint would then have to
+    /// know about.
     #[test]
     fn the_forward_is_exactly_the_gather() {
         let g = graph();
@@ -90,8 +86,8 @@ mod tests {
         assert_eq!(by_layer.id(), table.embedding::<2, 3>(&ids).id());
     }
 
-    /// The table's rank is in the type now, so a rank-3 one cannot reach the
-    /// constructor at all — the check moved from `forward` to `try_from_dyn`.
+    /// The table's rank is in the type, so a rank-3 one cannot reach the
+    /// constructor.
     #[test]
     #[should_panic(expected = "value has rank 3")]
     fn a_rank_three_table_is_refused_by_the_type() {

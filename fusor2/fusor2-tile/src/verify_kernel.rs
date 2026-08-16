@@ -1,4 +1,4 @@
-//! `verify_l2` — the L2 verifier.
+//! `verify_kernel` — the Kernel verifier.
 //!
 //! Seven clauses, in order:
 //! 1. **Full expression type-check.** Every node's cached `ty` equals what
@@ -11,8 +11,8 @@
 //! 4. **`cooperative_store_layout_supported` on every `CoopStore`**, plus
 //!    `Addr::Rc2`. The caller's documented recovery is the per-lane store
 //!    fallback: the emitters lower `CoopStore` to a masked per-lane `Store`
-//!    loop when the predicate fails, so `verify_l2` only rejects a `CoopStore`
-//!    node that survived to L2 with an unsupported layout.
+//!    loop when the predicate fails, so `verify_kernel` only rejects a `CoopStore`
+//!    node that survived to Kernel with an unsupported layout.
 //! 5. **Uniformity** — the analysis backing "guaranteed uniform" barriers.
 //! 6. **`verify_arena`** against the planner's `arena_plan`.
 //! 7. **`f16`/`bf16` gated on `caps`**, up front, so an f16 handle on a
@@ -21,7 +21,7 @@
 use fusor2_ir::Result;
 use fusor2_ir::device::Caps;
 use fusor2_ir::error::Error;
-use fusor2_ir::ir::level2::{
+use fusor2_ir::ir::kernel::{
     Accumulator, Addr, ArenaPlanner, CoopMatrixRole, CoopSrc, ElementType, KernelIr, Local,
     LowerError, ScalarElement, Source, Stmt, TileExpr, TileExprKind, TileLiteral,
     cooperative_store_layout_supported,
@@ -37,7 +37,7 @@ fn invalid(msg: impl Into<String>) -> Error {
 }
 
 /// Verify one kernel body against a device.
-pub fn verify_l2(ir: &KernelIr, caps: &Caps) -> Result<()> {
+pub fn verify_kernel(ir: &KernelIr, caps: &Caps) -> Result<()> {
     check_dtype_caps(ir, caps)?;
     check_types(ir)?;
     check_loads(ir, caps)?;
@@ -102,9 +102,9 @@ fn for_each_element(ir: &KernelIr, f: &mut dyn FnMut(ElementType)) {
                 TileExprKind::LoadTile { tile, .. } => f(tile.element),
                 TileExprKind::LoadLocal(local) => f(local.element),
                 TileExprKind::Reduce { kind, .. } => match kind.as_ref() {
-                    fusor2_ir::ir::level2::ReduceKind::Subgroup => {}
-                    fusor2_ir::ir::level2::ReduceKind::Workgroup { scratch, .. }
-                    | fusor2_ir::ir::level2::ReduceKind::Loop { scratch, .. } => f(scratch.element),
+                    fusor2_ir::ir::kernel::ReduceKind::Subgroup => {}
+                    fusor2_ir::ir::kernel::ReduceKind::Workgroup { scratch, .. }
+                    | fusor2_ir::ir::kernel::ReduceKind::Loop { scratch, .. } => f(scratch.element),
                 },
                 TileExprKind::CoopLoad { src, .. } => {
                     if let CoopSrc::TileRegion { tile, .. } = src.as_ref() {
@@ -144,7 +144,7 @@ fn for_each_element(ir: &KernelIr, f: &mut dyn FnMut(ElementType)) {
 // ---------------------------------------------------------------------------
 
 /// Derive the element type of one node from its children's cached types. The
-/// builder uses this to type a node; `verify_l2` re-derives it and compares.
+/// builder uses this to type a node; `verify_kernel` re-derives it and compares.
 pub fn infer_kind(kind: &TileExprKind) -> Result<ElementType> {
     use TileExprKind as K;
     Ok(match kind {
@@ -645,7 +645,7 @@ fn literal_u64(expr: &TileExpr) -> Option<u64> {
 /// natural power-of-two wrap, the very form `emit::expr::mod_literal_u32`
 /// rewrites the remainder into one layer down.
 fn max_value(expr: &TileExpr, env: &BoundEnv) -> Option<u64> {
-    use fusor2_ir::ir::level2::{Builtin, WorkgroupAxis};
+    use fusor2_ir::ir::kernel::{Builtin, WorkgroupAxis};
     use fusor2_ir::scalar::BinOp;
     match expr.kind() {
         TileExprKind::Literal(TileLiteral::U32(v)) => Some(u64::from(*v)),
@@ -817,14 +817,14 @@ pub fn check_reduce_stmts(body: &[Stmt]) -> Result<()> {
 }
 
 fn check_one_reduce(
-    kind: &fusor2_ir::ir::level2::ReduceKind,
+    kind: &fusor2_ir::ir::kernel::ReduceKind,
     values: &[TileExpr],
-    merge: &fusor2_ir::ir::level2::MergeBody,
-    fast: Option<fusor2_ir::ir::level2::TileReduceOp>,
+    merge: &fusor2_ir::ir::kernel::MergeBody,
+    fast: Option<fusor2_ir::ir::kernel::TileReduceOp>,
     outs: &[Local],
-    scratch: &[fusor2_ir::ir::level2::Tile],
+    scratch: &[fusor2_ir::ir::kernel::Tile],
 ) -> Result<()> {
-    use fusor2_ir::ir::level2::ReduceKind;
+    use fusor2_ir::ir::kernel::ReduceKind;
     let n = values.len();
     if n == 0 {
         return Err(invalid("a reduction with no accumulator lanes"));
@@ -931,7 +931,7 @@ fn check_one_reduce(
 /// `merge.body[0] == binary(op.binary(), load(lhs), load(rhs))`, exactly.
 pub fn is_plain_binary(
     body: &TileExpr,
-    op: fusor2_ir::ir::level2::TileReduceOp,
+    op: fusor2_ir::ir::kernel::TileReduceOp,
     lhs: &Local,
     rhs: &Local,
 ) -> bool {
@@ -1160,7 +1160,7 @@ mod tests {
     use crate::build::TileBuilder;
     use crate::build::fixtures::{caps_with, whole_buffer_view, wg_tile};
     use fusor2_ir::dtype::NumericContract;
-    use fusor2_ir::ir::level2::{BufferAccess, MemoryLevel, StorageView, TileLayout};
+    use fusor2_ir::ir::kernel::{BufferAccess, MemoryLevel, StorageView, TileLayout};
     use fusor2_ir::scalar::BinOp;
 
     #[test]
@@ -1172,7 +1172,7 @@ mod tests {
         let stmt = b.store_tile(tile, index, zero);
         b.push(stmt);
         let ir = b.finish([1, 1, 1], 64, "ok");
-        verify_l2(&ir, &caps_with(|_| {})).unwrap();
+        verify_kernel(&ir, &caps_with(|_| {})).unwrap();
     }
 
     #[test]
@@ -1185,7 +1185,7 @@ mod tests {
         let stmt = b.store_local(local, sum);
         b.push(stmt);
         let ir = b.finish([1, 1, 1], 1, "bad");
-        assert!(verify_l2(&ir, &caps_with(|_| {})).is_err());
+        assert!(verify_kernel(&ir, &caps_with(|_| {})).is_err());
     }
 
     #[test]
@@ -1198,7 +1198,7 @@ mod tests {
             BufferAccess::Read,
         );
         let view = whole_buffer_view(&buffer);
-        let lane = b.builtin(fusor2_ir::ir::level2::Builtin::Lane);
+        let lane = b.builtin(fusor2_ir::ir::kernel::Builtin::Lane);
         let mask = b.mask_true();
         let fill = b.lit_f32(0.0);
         let load = b.load(Source::Storage(view), Addr::Linear(lane), mask, fill);
@@ -1208,7 +1208,7 @@ mod tests {
         // The prover now bounds `Lane` by the block size, so the block must
         // exceed the buffer's extent for the load to stay unprovable.
         let ir = b.finish([1, 1, 1], 64, "unmasked");
-        match verify_l2(&ir, &caps_with(|_| {})) {
+        match verify_kernel(&ir, &caps_with(|_| {})) {
             Err(Error::Lower(LowerError::UnmaskedLoad(_))) => {}
             other => panic!("expected UnmaskedLoad, got {other:?}"),
         }
@@ -1232,7 +1232,7 @@ mod tests {
         let stmt = b.store_local(local, load);
         b.push(stmt);
         let ir = b.finish([1, 1, 1], 1, "in-range");
-        verify_l2(&ir, &caps_with(|_| {})).unwrap();
+        verify_kernel(&ir, &caps_with(|_| {})).unwrap();
     }
 
     /// `lane & 31` and `lane % 32` are the same function of `lane`. A
@@ -1250,7 +1250,7 @@ mod tests {
                 BufferAccess::Read,
             );
             let view = whole_buffer_view(&buffer);
-            let lane = b.builtin(fusor2_ir::ir::level2::Builtin::Lane);
+            let lane = b.builtin(fusor2_ir::ir::kernel::Builtin::Lane);
             let k = b.lit_u32(rhs);
             let index = b.binary(op, lane, k, NumericContract::RELAXED);
             let mask = b.mask_true();
@@ -1260,7 +1260,7 @@ mod tests {
             let stmt = b.store_local(local, load);
             b.push(stmt);
             let ir = b.finish([1, 1, 1], 32, "wrap");
-            verify_l2(&ir, &caps_with(|_| {})).unwrap_or_else(|e| panic!("{op:?}: {e:?}"));
+            verify_kernel(&ir, &caps_with(|_| {})).unwrap_or_else(|e| panic!("{op:?}: {e:?}"));
         }
     }
 
@@ -1324,7 +1324,7 @@ mod tests {
 
     /// A rank-2 layout whose first axis needs two sub-axes: not affine, so
     /// the cooperative store predicate must reject it.
-    fn non_affine_rc2(buffer: &fusor2_ir::ir::level2::Buffer) -> StorageView {
+    fn non_affine_rc2(buffer: &fusor2_ir::ir::kernel::Buffer) -> StorageView {
         use fusor2_ir::shape::{AxisGroup, MultiFlattenMap, SubAxis};
         let indexing = MultiFlattenMap {
             groups: smallvec::smallvec![
@@ -1428,11 +1428,11 @@ mod tests {
         let stmt = b.store_tile(tile, index, zero);
         b.push(stmt);
         let ir = b.finish([1, 1, 1], 64, "f16");
-        match verify_l2(&ir, &caps_with(|c| c.f16 = false)) {
+        match verify_kernel(&ir, &caps_with(|c| c.f16 = false)) {
             Err(Error::Legality(_)) => {}
             other => panic!("expected Legality, got {other:?}"),
         }
-        verify_l2(&ir, &caps_with(|c| c.f16 = true)).unwrap();
+        verify_kernel(&ir, &caps_with(|c| c.f16 = true)).unwrap();
     }
 
     #[test]
@@ -1444,8 +1444,8 @@ mod tests {
         let stmt = b.store_tile(tile, index, zero);
         b.push(stmt);
         let ir = b.finish([1, 1, 1], 64, "bf16");
-        assert!(verify_l2(&ir, &caps_with(|c| c.bf16 = false)).is_err());
-        verify_l2(&ir, &caps_with(|c| c.bf16 = true)).unwrap();
+        assert!(verify_kernel(&ir, &caps_with(|c| c.bf16 = false)).is_err());
+        verify_kernel(&ir, &caps_with(|c| c.bf16 = true)).unwrap();
     }
     // -----------------------------------------------------------------------
     // (8) the N-ary reduction
@@ -1461,7 +1461,7 @@ mod tests {
         let mut out = Vec::new();
         let _reads = b
             .reduce_carrier::<String>(
-                fusor2_ir::ir::level2::ReduceKind::Workgroup {
+                fusor2_ir::ir::kernel::ReduceKind::Workgroup {
                     scratch,
                     group_size: 64,
                 },
@@ -1515,7 +1515,7 @@ mod tests {
         let mut out = Vec::new();
         let reads = b
             .reduce_carrier::<String>(
-                fusor2_ir::ir::level2::ReduceKind::Subgroup,
+                fusor2_ir::ir::kernel::ReduceKind::Subgroup,
                 &sum,
                 std::slice::from_ref(&value),
                 &[64],
@@ -1526,8 +1526,8 @@ mod tests {
         assert!(out.is_empty(), "the fast path pushes no statement");
         assert_eq!(reads.len(), 1);
         let direct = b.reduce(
-            fusor2_ir::ir::level2::TileReduceOp::Sum,
-            fusor2_ir::ir::level2::ReduceKind::Subgroup,
+            fusor2_ir::ir::kernel::TileReduceOp::Sum,
+            fusor2_ir::ir::kernel::ReduceKind::Subgroup,
             value,
         );
         assert_eq!(reads[0], direct, "the delegated node must hash-cons together");
@@ -1539,7 +1539,7 @@ mod tests {
         let body = two_lane_reduce(&mut b);
         b.set_body(body);
         let ir = b.finish([1, 1, 1], 64, "two-lane");
-        verify_l2(&ir, &caps_with(|_| {})).unwrap();
+        verify_kernel(&ir, &caps_with(|_| {})).unwrap();
     }
 
     /// **The `accs[0]` bug, unrepresentable.** A node whose lane counts disagree
@@ -1586,7 +1586,7 @@ mod tests {
     #[test]
     fn a_merge_reading_outside_its_formals_is_rejected() {
         let mut b = TileBuilder::new();
-        let lane = b.builtin(fusor2_ir::ir::level2::Builtin::Lane);
+        let lane = b.builtin(fusor2_ir::ir::kernel::Builtin::Lane);
         let lane = b.cast(lane, ScalarElement::F32.element());
         let mut body = two_lane_reduce(&mut b);
         let Stmt::Reduce { merge, .. } = &mut body[0] else {
@@ -1629,7 +1629,7 @@ mod tests {
     /// express.
     #[test]
     fn a_claimed_fast_operator_must_match_the_merge() {
-        use fusor2_ir::ir::level2::TileReduceOp;
+        use fusor2_ir::ir::kernel::TileReduceOp;
         let mut b = TileBuilder::new();
         let mut body = two_lane_reduce(&mut b);
         let Stmt::Reduce { fast, .. } = &mut body[0] else {
@@ -1653,12 +1653,12 @@ mod tests {
         let value = b.lit_f32(1.0);
         let out_local = b.alloc_local(f32e);
         let mk = |fast| Stmt::Reduce {
-            kind: Box::new(fusor2_ir::ir::level2::ReduceKind::Workgroup {
+            kind: Box::new(fusor2_ir::ir::kernel::ReduceKind::Workgroup {
                 scratch: scratch.clone(),
                 group_size: 64,
             }),
             values: smallvec::smallvec![value.clone()],
-            merge: Box::new(fusor2_ir::ir::level2::MergeBody {
+            merge: Box::new(fusor2_ir::ir::kernel::MergeBody {
                 lhs: smallvec::smallvec![lhs.clone()],
                 rhs: smallvec::smallvec![rhs.clone()],
                 body: smallvec::smallvec![merged.clone()],

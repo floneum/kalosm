@@ -3,7 +3,7 @@
 
 use fusor2_ir::device::Caps;
 use fusor2_ir::dtype::Dtype;
-use fusor2_ir::ir::level1::{SgemmDomain, SgemmParams};
+use fusor2_ir::ir::launch::{SgemmDomain, SgemmParams};
 use fusor2_ir::shape::Dim;
 use smallvec::SmallVec;
 
@@ -19,15 +19,9 @@ const T_CHOICES: [u32; 4] = [1, 2, 4, 8];
 /// removes a measured winner.
 pub const MAX_PARAMS: usize = 64;
 
-/// The distinct leaves of the deleted regression tree that this generator's
-/// grid can reach, used **only** to order the local search's move frontier.
-///
-/// Four of the tree's leaves are outside the grid (`bn = 8`, `bm = 8`,
-/// `bm = 48 / tm = 6`) and one (`bk = 4`) is below the smallest generated
-/// depth; the tree also reaches `(true, 16, 64, 64, 2, 2)`, which needs
-/// 40 KiB of staging and is illegal on every device fusor2 targets. None of
-/// them is a seed, because a seed that cannot be generated would order a
-/// frontier that does not contain it.
+/// Measured-winner tilings, used **only** to order the local search's move
+/// frontier. Every seed must be reachable by the generator's grid: a seed
+/// that cannot be generated would order a frontier that does not contain it.
 pub static SEED_LEAVES: &[SgemmParams] = &[
     p(false, 32, 32, 32, 2, 2),
     p(true, 16, 64, 32, 2, 2),
@@ -65,8 +59,8 @@ const fn p(double_buffer: bool, bm: u32, bn: u32, bk: u32, tm: u32, tn: u32) -> 
     }
 }
 
-/// Compatibility entry point kept for the scaffold's `domains::sgemm_legal`
-/// re-export. `m`, `n` and `k` price the domain; they never filter it.
+/// Entry point for the scaffold's `domains::sgemm_legal` re-export.
+/// `m`, `n` and `k` price the domain; they never filter it.
 pub fn legal(m: Dim, n: Dim, k: Dim, dtype: Dtype, caps: &Caps) -> SgemmDomain {
     let _ = (m, n, k);
     let cx = DomainCtx::new(caps, crate::domains::default_planner());
@@ -137,9 +131,7 @@ mod tests {
     }
 
     /// Every emitted tiling passes all four predicates at 4,000 random
-    /// shapes drawn from the reference's own LCG. The domain does not vary
-    /// with shape — that is the point — so this asserts the generator is
-    /// shape-independent as well as legal.
+    /// shapes, and the domain never varies with shape.
     #[test]
     fn generated_params_are_all_legal() {
         let caps = apple_caps();

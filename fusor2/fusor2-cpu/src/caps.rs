@@ -1,5 +1,5 @@
 //! ISA and cache detection. The detected `Level` is cached in a `OnceLock` and
-//! dispatched **once per kernel launch**, not per row.
+//! dispatched once per kernel launch, not per row.
 
 use fusor2_ir::device::{Caps, DeviceKind, Limits, SubgroupWidths};
 use smallvec::smallvec;
@@ -79,19 +79,16 @@ pub fn cpu_caps() -> &'static Caps {
                 max_storage_buffer_binding_size: u64::MAX,
             },
             // A "subgroup" on CPU is one SIMD register, so `Reduce{Subgroup}`
-            // is legal and lowers to a horizontal reduce. Fixed width, which
-            // is what every subgroup-size-aware kernel requires.
+            // is legal and lowers to a horizontal reduce.
             subgroups: Some(SubgroupWidths { min: w, max: w }),
             f16: true,
             bf16: true,
             coop: smallvec![],
             // No f32 atomics: this forces `ScatterMode::SortSegment` and
-            // makes `ScatterMode::Atomic` unreachable at mint time. The nest
-            // both lower to needs no atomic either way.
+            // makes `ScatterMode::Atomic` unreachable at mint time.
             atomic_f32: false,
             // Thread-local scratch aliases freely, so `ArenaMode::ByteArena` is
-            // always available and the arena separation predicate is trivially
-            // true.
+            // always available.
             workgroup_alias: true,
             mixed_precision_coop_store: false,
             pipeline_cache: false,
