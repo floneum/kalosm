@@ -86,12 +86,22 @@ fn layout_elements(binding: &DimBinding, layout: &Layout) -> Result<u64> {
 /// identity. An *unmasked* load through a symbolic view still fails
 /// `verify_l2` loudly, as it must.
 fn decl_elements(layout: &Layout) -> u64 {
-    layout
-        .shape()
-        .iter()
-        .map(|d| d.as_const().unwrap_or(1))
-        .product::<u64>()
-        .max(1)
+    // Padding lives in the strides: the extent of the plan's row-major
+    // layouts is `shape[0] * strides[0]`, and the shape product undercounts
+    // a padded buffer. A non-const stride slot 0 is the `row_major_strides`
+    // placeholder, which implies no padding — the product of the remaining
+    // extents is exactly what it derives to.
+    let (Some(first), Some(stride0)) = (layout.shape().first(), layout.strides().first()) else {
+        return 1;
+    };
+    let outer = first.as_const().unwrap_or(1);
+    let stride0 = stride0.as_const().unwrap_or_else(|| {
+        layout.shape()[1..]
+            .iter()
+            .map(|d| d.as_const().unwrap_or(1))
+            .product()
+    });
+    outer.saturating_mul(stride0).max(1)
 }
 
 // ---------------------------------------------------------------------------
@@ -1859,30 +1869,49 @@ impl<'a> Ctx<'a> {
             offset: 0,
             layout,
         };
+        // The buffer's extent is **not** the shape product: padding lives in
+        // the strides, so a padded plan layout keeps the logical shape and
+        // the shape product undercounts the buffer — `index` is a *storage*
+        // element index (`repad_index` above), and a logical-count bound
+        // masks every padded row past the first to `fill`. For the row-major
+        // layouts the plan emits (offset 0), the extent is
+        // `shape[0] * strides[0]`; a `DERIVED_STRIDE` placeholder implies no
+        // padding (a padded layout with one is refused at plan derivation),
+        // so it resolves as the product of the remaining logical extents.
         let (plan_layout, _) = bound_layout(self.cx, operand.src);
-        let mut all_const: Option<u64> = Some(1);
-        for d in plan_layout.shape() {
-            all_const = match (all_const, d.as_const()) {
-                (Some(a), Some(v)) => Some(a.saturating_mul(v)),
-                _ => None,
-            };
-        }
-        let bound = match all_const {
-            Some(v) => self.b.u32(u32::try_from(v.max(1)).unwrap_or(u32::MAX)),
-            None => {
-                let mut acc: Option<TileExpr> = None;
-                for d in plan_layout.shape().iter().copied() {
-                    if d.known_eq(Dim::Const(1)) {
-                        continue;
+        let bound = match (plan_layout.shape().first(), plan_layout.strides().first()) {
+            (Some(&outer), Some(&stride0)) => {
+                let outer_e = if outer.known_eq(Dim::Const(1)) {
+                    None
+                } else {
+                    Some(self.dim_expr(outer)?)
+                };
+                let stride_e = match stride0 {
+                    Dim::Sym(s) if s == crate::uniforms::DERIVED_STRIDE => {
+                        let mut acc: Option<TileExpr> = None;
+                        for d in plan_layout.shape().iter().skip(1).copied() {
+                            if d.known_eq(Dim::Const(1)) {
+                                continue;
+                            }
+                            let e = self.dim_expr(d)?;
+                            acc = Some(match acc {
+                                Some(a) => self.b.mul(a, e),
+                                None => e,
+                            });
+                        }
+                        acc
                     }
-                    let e = self.dim_expr(d)?;
-                    acc = Some(match acc {
-                        Some(a) => self.b.mul(a, e),
-                        None => e,
-                    });
+                    s if s.known_eq(Dim::Const(1)) || s.known_eq(Dim::Const(0)) => None,
+                    s => Some(self.dim_expr(s)?),
+                };
+                match (outer_e, stride_e) {
+                    (Some(o), Some(s)) => self.b.mul(o, s),
+                    (Some(o), None) => o,
+                    (None, Some(s)) => s,
+                    (None, None) => self.b.u32(1),
                 }
-                acc.unwrap_or_else(|| self.b.u32(1))
             }
+            _ => self.b.u32(1),
         };
         let mask = self.b.compare(TileCompareOp::Lt, index.clone(), bound);
         let fill = self.zero_of(elem);

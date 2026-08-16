@@ -81,10 +81,10 @@ pub fn derive_buffers(
         }
         let facts = graph.facts(*id);
         let theta = extraction.theta.get(id).copied();
-        let layout = buffer_layout_for(facts, theta)?;
+        let (layout, elements) = buffer_layout_for(facts, theta)?;
         out.push(BufferPlan {
             value: *id,
-            elements: layout_elements(&layout),
+            elements,
             layout,
             dtype: facts.dtype,
             persistence: facts.persistence,
@@ -143,14 +143,27 @@ pub fn derive_bindings(
     Ok(out)
 }
 
-/// The padded layout one materialized value needs under one schedule point.
+/// The layout one materialized value needs under one schedule point, plus
+/// the buffer's allocation extent in elements.
 ///
-/// - default: `Layout::contiguous(shape)`;
-/// - `Coop { geom, splits, .. }`: pad `m` to a multiple of `geom.bm` and `n`
-///   to `geom.bn`, row-major strides over the padded shape, and when
-///   `splits > 1` prepend a leading axis of extent `splits` with stride
-///   `padded_m * padded_n` — the split-K scratch slice;
+/// **Padding lives in the strides, never in the shape.** The returned
+/// layout's shape is always the value's logical shape; a `Coop` point pads
+/// `m` to a multiple of `geom.bm` and `n` to `geom.bn` *in the strides*
+/// (row-major over the padded extents). A rank-2 padded matrix loses
+/// `m_pad` from `(shape, strides)` alone, which is why the padded element
+/// count is returned alongside — allocation cannot rederive it.
+///
+/// - default: `Layout::contiguous(shape)`, elements = product(shape);
+/// - `Coop { geom, splits, .. }`: logical shape over padded row-major
+///   strides, and when `splits > 1` a prepended axis of extent `splits`
+///   whose stride is one whole padded output — the split-K scratch slice;
+///   elements = `splits * product(padded)`;
 /// - `Sgemm` / `Sgemv` / `Fold` / `Map` / `Point`: contiguous.
+///
+/// Elements is `Dim::Sym(UNKNOWN_SYM)` when a symbolic extent keeps the
+/// count from being a constant; the runtime then derives it from the layout
+/// (`shape[0] * strides[0]` for these row-major layouts), never from the
+/// shape product, which undercounts a padded buffer.
 ///
 /// **`Sgemm` pads nothing.** Padding exists so a kernel may write a whole
 /// block without a bounds test, and only the cooperative store does that: the
@@ -160,14 +173,20 @@ pub fn derive_bindings(
 /// occupies exactly one, and a contraction with `n = 1` (every row reduction
 /// of a product: rms_norm, layer_norm, variance) has none. Its `[rows, cols]`
 /// output was being padded along two batch axes instead.
-pub fn buffer_layout_for(facts: &ValueFacts, theta: Option<SchedPoint>) -> Result<Layout> {
+pub fn buffer_layout_for(facts: &ValueFacts, theta: Option<SchedPoint>) -> Result<(Layout, Dim)> {
     let shape = &facts.shape;
     let (bm, bn, splits) = match theta {
         Some(SchedPoint::Coop { geom, splits, .. }) => (geom.bm, geom.bn, splits),
-        _ => return Ok(Layout::contiguous(shape)),
+        _ => {
+            let l = Layout::contiguous(shape);
+            let e = layout_elements(shape);
+            return Ok((l, e));
+        }
     };
     if shape.len() < 2 {
-        return Ok(Layout::contiguous(shape));
+        let l = Layout::contiguous(shape);
+        let e = layout_elements(shape);
+        return Ok((l, e));
     }
 
     let mut padded: Dims = shape.clone();
@@ -175,8 +194,40 @@ pub fn buffer_layout_for(facts: &ValueFacts, theta: Option<SchedPoint>) -> Resul
     padded[last - 1] = pad_to(padded[last - 1], bm);
     padded[last] = pad_to(padded[last], bn);
 
+    let strides = Layout::row_major_strides(&padded);
+    // A `row_major_strides` placeholder is resolved at dispatch from the
+    // *shape* — which is now logical — so a placeholder in a padded stride
+    // set would silently resolve to the unpadded product. That combination
+    // (a symbolic batch axis to the right of another batch axis, under a
+    // padding point) cannot be stated under this convention; fail loudly
+    // rather than under-address.
+    if padded != *shape
+        && strides
+            .iter()
+            .any(|s| matches!(s, Dim::Sym(x) if *x == UNKNOWN_SYM))
+    {
+        return Err(fusor2_ir::Error::Plan(format!(
+            "a padded layout over {shape:?} needs a derived stride, which would \
+             resolve from the logical shape and lose the padding"
+        )));
+    }
+    let padded_elements = {
+        let mut acc: Option<u64> = Some(u64::from(splits.max(1)));
+        for d in &padded {
+            acc = match (acc, d.as_const()) {
+                (Some(a), Some(v)) => Some(a.saturating_mul(v)),
+                _ => None,
+            };
+        }
+        match acc {
+            Some(v) => Dim::Const(v),
+            None => Dim::Sym(UNKNOWN_SYM),
+        }
+    };
+
     if splits <= 1 {
-        return Ok(Layout::contiguous(&padded));
+        let l = Layout::from_parts(Dim::Const(0), shape, &strides)?;
+        return Ok((l, padded_elements));
     }
 
     // Split-K scratch: one whole padded output per partial, so the combine
@@ -188,7 +239,6 @@ pub fn buffer_layout_for(facts: &ValueFacts, theta: Option<SchedPoint>) -> Resul
     // would not do: with any leading batch axis,
     // partial `s` would begin inside partial `s-1` and every batch past the
     // first would alias.
-    let strides = Layout::row_major_strides(&padded);
     let slice = match (
         strides.first().and_then(|s| s.as_const()),
         padded.first().and_then(|d| d.as_const()),
@@ -197,10 +247,11 @@ pub fn buffer_layout_for(facts: &ValueFacts, theta: Option<SchedPoint>) -> Resul
         _ => Dim::Sym(UNKNOWN_SYM),
     };
     let mut shape_out: Dims = smallvec::smallvec![Dim::Const(splits as u64)];
-    shape_out.extend(padded.iter().copied());
+    shape_out.extend(shape.iter().copied());
     let mut strides_out: SmallVec<[Dim; 6]> = smallvec::smallvec![slice];
     strides_out.extend(strides.iter().copied());
-    Layout::from_parts(Dim::Const(0), &shape_out, &strides_out)
+    let l = Layout::from_parts(Dim::Const(0), &shape_out, &strides_out)?;
+    Ok((l, padded_elements))
 }
 
 const fn pad_to(d: Dim, multiple: u32) -> Dim {
@@ -210,9 +261,9 @@ const fn pad_to(d: Dim, multiple: u32) -> Dim {
     }
 }
 
-fn layout_elements(layout: &Layout) -> Dim {
+fn layout_elements(shape: &[Dim]) -> Dim {
     let mut acc: u64 = 1;
-    for d in layout.shape() {
+    for d in shape {
         match d.as_const() {
             Some(v) => acc = acc.saturating_mul(v),
             None => return Dim::Sym(UNKNOWN_SYM),
@@ -914,9 +965,9 @@ mod tests {
             splits: 4,
             staging: 2,
         };
-        let layout = buffer_layout_for(&facts, Some(theta)).unwrap();
+        let (layout, elements) = buffer_layout_for(&facts, Some(theta)).unwrap();
         assert_eq!(layout.rank(), 3);
-        assert_eq!(layout_elements(&layout), Dim::Const(4 * 512 * 512));
+        assert_eq!(elements, Dim::Const(4 * 512 * 512));
         assert_eq!(layout.strides()[0], Dim::Const(512 * 512));
         assert_eq!(layout.shape()[0], Dim::Const(4));
     }
@@ -935,11 +986,11 @@ mod tests {
             splits: 4,
             staging: 2,
         };
-        let layout = buffer_layout_for(&facts, Some(theta)).unwrap();
+        let (layout, elements) = buffer_layout_for(&facts, Some(theta)).unwrap();
         assert_eq!(layout.rank(), 4);
         assert_eq!(layout.shape()[0], Dim::Const(4));
         assert_eq!(layout.strides()[0], Dim::Const(3 * 512 * 512));
-        assert_eq!(layout_elements(&layout), Dim::Const(4 * 3 * 512 * 512));
+        assert_eq!(elements, Dim::Const(4 * 3 * 512 * 512));
         // ...and the partials do not overlap: slice `s` ends where `s+1`
         // begins.
         let Dim::Const(slice) = layout.strides()[0] else {
@@ -960,9 +1011,11 @@ mod tests {
             splits: 1,
             staging: 1,
         };
-        let layout = buffer_layout_for(&facts, Some(theta)).unwrap();
-        assert_eq!(layout.shape()[0], Dim::Const(128));
+        let (layout, elements) = buffer_layout_for(&facts, Some(theta)).unwrap();
+        // Padding lives in the strides, never in the shape.
+        assert_eq!(layout.shape()[0], Dim::Const(100));
         assert_eq!(layout.shape()[1], Dim::Const(64));
+        assert_eq!(elements, Dim::Const(128 * 64));
         // The consumer reads a row every `padded_n` elements — exactly, not
         // "close enough": the reference's stride-equality test is this
         // invariant, established rather than checked.
@@ -979,15 +1032,15 @@ mod tests {
             splits: 1,
             staging: 1,
         };
-        let layout = buffer_layout_for(&facts, Some(theta)).unwrap();
+        let (layout, elements) = buffer_layout_for(&facts, Some(theta)).unwrap();
         assert_eq!(layout.shape()[0], Dim::Sym(s));
-        assert_eq!(layout_elements(&layout), Dim::Sym(UNKNOWN_SYM));
+        assert_eq!(elements, Dim::Sym(UNKNOWN_SYM));
     }
 
     #[test]
     fn contiguous_when_the_point_needs_no_padding() {
         let facts = f32_facts(&[Dim::Const(100), Dim::Const(37)]);
-        let l = buffer_layout_for(&facts, Some(SchedPoint::Point)).unwrap();
+        let (l, _) = buffer_layout_for(&facts, Some(SchedPoint::Point)).unwrap();
         assert!(l.is_contiguous());
         assert_eq!(l.shape()[0], Dim::Const(100));
     }

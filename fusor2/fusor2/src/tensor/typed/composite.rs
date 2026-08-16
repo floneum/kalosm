@@ -361,12 +361,18 @@ impl<const R: usize, T: Element> Tensor<R, T> {
 }
 
 impl<T: Element> Tensor<4, T> {
-    /// Nearest-neighbour upsample of a `[B, C, H, W]` value.
+    /// Nearest-neighbour upsample of a `[B, C, H, W]` value. `usize` scales,
+    /// as the reference spelled them; the lowering's `u32` is an internal
+    /// detail a caller should not have to cast for.
     #[track_caller]
-    pub fn upsample_nearest2d(&self, scale_h: u32, scale_w: u32) -> Self {
+    pub fn upsample_nearest2d(&self, scale_h: usize, scale_w: usize) -> Self {
+        let (h, w) = (
+            u32::try_from(scale_h).expect("upsample scale fits u32"),
+            u32::try_from(scale_w).expect("upsample scale fits u32"),
+        );
         Self::wrap(
             "upsample_nearest2d",
-            upsample::upsample_nearest2d(self.as_dyn(), scale_h, scale_w),
+            upsample::upsample_nearest2d(self.as_dyn(), h, w),
         )
     }
 

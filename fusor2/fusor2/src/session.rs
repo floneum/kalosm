@@ -632,9 +632,19 @@ impl Session {
         // is dropping it. The old filter did exactly that on any rank
         // mismatch, and a dense read of a padded buffer returns the top-left
         // corner plus padding zeros as if they were the value.
+        // Padding lives in the strides, never in the shape: a padded buffer
+        // is detected by its strides departing from the row-major set (or a
+        // nonzero offset), not by its shape — the plan layout's shape *is*
+        // the logical shape. A shape mismatch still routes here: the reader
+        // may be a reshaped spelling of the selected member.
         let padded = graph
             .device_layout(id)
-            .filter(|l| l.shape() != &facts.shape[..])
+            .filter(|l| {
+                l.shape() != &facts.shape[..]
+                    || !l.offset().known_eq(fusor2_ir::shape::Dim::Const(0))
+                    || l.strides()
+                        != &fusor2_ir::shape::Layout::row_major_strides(l.shape())[..]
+            })
             .map(|l| {
                 restate_layout(&l, &facts.shape, graph).ok_or_else(|| {
                     Error::Plan(format!(
@@ -1250,9 +1260,40 @@ impl Session {
                     // identical on the CPU target.
                     let verdict = if !ok {
                         WRONG_MEMBERS.fetch_add(1, Ordering::Relaxed);
+                        let detail = reference
+                            .bytes
+                            .iter()
+                            .zip(&sample.bytes)
+                            .enumerate()
+                            .find_map(|(o, ((dt, a), (_, b)))| {
+                                (*dt == Dtype::F32)
+                                    .then(|| first_mismatch(a, b).map(|m| (o, m)))
+                                    .flatten()
+                            });
+                        let detail = detail.map_or_else(String::new, |(o, (i, p, q, w))| {
+                            format!(" (out {o} elem {i}: incumbent {p} vs {q}, worst |d| {w})")
+                        });
+                        // A tiny output is worth printing whole: the zero/wrong
+                        // *pattern* (a column, a row tail, a stripe) names the
+                        // bug faster than any single element.
+                        if let Some(((_, a), (_, b))) =
+                            reference.bytes.first().zip(sample.bytes.first())
+                            && a.len() <= 128
+                            && a.len() % 4 == 0
+                        {
+                            let f = |s: &[u8]| {
+                                s.chunks_exact(4)
+                                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                    .map(|v| format!("{v:.3}"))
+                                    .collect::<Vec<_>>()
+                                    .join(" ")
+                            };
+                            eprintln!("[tune]   incumbent: {}", f(a));
+                            eprintln!("[tune]   candidate: {}", f(b));
+                        }
                         eprintln!(
                             "[tune] MISCOMPILE: candidate `{label}` of launch {ix} computes \
-                             different values from the incumbent plan"
+                             different values from the incumbent plan{detail}"
                         );
                         // Two members of one e-class disagreeing on bytes is
                         // a violated compiler invariant, full stop. In
@@ -1764,6 +1805,30 @@ impl Drop for TuningClock<'_> {
 
 /// Byte-identical, or — for f32 — within 1e-3 relative magnitude. NaN fails
 /// the comparison and is therefore rejected.
+/// The first disagreeing f32 element and the worst one, for the MISCOMPILE
+/// report: `(first_index, expected, got, worst_abs_diff)`. A miscompile
+/// message that names an element turns "run the sweep again with a debugger"
+/// into "read the line".
+fn first_mismatch(a: &[u8], b: &[u8]) -> Option<(usize, f32, f32, f32)> {
+    let f = |s: &[u8]| {
+        s.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect::<Vec<f32>>()
+    };
+    let (x, y) = (f(a), f(b));
+    let scale = x.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+    let mut first = None;
+    let mut worst = 0.0f32;
+    for (i, (p, q)) in x.iter().zip(&y).enumerate() {
+        let d = (p - q).abs();
+        if d > 1e-3 * scale && first.is_none() {
+            first = Some((i, *p, *q));
+        }
+        worst = worst.max(d);
+    }
+    first.map(|(i, p, q)| (i, p, q, worst))
+}
+
 fn agrees(dtype: Dtype, a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -1896,11 +1961,30 @@ fn restate_layout(
         //
         // Shortest run first; the longer runs are only reached
         // once the singleton reading has failed the remainder.
+        //
+        // A padded axis holds exactly **one** logical axis, so the run may
+        // contain at most one non-unit reader dim: whisper's `[1, 1500]` over
+        // a padded 1504 is one real axis behind a unit batch, and is real
+        // data — but `[1, 3, 4]` over a padded 16 nests a second real axis
+        // *inside* the padded one at its element stride, and elements 4..11
+        // of that reading are the padding between the logical extent and the
+        // block edge, returned as data. That parse also races the correct one
+        // (`[1, 1, 3]` on the padded m axis, `[4]` on n) in this backtracker,
+        // and whichever is tried first wins — which is how a coop-padded
+        // `[16, 16]` attention output read back as `[1, 1, 3, 4]` produced
+        // row 0 followed by zeros.
         let mut prod = 1u64;
+        let mut non_unit = 0usize;
         for take in 1..=r_ext.len() {
             prod = prod.saturating_mul(r_ext[take - 1]);
             if prod > ext {
                 break;
+            }
+            if r_ext[take - 1] != 1 {
+                non_unit += 1;
+                if non_unit > 1 {
+                    break;
+                }
             }
             let mark = strides.len();
             let mut inner = stride;
@@ -1921,6 +2005,13 @@ fn restate_layout(
     let mut strides: Vec<u64> = Vec::with_capacity(r_ext.len());
     if !assign(&l_ext, &l_str, &r_ext, &mut strides) {
         return None;
+    }
+    // `FUSOR2_RESTATE_LOG` prints every non-trivial restatement: the padded
+    // parse is ambiguous in principle (only the producer knows its logical
+    // extents), so when a wrong read is suspected this is the record that
+    // shows which parse won.
+    if std::env::var_os("FUSOR2_RESTATE_LOG").is_some() {
+        eprintln!("[restate] layout={l_ext:?}/{l_str:?} reader={r_ext:?} -> strides={strides:?}");
     }
     fusor2_ir::shape::Layout::from_parts(
         layout.offset(),
@@ -1974,7 +2065,18 @@ fn resolve_buffer_elements(
     graph: &GraphRef,
 ) -> Result<u64> {
     match elements {
-        Dim::Sym(s) if s == DERIVED_STRIDE => resolve_elements(layout.shape(), graph),
+        Dim::Sym(s) if s == DERIVED_STRIDE => {
+            // Padding lives in the strides: for the plan's row-major layouts
+            // the buffer extent is `shape[0] * strides[0]`, never the shape
+            // product, which undercounts a padded buffer.
+            let Some(first) = layout.shape().first() else {
+                return Ok(1);
+            };
+            let strides = resolve_strides(layout, graph)?;
+            Ok(resolve_dim(*first, graph)?
+                .saturating_mul(strides[0])
+                .max(1))
+        }
         d => resolve_dim(d, graph),
     }
 }

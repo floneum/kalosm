@@ -17,6 +17,22 @@ use crate::tensor::readback::TensorSlice;
 use crate::tensor::typed::{Axis, Element, Tensor, dims_of};
 use crate::Result;
 
+/// A padding argument for [`Tensor::pad_axis`]: `usize` pads both sides
+/// equally, `(left, right)` pads each independently.
+pub trait PadWidths {
+    fn widths(self) -> (usize, usize);
+}
+impl PadWidths for usize {
+    fn widths(self) -> (usize, usize) {
+        (self, self)
+    }
+}
+impl PadWidths for (usize, usize) {
+    fn widths(self) -> (usize, usize) {
+        self
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Views
 // ---------------------------------------------------------------------------
@@ -100,10 +116,14 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         Self::wrap("resize_dims", self.as_dyn().resize(&new_shape))
     }
 
-    /// Zero-pad one axis by `(left, right)`.
+    /// Zero-pad one axis: a bare `usize` pads both sides (the reference's
+    /// spelling), a `(left, right)` pair pads each independently.
     #[track_caller]
-    pub fn pad_axis(&self, axis: impl Axis<R>, padding: (usize, usize)) -> Self {
-        Self::wrap("pad_axis", self.as_dyn().pad_axis(axis.resolve(), padding))
+    pub fn pad_axis(&self, axis: impl Axis<R>, padding: impl PadWidths) -> Self {
+        Self::wrap(
+            "pad_axis",
+            self.as_dyn().pad_axis(axis.resolve(), padding.widths()),
+        )
     }
 
     /// [`Tensor::pad_axis`] with the two sides spelled out explicitly.

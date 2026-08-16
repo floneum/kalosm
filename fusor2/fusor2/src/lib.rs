@@ -66,6 +66,20 @@ mod trainer_surface;
 
 pub use device::Device;
 pub use tensor::typed::{Axis, Element, Minus1, Minus2, Tensor, cat, stack};
+/// The reference's axis-selector spelling: `t.sum::<2>(D::Minus1)`. Same
+/// items as the root `Minus1`/`Minus2`; kept so an axis argument written
+/// against the old API compiles unchanged.
+///
+/// The reference also named the selector *trait* `Dim`; here that name is the
+/// extent enum, and [`Axis`] is the trait. Old generic bounds port with one
+/// line: `use fusor2::Axis as Dim;`.
+#[allow(non_snake_case)]
+pub mod D {
+    pub use crate::tensor::typed::{Minus1, Minus2};
+}
+/// The reference's name for [`tensor::typed::Element`], kept at the root it
+/// had there.
+pub use tensor::typed::SimdElement;
 
 pub use graph::Graph;
 pub use quantized::QMatrix;
@@ -77,3 +91,9 @@ pub use fusor2_gguf::{ShardedVarBuilder, VarBuilder};
 pub use fusor2_ir::dtype::Dtype;
 pub use fusor2_ir::shape::Dim;
 pub use fusor2_ir::{Error, Result};
+
+// Reference-spelling re-exports: names the old API had at its root, pointing
+// at the same items they resolve to today. Paths only — no second
+// implementation exists behind any of these.
+pub use cache::{MaskKind, RopeCache};
+pub use composite::rope::base_inverse_frequency;

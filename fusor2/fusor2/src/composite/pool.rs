@@ -27,8 +27,14 @@ pub struct PoolSize {
 }
 
 impl PoolSize {
-    pub const fn new(size: u32, stride: u32) -> Self {
-        Self { size, stride }
+    /// `usize` arguments, as the reference spelled them; the `u32` fields are
+    /// an internal detail.
+    pub const fn new(size: usize, stride: usize) -> Self {
+        assert!(size <= u32::MAX as usize && stride <= u32::MAX as usize);
+        Self {
+            size: size as u32,
+            stride: stride as u32,
+        }
     }
 
     pub const fn is_non_overlapping(self) -> bool {
@@ -38,25 +44,25 @@ impl PoolSize {
 
 impl From<usize> for PoolSize {
     fn from(size: usize) -> Self {
-        Self::new(size as u32, size as u32)
+        Self::new(size, size)
     }
 }
 
 impl From<u32> for PoolSize {
     fn from(size: u32) -> Self {
-        Self::new(size, size)
+        Self::new(size as usize, size as usize)
     }
 }
 
 impl From<(usize, usize)> for PoolSize {
     fn from((size, stride): (usize, usize)) -> Self {
-        Self::new(size as u32, stride as u32)
+        Self::new(size, stride)
     }
 }
 
 impl From<[usize; 2]> for PoolSize {
     fn from([size, stride]: [usize; 2]) -> Self {
-        Self::new(size as u32, stride as u32)
+        Self::new(size, stride)
     }
 }
 

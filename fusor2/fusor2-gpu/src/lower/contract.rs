@@ -251,28 +251,56 @@ pub fn lower_coop(
     // The output. `plan::buffer_layout_for` pads `m` to `bm` and `n` to `bn` at
     // exactly this schedule point *so that* a whole-block cooperative store
     // needs no per-element mask — the store is subgroup-collective and cannot
-    // take one. If the plan did not deliver that padding the block store would
-    // run off the buffer, so it is checked here rather than assumed.
+    // take one. **Padding lives in the strides, never in the shape**: the plan
+    // layout keeps the value's logical shape and carries row-major strides
+    // over the padded extents. If the plan did not deliver that padding the
+    // block store would run off the buffer, so the strides are verified here
+    // rather than assumed: offset 0, and walking axes right to left, `n`
+    // strides 1, `m` strides `n_padded`, and every batch axis strides whole
+    // padded `m_padded * n_padded` blocks.
     let out = ctx.output()?;
     let out_layout = ctx.plan_layout(out)?.clone();
-    let split_at = out_layout.rank().saturating_sub(1).max(1);
-    let mv = crate::lower::flatten_matrix_layout_split(&out_layout, split_at, &ctx.binding)?;
     let tiles_m = shape.m.max(1).div_ceil(geom.bm.max(1)).max(1);
     let tiles_n = shape.n.max(1).div_ceil(geom.bn.max(1)).max(1);
     let m_padded = tiles_m.saturating_mul(geom.bm);
     let n_padded = tiles_n.saturating_mul(geom.bn);
-    let want_rows = shape.batch.saturating_mul(m_padded).max(1);
-    if mv.rows != want_rows || mv.cols != n_padded {
+    let rank = out_layout.rank();
+    if rank < 2 || !out_layout.offset().known_eq(Dim::Const(0)) {
         return Err(Error::Plan(format!(
-            "coop needs its output padded to whole {}x{} blocks: the plan laid out \
-             {} x {} where {want_rows} x {n_padded} was required",
-            geom.bm, geom.bn, mv.rows, mv.cols
+            "coop needs a rank >= 2, offset-0 output layout; the plan laid out \
+             rank {rank} at offset {}",
+            out_layout.offset()
         )));
     }
+    let mut expected = 1u64;
+    for axis in (0..rank).rev() {
+        let got = ctx.binding.require(out_layout.strides()[axis])?;
+        if got != expected {
+            return Err(Error::Plan(format!(
+                "coop needs its output padded to whole {}x{} blocks in the strides: \
+                 axis {axis} strides {got} where {expected} was required",
+                geom.bm, geom.bn
+            )));
+        }
+        // The next axis out strides one whole run of this one: its padded
+        // extent for `n` and `m`, its logical extent for the batch axes,
+        // which are never padded.
+        expected = expected.saturating_mul(if axis == rank - 1 {
+            u64::from(n_padded.max(1))
+        } else if axis == rank - 2 {
+            u64::from(m_padded.max(1))
+        } else {
+            ctx.binding.require(out_layout.shape()[axis])?.max(1)
+        });
+    }
+    let want_rows = shape.batch.saturating_mul(m_padded).max(1);
     let out_view = StorageView {
         buffer: ctx.buffer(out)?,
-        offset: mv.offset,
-        layout: mv.layout,
+        offset: 0,
+        layout: fusor2_ir::ir::level2::TileLayout::contiguous(
+            fusor2_ir::ir::level2::MemoryLevel::Storage,
+            &[want_rows, n_padded],
+        ),
     };
     let out_elem = out_view.buffer.element;
 
@@ -2162,9 +2190,9 @@ mod tests {
         // The padded output layout is the extractor's, read from the same
         // function the planner uses — the kernel's whole-block store depends
         // on it and checks it.
-        let layout = fusor2_cost::plan::buffer_layout_for(g.facts(out), Some(theta))
+        let (layout, elements) = fusor2_cost::plan::buffer_layout_for(g.facts(out), Some(theta))
             .expect("padded output layout");
-        let elements: u64 = layout.shape().iter().map(|d| d.as_const().unwrap_or(1)).product();
+        let elements: u64 = elements.as_const().expect("const shapes give a const extent");
         let plan = Plan {
             extraction: Extraction::default(),
             launches: vec![Launch {

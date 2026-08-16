@@ -451,13 +451,31 @@ impl GpuTarget {
                 continue;
             }
             // `BufferPlan::elements` is the derived placeholder whenever any
-            // extent is symbolic; the layout's shape is the authority then.
+            // extent is symbolic; the layout is the authority then. Padding
+            // lives in the strides, so the extent of the plan's row-major
+            // layouts is `shape[0] * strides[0]` — never the shape product,
+            // which undercounts a padded buffer. A `DERIVED_STRIDE` in slot 0
+            // implies no padding (plan derivation refuses the combination),
+            // so it resolves as the product of the remaining extents.
             let elements = match buffer.elements {
-                d if d == fusor2_ir::shape::Dim::Sym(crate::uniforms::DERIVED_STRIDE) => buffer
-                    .layout
-                    .shape()
-                    .iter()
-                    .try_fold(1u64, |acc, d| Some(acc.saturating_mul(binds.dim(*d)?))),
+                d if d == fusor2_ir::shape::Dim::Sym(crate::uniforms::DERIVED_STRIDE) => {
+                    match (buffer.layout.shape().first(), buffer.layout.strides().first()) {
+                        (Some(first), Some(stride0)) => {
+                            let stride0 = match stride0 {
+                                fusor2_ir::shape::Dim::Sym(s)
+                                    if *s == crate::uniforms::DERIVED_STRIDE =>
+                                {
+                                    buffer.layout.shape()[1..].iter().try_fold(1u64, |acc, d| {
+                                        Some(acc.saturating_mul(binds.dim(*d)?))
+                                    })
+                                }
+                                d => binds.dim(*d),
+                            };
+                            stride0.and_then(|s| Some(binds.dim(*first)?.saturating_mul(s)))
+                        }
+                        _ => Some(1),
+                    }
+                }
                 d => binds.dim(d),
             }
             .ok_or_else(|| {

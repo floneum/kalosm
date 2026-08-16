@@ -24,7 +24,7 @@
 //! arithmetic, narrow types.
 
 use std::marker::PhantomData;
-use std::ops::{Add, Div, Mul, Neg, Range, Sub};
+use std::ops::{Add, Div, Mul, Neg, Range, Rem, Sub};
 
 use fusor2_ir::dtype::{Dtype, RoundMode, Splat};
 use fusor2_ir::egraph::Id;
@@ -532,7 +532,7 @@ macro_rules! same_bin {
 }
 
 same_bin!(
-    add, sub, mul, div, pow, maximum, minimum, eq_tensor, ne_tensor, lt_tensor, lte_tensor,
+    add, sub, mul, div, rem, pow, maximum, minimum, eq_tensor, ne_tensor, lt_tensor, lte_tensor,
     gt_tensor, gte_tensor,
 );
 
@@ -556,6 +556,7 @@ same_scalar!(
     mul_scalar,
     div_scalar,
     rdiv_scalar,
+    rem_scalar,
     pow_scalar,
     max_scalar,
     min_scalar,
@@ -778,6 +779,12 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     pub fn matmul_t(&self, rhs: &Self) -> Self {
         Self::wrap("matmul_t", narrow_acc::<T>(self.raw.matmul_t(&rhs.raw)))
     }
+
+    /// The reference's spelling of [`Tensor::matmul`].
+    #[track_caller]
+    pub fn mat_mul(&self, rhs: &Self) -> Self {
+        self.matmul(rhs)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -940,6 +947,7 @@ binop!(Add, add, add, add_scalar);
 binop!(Sub, sub, sub, sub_scalar);
 binop!(Mul, mul, mul, mul_scalar);
 binop!(Div, div, div, div_scalar);
+binop!(Rem, rem, rem, rem_scalar);
 
 impl<const R: usize, T: Element> Neg for Tensor<R, T> {
     type Output = Tensor<R, T>;

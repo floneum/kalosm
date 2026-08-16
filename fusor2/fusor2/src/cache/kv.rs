@@ -613,6 +613,17 @@ impl<const R: usize, T: Element> KvCache<R, T> {
         self.v.replay_append(added)
     }
 
+    /// The cached keys, or `None` before the first append — the reference's
+    /// accessor spelling for the public `k` field.
+    pub fn k(&self) -> Option<&Tensor<R, T>> {
+        self.k.current()
+    }
+
+    /// The cached values, or `None` before the first append.
+    pub fn v(&self) -> Option<&Tensor<R, T>> {
+        self.v.current()
+    }
+
     /// Cached sequence length. The two halves always advance together, so the
     /// key cache is authoritative.
     pub fn len(&self) -> Dim {

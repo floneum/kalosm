@@ -125,6 +125,12 @@ impl Device {
         Ok(Self::Gpu(Gpu(Inner::new(Backend::gpu().await?)?)))
     }
 
+    /// The GPU if one is usable, otherwise the CPU — the reference's
+    /// "just give me a device" constructor.
+    pub fn auto() -> Self {
+        Self::gpu_blocking().unwrap_or_else(|_| Self::cpu())
+    }
+
     /// The device a value in `graph` was built from.
     ///
     /// A value knows its graph, a graph knows its session and a session knows
