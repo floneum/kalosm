@@ -1,5 +1,5 @@
 // Adapted from an upstream Whisper quantized model implementation, ported to
-// fusor2's const-rank `Tensor<R, T>`.
+// fusor's const-rank `Tensor<R, T>`.
 //
 // Every extent in Whisper is a compile-time constant, so the forward passes
 // carry their rank in the type and are infallible: the only `Result`s left in
@@ -8,11 +8,11 @@
 
 use std::num::NonZeroUsize;
 
-use fusor2::cache::{AttentionMask, KvCache, MaskCache, TensorCache};
-use fusor2::layers::{ConvNd, LayerNorm, Linear};
-use fusor2::tensor::Dyn;
-use fusor2::{Device, Dim, Dtype, Error, Graph, QMatrix, Result, Tensor, VarBuilder};
-use fusor2_gguf::RawTensorBytes;
+use fusor::cache::{AttentionMask, KvCache, MaskCache, TensorCache};
+use fusor::layers::{ConvNd, LayerNorm, Linear};
+use fusor::tensor::Dyn;
+use fusor::{Device, Dim, Dtype, Error, Graph, QMatrix, Result, Tensor, VarBuilder};
+use fusor_gguf::RawTensorBytes;
 use timestamps::extract_timestamps;
 
 use crate::config::Config;
@@ -24,7 +24,7 @@ type Activation = Tensor<3>;
 /// `[batch, heads, queries, keys]` attention scores.
 type Scores = Tensor<4>;
 
-/// The `[rows, cols]` quantized matrix a GGUF tensor denotes. `fusor2_gguf`
+/// The `[rows, cols]` quantized matrix a GGUF tensor denotes. `fusor_gguf`
 /// already reverses GGUF's fastest-varying-first dims at read, so `raw.shape`
 /// is row-major as-is.
 fn qmatrix_from_raw(graph: &Graph, raw: &RawTensorBytes) -> Result<QMatrix> {
@@ -455,8 +455,10 @@ impl TextDecoder {
         let ids = Tensor::<1, u32>::from_slice(&self.device, [seq_len], tokens);
         // The model expects a batch dim but this inference loop does not
         // handle it so we add it at this point.
-        let token_embedding: Activation =
-            self.token_embedding.embedding::<1, 2, f32>(&ids).unsqueeze(0);
+        let token_embedding: Activation = self
+            .token_embedding
+            .embedding::<1, 2, f32>(&ids)
+            .unsqueeze(0);
         let positional_embedding = self.positional_embedding.narrow(0, index_pos, seq_len);
         let mut x = token_embedding.add_::<2, 3, _>(&positional_embedding);
 
@@ -476,7 +478,13 @@ impl TextDecoder {
             let block_cache = &mut cache.blocks[i];
             let query = block_cache.feature_attn_cache.clone();
             let attention_output = attention_output.as_mut().map(|outputs| &mut outputs[i]);
-            x = block.forward(query, &x, mask.as_ref(), Some(block_cache), attention_output);
+            x = block.forward(
+                query,
+                &x,
+                mask.as_ref(),
+                Some(block_cache),
+                attention_output,
+            );
         }
 
         self.ln.forward(&x)
@@ -577,7 +585,9 @@ impl Whisper {
         attention_output: &[TensorCache<4>],
     ) -> Vec<Vec<f32>> {
         let Some(attention_heads) = attention_heads else {
-            panic!("The attention heads for word-level timestamps are not available for this model");
+            panic!(
+                "The attention heads for word-level timestamps are not available for this model"
+            );
         };
 
         let cross_attentions: Vec<Scores> = attention_output

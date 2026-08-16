@@ -15,8 +15,8 @@ fn cosine(a: &[f32], b: &[f32]) -> f32 {
 
 fn main() -> anyhow::Result<()> {
     pollster::block_on(async {
-        let kalosm_cache = PathBuf::from(std::env::var("HOME")?)
-            .join("Library/Application Support/kalosm/cache");
+        let kalosm_cache =
+            PathBuf::from(std::env::var("HOME")?).join("Library/Application Support/kalosm/cache");
         let source = BertSource::qwen3_embedding_0_6b()
             .with_tokenizer(FileSource::Local(
                 kalosm_cache.join("Qwen/Qwen3-Embedding-0.6B/main/tokenizer.json"),

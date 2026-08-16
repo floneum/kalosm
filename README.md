@@ -21,10 +21,10 @@
   </a>
 </div>
 
-Kalosm is an ecosystem of crates that make it easy to develop applications that use local or remote AI models. There are try main projects in this repo:
+Kalosm is an ecosystem of crates that make it easy to develop applications that use local or remote AI models. There are two main projects in this repo:
 
 - [Kalosm](./interfaces/kalosm): A simple interface for pre-trained models in rust
-- [Fusor](./fusor-ml/core): A runtime for quantized ML inference. Fusor uses WGPU to run models on any accelerator natively or in the browser
+- [Fusor](./fusor/fusor): A compiler-backed runtime for quantized ML inference on CPUs and WebGPU accelerators
 
 ## Kalosm
 
@@ -141,9 +141,9 @@ cargo run --release
 
 ## Fusor
 
-⚠️ Fusor is still early in development and is not ready for production use. Fusor will serve as the backend for Kalosm in the 0.5 release to enable web and AMD support
+⚠️ Fusor is still early in development and is not ready for production use. It is the local inference backend used by Kalosm's model crates.
 
-[Fusor](./fusor-ml/core) is a WGPU runtime for quantized ML inference. Fusor works with the gguf file format to load quantized models. It targets uses WebGpu to target many different accelerators including Nvidia GPUs, AMD GPUs, and Metal. Most ML frameworks contain hand optimized kernels that perform a series of operations together. Fusor uses a kernel fusion compiler to make merge custom operation chains into an optimized kernel without dropping down to the shader code. This compiles to a single kernel:
+[Fusor](./fusor/fusor) is a compiler-backed CPU and WebGPU runtime for quantized ML inference. It loads GGUF models and uses an e-graph compiler to fuse operation chains into optimized kernels without requiring model authors to write shader code. For example, this expression can compile into one kernel:
 ```rust, ignore
 fn exp_add_one(tensor: Tensor<2, f32>) -> Tensor<2, f32> {
   1. + (-tensor).exp()

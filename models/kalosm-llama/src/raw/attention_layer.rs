@@ -1,9 +1,9 @@
 use crate::raw::rope::RopeImplementation;
 
-use fusor2::cache::{KvCache, MaskKind};
-use fusor2::layers::RmsNorm;
-use fusor2::Minus1;
-use fusor2::{QMatrix, Tensor};
+use fusor::cache::{KvCache, MaskKind};
+use fusor::layers::RmsNorm;
+use fusor::Minus1;
+use fusor::{QMatrix, Tensor};
 
 pub enum FeedForwardVariant {
     // Used by the Llama, Qwen, and Gemma models
@@ -101,11 +101,7 @@ impl LlamaFeedForward {
         match &self.gate_up {
             Some(gate_up) if self.gate_bias.is_none() && self.up_bias.is_none() => {
                 // SwiGLU over one fused gate|up projection.
-                let pair_len = gate_up
-                    .rows
-                    .as_const()
-                    .expect("gguf rows are const") as usize
-                    / 2;
+                let pair_len = gate_up.rows.as_const().expect("gguf rows are const") as usize / 2;
                 let projected = x.q_mat_mul(gate_up);
                 let gate = projected.narrow(Minus1, 0, pair_len);
                 let up = projected.narrow(Minus1, pair_len, pair_len);
@@ -342,8 +338,13 @@ impl LlamaAttention {
 
         let scale = 1.0 / (head_dim as f32).sqrt();
         let (kind, mask_tensor) = mask;
-        let attn_output =
-            query_states.attention_masked(&key_states, &value_states, kind, mask_tensor, Some(scale));
+        let attn_output = query_states.attention_masked(
+            &key_states,
+            &value_states,
+            kind,
+            mask_tensor,
+            Some(scale),
+        );
 
         // A prefill on a sliding-window layer evicts after attention: the
         // materialized mask already bounded what each query saw.

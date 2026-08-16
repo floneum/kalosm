@@ -1,4 +1,0 @@
-out 0xa45dec1e98442bd9
-dq 0x9d3eefd367974641
-dk 0x712914ed2040211b
-dv 0xeedffc029ea157a5

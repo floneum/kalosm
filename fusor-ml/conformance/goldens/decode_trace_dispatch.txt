@@ -1,5 +1,0 @@
-399 [("flash_attention", 6), ("matmul_f32", 19), ("merged_matmul", 6), ("nary_direct", 33), ("row_program", 13)]
-1 [("flash_attention", 6), ("matmul_f32", 19), ("merged_matmul", 6), ("nary_direct", 32), ("row_program", 13)]
-1 [("flash_attention", 6), ("matmul_f32", 19), ("merged_matmul", 6), ("merged_region", 1), ("merged_row", 1), ("nary_direct", 35), ("row_program", 15)]
-1 [("flash_attention", 24), ("matmul_f32", 59), ("merged_matmul", 18), ("merged_region", 40), ("merged_row", 32), ("nary_direct", 114), ("row_program", 27)]
-1 [("flash_attention", 24), ("matmul_f32", 59), ("merged_matmul", 18), ("merged_region", 39), ("merged_row", 26), ("nary_direct", 114), ("row_program", 27)]

@@ -1,0 +1,20 @@
+[package]
+name = "fusor-cpu"
+description = "fusor fearless_simd Target: SIMD emitter, loop-nest lowering, worker pool"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+fusor-ir.workspace = true
+fusor-tile.workspace = true
+fusor-gguf.workspace = true
+smallvec.workspace = true
+rustc-hash.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+parking_lot.workspace = true
+fearless_simd.workspace = true

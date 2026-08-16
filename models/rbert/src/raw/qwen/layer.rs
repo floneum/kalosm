@@ -1,5 +1,5 @@
-use fusor2::layers::RmsNorm;
-use fusor2::{Device, Result, Tensor, VarBuilder};
+use fusor::layers::RmsNorm;
+use fusor::{Device, Result, Tensor, VarBuilder};
 
 use super::attention::QwenSelfAttention;
 use super::feed_forward::QwenFeedForward;

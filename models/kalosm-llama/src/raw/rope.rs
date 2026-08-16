@@ -1,6 +1,6 @@
 use super::{LlamaConfig, RopeScalingConfig};
-use fusor2::composite::base_inverse_frequency;
-use fusor2::{Device, Tensor};
+use fusor::composite::base_inverse_frequency;
+use fusor::{Device, Tensor};
 use std::f32::consts::PI;
 
 /// The base `1 / theta^(2i/dim)` frequencies with the llama3-style scaling and

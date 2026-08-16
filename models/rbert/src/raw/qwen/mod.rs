@@ -5,8 +5,8 @@ mod model;
 
 pub use model::QwenEmbeddingModel;
 
-use fusor2::layers::Linear;
-use fusor2::{Device, Dim, Dtype, Error, QMatrix, Result, Tensor, VarBuilder};
+use fusor::layers::Linear;
+use fusor::{Device, Dim, Dtype, Error, QMatrix, Result, Tensor, VarBuilder};
 
 /// A matmul weight that is either a block-quantized [`QMatrix`] read in place
 /// or a dense `[out, in]` tensor, depending on what the GGUF ships.
@@ -18,7 +18,7 @@ pub(crate) enum QLinear {
 impl QLinear {
     pub(crate) fn load(vb: &VarBuilder, device: &Device, name: &str) -> Result<Self> {
         let raw = vb.get_raw(name)?;
-        // `fusor2_gguf` reverses GGUF's fastest-varying-first dims at read, so
+        // `fusor_gguf` reverses GGUF's fastest-varying-first dims at read, so
         // `raw.shape` is already row-major `[rows, cols]`.
         let [rows, cols] = match raw.shape.as_slice() {
             [cols] => [Dim::Const(1), Dim::Const(*cols)],
@@ -31,8 +31,13 @@ impl QLinear {
         };
         match raw.fmt {
             Dtype::Q(fmt) => {
-                let q =
-                    QMatrix::from_raw_bytes(device.graph(), fmt, raw.layout, [rows, cols], &raw.bytes)?;
+                let q = QMatrix::from_raw_bytes(
+                    device.graph(),
+                    fmt,
+                    raw.layout,
+                    [rows, cols],
+                    &raw.bytes,
+                )?;
                 Ok(Self::Quantized(q))
             }
             // `from_raw_bytes` reads at the file's dtype and casts to the

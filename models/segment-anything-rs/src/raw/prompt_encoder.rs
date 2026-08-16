@@ -1,8 +1,8 @@
 //! Prompt encoder: encodes points, boxes, and masks into embeddings.
 
-use fusor2::layers::{ConvNd, Embedding, LayerNorm};
-use fusor2::{Device, Tensor};
-use fusor2_gguf::VarBuilder;
+use fusor::layers::{ConvNd, Embedding, LayerNorm};
+use fusor::{Device, Tensor};
+use fusor_gguf::VarBuilder;
 
 use super::{channel_layer_norm, load_dense, Result};
 
@@ -227,7 +227,10 @@ impl PromptEncoder {
 
         // Stack: (batch, 2, dim)
         Tensor::cat(
-            [ce1.reshape([batch, 1, ce_dim]), ce2.reshape([batch, 1, ce_dim])],
+            [
+                ce1.reshape([batch, 1, ce_dim]),
+                ce2.reshape([batch, 1, ce_dim]),
+            ],
             1,
         )
     }

@@ -1,5 +1,5 @@
-use fusor2::layers::{Embedding, RmsNorm};
-use fusor2::{Device, Dim, Dtype, Error, QMatrix, Result, Tensor, VarBuilder};
+use fusor::layers::{Embedding, RmsNorm};
+use fusor::{Device, Dim, Dtype, Error, QMatrix, Result, Tensor, VarBuilder};
 
 use super::layer::QwenLayer;
 
@@ -94,8 +94,7 @@ pub(crate) struct QwenRope {
 
 impl QwenRope {
     fn new(device: &Device, head_dim: usize, context_length: usize, theta: f32) -> Self {
-        let inverse_frequency =
-            fusor2::composite::base_inverse_frequency(head_dim as u32, theta);
+        let inverse_frequency = fusor::composite::base_inverse_frequency(head_dim as u32, theta);
         let half = inverse_frequency.len();
         let mut sin = Vec::with_capacity(context_length * half);
         let mut cos = Vec::with_capacity(context_length * half);

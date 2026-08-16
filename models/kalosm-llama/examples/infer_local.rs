@@ -28,8 +28,7 @@ fn main() {
             .unwrap();
 
         let prompt = "Once upon a time there was a penguin named Peng.";
-        let mut story = model(prompt)
-            .with_sampler(GenerationParameters::new().with_max_length(64));
+        let mut story = model(prompt).with_sampler(GenerationParameters::new().with_max_length(64));
 
         print!("{prompt}");
         std::io::stdout().flush().unwrap();

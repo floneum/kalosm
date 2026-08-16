@@ -1,7 +1,7 @@
 //! # Segment Anything RS
 //! A rust wrapper for [Segment Anything](https://segment-anything.com/)
 //!
-//! The model uses fusor2 tensors and prefers GPU execution when available,
+//! The model uses fusor tensors and prefers GPU execution when available,
 //! automatically falling back to CPU otherwise.
 //!
 //! ## Usage
@@ -24,8 +24,8 @@
 mod mask_generation;
 mod raw;
 
-use fusor2::{Device, Tensor};
-use fusor2_gguf::VarBuilder;
+use fusor::{Device, Tensor};
+use fusor_gguf::VarBuilder;
 use image::{DynamicImage, GenericImage, GenericImageView, ImageBuffer, Rgba};
 use kalosm_model_types::FileSource;
 use mask_generation::LowResMaskBatch;
@@ -200,7 +200,7 @@ impl SegmentAnythingInferenceSettings {
 pub enum LoadSegmentAnythingError {
     /// An error that can occur when initializing the runtime for a [`SegmentAnything`] model.
     #[error("Failed to initialize model runtime: {0}")]
-    LoadModel(#[from] fusor2::Error),
+    LoadModel(#[from] fusor::Error),
     /// An error that can occur when downloading a [`SegmentAnything`] model from Hugging Face.
     #[error("Failed to download model from Hugging Face: {0}")]
     DownloadModel(#[from] kalosm_common::CacheError),
@@ -214,7 +214,7 @@ pub enum LoadSegmentAnythingError {
 pub enum SegmentAnythingInferenceError {
     /// An error that can occur when trying to run a [`SegmentAnything`] model.
     #[error("Failed to run model: {0}")]
-    RunModel(#[from] fusor2::Error),
+    RunModel(#[from] fusor::Error),
     /// An error that can occur when converting the result of a [`SegmentAnything`] model to an image.
     #[error("Failed to merge masks")]
     MergeMasks,

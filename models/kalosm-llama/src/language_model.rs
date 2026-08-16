@@ -1,7 +1,7 @@
+use crate::WasmNotSync;
 use kalosm_language_model::{
     CreateTextCompletionSession, GenerationParameters, MessageContent, TextCompletionModel,
 };
-use crate::WasmNotSync;
 use kalosm_model_types::{ModelBuilder, ModelLoadingProgress, WasmNotSend};
 #[cfg(feature = "structured")]
 use kalosm_sample::{ArcParser, CreateParserState, Parse, Parser, ParserExt};

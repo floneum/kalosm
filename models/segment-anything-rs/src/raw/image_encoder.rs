@@ -1,12 +1,18 @@
 //! ViT-based image encoder for SAM.
 
-use fusor2::layers::{ConvNd, LayerNorm, Linear};
-use fusor2::{Device, Tensor};
-use fusor2_gguf::VarBuilder;
+use fusor::layers::{ConvNd, LayerNorm, Linear};
+use fusor::{Device, Tensor};
+use fusor_gguf::VarBuilder;
 
 use super::{channel_layer_norm, linear, load_dense, Activation, MlpBlock, Result};
 
-fn conv2d(vb: &VarBuilder, device: &Device, bias: bool, stride: u32, padding: u32) -> Result<ConvNd> {
+fn conv2d(
+    vb: &VarBuilder,
+    device: &Device,
+    bias: bool,
+    stride: u32,
+    padding: u32,
+) -> Result<ConvNd> {
     let mut conv = ConvNd::load(vb, device.graph().handle(), bias)?;
     conv.stride = [stride, stride].into_iter().collect();
     conv.padding = [padding, padding].into_iter().collect();

@@ -32,10 +32,7 @@ impl ModelBuilder for BertBuilder {
 
 impl Bert {
     /// Convert a `[1, hidden]` tensor (containing a single embedding) into an Embedding.
-    async fn tensor_to_embedding(
-        &self,
-        tensor: fusor2::Tensor<2>,
-    ) -> Result<Embedding, BertError> {
+    async fn tensor_to_embedding(&self, tensor: fusor::Tensor<2>) -> Result<Embedding, BertError> {
         let values = tensor.to_vec_f32_async().await.map_err(BertError::Fusor)?;
         Ok(Embedding::from(values))
     }

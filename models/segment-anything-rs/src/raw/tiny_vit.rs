@@ -3,10 +3,10 @@
 //! BatchNorm is fused into conv weights at GGUF conversion time,
 //! so Conv2dBN becomes a plain conv here.
 
-use fusor2::cache::MaskKind;
-use fusor2::layers::{ConvNd, LayerNorm, Linear};
-use fusor2::{Device, Tensor};
-use fusor2_gguf::VarBuilder;
+use fusor::cache::MaskKind;
+use fusor::layers::{ConvNd, LayerNorm, Linear};
+use fusor::{Device, Tensor};
+use fusor_gguf::VarBuilder;
 
 use super::{linear, load_dense, Result};
 

@@ -1,6 +1,6 @@
-use fusor2::cache::MaskKind;
-use fusor2::layers::Linear;
-use fusor2::{Device, Dim, Result, Tensor, VarBuilder};
+use fusor::cache::MaskKind;
+use fusor::layers::Linear;
+use fusor::{Device, Dim, Result, Tensor, VarBuilder};
 
 use super::{additive_key_mask, load_linear};
 

@@ -30,25 +30,14 @@ members = [
     "interfaces/kalosm-parse-macro",
     "interfaces/kalosm-common",
     "interfaces/kalosm-model-types",
-    "fusor-ml/core",
-    "fusor-ml/gguf",
-    "fusor-ml/cli",
-    "fusor-ml/cpu",
-    "fusor-ml/conformance",
-    "fusor-ml/fusor",
-    "fusor-ml/types",
-    "fusor-ml/tile-ir",
-    "fusor-ml/tile-ir-kernels",
-    "fusor-ml/tile-ir-runtime",
-    "fusor-ml/webgpu-runner",
 ]
-# `fusor2` is a standalone crate with its own `[workspace]`; keep the parent
+# `fusor` is a standalone crate with its own `[workspace]`; keep the parent
 # workspace from trying to absorb it.
-exclude = ["fusor2"]
+exclude = ["fusor"]
 
-# fusor-ml reaches the local wgpu fork through the
-# `[patch."https://github.com/ealmloff/wgpu"]` section below; crates-io wgpu
-# (used by fusor2) stays on the released 29.x so its naga types match.
+# The repository root repeats Fusor's vendored naga patch below because model
+# crates are built from this workspace and Cargo applies patches at the build
+# root, not at a path dependency's workspace root.
 
 [workspace.dependencies]
 kalosm = { path = "./interfaces/kalosm", version = "0.4.0", default-features = false }
@@ -66,19 +55,11 @@ kalosm-llama = { path = "./models/kalosm-llama", version = "0.4.0", default-feat
 kalosm-tokenizer = { path = "./models/kalosm-tokenizer", version = "0.4.0" }
 rwhisper = { path = "./models/rwhisper", version = "0.4.0", default-features = false }
 segment-anything-rs = { path = "./models/segment-anything-rs", version = "0.5.0" }
-fusor = { path = "./fusor-ml/fusor", version = "0.1.0", default-features = false }
-fusor-core = { path = "./fusor-ml/core", version = "0.1.0" }
-fusor-gguf = { path = "./fusor-ml/gguf", version = "0.1.0" }
-fusor-tile-ir = { path = "./fusor-ml/tile-ir", version = "0.1.0" }
-fusor-tile-ir-kernels = { path = "./fusor-ml/tile-ir-kernels", version = "0.1.0" }
-fusor-tile-ir-runtime = { path = "./fusor-ml/tile-ir-runtime", version = "0.1.0" }
-fusor-types = { path = "./fusor-ml/types", version = "0.1.0" }
 tokenizers = { version = "0.21.0", default-features = false }
 thiserror = "2.0.7"
 anyhow = "1.0.94"
 image = "0.25"
 rand = "0.9"
-criterion = { version = "0.8", features = ["async_futures"] }
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 futures-channel = { version = "0.3.31", default-features = false, features = ["std"] }
 web-time = "1.1.0"
@@ -395,13 +376,9 @@ codegen-units = 1
 [profile.dev.package."*"]
 opt-level = 3
 
-[patch."https://github.com/ealmloff/wgpu"]
-naga = { path = "../wgpu-fusor/naga" }
-wgpu = { path = "../wgpu-fusor/wgpu" }
-
-# fusor2's kernels need released naga 29 plus one correctness patch
+# fusor's kernels need released naga 29 plus one correctness patch
 # (`CooperativeLoad` in `bake_ref_count`, so a simdgroup load cannot sink past
 # its barrier). Patch tables only apply from the build root, so the vendored
-# copy is named here as well as in fusor2's own workspace.
+# copy is named here as well as in fusor's own workspace.
 [patch.crates-io]
-naga = { path = "fusor2/vendor/naga" }
+naga = { path = "fusor/vendor/naga" }

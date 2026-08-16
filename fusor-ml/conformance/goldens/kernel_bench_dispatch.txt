@@ -1,9 +1,0 @@
-wgrad merged_matmul 2
-wgrad256 merged_matmul 2
-wgrad256m merged_matmul 2
-fwd merged_matmul 2
-fwd256 merged_matmul 2
-fwdup merged_matmul 2
-attn merged_matmul 2
-softmax merged_row 1
-softmax row_program 1

@@ -11,10 +11,10 @@ use attention_layer::GroupedAttention;
 use attention_layer::LlamaFeedForward;
 use attention_layer::PhiFeedForward;
 use attention_layer::SeparateAttention;
-use fusor2::cache::{MaskCache, MaskKind};
-use fusor2::layers::RmsNorm;
-use fusor2::{Device, Dim, Dtype, Graph, QMatrix, Result, Tensor};
-use fusor2_gguf::{GgufValue, RawTensorBytes, ShardedVarBuilder};
+use fusor::cache::{MaskCache, MaskKind};
+use fusor::layers::RmsNorm;
+use fusor::{Device, Dim, Dtype, Graph, QMatrix, Result, Tensor};
+use fusor_gguf::{GgufValue, RawTensorBytes, ShardedVarBuilder};
 
 mod attention_layer;
 pub mod cache;
@@ -98,11 +98,11 @@ impl LlamaVarSource for ShardedVarBuilder {
 }
 
 /// The `[rows, cols]` quantized matrix a GGUF tensor denotes.
-/// `fusor2_gguf` already reverses GGUF's fastest-varying-first dims at read,
+/// `fusor_gguf` already reverses GGUF's fastest-varying-first dims at read,
 /// so `raw.shape` is row-major `[rows, cols]` as-is.
 fn qmatrix_from_raw(graph: &Graph, raw: &RawTensorBytes) -> Result<QMatrix> {
     let Dtype::Q(fmt) = raw.fmt else {
-        return Err(fusor2::Error::Dtype(format!(
+        return Err(fusor::Error::Dtype(format!(
             "{} has dtype {:?}; only block-quantized matmul weights are supported by this port",
             raw.name, raw.fmt
         )));
@@ -111,7 +111,7 @@ fn qmatrix_from_raw(graph: &Graph, raw: &RawTensorBytes) -> Result<QMatrix> {
         [cols] => (1, *cols),
         [rows, cols] => (*rows, *cols),
         other => {
-            return Err(fusor2::Error::Shape(format!(
+            return Err(fusor::Error::Shape(format!(
                 "{} has GGUF shape {other:?}; a QMatrix is rank 1 or 2",
                 raw.name
             )));
@@ -141,7 +141,7 @@ fn dense_1d(device: &Device, raw: &RawTensorBytes) -> Result<Tensor<1>> {
         Dtype::Q(_) => Ok(qmatrix_from_raw(device.graph(), raw)?
             .to_tensor()
             .reshape_dims([Dim::Const(n)])),
-        other => Err(fusor2::Error::Dtype(format!(
+        other => Err(fusor::Error::Dtype(format!(
             "{} has dtype {other:?}, which has no dense 1d path",
             raw.name
         ))),
@@ -202,7 +202,10 @@ impl Model {
         };
 
         // Parameter extraction from metadata.
-        let architecture = source.get("general.architecture")?.to_string_value()?.to_string();
+        let architecture = source
+            .get("general.architecture")?
+            .to_string_value()?
+            .to_string();
         let head_count = source.get(".attention.head_count")?.to_u32()? as usize;
         let head_count_kv = source.get(".attention.head_count_kv")?.to_u32()? as usize;
         let block_count = source.get(".block_count")?.to_u32()? as usize;
@@ -236,7 +239,7 @@ impl Model {
 
         if source.get(".rope.dimension_sections").is_ok() {
             return Err(LlamaSourceError::MissingGgufEntry(
-                "mrope (Qwen-VL) models are not supported by the fusor2 port yet".to_string(),
+                "mrope (Qwen-VL) models are not supported by the fusor port yet".to_string(),
             ));
         }
 
@@ -300,9 +303,12 @@ impl Model {
                     interleaved_rope,
                 })
             } else {
-                let q = qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.attn_q.weight"))?)?;
-                let k = qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.attn_k.weight"))?)?;
-                let v = qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.attn_v.weight"))?)?;
+                let q =
+                    qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.attn_q.weight"))?)?;
+                let k =
+                    qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.attn_k.weight"))?)?;
+                let v =
+                    qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.attn_v.weight"))?)?;
                 let qkv = QMatrix::concat_rows(&[&q, &k, &v]).ok();
                 let bias_q = source.tensor(&format!("{prefix}.attn_q.bias"));
                 let bias_k = source.tensor(&format!("{prefix}.attn_k.bias"));
@@ -334,40 +340,50 @@ impl Model {
                 };
                 AttentionVariant::Separate(Box::new(separate))
             };
-            let attention_wo =
-                qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.attn_output.weight"))?)?;
+            let attention_wo = qmatrix_from_raw(
+                &graph,
+                &source.tensor(&format!("{prefix}.attn_output.weight"))?,
+            )?;
             // Try to read from the up, down and gate weights
-            let feed_forward_variant =
-                if let Ok(ffn_gate) = source.tensor(&format!("{prefix}.ffn_gate.weight")) {
-                    let feed_forward_w1 = qmatrix_from_raw(&graph, &ffn_gate)?;
-                    let feed_forward_w2 =
-                        qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.ffn_down.weight"))?)?;
-                    let feed_forward_w3 =
-                        qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.ffn_up.weight"))?)?;
-                    FeedForwardVariant::Llama(Box::new(LlamaFeedForward::new(
-                        feed_forward_w1,
-                        feed_forward_w2,
-                        feed_forward_w3,
-                    )))
-                } else {
-                    // Otherwise, try to read from the up, and down weights
-                    let up = qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.ffn_up.weight"))?)?;
-                    let down =
-                        qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.ffn_down.weight"))?)?;
-                    let feed_forward_length = source.get(".feed_forward_length")?.to_u32()? as usize;
+            let feed_forward_variant = if let Ok(ffn_gate) =
+                source.tensor(&format!("{prefix}.ffn_gate.weight"))
+            {
+                let feed_forward_w1 = qmatrix_from_raw(&graph, &ffn_gate)?;
+                let feed_forward_w2 = qmatrix_from_raw(
+                    &graph,
+                    &source.tensor(&format!("{prefix}.ffn_down.weight"))?,
+                )?;
+                let feed_forward_w3 =
+                    qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.ffn_up.weight"))?)?;
+                FeedForwardVariant::Llama(Box::new(LlamaFeedForward::new(
+                    feed_forward_w1,
+                    feed_forward_w2,
+                    feed_forward_w3,
+                )))
+            } else {
+                // Otherwise, try to read from the up, and down weights
+                let up =
+                    qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.ffn_up.weight"))?)?;
+                let down = qmatrix_from_raw(
+                    &graph,
+                    &source.tensor(&format!("{prefix}.ffn_down.weight"))?,
+                )?;
+                let feed_forward_length = source.get(".feed_forward_length")?.to_u32()? as usize;
 
-                    FeedForwardVariant::Phi(PhiFeedForward {
-                        up,
-                        down,
-                        feed_forward_length,
-                    })
-                };
+                FeedForwardVariant::Phi(PhiFeedForward {
+                    up,
+                    down,
+                    feed_forward_length,
+                })
+            };
             let attention_norm = source.tensor(&format!("{prefix}.attn_norm.weight"))?;
             let post_attention_norm = source
                 .tensor(&format!("{prefix}.post_attention_norm.weight"))
                 .ok();
             let ffn_norm = source.tensor(&format!("{prefix}.ffn_norm.weight"))?;
-            let ffn_post_norm = source.tensor(&format!("{prefix}.post_ffw_norm.weight")).ok();
+            let ffn_post_norm = source
+                .tensor(&format!("{prefix}.post_ffw_norm.weight"))
+                .ok();
 
             let mut layer_sliding_window_size = None;
 
@@ -525,7 +541,10 @@ impl Model {
         device: &Device,
         mut cache: Option<&mut LlamaCache>,
     ) -> Result<Tensor<2>> {
-        if cache.as_ref().is_some_and(|c| c.blocks.first().is_some_and(|b| b.is_fixed())) {
+        if cache
+            .as_ref()
+            .is_some_and(|c| c.blocks.first().is_some_and(|b| b.is_fixed()))
+        {
             let cache = cache.as_deref_mut().expect("checked above");
             let (steps, index_pos) = self.plan_tokens(tokens, Some(cache));
             let n = steps.len();
@@ -554,7 +573,7 @@ impl Model {
                 }
                 logits = out.or(logits);
             }
-            return logits.ok_or_else(|| fusor2::Error::Shape("forward of no tokens".into()));
+            return logits.ok_or_else(|| fusor::Error::Shape("forward of no tokens".into()));
         }
         let hidden = self.forward_last_hidden_f32(tokens, device, cache)?;
         Ok(hidden.q_mat_mul(&self.output))
@@ -568,7 +587,7 @@ impl Model {
     ///
     /// Because it is identical, it is built once. `cache.decode_graph` holds
     /// the root and every later step re-arms the blocks' appends
-    /// ([`fusor2::cache::KvCache::replay_append`]) instead of re-deriving the
+    /// ([`fusor::cache::KvCache::replay_append`]) instead of re-deriving the
     /// nodes that produced them. A rebuild is still what happens whenever the
     /// nodes would genuinely differ — a grown store, a reset cache, a first
     /// step — and it re-establishes the memo.
@@ -583,14 +602,12 @@ impl Model {
         cache: &mut LlamaCache,
         want_logits: bool,
     ) -> Option<Tensor<2>> {
-        let (ids, pos) = self
-            .step_inputs
-            .get_or_init(|| {
-                (
-                    Tensor::leaf(device, [Dim::Const(1)]),
-                    Tensor::leaf(device, [Dim::Const(1)]),
-                )
-            });
+        let (ids, pos) = self.step_inputs.get_or_init(|| {
+            (
+                Tensor::leaf(device, [Dim::Const(1)]),
+                Tensor::leaf(device, [Dim::Const(1)]),
+            )
+        });
         ids.set_elements(&[token]);
         pos.set_elements(&[position as u32]);
 
@@ -666,7 +683,7 @@ impl Model {
         if encoded.seq_len <= 1 {
             return self.forward_last_hidden_from_embeddings(encoded, device, cache);
         }
-        // Chunk the prefill to one token per step. fusor2's extraction
+        // Chunk the prefill to one token per step. fusor's extraction
         // currently spells an M > 1 activation against a quantized weight as
         // a fold over the *materialized* dequantized matrix — ~27 GB of f32
         // launch roots for one 8B prefill — while M = 1 is the tuned
@@ -717,13 +734,7 @@ impl Model {
                 .unwrap_or(0) as usize
                 + seq_len;
             let (kind, mask) = self.mask_for(&graph, seq_len, k_len, layer.sliding_window_size)?;
-            let mut attn = layer.forward(
-                &x,
-                (kind, mask.as_ref()),
-                index_pos,
-                None,
-                cache_block,
-            );
+            let mut attn = layer.forward(&x, (kind, mask.as_ref()), index_pos, None, cache_block);
             if let Some(post_attention_norm) = &layer.post_attention_norm {
                 attn = post_attention_norm.forward(&attn);
             }

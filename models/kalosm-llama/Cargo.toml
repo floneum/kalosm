@@ -9,8 +9,8 @@ authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["llm", "llama", "mistral", "agents", "nlp"]
 
 [dependencies]
-fusor2 = { path = "../../fusor2/fusor2" }
-fusor2-gguf = { path = "../../fusor2/fusor2-gguf" }
+fusor = { path = "../../fusor/fusor" }
+fusor-gguf = { path = "../../fusor/fusor-gguf" }
 kalosm-tokenizer.workspace = true
 
 half = { version = "2.3.1" }
@@ -56,7 +56,7 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]
 default = ["gpu"]
-# fusor2 compiles both backends unconditionally; these are kept as no-ops so
+# fusor compiles both backends unconditionally; these are kept as no-ops so
 # downstream feature selections keep resolving.
 cpu = []
 gpu = []

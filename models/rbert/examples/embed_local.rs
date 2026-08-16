@@ -17,8 +17,8 @@ fn main() -> anyhow::Result<()> {
         let hf_snapshot = PathBuf::from(std::env::var("HOME")?).join(
             ".cache/huggingface/hub/models--BAAI--bge-small-en-v1.5/snapshots/5c38ec7c405ec4b44b94cc5a9bb96e735b38267a",
         );
-        let kalosm_cache = PathBuf::from(std::env::var("HOME")?)
-            .join("Library/Application Support/kalosm/cache");
+        let kalosm_cache =
+            PathBuf::from(std::env::var("HOME")?).join("Library/Application Support/kalosm/cache");
         let source = BertSource::bge_small_en()
             .with_config(FileSource::Local(hf_snapshot.join("config.json")))
             .with_tokenizer(FileSource::Local(hf_snapshot.join("tokenizer.json")))

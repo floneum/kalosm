@@ -1,4 +1,4 @@
-use fusor2::{Device, Result, Tensor, VarBuilder};
+use fusor::{Device, Result, Tensor, VarBuilder};
 
 use super::BertLayer;
 

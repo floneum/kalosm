@@ -1,9 +1,9 @@
 //! TwoWayTransformer for cross-attention between queries and image embeddings.
 
-use fusor2::cache::MaskKind;
-use fusor2::layers::{LayerNorm, Linear};
-use fusor2::{Device, Tensor};
-use fusor2_gguf::VarBuilder;
+use fusor::cache::MaskKind;
+use fusor::layers::{LayerNorm, Linear};
+use fusor::{Device, Tensor};
+use fusor_gguf::VarBuilder;
 
 use super::{linear, Activation, MlpBlock, Result};
 
@@ -62,7 +62,8 @@ impl Attention {
     fn separate_heads(&self, x: &Tensor<3>) -> Tensor<4> {
         let [b, n, c] = x.shape();
         let c_per_head = c / self.num_heads;
-        x.reshape([b, n, self.num_heads, c_per_head]).transpose(1, 2)
+        x.reshape([b, n, self.num_heads, c_per_head])
+            .transpose(1, 2)
     }
 
     fn recombine_heads(&self, x: &Tensor<4>) -> Tensor<3> {

@@ -1,0 +1,28 @@
+//! `fusor-cost` — one scalar picosecond roofline parameterized on *measured*
+//! device facts, and the one extraction that resolves node selection,
+//! materialization and schedule point together against it.
+//!
+//! Not a lexicographic tuple: the reference's own unit test shows the tuple
+//! gives the wrong verdict, and its own doc concedes dispatches are 0.2% of
+//! modelled time while the tuple will pay unbounded bandwidth to remove one.
+//!
+//! Precision is **not** a cost term — it is a verifier property
+//! (`NumericContract`), because a time-only model eliminates f32 everywhere.
+
+#![warn(unreachable_pub)]
+
+pub mod extract;
+pub mod facts;
+mod lower_bound;
+mod model;
+mod moves;
+pub mod plan;
+pub mod realize;
+pub mod replay;
+mod terms;
+pub mod tune_cache;
+mod verify_plan;
+
+pub use extract::LocalSearch;
+pub use model::Roofline;
+pub use replay::ReplayMemo;

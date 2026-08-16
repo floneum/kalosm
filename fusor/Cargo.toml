@@ -1,0 +1,68 @@
+[workspace]
+resolver = "3"
+members = [
+    "fusor-ir",
+    "fusor-tile",
+    "fusor-autograd",
+    "fusor-cost",
+    "fusor-gguf",
+    "fusor-gpu",
+    "fusor-cpu",
+    "fusor",
+    "fusor-conformance",
+]
+
+# Fusor is a standalone workspace, deliberately excluded from the repository
+# root workspace so it owns its compiler dependencies, test matrix, and
+# lockfile. The repository root repeats the vendored naga patch when it builds
+# model crates that depend on Fusor.
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+authors = ["Evan Almloff <evanalmloff@gmail.com>"]
+rust-version = "1.88"
+repository = "https://github.com/floneum/floneum"
+
+[workspace.dependencies]
+# --- internal ---------------------------------------------------------------
+fusor-ir = { path = "fusor-ir", version = "0.1.0" }
+fusor-tile = { path = "fusor-tile", version = "0.1.0" }
+fusor-autograd = { path = "fusor-autograd", version = "0.1.0" }
+fusor-cost = { path = "fusor-cost", version = "0.1.0" }
+fusor-gguf = { path = "fusor-gguf", version = "0.1.0" }
+fusor-gpu = { path = "fusor-gpu", version = "0.1.0" }
+fusor-cpu = { path = "fusor-cpu", version = "0.1.0" }
+fusor = { path = "fusor", version = "0.1.0" }
+
+# --- shared external, pinned once -------------------------------------------
+smallvec = { version = "1.15", features = ["union"] }
+rustc-hash = "2.1"
+fixedbitset = "0.5"
+half = { version = "2.6", features = ["bytemuck"] }
+bytemuck = { version = "1.25", features = ["derive"] }
+parking_lot = "0.12"
+lru = "0.14"
+pollster = "0.4"
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.9"
+
+# Released wgpu 29.x with `naga-ir`; WebGPU baseline limits are requested at
+# device creation and widened per kernel, never taken from `adapter.limits()`.
+wgpu = { version = "29", default-features = false, features = ["std", "naga-ir"] }
+naga = "29"
+
+# `fearless_simd`'s statically-known f32x4/f32x8/f32x16 is what makes a 4x4
+# register accumulator tile expressible; a width-erased API structurally cannot.
+fearless_simd = "0.4"
+
+# Released naga 29.0.4 with one correctness patch: `CooperativeLoad` joins
+# `Load` in `bake_ref_count`, so a simdgroup load referenced once is still
+# baked into a temporary and cannot sink past the barrier its Emit statement
+# ordered it against. Upstreaming tracked; the same fix was verified on the
+# historical wgpu fork used by the removed implementation.
+[patch.crates-io]
+naga = { path = "vendor/naga" }

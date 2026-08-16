@@ -1,5 +1,5 @@
-use fusor2::cache::KvCache;
-use fusor2::Tensor;
+use fusor::cache::KvCache;
+use fusor::Tensor;
 
 use super::LlamaConfig;
 

@@ -102,8 +102,8 @@ impl ChatModel<GenerationParameters> for Llama {
 }
 
 #[cfg(feature = "structured")]
-impl<Constraints>
-    kalosm_language_model::StructuredChatModel<Constraints, GenerationParameters> for Llama
+impl<Constraints> kalosm_language_model::StructuredChatModel<Constraints, GenerationParameters>
+    for Llama
 where
     <Constraints as Parser>::Output: WasmNotSend,
     <Constraints as Parser>::PartialState: WasmNotSend,

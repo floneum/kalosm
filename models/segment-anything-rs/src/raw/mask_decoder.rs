@@ -1,8 +1,8 @@
 //! Mask decoder: predicts masks from image+prompt embeddings.
 
-use fusor2::layers::{Embedding, LayerNorm, Linear};
-use fusor2::{stack, Device, Error, Tensor};
-use fusor2_gguf::VarBuilder;
+use fusor::layers::{Embedding, LayerNorm, Linear};
+use fusor::{stack, Device, Error, Tensor};
+use fusor_gguf::VarBuilder;
 
 use super::transformer::TwoWayTransformer;
 use super::{channel_layer_norm, linear, load_dense, Result};
@@ -27,7 +27,7 @@ const UPSCALE_KERNEL_HW: [usize; 2] = [2, 2];
 /// (so no per-pixel accumulation is required).
 ///
 /// This is intentionally local to the SAM port rather than exposed as a
-/// generic fusor2 layer.
+/// generic fusor layer.
 struct SamPixelShuffleUpscale2x2 {
     weight: Tensor<4>,
     bias: Option<Tensor<1>>,

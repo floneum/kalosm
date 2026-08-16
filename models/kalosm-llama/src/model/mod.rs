@@ -6,11 +6,11 @@ use crate::token_stream::TokenOutputStreamError;
 use crate::tokenizer::{LlamaTokenizer, LlamaTokenizerError};
 #[cfg(feature = "hf-config-json")]
 use crate::LlamaConfigJson;
-use fusor2::device::Device;
-use fusor2_gguf::{ShardedVarBuilder, VarBuilder};
+use crate::WasmNotSync;
+use fusor::device::Device;
+use fusor_gguf::{ShardedVarBuilder, VarBuilder};
 #[cfg(feature = "vision")]
 use kalosm_language_model::ImageFetchError;
-use crate::WasmNotSync;
 use kalosm_model_types::{ModelLoadingProgress, WasmNotSend};
 use std::cmp::Ordering;
 use std::collections::BinaryHeap;
@@ -67,7 +67,7 @@ fn logits_from_sorted_top_k(logits: Vec<Logit>) -> Logits {
 }
 
 fn use_full_logits_for_sampling(_vocab_len: usize) -> bool {
-    // fusor2's device-resident sort is O(n^2) memory, which does not scale to
+    // fusor's device-resident sort is O(n^2) memory, which does not scale to
     // a real vocabulary; the host heap top-k over the full logits row is the
     // default. Set KALOSM_LLAMA_GPU_TOP_K=1 to opt in to the device path.
     let gpu_top_k_enabled = std::env::var_os("KALOSM_LLAMA_GPU_TOP_K")
@@ -256,7 +256,7 @@ impl ForwardTrace {
 }
 
 struct PreparedForwardLogits {
-    logits: fusor2::Tensor<2>,
+    logits: fusor::Tensor<2>,
     len: usize,
     trace: ForwardTrace,
 }
@@ -334,7 +334,7 @@ fn top_k_logits_from_full(logits: &[f32], k: usize) -> Vec<Logit> {
 pub enum LlamaModelError {
     /// An error from Fusor while running the model.
     #[error("Fusor error: {0}")]
-    Fusor(#[from] fusor2::Error),
+    Fusor(#[from] fusor::Error),
 
     /// An error from the tokenizer while running the model.
     #[error("Tokenizer error: {0}")]
@@ -488,8 +488,8 @@ impl LlamaModel {
                 // Parse every shard from its in-memory bytes.
                 let mut shards = Vec::new();
                 for bytes in model_bytes {
-                    let gguf = fusor2_gguf::Gguf::from_bytes(bytes)
-                        .map_err(LlamaSourceError::Device)?;
+                    let gguf =
+                        fusor_gguf::Gguf::from_bytes(bytes).map_err(LlamaSourceError::Device)?;
                     shards.push(VarBuilder::new(std::sync::Arc::new(gguf)));
                 }
 

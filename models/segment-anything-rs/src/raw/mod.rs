@@ -1,4 +1,4 @@
-//! Raw SAM model port to fusor2.
+//! Raw SAM model port to fusor.
 //!
 //! # GGUF tensor naming contract
 //!
@@ -11,9 +11,9 @@
 //! - All other naming is the upstream Meta SegmentAnything PyTorch layout
 //!   (`image_encoder.*`, `prompt_encoder.*`, `mask_decoder.*`).
 
-use fusor2::layers::{LayerNorm, Linear};
-use fusor2::{Device, Dim, Dtype, Error, QMatrix, Tensor};
-use fusor2_gguf::VarBuilder;
+use fusor::layers::{LayerNorm, Linear};
+use fusor::{Device, Dim, Dtype, Error, QMatrix, Tensor};
+use fusor_gguf::VarBuilder;
 
 pub mod image_encoder;
 pub mod mask_decoder;
@@ -25,11 +25,11 @@ pub mod transformer;
 /// Loading is the fallible boundary: it reads a file. Every `forward` below is
 /// infallible, because a rank or extent mismatch inside one is a bug in the
 /// port, not a condition a caller can act on.
-pub(crate) type Result<T> = fusor2::Result<T>;
+pub(crate) type Result<T> = fusor::Result<T>;
 
 /// One GGUF tensor as a dense `F32` value of the rank the model expects.
 ///
-/// `fusor2_gguf` reverses GGUF's fastest-varying-first extents at read, so
+/// `fusor_gguf` reverses GGUF's fastest-varying-first extents at read, so
 /// `raw.shape` is already row-major. `F16`/`BF16` entries are cast by
 /// `Tensor::from_raw_bytes`; a block-quantized entry goes through `QMatrix`
 /// and is dequantized on device.
@@ -63,7 +63,7 @@ pub(crate) fn linear(vb: &VarBuilder, device: &Device) -> Result<Linear> {
 }
 
 /// LayerNorm over the **channel** axis of a `(B, C, H, W)` tensor - Meta's
-/// `LayerNorm2d`. fusor2's `LayerNorm` normalizes the last axis, so this is a
+/// `LayerNorm2d`. fusor's `LayerNorm` normalizes the last axis, so this is a
 /// permute to channels-last, the last-axis norm, and the permute back; all
 /// three are views the compiler is free to fold.
 pub(crate) fn channel_layer_norm(ln: &LayerNorm, x: &Tensor<4>) -> Tensor<4> {

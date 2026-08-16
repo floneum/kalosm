@@ -1,7 +1,7 @@
 //! Top-level Sam model: ties together image encoder, prompt encoder, and mask decoder.
 
-use fusor2::{Device, Tensor};
-use fusor2_gguf::VarBuilder;
+use fusor::{Device, Tensor};
+use fusor_gguf::VarBuilder;
 
 use super::image_encoder::ImageEncoderViT;
 use super::mask_decoder::MaskDecoder;
@@ -190,9 +190,7 @@ impl Sam {
         let upscaled = low_res_mask.upsample_nearest2d(scale_h, scale_w);
 
         // Crop to original size: narrow on H and W dims
-        let cropped = upscaled
-            .narrow(2, 0, original_h)
-            .narrow(3, 0, original_w);
+        let cropped = upscaled.narrow(2, 0, original_h).narrow(3, 0, original_w);
 
         (cropped, iou)
     }
@@ -212,9 +210,8 @@ impl Sam {
         // batch_size = 1 but producing a `(1, 1, 2)` point tensor.
         let image_pe = self.prompt_encoder.get_dense_pe();
 
-        let points_data = (!points.is_empty()).then(|| {
-            build_point_tensors(&self.device, points, original_h, original_w, 1)
-        });
+        let points_data = (!points.is_empty())
+            .then(|| build_point_tensors(&self.device, points, original_h, original_w, 1));
 
         let points_ref = points_data.as_ref().map(|(pts, lbls)| (pts, lbls));
 

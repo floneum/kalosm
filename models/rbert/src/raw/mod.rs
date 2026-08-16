@@ -1,4 +1,4 @@
-// Adapted from an upstream BERT implementation, on fusor2's const-rank tensor.
+// Adapted from an upstream BERT implementation, on fusor's const-rank tensor.
 //
 // Ranks, once, for the whole module: token ids and the validity mask are
 // `[batch, seq]` u32, a hidden state is `[batch, seq, hidden]` f32, and an
@@ -26,8 +26,8 @@ pub mod qwen;
 
 pub use qwen::QwenEmbeddingModel;
 
-use fusor2::layers::Linear;
-use fusor2::{Device, Result, Tensor, VarBuilder};
+use fusor::layers::Linear;
+use fusor::{Device, Result, Tensor, VarBuilder};
 use serde::Deserialize;
 use std::fmt::Debug;
 

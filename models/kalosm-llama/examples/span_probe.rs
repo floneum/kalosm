@@ -5,7 +5,7 @@
 //! Runs the same model as `infer_local`, warms the decode plan, then arms the
 //! launcher's per-dispatch timestamp path and reports the element-wise MIN
 //! span per launch across measured tokens (a slow sample is contention, a
-//! fast one is the kernel). Run with `FUSOR2_DUMP_PLAN=1 2>plan.txt` and join
+//! fast one is the kernel). Run with `FUSOR_DUMP_PLAN=1 2>plan.txt` and join
 //! `SPAN i` lines to the dumped decode-plan `Li:` lines by index.
 
 use kalosm_llama::prelude::*;
@@ -24,7 +24,7 @@ fn main() {
         assert!(path.exists(), "model file not found: {}", path.display());
 
         let device = Device::gpu().await.unwrap();
-        let fusor2::session::Backend::Gpu(target) = device.backend().clone() else {
+        let fusor::session::Backend::Gpu(target) = device.backend().clone() else {
             unreachable!("gpu device is gpu");
         };
 
@@ -38,8 +38,9 @@ fn main() {
         let warm = 6usize;
         let measured = 10usize;
         let prompt = "Once upon a time there was a penguin named Peng.";
-        let mut story = model(prompt)
-            .with_sampler(GenerationParameters::new().with_max_length((warm + measured + 16) as u32));
+        let mut story = model(prompt).with_sampler(
+            GenerationParameters::new().with_max_length((warm + measured + 16) as u32),
+        );
 
         let mut spans: Option<Vec<f64>> = None;
         let mut totals: Vec<f64> = Vec::new();

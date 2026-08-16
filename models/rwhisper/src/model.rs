@@ -1,6 +1,6 @@
 use flate2::{write::ZlibEncoder, Compression};
-use fusor2::cache::TensorCache;
-use fusor2::{stack, Device, Error, Tensor};
+use fusor::cache::TensorCache;
+use fusor::{stack, Device, Error, Tensor};
 use futures_channel::mpsc::UnboundedSender;
 use rand::{
     distr::{weighted::WeightedIndex, Distribution},
@@ -30,9 +30,9 @@ enum ModelType {
 }
 
 impl ModelType {
-    fn load(weights: &[u8], device: &Device, config: Config) -> fusor2::Result<Self> {
-        let gguf = fusor2_gguf::Gguf::from_bytes(weights.to_vec())?;
-        let vb = fusor2::VarBuilder::new(std::sync::Arc::new(gguf));
+    fn load(weights: &[u8], device: &Device, config: Config) -> fusor::Result<Self> {
+        let gguf = fusor_gguf::Gguf::from_bytes(weights.to_vec())?;
+        let vb = fusor::VarBuilder::new(std::sync::Arc::new(gguf));
         Ok(Self::Quantized(crate::quantized::Whisper::load(
             device, &vb, config,
         )?))
@@ -59,7 +59,7 @@ pub enum WhisperLoadingError {
     DownloadingError(#[from] CacheError),
     /// An error that can occur when trying to load a [`Whisper`](crate::Whisper) model.
     #[error("Failed to load model into device: {0}")]
-    LoadModel(#[from] fusor2::Error),
+    LoadModel(#[from] fusor::Error),
     /// An error that can occur when trying to load the whisper tokenizer.
     #[error("Failed to load tokenizer: {0}")]
     LoadTokenizer(tokenizers::Error),
@@ -79,7 +79,7 @@ pub enum WhisperLoadingError {
 pub enum WhisperError {
     /// An error that can occur when trying to run a [`Whisper`] model.
     #[error("Fusor error: {0}")]
-    Fusor(#[from] fusor2::Error),
+    Fusor(#[from] fusor::Error),
     /// An error that can occur when encoding or decoding for a [`Whisper`] model.
     #[error("Tokenizer error: {0}")]
     Tokenizer(tokenizers::Error),
@@ -219,7 +219,7 @@ impl Decoder {
         device: &Device,
         language_token: Option<u32>,
         attention_heads: Option<&'static [[usize; 2]]>,
-    ) -> fusor2::Result<Self> {
+    ) -> fusor::Result<Self> {
         let no_timestamps_token = token_id(&tokenizer, NO_TIMESTAMPS_TOKEN)?;
         // Suppress the notimestamps token when in timestamps mode.
         // https://github.com/openai/whisper/blob/e8622f9afc4eba139bf796c210f5c01081000472/whisper/decoding.py#L452
@@ -232,8 +232,7 @@ impl Decoder {
                 }
             })
             .collect();
-        let suppress_tokens =
-            Tensor::from_slice(device, [suppress_tokens.len()], &suppress_tokens);
+        let suppress_tokens = Tensor::from_slice(device, [suppress_tokens.len()], &suppress_tokens);
         let sot_token = token_id(&tokenizer, SOT_TOKEN)?;
         let transcribe_token = token_id(&tokenizer, TRANSCRIBE_TOKEN)?;
         let translate_token = token_id(&tokenizer, TRANSLATE_TOKEN)?;
@@ -244,7 +243,7 @@ impl Decoder {
             .ok_or_else(|| err_msg("no_speech_token not found"))?;
         let timestamp_tokens = (0..=1500)
             .map(|i| token_id(&tokenizer, &format!("<|{:.2}|>", i as f32 * 0.02)))
-            .collect::<fusor2::Result<Vec<_>>>()?;
+            .collect::<fusor::Result<Vec<_>>>()?;
         let timestamp_token_range =
             *timestamp_tokens.first().unwrap()..=*timestamp_tokens.last().unwrap();
         debug_assert!(timestamp_tokens
@@ -719,7 +718,7 @@ impl Decoder {
     }
 }
 
-pub fn token_id(tokenizer: &Tokenizer, token: &str) -> fusor2::Result<u32> {
+pub fn token_id(tokenizer: &Tokenizer, token: &str) -> fusor::Result<u32> {
     match tokenizer.token_to_id(token) {
         None => Err(err_msg(format!("no token-id for {token}"))),
         Some(id) => Ok(id),

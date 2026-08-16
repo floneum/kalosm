@@ -1,7 +1,7 @@
 // Based on an upstream Whisper DTW implementation with optimizations and refactoring.
 // https://rtavenar.github.io/blog/dtw.html is a good resource for understanding the dtw algorithm
 
-use fusor2::{stack, Minus2, Tensor};
+use fusor::{stack, Minus2, Tensor};
 use std::num::NonZeroUsize;
 
 use crate::config::{HOP_LENGTH, N_FRAMES, SAMPLE_RATE};
@@ -106,7 +106,13 @@ fn dynamic_time_warp(matrix: Vec<Vec<f32>>) -> (Vec<f32>, Vec<f32>) {
     let mut cost = (0..n + 1)
         .map(|i| {
             (0..m + 1)
-                .map(|j| if i == 0 && j == 0 { 0.0f32 } else { f32::INFINITY })
+                .map(|j| {
+                    if i == 0 && j == 0 {
+                        0.0f32
+                    } else {
+                        f32::INFINITY
+                    }
+                })
                 .collect::<Box<[_]>>()
         })
         .collect::<Box<[_]>>();

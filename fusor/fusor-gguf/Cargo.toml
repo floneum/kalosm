@@ -1,0 +1,16 @@
+[package]
+name = "fusor-gguf"
+description = "fusor quantized block-format tables, GGUF parsing and VarBuilders"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+fusor-ir.workspace = true
+smallvec.workspace = true
+rustc-hash.workspace = true
+half.workspace = true
+memmap2.workspace = true

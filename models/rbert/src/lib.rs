@@ -44,13 +44,13 @@
 
 use std::sync::{Arc, RwLock};
 
-use fusor2::{Tensor, VarBuilder};
+use fusor::{Tensor, VarBuilder};
 use kalosm_common::*;
 use kalosm_model_types::ModelLoadingProgress;
 use tokenizers::{Encoding, PaddingDirection, PaddingParams, Tokenizer};
 
-/// The device handle models run on, re-exported from fusor2.
-pub use fusor2::Device;
+/// The device handle models run on, re-exported from fusor.
+pub use fusor::Device;
 
 mod language_model;
 mod raw;
@@ -133,7 +133,7 @@ pub enum BertLoadingError {
     DownloadingError(#[from] CacheError),
     /// An error that can occur when trying to load a Bert model.
     #[error("Failed to load model into device: {0}")]
-    LoadModel(#[from] fusor2::Error),
+    LoadModel(#[from] fusor::Error),
     /// An IO error that can occur when trying to load a bert model.
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
@@ -153,7 +153,7 @@ pub enum BertLoadingError {
 pub enum BertError {
     /// An error that can occur when trying to run a Bert model.
     #[error("Failed to run model: {0}")]
-    Fusor(#[from] fusor2::Error),
+    Fusor(#[from] fusor::Error),
     /// An error that can occur when tokenizing or detokenizing text.
     #[error("Failed to tokenize: {0}")]
     TokenizerError(tokenizers::Error),
@@ -344,7 +344,7 @@ impl Bert {
                 Err(_) => Device::cpu(),
             },
         };
-        let gguf = fusor2_gguf::parse::Gguf::from_bytes(weights_bytes)
+        let gguf = fusor_gguf::parse::Gguf::from_bytes(weights_bytes)
             .map_err(BertLoadingError::LoadModel)?;
         let vb = VarBuilder::new(Arc::new(gguf));
 
@@ -468,14 +468,14 @@ impl Bert {
             let ids = &ids[..max_seq_len.min(ids.len())];
             Tensor::<1, u32>::from_slice(device, [ids.len()], ids)
         });
-        let token_ids: Tensor<2, u32> = fusor2::stack(token_ids, 0);
+        let token_ids: Tensor<2, u32> = fusor::stack(token_ids, 0);
 
         let attention_masks = tokens.iter().map(|tokens| {
             let mask = tokens.get_attention_mask();
             let mask = &mask[..max_seq_len.min(mask.len())];
             Tensor::<1, u32>::from_slice(device, [mask.len()], mask)
         });
-        let attention_mask: Tensor<2, u32> = fusor2::stack(attention_masks, 0);
+        let attention_mask: Tensor<2, u32> = fusor::stack(attention_masks, 0);
 
         let embeddings = self.model.forward(&token_ids, Some(&attention_mask));
 

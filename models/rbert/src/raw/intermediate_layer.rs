@@ -1,5 +1,5 @@
-use fusor2::layers::Linear;
-use fusor2::{Device, Result, Tensor, VarBuilder};
+use fusor::layers::Linear;
+use fusor::{Device, Result, Tensor, VarBuilder};
 
 use super::{load_linear, HiddenActLayer};
 

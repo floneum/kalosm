@@ -8,7 +8,7 @@ use std::sync::{Arc, RwLock};
 pub enum LlamaSessionLoadingError {
     /// An error from Fusor while loading or saving a [`LlamaSession`].
     #[error("Fusor error: {0:?}")]
-    Fusor(#[from] fusor2::Error),
+    Fusor(#[from] fusor::Error),
     /// The chat messages deserialized from the session are invalid.
     #[error("Chat messages deserialized from the session are invalid")]
     InvalidChatMessages,

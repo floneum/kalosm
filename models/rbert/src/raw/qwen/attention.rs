@@ -1,6 +1,6 @@
-use fusor2::cache::MaskKind;
-use fusor2::layers::RmsNorm;
-use fusor2::{Device, Dim, Result, Tensor, VarBuilder};
+use fusor::cache::MaskKind;
+use fusor::layers::RmsNorm;
+use fusor::{Device, Dim, Result, Tensor, VarBuilder};
 
 use super::model::QwenRope;
 use super::QLinear;
@@ -94,7 +94,8 @@ impl QwenSelfAttention {
 
         // Apply RoPE to Q and K (Qwen uses the non-interleaved half layout).
         // One node rotating both, which is what `rope_normal_pair_fused` was.
-        let (query_states, key_states) = query_states.rope_pair(&key_states, &rope.cos, &rope.sin, 0);
+        let (query_states, key_states) =
+            query_states.rope_pair(&key_states, &rope.cos, &rope.sin, 0);
 
         // Scaled dot-product attention. Grouped-query attention is handled
         // structurally by the composite: no K/V head expansion here.

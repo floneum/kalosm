@@ -51,7 +51,7 @@ use kalosm_model_types::FutureWasmNotSend;
 use kalosm_model_types::ModelLoadingProgress;
 use kalosm_model_types::WasmNotSend;
 
-/// `Sync` on native targets, nothing on wasm — the marker the old fusor facade
+/// `Sync` on native targets, nothing on wasm — the marker the former facade
 /// exported under this name.
 #[cfg(not(target_arch = "wasm32"))]
 #[doc(hidden)]
@@ -80,8 +80,8 @@ pub(crate) type LlamaImage = ();
 /// Re-export half::f16 for users who want to use f16 activation types
 pub use half::f16;
 
-/// Re-export the fusor2 device handle used to run the model.
-pub use fusor2::device::Device;
+/// Re-export the fusor device handle used to run the model.
+pub use fusor::device::Device;
 
 /// A prelude of commonly used items in kalosm-llama.
 pub mod prelude {
