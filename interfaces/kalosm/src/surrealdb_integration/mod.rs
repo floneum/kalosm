@@ -88,7 +88,7 @@ impl<C: Connection, R> EmbeddingIndexedTable<C, R> {
 
     /// Get the name of the table that links embedding ids to byte ranges in documents.
     pub fn table_links(&self) -> String {
-        format!("{}-links", &self.table)
+        format!("{}-links", self.table)
     }
 
     /// Get the raw vector database.
