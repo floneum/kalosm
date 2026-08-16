@@ -332,7 +332,7 @@ mod tests {
         assert_eq!(
             before,
             names.len(),
-            "a case name is registered twice; `run_case` would run both"
+            "a case name is registered twice; the registry would run both"
         );
     }
 

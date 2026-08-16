@@ -22,8 +22,8 @@ use crate::tensor::Tensor;
 /// the non-overlapping case whose adjoint is a mask.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PoolSize {
-    pub size: u32,
-    pub stride: u32,
+    size: u32,
+    stride: u32,
 }
 
 impl PoolSize {
@@ -249,7 +249,7 @@ mod tests {
             })
             .unwrap()
             .expect("a sugar node");
-        match g.handle().attrs_of(attrs).unwrap() {
+        match g.handle().state().attrs.lock()[attrs.0 as usize].clone() {
             MacroAttr::Pool { windows, reduce } => {
                 assert_eq!(reduce, PoolReduce::Max);
                 assert!(windows[0].is_non_overlapping());

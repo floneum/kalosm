@@ -2,7 +2,7 @@
 //! host reference. No probe touches the e-graph; `q/k/v` are never read back
 //! before the attention is built.
 
-use fusor2::composite::attention::attention;
+use fusor2::composite::attention;
 use fusor2::{Session, };
 use fusor2::tensor::Dyn as Tensor;
 use fusor2_conformance::harness::{dims, is_gpu, sessions};

@@ -218,7 +218,7 @@ fn diff_field(plan_field: &str, launch_sigs: &[String], inc: &[usize]) -> String
 
 impl ArmSet {
     fn metadata(graph: &GraphRef, incumbent: &Arc<Plan>) -> Self {
-        let g = graph.egraph.lock();
+        let g = graph.state().egraph.lock();
         let launch_sigs: Vec<String> = incumbent
             .launches
             .iter()
@@ -477,7 +477,7 @@ impl Session {
             set.arms.clear();
             while let Some(ix) = set.pending.pop() {
                 let labels = {
-                    let g = graph.egraph.lock();
+                    let g = graph.state().egraph.lock();
                     self.inner.extractor.launch_variant_labels(
                         &g,
                         incumbent,
@@ -617,7 +617,7 @@ impl Session {
         let ix = set.arms[i].ix;
         let label = set.arms[i].label.clone();
         let plan = {
-            let g = graph.egraph.lock();
+            let g = graph.state().egraph.lock();
             self.inner.extractor.replan_with_variants(
                 &g,
                 roots,
@@ -814,7 +814,7 @@ impl Session {
     ) -> bool {
         let tune = &self.inner.tune;
         let (sigs, mut labels) = {
-            let g = graph.egraph.lock();
+            let g = graph.state().egraph.lock();
             let sigs: Vec<String> = incumbent
                 .launches
                 .iter()
@@ -847,7 +847,7 @@ impl Session {
         // back to the sequential loop.
         if !winners.is_empty() {
             let batch = {
-                let g = graph.egraph.lock();
+                let g = graph.state().egraph.lock();
                 self.inner
                     .extractor
                     .replan_with_variants(
@@ -892,7 +892,7 @@ impl Session {
                     continue;
                 };
                 let variants = {
-                    let g = graph.egraph.lock();
+                    let g = graph.state().egraph.lock();
                     self.inner.extractor.launch_variants(
                         &g,
                         roots,
@@ -927,7 +927,7 @@ impl Session {
         'diff: while rounds < DIFF_SCAN_TOP_K {
             rounds += 1;
             let (sigs, labels, works) = {
-                let g = graph.egraph.lock();
+                let g = graph.state().egraph.lock();
                 let sigs: Vec<String> = current
                     .launches
                     .iter()
@@ -949,7 +949,7 @@ impl Session {
             order.sort_by_key(|&j| (std::cmp::Reverse(works[j]), j));
             for &j in order.iter().take(DIFF_SCAN_TOP_K) {
                 let variants = {
-                    let g = graph.egraph.lock();
+                    let g = graph.state().egraph.lock();
                     self.inner.extractor.launch_variants(
                         &g,
                         roots,

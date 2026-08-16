@@ -528,10 +528,10 @@ impl Whisper {
     ) -> Result<()> {
         let mut batch: Vec<Dyn> = Vec::new();
         for block in &cache.blocks {
-            if let Some(k) = block.attn.kv_cache.k.current() {
+            if let Some(k) = block.attn.kv_cache.k() {
                 batch.push(k.clone().into_dyn());
             }
-            if let Some(v) = block.attn.kv_cache.v.current() {
+            if let Some(v) = block.attn.kv_cache.v() {
                 batch.push(v.clone().into_dyn());
             }
             if !cache.cross_detached {
@@ -553,12 +553,7 @@ impl Whisper {
         }
         self.device.session().resolve(&batch)?;
         for block in &mut cache.blocks {
-            if let Some(k) = block.attn.kv_cache.k.current().cloned() {
-                block.attn.kv_cache.k.data = Some(k.detach());
-            }
-            if let Some(v) = block.attn.kv_cache.v.current().cloned() {
-                block.attn.kv_cache.v.data = Some(v.detach());
-            }
+            block.attn.kv_cache.detach();
             if !cache.cross_detached {
                 if let Some((k, v)) = block.feature_attn_cache.clone() {
                     block.feature_attn_cache = Some((k.detach(), v.detach()));
@@ -567,9 +562,7 @@ impl Whisper {
         }
         if let Some(outputs) = attention_output.as_deref_mut() {
             for out in outputs {
-                if let Some(t) = out.current().cloned() {
-                    out.data = Some(t.detach());
-                }
+                out.detach();
             }
         }
         cache.cross_detached = true;

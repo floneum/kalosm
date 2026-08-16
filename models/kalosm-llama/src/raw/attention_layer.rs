@@ -323,7 +323,7 @@ impl LlamaAttention {
                 // cannot be materialized as a resolve root, which the
                 // post-step detach needs it to be. `mul_scalar(1.0)` mints a
                 // map member the extractor can land in a buffer.
-                let (key_states, value_states) = if cache.k.is_empty() {
+                let (key_states, value_states) = if cache.is_empty() {
                     (key_states.mul_scalar(1.0), value_states.mul_scalar(1.0))
                 } else {
                     (key_states, value_states)
@@ -333,10 +333,7 @@ impl LlamaAttention {
                 // on decode (`q_len == 1`) evicting *before* attention leaves
                 // exactly the keys the window admits, so no mask is needed.
                 if let (Some(window), 1) = (self.sliding_window_size, q_len) {
-                    (
-                        cache.k.keep_last(window as u64).unwrap_or(k),
-                        cache.v.keep_last(window as u64).unwrap_or(v),
-                    )
+                    cache.keep_last(window as u64).unwrap_or((k, v))
                 } else {
                     (k, v)
                 }
@@ -353,8 +350,7 @@ impl LlamaAttention {
         if q_len > 1 {
             if let (Some(window), Some(cache)) = (self.sliding_window_size, cache.as_deref_mut()) {
                 if !cache.is_fixed() {
-                    cache.k.keep_last(window as u64);
-                    cache.v.keep_last(window as u64);
+                    cache.keep_last(window as u64);
                 }
             }
         }

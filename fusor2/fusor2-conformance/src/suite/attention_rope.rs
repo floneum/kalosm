@@ -6,11 +6,9 @@
 //! uploaded, so a lowering that silently needs one fails here rather than
 //! reading garbage.
 
-use fusor2::composite::attention::{
+use fusor2::composite::{
     attention, attention_causal, attention_grads, attention_lse, attention_masked,
     attention_with_lse,
-};
-use fusor2::composite::rope::{
     base_inverse_frequency, rope, rope_interleaved, rope_interleaved_pair,
     rope_interleaved_pair_with_position, rope_interleaved_with_position, rope_pair,
     rope_pair_with_position, rope_with_position, rotate_half,

@@ -50,15 +50,6 @@ mod trainer_surface;
 
 pub use device::Device;
 pub use tensor::typed::{Axis, Element, Minus1, Minus2, Tensor, cat, stack};
-/// Axis-selector spelling: `t.sum::<2>(D::Minus1)`. Same items as the root
-/// `Minus1`/`Minus2`. Generic bounds written against a `Dim` selector trait
-/// port with `use fusor2::Axis as Dim;`.
-#[allow(non_snake_case)]
-pub mod D {
-    pub use crate::tensor::typed::{Minus1, Minus2};
-}
-/// Alias for [`tensor::typed::Element`].
-pub use tensor::typed::SimdElement;
 
 pub use graph::Graph;
 pub use quantized::QMatrix;
@@ -70,7 +61,3 @@ pub use fusor2_gguf::{ShardedVarBuilder, VarBuilder};
 pub use fusor2_ir::dtype::Dtype;
 pub use fusor2_ir::shape::Dim;
 pub use fusor2_ir::{Error, Result};
-
-// Reference-spelling re-exports pointing at the same items.
-pub use cache::{MaskKind, RopeCache};
-pub use composite::rope::base_inverse_frequency;

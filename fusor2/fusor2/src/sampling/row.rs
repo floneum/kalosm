@@ -14,11 +14,11 @@
 //! [`sort_desc`].
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock, Weak};
+use std::sync::{Mutex, OnceLock};
 
 use fusor2_ir::egraph::Id;
 
-use crate::graph::{GraphInner, GraphRef};
+use crate::graph::{GraphRef, WeakGraphRef};
 use crate::tensor::Tensor;
 use crate::{Dim, Dtype, Error, Result};
 
@@ -99,7 +99,7 @@ impl Fixed {
     }
 }
 
-type Constants = Mutex<Vec<(Weak<GraphInner>, HashMap<Fixed, Id>)>>;
+type Constants = Mutex<Vec<(WeakGraphRef, HashMap<Fixed, Id>)>>;
 
 /// The per-graph constant pool.
 ///
@@ -354,7 +354,7 @@ pub(crate) fn unit_random_at(seed: u64, step: u64) -> f32 {
 /// Entries hold the token's `Id` and a [`Weak`] graph handle rather than the
 /// `Tensor`: a `Tensor` owns a `GraphRef`, so parking one here would keep its
 /// graph alive forever and the pruning below would never fire.
-type History = Mutex<Vec<(Weak<GraphInner>, Vec<Id>)>>;
+type History = Mutex<Vec<(WeakGraphRef, Vec<Id>)>>;
 
 fn history() -> &'static History {
     static HISTORY: OnceLock<History> = OnceLock::new();

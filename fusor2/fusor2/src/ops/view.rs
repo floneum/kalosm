@@ -7,7 +7,7 @@ use std::ops::Range;
 
 use fusor2_ir::ir::logical::Logical;
 use fusor2_ir::shape::{
-    BoundsProof, Dim, Dims, Layout, SlidingWindow, StrideSpec, SymId, reshape_specs,
+    BoundsProof, Dim, Dims, SlidingWindow, StrideSpec, SymId, reshape_specs,
     singleton_spec,
 };
 
@@ -445,80 +445,6 @@ impl Tensor {
         self.sliding_window_view(&[SlidingWindow::new(axis, window, step)])
     }
 
-    /// Set the view wholesale from a precomputed [`Layout`].
-    ///
-    /// This is `attention_grads`' dk/dv aliasing escape hatch. One
-    /// [`StrideSpec`] is derived per output axis by finding an input axis
-    /// whose stride divides the target stride; the offset delta is decomposed
-    /// in the input's row-major basis and attached to specs naming the
-    /// corresponding axes. The input is taken to be contiguous over its own
-    /// shape — the real layout is an extraction decision the frontend cannot
-    /// see.
-    pub fn restride_layout(&self, target: &Layout) -> Result<Tensor> {
-        let input = Layout::contiguous(&self.shape());
-        let in_strides: Vec<u64> = input
-            .strides()
-            .iter()
-            .map(|d| d.as_const().unwrap_or(0))
-            .collect();
-
-        let mut specs: Vec<StrideSpec> = Vec::with_capacity(target.rank());
-        for (a, (&size, &stride)) in target.shape().iter().zip(target.strides()).enumerate() {
-            let want = stride.as_const().ok_or_else(|| {
-                Error::Shape(format!("restride_layout: axis {a} has a symbolic stride"))
-            })?;
-            if want == 0 {
-                specs.push(StrideSpec::broadcast(size));
-                continue;
-            }
-            // Prefer the largest divisor, i.e. the smallest multiplier.
-            let pick = (0..in_strides.len())
-                .filter(|&d| in_strides[d] != 0 && want % in_strides[d] == 0)
-                .max_by_key(|&d| in_strides[d]);
-            let Some(d) = pick else {
-                return Err(Error::Shape(format!(
-                    "restride_layout: no input stride divides target stride {want} on axis {a}"
-                )));
-            };
-            let mult = want / in_strides[d];
-            let mult = u32::try_from(mult).map_err(|_| {
-                Error::Shape(format!("restride_layout: multiplier {mult} exceeds u32"))
-            })?;
-            specs.push(StrideSpec::dim_with(d as u32, size, mult));
-        }
-
-        // Distribute the offset delta over the specs that name each axis.
-        let mut delta = target
-            .offset()
-            .as_const()
-            .ok_or_else(|| Error::Shape("restride_layout: symbolic offset".into()))?;
-        for d in 0..in_strides.len() {
-            if delta == 0 {
-                break;
-            }
-            let s = in_strides[d];
-            if s == 0 || delta < s {
-                continue;
-            }
-            let digit = delta / s;
-            let slot = specs.iter().position(|sp| {
-                sp.multiplier != 0 && sp.input_dim as usize == d && sp.offset.known_eq(Dim::Const(0))
-            });
-            let Some(slot) = slot else {
-                return Err(Error::Shape(format!(
-                    "restride_layout: offset component {digit} on axis {d} has no spec to carry it"
-                )));
-            };
-            specs[slot] = specs[slot].with_offset(Dim::Const(digit));
-            delta -= digit * s;
-        }
-        if delta != 0 {
-            return Err(Error::Shape(format!(
-                "restride_layout: {delta} of the offset is not expressible"
-            )));
-        }
-        self.restride(&specs)
-    }
 }
 
 #[cfg(test)]

@@ -13,8 +13,8 @@ use crate::{Error, Result, Tensor};
 /// The weight is `[out, in]`; the activation's rank is [`Linear::forward`]'s,
 /// so one loaded layer serves a rank-2 and a rank-3 call in the same model.
 pub struct Linear<T: Element = f32> {
-    pub weight: Tensor<2, T>,
-    pub bias: Option<Tensor<1, T>>,
+    weight: Tensor<2, T>,
+    bias: Option<Tensor<1, T>>,
 }
 
 impl<T: Element> Linear<T> {

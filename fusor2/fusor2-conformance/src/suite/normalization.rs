@@ -537,11 +537,11 @@ fn welford_carrier(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .variance_last()
         .map_err(|e| -> CaseError { e.to_string().into() })?;
     let naive = x
-        .square()
+        .sqr()
         .and_then(|s| s.mean(1))
         .and_then(|ms| {
             let m = x.mean(1)?;
-            ms.sub(&m.square()?)
+            ms.sub(&m.sqr()?)
         })
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 

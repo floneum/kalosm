@@ -60,7 +60,7 @@ fn main() {
             ("causal", fusor2::cache::MaskKind::Causal),
         ] {
             let before = fusor2::session::wrong_member_count();
-            let o = fusor2::composite::attention::attention(&q, &k, &v, mask, None)
+            let o = fusor2::composite::attention(&q, &k, &v, mask, None)
                 .expect("attention build");
             let host = o.to_vec_f32().expect("resolve");
             let wrong = fusor2::session::wrong_member_count() - before;

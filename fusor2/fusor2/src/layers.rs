@@ -1,11 +1,11 @@
 //! Parameterized layers. Each is a thin struct over a few `Tensor` parameters
 //! and a `forward`; none of them owns a kernel.
 
-pub mod conv;
-pub mod embedding;
-pub mod layer_norm;
-pub mod linear;
-pub mod rms_norm;
+pub(crate) mod conv;
+pub(crate) mod embedding;
+pub(crate) mod layer_norm;
+pub(crate) mod linear;
+pub(crate) mod rms_norm;
 
 pub use conv::ConvNd;
 pub use embedding::Embedding;

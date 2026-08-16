@@ -21,11 +21,11 @@ use crate::{
 // § 2. Modules.
 use crate::autograd::{BackwardTarget, GradientSlot, Parent};
 use crate::cache::{AttentionMask, KvCache, MaskCache, MaskKind, RopeCache, TensorCache};
-use crate::composite::attention::{attention, attention_causal, attention_masked};
-use crate::composite::conv::{conv, grouped_conv, pad_with_zeros};
-use crate::composite::pool::{pool_avg, pool_max, pool_min};
-use crate::composite::rope::{base_inverse_frequency, rope, rope_interleaved};
-use crate::composite::upsample::{upsample_bilinear, upsample_nearest2d};
+use crate::composite::{
+    attention, attention_causal, attention_masked, base_inverse_frequency, conv, grouped_conv,
+    pad_with_zeros, pool_avg, pool_max, pool_min, rope, rope_interleaved, upsample_bilinear,
+    upsample_nearest2d,
+};
 use crate::device::{Cpu, Gpu, KernelProfile, KernelProfileRow};
 use crate::graph::{Gradients, GraphRef};
 use crate::layers::{ConvNd, Embedding, LayerNorm, LayerNormNd, Linear, RmsNorm};
@@ -34,8 +34,7 @@ use crate::quantized::QMatrix as QMatrixByModulePath;
 use crate::sampling::{GpuSampledToken, Mirostat2Sampler, StandardSamplerParams, top_k_pairs};
 use crate::session::Backend;
 use crate::tensor::{
-    Dyn, Extent, IndexOp, RoundMode, SimdElement, TensorIndex, TensorSlice, Typed, arange,
-    arange_step,
+    Dyn, Extent, IndexOp, RoundMode, TensorIndex, TensorSlice, arange, arange_step,
 };
 
 /// The three claims that are about *identity*, not existence, and that a

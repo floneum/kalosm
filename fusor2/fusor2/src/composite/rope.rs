@@ -30,7 +30,7 @@ pub fn base_inverse_frequency(dim: u32, theta: f32) -> Vec<f32> {
 
 /// Which elements pair with which.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum Pairing {
+enum Pairing {
     /// `(i, i + Dh/2)`.
     Halves,
     /// `(2i, 2i + 1)`.

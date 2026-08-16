@@ -216,11 +216,6 @@ fn bilinear_taps(src: u64, dst: u64, align_corners: bool) -> (Vec<u32>, Vec<u32>
     (lo, hi, frac)
 }
 
-/// Preserved alias for the reference's `resize`.
-pub fn resize(x: &Tensor, size: &[Dim]) -> Result<Tensor> {
-    upsample_nearest(x, size)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

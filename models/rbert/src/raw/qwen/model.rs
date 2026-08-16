@@ -95,7 +95,7 @@ pub(crate) struct QwenRope {
 impl QwenRope {
     fn new(device: &Device, head_dim: usize, context_length: usize, theta: f32) -> Self {
         let inverse_frequency =
-            fusor2::composite::rope::base_inverse_frequency(head_dim as u32, theta);
+            fusor2::composite::base_inverse_frequency(head_dim as u32, theta);
         let half = inverse_frequency.len();
         let mut sin = Vec::with_capacity(context_length * half);
         let mut cos = Vec::with_capacity(context_length * half);

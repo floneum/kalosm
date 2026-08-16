@@ -134,9 +134,6 @@ impl Reverse {
         }
     }
 
-    pub fn topology(&self) -> Option<&Topology> {
-        self.topo.as_deref()
-    }
 }
 
 impl Autograd for Reverse {
@@ -195,14 +192,6 @@ pub fn backward_into_with(
     let topo = Topology::of(graph);
     let mut tape = GraphTape::new(graph);
     walk(&topo, Some(custom), &mut tape, root, seed, wrt)
-}
-
-/// Reverse topological order of the primal subgraph reaching `root`. Ids are
-/// monotone, so this is a descending id scan — no DFS, no visited stack
-/// beyond one bitset. Reachability is applied by the caller.
-pub fn reverse_order(root: Val, len: usize) -> Vec<Val> {
-    let top = (root.index() + 1).min(len);
-    (0..top).rev().map(|i| Id(i as u32)).collect()
 }
 
 fn walk(
@@ -762,13 +751,6 @@ mod tests {
         assert_eq!(build(), build());
     }
 
-    #[test]
-    fn reverse_order_is_a_descending_id_scan() {
-        assert_eq!(
-            reverse_order(Id(2), 5),
-            vec![Id(2), Id(1), Id(0)]
-        );
-    }
 }
 
 #[cfg(test)]

@@ -129,20 +129,10 @@ impl Tensor {
         self.var(axis)?.unsqueeze(axis)
     }
 
-    /// Reference spelling of [`Tensor::var`].
-    pub fn variance(&self, axis: usize) -> Result<Tensor> {
-        self.var(axis)
-    }
-
     /// Sum every element into a rank-0 value.
     pub fn sum_all(&self) -> Result<Tensor> {
         self.flatten_all()?.sum(0)
     }
-    /// Mean of every element, rank 0.
-    pub fn mean_all(&self) -> Result<Tensor> {
-        self.flatten_all()?.mean(0)
-    }
-
     /// `1` where any element along `axis` is nonzero.
     pub fn any(&self, axis: usize) -> Result<Tensor> {
         self.ne_scalar(Scalar::Lit(crate::tensor::splat_zero(self.dtype())))?

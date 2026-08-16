@@ -656,14 +656,18 @@ pub fn geometry(theta: Option<SchedPoint>, space: &IndexSpace, caps: &Caps) -> G
 /// The 3-D fold against `max_compute_workgroups_per_dimension`. **Slab count
 /// first, then size x**: saturating x instead leaves the last slab nearly
 /// empty and every extra group still runs the prologue.
-pub fn distribute_workgroups(total: u64, max: u32) -> [u32; 3] {
-    if total == 0 {
-        return [0, 0, 0];
+pub fn distribute_workgroups(total: impl Into<u64>, max_per_dim: u32) -> [u32; 3] {
+    let total = total.into();
+    let max = u64::from(max_per_dim.max(1));
+    if total <= max {
+        return [total as u32, 1, 1];
     }
-    let max = max.max(1) as u64;
-    let y = total.div_ceil(max).min(max).max(1);
-    let x = total.div_ceil(y).min(max).max(1);
-    let z = total.div_ceil(x * y).min(max).max(1);
+    let y = total.div_ceil(max).min(max);
+    let x = total.div_ceil(y).min(max);
+    let z = total
+        .div_ceil(x.saturating_mul(y))
+        .min(u64::from(u32::MAX))
+        .max(1);
     [x as u32, y as u32, z as u32]
 }
 
@@ -1698,12 +1702,25 @@ mod tests {
 
     #[test]
     fn distribute_picks_the_slab_count_first() {
-        // 122,880 groups must not launch [65535, 2, 1].
-        let g = distribute_workgroups(122_880, 65_535);
-        assert_eq!(g[1], 2);
-        assert_eq!(g[0], 61_440);
-        assert_eq!(g[2], 1);
-        let slack = g[0] as u64 * g[1] as u64 * g[2] as u64 - 122_880;
-        assert!(slack < g[0] as u64, "slack must stay under one slab");
+        const MAX: u32 = 65_535;
+        assert_eq!(distribute_workgroups(0u32, MAX), [0, 1, 1]);
+        assert_eq!(distribute_workgroups(6u32, 4), [3, 2, 1]);
+        assert_eq!(distribute_workgroups(6u32, 1), [1, 1, 6]);
+        for total in (0..3_000_000u32).step_by(1409).chain([0, 1]) {
+            let [x, y, z] = distribute_workgroups(total, MAX);
+            assert!(x <= MAX && y <= MAX && z <= MAX, "{total} exceeds the limit");
+            let launched = u64::from(x) * u64::from(y) * u64::from(z);
+            assert!(launched >= u64::from(total), "{total} is not covered");
+            if total != 0 {
+                assert!(
+                    launched - u64::from(total) < u64::from(x),
+                    "{total} launches {launched} = {x}x{y}x{z}, slack is a full slab"
+                );
+            }
+        }
+        let [x, y, z] = distribute_workgroups(u32::MAX, MAX);
+        assert!(x <= MAX && y <= MAX && z <= MAX);
+        assert!(u64::from(x) * u64::from(y) * u64::from(z) >= u64::from(u32::MAX));
+        assert_eq!(distribute_workgroups(122_880u32, MAX), [61_440, 2, 1]);
     }
 }

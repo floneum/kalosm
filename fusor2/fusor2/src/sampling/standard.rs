@@ -21,7 +21,7 @@ pub struct StandardSamplerParams {
     /// keeps everything.
     pub min_p: f32,
     /// Above `1.0`, push down the logit of a token already drawn on this
-    /// graph. See [`row::apply_repetition_penalty`].
+    /// graph.
     pub repetition_penalty: f32,
     /// The draw is a pure function of this seed.
     pub seed: u64,

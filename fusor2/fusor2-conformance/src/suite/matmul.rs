@@ -167,7 +167,7 @@ fn qkv_triple(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let bi = upload(graph.handle(), &dims(&[1, cout]), &bias[i])?;
         outs.push(
             a.matmul(&wi)
-                .and_then(|y| y.broadcast_add(&bi))
+                .and_then(|y| y.add_(&bi))
                 .map_err(|e| -> CaseError { e.to_string().into() })?,
         );
     }
@@ -394,7 +394,7 @@ fn broadcast_bias(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let c = upload(graph.handle(), &dims(&[n as u64]), &bias)?;
     let y = a
         .matmul(&b)
-        .and_then(|p| p.broadcast_add(&c))
+        .and_then(|p| p.add_(&c))
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let product = host_matmul(&a_data, &b_data, 1, m, k, n);

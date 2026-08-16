@@ -4,7 +4,10 @@
 //! proves the adjoint is an elementwise mask-and-broadcast, i.e. the adjoint
 //! graph contains no `Scatter` node.
 
-use fusor2::composite::pool::PoolSize;
+use fusor2::composite::{
+    PoolSize, conv, grouped_conv as grouped_conv_op, pool_avg, pool_max, pool_min,
+    upsample_nearest,
+};
 use fusor2::{Dim, Dtype, Session};
 
 use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
@@ -161,7 +164,7 @@ fn conv1d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     )?;
     let b = upload(graph.handle(), &dims(&[out_ch as u64]), &b_data)?;
 
-    let y = fusor2::composite::conv::conv(&x, &w, Some(&b), &[1], &[k as u32 / 2], &[1])
+    let y = conv(&x, &w, Some(&b), &[1], &[k as u32 / 2], &[1])
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let (out_len, expected) = host_conv1d(
@@ -198,7 +201,7 @@ fn conv1d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
             probe,
         )?;
         let b = upload(g.handle(), &dims(&[out_ch as u64]), &b_data)?;
-        let y = fusor2::composite::conv::conv(&x, &w, Some(&b), &[1], &[k as u32 / 2], &[1])
+        let y = conv(&x, &w, Some(&b), &[1], &[k as u32 / 2], &[1])
             .map_err(|e| -> CaseError { e.to_string().into() })?;
         read_scalar(&loss_of(&y)?)
     })?;
@@ -229,7 +232,7 @@ fn conv2d_strided(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         &dims(&[out_ch as u64, in_ch as u64, k as u64, k as u64]),
         &w_data,
     )?;
-    let y = fusor2::composite::conv::conv(&x, &w, None, &[2, 2], &[0, 0], &[1, 1])
+    let y = conv(&x, &w, None, &[2, 2], &[0, 0], &[1, 1])
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let out_h = (h - k) / 2 + 1;
@@ -296,7 +299,7 @@ fn grouped_conv(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         &w_data,
     )?;
     let y =
-        fusor2::composite::conv::grouped_conv(&x, &w, None, &[1], &[1], &[1], groups as u32)
+        grouped_conv_op(&x, &w, None, &[1], &[1], &[1], groups as u32)
             .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let out_len = len + 2 - k + 1;
@@ -347,9 +350,9 @@ fn pool_case(session: &Session, kind: Pool, shape: &[u64], seed: u32) -> CaseRes
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(&[1, ch as u64, len as u64]), &data)?;
     let y = match kind {
-        Pool::Max => fusor2::composite::pool::pool_max(&x, &[PoolSize::new(window, window)]),
-        Pool::Min => fusor2::composite::pool::pool_min(&x, &[PoolSize::new(window, window)]),
-        Pool::Avg => fusor2::composite::pool::pool_avg(&x, &[PoolSize::new(window, window)]),
+        Pool::Max => pool_max(&x, &[PoolSize::new(window, window)]),
+        Pool::Min => pool_min(&x, &[PoolSize::new(window, window)]),
+        Pool::Avg => pool_avg(&x, &[PoolSize::new(window, window)]),
     }
     .map_err(|e| -> CaseError { e.to_string().into() })?;
 
@@ -388,7 +391,7 @@ fn non_overlapping_adjoint_is_mask(session: &Session) -> CaseResult {
 
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(&[1, 1, LEN as u64]), &data)?;
-    let y = fusor2::composite::pool::pool_max(&x, &[PoolSize::new(WINDOW, WINDOW)])
+    let y = pool_max(&x, &[PoolSize::new(WINDOW, WINDOW)])
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let grad = gradient_of(&graph, &y, &x)?;
@@ -442,7 +445,7 @@ fn upsample_nearest2d(session: &Session, shape: &[u64], seed: u32) -> CaseResult
 
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(&[1, c, h, w]), &data)?;
-    let y = fusor2::composite::upsample::upsample_nearest(
+    let y = upsample_nearest(
         &x,
         &[
             Dim::Const(1),

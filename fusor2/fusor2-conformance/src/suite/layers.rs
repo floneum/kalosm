@@ -7,7 +7,7 @@
 //! holds. A layer whose bias never receives a gradient trains to a plausible
 //! but wrong model, and only the second assertion catches it.
 
-use fusor2::composite::loss::{
+use fusor2::composite::{
     binary_cross_entropy_with_logits, distillation_loss, mse, softmax_cross_entropy,
 };
 use fusor2::layers::{Embedding, LayerNorm, LayerNormNd, Linear, RmsNorm};
@@ -533,7 +533,7 @@ fn mlp_step(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
             .relu()
             .map_err(|e| -> CaseError { e.to_string().into() })?;
         let out_v = hidden
-            .broadcast_mul(&b)
+            .mul_(&b)
             .and_then(|v| v.sqr())
             .map_err(|e| -> CaseError { e.to_string().into() })?;
         let loss = crate::suite::support::loss_of(&out_v)?;

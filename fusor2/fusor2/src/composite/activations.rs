@@ -41,7 +41,7 @@ fn clamp(x: ScalarExpr, lo: ScalarExpr, hi: ScalarExpr) -> ScalarExpr {
 // exact tree the frontend emits, and conformance can compare two spellings.
 
 /// `max(x, 0)`.
-pub fn relu_expr(dtype: Dtype) -> Result<ScalarExpr> {
+fn relu_expr(dtype: Dtype) -> Result<ScalarExpr> {
     Ok(ScalarExpr::bin(
         BinOp::Max,
         ScalarExpr::arg(0, dtype),
@@ -50,14 +50,14 @@ pub fn relu_expr(dtype: Dtype) -> Result<ScalarExpr> {
 }
 
 /// `1 / (1 + exp(-x))`.
-pub fn sigmoid_expr(dtype: Dtype) -> Result<ScalarExpr> {
+fn sigmoid_expr(dtype: Dtype) -> Result<ScalarExpr> {
     let x = ScalarExpr::arg(0, dtype);
     let e = ScalarExpr::un(UnOp::Exp, ScalarExpr::un(UnOp::Neg, x));
     Ok(div(lit(dtype, 1.0)?, add(lit(dtype, 1.0)?, e)))
 }
 
 /// `x / (1 + exp(-x))`.
-pub fn silu_expr(dtype: Dtype) -> Result<ScalarExpr> {
+fn silu_expr(dtype: Dtype) -> Result<ScalarExpr> {
     let x = ScalarExpr::arg(0, dtype);
     let e = ScalarExpr::un(UnOp::Exp, ScalarExpr::un(UnOp::Neg, x.clone()));
     Ok(div(x, add(lit(dtype, 1.0)?, e)))
@@ -66,7 +66,7 @@ pub fn silu_expr(dtype: Dtype) -> Result<ScalarExpr> {
 /// `(e^x - e^-x) / (e^x + e^-x)`, written out instead of the driver's `tanh`:
 /// WARP under-saturates the negative tail of the native `tanh` and the GELU
 /// tail depends on it.
-pub fn tanh_exact_expr(dtype: Dtype) -> Result<ScalarExpr> {
+fn tanh_exact_expr(dtype: Dtype) -> Result<ScalarExpr> {
     Ok(tanh_exact_of(ScalarExpr::arg(0, dtype)))
 }
 
@@ -83,7 +83,7 @@ fn tanh_exact_of(x: ScalarExpr) -> ScalarExpr {
 /// with `1 + tanh` clamped to `[0, 2]`.
 ///
 /// The clamps are what keep the value finite at +/-20 on every driver.
-pub fn gelu_expr(dtype: Dtype) -> Result<ScalarExpr> {
+fn gelu_expr(dtype: Dtype) -> Result<ScalarExpr> {
     let x = ScalarExpr::arg(0, dtype);
     let x3 = mul(x.clone(), mul(x.clone(), x.clone()));
     let inner = mul(
@@ -98,7 +98,7 @@ pub fn gelu_expr(dtype: Dtype) -> Result<ScalarExpr> {
 
 /// `0.5 * x * (1 + erf(x / sqrt 2))` with erf from Abramowitz & Stegun 7.1.26
 /// (max absolute error 1.5e-7).
-pub fn gelu_exact_expr(dtype: Dtype) -> Result<ScalarExpr> {
+fn gelu_exact_expr(dtype: Dtype) -> Result<ScalarExpr> {
     const P: f32 = 0.327_591_1;
     const A: [f32; 5] = [
         0.254_829_592,
@@ -135,7 +135,7 @@ pub fn gelu_exact_expr(dtype: Dtype) -> Result<ScalarExpr> {
 /// `max(x, 0) + log(1 + exp(-|x|))` — the numerically stable softplus. Its
 /// derivative is a single sigmoid, which is what the distillation loss's
 /// adjoint rewrite collapses the taped chain into.
-pub fn softplus_expr(dtype: Dtype) -> Result<ScalarExpr> {
+fn softplus_expr(dtype: Dtype) -> Result<ScalarExpr> {
     let x = ScalarExpr::arg(0, dtype);
     let a = ScalarExpr::un(UnOp::Abs, x.clone());
     let tail = ScalarExpr::un(
@@ -149,7 +149,7 @@ pub fn softplus_expr(dtype: Dtype) -> Result<ScalarExpr> {
 }
 
 /// `x > 0 ? x : slope * x`.
-pub fn leaky_relu_expr(dtype: Dtype, slope: f32) -> Result<ScalarExpr> {
+fn leaky_relu_expr(dtype: Dtype, slope: f32) -> Result<ScalarExpr> {
     let x = ScalarExpr::arg(0, dtype);
     let positive = ScalarExpr::cmp(CmpOp::Gt, x.clone(), lit(dtype, 0.0)?);
     Ok(ScalarExpr::select(
@@ -214,7 +214,8 @@ impl Tensor {
 /// The reference a backend is compared against — a plain tree walk, never a
 /// path a kernel takes. Public because `fusor2-conformance` uses the same
 /// walk.
-pub fn eval_host(expr: &ScalarExpr, arg: f32) -> f32 {
+#[cfg(test)]
+fn eval_host(expr: &ScalarExpr, arg: f32) -> f32 {
     use fusor2_ir::dtype::Splat;
     use fusor2_ir::scalar::ScalarKind;
     match expr.kind() {

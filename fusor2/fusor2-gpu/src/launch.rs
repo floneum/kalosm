@@ -865,38 +865,6 @@ impl BuildCursor {
     }
 }
 
-/// A DOT rendering of the realized launch DAG. Nodes are launches, edges are
-/// the buffers one launch writes and another reads.
-pub fn graphvis_dot(plan: &Plan) -> String {
-    use std::fmt::Write as _;
-    let mut out = String::from("digraph plan {\n  rankdir=TB;\n");
-    for (i, launch) in plan.launches.iter().enumerate() {
-        let _ = writeln!(
-            out,
-            "  launch{i} [label=\"{} root={} grid={:?} block={}\"];",
-            i, launch.root, launch.grid, launch.block
-        );
-    }
-    for (i, producer) in plan.launches.iter().enumerate() {
-        for (j, consumer) in plan.launches.iter().enumerate() {
-            if i == j {
-                continue;
-            }
-            for w in producer
-                .bindings
-                .iter()
-                .filter(|b| b.kind != fusor2_ir::extract::BindKind::Read)
-            {
-                if consumer.bindings.iter().any(|r| r.value == w.value) {
-                    let _ = writeln!(out, "  launch{i} -> launch{j} [label=\"{}\"];", w.value);
-                }
-            }
-        }
-    }
-    out.push_str("}\n");
-    out
-}
-
 /// The plan's cache key: the plan is the key.
 pub const fn plan_key(plan: &Plan) -> PlanHash {
     plan.hash
@@ -1065,36 +1033,4 @@ mod tests {
         assert_eq!(plan_key(&plan), PlanHash(0xabc));
     }
 
-    #[test]
-    fn graphvis_names_every_launch() {
-        use fusor2_ir::egraph::Id;
-        use fusor2_ir::extract::{BindKind, BindingPlan};
-        let launch = |root: u32, value: u32, kind: BindKind| fusor2_ir::extract::Dispatch {
-            root: Id(root),
-            members: Default::default(),
-            bindings: vec![BindingPlan {
-                binding: 1,
-                value: Id(value),
-                kind,
-            }],
-            grid: [1, 1, 1],
-            block: 256,
-        };
-        let plan = Plan {
-            extraction: Default::default(),
-            launches: vec![
-                launch(1, 7, BindKind::Write),
-                launch(2, 7, BindKind::Read),
-            ],
-            buffers: Vec::new(),
-            symbols: Vec::new(),
-            hash: PlanHash(0),
-            cost: Default::default(),
-        };
-        let dot = graphvis_dot(&plan);
-        assert!(dot.starts_with("digraph plan {"));
-        assert!(dot.contains("launch0"));
-        assert!(dot.contains("launch1"));
-        assert!(dot.contains("launch0 -> launch1"), "the write/read edge must appear");
-    }
 }

@@ -246,7 +246,7 @@ fn main() {
             let q = Tensor::from_slice(g.handle(), Dtype::F32, &sh, &q).map_err(|e| e.to_string())?;
             let k = Tensor::from_slice(g.handle(), Dtype::F32, &sh, &k).map_err(|e| e.to_string())?;
             let v = Tensor::from_slice(g.handle(), Dtype::F32, &sh, &v).map_err(|e| e.to_string())?;
-            let o = fusor2::composite::attention::attention(&q, &k, &v, MaskKind::None, Some(scale))
+            let o = fusor2::composite::attention(&q, &k, &v, MaskKind::None, Some(scale))
                 .map_err(|e| e.to_string())?
                 .sum(3)
                 .map_err(|e| e.to_string())?;

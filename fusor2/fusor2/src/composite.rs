@@ -3,20 +3,36 @@
 //! to recognize later and the structural attributes (`MaskKind::Causal`) stay
 //! on the node.
 
-pub mod activations;
-pub mod attention;
-pub mod conv;
-pub mod loss;
-pub mod normalization;
-pub mod pool;
-pub mod quantized;
-pub mod rope;
-pub mod upsample;
+pub(crate) mod activations;
+pub(crate) mod attention;
+pub(crate) mod conv;
+pub(crate) mod loss;
+pub(crate) mod normalization;
+pub(crate) mod pool;
+pub(crate) mod quantized;
+pub(crate) mod rope;
+pub(crate) mod upsample;
+
+pub use attention::{
+    MaskKind, attention, attention_causal, attention_grads, attention_lse, attention_masked,
+    attention_with_lse,
+};
+pub use conv::{conv, grouped_conv, pad_with_zeros};
+pub use loss::{
+    binary_cross_entropy_with_logits, distillation_loss, mse, softmax_cross_entropy,
+};
+pub use pool::{PoolSize, pool, pool_avg, pool_max, pool_min};
+pub use rope::{
+    base_inverse_frequency, rope, rope_interleaved, rope_interleaved_pair,
+    rope_interleaved_pair_with_position, rope_interleaved_with_position, rope_pair,
+    rope_pair_with_position, rope_with_position, rotate_half,
+};
+pub use upsample::{upsample_bilinear, upsample_nearest, upsample_nearest2d};
 
 use fusor2_autograd::tape::GraphTape;
 use fusor2_ir::egraph::Id;
 use fusor2_ir::facts::{ValueFacts, Work};
-use fusor2_ir::ir::launch::{AccessPlan, Effect, Launch, MaskKind, Operand};
+use fusor2_ir::ir::launch::{AccessPlan, Effect, Launch, Operand};
 use fusor2_ir::ir::{Op, OpDef, OpDefId, OpDefRegistry, OpTag, VerifyCtx};
 use fusor2_ir::shape::{Dim, Layout, SlidingWindow, SymId};
 use fusor2_ir::{Error, Result};
@@ -27,7 +43,7 @@ use crate::tensor::Tensor;
 
 /// Which reduction a normalization performs.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum NormKind {
+pub(crate) enum NormKind {
     Rms,
     Layer,
 }
@@ -41,21 +57,12 @@ pub enum PoolReduce {
     Mean,
 }
 
-/// Which loss a `Loss` sugar node stands for.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum LossKind {
-    SoftmaxCrossEntropy,
-    BinaryCrossEntropyWithLogits,
-    Distillation,
-    MeanSquaredError,
-}
-
 /// The closed macro-attribute vocabulary. Attributes live in a side table
 /// keyed by `AttrId` so `Op` stays `Hash + Eq` and the hash-cons memo is
 /// exact; a rule reads them back through
 /// [`crate::graph::GraphInner::attrs_of`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum MacroAttr {
+pub(crate) enum MacroAttr {
     Softmax {
         axis: u32,
     },
@@ -96,9 +103,6 @@ pub enum MacroAttr {
         paired: bool,
         with_position: bool,
     },
-    Loss {
-        kind: LossKind,
-    },
 }
 
 /// Which value an `Attention` sugar node stands for.
@@ -107,7 +111,7 @@ pub enum MacroAttr {
 /// attention entry points build four macros over overlapping operand lists,
 /// and this is what keeps them from hash-consing into one.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum AttentionOut {
+pub(crate) enum AttentionOut {
     Output,
     LogSumExp,
     GradQ,
@@ -119,7 +123,7 @@ pub enum AttentionOut {
 /// reads registration order.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 #[repr(u32)]
-pub enum MacroOp {
+pub(crate) enum MacroOp {
     Softmax = 0,
     Norm = 1,
     Conv = 2,
@@ -127,11 +131,11 @@ pub enum MacroOp {
     Upsample = 4,
     Attention = 5,
     Rope = 6,
-    Loss = 7,
 }
 
 impl MacroOp {
-    pub const ALL: [MacroOp; 8] = [
+    #[cfg(test)]
+    pub(crate) const ALL: [MacroOp; 7] = [
         MacroOp::Softmax,
         MacroOp::Norm,
         MacroOp::Conv,
@@ -139,14 +143,14 @@ impl MacroOp {
         MacroOp::Upsample,
         MacroOp::Attention,
         MacroOp::Rope,
-        MacroOp::Loss,
     ];
 
-    pub const fn def_id(self) -> OpDefId {
+    pub(crate) const fn def_id(self) -> OpDefId {
         OpDefId(self as u32)
     }
 
-    pub const fn name(self) -> &'static str {
+    #[cfg(test)]
+    pub(crate) const fn name(self) -> &'static str {
         MACRO_OPS[self as usize].name
     }
 }
@@ -156,7 +160,7 @@ impl MacroOp {
 /// All eight declare `lower_per_target: &[]` — unrunnable by construction.
 /// They exist so rules can read attributes off them; the `defn` in the same
 /// e-class is always the runnable floor.
-pub static MACRO_OPS: &[OpDef] = &[
+pub(crate) static MACRO_OPS: &[OpDef] = &[
     OpDef {
         name: "softmax",
         tag: OpTag::Ext,
@@ -227,21 +231,11 @@ pub static MACRO_OPS: &[OpDef] = &[
         lower_per_target: &[],
         effect: Effect::Pure,
     },
-    OpDef {
-        name: "loss",
-        tag: OpTag::Ext,
-        verify: verify_witness,
-        infer: infer_witness,
-        work: work_softmax,
-        adjoint: None,
-        lower_per_target: &[],
-        effect: Effect::Pure,
-    },
 ];
 
 /// Register every macro op into a fresh registry. Called exactly once, by
 /// `Session::new`, so ids are assigned in table order.
-pub fn register_macro_ops(registry: &mut OpDefRegistry) {
+pub(crate) fn register_macro_ops(registry: &mut OpDefRegistry) {
     for (i, def) in MACRO_OPS.iter().enumerate() {
         let id = registry.register(def.clone());
         debug_assert_eq!(

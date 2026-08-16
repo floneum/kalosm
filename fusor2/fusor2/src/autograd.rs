@@ -27,7 +27,7 @@ use crate::tensor::Tensor as Dyn;
 use crate::tensor::typed::{Element, Tensor as RawTensor};
 use crate::{Error, Result};
 
-pub use crate::tensor::typed::{Axis, Element as SimdElement};
+pub use crate::tensor::typed::Axis;
 pub use fusor2_ir::autograd::{GradientSlot, Parent};
 
 /// How many boundary hops one backward may take before it is a cycle.

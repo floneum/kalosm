@@ -49,11 +49,6 @@ impl Tensor {
         self.map1(ScalarExpr::bin(BinOp::Mul, a.clone(), a))
     }
 
-    /// Alias of [`Tensor::sqr`].
-    pub fn square(&self) -> Result<Tensor> {
-        self.sqr()
-    }
-
     /// `1 / x`.
     pub fn recip(&self) -> Result<Tensor> {
         let one = ScalarExpr::lit(crate::tensor::splat_one(self.dtype()));
@@ -157,27 +152,6 @@ impl Tensor {
     /// Broadcasting `a ^ b`.
     pub fn pow_(&self, rhs: &Tensor) -> Result<Tensor> {
         self.bin_broadcast(rhs, BinOp::Pow, "pow_")
-    }
-
-    /// Scaffold spelling of [`Tensor::add_`].
-    pub fn broadcast_add(&self, rhs: &Tensor) -> Result<Tensor> {
-        self.add_(rhs)
-    }
-    /// Scaffold spelling of [`Tensor::sub_`].
-    pub fn broadcast_sub(&self, rhs: &Tensor) -> Result<Tensor> {
-        self.sub_(rhs)
-    }
-    /// Scaffold spelling of [`Tensor::mul_`].
-    pub fn broadcast_mul(&self, rhs: &Tensor) -> Result<Tensor> {
-        self.mul_(rhs)
-    }
-    /// Scaffold spelling of [`Tensor::div_`].
-    pub fn broadcast_div(&self, rhs: &Tensor) -> Result<Tensor> {
-        self.div_(rhs)
-    }
-    /// Scaffold spelling of [`Tensor::pow_`].
-    pub fn broadcast_pow(&self, rhs: &Tensor) -> Result<Tensor> {
-        self.pow_(rhs)
     }
 
     /// Ternary select: take `on_true` where `self != 0`, else `on_false`.

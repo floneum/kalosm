@@ -186,19 +186,6 @@ impl IntoIterator for Cases {
     }
 }
 
-/// Build one case per row of a table.
-pub fn cases_from_rows<T: Send + Sync + 'static>(
-    area: &'static str,
-    rows: impl IntoIterator<Item = (&'static str, T)>,
-    body: impl Fn(&Session, &T) -> CaseResult + Copy + Send + Sync + 'static,
-) -> Cases {
-    let mut cases = Cases::new();
-    for (name, row) in rows {
-        cases.push(area, name, move |s| body(s, &row));
-    }
-    cases
-}
-
 fn require_gpu() -> bool {
     std::env::var("FUSOR2_CONFORMANCE_REQUIRE_GPU")
         .map(|value| {
@@ -567,24 +554,6 @@ pub fn run_one(case: &Case, session: &Session) -> Outcome {
     guard(|| (case.run)(session))
 }
 
-/// Run one named case on every session.
-pub fn run_case(name: &str) -> Vec<Report> {
-    let registry = crate::suite::registry();
-    let sessions = sessions();
-    let mut out = Vec::new();
-    for case in registry.iter().filter(|c| c.name == name) {
-        for session in &sessions {
-            let _guard = is_gpu(session).then(gpu_test_guard);
-            out.push(Report {
-                case: case.name.clone(),
-                backend: backend_name(session),
-                outcome: run_one(case, session),
-            });
-        }
-    }
-    out
-}
-
 /// Run the whole registry on every session, reporting progress as it goes.
 pub fn run_all(mut progress: impl FnMut(&Report)) -> Vec<Report> {
     let registry = crate::suite::registry();
@@ -767,12 +736,6 @@ mod tests {
         let case = Case::new("elementwise", "abs", |_| Ok(()));
         assert_eq!(case.name, "elementwise::abs");
         assert_eq!(case.short(), "abs");
-    }
-
-    #[test]
-    fn cases_from_rows_names_every_row() {
-        let cases = cases_from_rows("demo", [("a", 1u32), ("b", 2u32)], |_, _| Ok(()));
-        assert_eq!(cases.names(), vec!["demo::a", "demo::b"]);
     }
 
     #[test]

@@ -37,17 +37,11 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     /// Reshape against extents that may still be symbolic, which is how the
     /// decode loop keeps one plan across sequence lengths.
     ///
-    /// [`Tensor::reshape`] is the all-constant form and
-    /// [`Tensor::reshape_extents`] the one with an inferred hole.
+    /// [`Tensor::reshape`] is the all-constant form; runtime-rank
+    /// [`crate::tensor::Dyn::reshape`] also supports an inferred hole.
     #[track_caller]
     pub fn reshape_dims<const O: usize>(&self, shape: [Dim; O]) -> Tensor<O, T> {
         Self::wrap("reshape_dims", self.as_dyn().reshape_dims(&shape))
-    }
-
-    /// Broadcast against extents that may still be symbolic.
-    #[track_caller]
-    pub fn broadcast_dims<const O: usize>(&self, shape: [Dim; O]) -> Tensor<O, T> {
-        Self::wrap("broadcast_dims", self.as_dyn().broadcast_as(&shape))
     }
 
     /// Fold the last `from_end + 1` axes into one; output rank
@@ -105,12 +99,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         Self::wrap("resize", self.as_dyn().resize(&dims_of(new_shape)))
     }
 
-    /// [`Tensor::resize`] against extents that may be symbolic.
-    #[track_caller]
-    pub fn resize_dims(&self, new_shape: [Dim; R]) -> Self {
-        Self::wrap("resize_dims", self.as_dyn().resize(&new_shape))
-    }
-
     /// Zero-pad one axis: a bare `usize` pads both sides (the reference's
     /// spelling), a `(left, right)` pair pads each independently.
     #[track_caller]
@@ -144,8 +132,8 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     /// Row lookup: `[.., n]` of ids against a `[vocab, dim]` table gives
     /// `[.., n, dim]`, so `O = IDS + 1`.
     ///
-    /// The receiver is the *table*. [`Dyn::embedding`] is the same gather with
-    /// the axis named.
+    /// The receiver is the *table*. [`crate::tensor::Dyn::embedding`] is the
+    /// same gather with the axis named.
     #[track_caller]
     pub fn embedding<const IDS: usize, const O: usize>(
         &self,

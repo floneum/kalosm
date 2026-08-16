@@ -13,11 +13,11 @@ use crate::{Result, Tensor};
 /// `W - 2` is the number of spatial axes — and `T` its element type. Both
 /// default so that a bare `ConvNd` is the 2-d f32 case.
 pub struct ConvNd<const W: usize = 4, T: Element = f32> {
-    pub weight: Tensor<W, T>,
-    pub bias: Option<Tensor<1, T>>,
+    weight: Tensor<W, T>,
+    bias: Option<Tensor<1, T>>,
     pub stride: SmallVec<[u32; 3]>,
     pub padding: SmallVec<[u32; 3]>,
-    pub dilation: SmallVec<[u32; 3]>,
+    dilation: SmallVec<[u32; 3]>,
     pub groups: u32,
 }
 

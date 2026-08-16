@@ -18,7 +18,6 @@ use fusor2_ir::egraph::{EGraph, Id, Rule, Saturate, SaturationBudget, Saturation
 use fusor2_ir::extract::{ExtractBudget, Extractor, Plan, ReplayKey};
 use fusor2_ir::ir::logical::{Logical, LeafKind};
 use fusor2_ir::ir::launch::Effect;
-use fusor2_ir::ir::kernel::ArenaPlanner;
 use fusor2_ir::ir::{Op, OpDefRegistry, Semantics};
 use fusor2_ir::saturate::Driver;
 use fusor2_ir::shape::Dim;
@@ -35,11 +34,11 @@ mod explore;
 
 /// Submitted-but-unretired plans the session will let pile up before it
 /// blocks in `resolve`.
-pub const MAX_INFLIGHT_PLANS: u32 = 8;
+const MAX_INFLIGHT_PLANS: u32 = 8;
 
 /// Contractions below this never pay for a measurement round. Override with
 /// `FUSOR2_AUTOTUNE_MIN_MACS`; `0` tunes everything.
-pub const AUTOTUNE_MIN_MACS: u64 = 64 << 20;
+const AUTOTUNE_MIN_MACS: u64 = 64 << 20;
 /// Timed repeats per candidate, min taken.
 const TUNE_RUNS: usize = 4;
 /// How much better a candidate must be to displace the incumbent. Wide enough
@@ -56,7 +55,7 @@ const TUNE_MARGIN: f64 = 0.08;
 /// nonzero.
 static WRONG_MEMBERS: AtomicU64 = AtomicU64::new(0);
 
-/// See [`WRONG_MEMBERS`].
+/// Number of live member-verification failures observed by this process.
 pub fn wrong_member_count() -> u64 {
     WRONG_MEMBERS.load(Ordering::Relaxed)
 }
@@ -147,12 +146,10 @@ pub struct Session {
     inner: Arc<SessionInner>,
 }
 
-pub struct SessionInner {
+pub(crate) struct SessionInner {
     pub device: Backend,
     pub cost: Arc<dyn CostModel>,
     pub extractor: Arc<dyn Extractor>,
-    pub planner: Arc<dyn ArenaPlanner>,
-    pub registry: OpDefRegistry,
     semantics: Arc<dyn Semantics>,
     rules: Vec<Rule>,
     replay: ReplayMemo,
@@ -202,8 +199,6 @@ impl Session {
                 device,
                 cost,
                 extractor,
-                planner,
-                registry,
                 semantics,
                 rules,
                 replay: ReplayMemo::new(),
@@ -224,29 +219,20 @@ impl Session {
         self.inner.device.caps()
     }
 
-    pub fn semantics(&self) -> Arc<dyn Semantics> {
+    pub(crate) fn semantics(&self) -> Arc<dyn Semantics> {
         Arc::clone(&self.inner.semantics)
-    }
-
-    pub fn registry(&self) -> &OpDefRegistry {
-        &self.inner.registry
-    }
-
-    pub fn rules(&self) -> &[Rule] {
-        &self.inner.rules
     }
 
     /// Saturate, extract, lower, emit and dispatch everything `values` needs.
     ///
-    /// Atomic against every other resolve and readback on the same graph — see
-    /// [`crate::graph::GraphInner::resolve_lock`] for why the e-graph's own
-    /// mutex cannot do that job.
+    /// Atomic against every other resolve and readback on the same graph; the
+    /// e-graph mutex alone cannot cover dispatch followed by readback.
     pub fn resolve(&self, values: &[Tensor]) -> Result<()> {
         let Some(first) = values.first() else {
             return Ok(());
         };
         let graph = first.graph.clone();
-        let resolving = graph.resolve_lock.lock();
+        let resolving = graph.state().resolve_lock.lock();
         self.resolve_locked(&resolving, values)
     }
 
@@ -263,7 +249,7 @@ impl Session {
         }
         let graph = values[0].graph.clone();
         for v in values {
-            if !Arc::ptr_eq(&v.graph, &graph) {
+            if !GraphRef::ptr_eq(&v.graph, &graph) {
                 return Err(Error::Device(
                     "operands come from two different graphs".into(),
                 ));
@@ -290,7 +276,7 @@ impl Session {
             .collect();
 
         let (plan, roots, key, missed) = {
-            let mut g = graph.egraph.lock();
+            let mut g = graph.state().egraph.lock();
             // The root set is per-resolve: planning covers exactly the values
             // this call requested.
             g.clear_roots();
@@ -434,7 +420,7 @@ impl Session {
             static SEEN: OnceLock<StdMutex<HashSet<u128>>> = OnceLock::new();
             let seen = SEEN.get_or_init(|| StdMutex::new(HashSet::new()));
             if seen.lock().unwrap().insert(plan.hash.0) {
-                let g = graph.egraph.lock();
+                let g = graph.state().egraph.lock();
                 eprintln!(
                     "EXEC plan hash={:x} launches={}",
                     plan.hash.0,
@@ -487,28 +473,9 @@ impl Session {
         Ok(())
     }
 
-    /// Dispatches issued since construction. The conformance
-    /// `resolves_in::<N>` asserts read this, so it counts **dispatches**, not
-    /// encoder submissions.
+    /// Dispatches issued since construction, not encoder submissions.
     pub fn launch_count(&self) -> u64 {
         self.inner.launches.load(Ordering::Relaxed)
-    }
-
-    /// Resolve `values` and report whether it took exactly `N` dispatches.
-    ///
-    /// The two counter reads bracket the resolve *inside* the graph's
-    /// resolve lock, so the difference is this call's own dispatches even
-    /// when another thread is resolving the same graph. Counting outside it
-    /// would attribute the other thread's launches to this assert.
-    pub fn resolves_in<const N: u64>(&self, values: &[Tensor]) -> Result<bool> {
-        let Some(first) = values.first() else {
-            return Ok(N == 0);
-        };
-        let graph = first.graph.clone();
-        let resolving = graph.resolve_lock.lock();
-        let before = self.launch_count();
-        self.resolve_locked(&resolving, values)?;
-        Ok(self.launch_count() - before == N)
     }
 
     /// Bytes of an already-resolved value.
@@ -617,7 +584,7 @@ impl Session {
     /// The facade holds the `Logical` id the user built; the plan names the
     /// selected member, and those diverge the moment any rewrite fires.
     fn selected(&self, graph: &GraphRef, plan: &Plan, id: Id) -> Id {
-        let class = graph.egraph.lock().class_of(id);
+        let class = graph.state().egraph.lock().class_of(id);
         plan.extraction.selected(class).unwrap_or(id)
     }
 
@@ -637,7 +604,7 @@ impl Session {
         layout: Option<&fusor2_ir::shape::Layout>,
     ) {
         let members = {
-            let g = graph.egraph.lock();
+            let g = graph.state().egraph.lock();
             g.class_ids(g.class_of(id))
         };
         let layout = layout.cloned().map(Arc::new);
@@ -735,7 +702,7 @@ impl Session {
                 for (id, buf) in &supplied {
                     env = env.with_buffer(*id, buf.clone());
                 }
-                let g = graph.egraph.lock();
+                let g = graph.state().egraph.lock();
                 target.resolve(plan, &g, &env)
             }
             Backend::Cpu(target) => {
@@ -766,7 +733,7 @@ impl Session {
             supplied.insert(buffer.value, target.alloc(bytes, buffer.persistence)?);
         }
 
-        let g = graph.egraph.lock();
+        let g = graph.state().egraph.lock();
         for launch in &plan.launches {
             let theta = plan
                 .extraction
@@ -844,7 +811,7 @@ impl Session {
             return Ok(Some(buf));
         }
         let leaf = {
-            let g = graph.egraph.lock();
+            let g = graph.state().egraph.lock();
             match &g.node(id).op {
                 Op::Logical(Logical::Leaf(k @ (LeafKind::Const { .. } | LeafKind::Uniform { .. }))) => {
                     k.clone()
@@ -904,7 +871,7 @@ impl Session {
         // the production explorer substitutes one candidate exactly once, in
         // place of the incumbent's own dispatch.
         {
-            let g = graph.egraph.lock();
+            let g = graph.state().egraph.lock();
             if base.launches.iter().any(|l| {
                 l.members
                     .iter()
@@ -917,7 +884,7 @@ impl Session {
         // One probe pass over the base plan. `launch_variants` holds the work
         // gate, so "every launch offered nothing" is "not worth tuning".
         let probe: Vec<Vec<(String, Plan)>> = {
-            let g = graph.egraph.lock();
+            let g = graph.state().egraph.lock();
             (0..base.launches.len())
                 .map(|ix| {
                     self.inner.extractor.launch_variants(
@@ -946,7 +913,7 @@ impl Session {
         // order. A cached combination is only replayable onto the same plan
         // shape, so this is what it is keyed on.
         let plan_sig: String = {
-            let g = graph.egraph.lock();
+            let g = graph.state().egraph.lock();
             base.launches
                 .iter()
                 .map(|l| fusor2_cost::extract::launch_signature(&g, l))
@@ -988,7 +955,7 @@ impl Session {
             let variants = if Arc::ptr_eq(&best, &base) {
                 probed
             } else {
-                let g = graph.egraph.lock();
+                let g = graph.state().egraph.lock();
                 self.inner.extractor.launch_variants(
                     &g,
                     roots,
@@ -1004,7 +971,7 @@ impl Session {
             // already ruled out. The signature is structural, so it is the
             // same key the previous process wrote.
             let sig = {
-                let g = graph.egraph.lock();
+                let g = graph.state().egraph.lock();
                 best.launches
                     .get(ix)
                     .map(|l| fusor2_cost::extract::launch_signature(&g, l))
@@ -1258,7 +1225,7 @@ impl Session {
     /// The device buffer of an external leaf, uploading it on first use.
     fn leaf_buffer(&self, graph: &GraphRef, id: Id) -> Result<Option<Buf>> {
         let is_external = {
-            let g = graph.egraph.lock();
+            let g = graph.state().egraph.lock();
             matches!(
                 &g.node(id).op,
                 Op::Logical(Logical::Leaf(
@@ -1904,21 +1871,13 @@ mod tests {
     }
 
     #[test]
-    fn a_cpu_session_registers_every_macro_op_in_table_order() {
-        let s = Session::new(Backend::cpu().unwrap()).unwrap();
-        for op in crate::composite::MacroOp::ALL {
-            assert_eq!(s.registry().get(op.def_id()).unwrap().name, op.name());
-        }
-    }
-
-    #[test]
     fn the_rule_table_is_the_union_of_every_contributor() {
         let s = Session::new(Backend::cpu().unwrap()).unwrap();
         let expected = CORE_RULES.len()
             + SCHED_RULES.len()
             + fusor2_autograd::ADJOINT_RULES.len()
             + fusor2_cpu::CPU_RULES.len();
-        assert_eq!(s.rules().len(), expected);
+        assert_eq!(s.inner.rules.len(), expected);
     }
 
     #[test]

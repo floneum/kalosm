@@ -29,6 +29,7 @@ use fusor2_ir::ir::kernel::{
 use fusor2_ir::ir::{Node, Op};
 use fusor2_ir::shape::{AxisGroup, Dim, Layout, MultiFlattenMap, SubAxis, SymId};
 use fusor2_ir::target::LowerCtx;
+use fusor2_cost::realize::distribute_workgroups;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -55,19 +56,6 @@ pub fn bound_layout(cx: &LowerCtx<'_>, value: Id) -> (Layout, Dtype) {
             (Layout::contiguous(&facts.shape), facts.dtype)
         }
     }
-}
-
-/// Element count of a layout under the dispatch bindings. Resolving per axis
-/// rather than reading `BufferPlan::elements` is what lets a `[Sym(s), 64]`
-/// buffer have a length at all: the precomputed field collapses to the
-/// "unknown" sentinel as soon as one extent is symbolic.
-#[allow(dead_code)]
-fn layout_elements(binding: &DimBinding, layout: &Layout) -> Result<u64> {
-    let mut acc: u64 = 1;
-    for d in layout.shape() {
-        acc = acc.saturating_mul(binding.require(*d)?);
-    }
-    Ok(acc)
 }
 
 /// The step-invariant decl extent: constants multiply, symbolic dims count
@@ -240,23 +228,6 @@ impl DimBinding {
         out.sort_unstable();
         out
     }
-}
-
-/// Fold a 1-D workgroup count onto the 3-D dispatch grid.
-///
-/// **Pick the slab count first**, then size `x` to the slab. Saturating `x`
-/// instead leaves the last slab nearly empty (122,880 groups would launch
-/// `[65535, 2, 1]` = 131,070), and every extra workgroup still runs the kernel
-/// prologue and the in-range compares before falling through.
-pub fn distribute_workgroups(total: u32, max_per_dim: u32) -> [u32; 3] {
-    let max_per_dim = max_per_dim.max(1);
-    if total <= max_per_dim {
-        return [total, 1, 1];
-    }
-    let y = total.div_ceil(max_per_dim).min(max_per_dim);
-    let x = total.div_ceil(y).min(max_per_dim);
-    let z = total.div_ceil(x.saturating_mul(y)).max(1);
-    [x, y, z]
 }
 
 /// The dispatch grid for an index space at a given workgroup width.
@@ -1984,25 +1955,6 @@ pub fn lower(
 mod tests {
     use super::*;
 
-    /// Slack strictly under one slab, and `122_880` yields
-    /// `[61440, 2, 1]`, not `[65535, 2, 1]`.
-    #[test]
-    fn distribute_workgroups_slack_under_one_slab() {
-        const MAX: u32 = 65535;
-        for total in [1u32, 65535, 65536, 122_880, 4_000_000] {
-            let [x, y, z] = distribute_workgroups(total, MAX);
-            assert!(x <= MAX && y <= MAX && z <= MAX, "{total} exceeds the limit");
-            let launched = u64::from(x) * u64::from(y) * u64::from(z);
-            assert!(launched >= u64::from(total), "{total} is not covered");
-            assert!(
-                launched - u64::from(total) < u64::from(x.max(1)),
-                "{total} launches {launched} = {x}x{y}x{z}, slack is a full slab"
-            );
-        }
-        assert_eq!(distribute_workgroups(122_880, MAX), [61440, 2, 1]);
-        assert_ne!(distribute_workgroups(122_880, MAX), [65535, 2, 1]);
-    }
-
     /// The linearization every lowering applies to `@builtin(workgroup_id)`
     /// must be `gx + gy*X + gz*X*Y` **of the dispatched grid**, and
     /// `max_compute_workgroups_per_dimension` is not `X`.
@@ -2037,20 +1989,9 @@ mod tests {
 
         // ...and the limit really is the wrong stride: at 6 groups the grid is
         // [3, 2, 1], so `gy * MAX` sends the whole second row out of range.
-        let grid = distribute_workgroups(6, 4);
+        let grid = distribute_workgroups(6u32, 4);
         assert_eq!(grid, [3, 2, 1]);
         assert_ne!(grid[0], 4, "the slab width is not the per-dimension limit");
-    }
-
-    #[test]
-    fn distribute_workgroups_covers_a_wide_sweep() {
-        const MAX: u32 = 65535;
-        for total in (0..3_000_000).step_by(1409).chain([0, 1, u32::MAX]) {
-            let [x, y, z] = distribute_workgroups(total, MAX);
-            let launched = u64::from(x) * u64::from(y) * u64::from(z);
-            assert!(launched >= u64::from(total), "{total} is not covered");
-            assert!(x <= MAX && y <= MAX && z <= MAX);
-        }
     }
 
     /// WGSL has no infinite literal and naga rejects a module holding one,

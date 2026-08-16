@@ -56,7 +56,7 @@ fn unaries() -> Vec<(&'static str, Domain, UnaryOp, fn(f32) -> f32)> {
         ("log",        Domain::Positive,         |x| x.log(),    f32::ln),
         ("log2",       Domain::Positive,         |x| x.log2(),   f32::log2),
         ("neg",        Domain::Wide,             |x| x.neg(),    |v| -v),
-        ("sqr",        Domain::Wide,             |x| x.square(), |v| v * v),
+        ("sqr",        Domain::Wide,             |x| x.sqr(),    |v| v * v),
         ("sqrt",       Domain::Positive,         |x| x.sqrt(),   f32::sqrt),
     ]
 }
@@ -128,9 +128,9 @@ fn scalar_comparisons() -> Vec<(&'static str, UnaryOp, fn(f32) -> f32)> {
         ("eq_scalar",  |x| x.eq_scalar(0.0), |v| f32::from(v == 0.0)),
         ("ne_scalar",  |x| x.ne_scalar(0.0), |v| f32::from(v != 0.0)),
         ("lt_scalar",  |x| x.lt_scalar(0.0), |v| f32::from(v < 0.0)),
-        ("lte_scalar", |x| x.le_scalar(0.0), |v| f32::from(v <= 0.0)),
+        ("lte_scalar", |x| x.lte_scalar(0.0), |v| f32::from(v <= 0.0)),
         ("gt_scalar",  |x| x.gt_scalar(0.0), |v| f32::from(v > 0.0)),
-        ("gte_scalar", |x| x.ge_scalar(0.0), |v| f32::from(v >= 0.0)),
+        ("gte_scalar", |x| x.gte_scalar(0.0), |v| f32::from(v >= 0.0)),
     ]
 }
 
@@ -151,11 +151,11 @@ fn tensor_comparisons() -> Vec<(&'static str, BinaryOp, fn(f32, f32) -> f32)> {
 #[rustfmt::skip]
 fn broadcasting() -> Vec<(&'static str, BinaryOp, fn(f32, f32) -> f32)> {
     vec![
-        ("add_", |a, b| a.broadcast_add(b), |x, y| x + y),
-        ("sub_", |a, b| a.broadcast_sub(b), |x, y| x - y),
-        ("mul_", |a, b| a.broadcast_mul(b), |x, y| x * y),
-        ("div_", |a, b| a.broadcast_div(b), |x, y| x / y),
-        ("pow_", |a, b| a.broadcast_pow(b), |x, y| x.powf(y)),
+        ("add_", |a, b| a.add_(b), |x, y| x + y),
+        ("sub_", |a, b| a.sub_(b), |x, y| x - y),
+        ("mul_", |a, b| a.mul_(b), |x, y| x * y),
+        ("div_", |a, b| a.div_(b), |x, y| x / y),
+        ("pow_", |a, b| a.pow_(b), |x, y| x.powf(y)),
     ]
 }
 

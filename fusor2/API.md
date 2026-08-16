@@ -20,7 +20,7 @@ use fusor2::{Tensor, Device, Graph, Session, QMatrix, VarBuilder, Dim, Dtype, Er
 | Item | Why it is public |
 | --- | --- |
 | `Tensor<const R: usize, T: Element = f32>` | The headline type. Rank and dtype in the type, every op infallible. Matches fusor1's `Tensor<R, D, B>` in *shape* minus the `B: Fusion` slot, which had nothing to say once the e-graph owned materialization. |
-| `Element` | The dtype witness (`f32`, `f16`, `bf16`, `u32`, `i32`). Needed to write a `T`-generic layer. fusor1 spelled it `SimdElement`; that alias survives at `tensor::SimdElement`. |
+| `Element` | The dtype witness (`f32`, `f16`, `bf16`, `u32`, `i32`). Needed to write a `T`-generic layer. |
 | `Axis`, `Minus1`, `Minus2` | Axis selectors: `x.sum::<2>(Minus1)`. Strictly better than fusor1's `D`/`Dim` marker zoo — `usize` also implements `Axis`, so `x.sum::<2>(1)` reads as it should. **Kept.** |
 | `cat`, `stack` | Free functions over an `IntoIterator`, as fusor1 had them. `Tensor::cat` is the associated spelling. |
 | `Device` | One device type: backend + session + graph. What constructors take **and** what `Tensor::device()` returns. |
@@ -39,12 +39,12 @@ use fusor2::{Tensor, Device, Graph, Session, QMatrix, VarBuilder, Dim, Dtype, Er
 | --- | --- |
 | `tensor` | `Dyn` — the runtime-rank, `Result`-returning tensor. The **escape hatch**, reachable by `Tensor::into_dyn`/`as_dyn`, for code where a rank or a dtype is genuinely data. Also `Extent`, `RoundMode`, `IndexOp`/`TensorIndex`, `arange`/`arange_step`, `TensorSlice`, `ToVec`, `Element`/`Axis` (re-exported to the root). |
 | `device` | `Device`, `Cpu`, `Gpu`, `KernelProfile`, `KernelProfileRow`. The profile types are how a trainer reads per-kernel timings. |
-| `session` | `Session`, `Backend` (the CPU/GPU *selector* — `Session::new(Backend::gpu_blocking()?)`), `wrong_member_count`, the tuning constants. |
+| `session` | `Session`, `Backend` (the CPU/GPU *selector* — `Session::new(Backend::gpu_blocking()?)`), `wrong_member_count`. Tuning policy is private. |
 | `graph` | `Graph`, `GraphRef`, `Gradients`. |
 | `layers` | `Linear`, `RmsNorm`, `LayerNorm`, `LayerNormNd`, `Embedding`, `ConvNd`. Every model crate uses these. |
 | `cache` | `KvCache`, `TensorCache`, `MaskCache`, `AttentionMask`, `MaskKind`, `RopeCache`. The decode-loop state every model threads. |
 | `quantized` | `QMatrix`. |
-| `composite` | The op library at the `Dyn` layer: attention, rope, conv, pool, normalization, loss, upsample. Public because the conformance suite drives it directly and because it is where a new op is added. The **model-facing** entry points become methods on `Tensor` (§4). |
+| `composite` | The flat op library at the `Dyn` layer: attention, rope, conv, pool, loss, upsample. Its implementation submodules are private; the **model-facing** entry points are methods on `Tensor` (§4). |
 | `autograd` | The differentiable const-rank tensor, the tape, `with_backwards`, `BackwardTarget`, `GradientSlot`. `betlang-train`'s first `use` line. |
 | `optim` | `AdamW`, `cosine_decay`, `global_norm`, `clip_global_norm`. No in-workspace consumer; `betlang-train` is the out-of-workspace one. |
 | `sampling` | `StandardSamplerParams`, `Mirostat2Sampler`, `top_k_pairs`, `GpuSampledToken`. `kalosm-llama` calls `top_k_pairs`. |
@@ -63,12 +63,15 @@ Landed in this change:
 | `mod ops` | `pub(crate)`. It holds inherent `impl` blocks — those stay public — plus internals nothing outside named. |
 | `Gradients` (root) | `graph::Gradients`. |
 | `TensorSlice` (root) | `tensor::TensorSlice`. It is the argument type of a readback, not a name a caller writes. |
-| `Typed` (root) | Deleted from the root. It was the pre-rename spelling of the const-rank tensor; the root *is* that tensor now. `tensor::Typed` remains as the compatibility alias. |
+| `Typed` | Deleted. It was the pre-rename spelling of the const-rank tensor; the root *is* that tensor now. |
 | `Persistence`, `QFmt`, `QLayout` (root) | IR-level detail. No consumer imports them: the conformance suite takes them from `fusor2_ir::dtype` directly, and models never spell them (a `QMatrix` gets its format from `Dtype::Q(fmt)` destructuring and from `RawTensorBytes`, both inferred). |
 | `RoundMode` (root) | `tensor::RoundMode`. One op takes it. |
 | `SymId` (root) | Off the root. Nothing in or out of this workspace imports it; `Dim` is the type callers name. |
+| `GraphInner`, `SessionInner` | Private implementation state. `GraphRef` is an opaque shared handle rather than an alias exposing the graph implementation. |
+| `cache::{kv,mask,rope}`, `layers::*`, `sampling::*`, `tensor::{construction,readback,typed}`, `composite::*` submodules | Private. Their intended items are re-exported once from the parent module, eliminating duplicate paths. |
+| compatibility aliases (`mat_mul`, `square`, `variance`, `broadcast_*`, `ge_scalar`/`le_scalar`) | Deleted. Callers use `matmul`, `sqr`, `var`, `add_`/`sub_`/`mul_`/`div_`/`pow_`, and `gte_scalar`/`lte_scalar`. |
 
-One item went the other way. `composite::attention::MaskKind` was a *private*
+One item went the other way. `composite::MaskKind` was previously a *private*
 `use` of `fusor2_ir::ir::launch::MaskKind`, so `attention_masked` took an
 argument no caller could spell — `segment-anything-rs` had two lines that
 could not compile against any version of this crate. It is a `pub use` now.
@@ -124,9 +127,9 @@ deep for something fusor1 had as a method:
 
 ```rust
 // today
-let scores = fusor2::composite::attention::attention_masked(&q, &k, &v, scale, mask)?;
-let (q, k) = fusor2::composite::rope::rope_pair(&q, &k, &cos, &sin, offset)?;
-let up = fusor2::composite::upsample::upsample_nearest2d(&x, 4)?;
+let scores = fusor2::composite::attention_masked(&q, &k, &v, scale, mask)?;
+let (q, k) = fusor2::composite::rope_pair(&q, &k, &cos, &sin, offset)?;
+let up = fusor2::composite::upsample_nearest2d(&x, 4)?;
 
 // intended
 let scores = q.attention_masked(&k, &v, scale, mask);
@@ -164,8 +167,7 @@ Shape and readback (`typed/ops.rs`):
   *converts*; `to_flat()` is same-dtype. `to_vec_f32_async` / `to_flat_async`
   return `Result` rather than panicking: an `await` point is exactly where a
   caller does have somewhere to put the error.
-- `reshape_dims([Dim; O])`, `broadcast_dims`, `resize_dims` — the symbolic
-  spellings.
+- `reshape_dims([Dim; O])` — the symbolic reshape spelling used by model code.
 
 Views and indexing (`typed/ops.rs`): `flatten_last_n`, `flatten_first_n`,
 `flatten`, `squeeze_dims`, `unsqueeze_dims`, `repeat`, `resize`, `pad_axis`,
@@ -176,13 +178,13 @@ Ops as methods (`typed/composite.rs`) — this is §5's ergonomic target, landed
 `softmax`, `softmax_last_dim`, `log_softmax`, `rms_norm`, `rms_norm_no_weight`,
 `rms_norm_residual`, `layer_norm`, `attention`, `attention_causal`,
 `attention_masked`, `rope`, `rope_interleaved`, `rope_pair`,
-`rope_interleaved_pair`, `rope_at`, `rope_pair_at`,
+`rope_interleaved_pair`, `rope_pair_at`,
 `rope_interleaved_pair_at`, `pool`, `pool_max`,
 `pool_min`, `pool_avg`, `upsample_nearest2d`, `upsample_bilinear`, and
 `q_mat_mul` — on the **activation**, as the reference has it, rather than the
 inverted `QMatrix::q_mat_mul(&act)` receiver, which reads backwards in a
 forward pass. `base_inverse_frequency` stays a free function at
-`composite::rope`: it takes no tensor, so there is no receiver for it.
+`composite`: it takes no tensor, so there is no receiver for it.
 
 The rope family is a **square**, not a list: pairing (`rope` halves,
 `rope_interleaved` pairs `2i, 2i+1`) is architecture data a checkpoint fixes,
@@ -202,7 +204,7 @@ built, and a symbolic leading extent is reported rather than `expect`ed.
 Construction (`typed/construct.rs`): `Tensor::new(&device, array)` — the
 reference's spelling, which is why wrapping a runtime-rank value moved to
 `from_dyn`/`try_from_dyn` (`new`/`try_new` had exactly one call site in this
-workspace, a test) — plus `full`, `zeros_dims`, `param`, `leaf`, `arange`,
+workspace, a test) — plus `full`, `param`, `leaf`, `arange`,
 `arange_step`, and `from_raw_bytes(device, dtype, [Dim; R], bytes)`. `leaf` is
 the decode loop's constructor: a step-local input buffer, minted once and
 refilled with `set_elements` per step, so the node id — and the resolved plan
@@ -243,9 +245,9 @@ arithmetic is genuinely the lowering's business —
 disagreeing extent, a rank mismatch) are still asserted as `Result`s rather
 than as panics.
 
-Two accessors stay runtime-rank on purpose: `TensorCache::pending` and
-`KvCache::pending_into` feed a *resolve batch*, which collects roots of every
-rank a step produced and is the one genuinely heterogeneous list in the crate.
+`KvCache::pending_into` stays runtime-rank on purpose: it feeds a *resolve
+batch*, which collects roots of every rank a step produced and is the one
+genuinely heterogeneous list in the crate. `TensorCache::pending` is private.
 
 ## 8. A test-isolation note that is really a compiler finding
 

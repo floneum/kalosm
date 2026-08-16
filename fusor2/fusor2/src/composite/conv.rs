@@ -46,10 +46,6 @@ pub fn pad_with_zeros(x: &Tensor, axis: u32, left: u64, right: u64) -> Result<Te
 }
 
 /// Symmetric padding of one axis.
-pub fn pad_axis(x: &Tensor, axis: u32, padding: u64) -> Result<Tensor> {
-    pad_with_zeros(x, axis, padding, padding)
-}
-
 /// Split axis `axis` of `v` into `(outer, inner)`.
 ///
 /// Always legal, at any strides: `Restride` composes relative to the current

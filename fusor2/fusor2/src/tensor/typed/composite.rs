@@ -210,28 +210,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         )
     }
 
-    /// [`Tensor::rope`] against a device-side position vector.
-    ///
-    /// The offset stays on device, so the cos/sin table is never re-sliced on
-    /// the host and the plan survives the decode step.
-    #[track_caller]
-    pub fn rope_at(
-        &self,
-        cos: &Tensor<2, T>,
-        sin: &Tensor<2, T>,
-        positions: &Tensor<1, u32>,
-    ) -> Self {
-        Self::wrap(
-            "rope_at",
-            rope::rope_with_position(
-                self.as_dyn(),
-                cos.as_dyn(),
-                sin.as_dyn(),
-                positions.as_dyn(),
-            ),
-        )
-    }
-
     /// [`Tensor::rope_pair`] against a device-side position vector.
     #[track_caller]
     pub fn rope_pair_at(

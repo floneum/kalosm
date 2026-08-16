@@ -20,10 +20,10 @@ use crate::{Error, Result, Tensor};
 /// `T` is the table's element type. The rank is fixed at 2 — the table is
 /// `[rows, head_dim / 2]` by construction.
 pub struct RopeCache<T: Element = f32> {
-    pub sin: Tensor<2, T>,
-    pub cos: Tensor<2, T>,
-    pub head_dim: u32,
-    pub theta: f32,
+    sin: Tensor<2, T>,
+    cos: Tensor<2, T>,
+    head_dim: u32,
+    theta: f32,
     /// Rows currently in the table. Growth reuploads, so this is a host
     /// number, not a `Dim` the dispatch binds.
     rows: u64,

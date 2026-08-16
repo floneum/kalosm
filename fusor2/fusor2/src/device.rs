@@ -311,18 +311,17 @@ mod tests {
         let _serial = crate::device::test_device_lock();
         let a = Device::cpu();
         let b = Device::cpu();
-        assert!(Arc::ptr_eq(a.handle(), b.handle()));
+        assert!(GraphRef::ptr_eq(a.handle(), b.handle()));
         assert_eq!(a.name(), "cpu");
     }
 
     #[test]
     fn a_device_installs_the_ambient_graph() {
         let _serial = crate::device::test_device_lock();
-        let d = Device::cpu();
+        let _ = Device::cpu();
         // Another test may have installed a different device since; assert
-        // only that a graph is installed and this device's is live.
+        // only that a graph is installed.
         let _ = ambient_graph();
-        assert!(Arc::strong_count(d.handle()) >= 1);
     }
 
     /// `Device::cpu()` installs its graph on every call, not only the first:
@@ -332,7 +331,7 @@ mod tests {
     fn a_second_cpu_call_reinstalls_its_own_graph() {
         let _serial = crate::device::test_device_lock();
         let cpu = Device::cpu();
-        assert!(Arc::ptr_eq(
+        assert!(GraphRef::ptr_eq(
             ambient_graph().handle(),
             cpu.graph().handle()
         ));
@@ -340,11 +339,11 @@ mod tests {
         // Stand in for "some other device was created since".
         let other = Graph::new(cpu.session());
         install(&other);
-        assert!(Arc::ptr_eq(ambient_graph().handle(), other.handle()));
+        assert!(GraphRef::ptr_eq(ambient_graph().handle(), other.handle()));
 
         let cpu_again = Device::cpu();
         assert!(
-            Arc::ptr_eq(ambient_graph().handle(), cpu_again.graph().handle()),
+            GraphRef::ptr_eq(ambient_graph().handle(), cpu_again.graph().handle()),
             "a cached Device::cpu() must still install its own graph"
         );
     }

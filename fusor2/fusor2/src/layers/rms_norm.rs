@@ -15,8 +15,8 @@ use crate::{Error, Result, Tensor};
 /// alone still names the common case. The activation's rank is
 /// [`RmsNorm::forward`]'s own parameter.
 pub struct RmsNorm<const N: usize = 1, T: Element = f32> {
-    pub weight: Option<Tensor<N, T>>,
-    pub eps: f32,
+    weight: Option<Tensor<N, T>>,
+    eps: f32,
 }
 
 impl<const N: usize, T: Element> RmsNorm<N, T> {

@@ -8,8 +8,6 @@
 //! that change between steps and both are uniforms, so a whole training run
 //! compiles one kernel set.
 
-use std::sync::Arc;
-
 use fusor2_ir::shape::SymId;
 
 use crate::graph::GraphRef;
@@ -98,7 +96,7 @@ impl AdamW {
         }
         let graph = params[0].graph().clone();
         for (i, (p, g)) in params.iter().zip(grads).enumerate() {
-            if !Arc::ptr_eq(p.graph(), &graph) || !Arc::ptr_eq(g.graph(), &graph) {
+            if !GraphRef::ptr_eq(p.graph(), &graph) || !GraphRef::ptr_eq(g.graph(), &graph) {
                 return Err(Error::Device(
                     "AdamW::step got operands from two different graphs".into(),
                 ));
@@ -125,7 +123,7 @@ impl AdamW {
             }
         }
         if let Some(previous) = self.state_graph()
-            && !Arc::ptr_eq(previous, &graph)
+            && !GraphRef::ptr_eq(previous, &graph)
         {
             return Err(Error::Device(
                 "AdamW state belongs to another graph; the moments are values on it".into(),
@@ -224,7 +222,7 @@ pub fn global_norm(grads: &[Tensor]) -> Result<Tensor> {
     let graph = first.graph().clone();
     let mut total: Option<Tensor> = None;
     for (i, g) in grads.iter().enumerate() {
-        if !Arc::ptr_eq(g.graph(), &graph) {
+        if !GraphRef::ptr_eq(g.graph(), &graph) {
             return Err(Error::Device(
                 "global_norm got gradients from two different graphs".into(),
             ));

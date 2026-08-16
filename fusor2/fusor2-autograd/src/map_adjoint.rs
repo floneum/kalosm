@@ -454,20 +454,6 @@ fn select(c: ScalarExpr, t: ScalarExpr, f: ScalarExpr) -> ScalarExpr {
     ScalarExpr::select(c, t, f)
 }
 
-/// `d(expr)/d(Arg(arg))` with a unit seed, as a `ScalarExpr` over the same
-/// argument list. Comparisons differentiate to a literal zero, which is what
-/// makes "every requires-grad parent receives a gradient" hold without a
-/// special case.
-pub fn d_expr(expr: &ScalarExpr, arg: u32) -> Result<ScalarExpr> {
-    let nargs = max_arg(expr).map_or(arg + 1, |m| m.max(arg) + 1);
-    let seed = one_of(expr.dtype());
-    let partials = differentiate(expr, &seed, nargs);
-    Ok(partials
-        .get(arg as usize)
-        .and_then(|p| p.clone())
-        .unwrap_or_else(|| lit_of(expr.dtype(), 0.0)))
-}
-
 /// Highest `Arg` index appearing in `expr`.
 pub fn max_arg(expr: &ScalarExpr) -> Option<u32> {
     match expr.kind() {
@@ -844,10 +830,4 @@ mod tests {
         assert!((eval(&d, &[3.0]) - 6.0).abs() < 1e-5);
     }
 
-    #[test]
-    fn d_expr_agrees_with_differentiate() {
-        let expr = ScalarExpr::bin(BinOp::Mul, a0(), a1());
-        let d = d_expr(&expr, 1).unwrap();
-        assert_eq!(eval(&d, &[2.0, 5.0]), 2.0);
-    }
 }

@@ -63,9 +63,9 @@ struct FixedState {
 /// cache — so `TensorCache` alone still names it.
 #[derive(Clone)]
 pub struct TensorCache<const R: usize = 4, T: Element = f32> {
-    pub data: Option<Tensor<R, T>>,
-    pub axis: u32,
-    pub len: Dim,
+    data: Option<Tensor<R, T>>,
+    axis: u32,
+    len: Dim,
     fixed: Option<FixedState>,
 }
 
@@ -89,7 +89,7 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
 
     /// [`TensorCache::fixed`] with a caller-supplied length-symbol name;
     /// two caches sharing one name share one symbol.
-    pub fn fixed_named(axis: u32, capacity: u64, sym_name: String) -> Self {
+    pub(crate) fn fixed_named(axis: u32, capacity: u64, sym_name: String) -> Self {
         Self {
             data: None,
             axis,
@@ -108,16 +108,6 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         }
     }
 
-    /// A fixed ring of the newest `window` tokens. Decode-shaped use only:
-    /// the caller's mask must already treat every present key as visible.
-    pub fn fixed_windowed(axis: u32, window: u64) -> Self {
-        let mut cache = Self::fixed(axis, window.max(1));
-        if let Some(f) = cache.fixed.as_mut() {
-            f.window = Some(window.max(1));
-        }
-        cache
-    }
-
     /// Whether this cache is in fixed (scatter/ring) mode.
     pub fn is_fixed(&self) -> bool {
         self.fixed.is_some()
@@ -133,13 +123,13 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
     /// buffer.
     ///
     /// Runtime-rank: a resolve batch is a heterogeneous list of roots.
-    pub fn pending(&self) -> Option<Dyn> {
+    pub(crate) fn pending(&self) -> Option<Dyn> {
         self.fixed.as_ref().and_then(|f| f.out.clone())
     }
 
     /// Adopt the resolved scatter output into the store leaf and drop the
     /// output's binding so the next step re-dispatches. Call once per step,
-    /// after the resolve that included [`TensorCache::pending`].
+    /// after the resolve that included the pending scatter output.
     #[track_caller]
     pub fn commit(&mut self) {
         let Some(f) = self.fixed.as_mut() else {
@@ -156,12 +146,19 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         self.data.as_ref()
     }
 
+    /// Replace the cached value with a detached leaf after it resolves.
+    pub fn detach(&mut self) {
+        if let Some(value) = self.data.as_ref().cloned() {
+            self.data = Some(value.detach());
+        }
+    }
+
     /// The cached value at runtime rank, for the resolve-batch path.
-    pub fn current_dyn(&self) -> Option<&Dyn> {
+    pub(crate) fn current_dyn(&self) -> Option<&Dyn> {
         self.data.as_ref().map(Tensor::as_dyn)
     }
 
-    /// Tokens currently cached along [`TensorCache::axis`].
+    /// Tokens currently cached along the cache axis.
     pub fn len(&self) -> Dim {
         self.len
     }
@@ -505,8 +502,8 @@ fn add_dims(a: Dim, b: Dim) -> Dim {
 /// `R` and `T` are the cached values'; a bare `KvCache` is a rank-4 f32 pair.
 #[derive(Clone)]
 pub struct KvCache<const R: usize = 4, T: Element = f32> {
-    pub k: TensorCache<R, T>,
-    pub v: TensorCache<R, T>,
+    k: TensorCache<R, T>,
+    v: TensorCache<R, T>,
 }
 
 impl<const R: usize, T: Element> KvCache<R, T> {
@@ -528,7 +525,7 @@ impl<const R: usize, T: Element> KvCache<R, T> {
         }
     }
 
-    /// Ring of the newest `window` tokens. See [`TensorCache::fixed_windowed`].
+    /// Ring of the newest `window` tokens.
     pub fn windowed(axis: u32, window: u64) -> Self {
         let name = fresh_sym_name();
         let mut k = TensorCache::fixed_named(axis, window.max(1), name.clone());
@@ -572,6 +569,17 @@ impl<const R: usize, T: Element> KvCache<R, T> {
     #[track_caller]
     pub fn append(&mut self, k: &Tensor<R, T>, v: &Tensor<R, T>) -> (Tensor<R, T>, Tensor<R, T>) {
         (self.k.append(k), self.v.append(v))
+    }
+
+    /// Keep only the newest `len` entries in both halves.
+    pub fn keep_last(&mut self, len: u64) -> Option<(Tensor<R, T>, Tensor<R, T>)> {
+        self.k.keep_last(len).zip(self.v.keep_last(len))
+    }
+
+    /// Replace both cached values with detached leaves after they resolve.
+    pub fn detach(&mut self) {
+        self.k.detach();
+        self.v.detach();
     }
 
     /// Whether [`KvCache::replay_append`] would rebuild the last append's nodes
@@ -641,7 +649,7 @@ mod tests {
     /// The `Restride` operands of the class `id` names, in order — the two
     /// halves a `cat` glues together.
     fn cat_sources(t: &Dyn) -> Vec<Id> {
-        let g = t.graph().egraph.lock();
+        let g = t.graph().state().egraph.lock();
         let mut out = Vec::new();
         for member in g.class_ids(g.class_of(t.id())) {
             if let Op::Logical(Logical::Scatter { base, upd, .. }) = &g.node(member).op {
@@ -848,17 +856,17 @@ mod tests {
         assert!(!cat.can_replay(1));
 
         // A ring replays forever and wraps, exactly as its appends do.
-        let mut ring: TensorCache<4, f32> = TensorCache::fixed_windowed(2, 2);
-        ring.append(&v);
-        assert!(ring.can_replay(1));
-        ring.replay_append(1).unwrap();
-        ring.replay_append(1).unwrap();
+        let mut ring: KvCache<4, f32> = KvCache::windowed(2, 2);
+        ring.append(&v, &v);
+        assert!(ring.k.can_replay(1));
+        ring.k.replay_append(1).unwrap();
+        ring.k.replay_append(1).unwrap();
         assert_eq!(
-            write_slots(&ring),
+            write_slots(&ring.k),
             vec![0u32],
             "the third token of a two-slot ring writes slot 0"
         );
-        assert!(!ring.can_replay(3), "an append wider than the window");
+        assert!(!ring.k.can_replay(3), "an append wider than the window");
     }
 
     #[test]

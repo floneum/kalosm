@@ -153,9 +153,8 @@ impl QMatrix {
     /// `q_mat_mul` keeps the weights quantized inside the kernel.
     ///
     /// The sugar node and its definitional `Restride` + `Map` expansion are
-    /// unioned into one class here, so there is nothing to recognize later:
-    /// see [`crate::composite::quantized::dequant_defn`], which returns `None`
-    /// for the `(fmt, layout)` pairs that still need a block program.
+    /// unioned into one class here, so there is nothing to recognize later.
+    /// Formats that still need a block program keep only the sugar node.
     pub fn dequantize(&self) -> Result<Tensor> {
         let graph = self.tensor.graph();
         // The sugar is minted first, so it takes the lower id and lands in
@@ -181,7 +180,7 @@ impl QMatrix {
     }
 
     /// The `Restride` + `Map` expansion alone, with no `Logical::Dequant` in the
-    /// class — the `*_slow` spelling [`crate::composite::core_op`] documents.
+    /// class — the forced definitional spelling.
     ///
     /// The extractor has no alternative here, so a test against this proves
     /// the bit arithmetic rather than proving which class member happened to
@@ -311,7 +310,7 @@ impl QMatrix {
         let mut bytes = Vec::new();
         let mut rows: u64 = 0;
         for (i, m) in parts.iter().enumerate() {
-            if !std::sync::Arc::ptr_eq(graph, m.tensor.graph()) {
+            if !GraphRef::ptr_eq(graph, m.tensor.graph()) {
                 return Err(Error::Shape(format!(
                     "concat_rows part {i} lives in a different graph"
                 )));

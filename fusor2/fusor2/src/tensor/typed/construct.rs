@@ -32,15 +32,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         )
     }
 
-    /// [`Tensor::zeros`] against extents that may be symbolic.
-    #[track_caller]
-    pub fn zeros_dims(device: &Device, shape: [Dim; R]) -> Self {
-        Self::wrap(
-            "Tensor::zeros_dims",
-            Dyn::zeros(device.handle(), T::DTYPE, &shape),
-        )
-    }
-
     /// Host bytes at a **runtime** dtype, at a known rank.
     ///
     /// This is the weight-load constructor. The bytes are interpreted at

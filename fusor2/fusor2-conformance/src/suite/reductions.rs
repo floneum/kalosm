@@ -29,10 +29,10 @@ fn table() -> Vec<(&'static str, bool, Reduce, HostReduce, Domain)> {
         ("min",              false, |x| x.min(1),          host_min,                  Domain::Wide),
         ("product",          false, |x| x.product(1),      host_product,              Domain::Positive),
         ("product_keepdim",  true,  |x| x.product(1)?.unsqueeze(1), host_product,      Domain::Positive),
-        ("var",              false, |x| x.variance(1),     host_var,                  Domain::Wide),
-        ("var_keepdim",      true,  |x| x.variance(1)?.unsqueeze(1), host_var,         Domain::Wide),
+        ("var",              false, |x| x.var(1),          host_var,                  Domain::Wide),
+        ("var_keepdim",      true,  |x| x.var(1)?.unsqueeze(1), host_var,              Domain::Wide),
         ("log_sum_exp",      false, host_lse_op,           host_lse,                  Domain::Wide),
-        ("squared_sum",      false, |x| x.square()?.sum(1), |r| r.iter().map(|v| v * v).sum(), Domain::Wide),
+        ("squared_sum",      false, |x| x.sqr()?.sum(1),   |r| r.iter().map(|v| v * v).sum(), Domain::Wide),
     ]
 }
 
@@ -61,7 +61,7 @@ fn host_lse(row: &[f32]) -> f32 {
 /// `log_sum_exp` as a composition, with the max shift that keeps it stable.
 fn host_lse_op(x: &Tensor) -> fusor2::Result<Tensor> {
     let max = x.max(1)?.unsqueeze(1)?;
-    let shifted = x.broadcast_sub(&max)?;
+    let shifted = x.sub_(&max)?;
     shifted.exp()?.sum(1)?.log()?.add(&max.squeeze(1)?)
 }
 
@@ -223,8 +223,8 @@ pub mod generality {
         let a = upload(graph.handle(), &dims(&[n, 1, d]), &points)?;
         let b = upload(graph.handle(), &dims(&[1, m, d]), &centroids)?;
         let dist = a
-            .broadcast_sub(&b)
-            .and_then(|v| v.square())
+            .sub_(&b)
+            .and_then(|v| v.sqr())
             .and_then(|v| v.sum(2))
             .map_err(err)?;
         let nearest = dist.min(1).map_err(err)?;
@@ -367,7 +367,7 @@ pub mod generality {
         let graph = graph_of(session);
         let x = upload(graph.handle(), &dims(&[rows, cols]), &data)?;
         let b = upload(graph.handle(), &dims(&[rows, 1]), &bias)?;
-        let shifted = x.broadcast_add(&b).and_then(|y| y.max(1)).map_err(err)?;
+        let shifted = x.add_(&b).and_then(|y| y.max(1)).map_err(err)?;
         let plain = x.max(1).map_err(err)?;
 
         let shifted = read(&shifted)?;
@@ -480,8 +480,8 @@ pub mod generality {
         let x = upload(graph.handle(), &dims(&[rows, len]), &signal)?;
         let c = upload(graph.handle(), &dims(&[1, len]), &cos_w)?;
         let s = upload(graph.handle(), &dims(&[1, len]), &sin_w)?;
-        let re = x.broadcast_mul(&c).and_then(|p| p.sum(1)).map_err(err)?;
-        let im = x.broadcast_mul(&s).and_then(|p| p.sum(1)).map_err(err)?;
+        let re = x.mul_(&c).and_then(|p| p.sum(1)).map_err(err)?;
+        let im = x.mul_(&s).and_then(|p| p.sum(1)).map_err(err)?;
         let re = read(&re)?;
         let im = read(&im)?;
 
@@ -539,14 +539,14 @@ pub mod generality {
         let p = upload(graph.handle(), &dims(&[rows, classes]), &weights)?;
         let m = x.max_keepdim(1).map_err(err)?;
         let lse = x
-            .broadcast_sub(&m)
+            .sub_(&m)
             .and_then(|z| z.exp())
             .and_then(|z| z.sum_keepdim(1))
             .and_then(|z| z.log())
             .and_then(|z| z.add(&m))
             .map_err(err)?;
         let loss = x
-            .broadcast_sub(&lse)
+            .sub_(&lse)
             .and_then(|z| z.mul(&p))
             .and_then(|z| z.sum(1))
             .and_then(|z| z.mul_scalar(-1.0))

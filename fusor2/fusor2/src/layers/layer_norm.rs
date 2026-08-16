@@ -14,9 +14,9 @@ use crate::{Error, Result, Tensor};
 /// default so that `LayerNorm` alone still names the rank-1 f32 case every
 /// checkpoint ships. The activation's rank is [`LayerNorm::forward`]'s.
 pub struct LayerNorm<const N: usize = 1, T: Element = f32> {
-    pub weight: Tensor<N, T>,
-    pub bias: Option<Tensor<N, T>>,
-    pub eps: f32,
+    weight: Tensor<N, T>,
+    bias: Option<Tensor<N, T>>,
+    eps: f32,
 }
 
 impl<const N: usize, T: Element> LayerNorm<N, T> {
@@ -54,8 +54,8 @@ impl<const N: usize, T: Element> LayerNorm<N, T> {
 /// The affine parameters may be shaped like the group — `[3, 4]` for
 /// `axes == 2`.
 pub struct LayerNormNd<const N: usize = 1, T: Element = f32> {
-    pub inner: LayerNorm<N, T>,
-    pub axes: u32,
+    inner: LayerNorm<N, T>,
+    axes: u32,
 }
 
 impl<const N: usize, T: Element> LayerNormNd<N, T> {

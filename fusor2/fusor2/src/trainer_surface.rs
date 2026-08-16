@@ -560,9 +560,9 @@ mod tests {
         assert_eq!(keep.shape(), [2, 1]);
         assert_eq!(keep.dtype(), crate::Dtype::F16);
         for k in [
-            a.product_keepdim(1usize),
+            a.product::<1>(1usize).unsqueeze(1),
             a.max_keepdim(1usize),
-            a.min_keepdim(1usize),
+            a.min::<1>(1usize).unsqueeze(1),
             a.mean_keepdim(1usize),
             a.var_keepdim(1usize),
         ] {

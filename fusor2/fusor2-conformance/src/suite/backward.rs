@@ -414,7 +414,7 @@ fn broadcast_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let x = upload(graph.handle(), &dims(shape), &x_data)?;
     let b = upload(graph.handle(), &dims(&[cols as u64]), &bias)?;
     let y = x
-        .broadcast_add(&b)
+        .add_(&b)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let expected: Vec<f32> = x_data
@@ -440,7 +440,7 @@ fn broadcast_mul_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult
     let x = upload(graph.handle(), &dims(shape), &x_data)?;
     let s = upload(graph.handle(), &dims(&[cols as u64]), &scale)?;
     let y = x
-        .broadcast_mul(&s)
+        .mul_(&s)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let d_s = gradient_of(&graph, &y, &s)?;

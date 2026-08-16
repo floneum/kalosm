@@ -75,99 +75,12 @@ pub fn binary_cross_entropy_with_logits(logits: &Tensor, targets: &Tensor) -> Re
     logits.softplus()?.sub(&logits.mul(targets)?)
 }
 
-/// How the trainer folds its three sigmoid-cross-entropy terms into one
-/// per-class target.
-///
-/// `BCE(x, z) = softplus(x) - x*z` is affine in `z`, so
-///
-/// ```text
-/// (1-hw)*BCE(x, teacher) + hw*BCE(x, hard) + sw*BCE(x, parent)
-///     = (1 + sw) * softplus(x) - x * [(1-hw)*teacher + hw*hard + sw*parent]
-/// ```
-///
-/// The bracket is host data — [`BceTargets::fold`] — and the multiplier on
-/// the shared `softplus` term is [`BceTargets::softplus_weight`].
-#[derive(Copy, Clone, Debug, PartialEq)]
-pub struct BceTargets {
-    /// Weight of the hard (argmax) term against the teacher's distribution.
-    pub hard_loss_weight: f32,
-    /// Weight of the parent/self-distillation term. Also the only thing that
-    /// moves [`BceTargets::softplus_weight`] off 1.
-    pub self_loss_weight: f32,
-    /// Label smoothing on the hard term only, exactly as the trainer applies
-    /// it: `one_hot * (1 - s) + s / classes`.
-    pub label_smoothing: f32,
-}
-
-impl Default for BceTargets {
-    /// The trainer's defaults: no hard term, no parent term, and the 0.05
-    /// smoothing `main.rs` configures.
-    fn default() -> Self {
-        Self {
-            hard_loss_weight: 0.0,
-            self_loss_weight: 0.0,
-            label_smoothing: 0.05,
-        }
-    }
-}
-
-impl BceTargets {
-    /// The multiplier on the shared `softplus(x)` term once the terms are
-    /// folded: `1 + self_loss_weight`.
-    pub fn softplus_weight(&self) -> f32 {
-        1.0 + self.self_loss_weight
-    }
-
-    /// One row of folded targets. `teacher` and `parent` are per-class
-    /// probabilities; `label` indexes the hard target.
-    ///
-    /// The hard term is scaled by the teacher's total in-head mass.
-    pub fn fold(
-        &self,
-        teacher: &[f32],
-        parent: Option<&[f32]>,
-        label: u32,
-        out: &mut [f32],
-    ) -> Result<()> {
-        let classes = teacher.len();
-        if out.len() != classes {
-            return Err(Error::Shape(format!(
-                "fold needs {classes} outputs, got {}",
-                out.len()
-            )));
-        }
-        if let Some(parent) = parent
-            && parent.len() != classes
-        {
-            return Err(Error::Shape(format!(
-                "the parent row has {} classes, the teacher has {classes}",
-                parent.len()
-            )));
-        }
-        let mass = teacher.iter().sum::<f32>().clamp(0.0, 1.0);
-        let floor = self.label_smoothing / classes as f32;
-        for class in 0..classes {
-            let one_hot = if class as u32 == label { 1.0 } else { 0.0 };
-            let hard = mass * (one_hot * (1.0 - self.label_smoothing) + floor);
-            let mut value = (1.0 - self.hard_loss_weight) * teacher[class]
-                + self.hard_loss_weight * hard;
-            if let Some(parent) = parent {
-                value += self.self_loss_weight * parent[class];
-            }
-            out[class] = value;
-        }
-        Ok(())
-    }
-}
-
 /// `mean_rows sum_classes [w * softplus(x) - x * z]`, the folded one-vs-all
 /// BCE the trainer optimizes.
 ///
-/// `w` is [`BceTargets::softplus_weight`] and `z` is a row of
-/// [`BceTargets::fold`]. `rows` is the batch size the mean is taken over; it
-/// is a parameter rather than `logits.dim(0)` so a padded batch still divides
-/// by the live row count.
-pub fn folded_bce_loss(
+/// `rows` is the batch size the mean is taken over; it is a parameter rather
+/// than `logits.dim(0)` so a padded batch still divides by the live row count.
+fn folded_bce_loss(
     logits: &Tensor,
     targets: &Tensor,
     softplus_weight: f32,
@@ -189,7 +102,7 @@ pub fn folded_bce_loss(
 ///
 /// One-vs-all: the teacher's
 /// per-class probability at `temperature` is `sigmoid(teacher / T)`, and the
-/// student pays [`folded_bce_loss`] against it at the same temperature. The
+/// student pays the folded BCE loss against it at the same temperature. The
 /// `T^2` factor restores the gradient scale the division removed, so the
 /// learning rate does not have to be retuned per temperature.
 ///
@@ -232,7 +145,7 @@ pub fn mse(a: &Tensor, b: &Tensor) -> Result<Tensor> {
             b.dtype()
         )));
     }
-    a.sub_(b)?.sqr()?.mean_all()
+    a.sub_(b)?.sqr()?.flatten_all()?.mean(0)
 }
 
 #[cfg(test)]
@@ -404,76 +317,6 @@ mod tests {
             binary_cross_entropy_with_logits(x, &t).unwrap()
         });
         assert_matches(&analytic, &numeric);
-    }
-
-    #[test]
-    fn the_folded_target_is_the_trainers_bracket() {
-        // All three terms live, so the fold is not a no-op.
-        let config = BceTargets {
-            hard_loss_weight: 0.5,
-            self_loss_weight: 0.25,
-            label_smoothing: 0.1,
-        };
-        let teacher = [0.6f32, 0.2, 0.0];
-        let parent = [0.1f32, 0.1, 0.8];
-        let mut out = [0.0f32; 3];
-        config.fold(&teacher, Some(&parent), 1, &mut out).unwrap();
-
-        // mass = 0.8, floor = 0.1/3.
-        let mass = 0.8f32;
-        let floor = 0.1 / 3.0;
-        for class in 0..3 {
-            let one_hot = if class == 1 { 1.0 } else { 0.0 };
-            let hard = mass * (one_hot * 0.9 + floor);
-            let want = 0.5 * teacher[class] + 0.5 * hard + 0.25 * parent[class];
-            close(out[class], want, 1e-5);
-        }
-        close(config.softplus_weight(), 1.25, 1e-6);
-    }
-
-    #[test]
-    fn smoothing_moves_mass_off_the_hard_label() {
-        let teacher = [1.0f32, 0.0];
-        let sharp = BceTargets {
-            hard_loss_weight: 1.0,
-            self_loss_weight: 0.0,
-            label_smoothing: 0.0,
-        };
-        let smooth = BceTargets {
-            label_smoothing: 0.2,
-            ..sharp
-        };
-        let mut a = [0.0f32; 2];
-        let mut b = [0.0f32; 2];
-        sharp.fold(&teacher, None, 0, &mut a).unwrap();
-        smooth.fold(&teacher, None, 0, &mut b).unwrap();
-        // mass = 1, so sharp is exactly one-hot and smooth is 0.9 / 0.1.
-        assert_eq!(a, [1.0, 0.0]);
-        close(b[0], 0.9, 1e-6);
-        close(b[1], 0.1, 1e-6);
-    }
-
-    /// A teacher that does not sum to 1 discounts the hard term by its mass.
-    #[test]
-    fn the_hard_term_is_discounted_by_the_teachers_mass() {
-        let config = BceTargets {
-            hard_loss_weight: 1.0,
-            self_loss_weight: 0.0,
-            label_smoothing: 0.0,
-        };
-        let mut out = [0.0f32; 2];
-        config.fold(&[0.3, 0.1], None, 0, &mut out).unwrap();
-        close(out[0], 0.4, 1e-6);
-        close(out[1], 0.0, 1e-6);
-    }
-
-    #[test]
-    fn the_folded_target_refuses_a_ragged_parent() {
-        let config = BceTargets::default();
-        let mut out = [0.0f32; 3];
-        assert!(config.fold(&[0.5, 0.5, 0.0], Some(&[1.0]), 0, &mut out).is_err());
-        let mut short = [0.0f32; 2];
-        assert!(config.fold(&[0.5, 0.5, 0.0], None, 0, &mut short).is_err());
     }
 
     #[test]

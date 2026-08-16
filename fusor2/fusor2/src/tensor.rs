@@ -4,25 +4,24 @@
 //!
 //! Nothing else in `fusor2/src/tensor*`, `fusor2/src/ops/*` or
 //! `fusor2/src/broadcast.rs` touches the e-graph directly. Everything routes
-//! through these four `GraphInner` methods:
+//! through the opaque [`crate::graph::GraphRef`] handle:
 //!
 //! ```ignore
-//! impl GraphInner {
-//!     pub fn add_logical(&self, op: Logical) -> Result<Id>;         // hash-cons + infer
-//!     pub fn facts(&self, id: Id) -> ValueFacts;          // cloned; total
-//!     pub fn tensor(self: &Arc<Self>, id: Id) -> Tensor;  // wrap an id
-//!     pub fn set_leaf_bytes(&self, id: Id, bytes: Vec<u8>);
+//! impl GraphRef {
+//!     fn add_logical(&self, op: Logical) -> Result<Id>;
+//!     fn facts(&self, id: Id) -> ValueFacts;
+//!     fn tensor(&self, id: Id) -> Tensor;
+//!     fn set_leaf_bytes(&self, id: Id, bytes: Vec<u8>);
 //! }
 //! ```
 //!
-//! plus `GraphInner::{session, fresh_sym, read_back}`. [`Tensor::emit`] is the
-//! **only** place a node is minted inside this item.
+//! Construction, graph state, and readback stay behind that handle.
 
-pub mod construction;
-pub mod readback;
-pub mod typed;
+pub(crate) mod construction;
+pub(crate) mod readback;
+pub(crate) mod typed;
 
-use fusor2_ir::dtype::{Dtype, NumericContract, Persistence, Splat};
+use fusor2_ir::dtype::{Dtype, Splat};
 use fusor2_ir::egraph::Id;
 use fusor2_ir::facts::ValueFacts;
 use fusor2_ir::ir::logical::{Logical, LeafKind};
@@ -38,7 +37,7 @@ pub use crate::ops::index::{IndexOp, TensorIndex, cat, stack};
 pub use crate::ops::view::Extent;
 pub use construction::{FromArray, arange, arange_step};
 pub use readback::{TensorSlice, ToVec};
-pub use typed::{Axis, Element, SimdElement, Typed};
+pub use typed::{Axis, Element};
 /// The rounding an explicit `round_mode` selects.
 pub use fusor2_ir::dtype::RoundMode;
 
@@ -111,23 +110,6 @@ impl Tensor {
     /// Element count, or `None` when any extent is symbolic.
     pub fn elem_count(&self) -> Option<u64> {
         self.facts().elements()
-    }
-
-    /// Alternate spelling of [`Tensor::elem_count`].
-    pub fn elements(&self) -> Option<u64> {
-        self.elem_count()
-    }
-
-    pub fn numeric(&self) -> NumericContract {
-        self.facts().numeric
-    }
-
-    pub fn persistence(&self) -> Persistence {
-        self.facts().persistence
-    }
-
-    pub fn is_scalar(&self) -> bool {
-        self.rank() == 0
     }
 
     /// Materialize and re-leaf, cutting this value off from its producers.
@@ -224,12 +206,6 @@ impl Tensor {
                 ))
             })
             .unwrap_or(false)
-    }
-
-    /// Wrap in the compile-time-rank facade. Purely a type-level assertion —
-    /// the IR is unchanged.
-    pub fn typed<const R: usize, D: Element>(self) -> Result<Typed<R, D>> {
-        Typed::try_from_dyn(self)
     }
 
     /// Mint one Logical node and wrap it. The single call site for `add_logical` in
@@ -897,7 +873,6 @@ mod graph_tests {
         let g = graph();
         let s = Tensor::splat(g.handle(), Splat::F32(1.0), &[]).unwrap();
         assert_eq!(s.rank(), 0);
-        assert!(s.is_scalar());
         assert_eq!(s.elem_count(), Some(1));
         // Every op accepts it.
         assert_eq!(s.exp().unwrap().rank(), 0);
@@ -1042,8 +1017,7 @@ mod graph_tests {
     }
 
 
-    /// Every alias hash-conses onto its target, which is the strongest form of
-    /// "structurally identical": the same node id.
+    /// `expand` hash-conses onto `broadcast_as`.
     #[test]
     fn alias_surface() {
         let g = graph();
@@ -1052,7 +1026,6 @@ mod graph_tests {
             x.expand(&dims(&[2, 3])).unwrap().id(),
             x.broadcast_as(&dims(&[2, 3])).unwrap().id()
         );
-        assert_eq!(x.square().unwrap().id(), x.sqr().unwrap().id());
     }
 
 
@@ -1101,15 +1074,6 @@ mod graph_tests {
                 assert_eq!(tag_of(&y), OpTag::Map);
             }
         }
-    }
-
-    #[test]
-    fn typed_rejects_a_mismatch_without_panicking() {
-        let g = graph();
-        let x = leaf(&g, &[2, 3]);
-        assert!(x.clone().typed::<2, f32>().is_ok());
-        assert!(x.clone().typed::<3, f32>().is_err());
-        assert!(x.typed::<2, u32>().is_err());
     }
 
     #[test]

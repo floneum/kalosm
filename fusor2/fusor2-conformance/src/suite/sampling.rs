@@ -7,9 +7,7 @@
 //! surviving set, and that the pending forms hand back a device tensor rather
 //! than a host round trip.
 
-use fusor2::sampling::mirostat2::Mirostat2Sampler;
-use fusor2::sampling::standard::{StandardSamplerParams, sample};
-use fusor2::sampling::top_k::top_k_pairs;
+use fusor2::sampling::{Mirostat2Sampler, StandardSamplerParams, sample, top_k_pairs};
 use fusor2::tensor::Dyn as Tensor;
 use fusor2::{Dtype, Session};
 

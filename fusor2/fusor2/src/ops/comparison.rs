@@ -50,15 +50,6 @@ impl Tensor {
     pub fn gte_scalar(&self, s: impl Into<Scalar>) -> Result<Tensor> {
         self.cmp_scalar(CmpOp::Ge, s)
     }
-    /// Reference spelling of [`Tensor::lte_scalar`].
-    pub fn le_scalar(&self, s: impl Into<Scalar>) -> Result<Tensor> {
-        self.lte_scalar(s)
-    }
-    /// Reference spelling of [`Tensor::gte_scalar`].
-    pub fn ge_scalar(&self, s: impl Into<Scalar>) -> Result<Tensor> {
-        self.gte_scalar(s)
-    }
-
     /// `1` where `a == b`.
     pub fn eq_tensor(&self, rhs: &Tensor) -> Result<Tensor> {
         self.cmp_tensor(CmpOp::Eq, rhs, "eq_tensor")

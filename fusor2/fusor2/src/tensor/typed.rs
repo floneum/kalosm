@@ -36,16 +36,11 @@ mod construct;
 mod ops;
 
 /// A Rust scalar with a fusor2 dtype.
-///
-/// `SimdElement` is an alias for compatibility with other spellings.
 pub trait Element: bytemuck::Pod + Copy + Send + Sync + 'static {
     const DTYPE: Dtype;
     /// This value as the backend's splat literal.
     fn splat(self) -> Splat;
 }
-
-/// An alias for [`Element`].
-pub use self::Element as SimdElement;
 
 impl Element for f32 {
     const DTYPE: Dtype = Dtype::F32;
@@ -109,22 +104,6 @@ impl<const R: usize> Axis<R> for Minus2 {
     }
 }
 
-macro_rules! axis_consts {
-    ($($name:ident = $n:expr;)*) => {$(
-        /// A literal axis selector.
-        #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
-        pub struct $name;
-        impl<const R: usize> Axis<R> for $name {
-            fn resolve(self) -> usize { $n }
-        }
-    )*};
-}
-
-axis_consts! {
-    Dim0 = 0; Dim1 = 1; Dim2 = 2; Dim3 = 3;
-    Dim4 = 4; Dim5 = 5; Dim6 = 6; Dim7 = 7;
-}
-
 /// A [`crate::Tensor`] whose rank and dtype are asserted at construction and
 /// then tracked in the type. `repr(transparent)`: the same size and layout as
 /// the runtime-rank tensor.
@@ -133,9 +112,6 @@ pub struct Tensor<const R: usize, T: Element = f32> {
     raw: Dyn,
     _t: PhantomData<T>,
 }
-
-/// The pre-rename spelling of [`Tensor`].
-pub type Typed<const R: usize, D> = Tensor<R, D>;
 
 impl<const R: usize, T: Element> Clone for Tensor<R, T> {
     fn clone(&self) -> Self {
@@ -245,7 +221,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     pub fn into_dyn(self) -> Dyn {
         self.raw
     }
-    /// Alias of [`Tensor::as_tensor`].
+    /// Borrow the runtime-rank value underneath.
     pub fn as_dyn(&self) -> &Dyn {
         &self.raw
     }
@@ -442,7 +418,6 @@ same!(
     log,
     log2,
     sqrt,
-    inverse_sqrt,
     sin,
     cos,
     tan,
@@ -735,11 +710,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         Self::wrap("matmul_t", narrow_acc::<T>(self.raw.matmul_t(&rhs.raw)))
     }
 
-    /// The reference's spelling of [`Tensor::matmul`].
-    #[track_caller]
-    pub fn mat_mul(&self, rhs: &Self) -> Self {
-        self.matmul(rhs)
-    }
 }
 
 /// Rank-reducing folds; `O` is `R - 1`.
@@ -776,9 +746,7 @@ macro_rules! reduce_keepdim {
 
 reduce_keepdim!(
     sum_keepdim,
-    product_keepdim,
     max_keepdim,
-    min_keepdim,
     mean_keepdim,
     var_keepdim,
 );
@@ -1072,7 +1040,7 @@ mod tests {
         let device = Device::cpu();
         let x = Tensor::<2, f32>::zeros(&device, [2, 3]);
         let y = Tensor::<2, f32>::ones(&x.device(), [2, 3]);
-        assert!(std::sync::Arc::ptr_eq(x.graph(), y.graph()));
+        assert!(GraphRef::ptr_eq(x.graph(), y.graph()));
         assert_eq!(Tensor::add(&x, &y).to_flat(), vec![1.0f32; 6]);
         assert_eq!(x.device().name(), "cpu");
     }
@@ -1090,7 +1058,6 @@ mod tests {
     fn axis_selectors_resolve() {
         assert_eq!(Axis::<4>::resolve(Minus1), 3);
         assert_eq!(Axis::<4>::resolve(Minus2), 2);
-        assert_eq!(Axis::<4>::resolve(Dim0), 0);
         assert_eq!(Axis::<4>::resolve(2usize), 2);
     }
 
@@ -1100,17 +1067,6 @@ mod tests {
         assert!(const_extents::<1>(&sym, "test").is_err());
         assert_eq!(const_extents::<2>(&[Dim::Const(2), Dim::Const(3)], "t").unwrap(), [2, 3]);
         assert!(const_extents::<1>(&[Dim::Const(2), Dim::Const(3)], "t").is_err());
-    }
-
-    /// The dtype parameter defaults to `f32`, so `Tensor<1>` is `Tensor<1, f32>`.
-    ///
-    /// Never called: the assertion is that it type-checks.
-    #[allow(dead_code)]
-    fn a_bound_written_as_simd_element_resolves<const R: usize, T: SimdElement>(
-        t: &Tensor<R, T>,
-    ) -> usize {
-        let _: Dtype = T::DTYPE;
-        t.rank()
     }
 
     #[allow(dead_code)]

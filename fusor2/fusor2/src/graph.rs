@@ -4,7 +4,7 @@
 //! one graph with one root set, which is what makes gradient checkpointing
 //! the extractor's materialization bit.
 
-use std::sync::Arc;
+use std::sync::{Arc, Weak};
 
 use fusor2_autograd::custom::{CustomRegistry, with_backwards as register_custom};
 use fusor2_autograd::tape::{GraphTape, splat_of};
@@ -23,8 +23,26 @@ use crate::session::Session;
 use crate::tensor::Tensor;
 use crate::{Error, Result};
 
-/// Shared handle to the graph a [`Tensor`] belongs to.
-pub type GraphRef = Arc<GraphInner>;
+/// Shared handle to the graph a [`crate::Tensor`] belongs to.
+#[derive(Clone)]
+pub struct GraphRef {
+    state: Arc<GraphInner>,
+}
+
+#[derive(Clone)]
+pub(crate) struct WeakGraphRef {
+    state: Weak<GraphInner>,
+}
+
+impl WeakGraphRef {
+    pub(crate) fn strong_count(&self) -> usize {
+        self.state.strong_count()
+    }
+
+    pub(crate) fn upgrade(&self) -> Option<GraphRef> {
+        self.state.upgrade().map(|state| GraphRef { state })
+    }
+}
 
 /// Host bytes waiting to be uploaded for one external leaf, plus the device
 /// buffer once one exists. A `Persistent` leaf keeps its buffer across
@@ -50,10 +68,9 @@ pub(crate) struct SymbolStore {
 }
 
 /// The mutable graph state behind a [`GraphRef`].
-pub struct GraphInner {
+pub(crate) struct GraphInner {
     pub(crate) egraph: Mutex<EGraph>,
     pub(crate) session: Session,
-    pub(crate) params: Mutex<FxHashMap<String, Id>>,
     /// The `AttrId` side table. Attributes live outside `Op` so `Op` stays
     /// `Hash + Eq` and the hash-cons memo stays exact.
     pub(crate) attrs: Mutex<Vec<MacroAttr>>,
@@ -93,36 +110,46 @@ struct ConstKey {
     bytes: Vec<u8>,
 }
 
-impl GraphInner {
+impl GraphRef {
+    pub(crate) fn as_ptr(graph: &Self) -> *const GraphInner {
+        Arc::as_ptr(&graph.state)
+    }
+
+    pub(crate) fn ptr_eq(a: &Self, b: &Self) -> bool {
+        Arc::ptr_eq(&a.state, &b.state)
+    }
+
+    pub(crate) fn downgrade(graph: &Self) -> WeakGraphRef {
+        WeakGraphRef {
+            state: Arc::downgrade(&graph.state),
+        }
+    }
+
+    pub(crate) fn state(&self) -> &GraphInner {
+        &self.state
+    }
+
     /// Run `f` with exclusive access to the e-graph.
-    pub fn with_egraph<T>(&self, f: impl FnOnce(&mut EGraph) -> Result<T>) -> Result<T> {
-        let mut g = self.egraph.lock();
+    pub(crate) fn with_egraph<T>(&self, f: impl FnOnce(&mut EGraph) -> Result<T>) -> Result<T> {
+        let mut g = self.state.egraph.lock();
         f(&mut g)
     }
 
     /// Run `f` with a construction tape over the e-graph. Every macro-op
     /// `defn` is built through this, so forward and backward share one node
     /// arena.
-    pub fn build<T>(&self, f: impl FnOnce(&mut GraphTape<'_>) -> Result<T>) -> Result<T> {
-        let mut g = self.egraph.lock();
+    pub(crate) fn build<T>(&self, f: impl FnOnce(&mut GraphTape<'_>) -> Result<T>) -> Result<T> {
+        let mut g = self.state.egraph.lock();
         let mut tape = GraphTape::new(&mut g);
         f(&mut tape)
     }
 
-    pub fn add(&self, op: Op) -> Result<Id> {
-        self.egraph.lock().add(op)
+    pub(crate) fn add_logical(&self, op: Logical) -> Result<Id> {
+        self.state.egraph.lock().add(Op::Logical(op))
     }
 
-    pub fn add_logical(&self, op: Logical) -> Result<Id> {
-        self.egraph.lock().add(Op::Logical(op))
-    }
-
-    pub fn union(&self, a: Id, b: Id) -> Result<Id> {
-        self.egraph.lock().union(a, b)
-    }
-
-    /// [`Self::union`] with a stable return: the first call for a pair
-    /// unions and memoizes the root it produced; every later call for the
+    /// Union with a stable return: the first call for a pair unions and
+    /// memoizes the root it produced; every later call for the
     /// same pair returns that same id, even after saturation has grown the
     /// class and moved its current root.
     ///
@@ -132,52 +159,48 @@ impl GraphInner {
     /// consumer referencing it would miss the hash-cons memo and re-mint the
     /// whole downstream graph. The memoized id is an ordinary member of the
     /// class; selection, facts and readback are all per class.
-    pub fn union_stable(&self, a: Id, b: Id) -> Result<Id> {
+    pub(crate) fn union_stable(&self, a: Id, b: Id) -> Result<Id> {
         let key = if a.0 <= b.0 { (a, b) } else { (b, a) };
-        if let Some(hit) = self.union_memo.lock().get(&key).copied() {
+        if let Some(hit) = self.state.union_memo.lock().get(&key).copied() {
             return Ok(hit);
         }
-        let root = self.egraph.lock().union(a, b)?;
-        self.union_memo.lock().insert(key, root);
+        let root = self.state.egraph.lock().union(a, b)?;
+        self.state.union_memo.lock().insert(key, root);
         Ok(root)
     }
 
-    pub fn mark_defn(&self, id: Id) {
-        self.egraph.lock().mark_defn(id);
-    }
-
     /// The `GraphRef`-level spelling of [`Graph::with_backwards`].
-    pub fn register_backward(
+    pub(crate) fn register_backward(
         &self,
         value: Id,
         parents: &[fusor2_ir::autograd::Parent],
         rule: AdjointFn,
     ) -> Result<()> {
-        let mut reg = self.custom.lock();
+        let mut reg = self.state.custom.lock();
         register_custom(&mut reg, value, parents, rule)?;
         Ok(())
     }
 
-    pub fn facts(&self, id: Id) -> fusor2_ir::facts::ValueFacts {
-        self.egraph.lock().facts(id).clone()
+    pub(crate) fn facts(&self, id: Id) -> fusor2_ir::facts::ValueFacts {
+        self.state.egraph.lock().facts(id).clone()
     }
 
-    pub fn session(&self) -> &Session {
-        &self.session
+    pub(crate) fn session(&self) -> &Session {
+        &self.state.session
     }
 
     /// Wrap a node id as a user-facing tensor.
-    pub fn tensor(self: &Arc<Self>, id: Id) -> Tensor {
+    pub(crate) fn tensor(&self, id: Id) -> Tensor {
         Tensor {
             id,
-            graph: Arc::clone(self),
+            graph: self.clone(),
         }
     }
 
     /// Intern a macro attribute blob. Equal attributes share an id, so two
     /// identically-configured macro ops hash-cons together.
-    pub fn intern_attrs(&self, attrs: MacroAttr) -> AttrId {
-        let mut table = self.attrs.lock();
+    pub(crate) fn intern_attrs(&self, attrs: MacroAttr) -> AttrId {
+        let mut table = self.state.attrs.lock();
         if let Some(i) = table.iter().position(|a| *a == attrs) {
             return AttrId(i as u32);
         }
@@ -185,14 +208,10 @@ impl GraphInner {
         AttrId((table.len() - 1) as u32)
     }
 
-    pub fn attrs_of(&self, id: AttrId) -> Option<MacroAttr> {
-        self.attrs.lock().get(id.0 as usize).cloned()
-    }
-
     /// The one `BufferId` allocator. Every leaf name in a graph comes from
     /// here, so no two leaves can share a name by accident.
     pub(crate) fn fresh_buffer_id(&self) -> BufferId {
-        let mut next = self.next_buffer.lock();
+        let mut next = self.state.next_buffer.lock();
         let id = BufferId(*next);
         *next += 1;
         id
@@ -211,7 +230,7 @@ impl GraphInner {
             shape: shape.to_vec(),
             bytes,
         };
-        if let Some(id) = self.constants.lock().get(&key).copied() {
+        if let Some(id) = self.state.constants.lock().get(&key).copied() {
             return Ok(id);
         }
         let id = self.add_logical(Logical::Leaf(LeafKind::Buffer {
@@ -220,7 +239,7 @@ impl GraphInner {
             shape: shape.iter().copied().collect(),
         }))?;
         self.set_leaf_bytes(id, key.bytes.clone());
-        self.constants.lock().insert(key, id);
+        self.state.constants.lock().insert(key, id);
         Ok(id)
     }
 
@@ -232,7 +251,7 @@ impl GraphInner {
     ///
     /// `None` when `src` has no host bytes or they are not whole words.
     pub(crate) fn words_leaf_of(&self, src: Id) -> Result<Option<Id>> {
-        if let Some(id) = self.word_leaves.lock().get(&src).copied() {
+        if let Some(id) = self.state.word_leaves.lock().get(&src).copied() {
             return Ok(Some(id));
         }
         let Some(bytes) = self.leaf_bytes_shared(src) else {
@@ -247,7 +266,7 @@ impl GraphInner {
             shape: std::iter::once(Dim::Const(bytes.len() as u64 / 4)).collect(),
         }))?;
         self.set_leaf_bytes_shared(id, bytes);
-        self.word_leaves.lock().insert(src, id);
+        self.state.word_leaves.lock().insert(src, id);
         Ok(Some(id))
     }
 
@@ -263,12 +282,12 @@ impl GraphInner {
     /// `None` when the leaf is not quantized, is not `Native`, has no host
     /// bytes, or its native block stride is already a whole number of words.
     pub(crate) fn repacked_leaf_of(&self, src: Id) -> Result<Option<Id>> {
-        if let Some(cached) = self.repack_leaves.lock().get(&src).copied() {
+        if let Some(cached) = self.state.repack_leaves.lock().get(&src).copied() {
             return Ok(cached);
         }
         let mint = || -> Result<Option<Id>> {
             let (fmt, shape) = {
-                let g = self.egraph.lock();
+                let g = self.state.egraph.lock();
                 match &g.node(src).op {
                     Op::Logical(Logical::Leaf(LeafKind::Quantized {
                         fmt,
@@ -300,52 +319,52 @@ impl GraphInner {
             Ok(Some(id))
         };
         let out = mint()?;
-        self.repack_leaves.lock().insert(src, out);
+        self.state.repack_leaves.lock().insert(src, out);
         Ok(out)
     }
 
     /// A fresh symbolic quantity. Allocated by the e-graph so a frontend
     /// symbol can never collide with one a rule mints (`fold_split`'s block
     /// count).
-    pub fn fresh_sym(&self) -> SymId {
-        self.egraph.lock().fresh_sym()
+    pub(crate) fn fresh_sym(&self) -> SymId {
+        self.state.egraph.lock().fresh_sym()
     }
 
     /// A named symbol, created on first use. Two calls with the same name
     /// return the same `SymId`, so `graph.sym("seq")` is stable across a
     /// decode loop.
-    pub fn named_sym(&self, name: &str) -> SymId {
-        if let Some(s) = self.symbols.lock().named.get(name).copied() {
+    pub(crate) fn named_sym(&self, name: &str) -> SymId {
+        if let Some(s) = self.state.symbols.lock().named.get(name).copied() {
             return s;
         }
         let s = self.fresh_sym();
-        self.symbols.lock().named.insert(name.to_string(), s);
+        self.state.symbols.lock().named.insert(name.to_string(), s);
         s
     }
 
     /// Bind a symbolic extent for the next resolve.
-    pub fn bind_dim(&self, sym: SymId, value: u64) {
-        self.symbols.lock().dims.insert(sym, value);
+    pub(crate) fn bind_dim(&self, sym: SymId, value: u64) {
+        self.state.symbols.lock().dims.insert(sym, value);
     }
 
-    pub fn dim_binding(&self, sym: SymId) -> Option<u64> {
-        self.symbols.lock().dims.get(&sym).copied()
+    pub(crate) fn dim_binding(&self, sym: SymId) -> Option<u64> {
+        self.state.symbols.lock().dims.get(&sym).copied()
     }
 
     /// Write a runtime scalar. A learning rate set here is a word in
     /// binding 0, never a baked literal, so changing it recompiles nothing.
-    pub fn set_uniform(&self, sym: SymId, value: f32) {
-        self.symbols.lock().scalars.insert(sym, value);
+    pub(crate) fn set_uniform(&self, sym: SymId, value: f32) {
+        self.state.symbols.lock().scalars.insert(sym, value);
     }
 
-    pub fn uniform_value(&self, sym: SymId) -> Option<f32> {
-        self.symbols.lock().scalars.get(&sym).copied()
+    pub(crate) fn uniform_value(&self, sym: SymId) -> Option<f32> {
+        self.state.symbols.lock().scalars.get(&sym).copied()
     }
 
     /// Every `(sym, value)` runtime scalar declared so far.
-    pub fn uniform_scalars(&self) -> Vec<(SymId, f32)> {
+    pub(crate) fn uniform_scalars(&self) -> Vec<(SymId, f32)> {
         let mut out: Vec<(SymId, f32)> = self
-            .symbols
+            .state.symbols
             .lock()
             .scalars
             .iter()
@@ -356,9 +375,9 @@ impl GraphInner {
     }
 
     /// Every `(sym, extent)` dim binding declared so far.
-    pub fn dim_bindings(&self) -> Vec<(SymId, u64)> {
+    pub(crate) fn dim_bindings(&self) -> Vec<(SymId, u64)> {
         let mut out: Vec<(SymId, u64)> = self
-            .symbols
+            .state.symbols
             .lock()
             .dims
             .iter()
@@ -369,7 +388,7 @@ impl GraphInner {
     }
 
     /// Attach host bytes to an external leaf.
-    pub fn set_leaf_bytes(&self, id: Id, bytes: Vec<u8>) {
+    pub(crate) fn set_leaf_bytes(&self, id: Id, bytes: Vec<u8>) {
         self.set_leaf_bytes_shared(id, Arc::new(bytes));
     }
 
@@ -377,14 +396,14 @@ impl GraphInner {
     /// byte stream — a quantized weight and its `U32`-word respelling are
     /// the same allocation.
     pub(crate) fn set_leaf_bytes_shared(&self, id: Id, bytes: Arc<Vec<u8>>) {
-        let mut store = self.leaves.lock();
+        let mut store = self.state.leaves.lock();
         store.bytes.insert(id, bytes);
         // A changed upload invalidates the device copy, never the plan.
         store.device.remove(&id);
     }
 
-    pub fn leaf_bytes(&self, id: Id) -> Option<Vec<u8>> {
-        self.leaves
+    pub(crate) fn leaf_bytes(&self, id: Id) -> Option<Vec<u8>> {
+        self.state.leaves
             .lock()
             .bytes
             .get(&id)
@@ -393,7 +412,7 @@ impl GraphInner {
 
     /// The shared handle to a leaf's host bytes, no copy.
     pub(crate) fn leaf_bytes_shared(&self, id: Id) -> Option<Arc<Vec<u8>>> {
-        self.leaves.lock().bytes.get(&id).cloned()
+        self.state.leaves.lock().bytes.get(&id).cloned()
     }
 
     /// Run `f` over an external leaf's host bytes without copying them.
@@ -402,13 +421,13 @@ impl GraphInner {
     /// graph. The only caller uploads through the target's pool, which locks
     /// nothing of the graph's.
     pub(crate) fn with_leaf_bytes<T>(&self, id: Id, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
-        let store = self.leaves.lock();
+        let store = self.state.leaves.lock();
         store.bytes.get(&id).map(|b| f(b.as_slice()))
     }
 
     /// The device buffer backing `id`, once a resolve has produced one.
-    pub fn device_buf(&self, id: Id) -> Option<Buf> {
-        self.leaves.lock().device.get(&id).map(|(b, _)| b.clone())
+    pub(crate) fn device_buf(&self, id: Id) -> Option<Buf> {
+        self.state.leaves.lock().device.get(&id).map(|(b, _)| b.clone())
     }
 
     /// For each of `ids`, whether it is an external leaf the caller must
@@ -416,7 +435,7 @@ impl GraphInner {
     /// acquisitions for the whole set.
     pub(crate) fn external_leaf_buffers(&self, ids: &[Id]) -> Vec<(Id, Option<Buf>)> {
         let external: Vec<Id> = {
-            let g = self.egraph.lock();
+            let g = self.state.egraph.lock();
             ids.iter()
                 .copied()
                 .filter(|id| {
@@ -431,7 +450,7 @@ impl GraphInner {
                 })
                 .collect()
         };
-        let store = self.leaves.lock();
+        let store = self.state.leaves.lock();
         external
             .into_iter()
             .map(|id| (id, store.device.get(&id).map(|(b, _)| b.clone())))
@@ -444,20 +463,20 @@ impl GraphInner {
     /// next resolve so the same (structurally unchanged) graph re-dispatches
     /// instead of short-circuiting on last step's buffers. Clears every class
     /// member because `Session::bind_class` bound every member.
-    pub fn clear_class_device_buf(&self, id: Id) {
+    pub(crate) fn clear_class_device_buf(&self, id: Id) {
         let members = {
-            let mut g = self.egraph.lock();
+            let mut g = self.state.egraph.lock();
             let class = g.class_of(id);
             g.class_ids_cached(class)
         };
-        let mut store = self.leaves.lock();
+        let mut store = self.state.leaves.lock();
         for m in members.iter() {
             store.device.remove(m);
         }
     }
 
     pub(crate) fn set_device_buf(&self, id: Id, buf: Buf) {
-        let mut store = self.leaves.lock();
+        let mut store = self.state.leaves.lock();
         store.device.insert(id, (buf, None));
     }
 
@@ -469,7 +488,7 @@ impl GraphInner {
         buf: &Buf,
         layout: Option<&Arc<fusor2_ir::shape::Layout>>,
     ) {
-        let mut store = self.leaves.lock();
+        let mut store = self.state.leaves.lock();
         for id in ids {
             store.device.insert(*id, (buf.clone(), layout.cloned()));
         }
@@ -482,7 +501,7 @@ impl GraphInner {
         items: &[(Id, Buf, Option<Arc<fusor2_ir::shape::Layout>>)],
     ) {
         let classes: Vec<Arc<[Id]>> = {
-            let mut g = self.egraph.lock();
+            let mut g = self.state.egraph.lock();
             items
                 .iter()
                 .map(|(id, _, _)| {
@@ -491,7 +510,7 @@ impl GraphInner {
                 })
                 .collect()
         };
-        let mut store = self.leaves.lock();
+        let mut store = self.state.leaves.lock();
         for ((_, buf, layout), members) in items.iter().zip(&classes) {
             for m in members.iter() {
                 store.device.insert(*m, (buf.clone(), layout.clone()));
@@ -500,7 +519,7 @@ impl GraphInner {
     }
 
     pub(crate) fn device_layout(&self, id: Id) -> Option<fusor2_ir::shape::Layout> {
-        self.leaves
+        self.state.leaves
             .lock()
             .device
             .get(&id)
@@ -514,13 +533,13 @@ impl GraphInner {
     /// The guard spans both halves: a concurrent resolve landing between them
     /// could bind a fresh output buffer for a class this read is about to
     /// download, and downloading a buffer whose dispatch has not run yet
-    /// returns zeros rather than an error. See [`GraphInner::resolve_lock`].
-    pub fn read_back(self: &Arc<Self>, id: Id) -> Result<Vec<u8>> {
+    /// returns zeros rather than an error. See [`GraphRef::state`].
+    pub(crate) fn read_back(&self, id: Id) -> Result<Vec<u8>> {
         let tensor = self.tensor(id);
-        let resolving = self.resolve_lock.lock();
-        self.session
+        let resolving = self.state.resolve_lock.lock();
+        self.state.session
             .resolve_locked(&resolving, std::slice::from_ref(&tensor))?;
-        self.session.read_bytes_locked(&resolving, self, id)
+        self.state.session.read_bytes_locked(&resolving, self, id)
     }
 }
 
@@ -533,21 +552,22 @@ pub struct Graph {
 impl Graph {
     pub fn new(session: &Session) -> Self {
         Self {
-            inner: Arc::new(GraphInner {
-                egraph: Mutex::new(EGraph::new(session.semantics())),
-                session: session.clone(),
-                params: Mutex::new(FxHashMap::default()),
-                attrs: Mutex::new(Vec::new()),
-                leaves: Mutex::new(LeafStore::default()),
-                symbols: Mutex::new(SymbolStore::default()),
-                custom: Mutex::new(CustomRegistry::new()),
-                next_buffer: Mutex::new(0),
-                constants: Mutex::new(FxHashMap::default()),
-                word_leaves: Mutex::new(FxHashMap::default()),
-                repack_leaves: Mutex::new(FxHashMap::default()),
-                union_memo: Mutex::new(FxHashMap::default()),
-                resolve_lock: Mutex::new(()),
-            }),
+            inner: GraphRef {
+                state: Arc::new(GraphInner {
+                    egraph: Mutex::new(EGraph::new(session.semantics())),
+                    session: session.clone(),
+                    attrs: Mutex::new(Vec::new()),
+                    leaves: Mutex::new(LeafStore::default()),
+                    symbols: Mutex::new(SymbolStore::default()),
+                    custom: Mutex::new(CustomRegistry::new()),
+                    next_buffer: Mutex::new(0),
+                    constants: Mutex::new(FxHashMap::default()),
+                    word_leaves: Mutex::new(FxHashMap::default()),
+                    repack_leaves: Mutex::new(FxHashMap::default()),
+                    union_memo: Mutex::new(FxHashMap::default()),
+                    resolve_lock: Mutex::new(()),
+                }),
+            },
         }
     }
 
@@ -561,19 +581,18 @@ impl Graph {
     }
 
     pub fn session(&self) -> &Session {
-        &self.inner.session
+        self.inner.session()
     }
 
     /// A trainable parameter. `Persistence::Persistent`, so a quantized repack
     /// amortizes against its lifetime and the extractor knows it may not
     /// recompute it.
-    pub fn param(&self, name: &str, shape: &[Dim], dtype: Dtype) -> Result<Tensor> {
+    pub fn param(&self, _name: &str, shape: &[Dim], dtype: Dtype) -> Result<Tensor> {
         let id = self.inner.add_logical(Logical::Leaf(LeafKind::Param {
             name: self.inner.fresh_buffer_id(),
             dtype,
             shape: shape.iter().copied().collect(),
         }))?;
-        self.inner.params.lock().insert(name.to_string(), id);
         Ok(self.inner.tensor(id))
     }
 
@@ -589,7 +608,12 @@ impl Graph {
     }
 
     /// A step-local buffer with host contents.
-    pub fn constant_from_raw(&self, dtype: Dtype, shape: &[Dim], bytes: &[u8]) -> Result<Tensor> {
+    pub(crate) fn constant_from_raw(
+        &self,
+        dtype: Dtype,
+        shape: &[Dim],
+        bytes: &[u8],
+    ) -> Result<Tensor> {
         let t = self.leaf("", shape, dtype)?;
         self.inner.set_leaf_bytes(t.id, bytes.to_vec());
         Ok(t)
@@ -598,15 +622,6 @@ impl Graph {
     /// Upload dense host data.
     pub fn tensor(&self, dtype: Dtype, shape: &[Dim], bytes: &[u8]) -> Result<Tensor> {
         self.constant_from_raw(dtype, shape, bytes)
-    }
-
-    /// A splat constant. Folded into the kernel; never a buffer.
-    pub fn constant(&self, value: f32, shape: &[Dim], dtype: Dtype) -> Result<Tensor> {
-        let id = self.inner.add_logical(Logical::Leaf(LeafKind::Const {
-            value: splat_of(dtype, value)?,
-            shape: shape.iter().copied().collect(),
-        }))?;
-        Ok(self.inner.tensor(id))
     }
 
     /// A block-quantized weight leaf.
@@ -627,26 +642,6 @@ impl Graph {
         Ok(self.inner.tensor(id))
     }
 
-    /// A runtime scalar read from binding 0: `m * lr` built on one of these
-    /// recompiles nothing when the learning rate moves.
-    pub fn uniform(&self, name: &str) -> Result<Tensor> {
-        self.uniform_typed(name, Dtype::F32)
-    }
-
-    pub fn uniform_typed(&self, name: &str, dtype: Dtype) -> Result<Tensor> {
-        let sym = self.inner.named_sym(name);
-        let id = self
-            .inner
-            .add_logical(Logical::Leaf(LeafKind::Uniform { sym, dtype }))?;
-        Ok(self.inner.tensor(id))
-    }
-
-    /// Write a runtime scalar declared with [`Graph::uniform`].
-    pub fn set_uniform(&self, name: &str, value: f32) {
-        let sym = self.inner.named_sym(name);
-        self.inner.set_uniform(sym, value);
-    }
-
     /// A fresh symbolic dim, bound at dispatch and never at compile.
     pub fn sym(&self, name: &str) -> Dim {
         Dim::Sym(self.inner.named_sym(name))
@@ -656,35 +651,6 @@ impl Graph {
     pub fn bind(&self, name: &str, value: u64) {
         let sym = self.inner.named_sym(name);
         self.inner.bind_dim(sym, value);
-    }
-
-    /// Intern a macro attribute blob.
-    pub fn intern_attrs(&self, attrs: MacroAttr) -> AttrId {
-        self.inner.intern_attrs(attrs)
-    }
-
-    /// Attach a user-supplied backward to `value`, declaring its parents.
-    ///
-    /// The rule is a bare `fn` and its targets are bare node ids, so a
-    /// closure can never close an `Arc` cycle over the graph. A rule that
-    /// omits a `Parent { requires_grad: true }` is an error.
-    pub fn with_backwards(
-        &self,
-        value: &Tensor,
-        parents: &[Parent],
-        rule: AdjointFn,
-    ) -> Result<Tensor> {
-        let mut reg = self.inner.custom.lock();
-        register_custom(&mut reg, value.id, parents, rule)?;
-        Ok(value.clone())
-    }
-
-    /// Differentiate `loss` with respect to every parameter, seeded with ones.
-    pub fn backward(&self, loss: &Tensor) -> Result<Gradients> {
-        self.owns(loss, "loss")?;
-        let seed = self.ones_like(loss)?;
-        let wrt = self.parameter_ids();
-        self.backward_ids(loss, seed, &wrt)
     }
 
     /// Differentiate with respect to an explicit set.
@@ -723,8 +689,8 @@ impl Graph {
     ///
     /// Structural, over `children`; equal values are compared by class rather
     /// than by id.
-    pub fn reachable_from(&self, value: &Tensor, candidates: &[Tensor]) -> Vec<Tensor> {
-        let g = self.inner.egraph.lock();
+    pub(crate) fn reachable_from(&self, value: &Tensor, candidates: &[Tensor]) -> Vec<Tensor> {
+        let g = self.inner.state().egraph.lock();
         let mut want: FxHashMap<fusor2_ir::egraph::ClassId, Vec<usize>> = FxHashMap::default();
         for (i, c) in candidates.iter().enumerate() {
             want.entry(g.class_of(c.id)).or_default().push(i);
@@ -757,30 +723,12 @@ impl Graph {
     /// e-graph's arena, so a foreign one either names an unrelated node or is
     /// out of range.
     fn owns(&self, t: &Tensor, role: &str) -> Result<()> {
-        if Arc::ptr_eq(&t.graph, &self.inner) {
+        if GraphRef::ptr_eq(&t.graph, &self.inner) {
             return Ok(());
         }
         Err(Error::Plan(format!(
             "the {role} tensor belongs to a different graph; a backward pass cannot cross graphs"
         )))
-    }
-
-    pub fn gradients(&self, loss: &Tensor) -> Result<Gradients> {
-        self.backward(loss)
-    }
-
-    /// Every parameter leaf, in creation order.
-    pub fn parameters(&self) -> Vec<Tensor> {
-        self.parameter_ids()
-            .into_iter()
-            .map(|id| self.inner.tensor(id))
-            .collect()
-    }
-
-    fn parameter_ids(&self) -> Vec<Id> {
-        let mut ids: Vec<Id> = self.inner.params.lock().values().copied().collect();
-        ids.sort_unstable();
-        ids
     }
 
     fn ones_like(&self, t: &Tensor) -> Result<Id> {
@@ -792,14 +740,14 @@ impl Graph {
     }
 
     fn backward_ids(&self, loss: &Tensor, seed: Id, wrt: &[Id]) -> Result<Gradients> {
-        if !Arc::ptr_eq(&loss.graph, &self.inner) {
+        if !GraphRef::ptr_eq(&loss.graph, &self.inner) {
             return Err(Error::Device(
                 "backward across two graphs is not a thing".into(),
             ));
         }
-        let caps = self.inner.session.caps();
-        let custom = self.inner.custom.lock().clone();
-        let mut g = self.inner.egraph.lock();
+        let caps = self.inner.session().caps();
+        let custom = self.inner.state().custom.lock().clone();
+        let mut g = self.inner.state().egraph.lock();
         let grads = fusor2_autograd::backward::backward_into_with(
             &mut g, &caps, loss.id, seed, wrt, &custom,
         )?;
@@ -847,17 +795,12 @@ impl Gradients {
 
 }
 
-/// A parent declaration for [`Graph::with_backwards`].
-pub fn parent(t: &Tensor, requires_grad: bool) -> Parent {
+/// A parent declaration for a custom backward.
+pub(crate) fn parent(t: &Tensor, requires_grad: bool) -> Parent {
     Parent {
         value: t.id,
         requires_grad,
     }
-}
-
-/// The gradient slot of a tensor: a bare node id, never a handle.
-pub fn slot(t: &Tensor) -> fusor2_ir::autograd::GradientSlot {
-    fusor2_ir::autograd::GradientSlot(t.id)
 }
 
 #[cfg(test)]
@@ -895,23 +838,4 @@ mod tests {
         assert_ne!(Dim::Sym(fresh), a);
     }
 
-    #[test]
-    fn interning_folds_equal_attribute_blobs() {
-        let g = graph();
-        let one = g.intern_attrs(MacroAttr::Softmax { axis: 1 });
-        let same = g.intern_attrs(MacroAttr::Softmax { axis: 1 });
-        let other = g.intern_attrs(MacroAttr::Softmax { axis: 2 });
-        assert_eq!(one, same);
-        assert_ne!(one, other);
-    }
-
-    #[test]
-    fn a_uniform_is_a_leaf_not_a_one_element_tensor() {
-        let g = graph();
-        let lr = g.uniform("lr").unwrap();
-        g.set_uniform("lr", 3e-4);
-        assert_eq!(g.handle().facts(lr.id()).rank(), 0);
-        let sym = g.handle().named_sym("lr");
-        assert_eq!(g.handle().uniform_value(sym), Some(3e-4));
-    }
 }
