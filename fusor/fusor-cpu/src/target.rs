@@ -16,12 +16,12 @@ use rustc_hash::FxHashMap;
 use crate::alloc::AlignedBuf;
 use crate::emit::{CpuArtifact, CpuKernel};
 
-/// The SIMD backend.
+/// The native CPU backend.
 pub struct CpuTarget {
     caps: Caps,
     facts: DeviceFacts,
     /// `(size)`-keyed free list; a buffer is reusable once its `Arc` is unique.
-    pool: Mutex<FxHashMap<u64, Vec<Buf>>>,
+    pool: Mutex<FxHashMap<u64, PoolBucket>>,
 }
 
 impl CpuTarget {
@@ -51,7 +51,11 @@ fn seed_facts(caps: &Caps) -> DeviceFacts {
     // ~3 GHz x lanes x 2 (fma) per core.
     let fma = 3_000 * lanes * 2 * threads;
     DeviceFacts {
-        launch_ps: 1_000_000,
+        // The generic CPU runner lowers, binds, and dispatches each selected
+        // launch. BERT's one-workgroup maps measure in the 10--20 us range,
+        // so pricing them as a 1 us function call causes the extractor to
+        // materialize hundreds of avoidable micro-kernels.
+        launch_ps: 20_000_000,
         dram_bytes_per_us: 30_000,
         llc_bytes: crate::caps::CpuCaps::llc_bytes(),
         wg_bytes_per_us: 400_000,
@@ -121,14 +125,19 @@ impl Target for CpuTarget {
         // blocks are 18, 22, 34 and 210 bytes, so this is not a corner case.
         let bytes = bytes.next_multiple_of(4);
         let mut pool = self.pool.lock();
-        if let Some(free) = pool.get_mut(&bytes) {
-            if let Some(pos) = free.iter().position(|b| b.refcount() == 1) {
-                return Ok(free.swap_remove(pos));
+        if let Some(bucket) = pool.get_mut(&bytes) {
+            if let Some(buffer) = bucket.reusable() {
+                return Ok(buffer);
             }
         }
         drop(pool);
         let buf = Buf::new(AlignedBuf::zeroed(bytes as usize)?);
-        self.pool.lock().entry(bytes).or_default().push(buf.clone());
+        self.pool
+            .lock()
+            .entry(bytes)
+            .or_default()
+            .buffers
+            .push(buf.clone());
         Ok(buf)
     }
 
@@ -136,5 +145,29 @@ impl Target for CpuTarget {
     /// every dispatch has already retired when `launch` returns.
     fn wait(&self) -> Result<()> {
         Ok(())
+    }
+}
+
+#[derive(Default)]
+struct PoolBucket {
+    buffers: Vec<Buf>,
+    cursor: usize,
+}
+
+impl PoolBucket {
+    fn reusable(&mut self) -> Option<Buf> {
+        const MAX_SCAN: usize = 16;
+        let len = self.buffers.len();
+        for _ in 0..len.min(MAX_SCAN) {
+            let index = self.cursor % len;
+            self.cursor = (index + 1) % len;
+            if self.buffers[index].refcount() == 1 {
+                // The pool retains its handle. While the returned clone is in
+                // use the strong count is two; once released, the same
+                // allocation can be reused again without reallocation.
+                return Some(self.buffers[index].clone());
+            }
+        }
+        None
     }
 }

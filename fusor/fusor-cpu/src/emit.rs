@@ -19,8 +19,8 @@ use fusor_ir::Result;
 use fusor_ir::device::Caps;
 use fusor_ir::dtype::NumericContract;
 use fusor_ir::ir::kernel::{
-    Addr, ArenaPlanner, BufferDecl, Builtin, ElementType, KernelIr, LocalDecl, ScalarElement,
-    Source, Stmt, Tile, TileExpr, TileExprKind, TileLiteral, TileReduceOp,
+    Addr, ArenaPlanner, BufferDecl, Builtin, ElementType, KernelIr, LocalDecl, MemoryLevel,
+    ScalarElement, Source, Stmt, Tile, TileDecl, TileExpr, TileExprKind, TileLayout, TileLiteral,
 };
 use fusor_ir::scalar::BinOp;
 use fusor_ir::shape::MultiFlattenMap;
@@ -28,8 +28,7 @@ use fusor_ir::target::{Buf, EmitError, Uniforms};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
-use access::AccessForm;
-use expr::{Instr, NumTy, RKind, Reg, Slot, UniformSrc};
+use expr::{Instr, NumTy, RKind, Slot, UniformSrc};
 use stmt::{CAcc, CStmt, LaneLoop};
 
 /// One workgroup tile's placement in the thread-local scratch arena.
@@ -92,6 +91,8 @@ impl Program {
 #[derive(Clone, Debug)]
 pub struct CpuArtifact {
     pub prog: Arc<Program>,
+    pub contract: Option<crate::gemm::ContractSpec>,
+    pub jit: Option<crate::jit::JitKernel>,
     pub grid: [u32; 3],
     pub block: u32,
     pub name: &'static str,
@@ -129,7 +130,7 @@ pub fn emit(ir: &KernelIr, caps: &Caps) -> Result<CpuKernel, EmitError> {
 ///
 /// When a planner is supplied its `verify_uniformity` and `verify_arena` run
 /// **before** compilation and a failure is `EmitError::Validation`, never a
-/// silent fallback. Without one the arena falls back to a sequential packing,
+/// alternate execution path. Without one the arena uses sequential packing,
 /// which is always legal on CPU because thread-local scratch aliases freely.
 pub(crate) fn compile(
     ir: &KernelIr,
@@ -152,7 +153,7 @@ pub(crate) fn compile(
         None => None,
     };
 
-    let mut c = Compiler::new(ir);
+    let mut c = Compiler::new(ir, width);
     if let Some(plan) = &arena {
         c.seed_arena(plan);
     }
@@ -177,8 +178,20 @@ pub(crate) fn compile(
         has_atomic: c.has_atomic,
     };
 
+    let contract = crate::gemm::ContractSpec::parse(ir.name);
+    let jit = if contract.is_none() {
+        Some(
+            crate::jit::compile(&prog)
+                .map_err(EmitError::Unsupported)?
+                .ok_or_else(|| EmitError::Unsupported(crate::jit::unsupported_reason(&prog)))?,
+        )
+    } else {
+        None
+    };
     Ok(CpuArtifact {
         prog: Arc::new(prog),
+        contract,
+        jit,
         grid: ir.grid,
         block: ir.block.max(1),
         name: ir.name,
@@ -186,9 +199,9 @@ pub(crate) fn compile(
     })
 }
 
-fn prog_arena(plan: &Option<fusor_ir::ir::kernel::ArenaPlan>, fallback: u32) -> u32 {
+fn prog_arena(plan: &Option<fusor_ir::ir::kernel::ArenaPlan>, minimum: u32) -> u32 {
     plan.as_ref()
-        .map_or(fallback, |p| p.total_bytes.max(fallback))
+        .map_or(minimum, |p| p.total_bytes.max(minimum))
 }
 
 /// The widest legal instantiation that still divides the work sensibly.
@@ -213,6 +226,7 @@ fn scalar_of(e: ElementType) -> std::result::Result<ScalarElement, EmitError> {
 
 struct Compiler<'a> {
     ir: &'a KernelIr,
+    width: u32,
     tape: Vec<Instr>,
     regs: u32,
     memo: FxHashMap<TileExpr, Slot>,
@@ -231,9 +245,10 @@ struct Compiler<'a> {
 }
 
 impl<'a> Compiler<'a> {
-    fn new(ir: &'a KernelIr) -> Self {
+    fn new(ir: &'a KernelIr, width: u32) -> Self {
         Self {
             ir,
+            width,
             tape: Vec::new(),
             regs: 0,
             memo: FxHashMap::default(),
@@ -629,11 +644,17 @@ impl<'a> Compiler<'a> {
         let TileExprKind::Reduce { op, kind, value } = e.kind() else {
             return Ok(());
         };
-        let (tile, group, iterations, index) = match &**kind {
+        let (tile, scratch, group, iterations, index) = match &**kind {
             fusor_ir::ir::kernel::ReduceKind::Workgroup {
                 scratch,
                 group_size,
-            } => (self.tile_of(scratch), *group_size, None, None),
+            } => (
+                self.tile_of(scratch),
+                Arc::clone(scratch),
+                *group_size,
+                None,
+                None,
+            ),
             fusor_ir::ir::kernel::ReduceKind::Loop {
                 iterations,
                 index,
@@ -643,12 +664,26 @@ impl<'a> Compiler<'a> {
                 let li = self.local_of(index);
                 (
                     self.tile_of(scratch),
+                    Arc::clone(scratch),
                     *group_size,
                     Some(*iterations),
                     Some(li),
                 )
             }
-            fusor_ir::ir::kernel::ReduceKind::Subgroup => return Ok(()),
+            fusor_ir::ir::kernel::ReduceKind::Subgroup => {
+                let scratch = Arc::new(TileDecl::new(
+                    e.element(),
+                    TileLayout::contiguous(MemoryLevel::Workgroup, &[self.ir.block.max(1)]),
+                    "cpu_subgroup_reduce",
+                ));
+                (
+                    self.tile_of(&scratch),
+                    scratch,
+                    self.width.min(self.ir.block.max(1)),
+                    None,
+                    None,
+                )
+            }
         };
         let start = self.begin();
         let v = self.compile_expr(value)?;
@@ -682,14 +717,9 @@ impl<'a> Compiler<'a> {
             g,
             u32_ty,
         );
-        let tile_arc = Arc::clone(match &**kind {
-            fusor_ir::ir::kernel::ReduceKind::Workgroup { scratch, .. }
-            | fusor_ir::ir::kernel::ReduceKind::Loop { scratch, .. } => scratch,
-            fusor_ir::ir::kernel::ReduceKind::Subgroup => unreachable!(),
-        });
         let read = TileExpr::new(
             TileExprKind::LoadTile {
-                tile: tile_arc,
+                tile: scratch,
                 index: base,
             },
             e.element(),
@@ -1165,10 +1195,8 @@ fn collect_group_reduces(
     for c in children_of(e) {
         collect_group_reduces(&c, out, seen);
     }
-    if let TileExprKind::Reduce { kind, .. } = e.kind() {
-        if !matches!(&**kind, fusor_ir::ir::kernel::ReduceKind::Subgroup) && !out.contains(e) {
-            out.push(e.clone());
-        }
+    if matches!(e.kind(), TileExprKind::Reduce { .. }) && !out.contains(e) {
+        out.push(e.clone());
     }
 }
 
@@ -1310,7 +1338,7 @@ fn visit_stmt_exprs(s: &Stmt, f: &mut impl FnMut(&TileExpr)) {
 
 /// A raw view of one bound buffer.
 #[derive(Copy, Clone)]
-pub(crate) struct RawBuf {
+pub struct RawBuf {
     pub ptr: *mut u8,
     pub bytes: usize,
 }
@@ -1321,789 +1349,982 @@ unsafe impl Send for RawBuf {}
 // SAFETY: as above.
 unsafe impl Sync for RawBuf {}
 
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum Flow {
-    Normal,
-    Break,
-    Return,
-}
-
-struct Exec<'a, const W: usize> {
-    prog: &'a Program,
-    regs: Vec<Reg<W>>,
-    locals: Vec<u32>,
-    bufs: &'a [RawBuf],
-    scratch: *mut u8,
-    gid: [u32; 3],
-    grid: [u32; 3],
-    lane_base: u32,
-    active: Reg<W>,
-}
-
-impl<'a, const W: usize> Exec<'a, W> {
-    fn tile_f32(&mut self, tile: u16) -> &mut [f32] {
-        let info = &self.prog.tiles[tile as usize];
-        // SAFETY: the arena is sized to `arena_bytes`, which covers every
-        // placement, and each worker owns its own scratch.
-        unsafe {
-            std::slice::from_raw_parts_mut(
-                self.scratch.add(info.byte_offset as usize) as *mut f32,
-                info.elements as usize,
-            )
-        }
-    }
-
-    fn tile_ptr(&self, tile: u16) -> *mut u8 {
-        let info = &self.prog.tiles[tile as usize];
-        // SAFETY: as above.
-        unsafe { self.scratch.add(info.byte_offset as usize) }
-    }
-
-    fn lane_mask(&self) -> Reg<W> {
-        let mut m = [0u32; W];
-        for (k, slot) in m.iter_mut().enumerate() {
-            *slot = if self.lane_base + (k as u32) < self.prog.block {
-                u32::MAX
-            } else {
-                0
-            };
-        }
-        Reg(m)
-    }
-
-    fn eval(&mut self, range: &std::ops::Range<u32>) {
-        for pc in range.clone() {
-            self.step(pc as usize);
-        }
-    }
-
-    fn step(&mut self, pc: usize) {
-        // Copy the shared reference out of `self` first: `prog` is `&'a
-        // Program`, so the instruction borrow does not alias `&mut self`.
-        let prog: &'a Program = self.prog;
-        let instr = &prog.tape[pc];
-        let v = match instr {
-            Instr::Const { bits, .. } => Reg::splat_bits(*bits),
-            Instr::LaneId { .. } => Reg(core::array::from_fn(|k| self.lane_base + k as u32)),
-            Instr::Uniform { which, .. } => {
-                let w = self.prog.width;
-                let v = match which {
-                    UniformSrc::ProgramX => self.gid[0],
-                    UniformSrc::ProgramY => self.gid[1],
-                    UniformSrc::ProgramZ => self.gid[2],
-                    UniformSrc::GridX => self.grid[0],
-                    UniformSrc::GridY => self.grid[1],
-                    UniformSrc::GridZ => self.grid[2],
-                    UniformSrc::SubgroupSize => w,
-                    UniformSrc::NumSubgroups => self.prog.block.div_ceil(w),
-                    UniformSrc::SubgroupId => self.lane_base / w,
-                    UniformSrc::SubgroupLane => 0,
-                };
-                match which {
-                    UniformSrc::SubgroupLane => {
-                        Reg(core::array::from_fn(|k| (self.lane_base + k as u32) % w))
-                    }
-                    _ => Reg::splat_u32(v),
-                }
-            }
-            Instr::LoadLocal { local, .. } => {
-                let base = *local as usize * self.prog.block as usize;
-                Reg(core::array::from_fn(|k| {
-                    let lane = self.lane_base as usize + k;
-                    if lane < self.prog.block as usize {
-                        self.locals[base + lane]
-                    } else {
-                        0
-                    }
-                }))
-            }
-            Instr::Load {
-                buf,
-                elem,
-                index,
-                mask,
-                fill,
-                form,
-                ..
-            } => {
-                let b = self.bufs[*buf as usize];
-                let idx = self.regs[*index as usize];
-                let m = self.regs[*mask as usize];
-                let fl = self.regs[*fill as usize];
-                let act = self.active;
-                let elems = b.bytes / elem.byte_size() as usize;
-                let mut o = [0u32; W];
-                match form {
-                    AccessForm::Broadcast => {
-                        let i = idx.u(0) as usize;
-                        let val = if i < elems && m.u(0) != 0 && act.u(0) != 0 {
-                            // SAFETY: bounds-checked above.
-                            unsafe { expr::read_elem(*elem, b.ptr, i) }
-                        } else {
-                            fl.u(0)
-                        };
-                        o = [val; W];
-                    }
-                    AccessForm::Contiguous | AccessForm::UnitInnerStride => {
-                        let base = idx.u(0) as usize;
-                        for (k, slot) in o.iter_mut().enumerate() {
-                            let i = base + k;
-                            *slot = if i < elems && m.u(k) != 0 && act.u(k) != 0 {
-                                // SAFETY: bounds-checked above.
-                                unsafe { expr::read_elem(*elem, b.ptr, i) }
-                            } else {
-                                fl.u(k)
-                            };
-                        }
-                    }
-                    AccessForm::Gather => {
-                        for (k, slot) in o.iter_mut().enumerate() {
-                            let i = idx.u(k) as usize;
-                            *slot = if i < elems && m.u(k) != 0 && act.u(k) != 0 {
-                                // SAFETY: bounds-checked above.
-                                unsafe { expr::read_elem(*elem, b.ptr, i) }
-                            } else {
-                                fl.u(k)
-                            };
-                        }
-                    }
-                }
-                Reg(o)
-            }
-            Instr::LoadTile {
-                tile, elem, index, ..
-            } => {
-                let info = &self.prog.tiles[*tile as usize];
-                let ptr = self.tile_ptr(*tile);
-                let idx = self.regs[*index as usize];
-                Reg(core::array::from_fn(|k| {
-                    let i = idx.u(k) as usize;
-                    if i < info.elements as usize {
-                        // SAFETY: bounds-checked above.
-                        unsafe { expr::read_elem(*elem, ptr, i) }
-                    } else {
-                        0
-                    }
-                }))
-            }
-            Instr::Un { op, x, ty, .. } => expr::apply_un(*op, *ty, self.regs[*x as usize]),
-            Instr::Bin { op, a, b, ty, .. } => {
-                expr::apply_bin(*op, *ty, self.regs[*a as usize], self.regs[*b as usize])
-            }
-            Instr::Fma { a, b, c, .. } => {
-                let (ra, rb, rc) = (
-                    self.regs[*a as usize],
-                    self.regs[*b as usize],
-                    self.regs[*c as usize],
-                );
-                let mut o = [0u32; W];
-                for (k, slot) in o.iter_mut().enumerate() {
-                    *slot = ra.f(k).mul_add(rb.f(k), rc.f(k)).to_bits();
-                }
-                Reg(o)
-            }
-            Instr::Cmp { op, a, b, ty, .. } => {
-                expr::apply_cmp(*op, *ty, self.regs[*a as usize], self.regs[*b as usize])
-            }
-            Instr::MaskToValue { x, ty, .. } => {
-                let m = self.regs[*x as usize];
-                let one = match ty {
-                    NumTy::F32 => 1.0f32.to_bits(),
-                    _ => 1,
-                };
-                Reg(core::array::from_fn(|k| if m.u(k) != 0 { one } else { 0 }))
-            }
-            Instr::ValueToMask { x, ty, .. } => {
-                let v = self.regs[*x as usize];
-                Reg(core::array::from_fn(|k| {
-                    let nz = match ty {
-                        NumTy::F32 => v.f(k) != 0.0,
-                        _ => v.u(k) != 0,
-                    };
-                    if nz { u32::MAX } else { 0 }
-                }))
-            }
-            Instr::Round { mode, x, .. } => {
-                self.regs[*x as usize].mapf(|v| expr::round_mode(*mode, v))
-            }
-            Instr::Cast { x, from, to, .. } => expr::apply_cast(*from, *to, self.regs[*x as usize]),
-            Instr::Narrow { x, to, .. } => expr::apply_narrow(*to, self.regs[*x as usize]),
-            Instr::Bitcast { x, .. } => self.regs[*x as usize],
-            Instr::Select { c, t, f, .. } => Reg::select(
-                self.regs[*c as usize],
-                self.regs[*t as usize],
-                self.regs[*f as usize],
-            ),
-            Instr::VecCompose { out, parts } => {
-                for (i, p) in parts.iter().enumerate() {
-                    let v = self.regs[*p as usize];
-                    self.regs[*out as usize + i] = v;
-                }
-                return;
-            }
-            Instr::VecComponent {
-                base, component, ..
-            } => self.regs[*base as usize + *component as usize],
-            Instr::Dot { a, b, lanes, .. } => {
-                let mut acc = [0f32; W];
-                for i in 0..*lanes as usize {
-                    let ra = self.regs[*a as usize + i];
-                    let rb = self.regs[*b as usize + i];
-                    for (k, s) in acc.iter_mut().enumerate() {
-                        *s += ra.f(k) * rb.f(k);
-                    }
-                }
-                Reg::from_f(acc)
-            }
-            Instr::Reduce { op, x, kind, .. } => match kind {
-                RKind::Subgroup => {
-                    reduce::horizontal_masked(*op, self.regs[*x as usize], self.active)
-                }
-                RKind::TileGroup { tile, group } => {
-                    let lane_base = self.lane_base;
-                    let t = self.tile_f32(*tile);
-                    let g = (*group).max(1);
-                    Reg(core::array::from_fn(|k| {
-                        let lane = lane_base + k as u32;
-                        let base = ((lane / g) * g) as usize;
-                        t.get(base).copied().unwrap_or(0.0).to_bits()
-                    }))
-                }
-            },
-            Instr::Unpack2x16 { out, x } => {
-                let v = self.regs[*x as usize];
-                let lo = v.mapf(|f| f);
-                let _ = lo;
-                let a = Reg::<W>(core::array::from_fn(|k| {
-                    half::f16::from_bits((v.u(k) & 0xFFFF) as u16)
-                        .to_f32()
-                        .to_bits()
-                }));
-                let b = Reg::<W>(core::array::from_fn(|k| {
-                    half::f16::from_bits((v.u(k) >> 16) as u16)
-                        .to_f32()
-                        .to_bits()
-                }));
-                self.regs[*out as usize] = a;
-                self.regs[*out as usize + 1] = b;
-                return;
-            }
-            Instr::Copy { x, .. } => self.regs[*x as usize],
-            Instr::Rc2Index { row, col, map, .. } => {
-                let m = &self.prog.maps[*map as usize];
-                let r = self.regs[*row as usize];
-                let c = self.regs[*col as usize];
-                Reg(core::array::from_fn(|k| {
-                    access::rc2_offset(m, r.u(k), c.u(k))
-                }))
-            }
-        };
-        self.regs[instr.out() as usize] = v;
-    }
-
-    fn run(&mut self, stmts: &[CStmt]) -> Flow {
-        for s in stmts {
-            match self.run_one(s) {
-                Flow::Normal => {}
-                other => return other,
-            }
-        }
-        Flow::Normal
-    }
-
-    fn run_one(&mut self, s: &CStmt) -> Flow {
-        match s {
-            CStmt::Lanes(body) => {
-                let mut base = 0;
-                while base < self.prog.block {
-                    self.lane_base = base;
-                    self.active = self.lane_mask();
-                    if self.run(body) == Flow::Return {
-                        return Flow::Return;
-                    }
-                    base += W as u32;
-                }
-                self.lane_base = 0;
-                self.active = self.lane_mask();
-            }
-            CStmt::Store {
-                prep,
-                buf,
-                elem,
-                index,
-                value,
-                mask,
-            } => {
-                self.eval(prep);
-                let b = self.bufs[*buf as usize];
-                let elems = b.bytes / elem.byte_size() as usize;
-                let idx = self.regs[*index as usize];
-                let v = self.regs[*value as usize];
-                let m = self.regs[*mask as usize];
-                let act = self.active;
-                for k in 0..W {
-                    let i = idx.u(k) as usize;
-                    if m.u(k) != 0 && act.u(k) != 0 && i < elems {
-                        // SAFETY: bounds-checked; the write map is injective.
-                        unsafe { expr::write_elem(*elem, b.ptr, i, v.u(k)) };
-                    }
-                }
-            }
-            CStmt::AtomicAdd {
-                prep,
-                buf,
-                elem,
-                index,
-                value,
-                mask,
-            } => {
-                self.eval(prep);
-                let b = self.bufs[*buf as usize];
-                let elems = b.bytes / elem.byte_size() as usize;
-                let idx = self.regs[*index as usize];
-                let v = self.regs[*value as usize];
-                let m = self.regs[*mask as usize];
-                let act = self.active;
-                for k in 0..W {
-                    let i = idx.u(k) as usize;
-                    if m.u(k) != 0 && act.u(k) != 0 && i < elems {
-                        // SAFETY: bounds-checked. The launcher runs an
-                        // atomic-carrying program on a single worker, so this
-                        // read-modify-write is unshared and deterministic.
-                        unsafe {
-                            let old = expr::read_elem(*elem, b.ptr, i);
-                            let sum = f32::from_bits(old) + v.f(k);
-                            expr::write_elem(*elem, b.ptr, i, sum.to_bits());
-                        }
-                    }
-                }
-            }
-            CStmt::StoreLocal { prep, local, value } => {
-                self.eval(prep);
-                let v = self.regs[*value as usize];
-                let act = self.active;
-                let base = *local as usize * self.prog.block as usize;
-                for k in 0..W {
-                    let lane = self.lane_base as usize + k;
-                    if act.u(k) != 0 && lane < self.prog.block as usize {
-                        self.locals[base + lane] = v.u(k);
-                    }
-                }
-            }
-            CStmt::StoreTile {
-                prep,
-                tile,
-                elem,
-                index,
-                value,
-            } => {
-                self.eval(prep);
-                let info = self.prog.tiles[*tile as usize].clone();
-                let ptr = self.tile_ptr(*tile);
-                let idx = self.regs[*index as usize];
-                let v = self.regs[*value as usize];
-                let act = self.active;
-                for k in 0..W {
-                    let i = idx.u(k) as usize;
-                    if act.u(k) != 0 && i < info.elements as usize {
-                        // SAFETY: bounds-checked, thread-local scratch.
-                        unsafe { expr::write_elem(*elem, ptr, i, v.u(k)) };
-                    }
-                }
-            }
-            CStmt::FillTile {
-                prep,
-                tile,
-                elem,
-                value,
-                extents,
-                lo,
-                hi,
-            } => {
-                self.lane_base = 0;
-                self.active = self.lane_mask();
-                self.eval(prep);
-                let info = self.prog.tiles[*tile as usize].clone();
-                let ptr = self.tile_ptr(*tile);
-                let bits = self.regs[*value as usize].u(0);
-                let b0 = lo.map_or(extents[0], |s| self.regs[s as usize].u(0));
-                let b1 = hi.map_or(extents[1], |s| self.regs[s as usize].u(0));
-                let cols = extents[1].max(1);
-                for i in 0..info.elements {
-                    let (r, c) = (i / cols, i % cols);
-                    if r < b0 && c < b1 {
-                        // SAFETY: `i < elements`, thread-local scratch.
-                        unsafe { expr::write_elem(*elem, ptr, i as usize, bits) };
-                    }
-                }
-            }
-            CStmt::If {
-                prep,
-                cond,
-                uniform,
-                accept,
-                reject,
-            } => {
-                self.eval(prep);
-                let c = self.regs[*cond as usize];
-                if *uniform {
-                    let taken = c.u(0) != 0;
-                    return if taken {
-                        self.run(accept)
-                    } else {
-                        self.run(reject)
-                    };
-                }
-                // Divergent: both arms run under complementary masks, so every
-                // store merges rather than branching.
-                let saved = self.active;
-                self.active = Reg(core::array::from_fn(|k| saved.u(k) & c.u(k)));
-                let f1 = self.run(accept);
-                self.active = Reg(core::array::from_fn(|k| saved.u(k) & !c.u(k)));
-                let f2 = self.run(reject);
-                self.active = saved;
-                if f1 == Flow::Return || f2 == Flow::Return {
-                    return Flow::Return;
-                }
-            }
-            CStmt::Loop {
-                prep,
-                count,
-                index,
-                accs,
-                body,
-            } => {
-                self.eval(prep);
-                // Every accumulator is read at the value it had entering the
-                // step, then all are written.
-                let mut next: Vec<Reg<W>> = Vec::with_capacity(accs.len());
-                for a in accs {
-                    self.eval(&a.init_prep);
-                    next.push(self.regs[a.init as usize]);
-                }
-                for (a, v) in accs.iter().zip(&next) {
-                    self.write_local(a.local, *v);
-                }
-                let n = count.map_or(u32::MAX, |s| self.regs[s as usize].u(0));
-                let mut it = 0u32;
-                while it < n {
-                    if let Some(l) = index {
-                        self.write_local(*l, Reg::splat_u32(it));
-                    }
-                    let flow = self.run(body);
-                    next.clear();
-                    for a in accs {
-                        self.eval(&a.update_prep);
-                        next.push(self.regs[a.update as usize]);
-                    }
-                    for (a, v) in accs.iter().zip(&next) {
-                        self.write_local(a.local, *v);
-                    }
-                    match flow {
-                        Flow::Break => break,
-                        Flow::Return => return Flow::Return,
-                        Flow::Normal => {}
-                    }
-                    it += 1;
-                }
-            }
-            CStmt::Break => return Flow::Break,
-            CStmt::Return => return Flow::Return,
-            CStmt::StageTree {
-                prep,
-                tile,
-                value,
-                op,
-                group,
-            } => {
-                self.stage(prep, *tile, *value, None, 1);
-                self.tree(*tile, *op, *group);
-            }
-            CStmt::LoopTree {
-                prep,
-                tile,
-                value,
-                op,
-                group,
-                iterations,
-                index,
-            } => {
-                self.stage_loop(prep, *tile, *value, *index, *iterations, *op);
-                self.tree(*tile, *op, *group);
-            }
-            CStmt::CarrierTree {
-                prep,
-                tiles,
-                values,
-                lhs,
-                rhs,
-                merge_prep,
-                merged,
-                outs,
-                group,
-                fast,
-            } => {
-                self.carrier_stage(prep, tiles, values);
-                self.carrier_tree(tiles, lhs, rhs, merge_prep, merged, *group, *fast);
-                self.carrier_broadcast(tiles, outs, *group);
-            }
-            CStmt::Barrier => {}
-        }
-        Flow::Normal
-    }
-
-    /// Write one partial per lane into each lane's scratch tile.
-    fn carrier_stage(&mut self, prep: &std::ops::Range<u32>, tiles: &[u16], values: &[Slot]) {
-        let block = self.prog.block;
-        let mut base = 0;
-        while base < block {
-            self.lane_base = base;
-            self.active = self.lane_mask();
-            self.eval(prep);
-            for (tile, value) in tiles.iter().zip(values) {
-                let v = self.regs[*value as usize];
-                let t = self.tile_f32(*tile);
-                for k in 0..W {
-                    let lane = (base as usize) + k;
-                    if lane < block as usize && lane < t.len() {
-                        t[lane] = v.f(k);
-                    }
-                }
-            }
-            base += W as u32;
-        }
-        self.lane_base = 0;
-        self.active = self.lane_mask();
-    }
-
-    /// The log-tree, one level at a time, applying `merge` to `W` independent
-    /// pairs at once. A merge reads only its formals, so the whole level is
-    /// gathered before any of it is written back and no pair can observe a
-    /// half-merged sibling.
-    #[allow(clippy::too_many_arguments)]
-    fn carrier_tree(
-        &mut self,
-        tiles: &[u16],
-        lhs: &[u16],
-        rhs: &[u16],
-        merge_prep: &std::ops::Range<u32>,
-        merged: &[Slot],
-        group: u32,
-        fast: Option<TileReduceOp>,
-    ) {
-        let block = self.prog.block as usize;
-        let group = (group.max(1) as usize).min(block.max(1));
-        let chunk = W.min(block.max(1));
-        self.lane_base = 0;
-        self.active = Reg::splat_bits(u32::MAX);
-        let mut base = 0;
-        while base < block {
-            let mut stride = group / 2;
-            while stride >= 1 {
-                let mut i = 0;
-                while i < stride {
-                    let take = chunk.min(stride - i);
-                    let mut left = vec![[0f32; W]; tiles.len()];
-                    let mut right = vec![[0f32; W]; tiles.len()];
-                    for (s, tile) in tiles.iter().enumerate() {
-                        let t = self.tile_f32(*tile);
-                        for k in 0..take {
-                            let li = base + i + k;
-                            left[s][k] = t[li];
-                            right[s][k] = t[li + stride];
-                        }
-                    }
-                    let out_lanes: Vec<[f32; W]> = match fast {
-                        // One lane with a hardware operator folds without the
-                        // tape, exactly as the single-slot path does.
-                        Some(op) => (0..tiles.len())
-                            .map(|s| {
-                                core::array::from_fn(|k| {
-                                    reduce::combine_f32(op, left[s][k], right[s][k])
-                                })
-                            })
-                            .collect(),
-                        None => {
-                            for s in 0..tiles.len() {
-                                self.write_local(lhs[s], Reg::from_f(left[s]));
-                                self.write_local(rhs[s], Reg::from_f(right[s]));
-                            }
-                            self.eval(merge_prep);
-                            merged
-                                .iter()
-                                .map(|slot| {
-                                    let v = self.regs[*slot as usize];
-                                    core::array::from_fn(|k| v.f(k))
-                                })
-                                .collect()
-                        }
-                    };
-                    for (s, tile) in tiles.iter().enumerate() {
-                        let t = self.tile_f32(*tile);
-                        for k in 0..take {
-                            t[base + i + k] = out_lanes[s][k];
-                        }
-                    }
-                    i += take;
-                }
-                stride /= 2;
-            }
-            base += group;
-        }
-        self.lane_base = 0;
-        self.active = self.lane_mask();
-    }
-
-    /// Broadcast each group's result over the group, then load it per lane.
-    fn carrier_broadcast(&mut self, tiles: &[u16], outs: &[u16], group: u32) {
-        let block = self.prog.block as usize;
-        let group = (group.max(1) as usize).min(block.max(1));
-        for tile in tiles {
-            let t = self.tile_f32(*tile);
-            let len = block.min(t.len());
-            let mut base = 0;
-            while base < len {
-                let hi = (base + group).min(len);
-                let v = t[base];
-                for x in &mut t[base..hi] {
-                    *x = v;
-                }
-                base = hi;
-            }
-        }
-        let mut base = 0;
-        while base < self.prog.block {
-            self.lane_base = base;
-            self.active = self.lane_mask();
-            for (tile, out) in tiles.iter().zip(outs) {
-                let t = self.tile_f32(*tile);
-                let mut v = [0f32; W];
-                for (k, slot) in v.iter_mut().enumerate() {
-                    let lane = (base as usize) + k;
-                    if lane < t.len() {
-                        *slot = t[lane];
-                    }
-                }
-                self.write_local(*out, Reg::from_f(v));
-            }
-            base += W as u32;
-        }
-        self.lane_base = 0;
-        self.active = self.lane_mask();
-    }
-
-    fn write_local(&mut self, local: u16, v: Reg<W>) {
-        let base = local as usize * self.prog.block as usize;
-        for k in 0..W {
-            let lane = self.lane_base as usize + k;
-            if lane < self.prog.block as usize {
-                self.locals[base + lane] = v.u(k);
-            }
-        }
-    }
-
-    fn stage(
-        &mut self,
-        prep: &std::ops::Range<u32>,
-        tile: u16,
-        value: Slot,
-        _idx: Option<u16>,
-        _iters: u32,
-    ) {
-        let block = self.prog.block;
-        let mut base = 0;
-        while base < block {
-            self.lane_base = base;
-            self.active = self.lane_mask();
-            self.eval(prep);
-            let v = self.regs[value as usize];
-            let t = self.tile_f32(tile);
-            for k in 0..W {
-                let lane = (base as usize) + k;
-                if lane < block as usize && lane < t.len() {
-                    t[lane] = v.f(k);
-                }
-            }
-            base += W as u32;
-        }
-        self.lane_base = 0;
-        self.active = self.lane_mask();
-    }
-
-    fn stage_loop(
-        &mut self,
-        prep: &std::ops::Range<u32>,
-        tile: u16,
-        value: Slot,
-        index: u16,
-        iterations: u32,
-        op: TileReduceOp,
-    ) {
-        let block = self.prog.block;
-        let ident = reduce::identity_f32(op);
-        let mut base = 0;
-        while base < block {
-            self.lane_base = base;
-            self.active = self.lane_mask();
-            let mut acc = Reg::<W>::splat_f32(ident);
-            for it in 0..iterations {
-                self.write_local(index, Reg::splat_u32(it));
-                self.eval(prep);
-                let v = self.regs[value as usize];
-                acc = reduce::combine_reg(op, acc, v);
-            }
-            let t = self.tile_f32(tile);
-            for k in 0..W {
-                let lane = (base as usize) + k;
-                if lane < block as usize && lane < t.len() {
-                    t[lane] = acc.f(k);
-                }
-            }
-            base += W as u32;
-        }
-        self.lane_base = 0;
-        self.active = self.lane_mask();
-    }
-
-    fn tree(&mut self, tile: u16, op: TileReduceOp, group: u32) {
-        let block = self.prog.block as usize;
-        let t = self.tile_f32(tile);
-        let len = block.min(t.len());
-        reduce::tree_in_place(op, t, len, group as usize);
-    }
-}
-
-/// Execute one workgroup at a statically-known lane width.
-#[inline(always)]
-pub(crate) fn run_workgroup<const W: usize>(
-    prog: &Program,
-    gid: [u32; 3],
-    grid: [u32; 3],
-    bufs: &[RawBuf],
-    scratch: *mut u8,
-) {
-    let mut ex = Exec::<W> {
-        prog,
-        regs: vec![Reg::default(); prog.regs.max(1)],
-        locals: vec![0u32; prog.locals * prog.block as usize],
-        bufs,
-        scratch,
-        gid,
-        grid,
-        lane_base: 0,
-        active: Reg::splat_bits(u32::MAX),
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::alloc::AlignedBuf;
+    use fusor_ir::dtype::RoundMode;
+    use fusor_ir::ir::kernel::{
+        Accumulator, BufferAccess, LocalDecl, MemoryLevel, ReduceKind, StorageView, TileDecl,
+        TileLayout, TileReduceOp, WorkgroupAxis,
     };
-    for seg in &prog.segments {
-        // A barrier between two segments is this boundary: the previous
-        // segment has completed for *every* lane before the next one starts.
-        let collective = seg.stmts.iter().any(CStmt::is_collective);
-        let flow = if collective {
-            ex.run(&seg.stmts)
-        } else {
-            ex.run_one(&CStmt::Lanes(seg.stmts.clone()))
-        };
-        if flow == Flow::Return {
-            break;
+    use fusor_ir::scalar::{CmpOp, UnOp};
+
+    fn f32_ty() -> ElementType {
+        ElementType::Scalar(ScalarElement::F32)
+    }
+    fn u32_ty() -> ElementType {
+        ElementType::Scalar(ScalarElement::U32)
+    }
+    fn bool_ty() -> ElementType {
+        ElementType::Scalar(ScalarElement::Bool)
+    }
+
+    fn decl(binding: u32, elem: ScalarElement, n: u32, rw: bool) -> Arc<BufferDecl> {
+        Arc::new(BufferDecl {
+            binding,
+            element: ElementType::Scalar(elem),
+            layout: TileLayout::contiguous(MemoryLevel::Storage, &[n]),
+            access: if rw {
+                BufferAccess::ReadWrite
+            } else {
+                BufferAccess::Read
+            },
+        })
+    }
+
+    fn view(b: &Arc<BufferDecl>) -> StorageView {
+        StorageView {
+            buffer: Arc::clone(b),
+            offset: 0,
+            layout: b.layout.clone(),
         }
+    }
+
+    fn lane() -> TileExpr {
+        TileExpr::new(TileExprKind::Builtin(Builtin::Lane), u32_ty())
+    }
+    fn pid() -> TileExpr {
+        TileExpr::new(
+            TileExprKind::Builtin(Builtin::ProgramId(WorkgroupAxis::X)),
+            u32_ty(),
+        )
+    }
+    fn ulit(v: u32) -> TileExpr {
+        TileExpr::new(TileExprKind::Literal(TileLiteral::U32(v)), u32_ty())
+    }
+    fn flit(v: f32) -> TileExpr {
+        TileExpr::new(
+            TileExprKind::Literal(TileLiteral::F32(v.to_bits())),
+            f32_ty(),
+        )
+    }
+    fn tlit() -> TileExpr {
+        TileExpr::new(TileExprKind::Literal(TileLiteral::Bool(true)), bool_ty())
+    }
+    fn ubin(op: BinOp, a: TileExpr, b: TileExpr) -> TileExpr {
+        TileExpr::new(
+            TileExprKind::Binary {
+                op,
+                left: a,
+                right: b,
+                numeric: NumericContract::RELAXED,
+            },
+            u32_ty(),
+        )
+    }
+    fn fbin(op: BinOp, a: TileExpr, b: TileExpr, nc: NumericContract) -> TileExpr {
+        TileExpr::new(
+            TileExprKind::Binary {
+                op,
+                left: a,
+                right: b,
+                numeric: nc,
+            },
+            f32_ty(),
+        )
+    }
+    fn fload(b: &Arc<BufferDecl>, index: TileExpr) -> TileExpr {
+        TileExpr::new(
+            TileExprKind::Load {
+                src: Source::Storage(view(b)),
+                addr: Box::new(Addr::Linear(index)),
+                mask: tlit(),
+                fill: flit(0.0),
+            },
+            ElementType::Scalar(match b.element {
+                ElementType::Scalar(s) => s,
+                _ => ScalarElement::F32,
+            }),
+        )
+    }
+
+    /// Compile and run one kernel over f32 buffers, returning the outputs.
+    fn run_f32(ir: &KernelIr, inputs: &[Vec<f32>], out_len: usize) -> Vec<f32> {
+        let caps = crate::caps::cpu_caps();
+        let art = compile(ir, caps, None).expect("compile");
+        let kernel = CpuKernel {
+            name: art.name,
+            block: art.block,
+            vector_width: art.prog.width,
+            artifact: art,
+        };
+        let mut binds = Vec::new();
+        for v in inputs {
+            let mut b = AlignedBuf::zeroed(v.len() * 4).unwrap();
+            b.as_mut_slice()
+                .copy_from_slice(bytemuck::cast_slice(v.as_slice()));
+            binds.push(Buf::new(b));
+        }
+        let out = Buf::new(AlignedBuf::zeroed(out_len * 4).unwrap());
+        binds.push(out.clone());
+        kernel
+            .run(ir.grid, &binds, &Uniforms::default())
+            .expect("launch");
+        let ab = out.downcast_ref::<AlignedBuf>().unwrap();
+        bytemuck::cast_slice::<u8, f32>(ab.as_slice()).to_vec()
+    }
+
+    #[test]
+    fn barrier_splits_lane_loop() {
+        const BLOCK: u32 = 256;
+        let uni = decl(0, ScalarElement::U32, 1, false);
+        let out = decl(1, ScalarElement::F32, BLOCK, true);
+        let scratch: Arc<TileDecl> = Arc::new(TileDecl::new(
+            f32_ty(),
+            TileLayout::contiguous(MemoryLevel::Workgroup, &[BLOCK]),
+            "rev",
+        ));
+
+        let lane_f = TileExpr::new(
+            TileExprKind::Cast {
+                value: lane(),
+                to: f32_ty(),
+            },
+            f32_ty(),
+        );
+        let mirrored = ubin(BinOp::Sub, ulit(BLOCK - 1), lane());
+        let body = vec![
+            Stmt::StoreTile {
+                dst: Arc::clone(&scratch),
+                index: lane(),
+                value: lane_f,
+            },
+            Stmt::Barrier,
+            Stmt::Store {
+                dst: view(&out),
+                addr: Addr::Linear(lane()),
+                value: TileExpr::new(
+                    TileExprKind::LoadTile {
+                        tile: Arc::clone(&scratch),
+                        index: mirrored,
+                    },
+                    f32_ty(),
+                ),
+                mask: tlit(),
+            },
+        ];
+        let ir = KernelIr {
+            buffers: vec![uni, out],
+            grid: [1, 1, 1],
+            block: BLOCK,
+            body,
+            byte_arena: None,
+            name: "reverse",
+        };
+
+        let art = compile(&ir, crate::caps::cpu_caps(), None).unwrap();
+        assert_eq!(
+            art.prog.segments.len(),
+            2,
+            "a barrier must cut the lane loop in two"
+        );
+        assert!(
+            art.prog.width >= 8 && BLOCK % art.prog.width == 0,
+            "the block must split into whole lane chunks (W = {})",
+            art.prog.width
+        );
+
+        let got = run_f32(&ir, &[], BLOCK as usize);
+        for i in 0..BLOCK as usize {
+            assert_eq!(
+                got[i],
+                (BLOCK as usize - 1 - i) as f32,
+                "lane {i} read a stale tile slot: a no-op barrier would leave \
+                 every lane past the first chunk reading zeros"
+            );
+        }
+        // The specific failure a no-op barrier produces.
+        assert_ne!(got[8], 0.0);
+    }
+
+    fn fma_program(nc: NumericContract) -> Arc<Program> {
+        let uni = decl(0, ScalarElement::U32, 1, false);
+        let a = decl(1, ScalarElement::F32, 8, false);
+        let b = decl(2, ScalarElement::F32, 8, false);
+        let c = decl(3, ScalarElement::F32, 8, false);
+        let out = decl(4, ScalarElement::F32, 8, true);
+        let prod = fbin(BinOp::Mul, fload(&a, lane()), fload(&b, lane()), nc);
+        let sum = fbin(BinOp::Add, prod, fload(&c, lane()), nc);
+        let ir = KernelIr {
+            buffers: vec![uni, a, b, c, out.clone()],
+            grid: [1, 1, 1],
+            block: 8,
+            body: vec![Stmt::Store {
+                dst: view(&out),
+                addr: Addr::Linear(lane()),
+                value: sum,
+                mask: tlit(),
+            }],
+            byte_arena: None,
+            name: "fma",
+        };
+        compile(&ir, crate::caps::cpu_caps(), None).unwrap().prog
+    }
+
+    #[test]
+    fn numeric_contract_blocks_contraction() {
+        let relaxed = fma_program(NumericContract::RELAXED);
+        assert_eq!(
+            relaxed.fma_count(),
+            1,
+            "a relaxed a*b+c must contract into one mul_add"
+        );
+
+        let strict = fma_program(NumericContract::STRICT);
+        assert_eq!(
+            strict.fma_count(),
+            0,
+            "contract: false forbids fusing a mul and an add"
+        );
+        let muls = strict
+            .tape
+            .iter()
+            .filter(|i| matches!(i, Instr::Bin { op: BinOp::Mul, .. }))
+            .count();
+        let adds = strict
+            .tape
+            .iter()
+            .filter(|i| matches!(i, Instr::Bin { op: BinOp::Add, .. }))
+            .count();
+        assert_eq!(
+            (muls, adds),
+            (1, 1),
+            "strict must emit separate mul and add"
+        );
+
+        // `round(x, HalfAwayFromZero)` at an exact .5 rounds away from zero:
+        // MSQ1 export idempotence depends on it.
+        for i in -16i32..=16 {
+            if i % 2 == 0 {
+                continue;
+            }
+            let x = i as f32 * 0.5;
+            assert_eq!(
+                expr::round_mode(RoundMode::HalfAwayFromZero, x).abs(),
+                x.abs() + 0.5
+            );
+        }
+    }
+
+    #[test]
+    fn four_access_lowerings() {
+        access::reset_form_counts();
+        let uni = decl(0, ScalarElement::U32, 1, false);
+        let src = decl(1, ScalarElement::F32, 64, false);
+        let out = decl(2, ScalarElement::F32, 4 * 8, true);
+
+        // The same logical tensor read through four addressings.
+        let addrs = [
+            lane(),                             // contiguous
+            ulit(3),                            // broadcast
+            ubin(BinOp::Add, ulit(16), lane()), // unit inner stride
+            ubin(BinOp::Mul, lane(), ulit(3)),  // general gather
+        ];
+        let mut body = Vec::new();
+        for (i, a) in addrs.iter().enumerate() {
+            body.push(Stmt::Store {
+                dst: view(&out),
+                addr: Addr::Linear(ubin(BinOp::Add, ulit(i as u32 * 8), lane())),
+                value: fload(&src, a.clone()),
+                mask: tlit(),
+            });
+        }
+        let ir = KernelIr {
+            buffers: vec![uni, src, out],
+            grid: [1, 1, 1],
+            block: 8,
+            body,
+            byte_arena: None,
+            name: "access",
+        };
+
+        let data: Vec<f32> = (0..64).map(|i| i as f32).collect();
+        let got = run_f32(&ir, &[data.clone()], 32);
+        for k in 0..8usize {
+            assert_eq!(got[k], data[k], "contiguous lane {k}");
+            assert_eq!(got[8 + k], data[3], "broadcast lane {k}");
+            assert_eq!(got[16 + k], data[16 + k], "unit-inner lane {k}");
+            assert_eq!(got[24 + k], data[3 * k], "gather lane {k}");
+        }
+        let counts = access::form_counts();
+        for (i, f) in access::AccessForm::ALL.iter().enumerate() {
+            assert!(counts[i] > 0, "{f:?} was never selected");
+        }
+    }
+
+    /// A vector-typed `Select` selects **every** lane.
+    ///
+    /// Pins the regression where one `Instr::Select` wrote register `out`
+    /// only, leaving lanes 1.. uninitialized.
+    #[test]
+    fn a_masked_vector_select_writes_every_lane() {
+        const LANES: u32 = 8;
+        let uni = decl(0, ScalarElement::U32, 1, false);
+        let src = decl(1, ScalarElement::F32, LANES, false);
+        let out = decl(2, ScalarElement::F32, LANES, true);
+
+        let vec_ty = ElementType::Vector {
+            scalar: ScalarElement::F32,
+            lanes: LANES,
+        };
+        let parts: Vec<TileExpr> = (0..LANES).map(|i| fload(&src, ulit(i))).collect();
+        let taken = TileExpr::new(
+            TileExprKind::Vec {
+                scalar: ScalarElement::F32,
+                lanes: LANES,
+                parts,
+            },
+            vec_ty,
+        );
+        let zeros = TileExpr::new(
+            TileExprKind::Vec {
+                scalar: ScalarElement::F32,
+                lanes: LANES,
+                parts: (0..LANES).map(|_| flit(-1.0)).collect(),
+            },
+            vec_ty,
+        );
+        let selected = TileExpr::new(
+            TileExprKind::Select {
+                condition: tlit(),
+                accept: taken,
+                reject: zeros,
+            },
+            vec_ty,
+        );
+        let body = (0..LANES)
+            .map(|i| Stmt::Store {
+                dst: view(&out),
+                addr: Addr::Linear(ulit(i)),
+                value: TileExpr::new(
+                    TileExprKind::VecComponent {
+                        vector: selected.clone(),
+                        component: i,
+                    },
+                    f32_ty(),
+                ),
+                mask: tlit(),
+            })
+            .collect();
+        let ir = KernelIr {
+            buffers: vec![uni, src, out],
+            grid: [1, 1, 1],
+            block: 1,
+            body,
+            byte_arena: None,
+            name: "vector_select",
+        };
+
+        let data: Vec<f32> = (0..LANES).map(|i| i as f32 + 0.5).collect();
+        let got = run_f32(&ir, &[data.clone()], LANES as usize);
+        assert_eq!(got, data, "every lane of the selected vector must survive");
+    }
+
+    #[test]
+    fn f16_bf16_widen_compute() {
+        for (elem, to_bits) in [
+            (
+                ScalarElement::F16,
+                (|x: f32| half::f16::from_f32(x).to_bits() as u32) as fn(f32) -> u32,
+            ),
+            (
+                ScalarElement::BF16,
+                (|x: f32| half::bf16::from_f32(x).to_bits() as u32) as fn(f32) -> u32,
+            ),
+        ] {
+            let n = 256u32;
+            let uni = decl(0, ScalarElement::U32, 1, false);
+            let src = decl(1, elem, n, false);
+            let out = decl(2, elem, n, true);
+            let idx = ubin(BinOp::Add, ubin(BinOp::Mul, pid(), ulit(64)), lane());
+            let value = TileExpr::new(
+                TileExprKind::Unary {
+                    op: UnOp::Exp,
+                    value: fload(&src, idx.clone()),
+                    numeric: NumericContract::RELAXED,
+                },
+                f32_ty(),
+            );
+            let ir = KernelIr {
+                buffers: vec![uni, src, out.clone()],
+                grid: [4, 1, 1],
+                block: 64,
+                body: vec![Stmt::Store {
+                    dst: view(&out),
+                    addr: Addr::Linear(idx),
+                    value,
+                    mask: tlit(),
+                }],
+                byte_arena: None,
+                name: "widen",
+            };
+            let art = compile(&ir, crate::caps::cpu_caps(), None).unwrap();
+            // The register file holds f32: every ALU instruction is typed F32,
+            // never a one-lane narrow float.
+            assert!(art.prog.tape.iter().all(|i| !matches!(
+                i,
+                Instr::Un { ty: NumTy::U32, .. } | Instr::Un { ty: NumTy::I32, .. }
+            )));
+            assert!(art.prog.tape.iter().any(|i| matches!(
+                i,
+                Instr::Un {
+                    ty: NumTy::F32,
+                    op: UnOp::Exp,
+                    ..
+                }
+            )));
+
+            // Bitwise equality against `f16::from_f32(exp(f32::from(x)))`.
+            let kernel = CpuKernel {
+                name: art.name,
+                block: art.block,
+                vector_width: art.prog.width,
+                artifact: art,
+            };
+            let vals: Vec<f32> = (0..n).map(|i| (i as f32) * 0.03 - 3.0).collect();
+            let mut inb = AlignedBuf::zeroed(n as usize * 2).unwrap();
+            for (i, v) in vals.iter().enumerate() {
+                let raw = to_bits(*v) as u16;
+                inb.as_mut_slice()[i * 2..i * 2 + 2].copy_from_slice(&raw.to_le_bytes());
+            }
+            let outb = Buf::new(AlignedBuf::zeroed(n as usize * 2).unwrap());
+            kernel
+                .run(
+                    [4, 1, 1],
+                    &[Buf::new(inb), outb.clone()],
+                    &Uniforms::default(),
+                )
+                .unwrap();
+            let ab = outb.downcast_ref::<AlignedBuf>().unwrap();
+            for i in 0..n as usize {
+                let raw = u16::from_le_bytes([ab.as_slice()[i * 2], ab.as_slice()[i * 2 + 1]]);
+                let x = match elem {
+                    ScalarElement::F16 => half::f16::from_bits(to_bits(vals[i]) as u16).to_f32(),
+                    _ => half::bf16::from_bits(to_bits(vals[i]) as u16).to_f32(),
+                };
+                let want = to_bits(expr::expf(x)) as u16;
+                assert_eq!(raw, want, "{elem:?} element {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn workgroup_reduce_sums_every_lane() {
+        const BLOCK: u32 = 64;
+        let uni = decl(0, ScalarElement::U32, 1, false);
+        let src = decl(1, ScalarElement::F32, BLOCK, false);
+        let out = decl(2, ScalarElement::F32, 1, true);
+        let scratch: Arc<TileDecl> = Arc::new(TileDecl::new(
+            f32_ty(),
+            TileLayout::contiguous(MemoryLevel::Workgroup, &[BLOCK]),
+            "tree",
+        ));
+        let reduced = TileExpr::new(
+            TileExprKind::Reduce {
+                op: TileReduceOp::Sum,
+                kind: Box::new(ReduceKind::Workgroup {
+                    scratch,
+                    group_size: BLOCK,
+                }),
+                value: fload(&src, lane()),
+            },
+            f32_ty(),
+        );
+        let ir = KernelIr {
+            buffers: vec![uni, src, out.clone()],
+            grid: [1, 1, 1],
+            block: BLOCK,
+            body: vec![Stmt::Store {
+                dst: view(&out),
+                addr: Addr::Linear(ulit(0)),
+                value: reduced,
+                mask: TileExpr::new(
+                    TileExprKind::Compare {
+                        op: CmpOp::Eq,
+                        left: lane(),
+                        right: ulit(0),
+                    },
+                    bool_ty(),
+                ),
+            }],
+            byte_arena: None,
+            name: "wg_sum",
+        };
+        let data: Vec<f32> = (0..BLOCK).map(|i| i as f32).collect();
+        let got = run_f32(&ir, &[data], 1);
+        assert_eq!(got[0], (0..BLOCK).map(|i| i as f32).sum::<f32>());
+    }
+
+    #[test]
+    fn subgroup_reduce_is_a_horizontal_reduce() {
+        const BLOCK: u32 = 8;
+        let uni = decl(0, ScalarElement::U32, 1, false);
+        let src = decl(1, ScalarElement::F32, BLOCK, false);
+        let out = decl(2, ScalarElement::F32, BLOCK, true);
+        let reduced = TileExpr::new(
+            TileExprKind::Reduce {
+                op: TileReduceOp::Max,
+                kind: Box::new(ReduceKind::Subgroup),
+                value: fload(&src, lane()),
+            },
+            f32_ty(),
+        );
+        let ir = KernelIr {
+            buffers: vec![uni, src, out.clone()],
+            grid: [1, 1, 1],
+            block: BLOCK,
+            body: vec![Stmt::Store {
+                dst: view(&out),
+                addr: Addr::Linear(lane()),
+                value: reduced,
+                mask: tlit(),
+            }],
+            byte_arena: None,
+            name: "sg_max",
+        };
+        let data = vec![1.0, -2.0, 7.5, 3.0, 0.0, -9.0, 2.0, 4.0];
+        let got = run_f32(&ir, &[data], BLOCK as usize);
+        assert!(got.iter().all(|v| *v == 7.5), "{got:?}");
+    }
+
+    #[test]
+    fn matmul_epilogue_fuses_in_the_k_loop() {
+        // out[j] = gelu-ish(sum_k a[k] * b[k, j] + bias[j]) for one row.
+        const N: u32 = 16;
+        const K: u32 = 12;
+        let uni = decl(0, ScalarElement::U32, 1, false);
+        let a = decl(1, ScalarElement::F32, K, false);
+        let b = decl(2, ScalarElement::F32, K * N, false);
+        let bias = decl(3, ScalarElement::F32, N, false);
+        let out = decl(4, ScalarElement::F32, N, true);
+
+        let acc_local = Arc::new(LocalDecl::new(f32_ty()));
+        let kk = Arc::new(LocalDecl::new(u32_ty()));
+        let k_idx = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(&kk)), u32_ty());
+        let a_v = fload(&a, k_idx.clone());
+        let b_v = fload(
+            &b,
+            ubin(BinOp::Add, ubin(BinOp::Mul, k_idx, ulit(N)), lane()),
+        );
+        let prev = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(&acc_local)), f32_ty());
+        let update = fbin(
+            BinOp::Add,
+            prev,
+            fbin(BinOp::Mul, a_v, b_v, NumericContract::RELAXED),
+            NumericContract::RELAXED,
+        );
+        let acc = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(&acc_local)), f32_ty());
+        let epilogue = TileExpr::new(
+            TileExprKind::Unary {
+                op: UnOp::Tanh,
+                value: fbin(
+                    BinOp::Add,
+                    acc,
+                    fload(&bias, lane()),
+                    NumericContract::RELAXED,
+                ),
+                numeric: NumericContract::RELAXED,
+            },
+            f32_ty(),
+        );
+        let ir = KernelIr {
+            buffers: vec![uni, a, b, bias, out.clone()],
+            grid: [1, 1, 1],
+            block: N,
+            body: vec![
+                Stmt::Loop {
+                    count: Some(ulit(K)),
+                    index: Some(kk),
+                    accumulators: vec![Accumulator {
+                        local: acc_local,
+                        init: flit(0.0),
+                        update,
+                    }],
+                    body: vec![],
+                },
+                Stmt::Store {
+                    dst: view(&out),
+                    addr: Addr::Linear(lane()),
+                    value: epilogue,
+                    mask: tlit(),
+                },
+            ],
+            byte_arena: None,
+            name: "gemv_epilogue",
+        };
+
+        let art = compile(&ir, crate::caps::cpu_caps(), None).unwrap();
+        assert_eq!(art.prog.segments.len(), 1, "no barrier, so one segment");
+        assert_eq!(
+            art.prog.store_count(),
+            1,
+            "the epilogue must fuse: no intermediate materialization"
+        );
+
+        let av: Vec<f32> = (0..K).map(|i| 0.1 * (i as f32) - 0.5).collect();
+        let bv: Vec<f32> = (0..K * N).map(|i| 0.01 * (i as f32) - 0.3).collect();
+        let biasv: Vec<f32> = (0..N).map(|i| 0.05 * (i as f32)).collect();
+        let got = run_f32(&ir, &[av.clone(), bv.clone(), biasv.clone()], N as usize);
+        for j in 0..N as usize {
+            let mut acc = 0f64;
+            for k in 0..K as usize {
+                acc += av[k] as f64 * bv[k * N as usize + j] as f64;
+            }
+            let want = ((acc + biasv[j] as f64).tanh()) as f32;
+            assert!(
+                (got[j] - want).abs() < 1e-5,
+                "col {j}: {} vs {want}",
+                got[j]
+            );
+        }
+    }
+
+    #[test]
+    fn scatter_add_accumulates_duplicates() {
+        // 4096 indices into 64 bins x 8 lanes, 7% of them in one bin, plus a
+        // pure-padding tail. One workgroup per bin, so the accumulation order
+        // is fixed and the result is bit-reproducible at any thread count.
+        const BINS: u32 = 64;
+        const WIDTH: u32 = 8;
+        const N: u32 = 4096;
+        let uni = decl(0, ScalarElement::U32, 1, false);
+        let base = decl(1, ScalarElement::F32, BINS * WIDTH, false);
+        let idx = decl(2, ScalarElement::U32, N, false);
+        let upd = decl(3, ScalarElement::F32, N * WIDTH, false);
+        let out = decl(4, ScalarElement::F32, BINS * WIDTH, true);
+
+        let dst = ubin(BinOp::Add, ubin(BinOp::Mul, pid(), ulit(WIDTH)), lane());
+        let kk = Arc::new(LocalDecl::new(u32_ty()));
+        let k_idx = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(&kk)), u32_ty());
+        let this = TileExpr::new(
+            TileExprKind::Load {
+                src: Source::Storage(view(&idx)),
+                addr: Box::new(Addr::Linear(k_idx.clone())),
+                mask: tlit(),
+                fill: ulit(0),
+            },
+            u32_ty(),
+        );
+        let hit = TileExpr::new(
+            TileExprKind::Compare {
+                op: CmpOp::Eq,
+                left: this,
+                right: pid(),
+            },
+            bool_ty(),
+        );
+        let contribution = fload(
+            &upd,
+            ubin(BinOp::Add, ubin(BinOp::Mul, k_idx, ulit(WIDTH)), lane()),
+        );
+        let acc_local = Arc::new(LocalDecl::new(f32_ty()));
+        let prev = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(&acc_local)), f32_ty());
+        let update = TileExpr::new(
+            TileExprKind::Select {
+                condition: hit,
+                accept: fbin(
+                    BinOp::Add,
+                    prev.clone(),
+                    contribution,
+                    NumericContract::STRICT,
+                ),
+                reject: prev,
+            },
+            f32_ty(),
+        );
+        let ir = KernelIr {
+            buffers: vec![uni, base.clone(), idx, upd, out.clone()],
+            grid: [BINS, 1, 1],
+            block: WIDTH,
+            body: vec![
+                Stmt::Loop {
+                    count: Some(ulit(N)),
+                    index: Some(kk),
+                    accumulators: vec![Accumulator {
+                        local: Arc::clone(&acc_local),
+                        init: fload(&base, dst.clone()),
+                        update,
+                    }],
+                    body: vec![],
+                },
+                Stmt::Store {
+                    dst: view(&out),
+                    addr: Addr::Linear(dst),
+                    value: TileExpr::new(TileExprKind::LoadLocal(acc_local), f32_ty()),
+                    mask: tlit(),
+                },
+            ],
+            byte_arena: None,
+            name: "scatter_add",
+        };
+
+        // 7% of the indices land in bin 3; the last 256 are pure padding into
+        // a bin nothing reads back.
+        let indices: Vec<u32> = (0..N)
+            .map(|i| {
+                if i % 14 == 0 {
+                    3
+                } else if i >= N - 256 {
+                    BINS - 1
+                } else {
+                    (i * 7 + 11) % BINS
+                }
+            })
+            .collect();
+        let basev = vec![0.0f32; (BINS * WIDTH) as usize];
+        let updv: Vec<f32> = (0..N * WIDTH)
+            .map(|i| ((i % 97) as f32) * 0.25 - 6.0)
+            .collect();
+
+        let mut want = basev.clone();
+        for (i, b) in indices.iter().enumerate() {
+            for l in 0..WIDTH as usize {
+                want[*b as usize * WIDTH as usize + l] += updv[i * WIDTH as usize + l];
+            }
+        }
+
+        let caps = crate::caps::cpu_caps();
+        let art = compile(&ir, caps, None).unwrap();
+        let kernel = CpuKernel {
+            name: art.name,
+            block: art.block,
+            vector_width: art.prog.width,
+            artifact: art,
+        };
+        let mk_f32 = |v: &[f32]| {
+            let mut b = AlignedBuf::zeroed(v.len() * 4).unwrap();
+            b.as_mut_slice().copy_from_slice(bytemuck::cast_slice(v));
+            Buf::new(b)
+        };
+        let mut ib = AlignedBuf::zeroed(indices.len() * 4).unwrap();
+        ib.as_mut_slice()
+            .copy_from_slice(bytemuck::cast_slice(&indices));
+        let outb = Buf::new(AlignedBuf::zeroed(basev.len() * 4).unwrap());
+        kernel
+            .run(
+                [BINS, 1, 1],
+                &[mk_f32(&basev), Buf::new(ib), mk_f32(&updv), outb.clone()],
+                &Uniforms::default(),
+            )
+            .unwrap();
+        let ab = outb.downcast_ref::<AlignedBuf>().unwrap();
+        let got = bytemuck::cast_slice::<u8, f32>(ab.as_slice());
+        for i in 0..got.len() {
+            assert_eq!(got[i], want[i], "bin element {i}");
+        }
+    }
+
+    #[test]
+    fn parallel_for_is_deterministic() {
+        const N: u32 = 4096;
+        let uni = decl(0, ScalarElement::U32, 1, false);
+        let src = decl(1, ScalarElement::F32, N, false);
+        let out = decl(2, ScalarElement::F32, N, true);
+        let idx = ubin(BinOp::Add, ubin(BinOp::Mul, pid(), ulit(64)), lane());
+        let ir = KernelIr {
+            buffers: vec![uni, Arc::clone(&src), out.clone()],
+            grid: [N / 64, 1, 1],
+            block: 64,
+            body: vec![Stmt::Store {
+                dst: view(&out),
+                addr: Addr::Linear(idx.clone()),
+                value: TileExpr::new(
+                    TileExprKind::Unary {
+                        op: UnOp::Tanh,
+                        value: fload(&src, idx),
+                        numeric: NumericContract::RELAXED,
+                    },
+                    f32_ty(),
+                ),
+                mask: tlit(),
+            }],
+            byte_arena: None,
+            name: "det",
+        };
+        let data: Vec<f32> = (0..N).map(|i| (i as f32) * 0.001 - 2.0).collect();
+        let a = run_f32(&ir, &[data.clone()], N as usize);
+        let b = run_f32(&ir, &[data.clone()], N as usize);
+        assert_eq!(a, b, "two runs over the same pool must be bit-identical");
+        for i in 0..N as usize {
+            assert_eq!(a[i], expr::tanhf(data[i]), "element {i}");
+        }
+    }
+
+    #[test]
+    fn level_dispatched_once_per_worker_not_per_row() {
+        const N: u32 = 65536;
+        let uni = decl(0, ScalarElement::U32, 1, false);
+        let out = decl(1, ScalarElement::F32, N, true);
+        let idx = ubin(BinOp::Add, ubin(BinOp::Mul, pid(), ulit(64)), lane());
+        let ir = KernelIr {
+            buffers: vec![uni, out.clone()],
+            grid: [N / 64, 1, 1],
+            block: 64,
+            body: vec![Stmt::Store {
+                dst: view(&out),
+                addr: Addr::Linear(idx),
+                value: flit(1.0),
+                mask: tlit(),
+            }],
+            byte_arena: None,
+            name: "count",
+        };
+        let threads = crate::caps::CpuCaps::threads() as u64;
+        let bound = threads * 4 + 1;
+
+        crate::launch::reset_dispatch_count();
+        let _ = run_f32(&ir, &[], N as usize);
+        let small = crate::launch::dispatch_count();
+        assert!(small >= 1);
+        assert!(
+            small <= bound,
+            "{small} dispatches for {threads} threads at grid {} looks per-row",
+            N / 64
+        );
+
+        // Sixteen times the workgroups, same bound: the dispatch count tracks
+        // the worker pool, not the grid. A per-row dispatch would be 1024x
+        // this.
+        let wide = KernelIr {
+            block: 4,
+            grid: [N / 4, 1, 1],
+            ..ir.clone()
+        };
+        crate::launch::reset_dispatch_count();
+        let _ = run_f32(&wide, &[], N as usize);
+        let big = crate::launch::dispatch_count();
+        assert!(
+            big <= bound,
+            "{big} dispatches at grid {} exceeds the pool bound {bound}",
+            N / 4
+        );
+    }
+
+    #[test]
+    fn a_divergent_if_merges_both_arms_under_a_mask() {
+        const BLOCK: u32 = 32;
+        let uni = decl(0, ScalarElement::U32, 1, false);
+        let out = decl(1, ScalarElement::F32, BLOCK, true);
+        let even = TileExpr::new(
+            TileExprKind::Compare {
+                op: CmpOp::Eq,
+                left: ubin(BinOp::Rem, lane(), ulit(2)),
+                right: ulit(0),
+            },
+            bool_ty(),
+        );
+        let ir = KernelIr {
+            buffers: vec![uni, out.clone()],
+            grid: [1, 1, 1],
+            block: BLOCK,
+            body: vec![Stmt::If {
+                condition: even,
+                accept: vec![Stmt::Store {
+                    dst: view(&out),
+                    addr: Addr::Linear(lane()),
+                    value: flit(1.0),
+                    mask: tlit(),
+                }],
+                reject: vec![Stmt::Store {
+                    dst: view(&out),
+                    addr: Addr::Linear(lane()),
+                    value: flit(-1.0),
+                    mask: tlit(),
+                }],
+            }],
+            byte_arena: None,
+            name: "divergent",
+        };
+        let got = run_f32(&ir, &[], BLOCK as usize);
+        for i in 0..BLOCK as usize {
+            assert_eq!(got[i], if i % 2 == 0 { 1.0 } else { -1.0 }, "lane {i}");
+        }
+    }
+    /// **Loop accumulators step simultaneously.**
+    ///
+    /// Two accumulators that swap — `a' = b`, `b' = a` — must still swap after N
+    /// iterations. Writing them back one at a time makes `b'` read the already
+    /// updated `a`, so both collapse to the original `b`; a `(n, mean, m2)`
+    /// carrier hits the same edge, where `mean`'s update reads `n` and the
+    /// variance comes back about half right rather than obviously broken.
+    #[test]
+    fn loop_accumulators_read_the_values_they_entered_the_step_with() {
+        let uni = decl(0, ScalarElement::U32, 1, false);
+        let src = decl(1, ScalarElement::F32, 2, false);
+        let out = decl(2, ScalarElement::F32, 2, true);
+
+        let a = Arc::new(LocalDecl::new(f32_ty()));
+        let b = Arc::new(LocalDecl::new(f32_ty()));
+        let read =
+            |l: &Arc<LocalDecl>| TileExpr::new(TileExprKind::LoadLocal(Arc::clone(l)), f32_ty());
+        let accumulators = vec![
+            Accumulator {
+                local: Arc::clone(&a),
+                init: fload(&src, ulit(0)),
+                update: read(&b),
+            },
+            Accumulator {
+                local: Arc::clone(&b),
+                init: fload(&src, ulit(1)),
+                update: read(&a),
+            },
+        ];
+        let body = vec![
+            Stmt::Loop {
+                count: Some(ulit(3)),
+                index: None,
+                accumulators,
+                body: Vec::new(),
+            },
+            Stmt::Store {
+                dst: view(&out),
+                addr: Addr::Linear(ulit(0)),
+                value: read(&a),
+                mask: cmp_eq_lane_zero(),
+            },
+            Stmt::Store {
+                dst: view(&out),
+                addr: Addr::Linear(ulit(1)),
+                value: read(&b),
+                mask: cmp_eq_lane_zero(),
+            },
+        ];
+        let ir = KernelIr {
+            buffers: vec![uni, src, out],
+            grid: [1, 1, 1],
+            block: 8,
+            body,
+            byte_arena: None,
+            name: "swap",
+        };
+        let got = run_f32(&ir, &[vec![0.0], vec![1.0, 2.0]], 2);
+        // Three swaps of (1, 2) give (2, 1).
+        assert_eq!(
+            got,
+            vec![2.0, 1.0],
+            "sequential write-back would give (2, 2)"
+        );
+    }
+
+    fn cmp_eq_lane_zero() -> TileExpr {
+        TileExpr::new(
+            TileExprKind::Compare {
+                op: CmpOp::Eq,
+                left: lane(),
+                right: ulit(0),
+            },
+            bool_ty(),
+        )
     }
 }

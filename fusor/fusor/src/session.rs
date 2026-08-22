@@ -2,6 +2,7 @@
 //! extractor and the plan cache; `resolve` is the one place saturation,
 //! extraction and dispatch happen.
 
+use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::time::Instant;
@@ -16,17 +17,17 @@ use fusor_ir::device::Caps;
 use fusor_ir::dtype::{Dtype, Persistence};
 use fusor_ir::egraph::{EGraph, Id, Rule, Saturate, SaturationBudget, SaturationDelta};
 use fusor_ir::extract::{ExtractBudget, Extractor, Plan, ReplayKey};
-use fusor_ir::ir::launch::Effect;
-use fusor_ir::ir::logical::{LeafKind, Logical};
+use fusor_ir::ir::launch::{Effect, Launch};
+use fusor_ir::ir::logical::{BufferId, LeafKind, Logical};
 use fusor_ir::ir::{Op, OpDefRegistry, Semantics};
 use fusor_ir::saturate::Driver;
 use fusor_ir::shape::Dim;
-use fusor_ir::target::{Buf, LowerCtx, Target, Uniforms};
+use fusor_ir::target::{Artifact, Buf, LowerCtx, Target, Uniforms};
 use fusor_tile::{Planner, SCHED_RULES};
 use rustc_hash::FxHashMap;
 
 use crate::composite::register_macro_ops;
-use crate::graph::GraphRef;
+use crate::graph::{GraphRef, WeakGraphRef};
 use crate::tensor::Tensor;
 use crate::{Error, Result};
 
@@ -171,8 +172,55 @@ pub(crate) struct SessionInner {
     /// The online explorer's per-key state: deterministic resolve counters
     /// and the candidate arms production sampling is working through.
     explore: parking_lot::Mutex<explore::ExploreState>,
+    /// Verified CPU plans and native launch lists, keyed by an unsaturated
+    /// term modulo fresh step-buffer names.
+    cpu_structural: parking_lot::Mutex<FxHashMap<CpuStructuralKey, CpuStructuralEntry>>,
     launches: AtomicU64,
     in_flight: AtomicU32,
+}
+
+struct CpuExecutableLaunch {
+    artifact: Artifact,
+    grid: [u32; 3],
+    bindings: Vec<Id>,
+}
+
+struct CpuExecutable {
+    launches: Vec<CpuExecutableLaunch>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CpuTerm {
+    nodes: Vec<Op>,
+    roots: Vec<Id>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct CpuStructuralKey {
+    graph: usize,
+    dim_values: u64,
+    term: CpuTerm,
+}
+
+struct CpuStructuralEntry {
+    graph: WeakGraphRef,
+    roots: Vec<Id>,
+    inputs: Vec<Id>,
+    plan: Arc<Plan>,
+    executable: Arc<CpuExecutable>,
+}
+
+struct CpuStructuralHit {
+    roots: Vec<Id>,
+    plan: Arc<Plan>,
+    executable: Arc<CpuExecutable>,
+    inputs: FxHashMap<Id, Buf>,
+}
+
+struct CpuTemplateBindings {
+    inputs: FxHashMap<Id, Buf>,
+    outputs: Vec<Id>,
+    executable: Arc<CpuExecutable>,
 }
 
 impl Session {
@@ -214,6 +262,7 @@ impl Session {
                 tune: fusor_cost::tune_cache::TuneCache::load(device_fingerprint),
                 explore: parking_lot::Mutex::new(explore::ExploreState::default()),
                 saturation: SaturationMemo::default(),
+                cpu_structural: parking_lot::Mutex::new(FxHashMap::default()),
                 launches: AtomicU64::new(0),
                 in_flight: AtomicU32::new(0),
             }),
@@ -274,6 +323,37 @@ impl Session {
 
         if self.inner.in_flight.load(Ordering::Relaxed) >= MAX_INFLIGHT_PLANS {
             self.wait()?;
+        }
+
+        // Inference frontends commonly rebuild the same expression with a
+        // fresh `from_slice` leaf on every call. On CPU, reuse the already
+        // verified plan and compiled executable for an isomorphic raw term,
+        // rebinding only the fresh input and requested output buffers. This
+        // deliberately runs before saturation and extraction: those dominate
+        // the cost of replaying a model on an append-only graph.
+        if matches!(self.inner.device, Backend::Cpu(_))
+            && let Some(hit) = self.cpu_structural_hit(&graph, values)
+        {
+            let old_values: Vec<Tensor> = hit.roots.iter().map(|id| graph.tensor(*id)).collect();
+            let bindings = CpuTemplateBindings {
+                inputs: hit.inputs,
+                outputs: values.iter().map(|value| value.id).collect(),
+                executable: hit.executable,
+            };
+            let started = Instant::now();
+            let (launched, _) = self.run(&graph, &hit.plan, &old_values, Some(&bindings))?;
+            if resolve_profile() {
+                eprintln!(
+                    "[profile] structural replay hit: run {} us ({} launches)",
+                    started.elapsed().as_micros(),
+                    launched
+                );
+            }
+            self.inner
+                .launches
+                .fetch_add(launched as u64, Ordering::Relaxed);
+            self.inner.in_flight.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
         }
 
         let caps = self.caps();
@@ -449,7 +529,7 @@ impl Session {
         }
 
         let __t_run = Instant::now();
-        self.run(&graph, &plan, values)?;
+        let (launched, executable) = self.run(&graph, &plan, values, None)?;
         if let Some(sel) = explored {
             // Reads the profile the armed clock captured; must run before the
             // clock drops (its drop clears the last profile).
@@ -459,13 +539,16 @@ impl Session {
             eprintln!(
                 "[profile] run {} us ({} launches)",
                 __t_run.elapsed().as_micros(),
-                plan.launches.len()
+                launched
             );
         }
         self.inner
             .launches
-            .fetch_add(plan.launches.len() as u64, Ordering::Relaxed);
+            .fetch_add(launched as u64, Ordering::Relaxed);
         self.inner.in_flight.fetch_add(1, Ordering::Relaxed);
+        if let Some(executable) = executable {
+            self.insert_cpu_structural(&graph, &roots, Arc::clone(&plan), executable);
+        }
         Ok(())
     }
 
@@ -482,6 +565,64 @@ impl Session {
         self.inner.device.target().wait()?;
         self.inner.in_flight.store(0, Ordering::Relaxed);
         Ok(())
+    }
+
+    fn cpu_structural_hit(&self, graph: &GraphRef, values: &[Tensor]) -> Option<CpuStructuralHit> {
+        let roots: Vec<Id> = values.iter().map(|value| value.id).collect();
+        let (key, current_inputs) = cpu_cache_key(graph, &roots)?;
+        let mut entries = self.inner.cpu_structural.lock();
+        entries.retain(|_, entry| entry.graph.strong_count() > 0);
+        let entry = entries.get(&key)?;
+        if !entry
+            .graph
+            .upgrade()
+            .is_some_and(|owner| GraphRef::ptr_eq(&owner, graph))
+        {
+            return None;
+        }
+        let mut inputs = FxHashMap::default();
+        for (&old, current) in entry.inputs.iter().zip(current_inputs) {
+            if old == current {
+                continue;
+            }
+            let buffer = graph
+                .device_buf(current)
+                .or_else(|| self.leaf_buffer(graph, current).ok().flatten())?;
+            inputs.insert(old, buffer);
+        }
+        Some(CpuStructuralHit {
+            roots: entry.roots.clone(),
+            plan: Arc::clone(&entry.plan),
+            executable: Arc::clone(&entry.executable),
+            inputs,
+        })
+    }
+
+    fn insert_cpu_structural(
+        &self,
+        graph: &GraphRef,
+        roots: &[Id],
+        plan: Arc<Plan>,
+        executable: Arc<CpuExecutable>,
+    ) {
+        let Some((key, inputs)) = cpu_cache_key(graph, roots) else {
+            return;
+        };
+        let mut entries = self.inner.cpu_structural.lock();
+        entries.retain(|_, entry| entry.graph.strong_count() > 0);
+        if entries.len() >= fusor_cost::replay::CAPACITY && !entries.contains_key(&key) {
+            entries.clear();
+        }
+        entries.insert(
+            key,
+            CpuStructuralEntry {
+                graph: GraphRef::downgrade(graph),
+                roots: roots.to_vec(),
+                inputs,
+                plan,
+                executable,
+            },
+        );
     }
 
     /// Dispatches issued since construction, not encoder submissions.
@@ -616,12 +757,29 @@ impl Session {
         graph.set_device_buf_class(&members, buf, layout.as_ref());
     }
 
-    fn run(&self, graph: &GraphRef, plan: &Plan, values: &[Tensor]) -> Result<()> {
+    fn run(
+        &self,
+        graph: &GraphRef,
+        plan: &Plan,
+        values: &[Tensor],
+        template: Option<&CpuTemplateBindings>,
+    ) -> Result<(usize, Option<Arc<CpuExecutable>>)> {
         // What the extractor selected for each requested value.
         let wanted: Vec<Id> = values
             .iter()
             .map(|v| self.selected(graph, plan, v.id))
             .collect();
+        let output_aliases: FxHashMap<Id, Id> = template
+            .map(|bindings| {
+                wanted
+                    .iter()
+                    .copied()
+                    .zip(bindings.outputs.iter().copied())
+                    .collect()
+            })
+            .unwrap_or_default();
+        let launch_roots: rustc_hash::FxHashSet<Id> =
+            plan.launches.iter().map(|launch| launch.root).collect();
         // Every external leaf the plan reads, uploaded once. A `Persistent`
         // leaf keeps its buffer across resolves. The classification runs once
         // over the distinct bound values under one lock apiece rather than
@@ -649,13 +807,28 @@ impl Session {
                 }
             }
         }
+        if let Some(template) = template {
+            for (id, buf) in &template.inputs {
+                supplied.insert(*id, buf.clone());
+            }
+        }
         // Root outputs are allocated here rather than inside the backend so
         // the handle survives for readback. The root set is built once;
         // rescanning the launch list per buffer would be quadratic.
-        let launch_roots: rustc_hash::FxHashSet<Id> =
-            plan.launches.iter().map(|l| l.root).collect();
         let mut to_bind: Vec<(Id, Buf, Option<Arc<fusor_ir::shape::Layout>>)> = Vec::new();
         for buffer in &plan.buffers {
+            if let Some(target) = output_aliases.get(&buffer.value).copied() {
+                let elements = resolve_buffer_elements(buffer.elements, &buffer.layout, graph)?;
+                let bytes = (elements * buffer.dtype.byte_size()).max(4);
+                let buf = self
+                    .inner
+                    .device
+                    .target()
+                    .alloc(bytes, buffer.persistence)?;
+                to_bind.push((target, buf.clone(), Some(Arc::new(buffer.layout.clone()))));
+                supplied.insert(buffer.value, buf);
+                continue;
+            }
             if supplied.contains_key(&buffer.value) {
                 continue;
             }
@@ -665,6 +838,15 @@ impl Session {
             }
             let elements = resolve_buffer_elements(buffer.elements, &buffer.layout, graph)?;
             let bytes = (elements * buffer.dtype.byte_size()).max(4);
+            if matches!(self.inner.device, Backend::Cpu(_))
+                && let Some(existing) = graph.device_buf(buffer.value)
+                && existing
+                    .downcast_ref::<fusor_cpu::AlignedBuf>()
+                    .is_some_and(|buf| buf.len() as u64 >= bytes)
+            {
+                supplied.insert(buffer.value, existing);
+                continue;
+            }
             let buf = self
                 .inner
                 .device
@@ -712,11 +894,19 @@ impl Session {
                     env = env.with_buffer(*id, buf.clone());
                 }
                 let g = graph.state().egraph.lock();
-                target.resolve(plan, &g, &env)
+                target.resolve(plan, &g, &env)?;
+                Ok((plan.launches.len(), None))
             }
             Backend::Cpu(target) => {
                 let target = Arc::clone(target);
-                self.run_cpu(target.as_ref(), graph, plan, &mut supplied)
+                let (launched, executable) = self.run_cpu(
+                    target.as_ref(),
+                    graph,
+                    plan,
+                    &mut supplied,
+                    template.map(|bindings| Arc::clone(&bindings.executable)),
+                )?;
+                Ok((launched, Some(executable)))
             }
         }
     }
@@ -730,8 +920,10 @@ impl Session {
         graph: &GraphRef,
         plan: &Plan,
         supplied: &mut FxHashMap<Id, Buf>,
-    ) -> Result<()> {
+        cached: Option<Arc<CpuExecutable>>,
+    ) -> Result<(usize, Arc<CpuExecutable>)> {
         let uniforms = self.uniforms_for(plan, graph)?;
+        let dim_bindings = graph.dim_bindings();
 
         for buffer in &plan.buffers {
             if supplied.contains_key(&buffer.value) {
@@ -739,32 +931,55 @@ impl Session {
             }
             let elements = resolve_buffer_elements(buffer.elements, &buffer.layout, graph)?;
             let bytes = (elements * buffer.dtype.byte_size()).max(4);
+            if let Some(existing) = graph.device_buf(buffer.value)
+                && existing
+                    .downcast_ref::<fusor_cpu::AlignedBuf>()
+                    .is_some_and(|buf| buf.len() as u64 >= bytes)
+            {
+                supplied.insert(buffer.value, existing);
+                continue;
+            }
             supplied.insert(buffer.value, target.alloc(bytes, buffer.persistence)?);
         }
 
-        let g = graph.state().egraph.lock();
-        for launch in &plan.launches {
-            let theta = plan
-                .extraction
-                .theta
-                .get(&launch.root)
-                .copied()
-                .unwrap_or(fusor_ir::ir::launch::SchedPoint::Point);
-            let cx = LowerCtx {
-                plan,
-                launch,
-                graph: &g,
-                symbols: &plan.symbols,
-            };
-            let ir = target.lower(g.node(launch.root), launch.root, theta, &cx)?;
-            let artifact = target.emit(&ir)?;
+        let executable = if let Some(cached) = cached {
+            cached
+        } else {
+            let g = graph.state().egraph.lock();
+            let mut launches = Vec::with_capacity(plan.launches.len());
+            for launch in &plan.launches {
+                let theta = plan
+                    .extraction
+                    .theta
+                    .get(&launch.root)
+                    .copied()
+                    .unwrap_or(fusor_ir::ir::launch::SchedPoint::Point);
+                let cx = LowerCtx {
+                    plan,
+                    launch,
+                    graph: &g,
+                    symbols: &plan.symbols,
+                    dim_bindings: &dim_bindings,
+                };
+                let ir = target.lower(g.node(launch.root), launch.root, theta, &cx)?;
+                let artifact = target.emit(&ir)?;
+                let mut ordered: Vec<_> = launch.bindings.iter().collect();
+                ordered.sort_by_key(|binding| binding.binding);
+                launches.push(CpuExecutableLaunch {
+                    artifact,
+                    grid: ir.grid,
+                    bindings: ordered.into_iter().map(|binding| binding.value).collect(),
+                });
+            }
+            Arc::new(CpuExecutable { launches })
+        };
 
-            let mut ordered: Vec<_> = launch.bindings.iter().collect();
-            ordered.sort_by_key(|b| b.binding);
-            let mut binds = Vec::with_capacity(ordered.len());
-            for b in ordered {
-                let buf = supplied.get(&b.value).cloned().ok_or_else(|| {
-                    Error::Plan(format!("launch binds {} which nothing allocates", b.value))
+        let mut launched = 0usize;
+        for launch in &executable.launches {
+            let mut binds = Vec::with_capacity(launch.bindings.len());
+            for value in &launch.bindings {
+                let buf = supplied.get(value).cloned().ok_or_else(|| {
+                    Error::Plan(format!("launch binds {value} which nothing allocates"))
                 })?;
                 binds.push(buf);
             }
@@ -772,9 +987,10 @@ impl Session {
             // cost model's workgroup count; `KernelIr::grid` is what the
             // lowering indexed the body against. When they disagree the
             // kernel silently computes a prefix of its output.
-            target.launch(&artifact, ir.grid, &binds, &uniforms)?;
+            target.launch(&launch.artifact, launch.grid, &binds, &uniforms)?;
+            launched += 1;
         }
-        Ok(())
+        Ok((launched, executable))
     }
 
     /// Binding 0 for the CPU launcher, indexed by raw `SymId`: a dim symbol
@@ -1202,7 +1418,7 @@ impl Session {
         let mut gpu_us: Option<Vec<f64>> = None;
         for _ in 0..repetitions {
             let t = Instant::now();
-            self.run(graph, plan, values)?;
+            let _ = self.run(graph, plan, values, None)?;
             self.inner.device.target().wait()?;
             self.inner.in_flight.store(0, Ordering::Relaxed);
             nanos = nanos.min(t.elapsed().as_nanos() as u64);
@@ -1292,7 +1508,149 @@ fn dump_exec() -> bool {
     *ON.get_or_init(|| std::env::var_os("FUSOR_DUMP_EXEC").is_some())
 }
 
-/// Whether `FUSOR_NO_SAT_MEMO` is set; read once, `resolve` is the hot path.
+/// Canonicalize an unsaturated term while replacing each runtime buffer name
+/// with its traversal-order input slot. The resulting ordinary Op vector
+/// provides exact equality and hashing without a parallel hand-written matcher.
+fn canonical_cpu_term(graph: &GraphRef, roots: &[Id]) -> Option<(CpuTerm, Vec<Id>)> {
+    fn rebuild(op: &Op, source: Id, children: &[Id], inputs: &mut Vec<Id>) -> Option<Op> {
+        let child = |index: usize| children.get(index).copied();
+        Some(match op {
+            Op::Logical(Logical::Leaf(LeafKind::Buffer { dtype, shape, .. })) => {
+                let name = BufferId(inputs.len() as u32);
+                inputs.push(source);
+                Op::Logical(Logical::Leaf(LeafKind::Buffer {
+                    name,
+                    dtype: *dtype,
+                    shape: shape.clone(),
+                }))
+            }
+            Op::Logical(Logical::Leaf(leaf)) => Op::Logical(Logical::Leaf(leaf.clone())),
+            Op::Logical(Logical::Map { expr, outs, .. }) => Op::Logical(Logical::Map {
+                expr: expr.clone(),
+                ins: children.iter().copied().collect(),
+                outs: *outs,
+            }),
+            Op::Logical(Logical::Fold {
+                carrier, axis, acc, ..
+            }) => Op::Logical(Logical::Fold {
+                carrier: carrier.clone(),
+                axis: *axis,
+                acc: *acc,
+                ins: children.iter().copied().collect(),
+            }),
+            Op::Logical(Logical::Contract {
+                spec, acc, outs, ..
+            }) => Op::Logical(Logical::Contract {
+                spec: spec.clone(),
+                acc: *acc,
+                a: child(0)?,
+                b: child(1)?,
+                outs: *outs,
+            }),
+            Op::Logical(Logical::Restride { specs, bounds, .. }) => {
+                Op::Logical(Logical::Restride {
+                    specs: specs.clone(),
+                    bounds: *bounds,
+                    x: child(0)?,
+                })
+            }
+            Op::Logical(Logical::Window { specs, .. }) => Op::Logical(Logical::Window {
+                specs: specs.clone(),
+                x: child(0)?,
+            }),
+            Op::Logical(Logical::Gather { axis, .. }) => Op::Logical(Logical::Gather {
+                axis: *axis,
+                x: child(0)?,
+                idx: child(1)?,
+            }),
+            Op::Logical(Logical::Scatter {
+                axis,
+                combine,
+                unique,
+                ..
+            }) => Op::Logical(Logical::Scatter {
+                axis: *axis,
+                combine: *combine,
+                base: child(0)?,
+                idx: child(1)?,
+                upd: child(2)?,
+                unique: *unique,
+            }),
+            Op::Logical(Logical::Dequant { fmt, layout, .. }) => Op::Logical(Logical::Dequant {
+                fmt: *fmt,
+                layout: *layout,
+                x: child(0)?,
+            }),
+            Op::Logical(Logical::Project { slot, .. }) => Op::Logical(Logical::Project {
+                slot: *slot,
+                x: child(0)?,
+            }),
+            Op::Launch(Launch::Ext { def, ops, attrs }) => {
+                let mut ops = ops.clone();
+                if ops.len() != children.len() {
+                    return None;
+                }
+                for (operand, child) in ops.iter_mut().zip(children) {
+                    operand.src = *child;
+                }
+                Op::Launch(Launch::Ext {
+                    def: *def,
+                    ops,
+                    attrs: *attrs,
+                })
+            }
+            Op::Union(..) => Op::Union(child(0)?, child(1)?),
+            Op::Launch(_) => return None,
+        })
+    }
+
+    fn visit(
+        graph: &EGraph,
+        id: Id,
+        memo: &mut FxHashMap<Id, Id>,
+        nodes: &mut Vec<Op>,
+        inputs: &mut Vec<Id>,
+    ) -> Option<Id> {
+        if let Some(id) = memo.get(&id).copied() {
+            return Some(id);
+        }
+        let node = graph.node(id);
+        let children = node
+            .children
+            .iter()
+            .map(|child| visit(graph, *child, memo, nodes, inputs))
+            .collect::<Option<Vec<_>>>()?;
+        let op = rebuild(&node.op, id, &children, inputs)?;
+        let canonical = Id(nodes.len() as u32);
+        nodes.push(op);
+        memo.insert(id, canonical);
+        Some(canonical)
+    }
+
+    let graph = graph.state().egraph.lock();
+    let mut memo = FxHashMap::default();
+    let mut nodes = Vec::new();
+    let mut inputs = Vec::new();
+    let roots = roots
+        .iter()
+        .map(|root| visit(&graph, *root, &mut memo, &mut nodes, &mut inputs))
+        .collect::<Option<Vec<_>>>()?;
+    Some((CpuTerm { nodes, roots }, inputs))
+}
+
+fn cpu_cache_key(graph: &GraphRef, roots: &[Id]) -> Option<(CpuStructuralKey, Vec<Id>)> {
+    let (term, inputs) = canonical_cpu_term(graph, roots)?;
+    let mut dims = rustc_hash::FxHasher::default();
+    graph.dim_bindings().hash(&mut dims);
+    Some((
+        CpuStructuralKey {
+            graph: GraphRef::as_ptr(graph) as usize,
+            dim_values: dims.finish(),
+            term,
+        },
+        inputs,
+    ))
+}
 fn saturation_memo_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FUSOR_NO_SAT_MEMO").is_some())
@@ -1823,4 +2181,34 @@ fn resolve_elements(shape: &[Dim], graph: &GraphRef) -> Result<u64> {
         acc = acc.saturating_mul(resolve_dim(*d, graph)?);
     }
     Ok(acc.max(1))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::graph::Graph;
+
+    #[test]
+    fn a_fresh_step_leaf_reuses_the_cpu_plan_and_executable() {
+        let session = Session::new(Backend::cpu().unwrap()).unwrap();
+        let graph = Graph::new(&session);
+        let run = |values: &[f32]| {
+            let x =
+                Tensor::from_elements(graph.handle(), &[Dim::Const(values.len() as u64)], values)
+                    .unwrap();
+            let y = x.add_scalar(1.0).unwrap();
+            let bytes = graph.handle().read_back(y.id).unwrap();
+            bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+        };
+
+        assert_eq!(run(&[1.0, 2.0, 3.0]), vec![2.0, 3.0, 4.0]);
+        assert_eq!(session.inner.cpu_structural.lock().len(), 1);
+
+        assert_eq!(run(&[10.0, 11.0, 12.0]), vec![11.0, 12.0, 13.0]);
+        assert_eq!(
+            session.inner.cpu_structural.lock().len(),
+            1,
+            "a replay hit must not extract and record another plan"
+        );
+    }
 }

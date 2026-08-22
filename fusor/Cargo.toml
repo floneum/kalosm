@@ -55,10 +55,6 @@ rand = "0.9"
 wgpu = { version = "29", default-features = false, features = ["std", "naga-ir"] }
 naga = "29"
 
-# `fearless_simd`'s statically-known f32x4/f32x8/f32x16 is what makes a 4x4
-# register accumulator tile expressible; a width-erased API structurally cannot.
-fearless_simd = "0.4"
-
 # Use Naga from the ealmloff/wgpu fork. It includes the
 # `CooperativeLoad` correctness fix in `bake_ref_count`, so a simdgroup load
 # referenced once cannot sink past the barrier that ordered it.

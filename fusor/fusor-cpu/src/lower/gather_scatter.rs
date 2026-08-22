@@ -102,7 +102,7 @@ fn gather(
         ));
     }
     let binds = Binds::build(cx)?;
-    let extents = const_extents(&space.dims)?;
+    let extents = const_extents(cx, &space.dims)?;
     let n: u64 = extents.iter().map(|e| *e as u64).product::<u64>().max(1);
     let axis = axis as usize;
     if axis >= extents.len() {
@@ -114,7 +114,7 @@ fn gather(
     // and output disagree. Scaling the source's outer coordinate by the
     // output's stride reads the wrong row whenever the index vector is not
     // exactly as long as the axis it indexes.
-    let src_shape = const_extents(ops[0].layout.shape())?;
+    let src_shape = const_extents(cx, ops[0].layout.shape())?;
     let src_axis = *src_shape
         .get(axis)
         .ok_or_else(|| Error::Legality("gather axis is out of range for the source".into()))?;

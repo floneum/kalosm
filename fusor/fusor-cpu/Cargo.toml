@@ -1,6 +1,6 @@
 [package]
 name = "fusor-cpu"
-description = "fusor fearless_simd Target: SIMD emitter, loop-nest lowering, worker pool"
+description = "fusor CPU target: Cranelift kernels, platform GEMM, worker pool"
 edition.workspace = true
 version.workspace = true
 license.workspace = true
@@ -17,4 +17,8 @@ rustc-hash.workspace = true
 half.workspace = true
 bytemuck.workspace = true
 parking_lot.workspace = true
-fearless_simd.workspace = true
+cranelift-codegen = "0.125.3"
+cranelift-frontend = "0.125.3"
+cranelift-jit = "0.125.3"
+cranelift-module = "0.125.3"
+cranelift-native = "0.125.3"

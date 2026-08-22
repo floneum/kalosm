@@ -57,19 +57,13 @@ impl Buf {
     }
     /// A non-owning handle. Holding one does **not** hold the buffer: the
     /// pool's `strong_count == 1` reuse test still sees the buffer as free,
-    /// which is what lets a cache key a derived object on [`Self::addr`]
-    /// without pinning the allocation.
+    /// which lets caches witness pointer identity without pinning storage.
     pub fn downgrade(&self) -> WeakBuf {
         WeakBuf(Arc::downgrade(&self.0))
     }
 }
 
-/// A non-owning [`Buf`] handle.
-///
-/// Its purpose is address disambiguation: a live `WeakBuf` keeps the
-/// allocation from being reused, so a `Buf` whose [`Buf::addr`] equals the one
-/// this was taken from *is* that buffer. Without it an address is only valid
-/// while the buffer lives, and a freed-then-reallocated `Buf` can land on it.
+/// A non-owning [`Buf`] handle used to witness pointer identity in caches.
 #[derive(Clone)]
 pub struct WeakBuf(std::sync::Weak<dyn Any + Send + Sync>);
 
@@ -142,6 +136,10 @@ pub struct LowerCtx<'a> {
     pub launch: &'a Dispatch,
     pub graph: &'a crate::egraph::EGraph,
     pub symbols: &'a [SymId],
+    /// Concrete extent bindings for this dispatch. CPU native artifacts are
+    /// cached under the binding values, so their lowering may specialize
+    /// symbolic shapes without weakening executable-cache identity.
+    pub dim_bindings: &'a [(SymId, u64)],
 }
 
 impl LowerCtx<'_> {

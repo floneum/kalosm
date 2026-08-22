@@ -14,18 +14,25 @@ use fusor_ir::ir::kernel::{
     ScalarElement, Source, StorageView, TileExpr, TileExprKind, TileLayout, TileLiteral,
     WorkgroupAxis,
 };
-use fusor_ir::ir::launch::{Family, Launch, Operand, SchedPoint};
+use fusor_ir::ir::launch::{
+    AccessPlan, AddressMap, AddressTerm, Family, Launch, Operand, SchedPoint,
+};
 use fusor_ir::ir::{Node, Op};
 use fusor_ir::scalar::{BinOp, ScalarExpr, ScalarKind};
-use fusor_ir::shape::Dim;
+use fusor_ir::shape::{AxisGroup, Dim, Layout, SymId};
 use fusor_ir::target::LowerCtx;
+use smallvec::SmallVec;
 use std::sync::Arc;
 
 /// Lanes per workgroup for a node whose schedule point names no lane group.
 /// One grid point is one workgroup; `block` lanes are walked in chunks of the
 /// register width.
 pub(crate) fn default_block(caps: &Caps) -> u32 {
-    fusor_tile::domains::emitted_block(1, caps)
+    // A CPU "block" is an internal native loop chunk, not a GPU workgroup
+    // capability. Keeping it here avoids exposing 256 GPU-style schedule
+    // alternatives merely to let one Cranelift call process 256 elements.
+    let _ = caps;
+    256
 }
 
 pub(crate) fn lower(
@@ -108,6 +115,14 @@ fn compose(
             .copied()
             .unwrap_or(SchedPoint::Point);
         kernels.push((*m, lower(caps, node, selected, member_theta, cx)?));
+    }
+    if kernels
+        .iter()
+        .any(|(_, kernel)| crate::gemm::ContractSpec::parse(kernel.name).is_some())
+    {
+        return Err(Error::Legality(
+            "a platform GEMM must remain its own CPU dispatch".into(),
+        ));
     }
 
     let block = kernels[0].1.block;
@@ -390,18 +405,16 @@ impl Binds {
             let (element, extents) = match facts.dtype {
                 Dtype::Q(fmt) => {
                     let layout = qlayout_of(cx, b.value).unwrap_or(QLayout::Native);
-                    let elems: u64 = const_extents(&facts.shape)?
-                        .iter()
-                        .map(|e| *e as u64)
-                        .product();
+                    let extents = const_extents(cx, &facts.shape)?;
+                    let elems: u64 = extents.iter().map(|e| *e as u64).product();
                     let blocks = elems.div_ceil(u64::from(fmt.block_elements()).max(1));
                     let words = (blocks * u64::from(fmt.block_bytes(layout))).div_ceil(4);
                     (u32_ty(), vec![words as u32])
                 }
-                d => (
-                    ElementType::Scalar(elem_of(d)?),
-                    const_extents(&facts.shape)?,
-                ),
+                d => {
+                    let extents = const_extents(cx, &facts.shape)?;
+                    (ElementType::Scalar(elem_of(d)?), extents)
+                }
             };
             let access = match b.kind {
                 fusor_ir::extract::BindKind::Read => BufferAccess::Read,
@@ -442,19 +455,55 @@ impl Binds {
     }
 }
 
-pub(crate) fn const_extents(shape: &[Dim]) -> Result<Vec<u32>> {
-    shape
+const DERIVED_STRIDE: SymId = SymId(u32::MAX);
+
+/// Resolve a dimension at the concrete binding this CPU artifact is compiled
+/// for. The executable cache includes these values, so embedding them in the
+/// native loop nest cannot reuse code for a different shape.
+pub(crate) fn resolve_dim(cx: &LowerCtx<'_>, dim: Dim) -> Result<u32> {
+    let value = match dim {
+        Dim::Const(value) => value,
+        Dim::Sym(symbol) if symbol != DERIVED_STRIDE => cx
+            .dim_bindings
+            .iter()
+            .find_map(|(bound, value)| (*bound == symbol).then_some(*value))
+            .ok_or_else(|| Error::Legality(format!("dim {symbol} is unbound at CPU lowering")))?,
+        Dim::Sym(_) => {
+            return Err(Error::Legality(
+                "a derived row-major stride is not a standalone extent".into(),
+            ));
+        }
+    };
+    u32::try_from(value)
+        .map_err(|_| Error::Legality(format!("CPU dimension {value} exceeds u32 indexing")))
+}
+
+pub(crate) fn const_extents(cx: &LowerCtx<'_>, shape: &[Dim]) -> Result<Vec<u32>> {
+    shape.iter().map(|dim| resolve_dim(cx, *dim)).collect()
+}
+
+/// Concrete offset, extents and strides for the current artifact. Contiguous
+/// layouts use `DERIVED_STRIDE` after a symbolic axis; derive those strides
+/// from the now-concrete following extents just as session allocation does.
+pub(crate) fn resolved_layout(
+    cx: &LowerCtx<'_>,
+    layout: &Layout,
+) -> Result<(u32, Vec<u32>, Vec<u32>)> {
+    let offset = resolve_dim(cx, layout.offset())?;
+    let extents = const_extents(cx, layout.shape())?;
+    let strides = layout
+        .strides()
         .iter()
-        .map(|d| {
-            d.as_const().map(|v| v as u32).ok_or_else(|| {
-                Error::Legality(
-                    "the CPU lowering path needs concrete extents; a symbolic dim must be \
-                     specialized or bound through the uniform block first"
-                        .into(),
-                )
-            })
+        .enumerate()
+        .map(|(axis, stride)| match stride {
+            Dim::Sym(symbol) if *symbol == DERIVED_STRIDE => extents[axis + 1..]
+                .iter()
+                .try_fold(1u32, |product, extent| product.checked_mul(*extent))
+                .ok_or_else(|| Error::Legality("CPU derived stride exceeds u32 indexing".into())),
+            other => resolve_dim(cx, *other),
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok((offset, extents, strides))
 }
 
 /// A masked load of operand `slot` at `index`.
@@ -511,7 +560,7 @@ pub(crate) fn operand_at(
         cx,
         binds,
         operand.src,
-        address_of(operand, flat, space_total)?,
+        address_of(cx, operand, flat, space_total)?,
         mask,
     )
 }
@@ -542,7 +591,7 @@ pub(crate) fn scatter_geometry(
     let base = ops
         .first()
         .ok_or_else(|| Error::Legality("a scatter needs a base operand".into()))?;
-    let dest = const_extents(base.layout.shape())?;
+    let dest = const_extents(cx, base.layout.shape())?;
     if axis >= dest.len() {
         return Err(Error::Legality(format!(
             "scatter axis {axis} is outside a rank-{} base",
@@ -555,8 +604,10 @@ pub(crate) fn scatter_geometry(
     let idx = ops
         .get(1)
         .ok_or_else(|| Error::Legality("a scatter needs an index operand".into()))?;
-    let updates = const_extents(idx.layout.shape())?.iter().product::<u32>();
-    let _ = (cx, space);
+    let updates = const_extents(cx, idx.layout.shape())?
+        .iter()
+        .product::<u32>();
+    let _ = space;
     Ok(ScatterGeometry {
         outer: dest[..axis].iter().product::<u32>().max(1),
         bins: dest[axis].max(1),
@@ -566,14 +617,13 @@ pub(crate) fn scatter_geometry(
 }
 
 /// `flat` run through one operand's [`AddressMap`].
-pub(crate) fn address_of(operand: &Operand, flat: TileExpr, space_total: u64) -> Result<TileExpr> {
-    let map = operand.address_map().ok_or_else(|| {
-        Error::Legality(
-            "the CPU lowering path needs a decidable operand index map; a symbolic \
-             stride must be specialized or bound through the uniform block first"
-                .into(),
-        )
-    })?;
+pub(crate) fn address_of(
+    cx: &LowerCtx<'_>,
+    operand: &Operand,
+    flat: TileExpr,
+    space_total: u64,
+) -> Result<TileExpr> {
+    let map = resolved_address_map(cx, operand)?;
     if map.is_identity_over(space_total) {
         return Ok(flat);
     }
@@ -595,6 +645,65 @@ pub(crate) fn address_of(operand: &Operand, flat: TileExpr, space_total: u64) ->
         });
     }
     Ok(acc.unwrap_or_else(|| lit_u32(0)))
+}
+
+fn resolved_address_map(cx: &LowerCtx<'_>, operand: &Operand) -> Result<AddressMap> {
+    let (offset, extents, strides) = resolved_layout(cx, &operand.layout)?;
+    let groups: SmallVec<[AxisGroup; 4]> = match &operand.access {
+        AccessPlan::Unflatten(map) => map.groups.clone(),
+        _ => extents
+            .into_iter()
+            .zip(strides)
+            .map(|(extent, stride)| AxisGroup::affine(extent, stride))
+            .collect(),
+    };
+
+    let mut terms: SmallVec<[AddressTerm; 4]> = SmallVec::new();
+    let mut div_after = 1u64;
+    for group in groups.iter().rev() {
+        let mut below = 1u64;
+        for axis in group.sub_axes.iter().rev() {
+            let divisor = div_after
+                .checked_mul(below)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| Error::Legality("CPU operand divisor exceeds u32".into()))?;
+            terms.push(AddressTerm {
+                divisor,
+                modulus: axis.extent,
+                stride: axis.stride,
+            });
+            below = below
+                .checked_mul(u64::from(axis.extent))
+                .ok_or_else(|| Error::Legality("CPU operand extent product overflows".into()))?;
+        }
+        div_after = div_after
+            .checked_mul(below)
+            .ok_or_else(|| Error::Legality("CPU operand extent product overflows".into()))?;
+    }
+    terms.retain(|term| term.modulus > 1 && term.stride != 0);
+    terms.sort_unstable_by(|left, right| right.divisor.cmp(&left.divisor));
+    coalesce_address_terms(&mut terms);
+    Ok(AddressMap { offset, terms })
+}
+
+fn coalesce_address_terms(terms: &mut SmallVec<[AddressTerm; 4]>) {
+    let mut index = 0;
+    while index + 1 < terms.len() {
+        let (high, low) = (terms[index], terms[index + 1]);
+        let joins = u64::from(low.divisor) * u64::from(low.modulus) == u64::from(high.divisor)
+            && u64::from(low.stride) * u64::from(low.modulus) == u64::from(high.stride);
+        if joins && low.modulus.checked_mul(high.modulus).is_some() {
+            terms[index] = AddressTerm {
+                divisor: low.divisor,
+                modulus: low.modulus * high.modulus,
+                stride: low.stride,
+            };
+            terms.remove(index + 1);
+            index = index.saturating_sub(1);
+        } else {
+            index += 1;
+        }
+    }
 }
 
 /// Where one operand's elements come from: a bound buffer, or a constant the

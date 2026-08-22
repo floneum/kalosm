@@ -4,7 +4,6 @@
 
 use fusor_ir::ir::kernel::{Addr, Builtin, TileExpr, TileExprKind, TileLayout, TileLiteral};
 use fusor_ir::scalar::BinOp;
-use fusor_ir::shape::MultiFlattenMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// How one operand's lanes are gathered into a register.
@@ -50,6 +49,18 @@ pub(crate) static FORM_COUNTS: [AtomicU64; 4] = [
 
 pub(crate) fn note_form(form: AccessForm) {
     FORM_COUNTS[form.index()].fetch_add(1, Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(crate) fn reset_form_counts() {
+    for count in &FORM_COUNTS {
+        count.store(0, Ordering::Relaxed);
+    }
+}
+
+#[cfg(test)]
+pub(crate) fn form_counts() -> [u64; 4] {
+    std::array::from_fn(|index| FORM_COUNTS[index].load(Ordering::Relaxed))
 }
 
 /// The affine dependence of an index expression on the lane index:
@@ -189,45 +200,4 @@ pub(crate) fn form_of(layout: &TileLayout, addr: &Addr) -> AccessForm {
 
 fn is_bare_lane(e: &TileExpr) -> bool {
     matches!(e.kind(), TileExprKind::Builtin(Builtin::Lane))
-}
-
-/// Divmod one logical coordinate through an `AxisGroup`'s sub-axes,
-/// most-significant-first. Only the divmods the map actually declares are
-/// performed — `divmod_ops()` is the cost term the extractor prices, so
-/// emitting more than that would make the model wrong.
-#[inline(always)]
-pub(crate) fn apply_group(map: &MultiFlattenMap, axis: usize, coord: u32) -> u32 {
-    let group = &map.groups[axis];
-    if group.sub_axes.len() == 1 {
-        return coord.wrapping_mul(group.sub_axes[0].stride);
-    }
-    let mut rest = coord;
-    let mut acc = 0u32;
-    for (i, sub) in group.sub_axes.iter().enumerate() {
-        let below: u32 = group.sub_axes[i + 1..]
-            .iter()
-            .map(|s| s.extent)
-            .product::<u32>()
-            .max(1);
-        let q = rest / below;
-        rest %= below;
-        acc = acc.wrapping_add(q.wrapping_mul(sub.stride));
-    }
-    acc
-}
-
-/// Physical element offset of a rank-2 address.
-#[inline(always)]
-pub(crate) fn rc2_offset(map: &MultiFlattenMap, row: u32, col: u32) -> u32 {
-    let r = if map.groups.is_empty() {
-        row
-    } else {
-        apply_group(map, 0, row)
-    };
-    let c = if map.groups.len() > 1 {
-        apply_group(map, 1, col)
-    } else {
-        col
-    };
-    r.wrapping_add(c)
 }

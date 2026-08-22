@@ -838,6 +838,7 @@ impl GpuTarget {
                 launch,
                 graph,
                 symbols: &plan.symbols,
+                dim_bindings: &[],
             };
             let theta = plan
                 .extraction
@@ -935,6 +936,7 @@ impl GpuTarget {
             launch,
             graph,
             symbols: &plan.symbols,
+            dim_bindings: &[],
         };
         let theta = plan
             .extraction

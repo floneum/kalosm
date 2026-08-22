@@ -57,7 +57,11 @@ pub(crate) fn lower(
     };
     match op {
         Launch::Map { .. } => lower_map(caps, node, theta, cx),
-        Launch::Fold { .. } => lower_fold(caps, node, theta, cx),
+        // The carrier tree is the one native fold representation. It handles
+        // both scalar operators and multi-slot carriers, so lowering every
+        // fold through it prevents the planner from selecting a second shape
+        // that has no Cranelift implementation.
+        Launch::Fold { .. } => lower_fold_carrier(caps, node, theta, cx),
         _ => Err(Error::Legality("map_fold got a foreign node".into())),
     }
 }
@@ -82,7 +86,7 @@ fn lower_map(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> 
     };
     let binds = Binds::build(cx)?;
     let uniforms = binds.buffers.first().cloned();
-    let extents = const_extents(&space.dims)?;
+    let extents = const_extents(cx, &space.dims)?;
     let n = extents.iter().map(|e| *e as u64).product::<u64>().max(1);
 
     let tm = match theta {
@@ -142,6 +146,7 @@ fn lower_map(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> 
 /// One workgroup per output row; the reduced axis is walked with vector loads
 /// and finished by the strategy `theta` selected. The epilogue fuses straight
 /// onto the reduced value, so nothing is materialized in between.
+#[allow(dead_code)]
 fn lower_fold(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
     let Op::Launch(Launch::Fold {
         space,
@@ -162,7 +167,7 @@ fn lower_fold(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) ->
     let post = &post[0];
     let binds = Binds::build(cx)?;
     let uniforms = binds.buffers.first().cloned();
-    let extents = const_extents(&space.dims)?;
+    let extents = const_extents(cx, &space.dims)?;
     let axis = *axis as usize;
     if axis >= extents.len() {
         return Err(Error::Legality("fold axis is out of range".into()));
@@ -372,7 +377,7 @@ fn lower_fold_carrier(
 
     let binds = Binds::build(cx)?;
     let uniforms = binds.buffers.first().cloned();
-    let extents = const_extents(&space.dims)?;
+    let extents = const_extents(cx, &space.dims)?;
     let axis = *axis as usize;
     if axis >= extents.len() {
         return Err(Error::Legality("fold axis is out of range".into()));
@@ -598,7 +603,7 @@ fn lower_fold_carrier(
             rhs,
             body: merge_body,
         }),
-        fast: None,
+        fast: fusor_ir::ir::kernel::fast_reduce_op(carrier),
         outs: outs.clone(),
         scratch,
     });

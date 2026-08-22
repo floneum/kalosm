@@ -256,108 +256,6 @@ pub enum UniformSrc {
     SubgroupLane,
 }
 
-/// A `W`-lane register. Bits, so `Bitcast` is free and a mask is `0`/`!0`.
-///
-/// `W` is a const generic: `[Reg<W>; M]` is a register accumulator tile, and
-/// every operation below is a plain elementwise loop over a statically-sized
-/// array, which lowers to whole vector instructions under the target features
-/// `dispatch!` established.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
-#[repr(align(32))]
-pub(crate) struct Reg<const W: usize>(pub [u32; W]);
-
-impl<const W: usize> Default for Reg<W> {
-    fn default() -> Self {
-        Self([0; W])
-    }
-}
-
-impl<const W: usize> Reg<W> {
-    #[inline(always)]
-    pub(crate) fn splat_bits(bits: u32) -> Self {
-        Self([bits; W])
-    }
-    #[inline(always)]
-    pub(crate) fn splat_f32(v: f32) -> Self {
-        Self([v.to_bits(); W])
-    }
-    #[inline(always)]
-    pub(crate) fn splat_u32(v: u32) -> Self {
-        Self([v; W])
-    }
-    #[inline(always)]
-    pub(crate) fn f(self, i: usize) -> f32 {
-        f32::from_bits(self.0[i])
-    }
-    #[inline(always)]
-    pub(crate) fn u(self, i: usize) -> u32 {
-        self.0[i]
-    }
-    #[inline(always)]
-    pub(crate) fn i(self, i: usize) -> i32 {
-        self.0[i] as i32
-    }
-    #[inline(always)]
-    pub(crate) fn from_f(v: [f32; W]) -> Self {
-        let mut o = [0u32; W];
-        for k in 0..W {
-            o[k] = v[k].to_bits();
-        }
-        Self(o)
-    }
-    #[inline(always)]
-    pub(crate) fn to_f(self) -> [f32; W] {
-        let mut o = [0f32; W];
-        for k in 0..W {
-            o[k] = f32::from_bits(self.0[k]);
-        }
-        o
-    }
-    /// Elementwise f32 map.
-    #[inline(always)]
-    pub(crate) fn mapf(self, f: impl Fn(f32) -> f32) -> Self {
-        let mut o = [0u32; W];
-        for k in 0..W {
-            o[k] = f(f32::from_bits(self.0[k])).to_bits();
-        }
-        Self(o)
-    }
-    /// Elementwise f32 zip.
-    #[inline(always)]
-    pub(crate) fn zipf(self, b: Self, f: impl Fn(f32, f32) -> f32) -> Self {
-        let mut o = [0u32; W];
-        for k in 0..W {
-            o[k] = f(f32::from_bits(self.0[k]), f32::from_bits(b.0[k])).to_bits();
-        }
-        Self(o)
-    }
-    #[inline(always)]
-    pub(crate) fn zipu(self, b: Self, f: impl Fn(u32, u32) -> u32) -> Self {
-        let mut o = [0u32; W];
-        for k in 0..W {
-            o[k] = f(self.0[k], b.0[k]);
-        }
-        Self(o)
-    }
-    #[inline(always)]
-    pub(crate) fn zipi(self, b: Self, f: impl Fn(i32, i32) -> i32) -> Self {
-        let mut o = [0u32; W];
-        for k in 0..W {
-            o[k] = f(self.0[k] as i32, b.0[k] as i32) as u32;
-        }
-        Self(o)
-    }
-    /// Per-lane select on a `0`/`!0` mask.
-    #[inline(always)]
-    pub(crate) fn select(mask: Self, t: Self, f: Self) -> Self {
-        let mut o = [0u32; W];
-        for k in 0..W {
-            o[k] = (t.0[k] & mask.0[k]) | (f.0[k] & !mask.0[k]);
-        }
-        Self(o)
-    }
-}
-
 const LN2_HI: f32 = 0.693_145_75;
 const LN2_LO: f32 = 1.428_606_8e-6;
 const LOG2_E: f32 = std::f32::consts::LOG2_E;
@@ -828,186 +726,162 @@ pub(crate) fn atanhf(x: f32) -> f32 {
     if x < 0.0 { -r } else { r }
 }
 
-/// Apply a unary op elementwise across a register.
+/// Scalar helpers used only for operations Cranelift cannot lower directly.
 #[inline(always)]
-pub(crate) fn apply_un<const W: usize>(op: UnOp, ty: NumTy, x: Reg<W>) -> Reg<W> {
+pub(crate) fn apply_un(op: UnOp, ty: NumTy, bits: u32) -> u32 {
     match (op, ty) {
-        (UnOp::Neg, NumTy::F32) => Reg(core::array::from_fn(|k| x.0[k] ^ 0x8000_0000)),
-        (UnOp::Abs, NumTy::F32) => Reg(core::array::from_fn(|k| x.0[k] & 0x7FFF_FFFF)),
-        (UnOp::Neg, NumTy::I32) => Reg(core::array::from_fn(|k| x.i(k).wrapping_neg() as u32)),
-        (UnOp::Abs, NumTy::I32) => Reg(core::array::from_fn(|k| x.i(k).wrapping_abs() as u32)),
-        (UnOp::Neg, NumTy::U32) => Reg(core::array::from_fn(|k| x.0[k].wrapping_neg())),
-        (UnOp::Abs, NumTy::U32) => x,
-        // `Unpack2x16Float` has its own instruction: its result is a 2-lane
-        // vector, not a scalar register.
-        (UnOp::Unpack2x16Float, _) => x,
-        (op, _) => x.mapf(|v| match op {
-            // Both approximate exponentials lower to the exact `exp`; the
-            // relaxed contract permits the substitution.
-            UnOp::Exp | UnOp::ApproximateExp | UnOp::LessApproximateExp => expf(v),
-            UnOp::Exp2 => exp2f(v),
-            UnOp::Log => logf(v),
-            UnOp::Log2 => log2f(v),
-            UnOp::Sqrt => sqrtf(v),
-            UnOp::InverseSqrt => rsqrtf(v),
-            UnOp::Sin => sinf(v),
-            UnOp::Cos => cosf(v),
-            UnOp::Tan => tanf(v),
-            UnOp::Tanh => tanhf(v),
-            UnOp::Asin => asinf(v),
-            UnOp::Acos => acosf(v),
-            UnOp::Atan => atanf(v),
-            UnOp::Sinh => sinhf(v),
-            UnOp::Cosh => coshf(v),
-            UnOp::Asinh => asinhf(v),
-            UnOp::Acosh => acoshf(v),
-            UnOp::Atanh => atanhf(v),
-            UnOp::Abs => v.abs(),
-            UnOp::Neg => -v,
-            UnOp::Unpack2x16Float => v,
-        }),
+        (UnOp::Neg, NumTy::F32) => bits ^ 0x8000_0000,
+        (UnOp::Abs, NumTy::F32) => bits & 0x7fff_ffff,
+        (UnOp::Neg, NumTy::I32) => (bits as i32).wrapping_neg() as u32,
+        (UnOp::Abs, NumTy::I32) => (bits as i32).wrapping_abs() as u32,
+        (UnOp::Neg, NumTy::U32) => bits.wrapping_neg(),
+        (UnOp::Abs, NumTy::U32) | (UnOp::Unpack2x16Float, _) => bits,
+        (op, _) => {
+            let value = f32::from_bits(bits);
+            match op {
+                UnOp::Exp | UnOp::ApproximateExp | UnOp::LessApproximateExp => expf(value),
+                UnOp::Exp2 => exp2f(value),
+                UnOp::Log => logf(value),
+                UnOp::Log2 => log2f(value),
+                UnOp::Sqrt => sqrtf(value),
+                UnOp::InverseSqrt => rsqrtf(value),
+                UnOp::Sin => sinf(value),
+                UnOp::Cos => cosf(value),
+                UnOp::Tan => tanf(value),
+                UnOp::Tanh => tanhf(value),
+                UnOp::Asin => asinf(value),
+                UnOp::Acos => acosf(value),
+                UnOp::Atan => atanf(value),
+                UnOp::Sinh => sinhf(value),
+                UnOp::Cosh => coshf(value),
+                UnOp::Asinh => asinhf(value),
+                UnOp::Acosh => acoshf(value),
+                UnOp::Atanh => atanhf(value),
+                UnOp::Abs => value.abs(),
+                UnOp::Neg => -value,
+                UnOp::Unpack2x16Float => value,
+            }
+            .to_bits()
+        }
     }
 }
 
-/// Apply a binary op elementwise across two registers.
 #[inline(always)]
-pub(crate) fn apply_bin<const W: usize>(op: BinOp, ty: NumTy, a: Reg<W>, b: Reg<W>) -> Reg<W> {
+pub(crate) fn apply_bin(op: BinOp, ty: NumTy, a: u32, b: u32) -> u32 {
     match ty {
-        NumTy::F32 => match op {
-            BinOp::Add => a.zipf(b, |x, y| x + y),
-            BinOp::Sub => a.zipf(b, |x, y| x - y),
-            BinOp::Mul => a.zipf(b, |x, y| x * y),
-            BinOp::Div => a.zipf(b, |x, y| x / y),
-            BinOp::Rem => a.zipf(b, |x, y| x - trunc(x / y) * y),
-            BinOp::Pow => a.zipf(b, powf),
-            BinOp::Min => a.zipf(b, |x, y| if y < x { y } else { x }),
-            BinOp::Max => a.zipf(b, |x, y| if y > x { y } else { x }),
-            BinOp::BitAnd => a.zipu(b, |x, y| x & y),
-            BinOp::BitOr => a.zipu(b, |x, y| x | y),
-            BinOp::BitXor => a.zipu(b, |x, y| x ^ y),
-            BinOp::Shr | BinOp::Shl => a,
-            BinOp::LogicalAnd => a.zipf(b, |x, y| f32::from(x != 0.0 && y != 0.0)),
-            BinOp::LogicalOr => a.zipf(b, |x, y| f32::from(x != 0.0 || y != 0.0)),
-        },
+        NumTy::F32 => {
+            let (x, y) = (f32::from_bits(a), f32::from_bits(b));
+            match op {
+                BinOp::Add => (x + y).to_bits(),
+                BinOp::Sub => (x - y).to_bits(),
+                BinOp::Mul => (x * y).to_bits(),
+                BinOp::Div => (x / y).to_bits(),
+                BinOp::Rem => (x - trunc(x / y) * y).to_bits(),
+                BinOp::Pow => powf(x, y).to_bits(),
+                BinOp::Min => (if y < x { y } else { x }).to_bits(),
+                BinOp::Max => (if y > x { y } else { x }).to_bits(),
+                BinOp::BitAnd => a & b,
+                BinOp::BitOr => a | b,
+                BinOp::BitXor => a ^ b,
+                BinOp::Shr | BinOp::Shl => a,
+                BinOp::LogicalAnd => f32::from(x != 0.0 && y != 0.0).to_bits(),
+                BinOp::LogicalOr => f32::from(x != 0.0 || y != 0.0).to_bits(),
+            }
+        }
         NumTy::U32 => match op {
-            BinOp::Add => a.zipu(b, u32::wrapping_add),
-            BinOp::Sub => a.zipu(b, u32::wrapping_sub),
-            BinOp::Mul => a.zipu(b, u32::wrapping_mul),
-            BinOp::Div => a.zipu(b, |x, y| if y == 0 { u32::MAX } else { x / y }),
-            BinOp::Rem => a.zipu(b, |x, y| if y == 0 { 0 } else { x % y }),
-            BinOp::Pow => a.zipu(b, u32::wrapping_pow),
-            BinOp::Min => a.zipu(b, u32::min),
-            BinOp::Max => a.zipu(b, u32::max),
-            BinOp::BitAnd => a.zipu(b, |x, y| x & y),
-            BinOp::BitOr => a.zipu(b, |x, y| x | y),
-            BinOp::BitXor => a.zipu(b, |x, y| x ^ y),
-            BinOp::Shr => a.zipu(b, |x, y| x >> (y & 31)),
-            BinOp::Shl => a.zipu(b, |x, y| x << (y & 31)),
-            BinOp::LogicalAnd => a.zipu(b, |x, y| u32::from(x != 0 && y != 0)),
-            BinOp::LogicalOr => a.zipu(b, |x, y| u32::from(x != 0 || y != 0)),
-        },
-        NumTy::I32 => match op {
-            BinOp::Add => a.zipi(b, i32::wrapping_add),
-            BinOp::Sub => a.zipi(b, i32::wrapping_sub),
-            BinOp::Mul => a.zipi(b, i32::wrapping_mul),
-            BinOp::Div => a.zipi(b, |x, y| if y == 0 { -1 } else { x.wrapping_div(y) }),
-            BinOp::Rem => a.zipi(b, |x, y| if y == 0 { 0 } else { x.wrapping_rem(y) }),
-            BinOp::Pow => a.zipi(b, |x, y| x.wrapping_pow(y.max(0) as u32)),
-            BinOp::Min => a.zipi(b, i32::min),
-            BinOp::Max => a.zipi(b, i32::max),
-            BinOp::BitAnd => a.zipu(b, |x, y| x & y),
-            BinOp::BitOr => a.zipu(b, |x, y| x | y),
-            BinOp::BitXor => a.zipu(b, |x, y| x ^ y),
-            BinOp::Shr => a.zipi(b, |x, y| x >> (y & 31)),
-            BinOp::Shl => a.zipi(b, |x, y| x << (y & 31)),
-            BinOp::LogicalAnd => a.zipi(b, |x, y| i32::from(x != 0 && y != 0)),
-            BinOp::LogicalOr => a.zipi(b, |x, y| i32::from(x != 0 || y != 0)),
-        },
-    }
-}
-
-/// All six comparisons, producing a lane mask. Materialization to 1.0/0.0 is a
-/// separate instruction, minted only when the mask is consumed as a value.
-#[inline(always)]
-pub(crate) fn apply_cmp<const W: usize>(op: CmpOp, ty: NumTy, a: Reg<W>, b: Reg<W>) -> Reg<W> {
-    let mut o = [0u32; W];
-    for k in 0..W {
-        let t = match ty {
-            NumTy::F32 => {
-                let (x, y) = (a.f(k), b.f(k));
-                match op {
-                    CmpOp::Lt => x < y,
-                    CmpOp::Le => x <= y,
-                    CmpOp::Gt => x > y,
-                    CmpOp::Ge => x >= y,
-                    CmpOp::Eq => x == y,
-                    CmpOp::Ne => x != y,
-                }
-            }
-            NumTy::U32 => {
-                let (x, y) = (a.u(k), b.u(k));
-                match op {
-                    CmpOp::Lt => x < y,
-                    CmpOp::Le => x <= y,
-                    CmpOp::Gt => x > y,
-                    CmpOp::Ge => x >= y,
-                    CmpOp::Eq => x == y,
-                    CmpOp::Ne => x != y,
-                }
-            }
-            NumTy::I32 => {
-                let (x, y) = (a.i(k), b.i(k));
-                match op {
-                    CmpOp::Lt => x < y,
-                    CmpOp::Le => x <= y,
-                    CmpOp::Gt => x > y,
-                    CmpOp::Ge => x >= y,
-                    CmpOp::Eq => x == y,
-                    CmpOp::Ne => x != y,
-                }
-            }
-        };
-        o[k] = if t { u32::MAX } else { 0 };
-    }
-    Reg(o)
-}
-
-/// Numeric conversion between compute types.
-#[inline(always)]
-pub(crate) fn apply_cast<const W: usize>(from: NumTy, to: NumTy, x: Reg<W>) -> Reg<W> {
-    if from == to {
-        return x;
-    }
-    let mut o = [0u32; W];
-    for k in 0..W {
-        o[k] = match (from, to) {
-            (NumTy::F32, NumTy::U32) => {
-                let v = x.f(k);
-                if v <= 0.0 || v.is_nan() {
-                    0
-                } else if v >= 4_294_967_296.0 {
+            BinOp::Add => a.wrapping_add(b),
+            BinOp::Sub => a.wrapping_sub(b),
+            BinOp::Mul => a.wrapping_mul(b),
+            BinOp::Div => {
+                if b == 0 {
                     u32::MAX
                 } else {
-                    v as u32
+                    a / b
                 }
             }
-            (NumTy::F32, NumTy::I32) => (x.f(k) as i32) as u32,
-            (NumTy::U32, NumTy::F32) => (x.u(k) as f32).to_bits(),
-            (NumTy::I32, NumTy::F32) => (x.i(k) as f32).to_bits(),
-            _ => x.0[k],
-        };
+            BinOp::Rem => {
+                if b == 0 {
+                    0
+                } else {
+                    a % b
+                }
+            }
+            BinOp::Pow => a.wrapping_pow(b),
+            BinOp::Min => a.min(b),
+            BinOp::Max => a.max(b),
+            BinOp::BitAnd => a & b,
+            BinOp::BitOr => a | b,
+            BinOp::BitXor => a ^ b,
+            BinOp::Shr => a >> (b & 31),
+            BinOp::Shl => a << (b & 31),
+            BinOp::LogicalAnd => u32::from(a != 0 && b != 0),
+            BinOp::LogicalOr => u32::from(a != 0 || b != 0),
+        },
+        NumTy::I32 => {
+            let (x, y) = (a as i32, b as i32);
+            match op {
+                BinOp::Add => x.wrapping_add(y) as u32,
+                BinOp::Sub => x.wrapping_sub(y) as u32,
+                BinOp::Mul => x.wrapping_mul(y) as u32,
+                BinOp::Div => {
+                    if y == 0 {
+                        u32::MAX
+                    } else {
+                        x.wrapping_div(y) as u32
+                    }
+                }
+                BinOp::Rem => {
+                    if y == 0 {
+                        0
+                    } else {
+                        x.wrapping_rem(y) as u32
+                    }
+                }
+                BinOp::Pow => x.wrapping_pow(y.max(0) as u32) as u32,
+                BinOp::Min => x.min(y) as u32,
+                BinOp::Max => x.max(y) as u32,
+                BinOp::BitAnd => a & b,
+                BinOp::BitOr => a | b,
+                BinOp::BitXor => a ^ b,
+                BinOp::Shr => (x >> (y & 31)) as u32,
+                BinOp::Shl => (x << (y & 31)) as u32,
+                BinOp::LogicalAnd => i32::from(x != 0 && y != 0) as u32,
+                BinOp::LogicalOr => i32::from(x != 0 || y != 0) as u32,
+            }
+        }
     }
-    Reg(o)
 }
 
-/// Narrow to a storage element and widen back — a `Cast` to `F16`/`BF16` when
-/// the register file only holds f32.
 #[inline(always)]
-pub(crate) fn apply_narrow<const W: usize>(to: ScalarElement, x: Reg<W>) -> Reg<W> {
+pub(crate) fn apply_cast(from: NumTy, to: NumTy, bits: u32) -> u32 {
+    if from == to {
+        return bits;
+    }
+    match (from, to) {
+        (NumTy::F32, NumTy::U32) => {
+            let value = f32::from_bits(bits);
+            if value <= 0.0 || value.is_nan() {
+                0
+            } else if value >= 4_294_967_296.0 {
+                u32::MAX
+            } else {
+                value as u32
+            }
+        }
+        (NumTy::F32, NumTy::I32) => f32::from_bits(bits) as i32 as u32,
+        (NumTy::U32, NumTy::F32) => (bits as f32).to_bits(),
+        (NumTy::I32, NumTy::F32) => (bits as i32 as f32).to_bits(),
+        _ => bits,
+    }
+}
+
+#[inline(always)]
+pub(crate) fn apply_narrow(to: ScalarElement, bits: u32) -> u32 {
+    let value = f32::from_bits(bits);
     match to {
-        ScalarElement::F16 => x.mapf(|v| half::f16::from_f32(v).to_f32()),
-        ScalarElement::BF16 => x.mapf(|v| half::bf16::from_f32(v).to_f32()),
-        _ => x,
+        ScalarElement::F16 => half::f16::from_f32(value).to_f32().to_bits(),
+        ScalarElement::BF16 => half::bf16::from_f32(value).to_f32().to_bits(),
+        _ => bits,
     }
 }
 

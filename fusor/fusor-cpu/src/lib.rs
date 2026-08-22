@@ -1,7 +1,7 @@
 //! `fusor-cpu` — the same `KernelIr` through a different emitter.
 //!
-//! A runtime-parameterized SIMD loop nest over `fearless_simd`'s
-//! statically-known `f32x4`/`f32x8`/`f32x16`.
+//! Dense contractions use the platform GEMM implementation. All other CPU
+//! kernels compile to native code with Cranelift.
 //!
 //! `Barrier` splits the lane loop into two loops over the lane range; mapping
 //! `Barrier` to a no-op miscompiles every kernel that stages through workgroup
@@ -12,6 +12,8 @@
 mod alloc;
 mod caps;
 mod emit;
+mod gemm;
+mod jit;
 mod launch;
 mod lower;
 mod pool;
