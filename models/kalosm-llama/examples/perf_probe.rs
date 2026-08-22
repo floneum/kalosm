@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Tiny non-interactive perf measurement matching the chat steady-state
 //! tok/s metric. Used to bisect a 27 → 13 t/s regression.
 

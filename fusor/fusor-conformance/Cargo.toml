@@ -1,0 +1,24 @@
+[package]
+name = "fusor-conformance"
+description = "fusor conformance: op x backward matrix, launch-count asserts, ILP oracle, PlanHash goldens"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[dependencies]
+fusor.workspace = true
+fusor-ir.workspace = true
+fusor-tile.workspace = true
+fusor-cost.workspace = true
+fusor-gguf.workspace = true
+rustc-hash.workspace = true
+fixedbitset.workspace = true
+half.workspace = true
+
+[[bin]]
+name = "fusor-conformance"
+path = "src/main.rs"

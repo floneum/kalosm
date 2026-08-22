@@ -9,8 +9,8 @@ authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["llm", "llama", "mistral", "agents", "nlp"]
 
 [dependencies]
-fusor = { workspace = true, default-features = false }
-fusor-gguf = { workspace = true }
+fusor = { path = "../../fusor/fusor" }
+fusor-gguf = { path = "../../fusor/fusor-gguf" }
 kalosm-tokenizer.workspace = true
 
 half = { version = "2.3.1" }
@@ -48,7 +48,7 @@ pretty_assertions = "1.4.1"
 kalosm = { workspace = true, features = [
     "language",
     "structured",
-], default-features = true }
+], default-features = false }
 anyhow.workspace = true
 kalosm-streams.workspace = true
 reqwest = { version = "0.12" }
@@ -56,8 +56,10 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]
 default = ["gpu"]
-cpu = ["fusor/cpu"]
-gpu = ["fusor/gpu"]
+# fusor compiles both backends unconditionally; these are kept as no-ops so
+# downstream feature selections keep resolving.
+cpu = []
+gpu = []
 chat-template-json = ["minijinja/json"]
 hf-config-json = ["dep:serde_json"]
 vision = ["dep:image", "dep:pollster", "kalosm-language-model/media"]

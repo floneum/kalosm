@@ -1,4 +1,10 @@
-// Adapted from an upstream BERT implementation.
+// Adapted from an upstream BERT implementation, on fusor's const-rank tensor.
+//
+// Ranks, once, for the whole module: token ids and the validity mask are
+// `[batch, seq]` u32, a hidden state is `[batch, seq, hidden]` f32, and an
+// attention operand is `[batch, heads, seq, head_dim]` f32. Naming them in the
+// types is what lets every `forward` below be infallible — a shape that
+// disagrees is a compile error, not a `Result` the caller threads.
 
 mod embeddings;
 use embeddings::*;
@@ -20,6 +26,7 @@ pub mod qwen;
 
 pub use qwen::QwenEmbeddingModel;
 
+use fusor::layers::Linear;
 use fusor::{Device, Result, Tensor, VarBuilder};
 use serde::Deserialize;
 use std::fmt::Debug;
@@ -42,7 +49,7 @@ impl HiddenActLayer {
         Self { act, span }
     }
 
-    fn forward(&self, xs: &Tensor<3, f32>) -> Tensor<3, f32> {
+    fn forward<const R: usize>(&self, xs: &Tensor<R>) -> Tensor<R> {
         let _enter = self.span.enter();
         match self.act {
             // https://github.com/huggingface/transformers/blob/cd4584e3c809bb9e1392ccd3fe38b40daba5519a/src/transformers/activations.py#L213
@@ -50,6 +57,22 @@ impl HiddenActLayer {
             HiddenAct::Relu => xs.relu(),
         }
     }
+}
+
+/// Load a `Linear`, with the bias present iff the GGUF ships one.
+pub(crate) fn load_linear(vb: &VarBuilder, device: &Device) -> Result<Linear> {
+    let has_bias = vb.contains_key("bias");
+    Linear::load(vb, device.graph().handle(), has_bias)
+}
+
+/// `[batch, key]` u32 validity mask (1 = valid, 0 = pad) as the additive f32
+/// mask attention adds to the scores: 0 where valid, a large negative value
+/// where padded.
+pub(crate) fn additive_key_mask(mask: &Tensor<2, u32>) -> Tensor<2> {
+    const MASK_NEG_VALUE: f32 = -1e9;
+    mask.cast::<f32>()
+        .rsub_scalar(1.0f32)
+        .mul_scalar(MASK_NEG_VALUE)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
@@ -92,7 +115,7 @@ pub struct BertModel {
 
 impl BertModel {
     /// Load a new [`BertModel`] from [`VarBuilder`] with a [`Config`].
-    pub fn load(device: &Device, vb: &mut VarBuilder, config: &Config) -> Result<Self> {
+    pub fn load(device: &Device, vb: &VarBuilder, config: &Config) -> Result<Self> {
         let (embeddings, encoder) = match (
             BertEmbeddings::load(device, vb, config),
             BertEncoder::load(device, vb, config),
@@ -103,14 +126,10 @@ impl BertModel {
                     if let (Ok(embeddings), Ok(encoder)) = (
                         BertEmbeddings::load(
                             device,
-                            &mut vb.pp(format!("{model_type}.embeddings")),
+                            &vb.pp(format!("{model_type}.embeddings")),
                             config,
                         ),
-                        BertEncoder::load(
-                            device,
-                            &mut vb.pp(format!("{model_type}.encoder")),
-                            config,
-                        ),
+                        BertEncoder::load(device, &vb.pp(format!("{model_type}.encoder")), config),
                     ) {
                         (embeddings, encoder)
                     } else {
@@ -139,7 +158,7 @@ impl BertModel {
         input_ids: &Tensor<2, u32>,
         token_type_ids: &Tensor<2, u32>,
         attention_mask: Option<&Tensor<2, u32>>,
-    ) -> Tensor<3, f32> {
+    ) -> Tensor<3> {
         let _enter = self.span.enter();
         let embedding_output = self.embeddings.forward(input_ids, token_type_ids);
         self.encoder.forward(&embedding_output, attention_mask)

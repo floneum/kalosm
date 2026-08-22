@@ -14,10 +14,7 @@ on:
       - floneum/*/src/**
       - floneum/*/examples/**
       - floneum/*/Cargo.toml
-      - fusor-ml/*/src/**
-      - fusor-ml/*/tests/**
-      - fusor-ml/*/examples/**
-      - fusor-ml/*/Cargo.toml
+      - fusor/**
       - src/**
       - .github/**
       - Cargo.toml
@@ -37,10 +34,7 @@ on:
       - floneum/*/src/**
       - floneum/*/examples/**
       - floneum/*/Cargo.toml
-      - fusor-ml/*/src/**
-      - fusor-ml/*/tests/**
-      - fusor-ml/*/examples/**
-      - fusor-ml/*/Cargo.toml
+      - fusor/**
       - src/**
       - .github/**
       - Cargo.toml
@@ -95,6 +89,8 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: Check workspace
         run: cargo check --all --examples --tests --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape
+      - name: Check Fusor workspace
+        run: cargo check --manifest-path fusor/Cargo.toml --workspace --all-targets
 
   test:
     if: github.event.pull_request.draft == false
@@ -159,7 +155,10 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FUSOR_CONFORMANCE_REQUIRE_GPU: "1"
-        run: cargo test --lib --bins --tests --examples --workspace --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape --exclude fusor-core --exclude rbert --exclude rwhisper
+        run: |
+          cargo test --lib --bins --tests --examples --workspace --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape --exclude rbert --exclude rwhisper
+          cargo test --manifest-path fusor/Cargo.toml --workspace --lib --bins --tests --examples
+          cargo run --manifest-path fusor/Cargo.toml -p fusor-conformance
 
   doc:
     if: github.event.pull_request.draft == false
@@ -192,7 +191,9 @@ jobs:
           shared-key: "linux-build"
           cache-all-crates: "true"
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --doc --workspace --features kalosm/language,kalosm/llama,kalosm/bert,kalosm/structured,kalosm/fs-documents,kalosm/sound,kalosm/sound-denoise,kalosm/sound-source,kalosm/sound-voice-detection,kalosm/vision,kalosm/remote,kalosm/scrape,kalosm/surrealdb-local
+      - run: |
+          cargo test --doc --workspace --features kalosm/language,kalosm/llama,kalosm/bert,kalosm/structured,kalosm/fs-documents,kalosm/sound,kalosm/sound-denoise,kalosm/sound-source,kalosm/sound-voice-detection,kalosm/vision,kalosm/remote,kalosm/scrape,kalosm/surrealdb-local
+          cargo test --manifest-path fusor/Cargo.toml --doc --workspace
 
   fmt:
     if: github.event.pull_request.draft == false
@@ -203,7 +204,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt
-      - run: cargo fmt --all -- --check
+      - run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path fusor/Cargo.toml --all -- --check
 
   clippy:
     if: github.event.pull_request.draft == false
@@ -225,4 +228,6 @@ jobs:
           shared-key: "linux-check"
           cache-all-crates: "true"
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --workspace --examples --tests --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape -- -D warnings
+      - run: |
+          cargo clippy --workspace --examples --tests --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape -- -D warnings
+          cargo clippy --manifest-path fusor/Cargo.toml --workspace --all-targets -- -D warnings

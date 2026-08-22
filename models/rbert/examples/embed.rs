@@ -1,6 +1,5 @@
 use std::str::FromStr;
 
-use fusor::Device;
 use rbert::*;
 
 fn main() -> anyhow::Result<()> {
@@ -42,9 +41,9 @@ fn main() -> anyhow::Result<()> {
             .expect("Invalid embedding model. Supported models: qwen3, snowflake_extra_small, snowflake_small, snowflake_medium, snowflake_large");
         let bert = Bert::builder()
             .with_device(if std::env::var("FORCE_CPU").is_ok() {
-                Device::Cpu
+                Device::cpu()
             } else {
-                Device::auto().await
+                Device::gpu().await.unwrap_or_else(|_| Device::cpu())
             })
             .with_source(embedding_model.inner)
             .build()

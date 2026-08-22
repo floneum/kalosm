@@ -1,6 +1,7 @@
 //! Top-level Sam model: ties together image encoder, prompt encoder, and mask decoder.
 
-use fusor::{Concrete, Device, Fusion, Tensor, VarBuilder};
+use fusor::{Device, Tensor};
+use fusor_gguf::VarBuilder;
 
 use super::image_encoder::ImageEncoderViT;
 use super::mask_decoder::MaskDecoder;
@@ -27,7 +28,7 @@ enum ImageEncoder {
 }
 
 impl ImageEncoder {
-    fn forward(&self, xs: &Tensor<4, f32, impl Fusion<4, f32>>) -> Tensor<4, f32> {
+    fn forward(&self, xs: &Tensor<4>) -> Tensor<4> {
         match self {
             Self::Original(vit) => vit.forward(xs),
             Self::TinyViT(vit) => vit.forward(xs),
@@ -37,6 +38,7 @@ impl ImageEncoder {
 
 /// The Segment Anything Model.
 pub struct Sam {
+    device: Device,
     image_encoder: ImageEncoder,
     prompt_encoder: PromptEncoder,
     mask_decoder: MaskDecoder,
@@ -44,7 +46,7 @@ pub struct Sam {
 
 impl Sam {
     /// Load a ViT-B based SAM model.
-    pub fn load_vit_b(device: &Device, vb: &mut VarBuilder) -> Result<Self> {
+    pub fn load_vit_b(device: &Device, vb: &VarBuilder) -> Result<Self> {
         Self::load_vit(
             device,
             vb,
@@ -58,7 +60,7 @@ impl Sam {
     /// Load a ViT-based SAM model with custom architecture parameters.
     pub fn load_vit(
         device: &Device,
-        vb: &mut VarBuilder,
+        vb: &VarBuilder,
         encoder_embed_dim: usize,
         encoder_depth: usize,
         encoder_num_heads: usize,
@@ -68,7 +70,7 @@ impl Sam {
 
         let image_encoder = ImageEncoderViT::load(
             device,
-            &mut vb.pp("image_encoder"),
+            &vb.pp("image_encoder"),
             IMAGE_SIZE,
             VIT_PATCH_SIZE,
             encoder_embed_dim,
@@ -83,7 +85,7 @@ impl Sam {
 
         let prompt_encoder = PromptEncoder::load(
             device,
-            &mut vb.pp("prompt_encoder"),
+            &vb.pp("prompt_encoder"),
             PROMPT_EMBED_DIM,
             (image_embedding_size, image_embedding_size),
             (IMAGE_SIZE, IMAGE_SIZE),
@@ -91,13 +93,14 @@ impl Sam {
 
         let mask_decoder = MaskDecoder::load(
             device,
-            &mut vb.pp("mask_decoder"),
+            &vb.pp("mask_decoder"),
             PROMPT_EMBED_DIM,
             3, // num_multimask_outputs
             3, // iou_head_depth
         )?;
 
         Ok(Self {
+            device: device.clone(),
             image_encoder: ImageEncoder::Original(Box::new(image_encoder)),
             prompt_encoder,
             mask_decoder,
@@ -105,14 +108,14 @@ impl Sam {
     }
 
     /// Load a TinyViT-based (MobileSAM) model.
-    pub fn load_tiny(device: &Device, vb: &mut VarBuilder) -> Result<Self> {
+    pub fn load_tiny(device: &Device, vb: &VarBuilder) -> Result<Self> {
         let image_embedding_size = IMAGE_SIZE / VIT_PATCH_SIZE;
 
-        let image_encoder = tiny_vit_5m(device, &mut vb.pp("image_encoder"))?;
+        let image_encoder = tiny_vit_5m(device, &vb.pp("image_encoder"))?;
 
         let prompt_encoder = PromptEncoder::load(
             device,
-            &mut vb.pp("prompt_encoder"),
+            &vb.pp("prompt_encoder"),
             PROMPT_EMBED_DIM,
             (image_embedding_size, image_embedding_size),
             (IMAGE_SIZE, IMAGE_SIZE),
@@ -120,26 +123,30 @@ impl Sam {
 
         let mask_decoder = MaskDecoder::load(
             device,
-            &mut vb.pp("mask_decoder"),
+            &vb.pp("mask_decoder"),
             PROMPT_EMBED_DIM,
             3, // num_multimask_outputs
             3, // iou_head_depth
         )?;
 
         Ok(Self {
+            device: device.clone(),
             image_encoder: ImageEncoder::TinyViT(Box::new(image_encoder)),
             prompt_encoder,
             mask_decoder,
         })
     }
 
-    /// Compute image embeddings.
-    pub fn embeddings(&self, img: &Tensor<3, f32, Concrete<f32, 3>>) -> Tensor<4, f32> {
+    /// The device this model's weights live on. Inputs must be built on it.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
+    /// Compute image embeddings from a `(C, H, W)` image tensor.
+    pub fn embeddings(&self, img: &Tensor<3>) -> Tensor<4> {
         let img = self.preprocess(img);
         // Add batch dim: (C, H, W) -> (1, C, H, W)
-        let shape = img.shape();
-        let img = img.reshape([1, shape[0], shape[1], shape[2]]);
-        self.image_encoder.forward(&img)
+        self.image_encoder.forward(&img.unsqueeze(0))
     }
 
     /// Forward pass: image -> masks + IoU predictions.
@@ -147,19 +154,13 @@ impl Sam {
     /// Points format: `(x, y, is_foreground)` where x,y are in [0,1] normalized coords.
     pub fn forward(
         &self,
-        img: &Tensor<3, f32, Concrete<f32, 3>>,
+        img: &Tensor<3>,
         points: &[(f64, f64, bool)],
         multimask_output: bool,
-    ) -> (Tensor<4, f32>, Tensor<2, f32>) {
-        let shape = img.shape();
-        let original_h = shape[1];
-        let original_w = shape[2];
+    ) -> (Tensor<4>, Tensor<2>) {
+        let [_, original_h, original_w] = img.shape();
 
-        let img = self.preprocess(img);
-        // (C, H, W) -> (1, C, H, W)
-        let img_shape = img.shape();
-        let img = img.reshape([1, img_shape[0], img_shape[1], img_shape[2]]);
-        let img_embeddings = self.image_encoder.forward(&img);
+        let img_embeddings = self.embeddings(img);
 
         let (low_res_mask, iou) = self.forward_for_embeddings(
             &img_embeddings,
@@ -173,28 +174,25 @@ impl Sam {
         // Low-res masks come back at exactly IMAGE_SIZE/4 (256). If a
         // future model changes the upsampling ratio this assert will catch it
         // before `upsample_nearest2d` silently truncates.
-        let lr_shape = low_res_mask.shape();
-        let scale_h = IMAGE_SIZE / lr_shape[2];
-        let scale_w = IMAGE_SIZE / lr_shape[3];
+        let [_, _, lr_h, lr_w] = low_res_mask.shape();
+        let scale_h = IMAGE_SIZE / lr_h;
+        let scale_w = IMAGE_SIZE / lr_w;
         assert_eq!(
-            scale_h * lr_shape[2],
+            scale_h * lr_h,
             IMAGE_SIZE,
-            "low-res mask H ({}) must divide IMAGE_SIZE ({IMAGE_SIZE})",
-            lr_shape[2]
+            "low-res mask H ({lr_h}) must divide IMAGE_SIZE ({IMAGE_SIZE})",
         );
         assert_eq!(
-            scale_w * lr_shape[3],
+            scale_w * lr_w,
             IMAGE_SIZE,
-            "low-res mask W ({}) must divide IMAGE_SIZE ({IMAGE_SIZE})",
-            lr_shape[3]
+            "low-res mask W ({lr_w}) must divide IMAGE_SIZE ({IMAGE_SIZE})",
         );
-        let upscaled: Tensor<4, f32> = low_res_mask.upsample_nearest2d(scale_h, scale_w);
+        let upscaled = low_res_mask.upsample_nearest2d(scale_h, scale_w);
 
         // Crop to original size: narrow on H and W dims
-        let cropped_h = upscaled.narrow(2, 0, original_h);
-        let cropped = cropped_h.narrow(3, 0, original_w);
+        let cropped = upscaled.narrow(2, 0, original_h).narrow(3, 0, original_w);
 
-        (cropped.to_concrete(), iou)
+        (cropped, iou)
     }
 
     /// Generate mask and IoU predictions from pre-computed image embeddings.
@@ -202,23 +200,20 @@ impl Sam {
     /// Points format: `(x, y, is_foreground)` where x,y are normalized to [0,1].
     pub fn forward_for_embeddings(
         &self,
-        img_embeddings: &Tensor<4, f32>,
+        img_embeddings: &Tensor<4>,
         original_h: usize,
         original_w: usize,
         points: &[(f64, f64, bool)],
         multimask_output: bool,
-    ) -> (Tensor<4, f32>, Tensor<2, f32>) {
+    ) -> (Tensor<4>, Tensor<2>) {
         // Single-batch path; equivalent to calling the batched variant with
         // batch_size = 1 but producing a `(1, 1, 2)` point tensor.
-        let device = img_embeddings.device();
         let image_pe = self.prompt_encoder.get_dense_pe();
 
         let points_data = (!points.is_empty())
-            .then(|| build_point_tensors(&device, points, original_h, original_w, 1));
+            .then(|| build_point_tensors(&self.device, points, original_h, original_w, 1));
 
-        let points_ref = points_data
-            .as_ref()
-            .map(|(pts, lbls)| (pts as &Tensor<3, f32>, lbls as &Tensor<2, f32>));
+        let points_ref = points_data.as_ref().map(|(pts, lbls)| (pts, lbls));
 
         let (sparse_prompt_embeddings, dense_prompt_embeddings) =
             self.prompt_encoder.forward(points_ref, None, None);
@@ -243,17 +238,17 @@ impl Sam {
     /// - iou_predictions: `(batch, n_masks)`
     pub fn forward_for_embeddings_batched(
         &self,
-        img_embeddings: &Tensor<4, f32>,
+        img_embeddings: &Tensor<4>,
         original_h: usize,
         original_w: usize,
         points: &[(f64, f64, bool)],
         multimask_output: bool,
-    ) -> (Tensor<4, f32>, Tensor<2, f32>) {
-        let device = img_embeddings.device();
+    ) -> (Tensor<4>, Tensor<2>) {
         let image_pe = self.prompt_encoder.get_dense_pe();
         let batch_size = points.len();
 
-        let (pts, lbls) = build_point_tensors(&device, points, original_h, original_w, batch_size);
+        let (pts, lbls) =
+            build_point_tensors(&self.device, points, original_h, original_w, batch_size);
 
         let (sparse_prompt_embeddings, dense_prompt_embeddings) =
             self.prompt_encoder.forward(Some((&pts, &lbls)), None, None);
@@ -268,41 +263,34 @@ impl Sam {
     }
 
     /// Preprocess an image tensor: normalize by pixel mean/std and pad to IMAGE_SIZE.
-    pub(crate) fn preprocess(&self, img: &Tensor<3, f32>) -> Tensor<3, f32> {
-        let shape = img.shape();
-        let c = shape[0];
-        let h = shape[1];
-        let w = shape[2];
+    pub(crate) fn preprocess(&self, img: &Tensor<3>) -> Tensor<3> {
+        let [c, h, w] = img.shape();
         // Callers (`image_to_tensor`) resize so the longer side is exactly
         // IMAGE_SIZE; assert here so a mistake elsewhere fails loudly instead
-        // of producing a `pad_with_zeros(.., IMAGE_SIZE.wrapping_sub(h))` panic
-        // deep in the tensor stack.
+        // of producing a `pad_with_zeros(.., IMAGE_SIZE - h)` underflow deep
+        // in the tensor stack.
         assert!(
             h <= IMAGE_SIZE && w <= IMAGE_SIZE,
             "preprocess input ({h}x{w}) exceeds IMAGE_SIZE ({IMAGE_SIZE}); resize before calling",
         );
-        let device = img.device();
 
         // Create mean and std tensors: (3, 1, 1) broadcast to (3, H, W)
-        let mean_base = Tensor::from_slice(&device, [3, 1, 1], &PIXEL_MEAN);
-        let mean = mean_base.broadcast_as([c, h, w]);
-        let std_base = Tensor::from_slice(&device, [3, 1, 1], &PIXEL_STD);
-        let std = std_base.broadcast_as([c, h, w]);
+        let mean = Tensor::from_slice(&self.device, [3, 1, 1], &PIXEL_MEAN).broadcast_as([c, h, w]);
+        let std = Tensor::from_slice(&self.device, [3, 1, 1], &PIXEL_STD).broadcast_as([c, h, w]);
 
-        let img: Tensor<3, f32> = ((img - mean) / std).to_concrete();
+        let img = img.sub(&mean).div(&std);
 
         // Pad to IMAGE_SIZE
         let img = if h < IMAGE_SIZE {
-            img.pad_with_zeros(1, 0, IMAGE_SIZE - h).to_concrete()
+            img.pad_with_zeros(1, 0, IMAGE_SIZE - h)
         } else {
             img
         };
-        let img = if w < IMAGE_SIZE {
-            img.pad_with_zeros(2, 0, IMAGE_SIZE - w).to_concrete()
+        if w < IMAGE_SIZE {
+            img.pad_with_zeros(2, 0, IMAGE_SIZE - w)
         } else {
             img
-        };
-        img.to_concrete()
+        }
     }
 }
 
@@ -323,7 +311,7 @@ fn build_point_tensors(
     original_h: usize,
     original_w: usize,
     batch_size: usize,
-) -> (Tensor<3, f32>, Tensor<2, f32>) {
+) -> (Tensor<3>, Tensor<2>) {
     assert!(
         batch_size > 0 && points.len().is_multiple_of(batch_size),
         "build_point_tensors: points.len() ({}) must be a multiple of batch_size ({batch_size})",
@@ -342,8 +330,8 @@ fn build_point_tensors(
         .iter()
         .map(|(_x, _y, b)| if *b { 1f32 } else { 0f32 })
         .collect();
-    let pts: Tensor<3, f32> = Tensor::from_slice(device, [batch_size, n_per_batch, 2], &xys);
-    let lbls: Tensor<2, f32> = Tensor::from_slice(device, [batch_size, n_per_batch], &labels);
+    let pts = Tensor::from_slice(device, [batch_size, n_per_batch, 2], &xys);
+    let lbls = Tensor::from_slice(device, [batch_size, n_per_batch], &labels);
     (pts, lbls)
 }
 

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 //! Temporary perf probe for the Qwen2.5-VL mrope split+op+cat path.
 
 use kalosm_llama::*;

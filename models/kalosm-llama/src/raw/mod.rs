@@ -1,70 +1,4 @@
-use std::future::Future;
-use std::pin::Pin;
-use std::sync::Arc;
-#[cfg(not(target_arch = "wasm32"))]
-use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
-use web_time::{Duration, Instant};
-
-#[cfg(feature = "vision")]
-pub(crate) fn debug_check_nan_f32<const R: usize>(
-    t: &fusor::Tensor<R, f32>,
-    layer: usize,
-    label: &str,
-    index_pos: usize,
-) {
-    #[cfg(target_arch = "wasm32")]
-    {
-        let _ = (t, layer, label, index_pos);
-        return;
-    }
-    #[cfg(not(target_arch = "wasm32"))]
-    {
-        if layer != 0 && layer != usize::MAX {
-            return;
-        }
-        let Ok(slice) = pollster::block_on(t.as_slice()) else {
-            return;
-        };
-        let mut nan = 0usize;
-        let mut pos_inf = 0usize;
-        let mut neg_inf = 0usize;
-        let mut max_abs = 0f32;
-        let mut sample_idx = 0usize;
-        let mut sample_vals = [0usize; 4];
-        for (i, v) in slice.as_slice().iter().enumerate() {
-            let v = *v;
-            if v.is_nan() {
-                nan += 1;
-                if sample_idx < sample_vals.len() {
-                    sample_vals[sample_idx] = i;
-                    sample_idx += 1;
-                }
-            } else if v == f32::INFINITY {
-                pos_inf += 1;
-            } else if v == f32::NEG_INFINITY {
-                neg_inf += 1;
-            } else if v.abs() > max_abs {
-                max_abs = v.abs();
-            }
-        }
-        if nan > 0 || pos_inf > 0 || neg_inf > 0 {
-            tracing::warn!(
-                "trace_nan layer={layer} label={label} index_pos={index_pos} shape={:?} nan={nan} (first_nan_indices={:?}) +inf={pos_inf} -inf={neg_inf} max_abs={max_abs}",
-                t.shape(),
-                &sample_vals[..sample_idx]
-            );
-        }
-    }
-}
-
-#[cfg(not(feature = "vision"))]
-pub(crate) fn debug_check_nan_f32<const R: usize>(
-    _: &fusor::Tensor<R, f32>,
-    _: usize,
-    _: &str,
-    _: usize,
-) {
-}
+use std::sync::{Arc, Mutex};
 
 use crate::chat_template::HuggingFaceChatTemplate;
 use crate::raw::attention_layer::LlamaAttention;
@@ -77,28 +11,15 @@ use attention_layer::GroupedAttention;
 use attention_layer::LlamaFeedForward;
 use attention_layer::PhiFeedForward;
 use attention_layer::SeparateAttention;
-use fusor::cache::MaskCache;
-use fusor::layers::Embedding;
-use fusor::layers::Linear;
+use fusor::cache::{MaskCache, MaskKind};
 use fusor::layers::RmsNorm;
-use fusor::QMatrix;
-use fusor::ShardedVarBuilder;
-use fusor::{
-    AddOp, CastTensor, CastTo, FloatDataType, FloatOps, MatmulImpl, MulOp, SimdBinaryOp,
-    SimdElement, SimdReduceOp, SumOp,
-};
-use fusor::{AsyncReadRange, AsyncShardedVarBuilder};
-use fusor::{Device, Result, Tensor};
-use fusor_gguf::GgufMetadata;
-use fusor_gguf::GgufValue;
+use fusor::{Device, Dim, Dtype, Graph, QMatrix, Result, Tensor};
+use fusor_gguf::{GgufValue, RawTensorBytes, ShardedVarBuilder};
 
 mod attention_layer;
 pub mod cache;
 mod rope;
-#[cfg(feature = "vision")]
-mod vision;
 
-use crate::LlamaImage;
 use cache::LlamaCache;
 
 pub const DEFAULT_ROPE_FREQUENCY: f32 = 1_000_000.;
@@ -106,8 +27,8 @@ pub const GEMMA_DEFAULT_SLIDING_WINDOW_TYPE: usize = 6;
 pub const GEMMA_DEFAULT_ROPE_FREQUENCY_SLIDING: f32 = 10_000.;
 
 /// The configuration of a Llama model.
-pub struct LlamaConfig<F: FloatDataType + SimdElement = f32> {
-    pub(crate) rope_freq_weight: Option<Tensor<1, F>>,
+pub struct LlamaConfig {
+    pub(crate) rope_freq_weight: Option<Vec<f32>>,
     pub(crate) rope_theta: f32,
     pub(crate) context_length: usize,
     pub(crate) head_dimension: usize,
@@ -118,45 +39,15 @@ pub struct LlamaConfig<F: FloatDataType + SimdElement = f32> {
     pub(crate) stop_token_string: String,
     pub(crate) chat_template: Option<HuggingFaceChatTemplate>,
     pub(crate) rope_scaling: Option<RopeScalingConfig>,
+    #[allow(dead_code)]
     pub(crate) sliding_window_type: Option<usize>,
+    #[allow(dead_code)]
     pub(crate) sliding_window_size: Option<usize>,
-    #[cfg_attr(not(feature = "vision"), allow(dead_code))]
-    pub(crate) vision_start_token: Option<u32>,
-    pub(crate) _vision_end_token: Option<u32>,
-    #[cfg_attr(not(feature = "vision"), allow(dead_code))]
-    pub(crate) image_pad_token: Option<u32>,
-    #[cfg_attr(not(feature = "vision"), allow(dead_code))]
-    pub(crate) video_pad_token: Option<u32>,
-    pub(crate) mrope_sections: Option<Vec<usize>>,
 }
 
-impl<F: FloatDataType + SimdElement> LlamaConfig<F> {
+impl LlamaConfig {
     fn hidden_size(&self) -> usize {
         self.head_dimension * self.n_head
-    }
-
-    #[cfg(test)]
-    pub(crate) fn mock_test() -> Self {
-        Self {
-            rope_freq_weight: None,
-            rope_theta: 5000.,
-            context_length: 6,
-            head_dimension: 2,
-            n_head: 0,
-            n_layer: 0,
-            start_token_string: "<|startoftext|>".to_string(),
-            stop_token: 0,
-            stop_token_string: "<|endoftext|>".to_string(),
-            sliding_window_type: None,
-            sliding_window_size: None,
-            chat_template: None,
-            rope_scaling: None,
-            vision_start_token: None,
-            _vision_end_token: None,
-            image_pad_token: None,
-            video_pad_token: None,
-            mrope_sections: None,
-        }
     }
 }
 
@@ -168,190 +59,127 @@ pub struct RopeScalingConfig {
     pub(crate) original_max_position_embeddings: usize,
 }
 
-pub struct Model<F: FloatDataType + SimdElement = f32> {
-    pub(crate) config: Arc<LlamaConfig<F>>,
-    #[cfg(feature = "vision")]
-    vision_encoder: Option<vision::QwenVisionTransformer<F>>,
-    tok_embeddings: Embedding<f32>,
+pub struct Model {
+    pub(crate) config: Arc<LlamaConfig>,
+    tok_embeddings: QMatrix,
     tok_embedding_scale: Option<f32>,
-    layers: Vec<LlamaAttention<F>>,
-    norm: RmsNorm<1, F>,
+    layers: Vec<LlamaAttention>,
+    norm: RmsNorm,
     output: QMatrix,
-    /// Mask cache always uses f32 for SIMD compatibility
-    masks: MaskCache<f32>,
+    /// Memoizes the materialized (rectangular / windowed) masks.
+    masks: Mutex<MaskCache>,
+    /// The decode loop's persistent input leaves: the token id and its
+    /// absolute position, both `[1]` `u32`. Only their *bytes* change per
+    /// step, so every step reuses one graph and replays one plan.
+    step_inputs: std::sync::OnceLock<(Tensor<1, u32>, Tensor<1, u32>)>,
 }
 
 /// The embedded token inputs produced by [`Model::encode_tokens`], ready to be
 /// run through the transformer layers.
-pub(crate) struct EncodedTokens<F: FloatDataType + SimdElement> {
-    embeddings: Tensor<3, F>,
+pub(crate) struct EncodedTokens {
+    embeddings: Tensor<3>,
     seq_len: usize,
     index_pos: usize,
-    pos_ids: Option<Tensor<2, F>>,
 }
 
 pub(crate) trait LlamaVarSource {
     fn get(&self, name: &str) -> Result<&GgufValue>;
-
-    fn tensor<'a>(
-        &'a mut self,
-        name: &'a str,
-        device: &'a Device,
-    ) -> Pin<Box<dyn Future<Output = Result<QMatrix>> + 'a>>;
+    fn tensor(&self, name: &str) -> Result<RawTensorBytes>;
 }
 
-impl<R: std::io::Read + std::io::Seek> LlamaVarSource for ShardedVarBuilder<R> {
+impl LlamaVarSource for ShardedVarBuilder {
     fn get(&self, name: &str) -> Result<&GgufValue> {
         ShardedVarBuilder::get(self, name)
     }
 
-    fn tensor<'a>(
-        &'a mut self,
-        name: &'a str,
-        device: &'a Device,
-    ) -> Pin<Box<dyn Future<Output = Result<QMatrix>> + 'a>> {
-        Box::pin(std::future::ready(ShardedVarBuilder::tensor(
-            self, name, device,
-        )))
+    fn tensor(&self, name: &str) -> Result<RawTensorBytes> {
+        ShardedVarBuilder::tensor(self, name)
     }
 }
 
-impl<R: AsyncReadRange> LlamaVarSource for AsyncShardedVarBuilder<R> {
-    fn get(&self, name: &str) -> Result<&GgufValue> {
-        AsyncShardedVarBuilder::get(self, name)
-    }
-
-    fn tensor<'a>(
-        &'a mut self,
-        name: &'a str,
-        device: &'a Device,
-    ) -> Pin<Box<dyn Future<Output = Result<QMatrix>> + 'a>> {
-        Box::pin(AsyncShardedVarBuilder::tensor(self, name, device))
-    }
+/// The `[rows, cols]` quantized matrix a GGUF tensor denotes.
+/// `fusor_gguf` already reverses GGUF's fastest-varying-first dims at read,
+/// so `raw.shape` is row-major `[rows, cols]` as-is.
+fn qmatrix_from_raw(graph: &Graph, raw: &RawTensorBytes) -> Result<QMatrix> {
+    let Dtype::Q(fmt) = raw.fmt else {
+        return Err(fusor::Error::Dtype(format!(
+            "{} has dtype {:?}; only block-quantized matmul weights are supported by this port",
+            raw.name, raw.fmt
+        )));
+    };
+    let (rows, cols) = match raw.shape.as_slice() {
+        [cols] => (1, *cols),
+        [rows, cols] => (*rows, *cols),
+        other => {
+            return Err(fusor::Error::Shape(format!(
+                "{} has GGUF shape {other:?}; a QMatrix is rank 1 or 2",
+                raw.name
+            )));
+        }
+    };
+    QMatrix::from_raw_bytes(
+        graph,
+        fmt,
+        raw.layout,
+        [Dim::Const(rows), Dim::Const(cols)],
+        &raw.bytes,
+    )
 }
 
-#[cfg(not(target_arch = "wasm32"))]
-fn block_on_ready<F: Future>(future: F) -> F::Output {
-    fn clone(_: *const ()) -> RawWaker {
-        noop_raw_waker()
-    }
-
-    fn wake(_: *const ()) {}
-
-    fn noop_raw_waker() -> RawWaker {
-        RawWaker::new(
-            std::ptr::null(),
-            &RawWakerVTable::new(clone, wake, wake, wake),
-        )
-    }
-
-    let waker = unsafe { Waker::from_raw(noop_raw_waker()) };
-    let mut cx = Context::from_waker(&waker);
-    let mut future = Box::pin(future);
-    match future.as_mut().poll(&mut cx) {
-        Poll::Ready(output) => output,
-        Poll::Pending => panic!("synchronous GGUF model loading unexpectedly yielded"),
-    }
-}
-
-impl<F: FloatDataType + SimdElement + FloatOps + MatmulImpl> Model<F>
-where
-    MulOp: SimdBinaryOp<F>,
-    AddOp: SimdBinaryOp<F>,
-    SumOp: SimdReduceOp<F>,
-{
-    #[cfg(not(target_arch = "wasm32"))]
-    pub fn from_gguf<R: std::io::Seek + std::io::Read>(
-        source: &mut ShardedVarBuilder<R>,
-        vision_ct: Option<GgufMetadata>,
-        vision_bytes: Option<Vec<u8>>,
-        device: &Device,
-        override_stop_token_string: Option<String>,
-        override_chat_template: Option<String>,
-        rope_scaling: Option<RopeScalingConfig>,
-    ) -> std::result::Result<Self, LlamaSourceError>
-    where
-        f32: CastTensor<F> + CastTo<F>,
-        F: CastTensor<f32> + CastTo<f32>,
-    {
-        block_on_ready(Self::from_var_source(
-            source,
-            vision_ct,
-            vision_bytes,
+/// A GGUF tensor as a dense rank-1 `f32` value (norm weights, biases,
+/// `rope_freqs.weight`).
+fn dense_1d(device: &Device, raw: &RawTensorBytes) -> Result<Tensor<1>> {
+    let n: u64 = raw.shape.iter().product();
+    match raw.fmt {
+        // The dtype is data read out of the file; the rank is not.
+        Dtype::F32 | Dtype::F16 => Ok(Tensor::from_raw_bytes(
             device,
-            override_stop_token_string,
-            override_chat_template,
-            rope_scaling,
-        ))
+            raw.fmt,
+            [Dim::Const(n)],
+            &raw.bytes,
+        )),
+        Dtype::Q(_) => Ok(qmatrix_from_raw(device.graph(), raw)?
+            .to_tensor()
+            .reshape_dims([Dim::Const(n)])),
+        other => Err(fusor::Error::Dtype(format!(
+            "{} has dtype {other:?}, which has no dense 1d path",
+            raw.name
+        ))),
     }
+}
 
-    pub(crate) async fn from_var_source<S: LlamaVarSource>(
+impl Model {
+    pub fn from_gguf<S: LlamaVarSource>(
         source: &mut S,
-        vision_ct: Option<GgufMetadata>,
-        vision_bytes: Option<Vec<u8>>,
         device: &Device,
         override_stop_token_string: Option<String>,
         override_chat_template: Option<String>,
         rope_scaling: Option<RopeScalingConfig>,
-    ) -> std::result::Result<Self, LlamaSourceError>
-    where
-        f32: CastTensor<F> + CastTo<F>,
-        F: CastTensor<f32> + CastTo<f32>,
-    {
-        #[cfg(not(feature = "vision"))]
-        let _ = (vision_ct, vision_bytes);
+    ) -> std::result::Result<Self, LlamaSourceError> {
+        let graph = device.graph().clone();
 
-        // Helper to dequantize a QMatrix to 1D tensor
-        // VarBuilder preserves original shapes, so 1D tensors stay 1D
-        let dequantize_1d = |qmatrix: QMatrix| -> Tensor<1, F> {
-            let shape = qmatrix.shape();
-            if shape.len() == 1 {
-                // Already 1D, dequantize directly
-                let w1d: Tensor<1, f32> = qmatrix.dequantize();
-                w1d.cast()
-            } else if shape.len() == 2 {
-                // 2D tensor, reshape to 1D (for backwards compatibility)
-                let w2d: Tensor<2, f32> = qmatrix.dequantize();
-                w2d.reshape([w2d.shape()[0] * w2d.shape()[1]])
-                    .to_concrete()
-                    .cast()
-            } else {
-                panic!(
-                    "Expected 1D or 2D tensor for dequantize_1d, got {}D",
-                    shape.len()
-                )
-            }
-        };
-
-        let decode_norm = |qmatrix: QMatrix, eps: f64| -> Result<RmsNorm<1, F>> {
-            let weight = dequantize_1d(qmatrix);
-            Ok(RmsNorm::new(weight, None, eps as f32))
+        let decode_norm = |raw: RawTensorBytes, eps: f64| -> Result<RmsNorm> {
+            Ok(RmsNorm::new(Some(dense_1d(device, &raw)?), eps as f32))
         };
 
         // Get the eos and bos tokens from the metadata
-        let tokens: Box<[GgufValue]> = source.get("tokenizer.ggml.tokens")?.clone().try_into()?;
-        let tokens: Result<Vec<Box<str>>, LlamaSourceError> = tokens
+        let tokens: Vec<String> = source
+            .get("tokenizer.ggml.tokens")?
+            .to_array()?
             .iter()
-            .map(|v| {
-                let v: Box<str> = v.try_into()?;
-                Ok(v)
-            })
-            .collect();
-        let tokens = tokens?;
+            .map(|v| Ok(v.to_string_value()?.to_string()))
+            .collect::<Result<_>>()?;
         let start_token: Option<u32> = source
             .get("tokenizer.ggml.bos_token_id")
             .ok()
-            .and_then(|v| v.try_into().ok());
+            .and_then(|v| v.to_u32().ok());
         let stop_token = if let Some(override_stop_token_string) = override_stop_token_string {
             tokens
                 .iter()
                 .position(|v| **v == override_stop_token_string)
                 .unwrap_or(0) as u32
         } else {
-            source
-                .get("tokenizer.ggml.eos_token_id")?
-                .clone()
-                .try_into()?
+            source.get("tokenizer.ggml.eos_token_id")?.to_u32()?
         };
         let start_token_string = start_token
             .map(|v| tokens[v as usize].to_string())
@@ -361,7 +189,7 @@ where
             source
                 .get("tokenizer.chat_template")
                 .ok()
-                .and_then(|v| v.to_string().ok())
+                .and_then(|v| v.as_str())
                 .map(|s| s.to_string())
         });
         let chat_template = match chat_template {
@@ -374,7 +202,10 @@ where
         };
 
         // Parameter extraction from metadata.
-        let architecture = source.get("general.architecture")?.to_string()?.clone();
+        let architecture = source
+            .get("general.architecture")?
+            .to_string_value()?
+            .to_string();
         let head_count = source.get(".attention.head_count")?.to_u32()? as usize;
         let head_count_kv = source.get(".attention.head_count_kv")?.to_u32()? as usize;
         let block_count = source.get(".block_count")?.to_u32()? as usize;
@@ -384,41 +215,46 @@ where
 
         let rope_freq_base = source
             .get(".rope.freq_base")
-            .and_then(|m| Ok(m.to_f32()?))
+            .and_then(|m| m.to_f32())
             .unwrap_or(DEFAULT_ROPE_FREQUENCY);
         let sliding_window_size = source
             .get(".attention.sliding_window")
-            .and_then(|m| Ok(m.to_u32()?))
+            .and_then(|m| m.to_u32())
             .ok()
             .map(|x| x as usize);
         let sliding_window_type = source
             .get(".attention.sliding_window_type")
-            .and_then(|m| Ok(m.to_u32()?))
+            .and_then(|m| m.to_u32())
             .ok()
             .map(|x| x as usize)
             .or_else(|| (&*architecture == "gemma3").then_some(GEMMA_DEFAULT_SLIDING_WINDOW_TYPE));
 
         let rope_freq_base_sliding = source
             .get(".rope.local_freq_base")
-            .and_then(|m| Ok(m.to_f32()?))
+            .and_then(|m| m.to_f32())
             .ok()
             .or_else(|| {
                 (&*architecture == "gemma3").then_some(GEMMA_DEFAULT_ROPE_FREQUENCY_SLIDING)
             });
 
+        if source.get(".rope.dimension_sections").is_ok() {
+            return Err(LlamaSourceError::MissingGgufEntry(
+                "mrope (Qwen-VL) models are not supported by the fusor port yet".to_string(),
+            ));
+        }
+
         let context_length = source.get(".context_length")?.to_u32()? as usize;
         let head_dim = source
             .get(".attention.key_length")
-            .and_then(|v| Ok(v.to_u32()?))
+            .and_then(|v| v.to_u32())
             .ok()
             .map(|x| x as usize)
             .unwrap_or_else(|| embedding_length / head_count);
 
-        let rope_freq_weight: Option<Tensor<1, F>> = source
-            .tensor("rope_freqs.weight", device)
-            .await
-            .ok()
-            .map(&dequantize_1d);
+        let rope_freq_weight: Option<Vec<f32>> = match source.tensor("rope_freqs.weight") {
+            Ok(raw) => Some(dense_1d(device, &raw)?.to_vec_f32()),
+            Err(_) => None,
+        };
 
         let config = LlamaConfig {
             rope_freq_weight,
@@ -434,107 +270,60 @@ where
             rope_scaling,
             sliding_window_type,
             sliding_window_size,
-            vision_start_token: tokens
-                .iter()
-                .position(|v| &**v == "<|vision_start|>")
-                .map(|v| v as u32),
-            _vision_end_token: tokens
-                .iter()
-                .position(|v| &**v == "<|vision_end|>")
-                .map(|v| v as u32),
-            image_pad_token: tokens
-                .iter()
-                .position(|v| &**v == "<|image_pad|>")
-                .map(|v| v as u32),
-            video_pad_token: tokens
-                .iter()
-                .position(|v| &**v == "<|video_pad|>")
-                .map(|v| v as u32),
-            mrope_sections: source
-                .get(".rope.dimension_sections")
-                .ok()
-                .and_then(|m| {
-                    m.to_array()
-                        .ok()
-                        .map(|v| v.iter().map(|x| x.to_i32().map(|x| x as usize)).collect())
-                })
-                .transpose()?,
         };
         let config = Arc::new(config);
 
-        let rope: RopeImplementation<F> =
-            rope::RopeImplementation::new(&config, config.rope_theta, device)?;
-        let sliding_rope: Option<RopeImplementation<F>> = rope_freq_base_sliding
-            .map(|rope_freq_base_sliding| {
-                RopeImplementation::new(&config, rope_freq_base_sliding, device)
-            })
-            .transpose()?;
+        let rope = RopeImplementation::new(&config, config.rope_theta, device);
+        let sliding_rope = rope_freq_base_sliding.map(|rope_freq_base_sliding| {
+            RopeImplementation::new(&config, rope_freq_base_sliding, device)
+        });
 
-        let tok_embeddings_q = source.tensor("token_embd.weight", device).await?;
+        let tok_embeddings_q = qmatrix_from_raw(&graph, &source.tensor("token_embd.weight")?)?;
         let tok_embedding_scale =
             (&*architecture == "gemma3").then(|| (embedding_length as f32).sqrt());
-        let tok_embeddings = Embedding::new(tok_embeddings_q.clone());
 
-        let norm = source.tensor("output_norm.weight", device).await?;
+        let norm = source.tensor("output_norm.weight")?;
         let norm = decode_norm(norm, rms_norm_eps)?;
-        let output = match source.tensor("output.weight", device).await {
-            Ok(output) => output,
-            Err(_) => {
-                // If there is no output layer, assume the word embeddings are tied to the output
-                tok_embeddings_q.clone()
-            }
+        let output = match source.tensor("output.weight") {
+            Ok(output) => qmatrix_from_raw(&graph, &output)?,
+            // If there is no output layer, assume the word embeddings are tied to the output
+            Err(_) => tok_embeddings_q.clone(),
         };
         let mut layers = Vec::with_capacity(block_count);
-        let interleaved_rope = architecture.as_ref() != "qwen2"
-            && architecture.as_ref() != "qwen3"
-            && architecture.as_ref() != "gemma3";
+        let interleaved_rope = architecture.as_str() != "qwen2"
+            && architecture.as_str() != "qwen3"
+            && architecture.as_str() != "gemma3";
         for layer_idx in 0..block_count {
             let prefix = format!("blk.{layer_idx}");
-            let attention_variant = if let Ok(attention_qkv) = source
-                .tensor(&format!("{prefix}.attn_qkv.weight"), device)
-                .await
+            let attention_variant = if let Ok(attention_qkv) =
+                source.tensor(&format!("{prefix}.attn_qkv.weight"))
             {
                 AttentionVariant::Grouped(GroupedAttention {
-                    attention_qkv,
+                    attention_qkv: qmatrix_from_raw(&graph, &attention_qkv)?,
                     interleaved_rope,
                 })
             } else {
-                let q = source
-                    .tensor(&format!("{prefix}.attn_q.weight"), device)
-                    .await?;
-                let k = source
-                    .tensor(&format!("{prefix}.attn_k.weight"), device)
-                    .await?;
-                let v = source
-                    .tensor(&format!("{prefix}.attn_v.weight"), device)
-                    .await?;
-                let qkv = QMatrix::concat_rows(&[&q, &k, &v]);
-                let bias_q = source
-                    .tensor(&format!("{prefix}.attn_q.bias"), device)
-                    .await;
-                let bias_k = source
-                    .tensor(&format!("{prefix}.attn_k.bias"), device)
-                    .await;
-                let bias_v = source
-                    .tensor(&format!("{prefix}.attn_v.bias"), device)
-                    .await;
+                let q =
+                    qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.attn_q.weight"))?)?;
+                let k =
+                    qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.attn_k.weight"))?)?;
+                let v =
+                    qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.attn_v.weight"))?)?;
+                let qkv = QMatrix::concat_rows(&[&q, &k, &v]).ok();
+                let bias_q = source.tensor(&format!("{prefix}.attn_q.bias"));
+                let bias_k = source.tensor(&format!("{prefix}.attn_k.bias"));
+                let bias_v = source.tensor(&format!("{prefix}.attn_v.bias"));
                 let bias = if let (Ok(bias_q), Ok(bias_k), Ok(bias_v)) = (bias_q, bias_k, bias_v) {
                     Some(AttentionBias::new(
-                        dequantize_1d(bias_q),
-                        dequantize_1d(bias_k),
-                        dequantize_1d(bias_v),
+                        dense_1d(device, &bias_q)?,
+                        dense_1d(device, &bias_k)?,
+                        dense_1d(device, &bias_v)?,
                     ))
                 } else {
                     None
                 };
-                let q_norm = source
-                    .tensor(&format!("{prefix}.attn_q_norm.weight"), device)
-                    .await
-                    .ok();
-                let k_norm = source
-                    .tensor(&format!("{prefix}.attn_k_norm.weight"), device)
-                    .await
-                    .ok();
+                let q_norm = source.tensor(&format!("{prefix}.attn_q_norm.weight")).ok();
+                let k_norm = source.tensor(&format!("{prefix}.attn_k_norm.weight")).ok();
                 let separate = SeparateAttention {
                     attention_wq: q,
                     attention_qkv: qkv,
@@ -551,21 +340,21 @@ where
                 };
                 AttentionVariant::Separate(Box::new(separate))
             };
-            let attention_wo = source
-                .tensor(&format!("{prefix}.attn_output.weight"), device)
-                .await?;
+            let attention_wo = qmatrix_from_raw(
+                &graph,
+                &source.tensor(&format!("{prefix}.attn_output.weight"))?,
+            )?;
             // Try to read from the up, down and gate weights
-            let feed_forward_variant = if let Ok(ffn_gate) = source
-                .tensor(&format!("{prefix}.ffn_gate.weight"), device)
-                .await
+            let feed_forward_variant = if let Ok(ffn_gate) =
+                source.tensor(&format!("{prefix}.ffn_gate.weight"))
             {
-                let feed_forward_w1 = ffn_gate;
-                let feed_forward_w2 = source
-                    .tensor(&format!("{prefix}.ffn_down.weight"), device)
-                    .await?;
-                let feed_forward_w3 = source
-                    .tensor(&format!("{prefix}.ffn_up.weight"), device)
-                    .await?;
+                let feed_forward_w1 = qmatrix_from_raw(&graph, &ffn_gate)?;
+                let feed_forward_w2 = qmatrix_from_raw(
+                    &graph,
+                    &source.tensor(&format!("{prefix}.ffn_down.weight"))?,
+                )?;
+                let feed_forward_w3 =
+                    qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.ffn_up.weight"))?)?;
                 FeedForwardVariant::Llama(Box::new(LlamaFeedForward::new(
                     feed_forward_w1,
                     feed_forward_w2,
@@ -573,13 +362,12 @@ where
                 )))
             } else {
                 // Otherwise, try to read from the up, and down weights
-                let up = source
-                    .tensor(&format!("{prefix}.ffn_up.weight"), device)
-                    .await?;
-                // Transpose the down tensor
-                let down = source
-                    .tensor(&format!("{prefix}.ffn_down.weight"), device)
-                    .await?;
+                let up =
+                    qmatrix_from_raw(&graph, &source.tensor(&format!("{prefix}.ffn_up.weight"))?)?;
+                let down = qmatrix_from_raw(
+                    &graph,
+                    &source.tensor(&format!("{prefix}.ffn_down.weight"))?,
+                )?;
                 let feed_forward_length = source.get(".feed_forward_length")?.to_u32()? as usize;
 
                 FeedForwardVariant::Phi(PhiFeedForward {
@@ -588,19 +376,13 @@ where
                     feed_forward_length,
                 })
             };
-            let attention_norm = source
-                .tensor(&format!("{prefix}.attn_norm.weight"), device)
-                .await?;
+            let attention_norm = source.tensor(&format!("{prefix}.attn_norm.weight"))?;
             let post_attention_norm = source
-                .tensor(&format!("{prefix}.post_attention_norm.weight"), device)
-                .await
+                .tensor(&format!("{prefix}.post_attention_norm.weight"))
                 .ok();
-            let ffn_norm = source
-                .tensor(&format!("{prefix}.ffn_norm.weight"), device)
-                .await?;
+            let ffn_norm = source.tensor(&format!("{prefix}.ffn_norm.weight"))?;
             let ffn_post_norm = source
-                .tensor(&format!("{prefix}.post_ffw_norm.weight"), device)
-                .await
+                .tensor(&format!("{prefix}.post_ffw_norm.weight"))
                 .ok();
 
             let mut layer_sliding_window_size = None;
@@ -627,7 +409,7 @@ where
 
             layers.push(LlamaAttention {
                 attention_variant,
-                attention_wo: Linear::new(attention_wo, None),
+                attention_wo,
                 attention_norm: decode_norm(attention_norm, rms_norm_eps)?,
                 post_attention_norm: post_attention_norm
                     .map(|norm| decode_norm(norm, rms_norm_eps))
@@ -646,131 +428,32 @@ where
             })
         }
 
-        // If the model is a vision model, load the vision encoder
-        #[cfg(feature = "vision")]
-        let vision_encoder =
-            if let (Some(vision_ct), Some(vision_bytes)) = (vision_ct, vision_bytes) {
-                Some(vision::QwenVisionTransformer::from_gguf(
-                    vision_ct,
-                    &vision_bytes,
-                    device,
-                ))
-            } else {
-                None
-            };
         Ok(Self {
             config,
-            tok_embeddings,
+            tok_embeddings: tok_embeddings_q,
             tok_embedding_scale,
             layers,
             norm,
             output,
-            masks: Default::default(),
-            #[cfg(feature = "vision")]
-            vision_encoder: vision_encoder.transpose()?,
+            masks: Mutex::new(MaskCache::new()),
+            step_inputs: std::sync::OnceLock::new(),
         })
     }
-}
 
-impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl> Model<F>
-where
-    F: CastTo<f32> + CastTensor<f32>,
-    f32: CastTo<F> + CastTensor<F>,
-    MulOp: SimdBinaryOp<F>,
-    AddOp: SimdBinaryOp<F>,
-    SumOp: SimdReduceOp<F>,
-{
-    pub(crate) fn supports_gpu_token_run_ahead(&self) -> bool {
-        #[cfg(feature = "vision")]
-        {
-            self.vision_encoder.is_none()
-        }
-
-        #[cfg(not(feature = "vision"))]
-        {
-            true
-        }
-    }
-
-    pub fn encode_tokens(
+    /// The context-window bookkeeping half of `encode_tokens`: which tokens
+    /// to run and at which absolute starting position, with the cache's
+    /// token record updated (and the cache cleared when the window overflows).
+    fn plan_tokens(
         &self,
         raw_tokens: &[u32],
-        raw_images: &[LlamaImage],
-        device: &Device,
         mut cache: Option<&mut LlamaCache>,
-    ) -> Result<EncodedTokens<F>> {
-        #[cfg(feature = "vision")]
-        let (tokens, images, grid_thw, image_token_ranges) = {
-            let mut grid_thw = Vec::new();
-            let mut images = Vec::new();
-            let mut image_token_ranges = Vec::new();
-            // Embed all images
-            if let Some(vision_encoder) = &self.vision_encoder {
-                for (image, hints) in raw_images {
-                    let min_pixels = hints.min_tokens();
-                    let max_pixels = hints.max_tokens();
-                    let (image, thw) =
-                        vision_encoder.preprocess_image(image, min_pixels, max_pixels)?;
-                    images.push(image);
-                    grid_thw.push(thw)
-                }
-            }
-
-            // Add any image padding tokens to the tokens if needed
-            let tokens = if let (Some(image_pad_token), Some(vision_start_token), Some(vision)) = (
-                self.config.image_pad_token,
-                self.config.vision_start_token,
-                &self.vision_encoder,
-            ) {
-                let mut tokens = Vec::new();
-                let mut token_iter = raw_tokens.iter().copied();
-                let mut image_iter = grid_thw.iter();
-                while let Some(token) = token_iter.next() {
-                    tokens.push(token);
-                    let start_index = tokens.len();
-                    if token == vision_start_token {
-                        match token_iter.next() {
-                            Some(next) if next == image_pad_token => {
-                                // Push a pad token for every image token
-                                let grid = image_iter.next().ok_or_else(|| {
-                                    fusor::Error::msg(
-                                        "Image pad token found without matching image.",
-                                    )
-                                })?;
-                                for _ in 0..grid.iter().product::<u32>()
-                                    / (vision.spacial_merge_size as u32).pow(2)
-                                {
-                                    tokens.push(image_pad_token);
-                                }
-                                image_token_ranges.push(start_index..tokens.len());
-                            }
-                            Some(next) => {
-                                tokens.push(next);
-                            }
-                            None => break,
-                        }
-                    }
-                }
-                tokens
-            } else {
-                raw_tokens.to_vec()
-            };
-
-            (tokens, images, grid_thw, image_token_ranges)
-        };
-        #[cfg(not(feature = "vision"))]
-        let tokens = {
-            let _ = raw_images;
-            raw_tokens.to_vec()
-        };
-
+    ) -> (Vec<u32>, usize) {
+        let tokens = raw_tokens.to_vec();
         let mut seq_len = tokens.len();
         let cached_tokens = cache.as_ref().map(|c| c.tokens.len()).unwrap_or_default();
         // We use a lower cutoff than the context length to avoid recomputing the attention every single token
         let cutoff_len: usize = self.config.context_length.saturating_sub(32).max(8);
-        let (tokens, index_pos, start_time) = if seq_len + cached_tokens
-            > self.config.context_length
-        {
+        let (tokens, index_pos) = if seq_len + cached_tokens > self.config.context_length {
             let all_tokens = if let Some(cache) = cache.as_mut() {
                 cache.clear();
                 let mut all_tokens = cache.tokens.clone();
@@ -790,264 +473,299 @@ where
                 cache.tokens = all_tokens.to_vec();
             }
             assert!(all_tokens.len() <= self.config.context_length);
-            (all_tokens.to_vec(), 0, 0)
+            (all_tokens.to_vec(), 0)
         } else {
             let index_pos = cache.as_ref().map(|c| c.tokens.len()).unwrap_or_default();
-            let start_time = cache.as_ref().map(|c| c.start_time).unwrap_or_default();
             if let Some(cache) = cache.as_mut() {
                 cache.tokens.extend_from_slice(&tokens);
             }
-            (tokens, index_pos, start_time)
+            (tokens, index_pos)
         };
-        #[cfg(not(feature = "vision"))]
-        let _ = start_time;
-        let x_base = Tensor::new(device, tokens.as_slice());
-        let x = x_base.unsqueeze(0);
+        let _ = seq_len;
+        (tokens, index_pos)
+    }
 
-        let mut embeddings_f32 = self.tok_embeddings.forward(&x);
+    pub fn encode_tokens(
+        &self,
+        raw_tokens: &[u32],
+        device: &Device,
+        cache: Option<&mut LlamaCache>,
+    ) -> EncodedTokens {
+        let (tokens, index_pos) = self.plan_tokens(raw_tokens, cache);
+        let seq_len = tokens.len();
+        let ids = Tensor::from_slice(device, [seq_len], &tokens);
+        let mut embeddings = self.tok_embeddings.rows_at(&ids).unsqueeze(0);
         if let Some(scale) = self.tok_embedding_scale {
-            embeddings_f32 = (embeddings_f32 * scale).to_concrete();
-        }
-        #[cfg(feature = "vision")]
-        let mut embeddings: Tensor<3, F> = embeddings_f32.cast();
-        #[cfg(not(feature = "vision"))]
-        let embeddings: Tensor<3, F> = embeddings_f32.cast();
-        #[cfg(feature = "vision")]
-        let mut pos_ids = None;
-        #[cfg(not(feature = "vision"))]
-        let pos_ids = None;
-        #[cfg(feature = "vision")]
-        let batch_size = embeddings.shape()[0];
-        #[cfg(feature = "vision")]
-        let embed_dim = embeddings.shape()[2];
-
-        #[cfg(feature = "vision")]
-        if let Some(vision_encoder) = &self.vision_encoder {
-            for ((pixels, grid), range) in images.iter().zip(&grid_thw).zip(image_token_ranges) {
-                let pixels_f: Tensor<2, F> = pixels.cast();
-                let image_embeds = vision_encoder.forward_image(&pixels_f, *grid)?;
-                let image_embeds_3d = image_embeds.unsqueeze(0);
-                embeddings =
-                    embeddings.slice_assign([0..batch_size, range, 0..embed_dim], &image_embeds_3d);
-            }
-            let (new_pos_ids, new_start_time) =
-                vision_encoder.get_rope_index(&tokens, &grid_thw, &self.config, start_time)?;
-            if let Some(cache) = cache.as_mut() {
-                cache.start_time = new_start_time;
-            }
-            let pos_f32: Tensor<2, f32> = new_pos_ids.cast();
-            let pos_f: Tensor<2, F> = pos_f32.cast();
-            pos_ids = Some(pos_f);
+            embeddings = embeddings.mul_scalar(scale);
         }
 
-        Ok(EncodedTokens {
+        EncodedTokens {
             embeddings,
             seq_len,
             index_pos,
-            pos_ids,
-        })
+        }
     }
 
+    /// The `(MaskKind, mask tensor)` a `[q_len, k_len]` score block needs.
+    fn mask_for(
+        &self,
+        graph: &Graph,
+        q_len: usize,
+        k_len: usize,
+        window: Option<usize>,
+    ) -> Result<(MaskKind, Option<Tensor<2>>)> {
+        if q_len == 1 {
+            // One query against a warm cache sees every remaining key (a
+            // sliding window is enforced by eviction).
+            return Ok((MaskKind::None, None));
+        }
+        if q_len == k_len && window.is_none_or(|w| w >= k_len) {
+            return Ok((MaskKind::Causal, None));
+        }
+        let mask = self.masks.lock().unwrap().materialized(
+            graph,
+            Dim::Const(q_len as u64),
+            Dim::Const(k_len as u64),
+            window.map(|w| w as u64),
+        )?;
+        Ok((MaskKind::QkMask, mask.tensor().cloned()))
+    }
+
+    /// The last token's logits as `[1, vocab]`. Deliberately NOT reshaped to
+    /// rank 1: the reshape is a pure `Restride` view, and a view cannot be
+    /// the root of a resolve on its own (nothing would land in a buffer).
+    /// The row-major bytes are identical either way.
     pub fn forward(
         &self,
         tokens: &[u32],
-        images: &[LlamaImage],
-        device: &Device,
-        cache: Option<&mut LlamaCache>,
-    ) -> Result<Tensor<2, F>>
-    where
-        F: CastTo<f32> + CastTensor<f32> + Default,
-        f32: CastTo<F> + CastTensor<F>,
-    {
-        let x_f32 = self.forward_last_hidden_f32(tokens, images, device, cache)?;
-        let result_f32 = x_f32.q_mat_mul(&self.output);
-        Ok(result_f32.cast())
-    }
-
-    pub(crate) fn forward_last_hidden_f32(
-        &self,
-        tokens: &[u32],
-        images: &[LlamaImage],
         device: &Device,
         mut cache: Option<&mut LlamaCache>,
-    ) -> Result<Tensor<2, f32>>
-    where
-        F: CastTo<f32> + CastTensor<f32> + Default,
-        f32: CastTo<F> + CastTensor<F>,
-    {
-        let t_encode = Instant::now();
-        let encoded = self.encode_tokens(tokens, images, device, cache.as_deref_mut())?;
-        self.forward_last_hidden_from_embeddings(encoded, device, cache, Some(t_encode.elapsed()))
+    ) -> Result<Tensor<2>> {
+        if cache
+            .as_ref()
+            .is_some_and(|c| c.blocks.first().is_some_and(|b| b.is_fixed()))
+        {
+            let cache = cache.as_deref_mut().expect("checked above");
+            let (steps, index_pos) = self.plan_tokens(tokens, Some(cache));
+            let n = steps.len();
+            let mut logits = None;
+            for (i, tok) in steps.iter().enumerate() {
+                let want_logits = i + 1 == n;
+                let out = self.decode_step(*tok, index_pos + i, device, cache, want_logits);
+                // One resolve per step: this step's KV writes (always) plus
+                // the logits on the sampled step. Then every cache adopts its
+                // written buffer so the *same* graph runs the next step.
+                //
+                // The batch is the one genuinely rank-heterogeneous list here:
+                // a `[1, vocab]` logits row beside `[1, kv_heads, len, dim]`
+                // cache writes. That is what `resolve` takes and why the caches
+                // hand their pending roots over as `Dyn`.
+                let mut batch = Vec::with_capacity(2 * cache.blocks.len() + 1);
+                if let Some(out) = &out {
+                    batch.push(out.clone().into_dyn());
+                }
+                for block in &cache.blocks {
+                    block.pending_into(&mut batch);
+                }
+                device.session().resolve(&batch)?;
+                for block in &mut cache.blocks {
+                    block.commit();
+                }
+                logits = out.or(logits);
+            }
+            return logits.ok_or_else(|| fusor::Error::Shape("forward of no tokens".into()));
+        }
+        let hidden = self.forward_last_hidden_f32(tokens, device, cache)?;
+        Ok(hidden.q_mat_mul(&self.output))
     }
 
-    pub(crate) fn forward_last_hidden_f32_gpu_token(
+    /// One decode-shaped step: token `token` at absolute `position`, one
+    /// query against the (symbolic-length) caches. The graph this builds is
+    /// **identical** across steps — same leaves, same nodes — so from step
+    /// two on, saturation and extraction are replays and the plan is reused;
+    /// only leaf bytes and the length bindings change.
+    ///
+    /// Because it is identical, it is built once. `cache.decode_graph` holds
+    /// the root and every later step re-arms the blocks' appends
+    /// ([`fusor::cache::KvCache::replay_append`]) instead of re-deriving the
+    /// nodes that produced them. A rebuild is still what happens whenever the
+    /// nodes would genuinely differ — a grown store, a reset cache, a first
+    /// step — and it re-establishes the memo.
+    ///
+    /// `None` is a prefill step: its product is the KV writes it left in the
+    /// caches, and the head is not run.
+    fn decode_step(
         &self,
-        token: &Tensor<1, u32>,
+        token: u32,
+        position: usize,
         device: &Device,
         cache: &mut LlamaCache,
-    ) -> Result<(Tensor<2, f32>, usize)>
-    where
-        F: CastTo<f32> + CastTensor<f32> + Default,
-        f32: CastTo<F> + CastTensor<F>,
-    {
-        #[cfg(feature = "vision")]
-        if self.vision_encoder.is_some() {
-            return Err(fusor::Error::msg(
-                "GPU token run-ahead is only available for text-only models",
-            ));
-        }
+        want_logits: bool,
+    ) -> Option<Tensor<2>> {
+        let (ids, pos) = self.step_inputs.get_or_init(|| {
+            (
+                Tensor::leaf(device, [Dim::Const(1)]),
+                Tensor::leaf(device, [Dim::Const(1)]),
+            )
+        });
+        ids.set_elements(&[token]);
+        pos.set_elements(&[position as u32]);
 
-        if cache.tokens.len() + 1 > self.config.context_length {
-            return Err(fusor::Error::msg(
-                "GPU token run-ahead cannot trim a full context",
-            ));
-        }
-
-        let cache_slot = cache.tokens.len();
-        cache.tokens.push(0);
-        let x = token.unsqueeze(0);
-        let mut embeddings_f32 = self.tok_embeddings.forward(&x);
-        if let Some(scale) = self.tok_embedding_scale {
-            embeddings_f32 = (embeddings_f32 * scale).to_concrete();
-        }
-        let embeddings: Tensor<3, F> = embeddings_f32.cast();
-        let encoded = EncodedTokens {
-            embeddings,
-            seq_len: 1,
-            index_pos: cache_slot,
-            pos_ids: None,
-        };
-        let hidden =
-            self.forward_last_hidden_from_embeddings(encoded, device, Some(cache), None)?;
-        Ok((hidden, cache_slot))
-    }
-
-    fn forward_last_hidden_from_embeddings(
-        &self,
-        encoded: EncodedTokens<F>,
-        device: &Device,
-        mut cache: Option<&mut LlamaCache>,
-        encode_elapsed: Option<Duration>,
-    ) -> Result<Tensor<2, f32>>
-    where
-        F: CastTo<f32> + CastTensor<f32> + Default,
-        f32: CastTo<F> + CastTensor<F>,
-    {
-        let EncodedTokens {
-            embeddings: mut layer_in,
-            seq_len,
-            index_pos,
-            pos_ids,
-        } = encoded;
-        let _trace_text_prefill = seq_len > 1 && std::env::var_os("KALOSM_TRACE_TEXT").is_some();
-        let trace_forward_timing =
-            seq_len > 1 || std::env::var_os("KALOSM_TRACE_FORWARD_TIMING").is_some();
-        if trace_forward_timing {
-            if let Some(encode_elapsed) = encode_elapsed {
-                tracing::info!(
-                    "[timing] encode_tokens (incl. vision): {:.2?} seq_len={}",
-                    encode_elapsed,
-                    seq_len
-                );
+        if let Some(logits) = cache.decode_graph.clone() {
+            // Every block or none: a half-advanced cache would silently
+            // disagree with the graph about its own length.
+            if cache.blocks.iter().all(|block| block.can_replay(1)) {
+                for block in &mut cache.blocks {
+                    block
+                        .replay_append(1)
+                        .expect("can_replay was checked for every block");
+                }
+                return want_logits.then_some(logits);
             }
         }
-        let t_text_layers = Instant::now();
-        let trace_layer_nan = seq_len == 1 && std::env::var_os("KALOSM_TRACE_LAYER_NAN").is_some();
-        if trace_layer_nan {
-            let probe: fusor::Tensor<3, f32> = layer_in.cast();
-            debug_check_nan_f32(&probe, usize::MAX, "embed", index_pos);
+        // The nodes below may not be the memoized ones (a grown store mints a
+        // new leaf), so the memo dies here and is re-established only by a
+        // step that actually builds the head.
+        cache.decode_graph = None;
+
+        let mut layer_in = self.tok_embeddings.rows_at(ids).unsqueeze(0);
+        if let Some(scale) = self.tok_embedding_scale {
+            layer_in = layer_in.mul_scalar(scale);
         }
 
         for (i, layer) in self.layers.iter().enumerate() {
-            let x = layer_in;
-            let residual: Tensor<3, f32> = x.cast();
-            let x = layer.attention_norm.forward_generic(&x);
-            if trace_layer_nan {
-                let probe: fusor::Tensor<3, f32> = x.clone().cast();
-                debug_check_nan_f32(&probe, i, "post_attn_norm", index_pos);
-            }
-            let mask = (seq_len > 1).then(|| {
-                self.masks
-                    .get_mask(seq_len, index_pos, layer.sliding_window_size, device)
-            });
-            let mut attn = {
-                #[cfg(feature = "vision")]
-                {
-                    if trace_layer_nan {
-                        layer.forward_with_trace(
-                            &x,
-                            mask.as_ref(),
-                            index_pos,
-                            pos_ids.as_ref(),
-                            cache.as_mut().map(|c| &mut c.blocks[i]),
-                            i,
-                        )
-                    } else {
-                        layer.forward(
-                            &x,
-                            mask.as_ref(),
-                            index_pos,
-                            pos_ids.as_ref(),
-                            cache.as_mut().map(|c| &mut c.blocks[i]),
-                        )
-                    }
-                }
-                #[cfg(not(feature = "vision"))]
-                {
-                    layer.forward(
-                        &x,
-                        mask.as_ref(),
-                        index_pos,
-                        pos_ids.as_ref(),
-                        cache.as_mut().map(|c| &mut c.blocks[i]),
-                    )
-                }
-            };
-            if trace_layer_nan {
-                let probe: fusor::Tensor<3, f32> = attn.clone().cast();
-                debug_check_nan_f32(&probe, i, "attn_out", index_pos);
-            }
+            let residual = layer_in.clone();
+            let x = layer.attention_norm.forward(&layer_in);
+            // One query sees every cached key: structurally maskless.
+            let mut attn = layer.forward(
+                &x,
+                (MaskKind::None, None),
+                position,
+                Some(pos),
+                Some(&mut cache.blocks[i]),
+            );
             if let Some(post_attention_norm) = &layer.post_attention_norm {
-                attn = post_attention_norm.forward_generic(&attn);
+                attn = post_attention_norm.forward(&attn);
             }
-            let attn_f32: Tensor<3, f32> = attn.cast();
-
-            // MLP over RMSNorm(attention_output + residual). The fused path avoids
-            // materializing the mid-block residual add just to feed normalization.
-            let x = layer.ffn_norm.forward_residual_f32(&attn_f32, &residual);
+            let x = layer.ffn_norm.forward_residual(&attn, &residual);
             if layer.post_ffn_norm.is_none() {
                 if let Some(layer_out) = layer
                     .feed_forward_variant
-                    .forward_add_residuals(&x, &attn_f32, &residual)
+                    .forward_add_residuals(&x, &attn, &residual)
                 {
                     layer_in = layer_out;
-                    if trace_layer_nan {
-                        let probe: fusor::Tensor<3, f32> = layer_in.cast();
-                        debug_check_nan_f32(&probe, i, "ffn_fused", index_pos);
-                    }
                     continue;
                 }
             }
             let mut x = layer.feed_forward_variant.forward(&x);
             if let Some(post_ffn_norm) = &layer.post_ffn_norm {
-                x = post_ffn_norm.forward_generic(&x);
+                x = post_ffn_norm.forward(&x);
             }
-            let x_f32: Tensor<3, f32> = x.cast();
-            layer_in = (x_f32 + attn_f32 + residual).cast();
-            if trace_layer_nan {
-                let probe: fusor::Tensor<3, f32> = layer_in.cast();
-                debug_check_nan_f32(&probe, i, "ffn_unfused", index_pos);
-            }
+            layer_in = x.add(&attn).add(&residual);
         }
-        if trace_forward_timing {
-            tracing::info!("[timing] text layer loop: {:.2?}", t_text_layers.elapsed());
+        if !want_logits {
+            return None;
         }
-        let x = self.norm.forward_generic(&layer_in);
-        let x = x.i((.., seq_len - 1, ..));
-        let out = x.cast::<f32>();
-        Ok(out)
+        let x = self.norm.forward(&layer_in);
+        let hidden = x.reshape_dims([Dim::Const(1), x.extent(2)]);
+        let logits = hidden.q_mat_mul(&self.output);
+        cache.decode_graph = Some(logits.clone());
+        Some(logits)
     }
 
+    pub(crate) fn forward_last_hidden_f32(
+        &self,
+        tokens: &[u32],
+        device: &Device,
+        mut cache: Option<&mut LlamaCache>,
+    ) -> Result<Tensor<2>> {
+        let encoded = self.encode_tokens(tokens, device, cache.as_deref_mut());
+        if encoded.seq_len <= 1 {
+            return self.forward_last_hidden_from_embeddings(encoded, device, cache);
+        }
+        // Chunk the prefill to one token per step. fusor's extraction
+        // currently spells an M > 1 activation against a quantized weight as
+        // a fold over the *materialized* dequantized matrix — ~27 GB of f32
+        // launch roots for one 8B prefill — while M = 1 is the tuned
+        // staged-decode contraction that reads the blocks in place. Until
+        // batched quantized contraction extraction is fixed, a prefill is a
+        // sequence of decode steps.
+        let EncodedTokens {
+            embeddings,
+            seq_len,
+            index_pos,
+        } = encoded;
+        let mut last = None;
+        for i in 0..seq_len {
+            let step = EncodedTokens {
+                embeddings: embeddings.narrow(1, i, 1),
+                seq_len: 1,
+                index_pos: index_pos + i,
+            };
+            last = Some(self.forward_last_hidden_from_embeddings(
+                step,
+                device,
+                cache.as_deref_mut(),
+            )?);
+        }
+        Ok(last.expect("seq_len > 1 produced at least one step"))
+    }
+
+    fn forward_last_hidden_from_embeddings(
+        &self,
+        encoded: EncodedTokens,
+        device: &Device,
+        mut cache: Option<&mut LlamaCache>,
+    ) -> Result<Tensor<2>> {
+        let EncodedTokens {
+            embeddings: mut layer_in,
+            seq_len,
+            index_pos,
+        } = encoded;
+        let graph = device.graph().clone();
+
+        for (i, layer) in self.layers.iter().enumerate() {
+            let residual = layer_in.clone();
+            let x = layer.attention_norm.forward(&layer_in);
+            let cache_block = cache.as_deref_mut().map(|c| &mut c.blocks[i]);
+            let k_len = cache_block
+                .as_ref()
+                .and_then(|c| c.len().as_const())
+                .unwrap_or(0) as usize
+                + seq_len;
+            let (kind, mask) = self.mask_for(&graph, seq_len, k_len, layer.sliding_window_size)?;
+            let mut attn = layer.forward(&x, (kind, mask.as_ref()), index_pos, None, cache_block);
+            if let Some(post_attention_norm) = &layer.post_attention_norm {
+                attn = post_attention_norm.forward(&attn);
+            }
+
+            // MLP over RMSNorm(attention_output + residual). The fused path
+            // avoids materializing the mid-block residual add just to feed
+            // normalization.
+            let x = layer.ffn_norm.forward_residual(&attn, &residual);
+            if layer.post_ffn_norm.is_none() {
+                if let Some(layer_out) = layer
+                    .feed_forward_variant
+                    .forward_add_residuals(&x, &attn, &residual)
+                {
+                    layer_in = layer_out;
+                    continue;
+                }
+            }
+            let mut x = layer.feed_forward_variant.forward(&x);
+            if let Some(post_ffn_norm) = &layer.post_ffn_norm {
+                x = post_ffn_norm.forward(&x);
+            }
+            layer_in = x.add(&attn).add(&residual);
+        }
+        let x = self.norm.forward(&layer_in);
+        // The last token's hidden state, as `[1, hidden]`.
+        let hidden_size = x.extent(2);
+        Ok(x.narrow(1, seq_len - 1, 1)
+            .reshape_dims([Dim::Const(1), hidden_size]))
+    }
+
+    #[allow(dead_code)]
     pub(crate) fn output_matrix(&self) -> &QMatrix {
         &self.output
     }

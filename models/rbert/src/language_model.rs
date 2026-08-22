@@ -8,7 +8,6 @@ use crate::BertBuilder;
 use crate::BertError;
 use crate::BertLoadingError;
 use crate::Pooling;
-use fusor::ToVec2;
 pub use kalosm_language_model::{
     Embedder, EmbedderCacheExt, EmbedderExt, Embedding, EmbeddingInput, EmbeddingVariant,
 };
@@ -32,16 +31,10 @@ impl ModelBuilder for BertBuilder {
 }
 
 impl Bert {
-    /// Convert a 2D tensor (containing a single embedding) into an Embedding.
-    async fn tensor_to_embedding(
-        &self,
-        tensor: fusor::Tensor<2, f32>,
-    ) -> Result<Embedding, BertError> {
-        let slice = tensor.as_slice().await.map_err(BertError::Fusor)?;
-        let slice_data = slice.to_vec2();
-        Ok(Embedding::from(
-            slice_data.into_iter().next().into_iter().next().unwrap(),
-        ))
+    /// Convert a `[1, hidden]` tensor (containing a single embedding) into an Embedding.
+    async fn tensor_to_embedding(&self, tensor: fusor::Tensor<2>) -> Result<Embedding, BertError> {
+        let values = tensor.to_vec_f32_async().await.map_err(BertError::Fusor)?;
+        Ok(Embedding::from(values))
     }
 
     /// Embed a sentence with a specific pooling strategy.

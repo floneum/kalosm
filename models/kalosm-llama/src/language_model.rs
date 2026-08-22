@@ -1,9 +1,4 @@
-use fusor::{
-    AddOp, CastTensor, CastTo, FloatDataType, FloatOps, MatmulImpl, MulOp, SimdBinaryOp,
-    SimdElement, SimdReduceOp, SumOp, WasmNotSync,
-};
-#[cfg(feature = "vision")]
-use kalosm_language_model::ContentChunk;
+use crate::WasmNotSync;
 use kalosm_language_model::{
     CreateTextCompletionSession, GenerationParameters, MessageContent, TextCompletionModel,
 };
@@ -27,16 +22,8 @@ use crate::{
     UnstructuredGenerationTask,
 };
 
-impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl> ModelBuilder
-    for LlamaBuilder<F>
-where
-    F: CastTo<f32> + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTo<F> + CastTensor<F>,
-    MulOp: SimdBinaryOp<F>,
-    AddOp: SimdBinaryOp<F>,
-    SumOp: SimdReduceOp<F>,
-{
-    type Model = Llama<F>;
+impl ModelBuilder for LlamaBuilder {
+    type Model = Llama;
     type Error = LlamaSourceError;
 
     async fn start_with_loading_handler(
@@ -58,16 +45,8 @@ where
     }
 }
 
-impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl> CreateTextCompletionSession
-    for Llama<F>
-where
-    F: CastTo<f32> + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTo<F> + CastTensor<F>,
-    MulOp: SimdBinaryOp<F>,
-    AddOp: SimdBinaryOp<F>,
-    SumOp: SimdReduceOp<F>,
-{
-    type Session = LlamaSession<F>;
+impl CreateTextCompletionSession for Llama {
+    type Session = LlamaSession;
     type Error = LlamaModelError;
 
     fn new_session(&self) -> Result<Self::Session, Self::Error> {
@@ -75,15 +54,7 @@ where
     }
 }
 
-impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl>
-    TextCompletionModel<GenerationParameters> for Llama<F>
-where
-    F: CastTo<f32> + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTo<F> + CastTensor<F>,
-    MulOp: SimdBinaryOp<F>,
-    AddOp: SimdBinaryOp<F>,
-    SumOp: SimdReduceOp<F>,
-{
+impl TextCompletionModel<GenerationParameters> for Llama {
     async fn stream_text_with_callback<'a>(
         &'a self,
         session: &'a mut Self::Session,
@@ -98,20 +69,6 @@ where
         let sampler = GpuSamplerConfig::from_generation_parameters(&sampler);
         let on_token = Box::new(on_token);
         let text = msg.text();
-        #[cfg(feature = "vision")]
-        let images = {
-            let msg = msg.resolve_media_sources().await?;
-            let mut images = Vec::new();
-            for chunk in msg.chunks() {
-                if let ContentChunk::Media(media) = chunk {
-                    if let Some(bytes) = &media.source().as_bytes() {
-                        images.push((image::load_from_memory(bytes)?, media.hints().clone()))
-                    }
-                }
-            }
-            images
-        };
-        #[cfg(not(feature = "vision"))]
         let images = {
             if msg.has_media() {
                 return Err(LlamaModelError::MediaUnsupported);
@@ -120,10 +77,8 @@ where
         };
         self.inner
             .sender
-            .unbounded_send(Task::UnstructuredGeneration(UnstructuredGenerationTask::<
-                F,
-            > {
-                settings: InferenceSettings::<F> {
+            .unbounded_send(Task::UnstructuredGeneration(UnstructuredGenerationTask {
+                settings: InferenceSettings {
                     prompt: text,
                     images,
                     session: session.clone(),
@@ -149,14 +104,17 @@ where
 }
 
 #[cfg(feature = "structured")]
-impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl, T: Parse + 'static>
-    kalosm_language_model::CreateDefaultChatConstraintsForType<T> for Llama<F>
-where
-    F: CastTo<f32> + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTo<F> + CastTensor<F>,
-    MulOp: SimdBinaryOp<F>,
-    AddOp: SimdBinaryOp<F>,
-    SumOp: SimdReduceOp<F>,
+impl<T: Parse + 'static> kalosm_language_model::CreateDefaultChatConstraintsForType<T> for Llama {
+    type DefaultConstraints = ArcParser<T>;
+
+    fn create_default_constraints() -> Self::DefaultConstraints {
+        T::new_parser().boxed()
+    }
+}
+
+#[cfg(feature = "structured")]
+impl<T: Parse + 'static> kalosm_language_model::CreateDefaultCompletionConstraintsForType<T>
+    for Llama
 {
     type DefaultConstraints = ArcParser<T>;
 
@@ -166,32 +124,10 @@ where
 }
 
 #[cfg(feature = "structured")]
-impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl, T: Parse + 'static>
-    kalosm_language_model::CreateDefaultCompletionConstraintsForType<T> for Llama<F>
-where
-    F: CastTo<f32> + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTo<F> + CastTensor<F>,
-    MulOp: SimdBinaryOp<F>,
-    AddOp: SimdBinaryOp<F>,
-    SumOp: SimdReduceOp<F>,
-{
-    type DefaultConstraints = ArcParser<T>;
-
-    fn create_default_constraints() -> Self::DefaultConstraints {
-        T::new_parser().boxed()
-    }
-}
-
-#[cfg(feature = "structured")]
-impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl, Constraints>
+impl<Constraints>
     kalosm_language_model::StructuredTextCompletionModel<Constraints, GenerationParameters>
-    for Llama<F>
+    for Llama
 where
-    F: CastTo<f32> + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTo<F> + CastTensor<F>,
-    MulOp: SimdBinaryOp<F>,
-    AddOp: SimdBinaryOp<F>,
-    SumOp: SimdReduceOp<F>,
     <Constraints as Parser>::Output: WasmNotSend,
     <Constraints as Parser>::PartialState: WasmNotSend,
     Constraints: CreateParserState + WasmNotSend + 'static,
@@ -211,9 +147,6 @@ where
             let sampler =
                 CpuSampler::new(GpuSamplerConfig::from_generation_parameters(&sampler), seed);
             let on_token = Box::new(on_token);
-            #[cfg(feature = "vision")]
-            let resolved_message = text.resolve_media_sources().await?;
-            #[cfg(not(feature = "vision"))]
             let resolved_message = {
                 if text.has_media() {
                     return Err(LlamaModelError::MediaUnsupported);

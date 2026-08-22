@@ -42,11 +42,15 @@
 
 #![warn(missing_docs)]
 
-use fusor::{Device, Tensor, VarBuilder};
+use std::sync::{Arc, RwLock};
+
+use fusor::{Tensor, VarBuilder};
 use kalosm_common::*;
 use kalosm_model_types::ModelLoadingProgress;
-use std::sync::{Arc, RwLock};
 use tokenizers::{Encoding, PaddingDirection, PaddingParams, Tokenizer};
+
+/// The device handle models run on, re-exported from fusor.
+pub use fusor::Device;
 
 mod language_model;
 mod raw;
@@ -207,12 +211,13 @@ impl EmbeddingModel {
         }
     }
 
-    /// Forward pass through the model
+    /// Forward pass through the model. `[batch, seq]` ids in, `[batch, seq,
+    /// hidden]` out.
     pub fn forward(
         &self,
         input_ids: &Tensor<2, u32>,
         attention_mask: Option<&Tensor<2, u32>>,
-    ) -> Tensor<3, f32> {
+    ) -> Tensor<3> {
         match self {
             EmbeddingModel::Bert(model) => {
                 let token_type_ids = input_ids.zeros_like();
@@ -334,18 +339,21 @@ impl Bert {
 
         let device = match device {
             Some(device) => device,
-            None => Device::auto().await,
+            None => match Device::gpu().await {
+                Ok(device) => device,
+                Err(_) => Device::cpu(),
+            },
         };
-        let mut weights = std::io::Cursor::new(&weights_bytes);
-        let mut vb = VarBuilder::from_gguf(&mut weights)
-            .map_err(|err| BertLoadingError::LoadModel(fusor::Error::from(err)))?;
+        let gguf = fusor_gguf::parse::Gguf::from_bytes(weights_bytes)
+            .map_err(BertLoadingError::LoadModel)?;
+        let vb = VarBuilder::new(Arc::new(gguf));
 
         // Detect architecture from GGUF metadata
-        let architecture = vb.architecture();
+        let architecture = vb.architecture().map(|a| a.to_string());
         let model = match architecture.as_deref() {
             Some("qwen3") | Some("qwen2") => {
                 // Load Qwen embedding model
-                let qwen_model = QwenEmbeddingModel::load(&device, &mut vb)?;
+                let qwen_model = QwenEmbeddingModel::load(&device, &vb)?;
                 EmbeddingModel::Qwen(qwen_model)
             }
             _ => {
@@ -353,7 +361,7 @@ impl Bert {
                 let config_bytes = config_bytes.ok_or(BertLoadingError::ConfigNotFound)?;
                 let config: Config =
                     serde_json::from_slice(&config_bytes).map_err(BertLoadingError::LoadConfig)?;
-                let bert_model = BertModel::load(&device, &mut vb, &config)?;
+                let bert_model = BertModel::load(&device, &vb, &config)?;
                 EmbeddingModel::Bert(bert_model)
             }
         };
@@ -374,7 +382,7 @@ impl Bert {
         &self,
         sentences: Vec<&str>,
         pooling: Pooling,
-    ) -> Result<Vec<Tensor<2, f32>>, BertError> {
+    ) -> Result<Vec<Tensor<2>>, BertError> {
         let embedding_dim = self.model.embedding_dim();
         // Approximates the quadratic attention memory cost (seq_len^2).
         // Batches are split so that total work stays below this threshold.
@@ -391,7 +399,7 @@ impl Bert {
 
         encodings_with_indices.sort_unstable_by_key(|(_, encoding)| encoding.len());
 
-        let mut combined: Vec<Option<Tensor<2, f32>>> = vec![None; encodings_with_indices.len()];
+        let mut combined: Vec<Option<Tensor<2>>> = vec![None; encodings_with_indices.len()];
         let mut chunks = Vec::new();
         let mut current_chunk_len = 0;
         let mut current_chunk_max_token_len = 0;
@@ -435,7 +443,7 @@ impl Bert {
         &self,
         mut tokens: Vec<Encoding>,
         pooling: Pooling,
-    ) -> Result<Vec<Tensor<2, f32>>, BertError> {
+    ) -> Result<Vec<Tensor<2>>, BertError> {
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
@@ -456,72 +464,55 @@ impl Bert {
         let n_sentences = tokens.len();
         let max_seq_len = self.model.max_seq_len();
         let token_ids = tokens.iter().map(|tokens| {
-            let tokens = tokens.get_ids().to_vec();
-            Tensor::new(
-                device,
-                &tokens.as_slice()[..max_seq_len.min(tokens.as_slice().len())],
-            )
+            let ids = tokens.get_ids();
+            let ids = &ids[..max_seq_len.min(ids.len())];
+            Tensor::<1, u32>::from_slice(device, [ids.len()], ids)
         });
-        let token_ids = Tensor::stack(token_ids, 0);
+        let token_ids: Tensor<2, u32> = fusor::stack(token_ids, 0);
 
         let attention_masks = tokens.iter().map(|tokens| {
-            let attention_mask = tokens.get_attention_mask();
-            Tensor::new(
-                device,
-                &attention_mask[..max_seq_len.min(attention_mask.len())],
-            )
+            let mask = tokens.get_attention_mask();
+            let mask = &mask[..max_seq_len.min(mask.len())];
+            Tensor::<1, u32>::from_slice(device, [mask.len()], mask)
         });
-        let attention_mask = Tensor::stack(attention_masks, 0);
+        let attention_mask: Tensor<2, u32> = fusor::stack(attention_masks, 0);
 
         let embeddings = self.model.forward(&token_ids, Some(&attention_mask));
 
-        let shape = embeddings.shape();
-        let n_tokens = shape[1];
+        let n_tokens = embeddings
+            .extent(1)
+            .as_const()
+            .expect("the sequence length is const") as usize;
 
-        match pooling {
+        let pooled: Tensor<2> = match pooling {
             Pooling::Mean => {
                 // Take the mean embedding value for all tokens (except padding)
                 // Cast mask u32→f32, unsqueeze to [batch, seq_len, 1] for broadcasting
-                let mask_f32: Tensor<2, f32> = attention_mask.cast();
-                let mask_3d: Tensor<3, f32, _> = mask_f32.unsqueeze(2).to_concrete();
+                let mask_f32 = attention_mask.cast::<f32>();
+                let mask_3d: Tensor<3> = mask_f32.unsqueeze(2);
                 // Zero out padding positions, sum along seq dim → [batch, hidden_dim]
-                let masked_embeddings = (embeddings * mask_3d).to_concrete();
-                let summed = masked_embeddings.sum::<2>(1);
+                let masked: Tensor<3> = embeddings.mul_(&mask_3d);
+                let summed: Tensor<2> = masked.sum(1);
                 // Divide by valid token count [batch, 1] — broadcasts with [batch, hidden_dim]
-                let valid_count = mask_f32.sum_keepdim::<1>(1);
-                let embeddings = summed.div_(&valid_count);
-                let embeddings = normalize_l2(&embeddings);
-                Ok(embeddings
-                    .chunk(n_sentences, 0)
-                    .into_iter()
-                    .map(|c| c.to_concrete())
-                    .collect())
+                let valid_count = mask_f32.sum_keepdim(1);
+                let embeddings: Tensor<2> = summed.div_(&valid_count);
+                normalize_l2(&embeddings)
             }
             Pooling::CLS => {
                 // Index into the first token of each sentence which is the CLS token that contains the sentence embedding
-                let indexed_embeddings = embeddings.to_concrete().i((.., 0, ..));
-                Ok(indexed_embeddings
-                    .chunk(n_sentences, 0)
-                    .into_iter()
-                    .map(|c| c.to_concrete())
-                    .collect())
+                embeddings.narrow(1, 0, 1).squeeze(1)
             }
             Pooling::Last => {
                 // With left padding, the last token is always at the final position
-                let indexed_embeddings = embeddings.to_concrete().i((.., n_tokens - 1, ..));
-                let normalized = normalize_l2(&indexed_embeddings);
-                Ok(normalized
-                    .chunk(n_sentences, 0)
-                    .into_iter()
-                    .map(|c| c.to_concrete())
-                    .collect())
+                let last: Tensor<2> = embeddings.narrow(1, n_tokens - 1, 1).squeeze(1);
+                normalize_l2(&last)
             }
-        }
+        };
+        Ok(pooled.chunk(n_sentences, 0))
     }
 }
 
-fn normalize_l2(v: &Tensor<2, f32>) -> Tensor<2, f32> {
-    let v_sqr = v.sqr().to_concrete();
-    let sum_sq = v_sqr.sum_keepdim::<1>(1);
-    v.div_(&(sum_sq + 1e-12f32).to_concrete().sqrt())
+fn normalize_l2(v: &Tensor<2>) -> Tensor<2> {
+    let sum_sq = v.sqr().sum_keepdim(1);
+    v.div_(&sum_sq.add_scalar(1e-12f32).sqrt())
 }

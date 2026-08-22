@@ -1,0 +1,15 @@
+[package]
+name = "fusor-autograd"
+description = "fusor reverse mode as an L0 -> L0 transform; seven adjoint entries"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+fusor-ir.workspace = true
+smallvec.workspace = true
+rustc-hash.workspace = true
+half.workspace = true

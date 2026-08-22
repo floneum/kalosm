@@ -23,4 +23,4 @@ MESA_SHADER_CACHE_DISABLE=1 \
   WGPU_ADAPTER_NAME=llvmpipe \
   FUSOR_CONFORMANCE_REQUIRE_GPU=1 \
   RUST_MIN_STACK=16777216 \
-  cargo test -p fusor-conformance "$@"
+  cargo run --manifest-path fusor/Cargo.toml -p fusor-conformance -- "$@"

@@ -1,27 +1,24 @@
+use fusor::cache::MaskKind;
 use fusor::layers::Linear;
-use fusor::{Device, VarBuilder};
-use fusor::{Result, Tensor};
+use fusor::{Device, Dim, Result, Tensor, VarBuilder};
+
+use super::{additive_key_mask, load_linear};
 
 pub(crate) struct BertSelfAttention {
-    query: Linear<f32>,
-    key: Linear<f32>,
-    value: Linear<f32>,
+    query: Linear,
+    key: Linear,
+    value: Linear,
     num_attention_heads: usize,
     attention_head_size: usize,
     span: tracing::Span,
-    span_softmax: tracing::Span,
 }
 
 impl BertSelfAttention {
-    pub(crate) fn load(
-        device: &Device,
-        vb: &mut VarBuilder,
-        config: &super::Config,
-    ) -> Result<Self> {
+    pub(crate) fn load(device: &Device, vb: &VarBuilder, config: &super::Config) -> Result<Self> {
         let attention_head_size = config.hidden_size / config.num_attention_heads;
-        let query = Linear::load(device, &mut vb.pp("attn_q"))?;
-        let value = Linear::load(device, &mut vb.pp("attn_v"))?;
-        let key = Linear::load(device, &mut vb.pp("attn_k"))?;
+        let query = load_linear(&vb.pp("attn_q"), device)?;
+        let value = load_linear(&vb.pp("attn_v"), device)?;
+        let key = load_linear(&vb.pp("attn_k"), device)?;
         Ok(Self {
             query,
             key,
@@ -29,69 +26,47 @@ impl BertSelfAttention {
             num_attention_heads: config.num_attention_heads,
             attention_head_size,
             span: tracing::span!(tracing::Level::TRACE, "self-attn"),
-            span_softmax: tracing::span!(tracing::Level::TRACE, "softmax"),
         })
     }
 
-    pub(crate) fn transpose_for_scores(&self, xs: &Tensor<3, f32>) -> Tensor<4, f32> {
-        let shape = xs.shape();
-        let new_x_shape = [
-            shape[0],
-            shape[1],
-            self.num_attention_heads,
-            self.attention_head_size,
-        ];
-
-        xs.reshape(new_x_shape).transpose(1, 2).to_concrete()
+    /// `[batch, seq, hidden] -> [batch, heads, seq, head_dim]`.
+    fn transpose_for_scores(&self, xs: &Tensor<3>) -> Tensor<4> {
+        let [batch, seq, _] = xs.extents();
+        xs.reshape_dims([
+            batch,
+            seq,
+            Dim::Const(self.num_attention_heads as u64),
+            Dim::Const(self.attention_head_size as u64),
+        ])
+        .transpose(1, 2)
     }
 
     pub(crate) fn forward(
         &self,
-        hidden_states: &Tensor<3, f32>,
+        hidden_states: &Tensor<3>,
         attention_mask: Option<&Tensor<2, u32>>,
-    ) -> Tensor<3, f32> {
+    ) -> Tensor<3> {
         let _enter = self.span.enter();
         let scale = 1.0 / (self.attention_head_size as f32).sqrt();
-        let query_layer = self.query.forward(hidden_states);
-        let key_layer = self.key.forward(hidden_states);
-        let value_layer = self.value.forward(hidden_states);
+        let query_layer = self.transpose_for_scores(&self.query.forward(hidden_states));
+        let key_layer = self.transpose_for_scores(&self.key.forward(hidden_states));
+        let value_layer = self.transpose_for_scores(&self.value.forward(hidden_states));
 
-        let query_layer = self.transpose_for_scores(&query_layer);
-        let key_layer = self.transpose_for_scores(&key_layer);
-        let value_layer = self.transpose_for_scores(&value_layer);
-
-        let context_layer = if let Some(attention_mask) = attention_mask {
-            let attention_scores = query_layer.mat_mul(&key_layer.t());
-            let mut attention_scores = attention_scores.mul_scalar(scale);
-
-            // If there is an attention mask, filter the attention scores by that mask
-            // The attention mask is a tensor of shape (bsize, seq_len)
-            // the attention scores are a tensor of shape (bsize, _, seq_len, seq_len)
-            // We expand the attention mask to (bsize, 1, 1, seq_len)
-            let mask = attention_mask
-                .unsqueeze::<3>(1)
-                .unsqueeze::<4>(2)
-                .to_concrete();
-            let shape = attention_scores.shape();
-            let mask: Tensor<4, f32> = mask.broadcast_as::<4>(shape).to_concrete().cast();
-            // We use a value slightly larger that the true f32 min value to avoid NaN
-            const FALSE_MIN: f32 = -3.4028235e34f32;
-            let device = attention_scores.device();
-            let on_false = Tensor::splat(&device, FALSE_MIN, shape);
-            attention_scores = mask.where_cond(&attention_scores, &on_false);
-
-            let _enter_sm = self.span_softmax.enter();
-            let attention_probs = attention_scores.softmax_last_dim::<3>();
-            attention_probs.mat_mul(&value_layer)
-        } else {
-            query_layer.flash_attention(&key_layer, &value_layer, scale, None)
+        let context_layer = match attention_mask {
+            Some(attention_mask) => {
+                // `[batch, key]` validity mask as an additive batch-key mask.
+                let mask = additive_key_mask(attention_mask);
+                query_layer.attention_masked(
+                    &key_layer,
+                    &value_layer,
+                    MaskKind::BatchKeyMask,
+                    Some(&mask),
+                    Some(scale),
+                )
+            }
+            None => query_layer.attention(&key_layer, &value_layer, MaskKind::None, Some(scale)),
         };
-        let context_layer = context_layer.transpose(1, 2).to_concrete();
-        context_layer.flatten_last_n::<1, _>()
+        // `[batch, heads, seq, head_dim] -> [batch, seq, hidden]`.
+        context_layer.transpose(1, 2).flatten_last_n(1)
     }
 }
-
-// attention_probs before matmul: Tensor[dims 3, 12, 13, 13; f32]
-// value_layer before matmul: Tensor[dims 3, 12, 13, 32; f32]
-// context_layer after matmul: Tensor[dims 3, 12, 13, 32; f32]
-// context_layer after change: Tensor[dims 3, 13, 384; f32]

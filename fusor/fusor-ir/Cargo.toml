@@ -1,0 +1,16 @@
+[package]
+name = "fusor-ir"
+description = "fusor shared contracts: three IR levels, the acyclic e-graph, the rule language"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+# No wgpu, no SIMD, no device access, no filesystem.
+[dependencies]
+smallvec.workspace = true
+rustc-hash.workspace = true
+fixedbitset.workspace = true
+half.workspace = true
