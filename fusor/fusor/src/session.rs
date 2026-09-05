@@ -150,6 +150,14 @@ impl Backend {
         }
     }
 
+    /// Release every kernel compiled for graph `arena`; called when the
+    /// graph is dropped. See `GpuTarget::release_arena`.
+    pub(crate) fn release_arena(&self, arena: u64) {
+        if let Self::Gpu(t) = self {
+            t.release_arena(arena);
+        }
+    }
+
     /// The reason the GPU device was lost, once the driver has reported it.
     /// Always `None` on the CPU.
     pub fn device_lost(&self) -> Option<String> {

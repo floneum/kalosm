@@ -21,6 +21,20 @@ fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Everything after the flags is a case-name substring filter.
     let filter = args.iter().find(|a| !a.starts_with("--")).cloned();
+    // `--shard I/N` runs every Nth matching case starting at I, so one suite
+    // can be spread over N runners.
+    let shard = args
+        .iter()
+        .find_map(|a| a.strip_prefix("--shard="))
+        .map(|spec| {
+            let (i, n) = spec
+                .split_once('/')
+                .expect("--shard takes I/N, e.g. --shard=0/3");
+            let i: usize = i.parse().expect("--shard index is a number");
+            let n: usize = n.parse().expect("--shard count is a number");
+            assert!(n > 0 && i < n, "--shard index must be below the count");
+            (i, n)
+        });
 
     let devices = sessions();
     if devices.is_empty() {
@@ -34,13 +48,22 @@ fn main() -> ExitCode {
     // for watching a run that is slow or growing rather than reading its
     // summary afterwards. The summary below is unchanged.
     let progress = std::env::var_os("FUSOR_CONFORMANCE_PROGRESS").is_some();
-    let reports = match &filter {
-        Some(f) => harness::Harness::with_filter(f.clone()).run(),
-        None => harness::run_all(|r| {
+    let reports = match (&filter, shard) {
+        (None, None) => harness::run_all(|r| {
             if progress {
                 eprintln!("[progress] {} [{}]", r.case, r.backend);
             }
         }),
+        (f, shard) => {
+            let mut h = match f {
+                Some(f) => harness::Harness::with_filter(f.clone()),
+                None => harness::Harness::new(),
+            };
+            if let Some((i, n)) = shard {
+                h = h.sharded(i, n);
+            }
+            h.run()
+        }
     };
     let failures = harness::summarize(&reports);
 

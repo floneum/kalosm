@@ -66,6 +66,12 @@ pub fn dispatches_per_submit(total: usize, backend: wgpu::Backend) -> usize {
     }
 }
 
+/// `FUSOR_TRACE_DISPATCH`, read once.
+fn trace_dispatch() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FUSOR_TRACE_DISPATCH").is_some())
+}
+
 /// One kernel's aggregated timing across a resolve.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KernelProfileRow {
@@ -437,7 +443,16 @@ impl Launcher {
             .iter()
             .filter(|r| matches!(r, CommandRecord::Dispatch { .. }))
             .count();
-        let per_submit = dispatches_per_submit(total, self.backend);
+        // `FUSOR_TRACE_DISPATCH` runs one dispatch per submission and waits
+        // for each, naming the kernel and whether the device survived it —
+        // the only way to attribute a driver-side device loss to a kernel,
+        // since the loss is reported asynchronously and after the fact.
+        let trace = trace_dispatch();
+        let per_submit = if trace {
+            1
+        } else {
+            dispatches_per_submit(total, self.backend)
+        };
 
         let mut dispatch_ix = 0usize;
         let mut chunk: Vec<&CommandRecord> = Vec::new();
@@ -458,6 +473,17 @@ impl Launcher {
             if dispatches_in_chunk >= per_submit {
                 let (ix, submitted) =
                     self.encode_one_submit(&chunk, timestamps, mode, dispatch_ix, total)?;
+                if trace {
+                    let poll = self.device.poll(wgpu::PollType::wait_indefinitely());
+                    let state = match (&poll, self.lost.reason()) {
+                        (_, Some(reason)) => format!("LOST ({reason})"),
+                        (Err(e), None) => format!("poll error: {e}"),
+                        (Ok(_), None) => "ok".to_string(),
+                    };
+                    if let CommandRecord::Dispatch { name, grid, .. } = record {
+                        eprintln!("[trace] dispatch {name} grid={grid:?} -> {state}");
+                    }
+                }
                 dispatch_ix = ix;
                 chunk.clear();
                 dispatches_in_chunk = 0;

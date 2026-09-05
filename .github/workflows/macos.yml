@@ -72,7 +72,7 @@ jobs:
           cache-on-failure: "true"
       - name: Build test archives and the conformance binary
         run: |
-          cargo nextest archive --cargo-profile ci --all --lib --bins --tests \
+          cargo nextest archive --cargo-profile ci --workspace --lib --bins --tests \
             --features $FEATURES --archive-file root-tests.tar.zst
           cargo nextest archive --cargo-profile ci --manifest-path fusor/Cargo.toml --workspace \
             --lib --bins --tests --examples --archive-file fusor-tests.tar.zst
@@ -119,11 +119,14 @@ jobs:
       fail-fast: false
       matrix:
         shard:
-          - { name: core, suites: "smoke:: elementwise:: reductions:: multi_slot:: views:: indexing_scatter:: dtypes::" }
-          - { name: matmul, suites: "matmul:: conv_pool::" }
-          - { name: layers, suites: "normalization:: attention_rope:: layers:: backward::" }
-          - { name: quantized, suites: "quantized::" }
-          - { name: sampling, suites: "sampling::" }
+          - { name: core, suites: "smoke:: elementwise:: reductions:: multi_slot:: views:: indexing_scatter:: dtypes::", args: "" }
+          - { name: matmul, suites: "matmul:: conv_pool::", args: "" }
+          - { name: norm-layers, suites: "normalization:: layers::", args: "" }
+          - { name: attention-backward, suites: "attention_rope:: backward::", args: "" }
+          - { name: quantized, suites: "quantized::", args: "" }
+          - { name: sampling-0, suites: "sampling::", args: "--shard=0/3" }
+          - { name: sampling-1, suites: "sampling::", args: "--shard=1/3" }
+          - { name: sampling-2, suites: "sampling::", args: "--shard=2/3" }
     steps:
       - uses: actions/download-artifact@v4
         with:
@@ -135,5 +138,5 @@ jobs:
         run: |
           chmod +x bin/fusor-conformance
           for suite in ${{ matrix.shard.suites }}; do
-            bin/fusor-conformance "$suite"
+            bin/fusor-conformance "$suite" ${{ matrix.shard.args }}
           done

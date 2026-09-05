@@ -1312,6 +1312,31 @@ impl GpuTarget {
         self.sweep_unreferenced();
     }
 
+    /// Forget every compiled kernel that belonged to graph `arena`.
+    ///
+    /// Artifact keys carry the arena of the graph they were lowered for, so
+    /// a dropped graph's kernels can never be looked up again; until this
+    /// runs they only wait for an LRU sized for a whole model to push them
+    /// out, and a process that resolves many short-lived graphs keeps every
+    /// pipeline it ever built.
+    pub fn release_arena(&self, arena: u64) {
+        let popped = {
+            let mut artifacts = self.artifacts.lock();
+            let dead: Vec<ArtifactKey> = artifacts
+                .iter()
+                .filter(|(k, _)| k.arena == arena)
+                .map(|(k, _)| *k)
+                .collect();
+            for k in &dead {
+                artifacts.pop(k);
+            }
+            !dead.is_empty()
+        };
+        if popped {
+            self.sweep_unreferenced();
+        }
+    }
+
     /// Drop pipelines and bind groups no artifact entry references.
     fn sweep_unreferenced(&self) {
         let live: FxHashSet<u64> = self

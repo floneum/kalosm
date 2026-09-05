@@ -583,20 +583,33 @@ pub fn run_all(mut progress: impl FnMut(&Report)) -> Vec<Report> {
 }
 
 /// Runs cases against one or both backends, optionally filtered by a
-/// substring of the case name.
+/// substring of the case name and cut into round-robin shards.
 pub struct Harness {
     pub filter: Option<String>,
+    /// `(index, count)`: of the cases the filter keeps, run every `count`th
+    /// one starting at `index`. Registry order is fixed, so the shards of
+    /// one binary partition its cases exactly.
+    pub shard: Option<(usize, usize)>,
 }
 
 impl Harness {
     pub fn new() -> Self {
-        Self { filter: None }
+        Self {
+            filter: None,
+            shard: None,
+        }
     }
 
     pub fn with_filter(filter: impl Into<String>) -> Self {
         Self {
             filter: Some(filter.into()),
+            shard: None,
         }
+    }
+
+    pub fn sharded(mut self, index: usize, count: usize) -> Self {
+        self.shard = Some((index, count));
+        self
     }
 
     fn matches(&self, name: &str) -> bool {
@@ -608,7 +621,14 @@ impl Harness {
         let registry = crate::suite::registry();
         let sessions = sessions();
         let mut out = Vec::new();
-        for case in registry.iter().filter(|c| self.matches(&c.name)) {
+        let (index, count) = self.shard.unwrap_or((0, 1));
+        for case in registry
+            .iter()
+            .filter(|c| self.matches(&c.name))
+            .enumerate()
+            .filter(|(i, _)| i % count == index)
+            .map(|(_, c)| c)
+        {
             for session in &sessions {
                 let _guard = is_gpu(session).then(gpu_test_guard);
                 out.push(Report {

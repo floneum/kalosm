@@ -68,6 +68,15 @@ pub(crate) struct SymbolStore {
 }
 
 /// The mutable graph state behind a [`GraphRef`].
+/// A graph's kernels are keyed by its arena on the target; once the graph is
+/// gone nothing can reach them, so they go with it.
+impl Drop for GraphInner {
+    fn drop(&mut self) {
+        let arena = self.egraph.get_mut().arena_id();
+        self.session.device().release_arena(arena);
+    }
+}
+
 pub(crate) struct GraphInner {
     pub(crate) egraph: Mutex<EGraph>,
     pub(crate) session: Session,
