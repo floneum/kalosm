@@ -11,7 +11,28 @@ use std::process::ExitCode;
 
 use fusor_conformance::harness::{self, Outcome, sessions};
 
+/// Prints every `log` record at warn level or above to stderr. wgpu reports
+/// the driver's actual failure — the DX12 HRESULT behind a lost device, a
+/// D3D12 debug-layer message — only through `log`, and without a logger it
+/// is discarded and the run shows nothing but "Device is lost".
+struct StderrLog;
+
+impl log::Log for StderrLog {
+    fn enabled(&self, metadata: &log::Metadata) -> bool {
+        metadata.level() <= log::Level::Warn
+    }
+    fn log(&self, record: &log::Record) {
+        if self.enabled(record.metadata()) {
+            eprintln!("[{} {}] {}", record.level(), record.target(), record.args());
+        }
+    }
+    fn flush(&self) {}
+}
+
+static LOGGER: StderrLog = StderrLog;
+
 fn main() -> ExitCode {
+    let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
     // Race every class member of every launch, value-checking each against
     // the selected plan, so a case covers the *class* rather than whichever
     // member extraction happened to pick.

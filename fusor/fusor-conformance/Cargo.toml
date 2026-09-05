@@ -18,6 +18,7 @@ fusor-gguf.workspace = true
 rustc-hash.workspace = true
 fixedbitset.workspace = true
 half.workspace = true
+log = "0.4"
 
 [[bin]]
 name = "fusor-conformance"

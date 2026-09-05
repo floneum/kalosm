@@ -394,6 +394,7 @@ dependencies = [
  "fusor-ir",
  "fusor-tile",
  "half",
+ "log",
  "rustc-hash 2.1.3",
 ]
 
