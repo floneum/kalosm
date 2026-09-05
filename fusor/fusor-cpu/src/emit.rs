@@ -1530,15 +1530,15 @@ mod tests {
             "a barrier must cut the lane loop in two"
         );
         assert!(
-            art.prog.width >= 8 && BLOCK % art.prog.width == 0,
+            art.prog.width >= 8 && BLOCK.is_multiple_of(art.prog.width),
             "the block must split into whole lane chunks (W = {})",
             art.prog.width
         );
 
         let got = run_f32(&ir, &[], BLOCK as usize);
-        for i in 0..BLOCK as usize {
+        for (i, &lane) in got.iter().enumerate().take(BLOCK as usize) {
             assert_eq!(
-                got[i],
+                lane,
                 (BLOCK as usize - 1 - i) as f32,
                 "lane {i} read a stale tile slot: a no-op barrier would leave \
                  every lane past the first chunk reading zeros"
@@ -1650,7 +1650,7 @@ mod tests {
         };
 
         let data: Vec<f32> = (0..64).map(|i| i as f32).collect();
-        let got = run_f32(&ir, &[data.clone()], 32);
+        let got = run_f32(&ir, std::slice::from_ref(&data), 32);
         for k in 0..8usize {
             assert_eq!(got[k], data[k], "contiguous lane {k}");
             assert_eq!(got[8 + k], data[3], "broadcast lane {k}");
@@ -1727,7 +1727,7 @@ mod tests {
         };
 
         let data: Vec<f32> = (0..LANES).map(|i| i as f32 + 0.5).collect();
-        let got = run_f32(&ir, &[data.clone()], LANES as usize);
+        let got = run_f32(&ir, std::slice::from_ref(&data), LANES as usize);
         assert_eq!(got, data, "every lane of the selected vector must survive");
     }
 
@@ -1807,11 +1807,11 @@ mod tests {
                 )
                 .unwrap();
             let ab = outb.downcast_ref::<AlignedBuf>().unwrap();
-            for i in 0..n as usize {
+            for (i, &val) in vals.iter().enumerate().take(n as usize) {
                 let raw = u16::from_le_bytes([ab.as_slice()[i * 2], ab.as_slice()[i * 2 + 1]]);
                 let x = match elem {
-                    ScalarElement::F16 => half::f16::from_bits(to_bits(vals[i]) as u16).to_f32(),
-                    _ => half::bf16::from_bits(to_bits(vals[i]) as u16).to_f32(),
+                    ScalarElement::F16 => half::f16::from_bits(to_bits(val) as u16).to_f32(),
+                    _ => half::bf16::from_bits(to_bits(val) as u16).to_f32(),
                 };
                 let want = to_bits(expr::expf(x)) as u16;
                 assert_eq!(raw, want, "{elem:?} element {i}");
@@ -2153,8 +2153,8 @@ mod tests {
             name: "det",
         };
         let data: Vec<f32> = (0..N).map(|i| (i as f32) * 0.001 - 2.0).collect();
-        let a = run_f32(&ir, &[data.clone()], N as usize);
-        let b = run_f32(&ir, &[data.clone()], N as usize);
+        let a = run_f32(&ir, std::slice::from_ref(&data), N as usize);
+        let b = run_f32(&ir, std::slice::from_ref(&data), N as usize);
         assert_eq!(a, b, "two runs over the same pool must be bit-identical");
         for i in 0..N as usize {
             assert_eq!(a[i], expr::tanhf(data[i]), "element {i}");
@@ -2247,8 +2247,8 @@ mod tests {
             name: "divergent",
         };
         let got = run_f32(&ir, &[], BLOCK as usize);
-        for i in 0..BLOCK as usize {
-            assert_eq!(got[i], if i % 2 == 0 { 1.0 } else { -1.0 }, "lane {i}");
+        for (i, &lane) in got.iter().enumerate().take(BLOCK as usize) {
+            assert_eq!(lane, if i % 2 == 0 { 1.0 } else { -1.0 }, "lane {i}");
         }
     }
     /// **Loop accumulators step simultaneously.**

@@ -118,10 +118,10 @@ impl CoopShape {
         let n_passes = geom.n_passes.max(1);
         let rg = geom.rg.max(1);
         let cg = geom.cg.max(1);
-        let ok = geom.bn % n_passes == 0
-            && geom.bk % dim == 0
-            && geom.bm % (dim * rg) == 0
-            && (geom.bn / n_passes) % (dim * cg) == 0;
+        let ok = geom.bn.is_multiple_of(n_passes)
+            && geom.bk.is_multiple_of(dim)
+            && geom.bm.is_multiple_of(dim * rg)
+            && (geom.bn / n_passes).is_multiple_of(dim * cg);
         if !ok {
             return Err(Error::Plan(format!(
                 "coop geometry {geom:?} does not tile into {dim}-sided fragments"
@@ -823,6 +823,7 @@ fn source_element(src: &Source) -> ScalarElement {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn stage_operand_tile(
     ctx: &mut Ctx<'_>,
     body: &mut Vec<Stmt>,
@@ -1536,7 +1537,7 @@ fn lower_sgemv_subgroup_cols(
     // verify_launch rejects uneven spreads. A device where either fails has no
     // such point to select, so reaching here with one is a plan error.
     let block = subgroups * width;
-    if p.cols % subgroups != 0
+    if !p.cols.is_multiple_of(subgroups)
         || block > ctx.caps.limits.max_compute_invocations_per_workgroup
         || !ctx.caps.subgroups.is_some_and(|s| s.is_fixed())
     {
@@ -1549,7 +1550,10 @@ fn lower_sgemv_subgroup_cols(
     let parts = p.parts.max(1);
     let run = p.run().max(1);
     if parts > 1
-        && (p.vector % parts != 0 || p.gap % run != 0 || p.gap <= run || (width * run) % p.gap != 0)
+        && (!p.vector.is_multiple_of(parts)
+            || !p.gap.is_multiple_of(run)
+            || p.gap <= run
+            || !(width * run).is_multiple_of(p.gap))
     {
         return Err(Error::Plan(format!(
             "sgemv parts={parts} gap={} does not tile a width-{width} pass",
@@ -1641,8 +1645,8 @@ fn lower_sgemv_subgroup_cols(
     // Same constant-true routing as the whole-workgroup path: an exact k
     // keeps the unclamped straight-line loads and the aligned-window word
     // sharing; an exact n keeps the column loads and stores unmasked.
-    let exact = shape.k.max(1) % (width * vector).max(1) == 0;
-    let col_exact = n % p.cols == 0;
+    let exact = shape.k.max(1).is_multiple_of((width * vector).max(1));
+    let col_exact = n.is_multiple_of(p.cols);
     let n_e = ctx.b.u32(n);
 
     // The pass's activation window, evaluated once and reused by every

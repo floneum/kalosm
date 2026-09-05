@@ -10,6 +10,32 @@ use fusor_ir::error::Error;
 
 use crate::caps::{self, LimitWiden};
 
+/// Whether the wgpu device has been lost, and why.
+///
+/// wgpu reports a lost device only through its device-lost callback: every
+/// later `create_buffer` silently hands back an invalid handle, and every
+/// error of type `DeviceLost` is dropped on the floor. Without recording the
+/// reason here, the first visible symptom is an unrelated validation panic
+/// several calls later ("buffer is invalid", "buffer is already mapped"), on
+/// whichever call happens to touch the wreckage first.
+#[derive(Clone, Default)]
+pub struct LostFlag(std::sync::Arc<parking_lot::Mutex<Option<String>>>);
+
+impl LostFlag {
+    /// The recorded reason, if the device is gone.
+    pub fn reason(&self) -> Option<String> {
+        self.0.lock().clone()
+    }
+
+    /// `Err` naming the loss when the device is gone.
+    pub fn check(&self) -> Result<()> {
+        match self.reason() {
+            Some(reason) => Err(Error::Device(format!("the wgpu device was lost: {reason}"))),
+            None => Ok(()),
+        }
+    }
+}
+
 /// How to acquire a device. `widen` carries the per-field ceilings a caller
 /// has *proved* it needs; everything else stays at the WebGPU baseline.
 #[derive(Clone, Debug, Default)]
@@ -32,6 +58,7 @@ pub struct GpuDevice {
     limits_used: wgpu::Limits,
     features: wgpu::Features,
     adapter_info: wgpu::AdapterInfo,
+    lost: LostFlag,
 }
 
 impl GpuDevice {
@@ -88,6 +115,10 @@ impl GpuDevice {
     pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
         &self.adapter_info
     }
+    /// Set once the driver reports the device lost; see [`LostFlag`].
+    pub fn lost(&self) -> &LostFlag {
+        &self.lost
+    }
 }
 
 /// Pick an adapter, request a device at `baseline ∪ opts.widen`, probe caps.
@@ -135,6 +166,20 @@ pub(crate) async fn request_device(opts: &DeviceOptions) -> Result<GpuDevice> {
         .request_device(&descriptor)
         .await
         .map_err(|e| Error::Device(format!("request_device: {e}")))?;
+    let lost = LostFlag::default();
+    {
+        let lost = lost.clone();
+        device.set_device_lost_callback(move |reason, message| {
+            // `Destroyed` is the orderly teardown of a device nobody uses any
+            // more; only a driver-side loss is worth recording.
+            if reason == wgpu::DeviceLostReason::Destroyed {
+                return;
+            }
+            let text = format!("{reason:?}: {message}");
+            eprintln!("[fusor-gpu] wgpu device lost ({text})");
+            *lost.0.lock() = Some(text);
+        });
+    }
 
     let granted = device.features();
     let coop_props = caps::coop_properties(&adapter);
@@ -159,6 +204,7 @@ pub(crate) async fn request_device(opts: &DeviceOptions) -> Result<GpuDevice> {
         limits_used: limits,
         features: granted,
         adapter_info,
+        lost,
     })
 }
 

@@ -269,6 +269,36 @@ pub struct GpuTarget {
     config: GpuConfig,
 }
 
+// `GpuTarget` is `Send + Sync` by construction — every field is asserted so
+// below — but the impls are spelled out rather than derived. The auto-trait
+// solver otherwise descends through `wgpu::Device` into `wgpu_core`'s
+// mutually recursive resource graph (`Device` → `Queue` → `LifetimeTracker`
+// → `BindGroup` → `Device` …), well over a hundred levels, on top of
+// whatever depth the caller's own types add. A `Send` future holding a
+// `fusor::Session` two or three crates up the stack then dies with
+// `E0275: overflow evaluating the requirement` at the default recursion
+// limit. An explicit impl is where the solver stops.
+//
+// SAFETY: the compile-time assertions in `gpu_target_fields_are_send_sync`
+// hold `Send + Sync` for every field type, which is exactly what the auto
+// impls would have required.
+unsafe impl Send for GpuTarget {}
+unsafe impl Sync for GpuTarget {}
+
+#[allow(dead_code)]
+fn gpu_target_fields_are_send_sync() {
+    fn assert<T: Send + Sync>() {}
+    assert::<Arc<GpuDevice>>();
+    assert::<BufferPool>();
+    assert::<PlanCache>();
+    assert::<parking_lot::Mutex<lru::LruCache<ArtifactKey, ArtifactEntry>>>();
+    assert::<parking_lot::Mutex<lru::LruCache<u128, PipelineSlot>>>();
+    assert::<parking_lot::Mutex<lru::LruCache<String, Artifact>>>();
+    assert::<parking_lot::Mutex<lru::LruCache<u128, VerifySlot>>>();
+    assert::<Launcher>();
+    assert::<GpuConfig>();
+}
+
 impl GpuTarget {
     /// Probe an adapter at WebGPU baseline limits and build the target.
     pub async fn new() -> Result<Self> {
@@ -285,9 +315,10 @@ impl GpuTarget {
         let wgpu_device = Arc::new(device.device().clone());
         let queue = Arc::new(device.queue().clone());
         let backend = device.adapter().get_info().backend;
-        let pool = BufferPool::new(wgpu_device.clone(), queue.clone(), &config);
+        let lost = device.lost().clone();
+        let pool = BufferPool::new(wgpu_device.clone(), queue.clone(), &config, lost.clone());
         let cache = PlanCache::with_facts(device.facts(), config.cache_dir.clone());
-        let launcher = Launcher::new(wgpu_device, queue, backend, config.clone());
+        let launcher = Launcher::new(wgpu_device, queue, backend, config.clone(), lost);
         Ok(Self {
             device,
             pool,
@@ -469,19 +500,11 @@ impl GpuTarget {
         // the reads it records are the caller's, not a lowering's.
         let probe_binding =
             crate::lower::DimBinding::from_pairs(binds.dims.iter().map(|(k, v)| (*k, *v)));
-        for i in 0..queue_len {
-            match self.cached_artifact(
-                plan,
-                graph,
-                &work[i],
-                binds,
-                &probe_binding,
-                &keys,
-                &pack,
-            )? {
+        for (i, item) in work.iter_mut().enumerate().take(queue_len) {
+            match self.cached_artifact(plan, graph, item, binds, &probe_binding, &keys, &pack)? {
                 Some((artifact, grid)) => {
-                    work[i].artifact = Some(artifact);
-                    work[i].grid = grid;
+                    item.artifact = Some(artifact);
+                    item.grid = grid;
                 }
                 None => cold.push(i),
             }
@@ -783,6 +806,7 @@ impl GpuTarget {
     /// when it has to be built.
     ///
     /// `binding` is the resolve's, built once and handed down.
+    #[allow(clippy::too_many_arguments)]
     fn cached_artifact(
         &self,
         plan: &Plan,

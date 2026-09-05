@@ -125,10 +125,10 @@ impl Target for CpuTarget {
         // blocks are 18, 22, 34 and 210 bytes, so this is not a corner case.
         let bytes = bytes.next_multiple_of(4);
         let mut pool = self.pool.lock();
-        if let Some(bucket) = pool.get_mut(&bytes) {
-            if let Some(buffer) = bucket.reusable() {
-                return Ok(buffer);
-            }
+        if let Some(bucket) = pool.get_mut(&bytes)
+            && let Some(buffer) = bucket.reusable()
+        {
+            return Ok(buffer);
         }
         drop(pool);
         let buf = Buf::new(AlignedBuf::zeroed(bytes as usize)?);

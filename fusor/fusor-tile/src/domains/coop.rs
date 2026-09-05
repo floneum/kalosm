@@ -153,12 +153,11 @@ fn generate_geoms(operand: Dtype, cx: &DomainCtx<'_>) -> SmallVec<[CoopGeom; 16]
                                 .planner
                                 .workgroup_bytes(&coop_tiles(geom, stage), caps)
                                 .is_ok_and(|bytes| bytes <= max_bytes)
-                        {
-                            if pin.is_none_or(|(pm, pn, pk)| {
+                            && pin.is_none_or(|(pm, pn, pk)| {
                                 geom.bm == pm && geom.bn == pn && geom.bk == pk
-                            }) {
-                                out.push(geom);
-                            }
+                            })
+                        {
+                            out.push(geom);
                         }
                         n_passes *= 2;
                     }

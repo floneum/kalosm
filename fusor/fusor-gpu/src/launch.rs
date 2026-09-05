@@ -224,6 +224,8 @@ pub struct Launcher {
     /// handles do not hold the buffer, so the pool's `strong_count == 1`
     /// recycling is unaffected.
     bind_groups: Mutex<lru::LruCache<BindGroupKey, BindGroupEntry>>,
+    /// Set by the driver's device-lost callback; every poll checks it.
+    lost: crate::device::LostFlag,
 }
 
 /// What a cached bind group was built from.
@@ -251,12 +253,14 @@ impl Launcher {
         queue: Arc<wgpu::Queue>,
         backend: wgpu::Backend,
         config: GpuConfig,
+        lost: crate::device::LostFlag,
     ) -> Self {
         Self {
             device,
             queue,
             backend,
             config,
+            lost,
             in_flight: AtomicUsize::new(0),
             poll_waits: AtomicU64::new(0),
             dispatches: AtomicU64::new(0),
@@ -338,7 +342,7 @@ impl Launcher {
         if bytes.is_empty() {
             bytes.extend_from_slice(&0u32.to_le_bytes());
         }
-        while bytes.len() as u64 % wgpu::COPY_BUFFER_ALIGNMENT != 0 {
+        while !(bytes.len() as u64).is_multiple_of(wgpu::COPY_BUFFER_ALIGNMENT) {
             bytes.push(0);
         }
         if bytes.len() as u64 > gpu.size {
@@ -651,7 +655,17 @@ impl Launcher {
     }
 
     /// Spin in `Poll` mode for [`POLL_SPIN`], then block.
+    ///
+    /// A lost device is reported as an error naming the loss, both before
+    /// and after polling: wgpu itself turns a poll on a lost device into a
+    /// fatal panic that never says why the device went away.
     pub fn poll_wait(&self) -> Result<()> {
+        self.lost.check()?;
+        self.poll_wait_inner()?;
+        self.lost.check()
+    }
+
+    fn poll_wait_inner(&self) -> Result<()> {
         self.poll_waits.fetch_add(1, Ordering::Relaxed);
         let __w = Instant::now();
         let _g = scopeguard(move || {
@@ -680,6 +694,26 @@ impl Launcher {
     pub fn readback(&self, pool: &BufferPool, src: &Buf, bytes: u64) -> Result<Vec<u8>> {
         let bytes = crate::pool::padded_copy_size(bytes);
         let staging = pool.alloc_with_usage(bytes, READBACK_USAGE)?;
+        match self.readback_into(src, &staging, bytes) {
+            Ok(out) => {
+                pool.recycle(staging);
+                Ok(out)
+            }
+            Err(e) => {
+                // Any exit between `map_async` and `unmap` leaves the buffer
+                // marked mapped on the wgpu side, and `unmap` on a buffer
+                // whose map never completed is itself a validation error. The
+                // buffer is not reusable in any state we can name, so it
+                // leaves the pool.
+                pool.discard(staging);
+                Err(e)
+            }
+        }
+    }
+
+    /// Copy `src` into `staging`, map it, and return the bytes. On `Ok` the
+    /// staging buffer is unmapped again; on `Err` its map state is unknown.
+    fn readback_into(&self, src: &Buf, staging: &Buf, bytes: u64) -> Result<Vec<u8>> {
         {
             let record = CommandRecord::CopyBuffer {
                 src: src.clone(),
@@ -700,11 +734,19 @@ impl Launcher {
         });
         self.poll_wait()?;
         rx.recv()
-            .map_err(|_| Error::Device("readback callback never fired".into()))?
+            .map_err(|_| {
+                // wgpu drops the callback unfired when it rejects the map
+                // outright, which on a lost device it does without a word.
+                match self.lost.reason() {
+                    Some(reason) => Error::Device(format!(
+                        "readback map rejected: the wgpu device was lost: {reason}"
+                    )),
+                    None => Error::Device("readback callback never fired".into()),
+                }
+            })?
             .map_err(|e| Error::Device(format!("buffer map failed: {e}")))?;
         let out = slice.get_mapped_range().to_vec();
         gpu.buffer.unmap();
-        pool.recycle(staging);
         Ok(out)
     }
 

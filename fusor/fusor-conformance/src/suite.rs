@@ -182,12 +182,17 @@ pub mod support {
 
     /// Forward against a host reference, then backward against central
     /// differences. The shape every elementwise case takes.
+    /// `gpu_forward_tol` replaces the F32 `(absolute, relative)` bound for
+    /// the forward comparison on the GPU only, for an op whose driver
+    /// implementation is a documented approximation; the adjoint check keeps
+    /// its own bound.
     pub fn check_unary(
         session: &Session,
         shape: &[u64],
         data: &[f32],
         build: &dyn Fn(&Tensor) -> fusor::Result<Tensor>,
         reference: &dyn Fn(f32) -> f32,
+        gpu_forward_tol: Option<(f32, f32)>,
     ) -> CaseResult {
         let dimv = dims(shape);
         let graph = graph_of(session);
@@ -196,7 +201,18 @@ pub mod support {
 
         let actual = read(&y)?;
         let expected: Vec<f32> = data.iter().copied().map(reference).collect();
-        expect_values(session, shape, Dtype::F32, &actual, &expected)?;
+        match gpu_forward_tol.filter(|_| crate::harness::is_gpu(session)) {
+            Some((abs, rel)) => {
+                let usize_shape: Vec<usize> = shape.iter().map(|n| *n as usize).collect();
+                compare::approx_or_relative_compare(abs, rel)(
+                    "gpu",
+                    &usize_shape,
+                    &expected,
+                    &actual,
+                )?;
+            }
+            None => expect_values(session, shape, Dtype::F32, &actual, &expected)?,
+        }
 
         let analytic = gradient_of(&graph, &y, &x)?;
         let usize_shape: Vec<usize> = shape.iter().map(|n| *n as usize).collect();
@@ -225,10 +241,11 @@ pub mod support {
         domain: Domain,
         build: UnaryOp,
         reference: fn(f32) -> f32,
+        gpu_forward_tol: Option<(f32, f32)>,
     ) -> Case {
         fuzz_case(area, name, spec, move |session, shape, seed| {
             let data = domain.sample(seed, dense_len(&dims(shape)));
-            check_unary(session, shape, &data, &build, &reference)
+            check_unary(session, shape, &data, &build, &reference, gpu_forward_tol)
         })
     }
 

@@ -168,6 +168,7 @@ fn split_heads(x: &Tensor<3>, heads: usize, head_dim: usize) -> Tensor<4> {
 }
 
 impl SeparateAttention {
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         num_heads: usize,
@@ -226,6 +227,7 @@ pub struct GroupedAttention {
 }
 
 impl GroupedAttention {
+    #[allow(clippy::too_many_arguments)]
     fn forward(
         &self,
         num_heads: usize,
@@ -349,7 +351,7 @@ impl LlamaAttention {
         // A prefill on a sliding-window layer evicts after attention: the
         // materialized mask already bounded what each query saw.
         if q_len > 1 {
-            if let (Some(window), Some(cache)) = (self.sliding_window_size, cache.as_deref_mut()) {
+            if let (Some(window), Some(cache)) = (self.sliding_window_size, cache) {
                 if !cache.is_fixed() {
                     cache.keep_last(window as u64);
                 }

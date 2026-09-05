@@ -135,7 +135,7 @@ pub(crate) fn map_view(b: &Builder<'_>, id: Id) -> Option<MapView> {
         Op::Launch(Launch::Map {
             space, body, ops, ..
         }) => Some(MapView { space, body, ops }),
-        Op::Logical(Logical::Map { expr, ins, outs }) if outs == 1 => {
+        Op::Logical(Logical::Map { expr, ins, outs: 1 }) => {
             let space = IndexSpace::new(b.facts_of(id).shape.iter().copied());
             let ops = ins
                 .iter()

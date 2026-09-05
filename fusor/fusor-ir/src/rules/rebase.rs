@@ -665,7 +665,7 @@ fn hoist_outward(
                 }
             }
             let m = match_h(&matched, row, &is_invariant)?;
-            if m.c.as_ref().is_some_and(|c| reads_any_index(c)) {
+            if m.c.as_ref().is_some_and(reads_any_index) {
                 return None;
             }
             Some((peels, m))

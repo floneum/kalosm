@@ -1556,16 +1556,16 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
             // the mask's top, so the AND distributes over the sum.
             if m < u32::MAX && (m + 1).is_power_of_two() {
                 let s = (m + 1).trailing_zeros();
-                if let Some((a, c)) = top_literal_add(masked) {
-                    if low_max(&a, s) + u128::from(c & m) <= u128::from(m) {
-                        let anded = with(TileExprKind::Binary {
-                            op: TileBinaryOp::BitAnd,
-                            left: a,
-                            right: lit(m),
-                            numeric: *numeric,
-                        });
-                        return simplify_index(&add(anded, c & m));
-                    }
+                if let Some((a, c)) = top_literal_add(masked)
+                    && low_max(&a, s) + u128::from(c & m) <= u128::from(m)
+                {
+                    let anded = with(TileExprKind::Binary {
+                        op: TileBinaryOp::BitAnd,
+                        left: a,
+                        right: lit(m),
+                        numeric: *numeric,
+                    });
+                    return simplify_index(&add(anded, c & m));
                 }
             }
         }
@@ -1584,40 +1584,43 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
                     return simplify_index(&add(divided, c / d));
                 }
             }
-            if let (Some((a, c)), Some(d)) = (top_literal_add(left), lit_u32(right)) {
-                if d.is_power_of_two() && d > 1 {
-                    let s = d.trailing_zeros();
-                    if low_max(&a, s) + u128::from(c % d) < u128::from(d) {
-                        let divided = with(TileExprKind::Binary {
-                            op: TileBinaryOp::Div,
-                            left: a,
-                            right: lit(d),
-                            numeric: *numeric,
-                        });
-                        return simplify_index(&add(divided, c / d));
-                    }
+            if let (Some((a, c)), Some(d)) = (top_literal_add(left), lit_u32(right))
+                && d.is_power_of_two()
+                && d > 1
+            {
+                let s = d.trailing_zeros();
+                if low_max(&a, s) + u128::from(c % d) < u128::from(d) {
+                    let divided = with(TileExprKind::Binary {
+                        op: TileBinaryOp::Div,
+                        left: a,
+                        right: lit(d),
+                        numeric: *numeric,
+                    });
+                    return simplify_index(&add(divided, c / d));
                 }
             }
         }
         TileBinaryOp::Rem => {
-            if let (Some((a, c)), Some(d)) = (carry_free_add(left), lit_u32(right)) {
-                if d.is_power_of_two() && u64::from(d) <= (1u64 << known_zero_low_bits(&a)) {
-                    // `a % d = 0` outright: the alignment covers `d`.
-                    return lit(c % d);
-                }
+            if let (Some((a, c)), Some(d)) = (carry_free_add(left), lit_u32(right))
+                && d.is_power_of_two()
+                && u64::from(d) <= (1u64 << known_zero_low_bits(&a))
+            {
+                // `a % d = 0` outright: the alignment covers `d`.
+                return lit(c % d);
             }
-            if let (Some((a, c)), Some(d)) = (top_literal_add(left), lit_u32(right)) {
-                if d.is_power_of_two() && d > 1 {
-                    let s = d.trailing_zeros();
-                    if low_max(&a, s) + u128::from(c % d) < u128::from(d) {
-                        let reduced = with(TileExprKind::Binary {
-                            op: TileBinaryOp::Rem,
-                            left: a,
-                            right: lit(d),
-                            numeric: *numeric,
-                        });
-                        return simplify_index(&add(reduced, c % d));
-                    }
+            if let (Some((a, c)), Some(d)) = (top_literal_add(left), lit_u32(right))
+                && d.is_power_of_two()
+                && d > 1
+            {
+                let s = d.trailing_zeros();
+                if low_max(&a, s) + u128::from(c % d) < u128::from(d) {
+                    let reduced = with(TileExprKind::Binary {
+                        op: TileBinaryOp::Rem,
+                        left: a,
+                        right: lit(d),
+                        numeric: *numeric,
+                    });
+                    return simplify_index(&add(reduced, c % d));
                 }
             }
         }

@@ -97,6 +97,15 @@ impl Backend {
         }
     }
 
+    /// The reason the GPU device was lost, once the driver has reported it.
+    /// Always `None` on the CPU.
+    pub fn device_lost(&self) -> Option<String> {
+        match self {
+            Self::Cpu(_) => None,
+            Self::Gpu(t) => t.device().lost().reason(),
+        }
+    }
+
     /// The backend name, either `"cpu"` or `"gpu"`.
     pub fn name(&self) -> &'static str {
         match self {
@@ -1239,10 +1248,27 @@ impl Session {
             };
             for (label, candidate) in variants {
                 let candidate = Arc::new(candidate);
-                let Ok(Some(sample)) =
-                    self.timed_run(guard, graph, &candidate, values, repetitions)
-                else {
-                    continue;
+                let sample = match self.timed_run(guard, graph, &candidate, values, repetitions) {
+                    Ok(Some(sample)) => sample,
+                    // A candidate this device cannot build or read is not a
+                    // wrong answer; it is skipped. A candidate that took the
+                    // device down is a different matter: nothing after it
+                    // can run, and the name of the kernel is the whole
+                    // diagnosis.
+                    outcome => {
+                        if let Some(reason) = self.inner.device.device_lost() {
+                            let detail = match outcome {
+                                Err(e) => format!(" ({e})"),
+                                Ok(None) => String::new(),
+                                Ok(Some(_)) => unreachable!(),
+                            };
+                            return Err(Error::Device(format!(
+                                "the device was lost while racing candidate `{label}` of \
+                                 launch {ix}: {reason}{detail}"
+                            )));
+                        }
+                        continue;
+                    }
                 };
                 let sample_ns = plan_ns(&sample);
                 // A different tile is a different reduction order, so bit

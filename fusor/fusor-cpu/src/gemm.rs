@@ -268,7 +268,7 @@ mod tests {
         let mut out = vec![0.0; values.len()];
         gelu_dense(&values, &bias, &mut out).unwrap();
         for (&x, &got) in values.iter().zip(&out) {
-            let inner = 0.797_884_56 * (x + 0.044_715 * x * x * x);
+            let inner = 0.797_884_6 * (x + 0.044_715 * x * x * x);
             let expected = 0.5 * x * (1.0 + inner.tanh());
             assert!((got - expected).abs() < 2.0e-4, "x={x}");
         }

@@ -136,12 +136,14 @@ impl Analysis {
     }
 
     pub(crate) fn run(ir: &KernelIr, caps: &Caps) -> Self {
-        let mut a = Self::default();
-        a.fixed_width = caps.subgroups.filter(|s| s.is_fixed()).map(|s| s.assumed());
-        a.block = if ir.block > 0 {
-            ir.block
-        } else {
-            DEFAULT_WORKGROUP_INVOCATIONS
+        let mut a = Self {
+            fixed_width: caps.subgroups.filter(|s| s.is_fixed()).map(|s| s.assumed()),
+            block: if ir.block > 0 {
+                ir.block
+            } else {
+                DEFAULT_WORKGROUP_INVOCATIONS
+            },
+            ..Self::default()
         };
         let mut seen = Seen::default();
         for buffer in &ir.buffers {

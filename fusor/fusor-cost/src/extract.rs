@@ -4,11 +4,11 @@
 //! 2. Seed `sigma_0 = argmin lb`; realize; `m_0 = roots u {shared} u
 //!    {index-space mismatch} u {InPlace}`; `theta_0` from the local ranking.
 //! 3. Exact cost on the realized DAG.
-//! 3b. `co_select` over the multi-slot carriers only, from the seed.
+//!    3b. `co_select` over the multi-slot carriers only, from the seed.
 //!    Speculative: when it changes anything, step 4 runs from both states and
 //!    the cheaper plan wins.
 //! 4. Local search over `RESELECT`, `FLIP`, `RESCHEDULE`.
-//! 4b. `co_select`, the compound move: adopt every reader of one producer
+//!    4b. `co_select`, the compound move: adopt every reader of one producer
 //!    class together.
 //! 5. Budget, keeping best-so-far. Fully deterministic.
 //! 6. `verify_plan` on the winner — a hard conformance assert, never a
@@ -115,6 +115,7 @@ impl LocalSearch {
 
     /// The seed plus the DAG it denotes. The probe realization is reused
     /// when `m_0` turned out to add nothing.
+    #[allow(clippy::too_many_arguments)]
     fn seed_realized(
         &self,
         graph: &EGraph,
@@ -432,6 +433,7 @@ impl LocalSearch {
     /// obligations die with the move that implied them. The error arm carries
     /// one too: a state that fails to realize after repair still has the
     /// repair on it.
+    #[allow(clippy::result_large_err)]
     fn price(
         &self,
         graph: &EGraph,
@@ -439,7 +441,7 @@ impl LocalSearch {
         ex: &mut Extraction,
         cost: &dyn CostModel,
         cache: &mut NodeCache,
-    ) -> std::result::Result<(Realized, Picoseconds, RepairTrail), RepairTrail> {
+    ) -> PriceResult {
         price(graph, roots, ex, cost, self.arena.as_ref(), cache)
     }
 
@@ -808,7 +810,7 @@ fn co_select_over(
     cap: u32,
 ) -> Result<bool> {
     let mut improved = false;
-    for p in producers.iter().copied() {
+    for p in producers {
         if *moves >= cap {
             break;
         }
@@ -816,7 +818,7 @@ fn co_select_over(
         // the selected one. `readers[p]` is sorted, so the first entry per
         // class is that member.
         let mut proposal: Vec<(ClassId, Id)> = Vec::new();
-        for (c, m) in &readers[&p] {
+        for (c, m) in &readers[p] {
             if proposal.last().is_some_and(|(last, _)| last == c) {
                 continue;
             }
@@ -849,7 +851,7 @@ fn co_select_over(
         // `{c : consumers(c) > 1}` pass ran before these consumers existed,
         // so the materialize flip is offered alongside the adoption. Both
         // states are offered and the exact global cost still decides.
-        let producer = ex.sigma.get(&p).copied().filter(|n| {
+        let producer = ex.sigma.get(p).copied().filter(|n| {
             !ex.is_materialized(*n) && realize::leaf_role(graph, *n) == realize::LeafRole::NotLeaf
         });
         let mut kept = false;
@@ -1220,6 +1222,13 @@ fn repair(graph: &EGraph, ex: &mut Extraction, realized: &Realized, cost: &dyn C
 }
 
 /// Realize, [`repair_trailed`], re-realize. See [`LocalSearch::price`].
+/// A priced extraction, or — when repair could not converge — the trail of
+/// what was tried. The trail travels in `Err` by design: it is the whole
+/// diagnosis, and this is a search-internal result that is never boxed
+/// across a hot boundary.
+type PriceResult = std::result::Result<(Realized, Picoseconds, RepairTrail), RepairTrail>;
+
+#[allow(clippy::result_large_err)]
 fn price(
     graph: &EGraph,
     roots: &[Id],
@@ -1227,7 +1236,7 @@ fn price(
     cost: &dyn CostModel,
     arena: &dyn ArenaPlanner,
     cache: &mut NodeCache,
-) -> std::result::Result<(Realized, Picoseconds, RepairTrail), RepairTrail> {
+) -> PriceResult {
     let first = realize::realize_with(graph, roots, ex, cost, arena, cache)
         .map_err(|_| RepairTrail::default())?;
     let trail = repair_trailed(graph, ex, &first, cost);

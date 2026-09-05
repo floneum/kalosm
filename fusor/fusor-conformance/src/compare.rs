@@ -378,8 +378,8 @@ pub fn finite_difference_gradient(
     let mut probe = data.to_vec();
     let base = loss(&probe)?;
     let mut grad = vec![0.0f32; data.len()];
-    for i in 0..data.len() {
-        grad[i] = refined_partial(base, i, &mut probe, &mut *loss)?;
+    for (i, g) in grad.iter_mut().enumerate() {
+        *g = refined_partial(base, i, &mut probe, &mut *loss)?;
     }
     Ok(grad)
 }

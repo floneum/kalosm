@@ -681,7 +681,7 @@ fn resolved_address_map(cx: &LowerCtx<'_>, operand: &Operand) -> Result<AddressM
             .ok_or_else(|| Error::Legality("CPU operand extent product overflows".into()))?;
     }
     terms.retain(|term| term.modulus > 1 && term.stride != 0);
-    terms.sort_unstable_by(|left, right| right.divisor.cmp(&left.divisor));
+    terms.sort_unstable_by_key(|term| std::cmp::Reverse(term.divisor));
     coalesce_address_terms(&mut terms);
     Ok(AddressMap { offset, terms })
 }

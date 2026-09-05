@@ -988,13 +988,13 @@ fn host_rope_at(
     let mut expected = vec![0.0f32; data.len()];
     for b in 0..d.b {
         for h in 0..d.h {
-            for l in 0..d.l {
+            for (l, &position) in pos.iter().enumerate().take(d.l) {
                 let base = ((b * d.h + h) * d.l + l) * d.dh;
                 let rot = host_rope_vec(
                     &data[base..base + d.dh],
                     cos,
                     sin,
-                    pos[l] as usize,
+                    position as usize,
                     d.dh,
                     il,
                 );

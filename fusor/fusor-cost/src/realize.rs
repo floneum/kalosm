@@ -536,13 +536,12 @@ pub fn tiles_for(
                 decls.push(tile("sgemm_b", elem, &[p.bk.max(1), p.bn.max(1)]));
             }
         }
-        Some(SchedPoint::Sgemv(p)) => {
+        Some(SchedPoint::Sgemv(p))
             // The subgroup-per-column structure (`cols > 1`) closes each
             // column inside one subgroup and stages nothing.
-            if p.cols <= 1 {
+            if p.cols <= 1 => {
                 decls.push(tile("sgemv_partials", elem, &[p.subgroups.max(1)]));
             }
-        }
         _ => {}
     }
     // A fold's cross-lane close is one scratch tile of `emitted_block`

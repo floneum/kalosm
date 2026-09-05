@@ -843,13 +843,7 @@ fn product_zero_aware(session: &Session, shape: &[u64], seed: u32) -> CaseResult
                 0 => nonzero_product / v,
                 // Only the zero entry has a nonzero derivative, and it is the
                 // product of the others.
-                1 => {
-                    if *v == 0.0 {
-                        nonzero_product
-                    } else {
-                        0.0
-                    }
-                }
+                1 if *v == 0.0 => nonzero_product,
                 // Two or more zeros: every partial derivative still contains a
                 // zero factor.
                 _ => 0.0,

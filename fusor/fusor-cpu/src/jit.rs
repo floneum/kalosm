@@ -25,11 +25,13 @@ use crate::emit::stmt::CStmt;
 use crate::emit::{Program, RawBuf};
 
 type Entry = unsafe extern "C" fn(*const RawBuf, u32, u32, u32, u32, u32, u32);
+#[cfg(target_os = "macos")]
 type GeluEntry = unsafe extern "C" fn(*const f32, *const f32, *mut f32, usize);
 
 #[derive(Copy, Clone, Debug)]
 pub struct JitKernel(Entry);
 
+#[cfg(target_os = "macos")]
 #[derive(Copy, Clone)]
 struct GeluKernel(GeluEntry);
 
@@ -49,6 +51,7 @@ impl JitKernel {
     }
 }
 
+#[cfg(target_os = "macos")]
 /// Run the fused-contraction input transform as native Cranelift code. GEMM
 /// itself remains in the platform BLAS; this keeps the non-GEMM arithmetic on
 /// the same JIT path as standalone maps.
@@ -65,6 +68,7 @@ pub(crate) fn gelu_dense(a: &[f32], bias: &[f32], out: &mut [f32]) -> Result<(),
     Ok(())
 }
 
+#[cfg(target_os = "macos")]
 fn compile_gelu() -> Result<GeluKernel, String> {
     let mut module = JITModule::new(jit_builder()?);
     let ptr_ty = module.target_config().pointer_type();
@@ -144,6 +148,7 @@ fn compile_gelu() -> Result<GeluKernel, String> {
     Ok(GeluKernel(entry))
 }
 
+#[cfg(target_os = "macos")]
 fn emit_dense_gelu_at(
     b: &mut FunctionBuilder<'_>,
     a: Value,
@@ -162,13 +167,14 @@ fn emit_dense_gelu_at(
     b.ins().store(memory(), value, out, 0);
 }
 
+#[cfg(target_os = "macos")]
 fn emit_gelu_value(b: &mut FunctionBuilder<'_>, x: Value) -> Value {
     let x2 = b.ins().fmul(x, x);
     let x3 = b.ins().fmul(x, x2);
     let cubic_scale = b.ins().f32const(0.044_715);
     let cubic = b.ins().fmul(x3, cubic_scale);
     let sum = b.ins().fadd(x, cubic);
-    let sqrt_scale = b.ins().f32const(0.797_884_56);
+    let sqrt_scale = b.ins().f32const(0.797_884_6);
     let inner = b.ins().fmul(sum, sqrt_scale);
 
     // The [9/8] Pade form is branchless in the JIT. Four independent lanes
@@ -210,6 +216,7 @@ fn emit_gelu_value(b: &mut FunctionBuilder<'_>, x: Value) -> Value {
     b.ins().fmul(half_x, one_plus_t)
 }
 
+#[cfg(target_os = "macos")]
 fn horner(b: &mut FunctionBuilder<'_>, x: Value, coefficients: &[f32]) -> Value {
     let mut value = b.ins().f32const(coefficients[0]);
     for &coefficient in &coefficients[1..] {
@@ -754,7 +761,7 @@ fn fold_supported(prog: &Program) -> bool {
                 count: Some(_),
                 body,
                 ..
-            } => body.iter().all(|child| fold_stmt_supported(child)),
+            } => body.iter().all(fold_stmt_supported),
             CStmt::CarrierTree {
                 tiles,
                 values,
@@ -1232,7 +1239,7 @@ fn emit_fold_range_into(
                 elem,
                 index,
             } if *elem == ScalarElement::F32 => {
-                let index = fold_reg(&regs, *index)?;
+                let index = fold_reg(regs, *index)?;
                 regs[*out as usize] = Some(load_tile_f32(b, *tile, index, fold));
             }
             _ => emit_instr(b, instr, regs, &env, fold.helpers)?,
@@ -1711,7 +1718,7 @@ fn emit_un(b: &mut FunctionBuilder<'_>, op: UnOp, ty: NumTy, x: Value, h: &Helpe
 /// lets Cranelift schedule the polynomial with the surrounding map.
 fn emit_expf(b: &mut FunctionBuilder<'_>, bits: Value) -> Value {
     let x = as_f32(b, bits);
-    let log2_e = b.ins().f32const(1.442_695_04);
+    let log2_e = b.ins().f32const(std::f32::consts::LOG2_E);
     let scaled = b.ins().fmul(x, log2_e);
     let n = b.ins().nearest(scaled);
     let ln2_hi = b.ins().f32const(0.693_145_75);

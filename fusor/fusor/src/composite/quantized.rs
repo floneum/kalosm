@@ -30,7 +30,7 @@ use crate::quantized::QMatrix;
 /// of `u32` words.
 fn block_words(fmt: QFmt, layout: QLayout) -> Option<u64> {
     let bytes = u64::from(fmt.block_bytes(layout));
-    bytes.is_multiple_of(4).then(|| bytes / 4)
+    bytes.is_multiple_of(4).then_some(bytes / 4)
 }
 
 /// A byte offset inside a block as a word offset, or `None` if it straddles.

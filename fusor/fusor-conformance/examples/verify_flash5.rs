@@ -21,6 +21,7 @@ fn upload(g: &fusor::graph::GraphRef, shape: &[u64], d: &[f32]) -> Tensor {
     fusor_conformance::harness::from_f32(g, &dims(shape), d).unwrap()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn host(
     qd: &[f32],
     kd: &[f32],
@@ -67,9 +68,9 @@ fn host(
 fn once(session: &Session, b: u64, h: u64, lq: u64, lk: u64, dh: u64) -> Option<Vec<f32>> {
     let gr = fusor::graph::Graph::new(session);
     let g = gr.handle();
-    let q = upload(&g, &[b, h, lq, dh], &data(&[b, h, lq, dh], 1));
-    let k = upload(&g, &[b, h, lk, dh], &data(&[b, h, lk, dh], 2));
-    let v = upload(&g, &[b, h, lk, dh], &data(&[b, h, lk, dh], 3));
+    let q = upload(g, &[b, h, lq, dh], &data(&[b, h, lq, dh], 1));
+    let k = upload(g, &[b, h, lk, dh], &data(&[b, h, lk, dh], 2));
+    let v = upload(g, &[b, h, lk, dh], &data(&[b, h, lk, dh], 3));
     let out = attention(&q, &k, &v, MaskKind::None, None).ok()?;
     match out.to_vec_f32() {
         Ok(x) => Some(x),

@@ -199,6 +199,7 @@ fn gather(
 /// `tm` output elements per lane, in one loop: the loop costs one `idx[u]`
 /// read per output element per update, and `tm` accumulators in the same loop
 /// share that read.
+#[allow(clippy::too_many_arguments)]
 fn scatter(
     caps: &Caps,
     cx: &LowerCtx<'_>,

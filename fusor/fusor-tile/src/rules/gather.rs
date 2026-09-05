@@ -98,11 +98,9 @@ pub fn gather_quantized_rows(
                 stack.push(*l);
                 stack.push(*r);
             }
-            Op::Logical(Logical::Dequant { x, .. }) => {
-                if b.facts_of(*x).dtype.is_quantized() {
-                    leaf = Some(*x);
-                    break;
-                }
+            Op::Logical(Logical::Dequant { x, .. }) if b.facts_of(*x).dtype.is_quantized() => {
+                leaf = Some(*x);
+                break;
             }
             _ => {}
         }

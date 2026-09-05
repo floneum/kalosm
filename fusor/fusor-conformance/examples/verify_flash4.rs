@@ -17,6 +17,7 @@ fn upload(g: &fusor::graph::GraphRef, shape: &[u64], seed: u32) -> Tensor {
     fusor_conformance::harness::from_f32(g, &dims(shape), &data).unwrap()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn host(
     qd: &[f32],
     kd: &[f32],
@@ -64,9 +65,9 @@ fn run(session: &Session, b: u64, h: u64, lq: u64, lk: u64, dh: u64) {
     let backend = if is_gpu(session) { "gpu" } else { "cpu" };
     let gr = fusor::graph::Graph::new(session);
     let g = gr.handle();
-    let q = upload(&g, &[b, h, lq, dh], 1);
-    let k = upload(&g, &[b, h, lk, dh], 2);
-    let v = upload(&g, &[b, h, lk, dh], 3);
+    let q = upload(g, &[b, h, lq, dh], 1);
+    let k = upload(g, &[b, h, lk, dh], 2);
+    let v = upload(g, &[b, h, lk, dh], 3);
     let qd = q.to_vec_f32().unwrap();
     let kd = k.to_vec_f32().unwrap();
     let vd = v.to_vec_f32().unwrap();

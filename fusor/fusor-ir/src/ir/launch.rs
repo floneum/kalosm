@@ -12,6 +12,11 @@ use crate::shape::{Dim, Layout, MultiFlattenMap, SlidingWindow};
 use smallvec::SmallVec;
 
 /// The Launch op family.
+// `Contract` carries its whole tile vocabulary inline and dwarfs the other
+// variants. Nodes are hash-consed once and read many times, and every rule
+// destructures them by value pattern; the indirection boxing would add is
+// not worth the size of a variant that is a minority of any real graph.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Launch {
     Map {
@@ -388,7 +393,7 @@ impl Operand {
         // A one-wide axis and a stride-0 axis both contribute exactly zero.
         // Dropping them is what makes a broadcast read its single row.
         terms.retain(|t| t.modulus > 1 && t.stride != 0);
-        terms.sort_unstable_by(|a, b| b.divisor.cmp(&a.divisor));
+        terms.sort_unstable_by_key(|t| std::cmp::Reverse(t.divisor));
         coalesce(&mut terms);
         Some(AddressMap { offset, terms })
     }
@@ -604,9 +609,9 @@ impl CoopGeom {
         let mut rg = 1;
         while rg <= subgroups {
             let cg = subgroups / rg;
-            if subgroups % rg == 0
-                && bm % (Self::COOP_DIM * rg) == 0
-                && bn_pass % (Self::COOP_DIM * cg) == 0
+            if subgroups.is_multiple_of(rg)
+                && bm.is_multiple_of(Self::COOP_DIM * rg)
+                && bn_pass.is_multiple_of(Self::COOP_DIM * cg)
             {
                 let loads = cg * bm + rg * bn_pass;
                 if best_rg == 0 || loads < best_loads {
@@ -633,8 +638,8 @@ impl CoopGeom {
             && self.rg != 0
             && self.cg != 0
             && self.lanes(subgroup_width) <= max_wg_lanes
-            && self.bm % (Self::COOP_DIM * self.rg) == 0
-            && (self.bn / self.n_passes) % (Self::COOP_DIM * self.cg) == 0
+            && self.bm.is_multiple_of(Self::COOP_DIM * self.rg)
+            && (self.bn / self.n_passes).is_multiple_of(Self::COOP_DIM * self.cg)
     }
 }
 
@@ -687,7 +692,11 @@ impl SgemmParams {
     /// `tm | bm`, `tn | bn`, 32..=max lanes, staged footprint within the
     /// workgroup-storage limit.
     pub const fn legal(&self, elem_bytes: u32, max_wg_storage: u32, max_lanes: u32) -> bool {
-        if self.tm == 0 || self.tn == 0 || self.bm % self.tm != 0 || self.bn % self.tn != 0 {
+        if self.tm == 0
+            || self.tn == 0
+            || !self.bm.is_multiple_of(self.tm)
+            || !self.bn.is_multiple_of(self.tn)
+        {
             return false;
         }
         let lanes = (self.bm / self.tm) * (self.bn / self.tn);

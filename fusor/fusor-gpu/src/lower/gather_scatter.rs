@@ -59,7 +59,7 @@ fn tile_stride(extents: &[u64], axis: usize, tm: u32, run: u32) -> Option<u64> {
     }
     let stride: u64 = extents[axis + 1..].iter().product::<u64>().max(1);
     let blocks: u64 = extents[..=axis].iter().product::<u64>().max(1);
-    if blocks < u64::from(tm) || stride % u64::from(run.max(1)) != 0 {
+    if blocks < u64::from(tm) || !stride.is_multiple_of(u64::from(run.max(1))) {
         return None;
     }
     Some(stride)

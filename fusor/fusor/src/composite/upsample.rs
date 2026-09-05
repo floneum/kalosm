@@ -36,11 +36,9 @@ fn weight_leaf(graph: &GraphRef, dtype: Dtype, values: &[f32]) -> Result<Id> {
 fn nearest_indices(input: u64, output: u64) -> Vec<u32> {
     (0..output)
         .map(|o| {
-            let src = if output == 0 {
-                0
-            } else {
-                (o * input / output).min(input.saturating_sub(1))
-            };
+            let src = (o * input)
+                .checked_div(output)
+                .map_or(0, |src| src.min(input.saturating_sub(1)));
             src as u32
         })
         .collect()

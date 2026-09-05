@@ -48,14 +48,20 @@ pub(crate) fn lower(
     ];
     let binds = Binds::build(cx)?;
     let out = binds.of(cx.launch.root)?;
-    let platform = side(cx, &binds, a, [batch, m, k])
-        .and_then(|bound_a| side(cx, &binds, b, [batch, k, n]).map(|bound_b| (bound_a, bound_b)))
-        .and_then(|(bound_a, bound_b)| {
-            gemm_name(
-                m, n, k, batch, &out, &bound_a, &bound_b, &a.pre, &b.pre, post,
-            )
-            .ok()
-        });
+    // The platform GEMM is Accelerate, so it exists on macOS only; everywhere
+    // else every contraction takes the Cranelift SIMD path below.
+    let platform = if cfg!(target_os = "macos") {
+        side(cx, &binds, a, [batch, m, k])
+            .zip(side(cx, &binds, b, [batch, k, n]))
+            .and_then(|(bound_a, bound_b)| {
+                gemm_name(
+                    m, n, k, batch, &out, &bound_a, &bound_b, &a.pre, &b.pre, post,
+                )
+                .ok()
+            })
+    } else {
+        None
+    };
     if let Some(name) = platform {
         return Ok(KernelIr {
             buffers: binds.buffers,
@@ -430,7 +436,6 @@ fn collapse_resolved(extents: &[u32], strides: &[u32], groups: [u32; 3]) -> Opti
         .iter()
         .copied()
         .zip(strides.iter().copied())
-        .into_iter()
         .filter(|(extent, _)| *extent != 1)
         .collect();
     let mut out = [0; 3];

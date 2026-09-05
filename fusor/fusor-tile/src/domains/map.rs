@@ -46,9 +46,10 @@ pub fn map_domain(shape: &[Dim], access: &[AccessPlan], cx: &DomainCtx<'_>) -> M
             tm: 1,
             vector,
         });
-        for dim in 0..shape.len().saturating_sub(1) {
+        let leading = shape.len().saturating_sub(1);
+        for (dim, extent) in shape.iter().enumerate().take(leading) {
             for tm in TM_CHOICES {
-                if !shape[dim].at_least(u64::from(tm)) {
+                if !extent.at_least(u64::from(tm)) {
                     continue;
                 }
                 out.push(MapTiling {

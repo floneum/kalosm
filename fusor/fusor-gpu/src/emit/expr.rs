@@ -726,10 +726,10 @@ impl Emitter<'_> {
                 // entry is reused without emitting a Load, so
                 // `StoreLocal(acc, CoopMma{c: LoadLocal(acc)})` becomes one
                 // Load, N MMAs and one Store.
-                if matches!(local.element, ElementType::CoopMatrix { .. }) {
-                    if let Some(value) = self.coop_acc.get(&key(local)) {
-                        return Ok(*value);
-                    }
+                if matches!(local.element, ElementType::CoopMatrix { .. })
+                    && let Some(value) = self.coop_acc.get(&key(local))
+                {
+                    return Ok(*value);
                 }
                 let handle = self.private_local(local)?;
                 Ok(self.load_local_handle(body, handle))
@@ -958,13 +958,12 @@ impl Emitter<'_> {
                     right: b,
                     numeric: inner,
                 } = mul.kind()
+                    && inner.contract
                 {
-                    if inner.contract {
-                        let a = self.expr(a, body)?;
-                        let b = self.expr(b, body)?;
-                        let c = self.expr(other, body)?;
-                        return Ok(self.math3(body, MathFunction::Fma, a, b, c));
-                    }
+                    let a = self.expr(a, body)?;
+                    let b = self.expr(b, body)?;
+                    let c = self.expr(other, body)?;
+                    return Ok(self.math3(body, MathFunction::Fma, a, b, c));
                 }
             }
         }
@@ -974,10 +973,10 @@ impl Emitter<'_> {
 
         // Reassociation permits identity elimination and literal folding.
         // Under `reassoc: false` the operation is emitted literally.
-        if numeric.reassoc {
-            if let Some(folded) = self.fold_identity(op, l, r) {
-                return Ok(folded);
-            }
+        if numeric.reassoc
+            && let Some(folded) = self.fold_identity(op, l, r)
+        {
+            return Ok(folded);
         }
 
         Ok(match binary_operator(op) {
@@ -1030,10 +1029,8 @@ impl Emitter<'_> {
                     return self.rebuild_literal(left, a * b);
                 }
             }
-            BinOp::Div => {
-                if rv == Some(1.0) {
-                    return Some(left);
-                }
+            BinOp::Div if rv == Some(1.0) => {
+                return Some(left);
             }
             _ => {}
         }

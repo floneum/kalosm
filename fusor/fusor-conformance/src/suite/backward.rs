@@ -295,7 +295,7 @@ fn clamp_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 
     let grad = gradient_of(&graph, &y, &x)?;
     let want: Vec<f32> = data.iter().map(|v| f32::from(*v > LO && *v < HI)).collect();
-    if !want.iter().any(|v| *v == 0.0) || !want.iter().any(|v| *v == 1.0) {
+    if !want.contains(&0.0) || !want.contains(&1.0) {
         return Err(
             "the clamp case's data does not straddle both bounds; it proves nothing".into(),
         );
@@ -492,7 +492,7 @@ fn gelu_analytic(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     Ok(())
 }
 
-const GELU_C: f32 = 0.797_884_56; // sqrt(2/pi)
+const GELU_C: f32 = 0.797_884_6; // sqrt(2/pi)
 const GELU_A: f32 = 0.044_715;
 
 fn host_gelu(x: f32) -> f32 {

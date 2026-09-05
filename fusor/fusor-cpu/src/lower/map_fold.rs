@@ -582,14 +582,14 @@ fn lower_fold_carrier(
         .map(|l| TileExpr::new(TileExprKind::LoadLocal(Arc::clone(l)), f32_ty))
         .collect();
     let mut merge_body: smallvec::SmallVec<[TileExpr; 4]> = smallvec::SmallVec::new();
-    for slot in 0..lanes {
+    for merge in merges.iter().take(lanes) {
         merge_body.push(
             Translate {
                 args: &merge_args,
                 coords: &[],
                 uniforms: uniforms.clone(),
             }
-            .run(&merges[slot])?,
+            .run(merge)?,
         );
     }
     body.push(Stmt::Reduce {
@@ -615,13 +615,13 @@ fn lower_fold_carrier(
     let out_buf = binds.of(cx.launch.root)?;
     let mask = cmp(CmpOp::Eq, lane, lit_u32(0));
     let base = bin(BinOp::Mul, row, lit_u32(lanes as u32), u32_ty());
-    for slot in 0..lanes {
+    for (slot, post) in posts.iter().enumerate().take(lanes) {
         let value = Translate {
             args: &reduced,
             coords: &[],
             uniforms: uniforms.clone(),
         }
-        .run(&posts[slot])?;
+        .run(post)?;
         body.push(Stmt::Store {
             dst: view(&out_buf),
             addr: Addr::Linear(bin(

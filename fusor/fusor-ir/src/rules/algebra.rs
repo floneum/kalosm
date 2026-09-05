@@ -282,7 +282,7 @@ const MAX_SPLIT_CANDIDATES: usize = 3;
 fn block_candidates(extent: u64) -> SmallVec<[u64; 4]> {
     [64u64, 32, 16, 8, 4, 2]
         .into_iter()
-        .filter(|bl| extent % bl == 0 && extent / bl > 1)
+        .filter(|bl| extent.is_multiple_of(*bl) && extent / bl > 1)
         .take(MAX_SPLIT_CANDIDATES)
         .collect()
 }

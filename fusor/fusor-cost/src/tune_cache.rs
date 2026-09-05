@@ -133,13 +133,13 @@ impl Disk {
     }
 }
 
+/// Per-signature learned verdicts, keyed by candidate label.
+type LearnedTable = FxHashMap<String, FxHashMap<String, Learned>>;
+/// Per-plan-signature adopted combination and its measured nanoseconds.
+type ComboTable = FxHashMap<String, (Vec<Option<String>>, u64)>;
+
 /// Fold a file at `path` into the in-memory tables.
-fn read_tables(
-    path: &Path,
-) -> (
-    FxHashMap<String, FxHashMap<String, Learned>>,
-    FxHashMap<String, (Vec<Option<String>>, u64)>,
-) {
+fn read_tables(path: &Path) -> (LearnedTable, ComboTable) {
     let mut seen: FxHashMap<String, FxHashMap<String, Learned>> = FxHashMap::default();
     let mut combos: FxHashMap<String, (Vec<Option<String>>, u64)> = FxHashMap::default();
     if let Ok(body) = std::fs::read_to_string(path)
@@ -172,9 +172,9 @@ fn read_tables(
 pub struct TuneCache {
     path: Option<PathBuf>,
     /// `launch signature -> variant signature -> observation window`.
-    seen: Mutex<FxHashMap<String, FxHashMap<String, Learned>>>,
+    seen: Mutex<LearnedTable>,
     /// `plan signature -> (picks, score)`, the jointly-measured outcome.
-    combos: Mutex<FxHashMap<String, (Vec<Option<String>>, u64)>>,
+    combos: Mutex<ComboTable>,
     /// Set when anything changed, so an unchanged process writes nothing.
     dirty: Mutex<bool>,
 }
@@ -374,7 +374,7 @@ impl TuneCache {
         // Stable by prior only: candidates arrive in the enumerator's offer
         // order (round-robin over belief-ordered schedule domains), so a tie
         // keeps the domain's believed-best cell first.
-        fresh.sort_by(|a, b| a.1.cmp(&b.1));
+        fresh.sort_by_key(|a| a.1);
 
         let mut out: Vec<&'a String> = known
             .into_iter()

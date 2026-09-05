@@ -113,7 +113,7 @@ pub fn distillation_loss(
     temperature: f32,
 ) -> Result<Tensor> {
     require_pair(student_logits, teacher_logits, "distillation_loss")?;
-    if !(temperature > 0.0) {
+    if temperature.is_nan() || temperature <= 0.0 {
         return Err(Error::Shape(format!(
             "distillation_loss needs a positive temperature, got {temperature}"
         )));

@@ -52,9 +52,9 @@ fn main() {
     ];
 
     for &(b, h, q_len, kv_len, hd) in cases {
-        let q = tensor(&graph, &[b, h, q_len, hd], 1);
-        let k = tensor(&graph, &[b, h, kv_len, hd], 2);
-        let v = tensor(&graph, &[b, h, kv_len, hd], 3);
+        let q = tensor(graph, &[b, h, q_len, hd], 1);
+        let k = tensor(graph, &[b, h, kv_len, hd], 2);
+        let v = tensor(graph, &[b, h, kv_len, hd], 3);
         for (name, mask) in [
             ("none", fusor::cache::MaskKind::None),
             ("causal", fusor::cache::MaskKind::Causal),

@@ -455,14 +455,9 @@ impl<'a> Builder<'a> {
     /// Walk a chain of pure `Restride` views down to their base.
     pub fn trace_pure_views(&self, mut v: Id) -> ViewSpine {
         let mut views: SmallVec<[Id; 4]> = SmallVec::new();
-        loop {
-            match &self.graph.node(v).op {
-                Op::Logical(Logical::Restride { x, .. }) => {
-                    views.push(v);
-                    v = *x;
-                }
-                _ => break,
-            }
+        while let Op::Logical(Logical::Restride { x, .. }) = &self.graph.node(v).op {
+            views.push(v);
+            v = *x;
         }
         views.reverse();
         ViewSpine { base: v, views }

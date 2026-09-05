@@ -9,7 +9,7 @@ use fusor_ir::{Error, Result};
 use crate::tensor::Tensor;
 
 /// `sqrt(2/pi)`, the tanh-GELU coefficient.
-const GELU_C: f32 = 0.797_884_56;
+const GELU_C: f32 = 0.797_884_6;
 /// The cubic term's coefficient.
 const GELU_K: f32 = 0.044_715;
 /// Clamp value to avoid numerical issues with `tanh`.
@@ -101,11 +101,11 @@ fn gelu_expr(dtype: Dtype) -> Result<ScalarExpr> {
 fn gelu_exact_expr(dtype: Dtype) -> Result<ScalarExpr> {
     const P: f32 = 0.327_591_1;
     const A: [f32; 5] = [
-        0.254_829_592,
-        -0.284_496_736,
-        1.421_413_741,
-        -1.453_152_027,
-        1.061_405_429,
+        0.254_829_6,
+        -0.284_496_72,
+        1.421_413_8,
+        -1.453_152_1,
+        1.061_405_4,
     ];
     let x = ScalarExpr::arg(0, dtype);
     let z = mul(x.clone(), lit(dtype, std::f32::consts::FRAC_1_SQRT_2)?);

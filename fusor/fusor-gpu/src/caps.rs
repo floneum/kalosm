@@ -31,16 +31,17 @@ pub(crate) const FORK_METAL: bool = false;
 /// legality model cannot drift apart.
 pub(crate) fn baseline_limits() -> wgpu::Limits {
     let ir = Limits::default();
-    let mut limits = wgpu::Limits::default();
-    limits.max_compute_invocations_per_workgroup = ir.max_compute_invocations_per_workgroup;
-    limits.max_compute_workgroup_size_x = ir.max_compute_workgroup_size[0];
-    limits.max_compute_workgroup_size_y = ir.max_compute_workgroup_size[1];
-    limits.max_compute_workgroup_size_z = ir.max_compute_workgroup_size[2];
-    limits.max_compute_workgroups_per_dimension = ir.max_compute_workgroups_per_dimension;
-    limits.max_compute_workgroup_storage_size = ir.max_compute_workgroup_storage_size;
-    limits.max_storage_buffers_per_shader_stage = ir.max_storage_buffers_per_shader_stage;
-    limits.max_storage_buffer_binding_size = ir.max_storage_buffer_binding_size;
-    limits
+    wgpu::Limits {
+        max_compute_invocations_per_workgroup: ir.max_compute_invocations_per_workgroup,
+        max_compute_workgroup_size_x: ir.max_compute_workgroup_size[0],
+        max_compute_workgroup_size_y: ir.max_compute_workgroup_size[1],
+        max_compute_workgroup_size_z: ir.max_compute_workgroup_size[2],
+        max_compute_workgroups_per_dimension: ir.max_compute_workgroups_per_dimension,
+        max_compute_workgroup_storage_size: ir.max_compute_workgroup_storage_size,
+        max_storage_buffers_per_shader_stage: ir.max_storage_buffers_per_shader_stage,
+        max_storage_buffer_binding_size: ir.max_storage_buffer_binding_size,
+        ..wgpu::Limits::default()
+    }
 }
 
 /// Per-field ceilings a caller *proves* it needs. Every field is optional;

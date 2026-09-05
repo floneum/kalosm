@@ -45,7 +45,7 @@ pub(crate) fn log_softmax_defn(t: &mut GraphTape<'_>, x: Val, axis: u32) -> Resu
     let m = t.fold_binop(BinOp::Max, axis, dtype, x)?;
     let mb = t.broadcast_axis(m, axis, extent)?;
     let centered = t.binary(BinOp::Sub, x, mb)?;
-    let e = t.unary(UnOp::Exp, centered.clone())?;
+    let e = t.unary(UnOp::Exp, centered)?;
     let acc = accum_dtype(dtype);
     let s = t.fold_binop(BinOp::Add, axis, acc, e)?;
     let s = t.cast(dtype, s)?;

@@ -396,6 +396,13 @@ fn rem_u32_only(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     Ok(())
 }
 
+/// `(name, op, host reference)` for one rounding mode.
+type RoundRow = (
+    &'static str,
+    fn(&Tensor) -> fusor::Result<Tensor>,
+    fn(f32) -> f32,
+);
+
 /// Trainer constraint 5: `round`/`floor`/`ceil`/`trunc` are real primitives
 /// with an explicit `RoundMode`, not fourteen comparisons.
 fn round_modes(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
@@ -409,7 +416,7 @@ fn round_modes(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
 
-    let rows: [(&str, fn(&Tensor) -> fusor::Result<Tensor>, fn(f32) -> f32); 5] = [
+    let rows: [RoundRow; 5] = [
         ("floor", |t| t.floor(), f32::floor),
         ("ceil", |t| t.ceil(), f32::ceil),
         ("trunc", |t| t.trunc(), f32::trunc),

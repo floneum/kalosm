@@ -316,18 +316,10 @@ impl Deref for Llama {
 }
 
 /// A builder with configuration for a Llama model.
+#[derive(Default)]
 pub struct LlamaBuilder {
     source: source::LlamaSource,
     device: Option<Device>,
-}
-
-impl Default for LlamaBuilder {
-    fn default() -> Self {
-        Self {
-            source: Default::default(),
-            device: None,
-        }
-    }
 }
 
 impl LlamaBuilder {

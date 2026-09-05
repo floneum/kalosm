@@ -532,7 +532,7 @@ impl Whisper {
     pub(crate) fn detach_caches(
         &self,
         cache: &mut TextDecoderCache,
-        mut attention_output: Option<&mut [TensorCache<4>]>,
+        attention_output: Option<&mut [TensorCache<4>]>,
     ) -> Result<()> {
         let mut batch: Vec<Dyn> = Vec::new();
         for block in &cache.blocks {
@@ -568,7 +568,7 @@ impl Whisper {
                 }
             }
         }
-        if let Some(outputs) = attention_output.as_deref_mut() {
+        if let Some(outputs) = attention_output {
             for out in outputs {
                 out.detach();
             }

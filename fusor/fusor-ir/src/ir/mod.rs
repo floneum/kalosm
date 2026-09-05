@@ -34,6 +34,8 @@ impl fmt::Display for Level {
 /// every alternative alive simultaneously without a rebuild, and is
 /// allocated at an id strictly greater than both operands, so acyclicity is
 /// a property of the id allocator.
+// Inherits `Launch`'s size; see the note on that enum.
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
     Logical(Logical),

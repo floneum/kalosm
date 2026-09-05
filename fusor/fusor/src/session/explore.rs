@@ -393,7 +393,7 @@ impl Session {
             // displaced incumbent now would file arms against dead labels.
             return None;
         }
-        if ks.counter % eps != 0 {
+        if !ks.counter.is_multiple_of(eps) {
             return None;
         }
 
@@ -1052,8 +1052,8 @@ impl Session {
 
 impl ExploreState {
     fn key_mut(&mut self, key: ReplayKey) -> &mut KeyState {
-        if !self.keys.contains_key(&key) {
-            self.keys.insert(key, KeyState::default());
+        if let std::collections::hash_map::Entry::Vacant(e) = self.keys.entry(key) {
+            e.insert(KeyState::default());
             self.order.push(key);
             while self.order.len() > KEY_CAP {
                 let evicted = self.order.remove(0);

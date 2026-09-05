@@ -470,7 +470,7 @@ fn grow(f: &mut FixedState, graph: &GraphRef, like: &Dyn, axis: usize, needed: u
         }
         let kept = old_store.narrow(axis, 0, len as usize)?;
         let moved = store.slice_assign(&ranges, &kept)?;
-        graph.session().resolve(&[moved.clone()])?;
+        graph.session().resolve(std::slice::from_ref(&moved))?;
         store.adopt_buffer(&moved)?;
         moved.clear_device_buf();
     }

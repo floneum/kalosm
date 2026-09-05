@@ -568,7 +568,7 @@ fn mlp_step(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         *w -= LR * g;
     }
     let (after, _, _) = loss_at(&w1, &w2)?;
-    if !(after < before) {
+    if after.is_nan() || after >= before {
         return Err(format!(
             "one step of gradient descent moved the loss from {before} to {after}; the \
              gradient does not point downhill"

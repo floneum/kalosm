@@ -263,7 +263,7 @@ const LN2: f32 = std::f32::consts::LN_2;
 const PI_2_HI: f32 = std::f32::consts::FRAC_PI_2;
 const PI_2_MID: f32 = 7.549_789_4e-8;
 const PI_2_LO: f32 = 5.390_302_6e-15;
-const TWO_OVER_PI: f32 = 0.636_619_78;
+const TWO_OVER_PI: f32 = std::f32::consts::FRAC_2_PI;
 
 /// `x * 2^n` by exponent-bit assembly, saturating outside the normal range.
 #[inline(always)]
@@ -290,9 +290,7 @@ pub(crate) fn rint(x: f32) -> f32 {
     let a = frac.abs();
     let bump = if a > 0.5 {
         1.0
-    } else if a < 0.5 {
-        0.0
-    } else if (t as i64) % 2 == 0 {
+    } else if a < 0.5 || (t as i64) % 2 == 0 {
         0.0
     } else {
         1.0
@@ -302,7 +300,7 @@ pub(crate) fn rint(x: f32) -> f32 {
 
 #[inline(always)]
 pub(crate) fn trunc(x: f32) -> f32 {
-    if !(x.abs() < 8_388_608.0) {
+    if x.is_nan() || x.abs() >= 8_388_608.0 {
         // |x| >= 2^23 (or NaN): already integral, or not representable.
         return x;
     }
@@ -348,9 +346,9 @@ pub(crate) fn round_mode(mode: RoundMode, x: f32) -> f32 {
 #[inline(always)]
 fn exp_poly(r: f32) -> f32 {
     let mut p = 2.480_158_7e-5; // 1/8!
-    p = p * r + 1.984_126_98e-4; // 1/7!
+    p = p * r + 1.984_127e-4; // 1/7!
     p = p * r + 1.388_888_9e-3; // 1/6!
-    p = p * r + 8.333_333_3e-3; // 1/5!
+    p = p * r + 8.333_333e-3; // 1/5!
     p = p * r + 4.166_666_6e-2; // 1/4!
     p = p * r + 0.166_666_67; // 1/3!
     p = p * r + 0.5;
@@ -514,8 +512,8 @@ fn trig_reduce(x: f32) -> (f32, i32) {
 fn sin_poly(r: f32) -> f32 {
     let z = r * r;
     let mut p = 2.755_731_9e-6; // 1/9!
-    p = p * z - 1.984_126_98e-4; // -1/7!
-    p = p * z + 8.333_333_3e-3; // 1/5!
+    p = p * z - 1.984_127e-4; // -1/7!
+    p = p * z + 8.333_333e-3; // 1/5!
     p = p * z - 0.166_666_67; // -1/3!
     r + r * z * p
 }
@@ -524,7 +522,7 @@ fn sin_poly(r: f32) -> f32 {
 #[inline(always)]
 fn cos_poly(r: f32) -> f32 {
     let z = r * r;
-    let mut p = -2.755_731_9e-7; // -1/10!
+    let mut p = -2.755_732e-7; // -1/10!
     p = p * z + 2.480_158_7e-5; // 1/8!
     p = p * z - 1.388_888_9e-3; // -1/6!
     p = p * z + 4.166_666_6e-2; // 1/4!
@@ -614,8 +612,8 @@ pub(crate) fn asinf(x: f32) -> f32 {
     } else {
         (a * a, a, false)
     };
-    let mut p = 4.216_319_9e-2;
-    p = p * z + 2.418_131_1e-2;
+    let mut p = 4.216_32e-2;
+    p = p * z + 2.418_131e-2;
     p = p * z + 4.547_002_6e-2;
     p = p * z + 7.495_300_3e-2;
     p = p * z + 0.166_667_52;
@@ -792,13 +790,7 @@ pub(crate) fn apply_bin(op: BinOp, ty: NumTy, a: u32, b: u32) -> u32 {
             BinOp::Add => a.wrapping_add(b),
             BinOp::Sub => a.wrapping_sub(b),
             BinOp::Mul => a.wrapping_mul(b),
-            BinOp::Div => {
-                if b == 0 {
-                    u32::MAX
-                } else {
-                    a / b
-                }
-            }
+            BinOp::Div => a.checked_div(b).unwrap_or(u32::MAX),
             BinOp::Rem => {
                 if b == 0 {
                     0

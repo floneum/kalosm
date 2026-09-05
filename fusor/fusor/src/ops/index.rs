@@ -289,12 +289,12 @@ impl Tensor {
         }
         let out = Tensor::zeros(&self.graph, self.dtype(), new_shape)?;
         let mut overlap: Vec<Range<usize>> = Vec::with_capacity(self.rank());
-        for i in 0..self.rank() {
+        for (i, new_dim) in new_shape.iter().enumerate().take(self.rank()) {
             let old = self
                 .dim(i)
                 .as_const()
                 .ok_or_else(|| Error::Shape("resize needs constant extents".into()))?;
-            let new = new_shape[i]
+            let new = new_dim
                 .as_const()
                 .ok_or_else(|| Error::Shape("resize needs constant extents".into()))?;
             overlap.push(0..old.min(new) as usize);

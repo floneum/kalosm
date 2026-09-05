@@ -45,15 +45,13 @@ fn q4k_bytes(rows: u64, cols: u64) -> Vec<u8> {
 fn q6k_bytes(rows: u64, cols: u64) -> Vec<u8> {
     let blocks = rows * cols / 256;
     let mut template = [0u8; 210];
-    for i in 0..128 {
-        template[i] = (i as u8).wrapping_mul(29);
+    for (i, byte) in template[..128].iter_mut().enumerate() {
+        *byte = (i as u8).wrapping_mul(29);
     }
-    for i in 0..64 {
-        template[128 + i] = (i as u8).wrapping_mul(53);
+    for (i, byte) in template[128..192].iter_mut().enumerate() {
+        *byte = (i as u8).wrapping_mul(53);
     }
-    for i in 0..16 {
-        template[192 + i] = 3; // small signed scales
-    }
+    template[192..208].fill(3); // small signed scales
     template[208..210].copy_from_slice(&0x3000u16.to_le_bytes()); // d
     let mut out = Vec::with_capacity((blocks * 210) as usize);
     for _ in 0..blocks {

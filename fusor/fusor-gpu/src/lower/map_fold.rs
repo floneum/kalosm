@@ -454,7 +454,7 @@ pub(crate) fn lower_kfold(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> R
         }
     };
 
-    let value = ctx.eval_scalar(post, &reduced, &[row.clone()])?;
+    let value = ctx.eval_scalar(post, &reduced, std::slice::from_ref(&row))?;
     let value = ctx.b.cast(value, out_elem);
     let lane_zero = {
         let z = ctx.b.u32(0);
@@ -688,9 +688,9 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resu
         let lane_ident = carrier
             .identity_lanes()
             .ok_or_else(|| Error::Plan("this carrier has a symbolic Vector extent".into()))?;
-        for slot in 0..lanes {
+        for &ident in lane_ident.iter().take(lanes) {
             let local = ctx.b.local(acc_ty);
-            let init = identity_expr(&mut ctx, lane_ident[slot], acc_elem);
+            let init = identity_expr(&mut ctx, ident, acc_elem);
             let read = ctx.b.load_local(local.clone());
             acc_reads.push(read.clone());
             accs.push(Accumulator {
@@ -747,8 +747,8 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resu
             merge_args.push(ctx.b.load_local(l.clone()));
         }
         let mut body: smallvec::SmallVec<[TileExpr; 4]> = smallvec::SmallVec::new();
-        for slot in 0..lanes {
-            body.push(ctx.eval_scalar(&merges[slot], &merge_args, &[])?);
+        for merge in merges.iter().take(lanes) {
+            body.push(ctx.eval_scalar(merge, &merge_args, &[])?);
         }
         stmts.push(Stmt::Reduce {
             kind: Box::new(ReduceKind::Workgroup {
@@ -771,8 +771,8 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resu
     let mask = ctx.b.and(row_live, lane_zero);
     let lanes_e = ctx.b.u32(lanes as u32);
     let base = ctx.b.mul(row.clone(), lanes_e);
-    for slot in 0..lanes {
-        let value = ctx.eval_scalar(&posts[slot], &reduced, &[row.clone()])?;
+    for (slot, post) in posts.iter().enumerate().take(lanes) {
+        let value = ctx.eval_scalar(post, &reduced, std::slice::from_ref(&row))?;
         let value = ctx.b.cast(value, out_elem);
         let off = ctx.b.u32(slot as u32);
         let addr = ctx.b.add(base.clone(), off);

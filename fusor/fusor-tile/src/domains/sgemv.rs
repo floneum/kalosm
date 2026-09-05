@@ -165,7 +165,11 @@ pub fn sgemv_domain(cx: &DomainCtx<'_>) -> SgemvDomain {
                     }
                     let run = vector / parts;
                     for gap in GAP_CHOICES {
-                        if run == 0 || gap % run != 0 || gap <= run || (width * run) % gap != 0 {
+                        if run == 0
+                            || gap % run != 0
+                            || gap <= run
+                            || !(width * run).is_multiple_of(gap)
+                        {
                             continue;
                         }
                         let cell = w(vector, subgroups, cols, parts, gap);

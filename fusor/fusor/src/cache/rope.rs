@@ -43,7 +43,7 @@ impl<T: Element> RopeCache<T> {
                     .into(),
             ));
         };
-        if head_dim == 0 || head_dim % 2 != 0 {
+        if head_dim == 0 || !head_dim.is_multiple_of(2) {
             return Err(Error::Shape(format!(
                 "rope pairs head elements, so head_dim must be even and nonzero, got {head_dim}"
             )));

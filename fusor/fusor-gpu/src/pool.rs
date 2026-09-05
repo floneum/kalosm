@@ -69,6 +69,7 @@ pub struct BufferPool {
     ceiling_bytes: Mutex<u64>,
     poison: bool,
     upload_staging: Mutex<Vec<StagingChunk>>,
+    lost: crate::device::LostFlag,
 }
 
 /// A reusable upload staging buffer, kept mapped between uses.
@@ -99,7 +100,12 @@ impl BufferPool {
     ///
     /// The ceiling is `hw.memsize / 3 * 2` on Apple silicon and `u64::MAX`
     /// elsewhere, overridable by [`GpuConfig::max_gpu_memory_bytes`].
-    pub fn new(device: Arc<wgpu::Device>, queue: Arc<wgpu::Queue>, config: &GpuConfig) -> Self {
+    pub fn new(
+        device: Arc<wgpu::Device>,
+        queue: Arc<wgpu::Queue>,
+        config: &GpuConfig,
+        lost: crate::device::LostFlag,
+    ) -> Self {
         let ceiling = config.max_gpu_memory_bytes.unwrap_or_else(default_ceiling);
         Self {
             device,
@@ -111,6 +117,7 @@ impl BufferPool {
             ceiling_bytes: Mutex::new(ceiling),
             poison: config.poison_allocations,
             upload_staging: Mutex::new(Vec::new()),
+            lost,
         }
     }
 
@@ -155,6 +162,10 @@ impl BufferPool {
             }
         }
 
+        // A lost device hands back an invalid handle from `create_buffer`
+        // without an error; the first write to it would then fail as a
+        // validation panic with no mention of the loss.
+        self.lost.check()?;
         Ok(self.create(size, usage))
     }
 
@@ -288,6 +299,40 @@ impl BufferPool {
                 .live_bytes
                 .saturating_sub(released.saturating_mul(key.size));
         }
+    }
+
+    /// Forget `buf` entirely: the pool drops its own handle, so the driver
+    /// buffer is destroyed as soon as the caller's clone goes.
+    ///
+    /// For a buffer whose state is no longer known to be clean — a readback
+    /// staging buffer whose map failed part-way is still marked mapped on
+    /// the wgpu side, and the next `map_async` on it would panic. Such a
+    /// buffer must never be handed out again.
+    pub fn discard(&self, buf: Buf) {
+        let Some((size, usage)) = buf
+            .downcast_ref::<GpuBuffer>()
+            .map(|g| (g.size, g.usage.bits()))
+        else {
+            return;
+        };
+        let key = PoolKey { size, usage };
+        let addr = buf.addr();
+        let removed = {
+            let mut free = self.free.lock();
+            match free.get_mut(&key) {
+                Some(bucket) => {
+                    let before = bucket.len();
+                    bucket.retain(|b| b.addr() != addr);
+                    before - bucket.len()
+                }
+                None => 0,
+            }
+        };
+        if removed > 0 {
+            let mut counters = self.counters.lock();
+            counters.live_bytes = counters.live_bytes.saturating_sub(size);
+        }
+        drop(buf);
     }
 
     /// Drop every free buffer whose only handle is the pool's, releasing their

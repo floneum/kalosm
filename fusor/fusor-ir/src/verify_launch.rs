@@ -309,7 +309,7 @@ pub fn check_schedule_domain(
                         || run == 0
                         || p.gap % run.max(1) != 0
                         || p.gap <= run
-                        || (subgroup_width * run) % p.gap.max(1) != 0
+                        || !(subgroup_width * run).is_multiple_of(p.gap.max(1))
                     {
                         return Err(Error::Legality(format!(
                             "sgemv params {p:?} split the lane window illegally \

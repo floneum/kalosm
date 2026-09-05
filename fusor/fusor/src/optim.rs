@@ -136,7 +136,7 @@ impl AdamW {
                 "AdamW state belongs to another graph; the moments are values on it".into(),
             ));
         }
-        if !(self.beta1 < 1.0) || !(self.beta2 < 1.0) {
+        if self.beta1.is_nan() || self.beta1 >= 1.0 || self.beta2.is_nan() || self.beta2 >= 1.0 {
             return Err(Error::Shape(format!(
                 "AdamW needs beta1 and beta2 below 1, got {} and {}",
                 self.beta1, self.beta2
@@ -268,7 +268,7 @@ pub fn clip_global_norm(grads: &[Tensor], max_norm: f32) -> Result<Vec<Tensor>> 
     if grads.is_empty() {
         return Ok(Vec::new());
     }
-    if !(max_norm > 0.0) {
+    if max_norm.is_nan() || max_norm <= 0.0 {
         return Err(Error::Shape(format!(
             "clip_global_norm needs a positive cap, got {max_norm}"
         )));

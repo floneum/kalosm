@@ -62,7 +62,7 @@ impl BackwardTarget {
 }
 
 /// A user backward, type-erased over the value's rank and dtype.
-type Rule = Arc<dyn Fn(Dyn) -> Result<Vec<BackwardTarget>>>;
+type Rule = Arc<dyn Fn(Dyn) -> Result<Vec<BackwardTarget>> + Send + Sync>;
 
 #[derive(Default)]
 struct Boundary {
@@ -257,7 +257,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     /// [`Tensor::backward_with`], which is where it can name the value.
     pub fn with_backwards<const N: usize, F>(self, parents: [Parent; N], rule: F) -> Self
     where
-        F: Fn(RawTensor<R, T>) -> Result<Vec<BackwardTarget>> + 'static,
+        F: Fn(RawTensor<R, T>) -> Result<Vec<BackwardTarget>> + Send + Sync + 'static,
     {
         let erased: Rule = Arc::new(move |grad: Dyn| {
             let typed = RawTensor::<R, T>::try_from_dyn(grad)?;
@@ -602,10 +602,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         I: IntoIterator<Item = Tensor<R, T>>,
     {
         let parts: Vec<Tensor<R, T>> = parts.into_iter().collect();
-        let graph = parts
-            .first()
-            .map(|p| p.graph.clone())
-            .unwrap_or_else(Graph::new);
+        let graph = parts.first().map(|p| p.graph.clone()).unwrap_or_default();
         let value = crate::tensor::typed::cat(parts.into_iter().map(|p| p.value), dim);
         Tensor { value, graph }
     }

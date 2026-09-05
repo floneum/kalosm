@@ -126,6 +126,10 @@ fn ref_pad(d: &[f32], shape: &[u64], axis: usize, lo: usize, hi: usize) -> (Vec<
     (out_shape, out)
 }
 
+/// The host's own view of the op: `(output shape, output data)` from the
+/// input data.
+type ViewReference<'a> = dyn Fn(&[f32]) -> (Vec<u64>, Vec<f32>) + 'a;
+
 /// Forward against the host reference, then a finite-difference backward.
 ///
 /// The backward half is the point: every view is a `Restride`, and a
@@ -137,7 +141,7 @@ fn check_view(
     shape: &[u64],
     seed: u32,
     build: &dyn Fn(&Tensor) -> fusor::Result<Tensor>,
-    reference: &dyn Fn(&[f32]) -> (Vec<u64>, Vec<f32>),
+    reference: &ViewReference<'_>,
 ) -> CaseResult {
     let len: usize = shape.iter().product::<u64>() as usize;
     let data = Domain::Wide.sample(seed, len);

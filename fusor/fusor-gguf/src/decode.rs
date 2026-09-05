@@ -641,7 +641,7 @@ mod tests {
                     &raw[block * stride..(block + 1) * stride],
                     &mut expected,
                 );
-                for element in 0..elements {
+                for (element, &want) in expected.iter().enumerate().take(elements) {
                     let args = BlockDecodeArgs {
                         src: &view,
                         layout,
@@ -657,7 +657,6 @@ mod tests {
                         "{} must return a scalar f32",
                         spec.decode.name
                     );
-                    let want = expected[element];
                     let have = eval(&program, &words).f();
                     assert!(
                         (want - have).abs() <= 1e-6 * want.abs().max(1.0),

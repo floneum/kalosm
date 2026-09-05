@@ -20,6 +20,16 @@ use crate::suite::support::{
 /// The forward-only rows take no gradient, so they can afford multi-workgroup
 /// extents. [`non_vacuous`] needs enough samples that a random draw cannot
 /// land entirely on the op's identity interval.
+/// `(name, sampling domain, op, host reference)` for a unary row that is
+/// checked forward and backward.
+type UnaryRow = (&'static str, Domain, UnaryOp, fn(f32) -> f32);
+/// The binary counterpart of [`UnaryRow`].
+type BinaryRow = (&'static str, Domain, BinaryOp, fn(f32, f32) -> f32);
+/// `(name, op, host reference)` for a unary row over the default domain.
+type UnaryRefRow = (&'static str, UnaryOp, fn(f32) -> f32);
+/// The binary counterpart of [`UnaryRefRow`].
+type BinaryRefRow = (&'static str, BinaryOp, fn(f32, f32) -> f32);
+
 const FORWARD_SPEC: &[FuzzDim] = &[FuzzDim::Range(4, 8), FuzzDim::Range(8, 64)];
 
 /// `(e^x - e^-x) / (e^x + e^-x)`, the form `tanh_exact` names. The reference
@@ -33,7 +43,7 @@ fn tanh_exact_ref(x: f32) -> f32 {
 /// `less_approximate_exp` are the other two of the 23; they get a relative
 /// bound instead.
 #[rustfmt::skip]
-fn unaries() -> Vec<(&'static str, Domain, UnaryOp, fn(f32) -> f32)> {
+fn unaries() -> Vec<UnaryRow> {
     vec![
         // `abs` is sampled off zero: its adjoint is undefined there and a
         // central difference straddling the kink disagrees with any convention.
@@ -63,7 +73,7 @@ fn unaries() -> Vec<(&'static str, Domain, UnaryOp, fn(f32) -> f32)> {
 
 /// The 8 scalar-arith unaries, each with its constant baked into the closure.
 #[rustfmt::skip]
-fn scalar_arith() -> Vec<(&'static str, Domain, UnaryOp, fn(f32) -> f32)> {
+fn scalar_arith() -> Vec<UnaryRow> {
     vec![
         ("add_scalar", Domain::Wide,     |x| x.add_scalar(0.75), |v| v + 0.75),
         ("sub_scalar", Domain::Wide,     |x| x.sub_scalar(0.25), |v| v - 0.25),
@@ -84,7 +94,7 @@ fn scalar_arith() -> Vec<(&'static str, Domain, UnaryOp, fn(f32) -> f32)> {
 /// No gradient is taken, so the kink is harmless; [`non_vacuous`] keeps the
 /// domain honest.
 #[rustfmt::skip]
-fn forward_only() -> Vec<(&'static str, Domain, UnaryOp, fn(f32) -> f32)> {
+fn forward_only() -> Vec<UnaryRow> {
     vec![
         ("abs_straddles_zero",       Domain::Wide,            |x| x.abs(),           f32::abs),
         ("max_scalar_clamps_below",  Domain::Custom(-2.0, 2.0), |x| x.max_scalar(0.5), |v| v.max(0.5)),
@@ -109,7 +119,7 @@ fn non_vacuous(name: &str, data: &[f32], reference: fn(f32) -> f32) -> Result<()
 
 /// The 5 same-rank binaries plus `pow`.
 #[rustfmt::skip]
-fn binaries() -> Vec<(&'static str, Domain, BinaryOp, fn(f32, f32) -> f32)> {
+fn binaries() -> Vec<BinaryRow> {
     vec![
         ("add", Domain::Wide,     |a, b| a.add(b), |x, y| x + y),
         ("sub", Domain::Wide,     |a, b| a.sub(b), |x, y| x - y),
@@ -123,7 +133,7 @@ fn binaries() -> Vec<(&'static str, Domain, BinaryOp, fn(f32, f32) -> f32)> {
 /// The 6 scalar comparisons, which — as in the reference — take a *scalar*,
 /// not a tensor. Each differentiates to zero.
 #[rustfmt::skip]
-fn scalar_comparisons() -> Vec<(&'static str, UnaryOp, fn(f32) -> f32)> {
+fn scalar_comparisons() -> Vec<UnaryRefRow> {
     vec![
         ("eq_scalar",  |x| x.eq_scalar(0.0), |v| f32::from(v == 0.0)),
         ("ne_scalar",  |x| x.ne_scalar(0.0), |v| f32::from(v != 0.0)),
@@ -136,7 +146,7 @@ fn scalar_comparisons() -> Vec<(&'static str, UnaryOp, fn(f32) -> f32)> {
 
 /// The 6 tensor comparisons.
 #[rustfmt::skip]
-fn tensor_comparisons() -> Vec<(&'static str, BinaryOp, fn(f32, f32) -> f32)> {
+fn tensor_comparisons() -> Vec<BinaryRefRow> {
     vec![
         ("eq_tensor",  |a, b| a.eq_tensor(b),  |x, y| f32::from(x == y)),
         ("ne_tensor",  |a, b| a.ne_tensor(b),  |x, y| f32::from(x != y)),
@@ -149,7 +159,7 @@ fn tensor_comparisons() -> Vec<(&'static str, BinaryOp, fn(f32, f32) -> f32)> {
 
 /// The 5 broadcasting binaries.
 #[rustfmt::skip]
-fn broadcasting() -> Vec<(&'static str, BinaryOp, fn(f32, f32) -> f32)> {
+fn broadcasting() -> Vec<BinaryRefRow> {
     vec![
         ("add_", |a, b| a.add_(b), |x, y| x + y),
         ("sub_", |a, b| a.sub_(b), |x, y| x - y),
@@ -157,6 +167,22 @@ fn broadcasting() -> Vec<(&'static str, BinaryOp, fn(f32, f32) -> f32)> {
         ("div_", |a, b| a.div_(b), |x, y| x / y),
         ("pow_", |a, b| a.pow_(b), |x, y| x.powf(y)),
     ]
+}
+
+/// The forward bound a GPU gets on a row whose driver implementation is a
+/// documented approximation, or `None` for the F32 default.
+///
+/// Mesa lowers the SPIR-V `asin`/`acos` to a fixed polynomial a few 1e-4
+/// off in absolute terms — on lavapipe in CI and on every Mesa Vulkan driver
+/// in the field alike. The kernel emits the plain `asin`/`acos` builtin, so
+/// what is being measured there is the driver, not the compiler; the row's
+/// adjoint check (`1 / sqrt(1 - x^2)`, computed from primitives) keeps the
+/// default bound.
+fn gpu_forward_tolerance(name: &str) -> Option<(f32, f32)> {
+    match name {
+        "asin" | "acos" => Some((1e-3, 1e-4)),
+        _ => None,
+    }
 }
 
 pub fn cases() -> Cases {
@@ -170,6 +196,7 @@ pub fn cases() -> Cases {
             domain,
             op,
             reference,
+            gpu_forward_tolerance(name),
         ));
     }
     for (name, domain, op, reference) in scalar_arith() {
@@ -180,6 +207,7 @@ pub fn cases() -> Cases {
             domain,
             op,
             reference,
+            None,
         ));
     }
     for (name, domain, op, reference) in forward_only() {
