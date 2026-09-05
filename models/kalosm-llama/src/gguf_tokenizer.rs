@@ -155,7 +155,7 @@ impl GGUFPreTokenizerConfig {
             })
             .collect();
         let bos_token = vocab[bos];
-        let vocab = ahash::AHashMap::from_iter(vocab.into_iter());
+        let vocab = ahash::AHashMap::from_iter(vocab);
         let bpe_tokenizer = BpeBuilder::new()
             .vocab_and_merges(vocab, merges)
             .ignore_merges(self.ignore_merges)

@@ -1,6 +1,6 @@
 [package]
 name = "kalosm-language"
-version = "0.4.1"
+version = "0.4.2"
 edition = "2021"
 description = "A set of pretrained language models "
 license = "MIT/Apache-2.0"

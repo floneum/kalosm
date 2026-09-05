@@ -1,6 +1,6 @@
 [package]
 name = "kalosm-llama"
-version = "0.4.1"
+version = "0.4.3"
 edition = "2021"
 description = "A simple interface for Llama models"
 license = "MIT/Apache-2.0"
