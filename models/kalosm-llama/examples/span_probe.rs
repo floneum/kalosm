@@ -24,9 +24,8 @@ fn main() {
         assert!(path.exists(), "model file not found: {}", path.display());
 
         let device = Device::gpu().await.unwrap();
-        let fusor::session::Backend::Gpu(target) = device.backend().clone() else {
-            unreachable!("gpu device is gpu");
-        };
+        let probe = device.clone();
+        let target = probe.backend().gpu_target().expect("gpu device is gpu");
 
         let model = Llama::builder()
             .with_source(LlamaSource::new(FileSource::Local(path)))

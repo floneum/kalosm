@@ -28,10 +28,12 @@ struct Inner {
 }
 
 /// A GPU device. Held by [`Device::Gpu`].
+#[cfg(feature = "gpu")]
 #[derive(Clone)]
 pub struct Gpu(Arc<Inner>);
 
 /// A CPU device. Held by [`Device::Cpu`].
+#[cfg(feature = "cpu")]
 #[derive(Clone)]
 pub struct Cpu(Arc<Inner>);
 
@@ -39,8 +41,10 @@ pub struct Cpu(Arc<Inner>);
 #[derive(Clone)]
 pub enum Device {
     /// A CPU-backed graph and session.
+    #[cfg(feature = "cpu")]
     Cpu(Cpu),
     /// A GPU-backed graph and session.
+    #[cfg(feature = "gpu")]
     Gpu(Gpu),
 }
 
@@ -48,6 +52,7 @@ pub enum Device {
 /// successful device creation.
 static AMBIENT: OnceLock<Mutex<Option<Graph>>> = OnceLock::new();
 /// One CPU device per process, so two `Device::cpu()` calls agree on a graph.
+#[cfg(feature = "cpu")]
 static CPU: OnceLock<Device> = OnceLock::new();
 
 fn ambient() -> &'static Mutex<Option<Graph>> {
@@ -90,6 +95,7 @@ impl Device {
     /// # Panics
     /// If the CPU target cannot be built. [`Device::try_cpu`] is the checked
     /// spelling.
+    #[cfg(feature = "cpu")]
     pub fn cpu() -> Self {
         let device = CPU
             .get_or_init(|| Self::try_cpu().expect("cpu device"))
@@ -99,24 +105,42 @@ impl Device {
     }
 
     /// [`Device::cpu`], reporting the failure instead of panicking.
+    #[cfg(feature = "cpu")]
     pub fn try_cpu() -> Result<Self> {
         Ok(Self::Cpu(Cpu(Inner::new(Backend::cpu()?)?)))
     }
 
     /// The GPU backend, blocking on adapter acquisition. `Err` when there is
     /// no usable adapter — the caller is expected to fall back.
+    #[cfg(feature = "gpu")]
     pub fn gpu_blocking() -> Result<Self> {
         Ok(Self::Gpu(Gpu(Inner::new(Backend::gpu_blocking()?)?)))
     }
 
     /// The GPU backend, awaiting adapter acquisition.
+    #[cfg(feature = "gpu")]
     pub async fn gpu() -> Result<Self> {
         Ok(Self::Gpu(Gpu(Inner::new(Backend::gpu().await?)?)))
     }
 
     /// The GPU if one is usable, otherwise the CPU.
+    #[cfg(all(feature = "gpu", feature = "cpu"))]
     pub fn auto() -> Self {
         Self::gpu_blocking().unwrap_or_else(|_| Self::cpu())
+    }
+
+    /// The GPU. Built without the `cpu` feature there is nothing to fall
+    /// back to, so an unusable adapter is a panic; use [`Device::gpu_blocking`]
+    /// to handle it.
+    #[cfg(all(feature = "gpu", not(feature = "cpu")))]
+    pub fn auto() -> Self {
+        Self::gpu_blocking().expect("no usable GPU adapter, and the `cpu` feature is off")
+    }
+
+    /// The CPU: the only backend this build has.
+    #[cfg(all(feature = "cpu", not(feature = "gpu")))]
+    pub fn auto() -> Self {
+        Self::cpu()
     }
 
     /// The device a value in `graph` was built from. Wraps the same session
@@ -127,14 +151,18 @@ impl Device {
             graph: Graph::from_handle(graph.clone()),
         });
         match inner.session.device() {
+            #[cfg(feature = "cpu")]
             Backend::Cpu(_) => Self::Cpu(Cpu(inner)),
+            #[cfg(feature = "gpu")]
             Backend::Gpu(_) => Self::Gpu(Gpu(inner)),
         }
     }
 
     fn inner(&self) -> &Arc<Inner> {
         match self {
+            #[cfg(feature = "cpu")]
             Self::Cpu(d) => &d.0,
+            #[cfg(feature = "gpu")]
             Self::Gpu(d) => &d.0,
         }
     }
@@ -156,7 +184,9 @@ impl Device {
     /// The backend name, either `"cpu"` or `"gpu"`.
     pub fn name(&self) -> &'static str {
         match self {
+            #[cfg(feature = "cpu")]
             Self::Cpu(_) => "cpu",
+            #[cfg(feature = "gpu")]
             Self::Gpu(_) => "gpu",
         }
     }
@@ -194,6 +224,7 @@ impl std::fmt::Debug for Device {
     }
 }
 
+#[cfg(feature = "gpu")]
 impl Gpu {
     /// The GPU session.
     pub fn session(&self) -> &Session {
@@ -211,7 +242,7 @@ impl Gpu {
     /// Drain the per-resolve kernel timings collected since the last call.
     /// Empty unless the backend was built with profiling on.
     pub fn take_kernel_profiles(&self) -> Vec<KernelProfile> {
-        let Backend::Gpu(target) = self.0.session.device() else {
+        let Some(target) = self.0.session.device().gpu_target() else {
             return Vec::new();
         };
         target
@@ -222,6 +253,7 @@ impl Gpu {
     }
 }
 
+#[cfg(feature = "cpu")]
 impl Cpu {
     /// The CPU session.
     pub fn session(&self) -> &Session {
@@ -263,6 +295,7 @@ pub struct KernelProfile {
     pub top_names: Vec<KernelProfileRow>,
 }
 
+#[cfg(feature = "gpu")]
 impl KernelProfile {
     fn from_backend(p: fusor_gpu::launch::KernelProfile) -> Self {
         Self {

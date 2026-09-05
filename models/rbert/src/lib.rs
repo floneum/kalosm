@@ -42,6 +42,9 @@
 
 #![warn(missing_docs)]
 
+#[cfg(not(any(feature = "cpu", feature = "gpu")))]
+compile_error!("rbert: enable at least one backend feature, `cpu` or `gpu`");
+
 use std::sync::{Arc, RwLock};
 
 use fusor::{Tensor, VarBuilder};
@@ -339,10 +342,7 @@ impl Bert {
 
         let device = match device {
             Some(device) => device,
-            None => match Device::gpu().await {
-                Ok(device) => device,
-                Err(_) => Device::cpu(),
-            },
+            None => default_device().await,
         };
         let gguf = fusor_gguf::parse::Gguf::from_bytes(weights_bytes)
             .map_err(BertLoadingError::LoadModel)?;
@@ -515,4 +515,26 @@ impl Bert {
 fn normalize_l2(v: &Tensor<2>) -> Tensor<2> {
     let sum_sq = v.sqr().sum_keepdim(1);
     v.div_(&sum_sq.add_scalar(1e-12f32).sqrt())
+}
+
+/// The GPU when an adapter is usable, otherwise the CPU. Without the `cpu`
+/// feature an unusable adapter is a panic: there is nothing to fall back to.
+async fn default_device() -> Device {
+    #[cfg(all(feature = "gpu", feature = "cpu"))]
+    {
+        Device::gpu().await.unwrap_or_else(|err| {
+            tracing::warn!("no gpu adapter, falling back to cpu: {err}");
+            Device::cpu()
+        })
+    }
+    #[cfg(all(feature = "gpu", not(feature = "cpu")))]
+    {
+        Device::gpu()
+            .await
+            .unwrap_or_else(|err| panic!("no gpu adapter, and the `cpu` feature is off: {err}"))
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        Device::cpu()
+    }
 }

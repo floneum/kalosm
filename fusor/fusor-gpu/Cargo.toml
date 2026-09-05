@@ -39,7 +39,9 @@ wgpu = { version = "29", default-features = false, features = ["dx12"] }
 wgpu = { version = "29", default-features = false, features = ["vulkan"] }
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-wgpu = { version = "29", default-features = false, features = ["webgpu"] }
+# The web backend's handles are `Rc`-based; this feature marks them Send/Sync
+# on the single-threaded wasm target so the pool and plan cache type-check.
+wgpu = { version = "29", default-features = false, features = ["webgpu", "fragile-send-sync-non-atomic-wasm"] }
 
 [features]
 default = []

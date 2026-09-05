@@ -21,6 +21,9 @@
 
 #![warn(missing_docs)]
 
+#[cfg(not(any(feature = "cpu", feature = "gpu")))]
+compile_error!("segment-anything-rs: enable at least one backend feature, `cpu` or `gpu`");
+
 mod mask_generation;
 mod raw;
 
@@ -243,11 +246,7 @@ impl SegmentAnything {
                 kalosm_common::Cache::default().get(&source, |_| {}).await?
             }
         };
-        let device = match Device::gpu().await {
-            Ok(device) => device,
-            // No usable GPU adapter; fall back to the CPU backend.
-            Err(_) => Device::cpu(),
-        };
+        let device = default_device().await?;
         let vb = VarBuilder::from_gguf(&model_path)?;
         let sam = match source.architecture {
             SegmentAnythingArchitecture::MobileSamTiny => Sam::load_tiny(&device, &vb)?,
@@ -442,5 +441,22 @@ impl SegmentAnything {
         }
 
         Ok(masks)
+    }
+}
+
+/// The GPU when an adapter is usable, otherwise the CPU. Without the `cpu`
+/// feature there is nothing to fall back to, so the adapter error is returned.
+async fn default_device() -> Result<Device, LoadSegmentAnythingError> {
+    #[cfg(all(feature = "gpu", feature = "cpu"))]
+    {
+        Ok(Device::gpu().await.unwrap_or_else(|_| Device::cpu()))
+    }
+    #[cfg(all(feature = "gpu", not(feature = "cpu")))]
+    {
+        Ok(Device::gpu().await?)
+    }
+    #[cfg(not(feature = "gpu"))]
+    {
+        Ok(Device::cpu())
     }
 }

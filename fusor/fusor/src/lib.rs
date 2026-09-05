@@ -26,6 +26,9 @@
 
 #![warn(missing_docs, unreachable_pub)]
 
+#[cfg(not(any(feature = "cpu", feature = "gpu")))]
+compile_error!("fusor: enable at least one backend feature, `cpu` or `gpu`");
+
 pub mod autograd;
 mod broadcast;
 pub mod cache;
@@ -46,8 +49,9 @@ pub mod tensor;
 mod api_surface;
 
 /// The trainer's API surface, restated so a regression is a compile error
-/// here. Test-only: it defines no public item.
-#[cfg(test)]
+/// here. Test-only: it defines no public item. The trainer selects between
+/// both backends, so the restatement needs both.
+#[cfg(all(test, feature = "cpu", feature = "gpu"))]
 mod trainer_surface;
 
 pub use device::Device;

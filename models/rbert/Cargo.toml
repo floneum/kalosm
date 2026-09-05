@@ -9,7 +9,7 @@ authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["ai", "llm", "bert", "nlp", "transformers"]
 
 [dependencies]
-fusor = { path = "../../fusor/fusor" }
+fusor = { path = "../../fusor/fusor", default-features = false }
 fusor-gguf = { path = "../../fusor/fusor-gguf" }
 tokenizers = { workspace = true, features = ["fancy-regex"] }
 thiserror.workspace = true
@@ -25,10 +25,8 @@ pollster = "0.4.0"
 
 [features]
 default = ["cpu", "gpu"]
-# fusor compiles both backends unconditionally; these are kept as no-ops so
-# downstream feature selections keep resolving.
-cpu = []
-gpu = []
+cpu = ["fusor/cpu"]
+gpu = ["fusor/gpu"]
 
 [dev-dependencies]
 anyhow.workspace = true

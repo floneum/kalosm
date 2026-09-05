@@ -33,7 +33,11 @@ use crate::composite::{
     rope_interleaved_with_position, rope_pair, rope_pair_with_position, rope_with_position,
     rotate_half, softmax_cross_entropy, upsample_bilinear, upsample_nearest, upsample_nearest2d,
 };
-use crate::device::{Cpu, Gpu, KernelProfile, KernelProfileRow};
+#[cfg(feature = "cpu")]
+use crate::device::Cpu;
+#[cfg(feature = "gpu")]
+use crate::device::Gpu;
+use crate::device::{KernelProfile, KernelProfileRow};
 use crate::graph::{Gradients, GraphRef};
 use crate::layers::{ConvNd, Embedding, LayerNorm, LayerNormNd, Linear, RmsNorm};
 use crate::optim::{AdamW, clip_global_norm, cosine_decay, global_norm};

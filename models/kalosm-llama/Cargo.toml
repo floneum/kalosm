@@ -9,7 +9,7 @@ authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["llm", "llama", "mistral", "agents", "nlp"]
 
 [dependencies]
-fusor = { path = "../../fusor/fusor" }
+fusor = { path = "../../fusor/fusor", default-features = false }
 fusor-gguf = { path = "../../fusor/fusor-gguf" }
 kalosm-tokenizer.workspace = true
 
@@ -56,10 +56,8 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 
 [features]
 default = ["gpu"]
-# fusor compiles both backends unconditionally; these are kept as no-ops so
-# downstream feature selections keep resolving.
-cpu = []
-gpu = []
+cpu = ["fusor/cpu"]
+gpu = ["fusor/gpu"]
 chat-template-json = ["minijinja/json"]
 hf-config-json = ["dep:serde_json"]
 vision = ["dep:image", "dep:pollster", "kalosm-language-model/media"]
@@ -69,3 +67,19 @@ hf-tokenizer-json = ["dep:tokenizers"]
 [[example]]
 name = "structured"
 required-features = ["structured"]
+
+[[example]]
+name = "infer"
+required-features = ["cpu"]
+
+[[example]]
+name = "infer_local"
+required-features = ["gpu"]
+
+[[example]]
+name = "span_probe"
+required-features = ["gpu"]
+
+[[example]]
+name = "token_probe"
+required-features = ["gpu"]

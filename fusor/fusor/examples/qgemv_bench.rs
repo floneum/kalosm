@@ -16,7 +16,6 @@
 
 use fusor::device::Device;
 use fusor::quantized::QMatrix;
-use fusor::session::Backend;
 use fusor::{Dim, Dtype};
 use fusor_ir::dtype::{QFmt, QLayout};
 
@@ -100,7 +99,7 @@ fn main() -> fusor::Result<()> {
         // Steady state on the per-dispatch timestamp path. Fresh bytes each
         // iteration so the leaf rebinds and the resolve is a replay, not a
         // memoized readback.
-        let Backend::Gpu(target) = session.device() else {
+        let Some(target) = session.device().gpu_target() else {
             unreachable!("gpu_blocking returned a non-gpu device");
         };
         let mut xbytes: Vec<u8> = xdata.iter().flat_map(|f| f.to_le_bytes()).collect();

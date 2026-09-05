@@ -2,6 +2,7 @@
 //! extractor and the plan cache; `resolve` is the one place saturation,
 //! extraction and dispatch happen.
 
+#[cfg(feature = "cpu")]
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -9,7 +10,9 @@ use std::time::Instant;
 
 use fusor_cost::tune_cache::Verdict;
 use fusor_cost::{LocalSearch, ReplayMemo, Roofline};
+#[cfg(feature = "cpu")]
 use fusor_cpu::CpuTarget;
+#[cfg(feature = "gpu")]
 use fusor_gpu::GpuTarget;
 use fusor_ir::CORE_RULES;
 use fusor_ir::cost::CostModel;
@@ -17,20 +20,29 @@ use fusor_ir::device::Caps;
 use fusor_ir::dtype::{Dtype, Persistence};
 use fusor_ir::egraph::{EGraph, Id, Rule, Saturate, SaturationBudget, SaturationDelta};
 use fusor_ir::extract::{ExtractBudget, Extractor, Plan, ReplayKey};
-use fusor_ir::ir::launch::{Effect, Launch};
-use fusor_ir::ir::logical::{BufferId, LeafKind, Logical};
+use fusor_ir::ir::launch::Effect;
+#[cfg(feature = "cpu")]
+use fusor_ir::ir::launch::Launch;
+#[cfg(feature = "cpu")]
+use fusor_ir::ir::logical::BufferId;
+use fusor_ir::ir::logical::{LeafKind, Logical};
 use fusor_ir::ir::{Op, OpDefRegistry, Semantics};
 use fusor_ir::saturate::Driver;
 use fusor_ir::shape::Dim;
-use fusor_ir::target::{Artifact, Buf, LowerCtx, Target, Uniforms};
+#[cfg(feature = "cpu")]
+use fusor_ir::target::{Artifact, LowerCtx, Uniforms};
+use fusor_ir::target::{Buf, Target};
 use fusor_tile::{Planner, SCHED_RULES};
 use rustc_hash::FxHashMap;
 
 use crate::composite::register_macro_ops;
-use crate::graph::{GraphRef, WeakGraphRef};
+use crate::graph::GraphRef;
+#[cfg(feature = "cpu")]
+use crate::graph::WeakGraphRef;
 use crate::tensor::Tensor;
 use crate::{Error, Result};
 
+#[cfg(feature = "gpu")]
 mod explore;
 
 /// Submitted-but-unretired plans the session will let pile up before it
@@ -68,31 +80,64 @@ pub(crate) type ResolveGuard<'a> = parking_lot::MutexGuard<'a, ()>;
 #[derive(Clone)]
 pub enum Backend {
     /// Native CPU execution.
+    #[cfg(feature = "cpu")]
     Cpu(Arc<CpuTarget>),
     /// WebGPU execution.
+    #[cfg(feature = "gpu")]
     Gpu(Arc<GpuTarget>),
 }
 
 impl Backend {
     /// Create a CPU backend.
+    #[cfg(feature = "cpu")]
     pub fn cpu() -> Result<Self> {
         Ok(Self::Cpu(Arc::new(CpuTarget::new()?)))
     }
 
     /// Create a GPU backend asynchronously.
+    #[cfg(feature = "gpu")]
     pub async fn gpu() -> Result<Self> {
         Ok(Self::Gpu(Arc::new(GpuTarget::new().await?)))
     }
 
     /// Create a GPU backend and block until adapter initialization completes.
+    #[cfg(feature = "gpu")]
     pub fn gpu_blocking() -> Result<Self> {
         Ok(Self::Gpu(Arc::new(GpuTarget::new_blocking()?)))
+    }
+
+    /// Whether this is the CPU backend.
+    pub fn is_cpu(&self) -> bool {
+        #[cfg(feature = "cpu")]
+        return matches!(self, Self::Cpu(_));
+        #[cfg(not(feature = "cpu"))]
+        false
+    }
+
+    /// Whether this is the GPU backend.
+    pub fn is_gpu(&self) -> bool {
+        #[cfg(feature = "gpu")]
+        return matches!(self, Self::Gpu(_));
+        #[cfg(not(feature = "gpu"))]
+        false
+    }
+
+    /// The GPU target, when this is the GPU backend.
+    #[cfg(feature = "gpu")]
+    pub fn gpu_target(&self) -> Option<&GpuTarget> {
+        match self {
+            Self::Gpu(t) => Some(t.as_ref()),
+            #[cfg(feature = "cpu")]
+            Self::Cpu(_) => None,
+        }
     }
 
     /// The backend's compiler and execution target.
     pub fn target(&self) -> Arc<dyn Target> {
         match self {
+            #[cfg(feature = "cpu")]
             Self::Cpu(t) => Arc::clone(t) as Arc<dyn Target>,
+            #[cfg(feature = "gpu")]
             Self::Gpu(t) => Arc::clone(t) as Arc<dyn Target>,
         }
     }
@@ -101,7 +146,9 @@ impl Backend {
     /// Always `None` on the CPU.
     pub fn device_lost(&self) -> Option<String> {
         match self {
+            #[cfg(feature = "cpu")]
             Self::Cpu(_) => None,
+            #[cfg(feature = "gpu")]
             Self::Gpu(t) => t.device().lost().reason(),
         }
     }
@@ -109,7 +156,9 @@ impl Backend {
     /// The backend name, either `"cpu"` or `"gpu"`.
     pub fn name(&self) -> &'static str {
         match self {
+            #[cfg(feature = "cpu")]
             Self::Cpu(_) => "cpu",
+            #[cfg(feature = "gpu")]
             Self::Gpu(_) => "gpu",
         }
     }
@@ -117,17 +166,24 @@ impl Backend {
     /// A snapshot of the backend capabilities used for planning.
     pub fn caps(&self) -> Caps {
         match self {
+            #[cfg(feature = "cpu")]
             Self::Cpu(t) => t.caps().clone(),
+            #[cfg(feature = "gpu")]
             Self::Gpu(t) => t.caps().clone(),
         }
     }
 
     /// Upload host bytes into a fresh device buffer.
     pub(crate) fn upload(&self, bytes: &[u8], persistence: Persistence) -> Result<Buf> {
+        // Only the CPU allocator distinguishes persistence classes.
+        #[cfg(not(feature = "cpu"))]
+        let _ = persistence;
         match self {
+            #[cfg(feature = "gpu")]
             Self::Gpu(t) => t
                 .pool()
                 .create_buffer_init(bytes, fusor_gpu::pool::TENSOR_USAGE),
+            #[cfg(feature = "cpu")]
             Self::Cpu(t) => {
                 let buf = t.alloc(bytes.len().max(4) as u64, persistence)?;
                 let aligned = buf
@@ -146,7 +202,9 @@ impl Backend {
     /// Copy a device buffer back to the host. One of exactly three host syncs.
     fn download(&self, buf: &Buf, bytes: u64) -> Result<Vec<u8>> {
         match self {
+            #[cfg(feature = "gpu")]
             Self::Gpu(t) => pollster::block_on(t.readback(buf, bytes)),
+            #[cfg(feature = "cpu")]
             Self::Cpu(_) => {
                 let aligned = buf
                     .downcast_ref::<fusor_cpu::AlignedBuf>()
@@ -180,30 +238,36 @@ pub(crate) struct SessionInner {
     tune: fusor_cost::tune_cache::TuneCache,
     /// The online explorer's per-key state: deterministic resolve counters
     /// and the candidate arms production sampling is working through.
+    #[cfg(feature = "gpu")]
     explore: parking_lot::Mutex<explore::ExploreState>,
     /// Verified CPU plans and native launch lists, keyed by an unsaturated
     /// term modulo fresh step-buffer names.
+    #[cfg(feature = "cpu")]
     cpu_structural: parking_lot::Mutex<FxHashMap<CpuStructuralKey, CpuStructuralEntry>>,
     launches: AtomicU64,
     in_flight: AtomicU32,
 }
 
+#[cfg(feature = "cpu")]
 struct CpuExecutableLaunch {
     artifact: Artifact,
     grid: [u32; 3],
     bindings: Vec<Id>,
 }
 
+#[cfg(feature = "cpu")]
 struct CpuExecutable {
     launches: Vec<CpuExecutableLaunch>,
 }
 
+#[cfg(feature = "cpu")]
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CpuTerm {
     nodes: Vec<Op>,
     roots: Vec<Id>,
 }
 
+#[cfg(feature = "cpu")]
 #[derive(Clone, PartialEq, Eq, Hash)]
 struct CpuStructuralKey {
     graph: usize,
@@ -211,6 +275,7 @@ struct CpuStructuralKey {
     term: CpuTerm,
 }
 
+#[cfg(feature = "cpu")]
 struct CpuStructuralEntry {
     graph: WeakGraphRef,
     roots: Vec<Id>,
@@ -219,6 +284,7 @@ struct CpuStructuralEntry {
     executable: Arc<CpuExecutable>,
 }
 
+#[cfg(feature = "cpu")]
 struct CpuStructuralHit {
     roots: Vec<Id>,
     plan: Arc<Plan>,
@@ -226,11 +292,21 @@ struct CpuStructuralHit {
     inputs: FxHashMap<Id, Buf>,
 }
 
+#[cfg(feature = "cpu")]
 struct CpuTemplateBindings {
     inputs: FxHashMap<Id, Buf>,
     outputs: Vec<Id>,
     executable: Arc<CpuExecutable>,
 }
+
+/// Uninhabited without the `cpu` backend: `run` still names the type, and a
+/// GPU resolve never has one to pass.
+#[cfg(not(feature = "cpu"))]
+enum CpuExecutable {}
+
+/// Uninhabited without the `cpu` backend; see [`CpuExecutable`].
+#[cfg(not(feature = "cpu"))]
+enum CpuTemplateBindings {}
 
 impl Session {
     /// Create a planner, compiler, and execution session for `device`.
@@ -269,8 +345,10 @@ impl Session {
                 rules,
                 replay: ReplayMemo::new(),
                 tune: fusor_cost::tune_cache::TuneCache::load(device_fingerprint),
+                #[cfg(feature = "gpu")]
                 explore: parking_lot::Mutex::new(explore::ExploreState::default()),
                 saturation: SaturationMemo::default(),
+                #[cfg(feature = "cpu")]
                 cpu_structural: parking_lot::Mutex::new(FxHashMap::default()),
                 launches: AtomicU64::new(0),
                 in_flight: AtomicU32::new(0),
@@ -340,7 +418,8 @@ impl Session {
         // rebinding only the fresh input and requested output buffers. This
         // deliberately runs before saturation and extraction: those dominate
         // the cost of replaying a model on an append-only graph.
-        if matches!(self.inner.device, Backend::Cpu(_))
+        #[cfg(feature = "cpu")]
+        if self.inner.device.is_cpu()
             && let Some(hit) = self.cpu_structural_hit(&graph, values)
         {
             let old_values: Vec<Tensor> = hit.roots.iter().map(|id| graph.tensor(*id)).collect();
@@ -486,7 +565,7 @@ impl Session {
             (plan, roots, key, missed)
         };
 
-        let plan = if missed && matches!(self.inner.device, Backend::Gpu(_)) {
+        let plan = if missed && self.inner.device.is_gpu() {
             let tuned = self.autotune(resolving, &graph, &roots, plan, values)?;
             self.inner.replay.insert(key, (*tuned).clone());
             tuned
@@ -498,11 +577,13 @@ impl Session {
         // arm for the incumbent and let this production dispatch's own GPU
         // spans feed the tuner's windows. Every arm is a verify_plan-checked
         // member plan.
-        let explored = if !missed && matches!(self.inner.device, Backend::Gpu(_)) {
+        #[cfg(feature = "gpu")]
+        let explored = if !missed && self.inner.device.is_gpu() {
             self.explore_step(&graph, &roots, key, &plan)
         } else {
             None
         };
+        #[cfg(feature = "gpu")]
         let (plan, _explore_clock) = match &explored {
             Some(sel) => (
                 Arc::clone(sel.plan()),
@@ -539,6 +620,7 @@ impl Session {
 
         let __t_run = Instant::now();
         let (launched, executable) = self.run(&graph, &plan, values, None)?;
+        #[cfg(feature = "gpu")]
         if let Some(sel) = explored {
             // Reads the profile the armed clock captured; must run before the
             // clock drops (its drop clears the last profile).
@@ -555,9 +637,12 @@ impl Session {
             .launches
             .fetch_add(launched as u64, Ordering::Relaxed);
         self.inner.in_flight.fetch_add(1, Ordering::Relaxed);
+        #[cfg(feature = "cpu")]
         if let Some(executable) = executable {
             self.insert_cpu_structural(&graph, &roots, Arc::clone(&plan), executable);
         }
+        #[cfg(not(feature = "cpu"))]
+        let _ = executable;
         Ok(())
     }
 
@@ -576,6 +661,7 @@ impl Session {
         Ok(())
     }
 
+    #[cfg(feature = "cpu")]
     fn cpu_structural_hit(&self, graph: &GraphRef, values: &[Tensor]) -> Option<CpuStructuralHit> {
         let roots: Vec<Id> = values.iter().map(|value| value.id).collect();
         let (key, current_inputs) = cpu_cache_key(graph, &roots)?;
@@ -607,6 +693,7 @@ impl Session {
         })
     }
 
+    #[cfg(feature = "cpu")]
     fn insert_cpu_structural(
         &self,
         graph: &GraphRef,
@@ -778,6 +865,12 @@ impl Session {
             .iter()
             .map(|v| self.selected(graph, plan, v.id))
             .collect();
+        #[cfg(not(feature = "cpu"))]
+        let output_aliases: FxHashMap<Id, Id> = {
+            let _ = template;
+            FxHashMap::default()
+        };
+        #[cfg(feature = "cpu")]
         let output_aliases: FxHashMap<Id, Id> = template
             .map(|bindings| {
                 wanted
@@ -816,6 +909,7 @@ impl Session {
                 }
             }
         }
+        #[cfg(feature = "cpu")]
         if let Some(template) = template {
             for (id, buf) in &template.inputs {
                 supplied.insert(*id, buf.clone());
@@ -847,7 +941,8 @@ impl Session {
             }
             let elements = resolve_buffer_elements(buffer.elements, &buffer.layout, graph)?;
             let bytes = (elements * buffer.dtype.byte_size()).max(4);
-            if matches!(self.inner.device, Backend::Cpu(_))
+            #[cfg(feature = "cpu")]
+            if self.inner.device.is_cpu()
                 && let Some(existing) = graph.device_buf(buffer.value)
                 && existing
                     .downcast_ref::<fusor_cpu::AlignedBuf>()
@@ -891,6 +986,7 @@ impl Session {
         }
 
         match &self.inner.device {
+            #[cfg(feature = "gpu")]
             Backend::Gpu(target) => {
                 let mut env = fusor_gpu::target::BindingEnv::new();
                 for (sym, value) in graph.dim_bindings() {
@@ -906,6 +1002,7 @@ impl Session {
                 target.resolve(plan, &g, &env)?;
                 Ok((plan.launches.len(), None))
             }
+            #[cfg(feature = "cpu")]
             Backend::Cpu(target) => {
                 let target = Arc::clone(target);
                 let (launched, executable) = self.run_cpu(
@@ -923,6 +1020,7 @@ impl Session {
     /// The generic runner: one `lower -> emit -> launch` per plan launch, in
     /// plan order. The GPU takes `GpuTarget::resolve` instead, which adds the
     /// plan cache, the parallel build cohort and one encoder per resolve.
+    #[cfg(feature = "cpu")]
     fn run_cpu(
         &self,
         target: &CpuTarget,
@@ -1005,6 +1103,7 @@ impl Session {
     /// Binding 0 for the CPU launcher, indexed by raw `SymId`: a dim symbol
     /// contributes its extent, a scalar symbol its `f32` bits, and the
     /// emitter bitcasts on read. Neither ever enters a kernel's identity.
+    #[cfg(feature = "cpu")]
     fn uniforms_for(&self, plan: &Plan, graph: &GraphRef) -> Result<Uniforms> {
         let dims = graph.dim_bindings();
         let scalars = graph.uniform_scalars();
@@ -1079,6 +1178,19 @@ impl Session {
     /// Coordinate descent, incumbent carried forward, so attention's two
     /// contractions are tuned against each other rather than in isolation.
     /// The measurement travels with the plan it measured.
+    /// The per-dispatch spans the device timed for the last resolve, when it
+    /// has a timer and it was armed. Never on the CPU.
+    fn take_last_profile(&self) -> Option<Vec<f64>> {
+        #[cfg(feature = "gpu")]
+        return self
+            .inner
+            .device
+            .gpu_target()
+            .and_then(|t| t.launcher().take_last_profile());
+        #[cfg(not(feature = "gpu"))]
+        None
+    }
+
     fn autotune(
         &self,
         guard: &ResolveGuard<'_>,
@@ -1139,6 +1251,7 @@ impl Session {
         // autotuning keeps the repeated samples and per-dispatch timestamps it
         // needs for stable comparisons.
         let repetitions = if verify_members { 1 } else { TUNE_RUNS };
+        #[cfg(feature = "gpu")]
         let _clock = (!verify_members).then(|| TuningClock::new(&self.inner.device));
 
         let Some(reference) = self.timed_run(guard, graph, &base, values, repetitions)? else {
@@ -1359,7 +1472,7 @@ impl Session {
                             // *can* time kernels but did not time this plan
                             // records nothing, rather than mixing two units in
                             // one device's file.
-                            None if matches!(self.inner.device, Backend::Cpu(_)) => {
+                            None if self.inner.device.is_cpu() => {
                                 Some(Verdict::Ran(ratio_ppm(sample_ns, base_ns)))
                             }
                             None => None,
@@ -1450,9 +1563,7 @@ impl Session {
             self.inner.device.target().wait()?;
             self.inner.in_flight.store(0, Ordering::Relaxed);
             nanos = nanos.min(t.elapsed().as_nanos() as u64);
-            if let Backend::Gpu(target) = &self.inner.device
-                && let Some(us) = target.launcher().take_last_profile()
-            {
+            if let Some(us) = self.take_last_profile() {
                 // Element-wise minimum, for the same reason the wall clock is a
                 // minimum: a slow sample is contention, a fast one is the
                 // kernel.
@@ -1539,6 +1650,7 @@ fn dump_exec() -> bool {
 /// Canonicalize an unsaturated term while replacing each runtime buffer name
 /// with its traversal-order input slot. The resulting ordinary Op vector
 /// provides exact equality and hashing without a parallel hand-written matcher.
+#[cfg(feature = "cpu")]
 fn canonical_cpu_term(graph: &GraphRef, roots: &[Id]) -> Option<(CpuTerm, Vec<Id>)> {
     fn rebuild(op: &Op, source: Id, children: &[Id], inputs: &mut Vec<Id>) -> Option<Op> {
         let child = |index: usize| children.get(index).copied();
@@ -1666,6 +1778,7 @@ fn canonical_cpu_term(graph: &GraphRef, roots: &[Id]) -> Option<(CpuTerm, Vec<Id
     Some((CpuTerm { nodes, roots }, inputs))
 }
 
+#[cfg(feature = "cpu")]
 fn cpu_cache_key(graph: &GraphRef, roots: &[Id]) -> Option<(CpuStructuralKey, Vec<Id>)> {
     let (term, inputs) = canonical_cpu_term(graph, roots)?;
     let mut dims = rustc_hash::FxHasher::default();
@@ -1782,6 +1895,7 @@ fn plans_align(candidate: &Plan, incumbent: &Plan, ix: usize) -> bool {
 /// from `incumbent` at most at the swapped indices — the check a batched
 /// prior adoption holds its composed replan to before trusting per-launch
 /// windows measured against single swaps.
+#[cfg(feature = "gpu")]
 fn batch_aligns(candidate: &Plan, incumbent: &Plan, swaps: &[(usize, String)]) -> bool {
     candidate.launches.len() == incumbent.launches.len()
         && candidate
@@ -1797,6 +1911,7 @@ fn batch_aligns(candidate: &Plan, incumbent: &Plan, swaps: &[(usize, String)]) -
 /// launches with equal keys are the same work on the same schedule. `Id`s are
 /// process-local, which is fine: a diff always compares two plans over the
 /// same graph.
+#[cfg(feature = "gpu")]
 fn launch_key(launch: &fusor_ir::extract::Dispatch) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut h = rustc_hash::FxHasher::default();
@@ -1816,6 +1931,7 @@ fn launch_key(launch: &fusor_ir::extract::Dispatch) -> u64 {
 /// removes a producer launch and re-spells a consumer diffs as (one inserted
 /// launch, two deleted launches), and the summed spans of each side's changed
 /// set are the honest comparison for a plan too large to time whole.
+#[cfg(feature = "gpu")]
 fn plan_sparse_diff(
     candidate: &Plan,
     incumbent: &Plan,
@@ -1828,6 +1944,7 @@ fn plan_sparse_diff(
 
 /// The alignment itself, over launch keys. Split from [`plan_sparse_diff`]
 /// so the path walk is testable without building plans.
+#[cfg(feature = "gpu")]
 fn sparse_diff(a: &[u64], b: &[u64], max_d: usize) -> Option<(Vec<usize>, Vec<usize>)> {
     let (n, m) = (a.len(), b.len());
     if n.abs_diff(m) > max_d {
@@ -1930,14 +2047,13 @@ fn ratio_ppm(sample: f64, base: f64) -> u64 {
 
 /// Turns the per-dispatch timestamp path on for a tuning pass and off again on
 /// every exit path, so a production resolve never pays for a query set.
+#[cfg(feature = "gpu")]
 struct TuningClock<'a>(Option<&'a GpuTarget>);
 
+#[cfg(feature = "gpu")]
 impl<'a> TuningClock<'a> {
     fn new(device: &'a Backend) -> Self {
-        let target = match device {
-            Backend::Gpu(t) => Some(t.as_ref()),
-            Backend::Cpu(_) => None,
-        };
+        let target = device.gpu_target();
         if let Some(t) = target {
             t.launcher().set_tuning(true);
         }
@@ -1945,6 +2061,7 @@ impl<'a> TuningClock<'a> {
     }
 }
 
+#[cfg(feature = "gpu")]
 impl Drop for TuningClock<'_> {
     fn drop(&mut self) {
         if let Some(t) = self.0 {
@@ -2215,12 +2332,13 @@ fn resolve_elements(shape: &[Dim], graph: &GraphRef) -> Result<u64> {
     Ok(acc.max(1))
 }
 
-#[cfg(test)]
+#[cfg(all(test, feature = "cpu"))]
 mod tests {
     use super::*;
     use crate::graph::Graph;
 
     #[test]
+    #[cfg(feature = "cpu")]
     fn a_fresh_step_leaf_reuses_the_cpu_plan_and_executable() {
         let session = Session::new(Backend::cpu().unwrap()).unwrap();
         let graph = Graph::new(&session);

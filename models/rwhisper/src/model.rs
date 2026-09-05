@@ -102,15 +102,7 @@ impl WhisperInner {
         tokenizer: &[u8],
         config: &[u8],
     ) -> Result<Self, WhisperLoadingError> {
-        // Set FUSOR_USE_GPU=1 to use GPU, otherwise CPU
-        let use_gpu = std::env::var("FUSOR_USE_GPU")
-            .map(|v| v == "1")
-            .unwrap_or(false);
-        let device = if use_gpu {
-            Device::gpu().await?
-        } else {
-            Device::cpu()
-        };
+        let device = default_device().await?;
 
         let tokenizer =
             Tokenizer::from_bytes(tokenizer).map_err(WhisperLoadingError::LoadTokenizer)?;
@@ -809,5 +801,31 @@ impl Decoder {
         }
 
         logits
+    }
+}
+
+/// Set `FUSOR_USE_GPU=1` to run on the GPU; the default is the CPU. A build
+/// with only one backend uses that backend regardless.
+async fn default_device() -> Result<Device, WhisperLoadingError> {
+    let use_gpu = std::env::var("FUSOR_USE_GPU").is_ok_and(|v| v == "1");
+    #[cfg(all(feature = "cpu", feature = "gpu"))]
+    {
+        if use_gpu {
+            Ok(Device::gpu().await?)
+        } else {
+            Ok(Device::cpu())
+        }
+    }
+    #[cfg(all(feature = "gpu", not(feature = "cpu")))]
+    {
+        let _ = use_gpu;
+        Ok(Device::gpu().await?)
+    }
+    #[cfg(all(feature = "cpu", not(feature = "gpu")))]
+    {
+        if use_gpu {
+            tracing::warn!("FUSOR_USE_GPU is set but the `gpu` feature is off; using the cpu");
+        }
+        Ok(Device::cpu())
     }
 }

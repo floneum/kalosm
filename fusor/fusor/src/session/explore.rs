@@ -409,7 +409,9 @@ impl Session {
         // focused set of launches can be timed per resolve, which bounds this
         // key's exploration to per-launch granularity.
         let whole = match &self.inner.device {
+            #[cfg(feature = "gpu")]
             Backend::Gpu(t) => t.launcher().can_time_whole(incumbent.launches.len()),
+            #[cfg(feature = "cpu")]
             Backend::Cpu(_) => return None,
         };
         let set = ks
@@ -593,8 +595,9 @@ impl Session {
         };
         // Time exactly the launches the comparison reads; only a whole-plan
         // arm leaves the focus unset.
+        #[cfg(feature = "gpu")]
         if !run.whole
-            && let Backend::Gpu(t) = &self.inner.device
+            && let Some(t) = self.inner.device.gpu_target()
         {
             t.launcher().set_tuning_focus(Some(focus));
         }
@@ -666,7 +669,7 @@ impl Session {
     /// File the armed resolve's GPU spans into the windows and adopt on a
     /// window-min win. Called after `run`, while the tuning clock is alive.
     pub(super) fn explore_record(&self, run: ExploreRun) {
-        let Backend::Gpu(target) = &self.inner.device else {
+        let Some(target) = self.inner.device.gpu_target() else {
             return;
         };
         let Some(spans_us) = target.launcher().take_last_profile() else {

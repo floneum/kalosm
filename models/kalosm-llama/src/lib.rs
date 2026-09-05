@@ -27,6 +27,9 @@
 #![warn(missing_docs)]
 #![recursion_limit = "256"]
 
+#[cfg(not(any(feature = "cpu", feature = "gpu")))]
+compile_error!("kalosm-llama: enable at least one backend feature, `cpu` or `gpu`");
+
 mod chat;
 mod chat_template;
 mod gguf_tokenizer;
@@ -342,15 +345,25 @@ impl LlamaBuilder {
 
     /// Get the device or the default device if not set.
     pub(crate) async fn get_device(&self) -> Device {
-        match self.device.clone() {
-            Some(device) => device,
-            None => match Device::gpu().await {
-                Ok(device) => device,
-                Err(err) => {
-                    tracing::warn!("no gpu adapter, falling back to cpu: {err}");
-                    Device::cpu()
-                }
-            },
+        if let Some(device) = self.device.clone() {
+            return device;
+        }
+        #[cfg(all(feature = "gpu", feature = "cpu"))]
+        {
+            Device::gpu().await.unwrap_or_else(|err| {
+                tracing::warn!("no gpu adapter, falling back to cpu: {err}");
+                Device::cpu()
+            })
+        }
+        #[cfg(all(feature = "gpu", not(feature = "cpu")))]
+        {
+            Device::gpu()
+                .await
+                .unwrap_or_else(|err| panic!("no gpu adapter, and the `cpu` feature is off: {err}"))
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            Device::cpu()
         }
     }
 

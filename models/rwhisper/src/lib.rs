@@ -33,6 +33,9 @@
 
 #![warn(missing_docs)]
 
+#[cfg(not(any(feature = "cpu", feature = "gpu")))]
+compile_error!("rwhisper: enable at least one backend feature, `cpu` or `gpu`");
+
 use cpal::FromSample;
 use futures_channel::mpsc::{UnboundedReceiver, UnboundedSender};
 use kalosm_common::Cache;
