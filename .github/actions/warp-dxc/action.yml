@@ -1,0 +1,29 @@
+name: WARP and DXC
+description: Fetch Microsoft's WARP software adapter and the DXC shader compiler, through the Actions cache.
+runs:
+  using: composite
+  steps:
+    # WARP and DXC are small downloads (a few MB each) but redirecting them
+    # through the GitHub Actions cache means we don't pull from nuget /
+    # GitHub releases on every PR run.
+    - name: Cache WARP/DXC downloads
+      id: cache-warp-dxc
+      uses: actions/cache@v4
+      with:
+        path: |
+          warp
+          dxc
+        # Bump the suffix when the WARP / DXC versions below change.
+        key: ${{ runner.os }}-warp-1.0.8-dxc-1.7.2308-v1
+    - name: Setup WARP
+      if: steps.cache-warp-dxc.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        curl -L --retry 5 https://www.nuget.org/api/v2/package/Microsoft.Direct3D.WARP/1.0.8 -o warp.zip
+        7z e warp.zip -owarp build/native/amd64/d3d10warp.dll
+    - name: Setup DXC
+      if: steps.cache-warp-dxc.outputs.cache-hit != 'true'
+      shell: bash
+      run: |
+        curl -L --retry 5 https://github.com/microsoft/DirectXShaderCompiler/releases/download/v1.7.2308/dxc_2023_08_14.zip -o dxc.zip
+        7z e dxc.zip -odxc bin/x64/dxcompiler.dll bin/x64/dxil.dll

@@ -19,7 +19,7 @@ use fusor_ir::ir::kernel::KernelIr;
 use fusor_ir::ir::launch::SchedPoint;
 use fusor_ir::shape::SymId;
 use fusor_ir::target::{Artifact, Buf, EmitError, LowerCtx, Target, Uniforms};
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use crate::device::GpuDevice;
 use crate::launch::{BuildCursor, CommandRecord, GpuArtifact, KernelProfile, Launcher, TimingMode};
@@ -389,6 +389,7 @@ impl GpuTarget {
     /// 3. **Serial, exact plan order** — push command records and release
     ///    consumed buffers.
     pub fn resolve(&self, plan: &Plan, graph: &EGraph, binds: &BindingEnv) -> Result<()> {
+        self.cache_stats();
         let start = Instant::now();
         // `FUSOR_GAPSTEP` — the resolve-phase stopwatch, one line per resolve:
         //
@@ -1245,5 +1246,110 @@ impl Target for GpuTarget {
 
     fn wait(&self) -> Result<()> {
         self.launcher.poll_wait()
+    }
+}
+
+impl GpuTarget {
+    /// Under `FUSOR_CACHE_STATS`, print every retained-object count this
+    /// target owns, once per 64 resolves, so growth across a long run can be
+    /// attributed to a cache rather than guessed at.
+    fn cache_stats(&self) {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static N: AtomicU64 = AtomicU64::new(0);
+        if !*ON.get_or_init(|| std::env::var_os("FUSOR_CACHE_STATS").is_some()) {
+            return;
+        }
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        if !n.is_multiple_of(64) {
+            return;
+        }
+        let pool = self.pool.counters();
+        eprintln!(
+            "[cache-stats] resolves={n} artifacts={} pipelines={} by_source={} verified={} \
+             bind_groups={} plans={} pool_live_mib={} pool_created={}",
+            self.artifacts.lock().len(),
+            self.pipelines.lock().len(),
+            self.pipelines_by_source.lock().len(),
+            self.verified.lock().len(),
+            self.launcher.bind_group_count(),
+            self.cache.memory_len(),
+            pool.live_bytes >> 20,
+            pool.created,
+        );
+    }
+}
+
+impl GpuTarget {
+    /// Forget every compiled kernel that only a losing race candidate ever
+    /// used.
+    ///
+    /// Autotuning and the member sweep build one pipeline per candidate and
+    /// run it once. Left in the caches, those pipelines are retained until an
+    /// LRU sized for a whole model's kernels evicts them — on a software
+    /// driver, where a pipeline is megabytes of JIT'd code and a bind group
+    /// pins its buffers, that is the process growing without bound. After a
+    /// race the adopted plan's artifacts are the only ones worth keeping:
+    /// every artifact key a candidate owns and `keep` does not is dropped,
+    /// and the pipeline and bind-group tiers are swept of what nothing
+    /// references any more.
+    pub fn release_candidates(&self, arena: u64, candidates: &[Arc<Plan>], keep: &Plan) {
+        let keep_keys: FxHashSet<ArtifactKey> =
+            plan_artifact_keys(keep, &UniformPack::new(keep), arena)
+                .into_iter()
+                .collect();
+        {
+            let mut artifacts = self.artifacts.lock();
+            for candidate in candidates {
+                let pack = UniformPack::new(candidate);
+                for key in plan_artifact_keys(candidate, &pack, arena) {
+                    if !keep_keys.contains(&key) {
+                        artifacts.pop(&key);
+                    }
+                }
+            }
+        }
+        self.sweep_unreferenced();
+    }
+
+    /// Drop pipelines and bind groups no artifact entry references.
+    fn sweep_unreferenced(&self) {
+        let live: FxHashSet<u64> = self
+            .artifacts
+            .lock()
+            .iter()
+            .flat_map(|(_, entry)| entry.variants.iter())
+            .filter_map(|(_, (artifact, _, _))| artifact.downcast_ref::<GpuArtifact>())
+            .map(|a| a.id)
+            .collect();
+        let id_of = |artifact: &Artifact| artifact.downcast_ref::<GpuArtifact>().map(|a| a.id);
+        {
+            let mut by_source = self.pipelines_by_source.lock();
+            let dead: Vec<String> = by_source
+                .iter()
+                .filter(|(_, a)| id_of(a).is_some_and(|id| !live.contains(&id)))
+                .map(|(k, _)| k.clone())
+                .collect();
+            for k in dead {
+                by_source.pop(&k);
+            }
+        }
+        {
+            let mut pipelines = self.pipelines.lock();
+            // A slot still being compiled is `None`; it stays.
+            let dead: Vec<u128> = pipelines
+                .iter()
+                .filter(|(_, slot)| {
+                    slot.try_lock()
+                        .and_then(|a| a.as_ref().and_then(id_of))
+                        .is_some_and(|id| !live.contains(&id))
+                })
+                .map(|(k, _)| *k)
+                .collect();
+            for k in dead {
+                pipelines.pop(&k);
+            }
+        }
+        self.launcher.retain_bind_groups(&live);
     }
 }

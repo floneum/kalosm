@@ -376,6 +376,13 @@ codegen-units = 1
 [profile.dev.package."*"]
 opt-level = 3
 
+# CI builds: dev semantics without full debuginfo. Debuginfo is a large share
+# of a cold compile and of link time, and a CI failure only needs the line
+# tables a backtrace reads.
+[profile.ci]
+inherits = "dev"
+debug = "line-tables-only"
+
 # Fusor's kernels use Naga from the ealmloff/wgpu fork, including the
 # `CooperativeLoad` correctness fix in `bake_ref_count`. Patch tables only apply
 # from the build root, so the same revision is named in Fusor's own workspace.

@@ -654,6 +654,26 @@ impl Launcher {
         Ok(())
     }
 
+    /// Cached bind groups currently retained.
+    pub fn bind_group_count(&self) -> usize {
+        self.bind_groups.lock().len()
+    }
+
+    /// Drop every cached bind group whose artifact is not in `live`. A bind
+    /// group pins the buffers it was built over, so one built for a kernel
+    /// nobody will dispatch again is holding memory for nothing.
+    pub fn retain_bind_groups(&self, live: &rustc_hash::FxHashSet<u64>) {
+        let mut groups = self.bind_groups.lock();
+        let dead: Vec<BindGroupKey> = groups
+            .iter()
+            .filter(|(k, _)| !live.contains(&k.artifact))
+            .map(|(k, _)| k.clone())
+            .collect();
+        for k in dead {
+            groups.pop(&k);
+        }
+    }
+
     /// Spin in `Poll` mode for [`POLL_SPIN`], then block.
     ///
     /// A lost device is reported as an error naming the loss, both before

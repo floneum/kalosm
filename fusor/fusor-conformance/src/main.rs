@@ -30,9 +30,17 @@ fn main() -> ExitCode {
         println!("backends: {}", names.join(", "));
     }
 
+    // `FUSOR_CONFORMANCE_PROGRESS` streams each result to stderr as it lands,
+    // for watching a run that is slow or growing rather than reading its
+    // summary afterwards. The summary below is unchanged.
+    let progress = std::env::var_os("FUSOR_CONFORMANCE_PROGRESS").is_some();
     let reports = match &filter {
         Some(f) => harness::Harness::with_filter(f.clone()).run(),
-        None => harness::run_all(|_| {}),
+        None => harness::run_all(|r| {
+            if progress {
+                eprintln!("[progress] {} [{}]", r.case, r.backend);
+            }
+        }),
     };
     let failures = harness::summarize(&reports);
 

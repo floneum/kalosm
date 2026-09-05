@@ -83,6 +83,11 @@ pub struct CacheCounters {
 }
 
 impl PlanCache {
+    /// Plans currently held in the memory tier.
+    pub fn memory_len(&self) -> usize {
+        self.memory.lock().len()
+    }
+
     /// Build a cache. `dir` is the root under which `fusor/plans/<salt>/`
     /// lives; `None` disables the disk tier entirely.
     pub fn new(capacity: usize, salt: u64, dir: Option<PathBuf>) -> Self {

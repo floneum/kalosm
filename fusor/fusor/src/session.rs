@@ -142,6 +142,14 @@ impl Backend {
         }
     }
 
+    /// Release the kernels only losing race candidates used; see
+    /// `GpuTarget::release_candidates`. The CPU keeps nothing per candidate.
+    pub(crate) fn release_candidates(&self, arena: u64, candidates: &[Arc<Plan>], keep: &Plan) {
+        if let Self::Gpu(t) = self {
+            t.release_candidates(arena, candidates, keep);
+        }
+    }
+
     /// The reason the GPU device was lost, once the driver has reported it.
     /// Always `None` on the CPU.
     pub fn device_lost(&self) -> Option<String> {
@@ -1274,6 +1282,8 @@ impl Session {
         let mut picks: Vec<Option<String>> = vec![None; base.launches.len()];
 
         let mut best = Arc::clone(&base);
+        // Every plan built for this race, so what lost can be released.
+        let mut raced: Vec<Arc<Plan>> = vec![Arc::clone(&base)];
         let base_ns = plan_ns(&reference);
         let mut best_ns = base_ns;
         // The incumbent's own per-launch spans, plan order. A candidate
@@ -1361,6 +1371,7 @@ impl Session {
             };
             for (label, candidate) in variants {
                 let candidate = Arc::new(candidate);
+                raced.push(Arc::clone(&candidate));
                 let sample = match self.timed_run(guard, graph, &candidate, values, repetitions) {
                     Ok(Some(sample)) => sample,
                     // A candidate this device cannot build or read is not a
@@ -1542,6 +1553,8 @@ impl Session {
         if log {
             eprintln!("[tune] winner {best_ns:.0} ns");
         }
+        let arena = graph.state().egraph.lock().arena_id();
+        self.inner.device.release_candidates(arena, &raced, &best);
         Ok(best)
     }
 

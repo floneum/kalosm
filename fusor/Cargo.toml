@@ -60,3 +60,12 @@ naga = "29"
 # referenced once cannot sink past the barrier that ordered it.
 [patch.crates-io]
 naga = { git = "https://github.com/ealmloff/wgpu", rev = "c4f55cabaadc22b942c1dd8894bf85f17f2718dc" }
+
+# CI builds: the conformance sweep runs the planner and every raced kernel
+# body on the host, and unoptimized planner code is most of its wall time.
+# `opt-level = 1` keeps the compile close to dev while cutting that several
+# fold; line tables keep backtraces readable.
+[profile.ci]
+inherits = "dev"
+opt-level = 1
+debug = "line-tables-only"
