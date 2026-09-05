@@ -148,8 +148,10 @@ jobs:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FUSOR_CONFORMANCE_REQUIRE_GPU: "1"
         run: |
+          # rbert and rwhisper need model downloads; so does kalosm's
+          # hybrid-search integration test (a BERT chunker from HuggingFace).
           cargo nextest run --archive-file root-tests.tar.zst --workspace-remap . --extract-to . \
-            -E 'not (package(rbert) | package(rwhisper))'
+            -E 'not (package(rbert) | package(rwhisper) | binary(hybrid_test))'
           cargo nextest run --archive-file fusor-tests.tar.zst --workspace-remap fusor --extract-to fusor
 
   # Shards balanced from measured per-suite times. A filter ending in `::`
