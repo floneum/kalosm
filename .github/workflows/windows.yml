@@ -169,12 +169,14 @@ jobs:
           - { name: norm-layers, suites: "normalization:: layers::", args: "" }
           - { name: attention-backward, suites: "attention_rope:: backward::", args: "" }
           - { name: quantized, suites: "quantized::", args: "" }
-          - { name: sampling-0, suites: "sampling::", args: "--shard=0/6" }
-          - { name: sampling-1, suites: "sampling::", args: "--shard=1/6" }
-          - { name: sampling-2, suites: "sampling::", args: "--shard=2/6" }
-          - { name: sampling-3, suites: "sampling::", args: "--shard=3/6" }
-          - { name: sampling-4, suites: "sampling::", args: "--shard=4/6" }
-          - { name: sampling-5, suites: "sampling::", args: "--shard=5/6" }
+          - { name: sampling-0, suites: "sampling::", args: "--shard=0/8" }
+          - { name: sampling-1, suites: "sampling::", args: "--shard=1/8" }
+          - { name: sampling-2, suites: "sampling::", args: "--shard=2/8" }
+          - { name: sampling-3, suites: "sampling::", args: "--shard=3/8" }
+          - { name: sampling-4, suites: "sampling::", args: "--shard=4/8" }
+          - { name: sampling-5, suites: "sampling::", args: "--shard=5/8" }
+          - { name: sampling-6, suites: "sampling::", args: "--shard=6/8" }
+          - { name: sampling-7, suites: "sampling::", args: "--shard=7/8" }
     steps:
       - uses: actions/checkout@v6
         with:

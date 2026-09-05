@@ -171,12 +171,14 @@ jobs:
           - { name: norm-layers, suites: "normalization:: layers::", args: "" }
           - { name: attention-backward, suites: "attention_rope:: backward::", args: "" }
           - { name: quantized, suites: "quantized::", args: "" }
-          - { name: sampling-0, suites: "sampling::", args: "--shard=0/6" }
-          - { name: sampling-1, suites: "sampling::", args: "--shard=1/6" }
-          - { name: sampling-2, suites: "sampling::", args: "--shard=2/6" }
-          - { name: sampling-3, suites: "sampling::", args: "--shard=3/6" }
-          - { name: sampling-4, suites: "sampling::", args: "--shard=4/6" }
-          - { name: sampling-5, suites: "sampling::", args: "--shard=5/6" }
+          - { name: sampling-0, suites: "sampling::", args: "--shard=0/8" }
+          - { name: sampling-1, suites: "sampling::", args: "--shard=1/8" }
+          - { name: sampling-2, suites: "sampling::", args: "--shard=2/8" }
+          - { name: sampling-3, suites: "sampling::", args: "--shard=3/8" }
+          - { name: sampling-4, suites: "sampling::", args: "--shard=4/8" }
+          - { name: sampling-5, suites: "sampling::", args: "--shard=5/8" }
+          - { name: sampling-6, suites: "sampling::", args: "--shard=6/8" }
+          - { name: sampling-7, suites: "sampling::", args: "--shard=7/8" }
     steps:
       - uses: actions/checkout@v6
         with:
@@ -200,11 +202,22 @@ jobs:
             bin/fusor-conformance "$suite" ${{ matrix.shard.args }}
           done
 
+  # Doctests are edition-2021 here, so rustdoc compiles and links every one
+  # separately against the full dependency tree — about ten minutes serial
+  # for ~135 of them. Three runners: the two crates that hold most of them,
+  # and everything else.
   doc:
     needs: build
-    name: Docs
+    name: Docs (${{ matrix.shard.name }})
     runs-on: ubuntu-24.04
     timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - { name: language-model, args: "-p kalosm-language-model" }
+          - { name: kalosm, args: "-p kalosm" }
+          - { name: rest, args: "--workspace --exclude kalosm-language-model --exclude kalosm" }
     steps:
       - uses: actions/checkout@v6
       - name: Free disk space
@@ -222,23 +235,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          # The slot `build` just saved, same profile and feature set:
-          # doctests link those .rlibs, so only the doctests compile here.
+          # The slot `build` saved, same profile and feature set: doctests
+          # link those .rlibs, so only the doctests compile here.
           shared-key: "linux-build"
           workspaces: |
             . -> target
             fusor -> target
+          cache-all-crates: "true"
+          cache-workspace-crates: "true"
           save-if: "false"
-      - env:
-          # Why cargo considers a restored artifact stale, if it does: this
-          # job is expected to compile only the doctests.
-          CARGO_LOG: cargo::core::compiler::fingerprint=info
-        run: |
-          cargo test --profile ci --doc --workspace --features $FEATURES 2> cargo-log.txt || { grep -vE "fingerprint" cargo-log.txt | tail -200; exit 1; }
-          echo "::group::stale fingerprints"
-          grep -E "dirty|stale|fingerprint error" cargo-log.txt | head -60 || true
-          echo "::endgroup::"
-          cargo test --profile ci --manifest-path fusor/Cargo.toml --doc --workspace
+      - run: cargo test --profile ci --doc ${{ matrix.shard.args }} --features $FEATURES
+      - if: matrix.shard.name == 'rest'
+        run: cargo test --profile ci --manifest-path fusor/Cargo.toml --doc --workspace
 
   # Clippy is `cargo check` plus lints over the same targets, so there is no
   # separate check job.
