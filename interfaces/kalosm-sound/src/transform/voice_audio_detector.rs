@@ -76,7 +76,7 @@ impl<S: AsyncSource + Unpin> Stream for VoiceActivityDetectorStream<S> {
                     return Poll::Ready(None);
                 }
             }
-            let data = this.buffer.drain(..).collect::<Vec<_>>();
+            let data = std::mem::take(&mut this.buffer);
             let model = this.vad.clone();
             let vad = tokio::task::spawn_blocking(move || {
                 let mut locked = model.write().unwrap();
