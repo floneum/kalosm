@@ -760,6 +760,14 @@ impl Launcher {
     /// Copy `src` into `staging`, map it, and return the bytes. On `Ok` the
     /// staging buffer is unmapped again; on `Err` its map state is unknown.
     fn readback_into(&self, src: &Buf, staging: &Buf, bytes: u64) -> Result<Vec<u8>> {
+        let trace = trace_dispatch();
+        let state = |what: &str| {
+            if trace {
+                let src_size = src.downcast_ref::<GpuBuffer>().map_or(0, |b| b.size);
+                let lost = self.lost.reason().unwrap_or_else(|| "ok".into());
+                eprintln!("[trace] readback {what}: {bytes}B of a {src_size}B buffer -> {lost}");
+            }
+        };
         {
             let record = CommandRecord::CopyBuffer {
                 src: src.clone(),
@@ -770,6 +778,10 @@ impl Launcher {
             };
             self.encode_command_records(&[record], None, TimingMode::All)?;
         }
+        if trace {
+            let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
+            state("copy");
+        }
         let gpu = staging
             .downcast_ref::<GpuBuffer>()
             .ok_or_else(|| Error::Device("staging buffer is not pooled".into()))?;
@@ -779,6 +791,7 @@ impl Launcher {
             let _ = tx.send(r);
         });
         self.poll_wait()?;
+        state("map");
         rx.recv()
             .map_err(|_| {
                 // wgpu drops the callback unfired when it rejects the map

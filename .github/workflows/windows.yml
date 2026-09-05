@@ -57,11 +57,22 @@ jobs:
   build:
     if: github.event.pull_request.draft == false
     runs-on: windows-2022
+    timeout-minutes: 45
     name: windows (build)
     steps:
       - name: disable git eol translation
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v6
+      # A Rust build on the runner's C: drive is dominated by Windows
+      # Defender scanning every .o, .rlib, .rmeta and .exe as it is written.
+      # A Dev Drive (ReFS, AV filtering disabled) with the repo, Cargo home
+      # and target dir on it is the difference between a compile and a
+      # compile plus a virus scan of the compile. The rest of the job works
+      # from `KALOSM_WORKSPACE`, the copy on that drive.
+      - name: Setup Dev Drive
+        run: ${{ github.workspace }}/.github/workflows/setup-dev-drive.ps1
+      - name: Copy repo to the Dev Drive
+        run: Copy-Item -Path "${{ github.workspace }}" -Destination "$env:KALOSM_WORKSPACE" -Recurse
       # `dtolnay/rust-toolchain` is a single-step toolchain install that
       # uses the GitHub Actions toolchain cache; much faster than the
       # `Invoke-WebRequest win.rustup.rs` dance.
@@ -76,11 +87,14 @@ jobs:
           # Both workspaces build into the root target dir (`--target-dir`).
           shared-key: "windows-stable"
           workspaces: |
-            . -> target
-            fusor -> ../target
+            ${{ env.KALOSM_WORKSPACE }} -> target
+            ${{ env.KALOSM_WORKSPACE }}/fusor -> ../target
           cache-on-failure: "true"
+          cache-all-crates: "true"
+          cache-workspace-crates: "true"
       - name: Build test archives and the conformance binary
         shell: bash
+        working-directory: ${{ env.KALOSM_WORKSPACE }}
         run: |
           rustc -Vv
           cargo -V
@@ -93,25 +107,30 @@ jobs:
         with:
           name: windows-tests
           path: |
-            root-tests.tar.zst
-            fusor-tests.tar.zst
+            ${{ env.KALOSM_WORKSPACE }}/root-tests.tar.zst
+            ${{ env.KALOSM_WORKSPACE }}/fusor-tests.tar.zst
           retention-days: 1
       - uses: actions/upload-artifact@v4
         with:
           name: fusor-conformance-windows
-          path: target/ci/fusor-conformance.exe
+          path: ${{ env.KALOSM_WORKSPACE }}/target/ci/fusor-conformance.exe
           retention-days: 1
 
   tests:
     needs: build
     runs-on: windows-2022
+    timeout-minutes: 45
     name: windows (tests)
     steps:
       - name: disable git eol translation
         run: git config --global core.autocrlf false
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
-      - uses: taiki-e/install-action@nextest
+      # A direct download: `taiki-e/install-action` has failed twice on this
+      # runner image with a bash startup error it documents as a known flake.
+      - name: Install nextest
+        shell: bash
+        run: curl -LsSf https://get.nexte.st/latest/windows-tar | tar zxf - -C "$CARGO_HOME/bin"
       - name: WARP and DXC
         uses: ./.github/actions/warp-dxc
       - uses: actions/download-artifact@v4
@@ -139,6 +158,7 @@ jobs:
   conformance:
     needs: build
     runs-on: windows-2022
+    timeout-minutes: 45
     name: windows (${{ matrix.shard.name }})
     strategy:
       fail-fast: false
@@ -149,9 +169,12 @@ jobs:
           - { name: norm-layers, suites: "normalization:: layers::", args: "" }
           - { name: attention-backward, suites: "attention_rope:: backward::", args: "" }
           - { name: quantized, suites: "quantized::", args: "" }
-          - { name: sampling-0, suites: "sampling::", args: "--shard=0/3" }
-          - { name: sampling-1, suites: "sampling::", args: "--shard=1/3" }
-          - { name: sampling-2, suites: "sampling::", args: "--shard=2/3" }
+          - { name: sampling-0, suites: "sampling::", args: "--shard=0/6" }
+          - { name: sampling-1, suites: "sampling::", args: "--shard=1/6" }
+          - { name: sampling-2, suites: "sampling::", args: "--shard=2/6" }
+          - { name: sampling-3, suites: "sampling::", args: "--shard=3/6" }
+          - { name: sampling-4, suites: "sampling::", args: "--shard=4/6" }
+          - { name: sampling-5, suites: "sampling::", args: "--shard=5/6" }
     steps:
       - uses: actions/checkout@v6
         with:
