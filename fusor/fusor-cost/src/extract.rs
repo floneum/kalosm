@@ -1476,7 +1476,7 @@ pub fn launch_signature(graph: &EGraph, launch: &Dispatch) -> String {
     };
     let extra = match &graph.node(root).op {
         Op::Launch(Launch::Contract { m, n, k, batch, .. }) => {
-            let c = |d: &Dim| d.as_const().map_or(0, |v| v);
+            let c = |d: &Dim| d.as_const().unwrap_or(0);
             format!("mnkb={},{},{},{}", c(m), c(n), c(k), c(batch))
         }
         // `space` is the *iteration* domain and carries the reduced extent;

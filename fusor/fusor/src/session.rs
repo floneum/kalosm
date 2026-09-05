@@ -1318,8 +1318,10 @@ impl Session {
                             && a.len() % 4 == 0
                         {
                             let f = |s: &[u8]| {
-                                s.chunks_exact(4)
-                                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                                s.as_chunks::<4>()
+                                    .0
+                                    .iter()
+                                    .map(|c| f32::from_le_bytes(*c))
                                     .map(|v| format!("{v:.3}"))
                                     .collect::<Vec<_>>()
                                     .join(" ")
@@ -1956,8 +1958,10 @@ impl Drop for TuningClock<'_> {
 /// report: `(first_index, expected, got, worst_abs_diff)`.
 fn first_mismatch(a: &[u8], b: &[u8]) -> Option<(usize, f32, f32, f32)> {
     let f = |s: &[u8]| {
-        s.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        s.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect::<Vec<f32>>()
     };
     let (x, y) = (f(a), f(b));
@@ -1985,8 +1989,10 @@ fn agrees(dtype: Dtype, a: &[u8], b: &[u8]) -> bool {
         return false;
     }
     let f = |s: &[u8]| {
-        s.chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        s.as_chunks::<4>()
+            .0
+            .iter()
+            .map(|c| f32::from_le_bytes(*c))
             .collect::<Vec<f32>>()
     };
     let (x, y) = (f(a), f(b));

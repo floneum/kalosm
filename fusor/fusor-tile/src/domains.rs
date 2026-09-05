@@ -112,7 +112,7 @@ pub(crate) fn fold_order(s: &FoldStrat) -> (u8, u32, u32) {
 
 /// Ascending-tuple tiebreak for the map cap.
 pub(crate) fn map_order(t: &MapTiling) -> (u32, u32, u32) {
-    (t.dim.map_or(u32::MAX, |d| d), t.tm, t.vector)
+    (t.dim.unwrap_or(u32::MAX), t.tm, t.vector)
 }
 
 /// The [`ArenaPlanner`] the rules in [`crate::rules`] reach for: the one
