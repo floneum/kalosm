@@ -155,6 +155,25 @@ impl BufferPool {
             }
             let live = self.counters.lock().live_bytes;
             if live.saturating_add(size) > ceiling {
+                // Who holds the ceiling: every bucket's pinned (refcount > 1)
+                // and idle bytes, largest first.
+                if std::env::var_os("FUSOR_POOL_DEBUG").is_some() {
+                    let free = self.free.lock();
+                    let mut rows: Vec<(u64, usize, usize)> = free
+                        .iter()
+                        .map(|(k, b)| {
+                            let pinned = b.iter().filter(|x| x.refcount() > 1).count();
+                            (k.size, pinned, b.len() - pinned)
+                        })
+                        .collect();
+                    rows.sort_by_key(|(size, pinned, _)| std::cmp::Reverse(size * *pinned as u64));
+                    for (size, pinned, idle) in rows.iter().take(12) {
+                        eprintln!(
+                            "[pool] size {size}: {pinned} pinned ({} MB), {idle} idle",
+                            size * *pinned as u64 / (1 << 20)
+                        );
+                    }
+                }
                 return Err(Error::Device(format!(
                     "gpu allocation of {size} bytes would exceed the {ceiling}-byte ceiling \
                      with {live} bytes live"

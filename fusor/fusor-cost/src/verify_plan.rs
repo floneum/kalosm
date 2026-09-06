@@ -168,8 +168,29 @@ pub(crate) fn check_schedules(
             && let Some(iters) = l1.iter_space().iterations()
             && iters > u64::from(u32::MAX)
         {
+            let what = plan
+                .launches
+                .iter()
+                .find(|d| d.root == id)
+                .map(|d| crate::extract::launch_signature(graph, d))
+                .unwrap_or_default();
+            // The class the extractor chose this member from: what else it
+            // could have run and whether the schedule domain admitted it.
+            let siblings: Vec<String> = graph
+                .members(graph.class_of(id))
+                .iter()
+                .map(|m| {
+                    format!(
+                        "{m:?} {} legal={} domain={:?}",
+                        crate::extract::op_tag(&graph.node(*m).op),
+                        realize::has_legal_point(graph, *m, caps),
+                        realize::domain_of(graph, *m).map(|d| d.len())
+                    )
+                })
+                .collect();
             return Err(Error::Plan(format!(
-                "{id} iterates {iters} elements, past u32 flat addressing"
+                "{id} iterates {iters} elements, past u32 flat addressing: {what}; class members: [{}]",
+                siblings.join("; ")
             )));
         }
         let domain = match &graph.node(id).op {

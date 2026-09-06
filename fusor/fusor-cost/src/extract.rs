@@ -409,6 +409,8 @@ impl LocalSearch {
         }
 
         let plan = derive_plan(graph, &ex, &realized, cost.facts(), best_cost)?;
+        // Before verification: a rejected plan is the one worth reading.
+        probe_dump(graph, &plan, &ex, &realized, &self.caps);
         crate::verify_plan::verify_plan_with(
             graph,
             &plan,
@@ -417,7 +419,6 @@ impl LocalSearch {
             self.registry.as_ref(),
         )?;
 
-        probe_dump(graph, &plan, &ex, &realized, &self.caps);
         stats.observe(plan.hash, &binding_of(graph, &realized));
         trace.micros = started.elapsed().as_micros() as u64;
         Ok((plan, trace))
@@ -918,8 +919,9 @@ fn probe_dump(graph: &EGraph, plan: &Plan, _ex: &Extraction, realized: &Realized
         let n = graph.node(l.root);
         let facts = graph.facts(l.root);
         eprintln!(
-            "  L{i}: root={:?} op={} shape={:?} members={} grid={:?} block={}",
+            "  L{i}: root={:?} class={} op={} shape={:?} members={} grid={:?} block={}",
             l.root,
+            graph.class_of(l.root).0.index(),
             op_tag(&n.op),
             facts.shape,
             l.members.len(),
@@ -997,7 +999,7 @@ fn probe_dump(graph: &EGraph, plan: &Plan, _ex: &Extraction, realized: &Realized
     }
 }
 
-fn op_tag(op: &Op) -> String {
+pub(crate) fn op_tag(op: &Op) -> String {
     use fusor_ir::ir::launch::Launch;
     match op {
         Op::Launch(Launch::Map {

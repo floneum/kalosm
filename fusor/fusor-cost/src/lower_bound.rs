@@ -16,10 +16,18 @@ use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 
-/// Kleene iteration from `0`: the operator is monotone, so passes converge
-/// upward onto the least fixpoint — exact where the class graph is acyclic,
-/// a safe underestimate where a class cycle exists.
-const MAX_PASSES: u32 = 8;
+/// One postorder sweep from `0`. The operator is monotone, so the sweep is
+/// exact wherever the class graph is acyclic and an underestimate through a
+/// class cycle — still admissible, which is all the bound promises.
+///
+/// Not iterated to a fixpoint: through the identity-shaped cycles a large
+/// graph carries (a value unioned with a copy of itself, a region reading
+/// its own class) every further sweep compounds the cycle's cost into every
+/// reader, ~35× per sweep on a 140k-node vision graph, until both bounds
+/// saturate and every class downstream ties at infinity. The seed then
+/// falls to the smallest id, which is the definitional fold of every
+/// contraction.
+const MAX_PASSES: u32 = 1;
 
 /// Ceiling on `node_math` evaluations spent scanning schedule domains. Past
 /// it a node's math term degrades to zero, which is still a *lower* bound and
@@ -43,8 +51,7 @@ fn domain_len(graph: &EGraph, id: Id) -> usize {
     }
 }
 
-/// Indexed by node id. One bottom-up sweep per pass; passes stop as soon as
-/// nothing changes, so an acyclic graph costs two sweeps.
+/// Indexed by node id. One bottom-up sweep in dependency postorder.
 pub(crate) fn lower_bound(graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds> {
     let ids: Vec<Id> = (0..graph.len()).map(|i| Id(i as u32)).collect();
     lower_bound_over(graph, cost, &ids)
@@ -79,16 +86,21 @@ fn lower_bound_over(graph: &EGraph, cost: &dyn CostModel, ids: &[Id]) -> Vec<Pic
     let math = node_math_table(graph, cost, ids);
     let order = postorder(graph, ids);
 
-    for _ in 0..MAX_PASSES {
-        let mut changed = false;
+    let debug = std::env::var_os("FUSOR_SEED_DEBUG").is_some();
+    for pass in 0..MAX_PASSES {
+        let mut changed = 0usize;
         for id in &order {
             let next = combine(graph, *id, &math, &lb);
             if next != lb[id.index()] {
                 lb[id.index()] = next;
-                changed = true;
+                changed += 1;
             }
         }
-        if !changed {
+        if debug {
+            let max = lb.iter().map(|p| p.0).max().unwrap_or(0);
+            eprintln!("[lb] pass {pass}: {changed} changed, max {max}");
+        }
+        if changed == 0 {
             break;
         }
     }
@@ -128,9 +140,22 @@ fn postorder(graph: &EGraph, ids: &[Id]) -> Vec<Id> {
             state[id.index()] = 1;
             stack.push((id, true));
             let node = graph.node(id);
+            let debug = std::env::var_os("FUSOR_SEED_DEBUG").is_some();
             let push = |next: Id, stack: &mut Vec<(Id, bool)>| {
                 if state[next.index()] == 0 && masked.contains(next.index()) {
                     stack.push((next, false));
+                } else if debug && state[next.index()] == 1 {
+                    // A back edge: the class graph has a cycle through here,
+                    // and both bounds will climb until they saturate.
+                    let show = |i: Id| {
+                        let s = format!("{:?}", graph.node(i).op);
+                        s.chars().take(160).collect::<String>()
+                    };
+                    eprintln!(
+                        "[lb] class cycle edge {id:?} -> {next:?}\n      {id:?} = {}\n      {next:?} = {}",
+                        show(id),
+                        show(next)
+                    );
                 }
             };
             match &node.op {
@@ -300,6 +325,10 @@ fn node_math_table(graph: &EGraph, cost: &dyn CostModel, ids: &[Id]) -> Vec<Pico
         // domain wide enough to pay for it gets a memo entry.
         if domain_len(graph, id) <= MEMO_THRESHOLD {
             *slot = best_math(graph, cost, id, &mut budget);
+            if slot.0 >= u64::MAX / 4 && std::env::var_os("FUSOR_SEED_DEBUG").is_some() {
+                let show: String = format!("{:?}", node.op).chars().take(200).collect();
+                eprintln!("[lb] math saturated at {id:?}: {show}");
+            }
             continue;
         }
         let key = shape_key(graph, id);
