@@ -62,6 +62,69 @@ fn synthetic(srvs: usize, subgroup: bool, clamp: bool) -> Variant {
     }
 }
 
+#[derive(Clone, Copy)]
+enum Pre {
+    /// The pairs kernel's activation: `(m0 == m1) * (m2 > m3) + (m0 > m1)`
+    /// built from `select(0, 1, cmp)` and `fma`.
+    CompareSelect,
+    /// The same predicates through `f32(bool)` casts.
+    CompareCast,
+    /// A plain sum of the four loads.
+    Sum,
+}
+
+/// The shape of the pairs contraction with the depth and the activation as
+/// knobs: `k` unrolled steps per lane, each loading the vector and four
+/// matrices under a `kk < 36` mask, then a subgroup sum and a lane-0 store.
+fn contraction(k: usize, pre: Pre) -> Variant {
+    let mut w = String::from("@group(0) @binding(0)\nvar<storage> global: array<u32>;\n");
+    for i in 1..=5 {
+        w.push_str(&format!(
+            "@group(0) @binding({i})\nvar<storage> global_{i}: array<f32>;\n"
+        ));
+    }
+    w.push_str("@group(0) @binding(6)\nvar<storage, read_write> global_6: array<f32>;\n\n");
+    w.push_str("@compute @workgroup_size(4, 1, 1)\nfn main(@builtin(workgroup_id) wg: vec3<u32>, @builtin(subgroup_invocation_id) lane: u32) {\n");
+    w.push_str("    var acc: f32 = 0f;\n    let row: u32 = wg.x;\n");
+    for j in 0..k {
+        w.push_str(&format!("    let kk_{j}: u32 = (lane * {k}u) + {j}u;\n"));
+        w.push_str(&format!("    let ok_{j}: bool = (kk_{j} < 36u);\n"));
+        for i in 2..=5 {
+            w.push_str(&format!(
+                "    let m{i}_{j}: f32 = select(0f, global_{i}[min(((row * 36u) + kk_{j}), (arrayLength((&global_{i})) - 1u))], ok_{j});\n"
+            ));
+        }
+        let av = match pre {
+            Pre::CompareSelect => format!(
+                "fma(select(0f, 1f, (m2_{j} == m3_{j})), select(0f, 1f, (m4_{j} > m5_{j})), select(0f, 1f, (m2_{j} > m3_{j})))"
+            ),
+            Pre::CompareCast => {
+                format!("fma(f32(m2_{j} == m3_{j}), f32(m4_{j} > m5_{j}), f32(m2_{j} > m3_{j}))")
+            }
+            Pre::Sum => format!("(((m2_{j} + m3_{j}) + m4_{j}) + m5_{j})"),
+        };
+        w.push_str(&format!(
+            "    let av_{j}: f32 = select(0f, {av}, ok_{j});\n"
+        ));
+        w.push_str(&format!(
+            "    let bv_{j}: f32 = select(0f, global_1[min(kk_{j}, (arrayLength((&global_1)) - 1u))], ok_{j});\n"
+        ));
+        w.push_str(&format!("    acc = fma(av_{j}, bv_{j}, acc);\n"));
+    }
+    w.push_str("    let total: f32 = subgroupAdd(acc);\n    if (lane == 0u) {\n        global_6[row] = total;\n    }\n    return;\n}\n");
+    let pre_name = match pre {
+        Pre::CompareSelect => "compare-select",
+        Pre::CompareCast => "compare-cast",
+        Pre::Sum => "sum",
+    };
+    Variant {
+        label: format!("contraction k={k} pre={pre_name}"),
+        wgsl: w,
+        sizes: vec![4, 144, 5184, 5184, 5184, 5184, 144],
+        grid: 36,
+    }
+}
+
 fn variants() -> Vec<Variant> {
     let pairs = include_str!("data/warp_sgemv_cols_pairs.wgsl");
     let outer = include_str!("data/warp_sgemv_cols_outer.wgsl");
@@ -97,6 +160,17 @@ fn variants() -> Vec<Variant> {
     }
     v.push(synthetic(5, false, true));
     v.push(synthetic(5, true, false));
+    for (k, pre) in [
+        (8, Pre::CompareSelect),
+        (32, Pre::CompareSelect),
+        (32, Pre::CompareCast),
+        (32, Pre::Sum),
+        (128, Pre::CompareSelect),
+        (128, Pre::Sum),
+        (256, Pre::Sum),
+    ] {
+        v.push(contraction(k, pre));
+    }
     v
 }
 
