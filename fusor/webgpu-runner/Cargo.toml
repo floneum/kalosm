@@ -1,13 +1,12 @@
 [package]
 name = "fusor-webgpu-runner"
 description = "Browser runner for the fusor conformance suite and benchmarks, on WebGPU"
-edition.workspace = true
-version.workspace = true
-license.workspace = true
-authors.workspace = true
-rust-version.workspace = true
-repository.workspace = true
+edition = "2024"
+version = "0.1.0"
 publish = false
+
+# Its own workspace: see `exclude` in ../Cargo.toml.
+[workspace]
 
 [dependencies]
 dioxus = { version = "0.7", default-features = false, features = ["minimal", "web", "asset", "document"] }
@@ -15,9 +14,9 @@ dioxus-icons = { version = "0.1.0", default-features = false }
 dioxus-primitives = { git = "https://github.com/DioxusLabs/components", version = "0.0.1", default-features = false, features = ["web"] }
 dioxus-router = { version = "0.7", default-features = false, features = ["html"] }
 # GPU only: the CPU backend is native-only, and a browser has one device.
-fusor = { workspace = true, default-features = false, features = ["gpu"] }
-fusor-conformance = { workspace = true, default-features = false, features = ["burn-bench"] }
-web-time.workspace = true
+fusor = { path = "../fusor", default-features = false, features = ["gpu"] }
+fusor-conformance = { path = "../fusor-conformance", default-features = false, features = ["burn-bench"] }
+web-time = "1"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
 # dioxus-web 0.7.10's history code needs `Location`, which only its
@@ -25,3 +24,22 @@ web-time.workspace = true
 web-sys = { version = "0.3", features = ["Window", "Location", "History"] }
 getrandom = { version = "0.3", features = ["wasm_js"] }
 getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+# Patch tables only apply from the build root, so the workspace's naga fork
+# is repeated here; see ../Cargo.toml.
+[patch.crates-io]
+naga = { git = "https://github.com/ealmloff/wgpu", rev = "c4f55cabaadc22b942c1dd8894bf85f17f2718dc" }
+
+# CI builds: the conformance sweep runs the planner and every raced kernel
+# body on the host, and unoptimized planner code is most of its wall time.
+# `opt-level = 1` keeps the compile close to dev while cutting that several
+# fold; line tables keep backtraces readable.
+[profile.ci]
+inherits = "dev"
+opt-level = 1
+debug = "line-tables-only"
+
+# The web bundle: `wasm-opt` aborts on the DWARF 5 units a current rustc
+# emits ("compile unit size was incorrect"), so release strips debuginfo.
+[profile.release]
+strip = "debuginfo"
