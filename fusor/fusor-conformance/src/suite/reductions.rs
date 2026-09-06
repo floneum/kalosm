@@ -74,8 +74,8 @@ pub fn cases() -> Cases {
             "reductions",
             name,
             SPEC,
-            move |session, shape, seed| {
-                reduction_case(session, shape, seed, keepdim, op, reference, domain)
+            async move |session: &Session, shape: &[u64], seed: u32| {
+                reduction_case(session, shape, seed, keepdim, op, reference, domain).await
             },
         ));
     }
@@ -215,7 +215,7 @@ pub mod generality {
     /// Nearest-centroid assignment: `min over M of sum over D of (a-b)^2`.
     /// The `[N, M]` distance matrix is an intermediate of a reduction that
     /// covers it and is never materialized.
-    fn kmeans_assignment(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    async fn kmeans_assignment(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (n, m, d) = (shape[0], shape[1], shape[2]);
         let points = Domain::Wide.sample(seed, (n * d) as usize);
         let centroids = Domain::Wide.sample(seed ^ 0x9e37_79b9, (m * d) as usize);
@@ -229,7 +229,7 @@ pub mod generality {
             .and_then(|v| v.sum(2))
             .map_err(err)?;
         let nearest = dist.min(1).map_err(err)?;
-        let actual = read(&nearest)?;
+        let actual = read(&nearest).await?;
 
         let mut expected = Vec::with_capacity(n as usize);
         for pt in 0..n as usize {
@@ -244,7 +244,7 @@ pub mod generality {
             }
             expected.push(best);
         }
-        expect_shaped(session, &[n], &actual, &expected)?;
+        expect_shaped(session, &[n], &actual, &expected).await?;
 
         Ok(())
     }
@@ -259,7 +259,7 @@ pub mod generality {
     /// The elementwise values are asserted bit-identically against the host
     /// formula; the sum is compared to tolerance, because a reduction's order
     /// is a schedule decision.
-    fn qat_fake_quant_chain(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    async fn qat_fake_quant_chain(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (rows, cols) = (shape[0], shape[1]);
         const LEVELS: u32 = 127;
         let data = Domain::Custom(-3.0, 3.0).sample(seed, (rows * cols) as usize);
@@ -271,7 +271,7 @@ pub mod generality {
         let q = x.fake_quant(LEVELS, &s).map_err(err)?;
         let total = q.sum(1).map_err(err)?;
 
-        let quantized = read(&q)?;
+        let quantized = read(&q).await?;
         let lim = LEVELS as f32;
         let host: Vec<f32> = data
             .iter()
@@ -294,9 +294,9 @@ pub mod generality {
             }
         }
 
-        let actual = read(&total)?;
+        let actual = read(&total).await?;
         let expected: Vec<f32> = host.chunks(cols as usize).map(|r| r.iter().sum()).collect();
-        expect_shaped(session, &[rows], &actual, &expected)?;
+        expect_shaped(session, &[rows], &actual, &expected).await?;
 
         Ok(())
     }
@@ -307,7 +307,7 @@ pub mod generality {
     /// Sampling temperature: `argmax(logits / T)`. The `(*c)` row hoists `1/T`
     /// out of the reduction; float division is monotone, so the argmax is
     /// preserved.
-    fn temperature(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    async fn temperature(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (rows, vocab) = (shape[0], shape[1]);
         const T: f32 = 0.7;
         let logits = Domain::Custom(-8.0, 8.0).sample(seed, (rows * vocab) as usize);
@@ -319,9 +319,9 @@ pub mod generality {
         let cold = x.max(1).map_err(err)?;
         let picked = scaled.arg_max(1).map_err(err)?;
 
-        let hot = read(&hot)?;
-        let cold = read(&cold)?;
-        let picked = read(&picked)?;
+        let hot = read(&hot).await?;
+        let cold = read(&cold).await?;
+        let picked = read(&picked).await?;
         for (r, ((h, c), p)) in hot.iter().zip(&cold).zip(&picked).enumerate() {
             let row = &logits[r * vocab as usize..(r + 1) * vocab as usize];
             let want = row.iter().copied().fold(f32::NEG_INFINITY, f32::max);
@@ -360,7 +360,7 @@ pub mod generality {
 
     /// `max(x + bias) == max(x) + bias` for a bias invariant along the
     /// reduced axis. Exact in float.
-    fn shifted_max(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    async fn shifted_max(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (rows, cols) = (shape[0], shape[1]);
         let data = Domain::Wide.sample(seed, (rows * cols) as usize);
         let bias: Vec<f32> = (0..rows).map(|r| 0.25 * (r as f32) - 0.5).collect();
@@ -371,8 +371,8 @@ pub mod generality {
         let shifted = x.add_(&b).and_then(|y| y.max(1)).map_err(err)?;
         let plain = x.max(1).map_err(err)?;
 
-        let shifted = read(&shifted)?;
-        let plain = read(&plain)?;
+        let shifted = read(&shifted).await?;
+        let plain = read(&plain).await?;
         for (r, (s, p)) in shifted.iter().zip(&plain).enumerate() {
             let want = p + bias[r];
             if s.to_bits() != want.to_bits() {
@@ -388,7 +388,7 @@ pub mod generality {
     }
 
     /// `min(-x) == -max(x)`, exactly. The `Neg` row is total on every dtype.
-    fn negated_min(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    async fn negated_min(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (rows, cols) = (shape[0], shape[1]);
         let data = Domain::Wide.sample(seed, (rows * cols) as usize);
 
@@ -396,8 +396,8 @@ pub mod generality {
         let x = upload(graph.handle(), &dims(&[rows, cols]), &data)?;
         let lhs = x.mul_scalar(-1.0).and_then(|v| v.min(1)).map_err(err)?;
         let rhs = x.max(1).and_then(|m| m.mul_scalar(-1.0)).map_err(err)?;
-        let lhs = read(&lhs)?;
-        let rhs = read(&rhs)?;
+        let lhs = read(&lhs).await?;
+        let rhs = read(&rhs).await?;
         for (r, (a, b)) in lhs.iter().zip(&rhs).enumerate() {
             if a.to_bits() != b.to_bits() {
                 return Err(format!("row {r}: min(-x) = {a}, -max(x) = {b}").into());
@@ -413,7 +413,7 @@ pub mod generality {
     /// Dynamic-range quantization calibration: the min and the max of one
     /// tensor, in one traversal. The joint fold is compared slot by slot
     /// against two separate reductions of the same data.
-    fn min_and_max_one_pass(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    async fn min_and_max_one_pass(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (rows, cols) = (shape[0], shape[1]);
         let data = Domain::Wide.sample(seed, (rows * cols) as usize);
 
@@ -442,14 +442,14 @@ pub mod generality {
         let graph = graph_of(session);
         let x = upload(graph.handle(), &dims(&[rows, cols]), &data)?;
         let both = x.fold_carrier(joined.carrier, 1).map_err(err)?;
-        let actual = read(&both)?;
+        let actual = read(&both).await?;
 
         let mut expected = Vec::with_capacity((rows * 2) as usize);
         for row in data.chunks(cols as usize) {
             expected.push(row.iter().copied().fold(f32::NEG_INFINITY, f32::max));
             expected.push(row.iter().copied().fold(f32::INFINITY, f32::min));
         }
-        expect_shaped(session, &[rows, 2], &actual, &expected)
+        expect_shaped(session, &[rows, 2], &actual, &expected).await
     }
 
     /// `[rows, len]`. `len > 2 * BIN` and never a divisor of `2 * BIN` or
@@ -459,7 +459,7 @@ pub mod generality {
 
     /// A single-bin DFT: the real and imaginary projections of one windowed
     /// signal, over one axis, in one pass.
-    fn goertzel(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    async fn goertzel(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (rows, len) = (shape[0], shape[1]);
         let _ = seed; // the signal is the case: a sine at the probed bin.
         const BIN: usize = 5;
@@ -483,8 +483,8 @@ pub mod generality {
         let s = upload(graph.handle(), &dims(&[1, len]), &sin_w)?;
         let re = x.mul_(&c).and_then(|p| p.sum(1)).map_err(err)?;
         let im = x.mul_(&s).and_then(|p| p.sum(1)).map_err(err)?;
-        let re = read(&re)?;
-        let im = read(&im)?;
+        let re = read(&re).await?;
+        let im = read(&im).await?;
 
         for r in 0..rows as usize {
             let row = &signal[r * len as usize..(r + 1) * len as usize];
@@ -517,7 +517,7 @@ pub mod generality {
     /// Soft-label distillation loss: `-sum_c p_c * (x_c - lse(x))`.
     /// The logits sit at ~900, where a naive `sum(exp(x))` is `inf` and the
     /// loss is `NaN`, so the finiteness check is a real assert.
-    fn distillation(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    async fn distillation(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (rows, classes) = (shape[0], shape[1]);
         let mut logits = Domain::Custom(-4.0, 4.0).sample(seed, (rows * classes) as usize);
         for v in logits.iter_mut() {
@@ -552,7 +552,7 @@ pub mod generality {
             .and_then(|z| z.sum(1))
             .and_then(|z| z.mul_scalar(-1.0))
             .map_err(err)?;
-        let actual = read(&loss)?;
+        let actual = read(&loss).await?;
 
         let mut expected = Vec::with_capacity(rows as usize);
         for r in 0..rows as usize {
@@ -590,7 +590,7 @@ pub mod generality {
     /// A ragged batch: `sum(select(position < valid_len, x, 0))`. Zero is the
     /// `Add` identity, so the padded tail contributes nothing by the monoid
     /// law rather than by a padding flag on a node.
-    fn ragged_padding(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    async fn ragged_padding(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (rows, cols) = (shape[0], shape[1]);
         let data = Domain::Wide.sample(seed, (rows * cols) as usize);
         let mut rng = Rng::new(seed ^ 0x5eed);
@@ -610,7 +610,7 @@ pub mod generality {
         let keep = pos.lt_tensor(&lim).map_err(err)?;
         let masked = keep.where_cond(&x, &zero).map_err(err)?;
         let total = masked.sum(1).map_err(err)?;
-        let actual = read(&total)?;
+        let actual = read(&total).await?;
 
         let expected: Vec<f32> = (0..rows as usize)
             .map(|r| {
@@ -619,7 +619,7 @@ pub mod generality {
                     .sum()
             })
             .collect();
-        expect_shaped(session, &[rows], &actual, &expected)?;
+        expect_shaped(session, &[rows], &actual, &expected).await?;
 
         Ok(())
     }
@@ -633,26 +633,26 @@ pub mod generality {
     /// is exactly where the reduction *order* matters, so whether the compiler
     /// runs it split or unsplit, the answer must sit within reassociation
     /// tolerance of the true sum.
-    fn long_sum_agrees_with_f64(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+    async fn long_sum_agrees_with_f64(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let (rows, cols) = (shape[0], shape[1]);
         let data = Domain::Wide.sample(seed, (rows * cols) as usize);
 
         let graph = graph_of(session);
         let x = upload(graph.handle(), &dims(&[rows, cols]), &data)?;
         let total = x.sum(1).map_err(err)?;
-        let actual = read(&total)?;
+        let actual = read(&total).await?;
         // f64 accumulation on the host: at these lengths the f32 order matters.
         let expected: Vec<f32> = data
             .chunks(cols as usize)
             .map(|r| r.iter().map(|v| *v as f64).sum::<f64>() as f32)
             .collect();
-        expect_shaped(session, &[rows], &actual, &expected)?;
+        expect_shaped(session, &[rows], &actual, &expected).await?;
 
         Ok(())
     }
 }
 
-fn reduction_case(
+async fn reduction_case(
     session: &Session,
     shape: &[u64],
     seed: u32,
@@ -670,18 +670,19 @@ fn reduction_case(
     let x = upload(graph.handle(), &dimv, &data)?;
     let y = op(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let actual = read(&y)?;
+    let actual = read(&y).await?;
     let expected: Vec<f32> = data.chunks(axis as usize).map(reference).collect();
-    expect_values(session, &out_shape, Dtype::F32, &actual, &expected)?;
+    expect_values(session, &out_shape, Dtype::F32, &actual, &expected).await?;
 
-    let analytic = gradient_of(&graph, &y, &x)?;
+    let analytic = gradient_of(&graph, &y, &x).await?;
     let probe_graph = graph_of(session);
     let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
     let probe_y = op(&probe_x).map_err(|e| -> CaseError { e.to_string().into() })?;
     let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[rows as usize, axis as usize], &data, &mut |p| {
+    let numeric = finite_difference_gradient(&[rows as usize, axis as usize], &data, |p| {
         read_probe_loss(&probe_x, &probe_loss, p)
-    })?;
+    })
+    .await?;
     assert_gradient_matches_finite_difference(&analytic, &numeric)?;
     Ok(())
 }
@@ -695,7 +696,7 @@ const HIGH_RANK_SPEC: &[FuzzDim] = &[
     FuzzDim::Range(1, 6),
 ];
 
-fn sum_high_rank(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn sum_high_rank(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (b_n, c_n, h_n, w_n) = (
         shape[0] as usize,
         shape[1] as usize,
@@ -713,7 +714,7 @@ fn sum_high_rank(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .sum(2)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let actual = read(&y)?;
+    let actual = read(&y).await?;
     let mut expected = vec![0.0f32; b_n * c_n * w_n];
     for b in 0..b_n {
         for c in 0..c_n {
@@ -730,10 +731,11 @@ fn sum_high_rank(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         Dtype::F32,
         &actual,
         &expected,
-    )?;
+    )
+    .await?;
 
     // `sum`'s adjoint broadcasts, so every element gets exactly 1.
-    let grad = gradient_of(&graph, &y, &x)?;
+    let grad = gradient_of(&graph, &y, &x).await?;
     if let Some((i, v)) = grad
         .iter()
         .enumerate()
@@ -746,7 +748,7 @@ fn sum_high_rank(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 
 /// Ties split evenly under `TiePolicy::SplitEvenly`: the gradient divides by
 /// the tie count.
-fn extrema_tie_case(session: &Session, is_max: bool) -> CaseResult {
+async fn extrema_tie_case(session: &Session, is_max: bool) -> CaseResult {
     // Row 0 has a three-way tie at the extremum; row 1 and row 2 have a unique
     // extremum, so the case covers both branches at once.
     let peak = if is_max { 1.0 } else { -1.0 };
@@ -762,7 +764,7 @@ fn extrema_tie_case(session: &Session, is_max: bool) -> CaseResult {
     let y = if is_max { x.max(1) } else { x.min(1) }
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let grad = gradient_of(&graph, &y, &x)?;
+    let grad = gradient_of(&graph, &y, &x).await?;
     let expected: Vec<f32> = vec![
         1.0 / 3.0,
         0.0,
@@ -794,12 +796,12 @@ fn extrema_tie_case(session: &Session, is_max: bool) -> CaseResult {
     Ok(())
 }
 
-fn max_ties_split_evenly(session: &Session) -> CaseResult {
-    extrema_tie_case(session, true)
+async fn max_ties_split_evenly(session: &Session) -> CaseResult {
+    extrema_tie_case(session, true).await
 }
 
-fn min_ties_split_evenly(session: &Session) -> CaseResult {
-    extrema_tie_case(session, false)
+async fn min_ties_split_evenly(session: &Session) -> CaseResult {
+    extrema_tie_case(session, false).await
 }
 
 /// `[rows, axis]`. Rows >= 3 so `row % 3` zeros covers all three branches of
@@ -809,7 +811,7 @@ const ZERO_AWARE_SPEC: &[FuzzDim] = &[FuzzDim::Range(3, 5), FuzzDim::Range(2, 8)
 /// `product`'s three-branch zero-aware rule: no zeros in the row, exactly one
 /// zero, and two or more zeros (which give a zero gradient everywhere in that
 /// row). The zeros are planted at sampled positions in otherwise-nonzero data.
-fn product_zero_aware(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn product_zero_aware(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (rows, axis) = (shape[0], shape[1]);
     let mut data = Domain::Positive.sample(seed, (rows * axis) as usize);
     let mut rng = Rng::new(seed ^ 0x5eed);
@@ -830,7 +832,7 @@ fn product_zero_aware(session: &Session, shape: &[u64], seed: u32) -> CaseResult
     let y = x
         .product(1)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let grad = gradient_of(&graph, &y, &x)?;
+    let grad = gradient_of(&graph, &y, &x).await?;
 
     let mut expected = vec![0.0f32; data.len()];
     for row in 0..rows as usize {
@@ -871,7 +873,7 @@ const FOLD_SPLIT_SPEC: &[FuzzDim] = &[FuzzDim::Range(4096, 16384)];
 /// The two forms are not bit-identical — float `Add` is not associative,
 /// which is the whole reason the rule carries a `reassoc` guard — so they are
 /// compared relatively rather than exactly.
-fn fold_split_agrees(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn fold_split_agrees(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let long = shape[0];
     let data = Domain::Wide.sample(seed, long as usize);
     let dimv = dims(&[long]);
@@ -881,7 +883,7 @@ fn fold_split_agrees(session: &Session, shape: &[u64], seed: u32) -> CaseResult 
     let y = x
         .sum_all()
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let actual = read_scalar(&y)?;
+    let actual = read_scalar(&y).await?;
 
     // f64-accumulated reference: a split fold and an unsplit one must both
     // land near the true sum.

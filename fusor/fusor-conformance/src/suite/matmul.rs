@@ -85,13 +85,13 @@ pub fn cases() -> Cases {
         "matmul",
         "q_mat_mul",
         QMATMUL_SPEC,
-        |s, sh, seed| quantized_matmul(s, 2, sh, seed),
+        async move |s: &Session, sh: &[u64], seed: u32| quantized_matmul(s, 2, sh, seed).await,
     ));
     cases.push_case(fuzz_case(
         "matmul",
         "q_mat_mul_rank1",
         QMATMUL_RANK1_SPEC,
-        |s, sh, seed| quantized_matmul(s, 1, sh, seed),
+        async move |s: &Session, sh: &[u64], seed: u32| quantized_matmul(s, 1, sh, seed).await,
     ));
     // Split-K at the extents the trainer and this suite actually use. The
     // shipped `extent.at_least(4096)` gate refuses every one of them, so
@@ -102,7 +102,7 @@ pub fn cases() -> Cases {
             "matmul",
             split_k_name(k),
             SPLIT_K_MN_SPEC,
-            move |s, sh, seed| split_k(s, k, sh, seed),
+            async move |s: &Session, sh: &[u64], seed: u32| split_k(s, k, sh, seed).await,
         ));
     }
     cases.push_case(fuzz_case("matmul", "wide_n_columns", WIDE_N_SPEC, wide_n));
@@ -122,7 +122,7 @@ pub fn cases() -> Cases {
 /// never revisits it produces `0.0` from column 64 on — a silent wrong answer
 /// for every dense layer wider than 64 units — while passing every narrow
 /// case.
-fn wide_n(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn wide_n(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let [m, k, n] = [shape[0], shape[1], shape[2]];
     let a = Domain::Wide.sample(seed, (m * k) as usize);
     let b = Domain::Wide.sample(seed ^ 0x9e37_79b9, (k * n) as usize);
@@ -133,7 +133,7 @@ fn wide_n(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let y = lhs
         .matmul(&rhs)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let actual = read(&y)?;
+    let actual = read(&y).await?;
     let mut expected = vec![0.0f32; (m * n) as usize];
     for i in 0..m as usize {
         for j in 0..n as usize {
@@ -144,14 +144,14 @@ fn wide_n(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
             expected[i * n as usize + j] = acc as f32;
         }
     }
-    expect_values(session, &[m, n], Dtype::F32, &actual, &expected)
+    expect_values(session, &[m, n], Dtype::F32, &actual, &expected).await
 }
 
 /// Three projections of one activation, each with its own bias: `x@Wq + bq`,
 /// `x@Wk + bk`, `x@Wv + bv` resolved together. Every projection's own
 /// epilogue must survive whatever horizontal fusion the compiler applies — a
 /// fusion that dropped one bias still produces three plausible matrices.
-fn qkv_triple(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn qkv_triple(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let [rows, cin, cout] = [shape[0], shape[1], shape[2]];
     let x = Domain::Wide.sample(seed, (rows * cin) as usize);
     let w: Vec<Vec<f32>> = (0..3)
@@ -175,7 +175,7 @@ fn qkv_triple(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     }
 
     for (i, out) in outs.iter().enumerate() {
-        let actual = read(out)?;
+        let actual = read(out).await?;
         let mut expected = vec![0.0f32; (rows * cout) as usize];
         for r in 0..rows as usize {
             for c in 0..cout as usize {
@@ -186,7 +186,7 @@ fn qkv_triple(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
                 expected[r * cout as usize + c] = acc as f32 + bias[i][c];
             }
         }
-        expect_values(session, &[rows, cout], Dtype::F32, &actual, &expected)?;
+        expect_values(session, &[rows, cout], Dtype::F32, &actual, &expected).await?;
     }
     Ok(())
 }
@@ -211,7 +211,7 @@ fn split_k_name(k: u64) -> &'static str {
 /// the two orders differ in f32. The reference is accumulated in f64, so both
 /// forms are measured against the true sum rather than against one particular
 /// traversal order.
-fn split_k(session: &Session, k: u64, shape: &[u64], seed: u32) -> CaseResult {
+async fn split_k(session: &Session, k: u64, shape: &[u64], seed: u32) -> CaseResult {
     let [m, n] = [shape[0], shape[1]];
     let a_data = Domain::Wide.sample(seed, (m * k) as usize);
     let b_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, (k * n) as usize);
@@ -222,7 +222,7 @@ fn split_k(session: &Session, k: u64, shape: &[u64], seed: u32) -> CaseResult {
     let y = a
         .matmul(&b)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let actual = read(&y)?;
+    let actual = read(&y).await?;
 
     let mut expected = vec![0.0f32; (m * n) as usize];
     for i in 0..m as usize {
@@ -274,7 +274,7 @@ fn host_matmul(a: &[f32], b: &[f32], batch: usize, m: usize, k: usize, n: usize)
 /// One contraction at an arbitrary batch prefix (`shape` is
 /// `[prefix..., m, k, n]`). Batch dims must already match: there is no
 /// implicit broadcast, the frontend emits the restride.
-fn batched(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn batched(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (prefix, mkn) = shape.split_at(shape.len() - 3);
     let [m, k, n] = [mkn[0], mkn[1], mkn[2]];
     let batch: u64 = prefix.iter().product::<u64>().max(1);
@@ -292,7 +292,7 @@ fn batched(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .matmul(&b)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let actual = read(&y)?;
+    let actual = read(&y).await?;
     let expected = host_matmul(
         &a_data,
         &b_data,
@@ -301,13 +301,13 @@ fn batched(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         k as usize,
         n as usize,
     );
-    expect_values(session, &out_shape, Dtype::F32, &actual, &expected)?;
+    expect_values(session, &out_shape, Dtype::F32, &actual, &expected).await?;
 
     // dA = grad @ B^T. Under `sum_all` the incoming gradient is all ones, so
     // dA[i, t] is the row sum of B[t, :] — checked analytically rather than
     // only against finite differences, because a transposed contraction spec
     // that got its labels backwards still passes a symmetric shape.
-    let d_a = gradient_of(&graph, &y, &a)?;
+    let d_a = gradient_of(&graph, &y, &a).await?;
     let mut want_a = vec![0.0f32; (batch * m * k) as usize];
     for bi in 0..batch as usize {
         for i in 0..m as usize {
@@ -332,7 +332,7 @@ fn batched(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 /// layout** — that is the whole reason the op exists separately from
 /// `matmul(a, b.t())`. Optimizer-side flattens stay zero-cost views instead of
 /// gather kernels only if the gradient comes out in the weight's layout.
-fn transposed_rhs(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn transposed_rhs(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let [m, k, n] = [shape[0] as usize, shape[1] as usize, shape[2] as usize];
     let a_data = Domain::Wide.sample(seed, m * k);
     let b_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, n * k);
@@ -354,11 +354,12 @@ fn transposed_rhs(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         session,
         &[m as u64, n as u64],
         Dtype::F32,
-        &read(&y)?,
+        &read(&y).await?,
         &expected,
-    )?;
+    )
+    .await?;
 
-    let d_rhs = gradient_of(&graph, &y, &b)?;
+    let d_rhs = gradient_of(&graph, &y, &b).await?;
     if d_rhs.len() != n * k {
         return Err(format!(
             "d_rhs has {} elements, want {}: it must land in rhs's own [N, K] layout, \
@@ -384,7 +385,7 @@ fn transposed_rhs(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 /// A contraction with a rank-1 bias broadcast over its rows: the epilogue that
 /// `sink_epilogue` folds into the contraction's `post`. The bias gradient must
 /// be summed over the broadcast axis.
-fn broadcast_bias(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn broadcast_bias(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let [m, k, n] = [shape[0] as usize, shape[1] as usize, shape[2] as usize];
     let a_data = Domain::Wide.sample(seed, m * k);
     let b_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, k * n);
@@ -409,11 +410,12 @@ fn broadcast_bias(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         session,
         &[m as u64, n as u64],
         Dtype::F32,
-        &read(&y)?,
+        &read(&y).await?,
         &expected,
-    )?;
+    )
+    .await?;
 
-    let d_bias = gradient_of(&graph, &y, &c)?;
+    let d_bias = gradient_of(&graph, &y, &c).await?;
     if d_bias.len() != n {
         return Err(format!("the bias gradient has {} elements, want {n}", d_bias.len()).into());
     }
@@ -435,7 +437,12 @@ fn broadcast_bias(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 /// Gradients flow to the **activation only**: the weight is quantized and
 /// non-trainable through this route, which is what makes QAT a separate master
 /// copy rather than a quantized backward kernel.
-fn quantized_matmul(session: &Session, act_rank: usize, shape: &[u64], seed: u32) -> CaseResult {
+async fn quantized_matmul(
+    session: &Session,
+    act_rank: usize,
+    shape: &[u64],
+    seed: u32,
+) -> CaseResult {
     use fusor_ir::dtype::{QFmt, QLayout};
 
     let rows = shape[0];
@@ -502,7 +509,7 @@ fn quantized_matmul(session: &Session, act_rank: usize, shape: &[u64], seed: u32
     } else {
         vec![batch, rows as usize]
     };
-    let got = read(&y)?;
+    let got = read(&y).await?;
     // A quantized dot accumulates in f32 over 32 terms, so the bar is
     // relative to the result rather than absolute.
     crate::compare::approx_or_relative_eq(
@@ -519,7 +526,7 @@ fn quantized_matmul(session: &Session, act_rank: usize, shape: &[u64], seed: u32
     )?;
 
     // Gradients flow to the activation only.
-    let d_a = gradient_of(&graph, &y, &a)?;
+    let d_a = gradient_of(&graph, &y, &a).await?;
     let want: Vec<f32> = (0..batch * k)
         .map(|n| (0..rows as usize).map(|r| weights[r * k + n % k]).sum())
         .collect();

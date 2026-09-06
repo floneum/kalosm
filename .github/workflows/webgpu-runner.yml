@@ -1,0 +1,40 @@
+name: WebGPU Runner
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - fusor/**
+      - .github/workflows/webgpu-runner.yml
+      - .github/workflows/webgpu-runner-pages.yml
+      - Cargo.toml
+      - Cargo.lock
+
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    branches:
+      - main
+    paths:
+      - fusor/**
+      - .github/workflows/webgpu-runner.yml
+      - .github/workflows/webgpu-runner-pages.yml
+      - Cargo.toml
+      - Cargo.lock
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    uses: dioxuslabs/dioxus-ci/.github/workflows/web-build.yml@main
+    with:
+      working-directory: fusor/webgpu-runner
+      base-path: ${{ github.event.repository.name }}
+      debug-symbols: false
+      dx-cli-version: 0.7.7
+      runs-on: ubuntu-24.04

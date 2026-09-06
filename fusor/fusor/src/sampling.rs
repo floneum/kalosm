@@ -11,5 +11,5 @@ pub(crate) mod standard;
 pub(crate) mod top_k;
 
 pub use mirostat2::Mirostat2Sampler;
-pub use standard::{StandardSamplerParams, sample};
+pub use standard::{StandardSamplerParams, sample, sample_async};
 pub use top_k::{GpuSampledToken, top_k_pairs};

@@ -12,7 +12,7 @@ use crate::rules::RuleId;
 use fixedbitset::FixedBitSet;
 use smallvec::SmallVec;
 use std::collections::VecDeque;
-use std::time::Instant;
+use web_time::Instant;
 
 /// The shipped driver. Targets contribute rules, never a driver.
 #[derive(Default, Debug, Clone, Copy)]

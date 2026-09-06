@@ -99,7 +99,7 @@ fn upload_as(
 
 /// Values every dtype in [`DENSE`] can hold exactly: small non-negative
 /// integers. Used wherever a case must be dtype-agnostic.
-fn integral(seed: u32, len: usize) -> Vec<f32> {
+async fn integral(seed: u32, len: usize) -> Vec<f32> {
     Domain::Custom(0.0, 8.0)
         .sample(seed, len)
         .into_iter()
@@ -115,9 +115,14 @@ pub fn cases() -> Cases {
     for dtype in DENSE {
         let dtype = *dtype;
         let name = leak(format!("roundtrip_{}", dtype_name(dtype)));
-        cases.push_case(fuzz_case("dtypes", name, SPEC, move |s, shape, seed| {
-            roundtrip_case(s, dtype, shape, seed)
-        }));
+        cases.push_case(fuzz_case(
+            "dtypes",
+            name,
+            SPEC,
+            async move |s: &Session, shape: &[u64], seed: u32| {
+                roundtrip_case(s, dtype, shape, seed).await
+            },
+        ));
     }
 
     // Every ordered pair of dense dtypes.
@@ -128,9 +133,14 @@ pub fn cases() -> Cases {
             }
             let (from, to) = (*from, *to);
             let name = leak(format!("cast_{}_to_{}", dtype_name(from), dtype_name(to)));
-            cases.push_case(fuzz_case("dtypes", name, SPEC, move |s, shape, seed| {
-                cast_case(s, from, to, shape, seed)
-            }));
+            cases.push_case(fuzz_case(
+                "dtypes",
+                name,
+                SPEC,
+                async move |s: &Session, shape: &[u64], seed: u32| {
+                    cast_case(s, from, to, shape, seed).await
+                },
+            ));
         }
     }
 
@@ -189,13 +199,13 @@ fn dtype_name(dtype: Dtype) -> &'static str {
 /// Upload as `dtype`, read back as f32, compare against the host's own
 /// rounding. A dtype whose readback path drops precision differently from its
 /// upload path fails here before any op runs.
-fn roundtrip_case(session: &Session, dtype: Dtype, shape: &[u64], seed: u32) -> CaseResult {
+async fn roundtrip_case(session: &Session, dtype: Dtype, shape: &[u64], seed: u32) -> CaseResult {
     if let Some(why) = unsupported(session, dtype) {
         return Err(skip(why));
     }
     let len = len_of(shape);
     let data = match dtype {
-        Dtype::U32 | Dtype::I32 => integral(seed, len),
+        Dtype::U32 | Dtype::I32 => integral(seed, len).await,
         _ => Domain::Wide.sample(seed, len),
     };
     let graph = graph_of(session);
@@ -208,14 +218,20 @@ fn roundtrip_case(session: &Session, dtype: Dtype, shape: &[u64], seed: u32) -> 
         .into());
     }
     let expected: Vec<f32> = data.iter().map(|v| quantize_to(dtype, *v)).collect();
-    expect_values(session, shape, dtype, &read(&x)?, &expected)?;
+    expect_values(session, shape, dtype, &read(&x).await?, &expected).await?;
     Ok(())
 }
 
 /// One `cast` edge. The reference is the composition of the two host
 /// quantizations, so a lossy pair is expected to be lossy in exactly the way
 /// the host says.
-fn cast_case(session: &Session, from: Dtype, to: Dtype, shape: &[u64], seed: u32) -> CaseResult {
+async fn cast_case(
+    session: &Session,
+    from: Dtype,
+    to: Dtype,
+    shape: &[u64],
+    seed: u32,
+) -> CaseResult {
     for dtype in [from, to] {
         if let Some(why) = unsupported(session, dtype) {
             return Err(skip(why));
@@ -223,7 +239,7 @@ fn cast_case(session: &Session, from: Dtype, to: Dtype, shape: &[u64], seed: u32
     }
     // Integers only, so the case measures the cast rather than the rounding
     // of an arbitrary float into a 5-bit exponent.
-    let data = integral(seed, len_of(shape));
+    let data = integral(seed, len_of(shape)).await;
     let graph = graph_of(session);
     let x = upload_as(graph.handle(), from, shape, &data)?;
     let y = x
@@ -236,7 +252,7 @@ fn cast_case(session: &Session, from: Dtype, to: Dtype, shape: &[u64], seed: u32
         .iter()
         .map(|v| quantize_to(to, quantize_to(from, *v)))
         .collect();
-    expect_values(session, shape, to, &read(&y)?, &expected)?;
+    expect_values(session, shape, to, &read(&y).await?, &expected).await?;
     Ok(())
 }
 
@@ -245,7 +261,7 @@ fn cast_case(session: &Session, from: Dtype, to: Dtype, shape: &[u64], seed: u32
 ///
 /// The gradient must be an f32 tensor of the master's shape. A rule that
 /// leaves it in f16 silently truncates every update the optimizer applies.
-fn cast_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn cast_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     if let Some(why) = unsupported(session, Dtype::F16) {
         return Err(skip(why));
     }
@@ -261,7 +277,7 @@ fn cast_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .cast(Dtype::F32)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let grad = gradient_of(&graph, &back, &master)?;
+    let grad = gradient_of(&graph, &back, &master).await?;
     if grad.len() != len {
         return Err(format!(
             "the master gradient has {} elements, want {len}",
@@ -277,7 +293,7 @@ fn cast_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 
 /// f32 -> f16 -> f32 must be idempotent: the second trip changes nothing,
 /// because the value is already representable.
-fn f16_round_trip(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn f16_round_trip(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     if let Some(why) = unsupported(session, Dtype::F16) {
         return Err(skip(why));
     }
@@ -294,14 +310,14 @@ fn f16_round_trip(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .and_then(|h| h.cast(Dtype::F32))
         .map_err(|e| -> CaseError { e.to_string().into() })?;
     // Exact: the second trip is a no-op on an already-representable value.
-    let (a, b) = (read(&once)?, read(&twice)?);
+    let (a, b) = (read(&once).await?, read(&twice).await?);
     crate::compare::exact_eq(backend_of(session), &[len], &a, &b)?;
     Ok(())
 }
 
 /// `a * b + a` in each float dtype, against the host computed at that dtype's
 /// own precision.
-fn float_arithmetic(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn float_arithmetic(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let len = len_of(shape);
     let lhs = Domain::Custom(0.25, 2.0).sample(seed, len);
     let rhs = Domain::Custom(0.25, 2.0).sample(seed ^ 0x9e37_79b9, len);
@@ -327,14 +343,14 @@ fn float_arithmetic(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
                 quantize_to(dtype, quantize_to(dtype, x * y) + x)
             })
             .collect();
-        expect_values(session, shape, dtype, &read(&y)?, &expected)?;
+        expect_values(session, shape, dtype, &read(&y).await?, &expected).await?;
     }
     Ok(())
 }
 
 /// There is no Bool. A comparison returns 1/0 **in the operand's own dtype**,
 /// so `u32 == u32` is a `u32` and can be multiplied by a `u32` without a cast.
-fn comparison_dtype(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn comparison_dtype(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     // Values in [0, 8) straddle the >= 3 threshold, so both mask values occur.
     let values = fill_indices(seed, len_of(shape), 8);
     let graph = graph_of(session);
@@ -352,7 +368,7 @@ fn comparison_dtype(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .into());
     }
     let expected: Vec<f32> = values.iter().map(|v| f32::from(*v >= 3)).collect();
-    expect_values(session, shape, Dtype::U32, &read(&mask)?, &expected)?;
+    expect_values(session, shape, Dtype::U32, &read(&mask).await?, &expected).await?;
 
     // The mask is usable as an operand at its own dtype, without a cast.
     let gated = x
@@ -362,13 +378,13 @@ fn comparison_dtype(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .iter()
         .map(|v| if *v >= 3 { *v as f32 } else { 0.0 })
         .collect();
-    expect_values(session, shape, Dtype::U32, &read(&gated)?, &want)?;
+    expect_values(session, shape, Dtype::U32, &read(&gated).await?, &want).await?;
     Ok(())
 }
 
 /// `rem` exists for `u32` only. On floats it must be refused rather than
 /// lowered to something with a different sign convention per backend.
-fn rem_u32_only(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn rem_u32_only(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let len = len_of(shape);
     // The divisor must be nonzero; the dividends must cross it in both
     // directions so the remainder is not the identity.
@@ -383,7 +399,7 @@ fn rem_u32_only(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .rem(&b)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
     let expected: Vec<f32> = values.iter().map(|v| (v % divisor) as f32).collect();
-    expect_values(session, shape, Dtype::U32, &read(&y)?, &expected)?;
+    expect_values(session, shape, Dtype::U32, &read(&y).await?, &expected).await?;
 
     let f = upload(
         graph.handle(),
@@ -405,7 +421,7 @@ type RoundRow = (
 
 /// Trainer constraint 5: `round`/`floor`/`ceil`/`trunc` are real primitives
 /// with an explicit `RoundMode`, not fourteen comparisons.
-fn round_modes(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn round_modes(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let len = len_of(shape);
     // The quarter grid over [-4, 4]: exact in f32, lands halves in both signs,
     // which is where half-to-even and half-away-from-zero differ.
@@ -426,7 +442,7 @@ fn round_modes(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     for (name, build, reference) in rows {
         let y = build(&x).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
         let expected: Vec<f32> = data.iter().copied().map(reference).collect();
-        crate::compare::exact_eq(backend_of(session), &[len], &expected, &read(&y)?)
+        crate::compare::exact_eq(backend_of(session), &[len], &expected, &read(&y).await?)
             .map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
     }
     Ok(())
@@ -449,7 +465,7 @@ fn host_round_even(v: f32) -> f32 {
 
 /// float -> int -> float is truncation toward zero, and the pair composes to
 /// the host's own `trunc`.
-fn float_int_round_trip(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn float_int_round_trip(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let len = len_of(shape);
     // Both signs, so truncation toward zero differs from floor.
     let data = fill_range(seed, len, -8.0, 8.0);
@@ -460,7 +476,7 @@ fn float_int_round_trip(session: &Session, shape: &[u64], seed: u32) -> CaseResu
         .and_then(|i| i.cast(Dtype::F32))
         .map_err(|e| -> CaseError { e.to_string().into() })?;
     let expected: Vec<f32> = data.iter().map(|v| v.trunc()).collect();
-    crate::compare::exact_eq(backend_of(session), &[len], &expected, &read(&y)?)?;
+    crate::compare::exact_eq(backend_of(session), &[len], &expected, &read(&y).await?)?;
     Ok(())
 }
 
@@ -468,7 +484,7 @@ fn float_int_round_trip(session: &Session, shape: &[u64], seed: u32) -> CaseResu
 /// magnitude ~1 in f16 stalls once the running total passes 2048, because the
 /// f16 ulp there exceeds the addend; the result would be roughly half the
 /// right answer.
-fn widening_accumulator(session: &Session, shape: &[u64], _seed: u32) -> CaseResult {
+async fn widening_accumulator(session: &Session, shape: &[u64], _seed: u32) -> CaseResult {
     if let Some(why) = unsupported(session, Dtype::F16) {
         return Err(skip(why));
     }
@@ -479,7 +495,7 @@ fn widening_accumulator(session: &Session, shape: &[u64], _seed: u32) -> CaseRes
     let y = x
         .sum(0)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let got = read(&y)?;
+    let got = read(&y).await?;
     let total = got.first().copied().unwrap_or(f32::NAN);
     if (total - n as f32).abs() > 1.0 {
         return Err(format!(

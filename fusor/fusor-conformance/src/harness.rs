@@ -7,6 +7,7 @@
 
 use std::any::Any;
 use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::sync::Arc;
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use fusor::graph::GraphRef;
@@ -91,9 +92,13 @@ macro_rules! ensure_ne {
     }};
 }
 
+/// A case body's future, borrowing the session it runs on.
+pub type CaseFuture<'a> = std::pin::Pin<Box<dyn std::future::Future<Output = CaseResult> + 'a>>;
+
 /// The body of a case. `Fn` so one case can run on every session in
-/// [`sessions`].
-pub type CaseFn = Box<dyn Fn(&Session) -> CaseResult + Send + Sync>;
+/// [`sessions`]; async so the same body runs in a browser, where every
+/// readback is awaited. Natively the harness blocks on it.
+pub type CaseFn = Box<dyn for<'a> Fn(&'a Session) -> CaseFuture<'a> + Send + Sync>;
 
 /// One conformance case, named `area::case`.
 pub struct Case {
@@ -106,13 +111,17 @@ impl Case {
     pub fn new(
         area: &'static str,
         case: impl Into<String>,
-        run: impl Fn(&Session) -> CaseResult + Send + Sync + 'static,
+        run: impl AsyncFn(&Session) -> CaseResult + Send + Sync + 'static,
     ) -> Self {
         let case = case.into();
+        let run = Arc::new(run);
         Self {
             name: format!("{area}::{case}"),
             area,
-            run: Box::new(run),
+            run: Box::new(move |session: &Session| {
+                let run = Arc::clone(&run);
+                Box::pin(async move { (*run)(session).await })
+            }),
         }
     }
 
@@ -143,7 +152,7 @@ impl Cases {
         &mut self,
         area: &'static str,
         name: impl Into<String>,
-        run: impl Fn(&Session) -> CaseResult + Send + Sync + 'static,
+        run: impl AsyncFn(&Session) -> CaseResult + Send + Sync + 'static,
     ) -> &mut Self {
         self.0.push(Case::new(area, name, run));
         self
@@ -195,6 +204,7 @@ fn require_gpu() -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 fn acquire_gpu() -> Option<Backend> {
     match Backend::gpu_blocking() {
         Ok(gpu) => Some(gpu),
@@ -218,24 +228,12 @@ fn cached_gpu() -> Option<Backend> {
     acquire_gpu()
 }
 
-#[cfg(target_arch = "wasm32")]
-fn cached_gpu() -> Option<Backend> {
-    thread_local! {
-        static GPU: std::cell::RefCell<Option<Option<Backend>>> =
-            const { std::cell::RefCell::new(None) };
-    }
-    if let Some(cached) = GPU.with(|cell| cell.borrow().clone()) {
-        return cached;
-    }
-    let acquired = acquire_gpu();
-    GPU.with(|cell| *cell.borrow_mut() = Some(acquired.clone()));
-    acquired
-}
-
 /// Always CPU, plus GPU when one is available. Every case runs on every
-/// session returned here.
+/// session returned here. Native: the GPU is acquired blocking.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn sessions() -> Vec<Session> {
     let mut out = Vec::new();
+    #[cfg(feature = "cpu")]
     if let Ok(cpu) = Backend::cpu()
         && let Ok(session) = Session::new(cpu)
     {
@@ -245,6 +243,30 @@ pub fn sessions() -> Vec<Session> {
         && let Ok(session) = Session::new(gpu)
     {
         out.push(session);
+    }
+    out
+}
+
+/// [`sessions`], acquiring the GPU asynchronously: the only form a browser
+/// can use, where the adapter request is a promise.
+pub async fn sessions_async() -> Vec<Session> {
+    let mut out = Vec::new();
+    #[cfg(all(feature = "cpu", not(target_arch = "wasm32")))]
+    if let Ok(cpu) = Backend::cpu()
+        && let Ok(session) = Session::new(cpu)
+    {
+        out.push(session);
+    }
+    match Backend::gpu().await {
+        Ok(gpu) => {
+            if let Ok(session) = Session::new(gpu) {
+                out.push(session);
+            }
+        }
+        Err(err) => assert!(
+            !require_gpu(),
+            "GPU conformance is required but no GPU device was available: {err}"
+        ),
     }
     out
 }
@@ -413,21 +435,25 @@ pub fn fuzz_case(
     area: &'static str,
     name: &'static str,
     spec: &'static [FuzzDim],
-    body: impl Fn(&Session, &[u64], u32) -> CaseResult + Send + Sync + 'static,
+    body: impl AsyncFn(&Session, &[u64], u32) -> CaseResult + Send + Sync + 'static,
 ) -> Case {
-    Case::new(area, name, move |session| {
+    Case::new(area, name, async move |session: &Session| {
         for run in 0..runs() {
             let seed = case_seed(name, run);
             let shape = sample_shape(&mut Rng::new(seed), spec);
-            body(session, &shape, seed).map_err(|e| -> CaseError {
-                // A skip must stay a skip: the run context goes after the
-                // marker, not in front of it.
-                let message = e.to_string();
-                match message.strip_prefix(SKIP_PREFIX) {
-                    Some(why) => skip(format!("run {run} at shape {shape:?}: {why}")),
-                    None => format!("run {run} at shape {shape:?} (seed {seed}): {message}").into(),
-                }
-            })?;
+            body(session, &shape, seed)
+                .await
+                .map_err(|e| -> CaseError {
+                    // A skip must stay a skip: the run context goes after the
+                    // marker, not in front of it.
+                    let message = e.to_string();
+                    match message.strip_prefix(SKIP_PREFIX) {
+                        Some(why) => skip(format!("run {run} at shape {shape:?}: {why}")),
+                        None => {
+                            format!("run {run} at shape {shape:?} (seed {seed}): {message}").into()
+                        }
+                    }
+                })?;
         }
         Ok(())
     })
@@ -518,6 +544,7 @@ fn panic_message(payload: Box<dyn Any + Send>) -> String {
 
 fn backend_name(session: &Session) -> &'static str {
     match session.device() {
+        #[cfg(feature = "cpu")]
         Backend::Cpu(_) => "cpu",
         Backend::Gpu(_) => "gpu",
     }
@@ -533,24 +560,47 @@ pub fn guard(body: impl FnOnce() -> CaseResult) -> Outcome {
     let result = catch_unwind(AssertUnwindSafe(body));
     std::panic::set_hook(hushed);
     match result {
-        Ok(Ok(())) => Outcome::Pass,
-        Ok(Err(err)) => {
+        Ok(result) => outcome_of(result),
+        Err(payload) => Outcome::Fail(format!("panicked: {}", panic_message(payload))),
+    }
+}
+
+/// The outcome a case body's result denotes: a [`SKIP_PREFIX`] error is a
+/// skip, any other error a failure.
+fn outcome_of(result: CaseResult) -> Outcome {
+    match result {
+        Ok(()) => Outcome::Pass,
+        Err(err) => {
             let message = err.to_string();
             match message.strip_prefix(SKIP_PREFIX) {
                 Some(why) => Outcome::Skipped(why.to_string()),
                 None => Outcome::Fail(message),
             }
         }
-        Err(payload) => Outcome::Fail(format!("panicked: {}", panic_message(payload))),
     }
 }
 
-/// Run one case against one session.
+/// Run one case against one session, blocking on its body. Native only.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn run_one(case: &Case, session: &Session) -> Outcome {
-    guard(|| (case.run)(session))
+    guard(|| pollster::block_on((case.run)(session)))
+}
+
+/// Run one case against one session, awaiting its body. A panic is not
+/// caught here: on the web it aborts, and the harness is not what decides
+/// that.
+pub async fn run_one_async(case: &Case, session: &Session) -> Outcome {
+    outcome_of((case.run)(session).await)
+}
+
+/// [`run_all`], awaited, over sessions the caller acquired (see
+/// [`sessions_async`]).
+pub async fn run_all_async(sessions: &[Session], mut progress: impl FnMut(&Report)) -> Vec<Report> {
+    Harness::new().run_async(sessions, &mut progress).await
 }
 
 /// Run the whole registry on every session, reporting progress as it goes.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn run_all(mut progress: impl FnMut(&Report)) -> Vec<Report> {
     let registry = crate::suite::registry();
     let sessions = sessions();
@@ -616,19 +666,26 @@ impl Harness {
         self.filter.as_ref().is_none_or(|f| name.contains(f))
     }
 
-    /// Every matching case on every available backend.
-    pub fn run(&self) -> Vec<Report> {
-        let registry = crate::suite::registry();
-        let sessions = sessions();
-        let mut out = Vec::new();
+    /// The cases this harness selects, in registry order.
+    fn selected<'r>(&self, registry: &'r Cases) -> Vec<&'r Case> {
         let (index, count) = self.shard.unwrap_or((0, 1));
-        for case in registry
+        registry
             .iter()
             .filter(|c| self.matches(&c.name))
             .enumerate()
             .filter(|(i, _)| i % count == index)
             .map(|(_, c)| c)
-        {
+            .collect()
+    }
+
+    /// Every matching case on every available backend. Native only: the
+    /// sessions are acquired and every case body run blocking.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn run(&self) -> Vec<Report> {
+        let sessions = sessions();
+        let registry = crate::suite::registry();
+        let mut out = Vec::new();
+        for case in self.selected(&registry) {
             for session in &sessions {
                 let _guard = is_gpu(session).then(gpu_test_guard);
                 out.push(Report {
@@ -636,6 +693,30 @@ impl Harness {
                     backend: backend_name(session),
                     outcome: run_one(case, session),
                 });
+            }
+        }
+        out
+    }
+
+    /// [`Self::run`], awaited, over sessions the caller acquired. Every
+    /// report is also handed to `progress` as it lands, which is what a
+    /// browser page shows while the suite runs.
+    pub async fn run_async(
+        &self,
+        sessions: &[Session],
+        mut progress: impl FnMut(&Report),
+    ) -> Vec<Report> {
+        let registry = crate::suite::registry();
+        let mut out = Vec::new();
+        for case in self.selected(&registry) {
+            for session in sessions {
+                let report = Report {
+                    case: case.name.clone(),
+                    backend: backend_name(session),
+                    outcome: run_one_async(case, session).await,
+                };
+                progress(&report);
+                out.push(report);
             }
         }
         out

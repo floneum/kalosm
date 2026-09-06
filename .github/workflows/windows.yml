@@ -134,7 +134,7 @@ jobs:
       # runner image with a bash startup error it documents as a known flake.
       - name: Install nextest
         shell: bash
-        run: curl -LsSf https://get.nexte.st/latest/windows-tar | tar zxf - -C "$CARGO_HOME/bin"
+        run: curl -LsSf https://get.nexte.st/latest/windows-tar | tar zxf - -C "$HOME/.cargo/bin"
       - name: WARP and DXC
         uses: ./.github/actions/warp-dxc
       - uses: actions/download-artifact@v4

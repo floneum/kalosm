@@ -44,7 +44,7 @@ use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::sync::Arc;
-use std::time::Instant;
+use web_time::Instant;
 
 /// The shipped extraction. Deterministic: ties break by node id, then by
 /// [`fusor_ir::extract::Move`] discriminant order, which is the order

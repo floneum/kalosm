@@ -6,7 +6,7 @@
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
-use std::time::Instant;
+use web_time::Instant;
 
 use fusor_cost::tune_cache::Verdict;
 use fusor_cost::{LocalSearch, ReplayMemo, Roofline};
@@ -102,6 +102,7 @@ impl Backend {
 
     /// Create a GPU backend and block until adapter initialization completes.
     #[cfg(feature = "gpu")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn gpu_blocking() -> Result<Self> {
         Ok(Self::Gpu(Arc::new(GpuTarget::new_blocking()?)))
     }
@@ -145,16 +146,22 @@ impl Backend {
     /// Release the kernels only losing race candidates used; see
     /// `GpuTarget::release_candidates`. The CPU keeps nothing per candidate.
     pub(crate) fn release_candidates(&self, arena: u64, candidates: &[Arc<Plan>], keep: &Plan) {
-        if let Self::Gpu(t) = self {
-            t.release_candidates(arena, candidates, keep);
+        match self {
+            #[cfg(feature = "gpu")]
+            Self::Gpu(t) => t.release_candidates(arena, candidates, keep),
+            #[allow(unreachable_patterns)]
+            _ => {}
         }
     }
 
     /// Release every kernel compiled for graph `arena`; called when the
     /// graph is dropped. See `GpuTarget::release_arena`.
     pub(crate) fn release_arena(&self, arena: u64) {
-        if let Self::Gpu(t) = self {
-            t.release_arena(arena);
+        match self {
+            #[cfg(feature = "gpu")]
+            Self::Gpu(t) => t.release_arena(arena),
+            #[allow(unreachable_patterns)]
+            _ => {}
         }
     }
 
@@ -215,11 +222,13 @@ impl Backend {
         }
     }
 
-    /// Copy a device buffer back to the host. One of exactly three host syncs.
-    fn download(&self, buf: &Buf, bytes: u64) -> Result<Vec<u8>> {
+    /// Copy a device buffer back to the host. One of exactly three host
+    /// syncs, and the one that is awaited: on WebGPU the copy completes only
+    /// when the browser's event loop runs, so it cannot be spun on.
+    async fn download(&self, buf: &Buf, bytes: u64) -> Result<Vec<u8>> {
         match self {
             #[cfg(feature = "gpu")]
-            Self::Gpu(t) => pollster::block_on(t.readback(buf, bytes)),
+            Self::Gpu(t) => t.readback(buf, bytes).await,
             #[cfg(feature = "cpu")]
             Self::Cpu(_) => {
                 let aligned = buf
@@ -677,6 +686,19 @@ impl Session {
         Ok(())
     }
 
+    /// [`Self::wait`], awaited: the form a browser can use, where nothing
+    /// can block on the device.
+    pub async fn wait_async(&self) -> Result<()> {
+        match &self.inner.device {
+            #[cfg(feature = "gpu")]
+            Backend::Gpu(t) => t.wait_async().await?,
+            #[allow(unreachable_patterns)]
+            _ => self.inner.device.target().wait()?,
+        }
+        self.inner.in_flight.store(0, Ordering::Relaxed);
+        Ok(())
+    }
+
     #[cfg(feature = "cpu")]
     fn cpu_structural_hit(&self, graph: &GraphRef, values: &[Tensor]) -> Option<CpuStructuralHit> {
         let roots: Vec<Id> = values.iter().map(|value| value.id).collect();
@@ -742,17 +764,22 @@ impl Session {
         self.inner.launches.load(Ordering::Relaxed)
     }
 
-    /// Bytes of an already-resolved value.
+    /// Everything a readback of `id` needs once the graph lock is released:
+    /// the device buffer, how many bytes to pull, and — for a padded layout
+    /// — how to gather the value out of them. See [`Self::read_plan_locked`].
     ///
     /// `_resolving` is a witness that the caller holds the graph's
-    /// `resolve_lock`: downloading a buffer is only meaningful while no other
-    /// thread can be part-way through dispatching a plan that writes it.
-    pub(crate) fn read_bytes_locked(
+    /// `resolve_lock`: the plan is only meaningful while no other thread can
+    /// be part-way through dispatching a plan that writes the buffer. The
+    /// download itself needs no lock: the plan holds its own handle on the
+    /// buffer, so the pool cannot hand it to a later resolve, and the copy
+    /// is queued after the dispatch that produced it.
+    pub(crate) fn read_plan_locked(
         &self,
         _resolving: &ResolveGuard<'_>,
         graph: &GraphRef,
         id: Id,
-    ) -> Result<Vec<u8>> {
+    ) -> Result<ReadPlan> {
         let buf = graph
             .device_buf(id)
             .ok_or_else(|| Error::Plan(format!("{id} has no device buffer; resolve it first")))?;
@@ -797,7 +824,11 @@ impl Session {
             .transpose()?;
         let Some(layout) = padded else {
             let elements = resolve_elements(&facts.shape, graph)?;
-            return self.inner.device.download(&buf, elements * elem);
+            return Ok(ReadPlan {
+                buf,
+                bytes: elements * elem,
+                gather: None,
+            });
         };
 
         let base = resolve_dim(layout.offset(), graph)?;
@@ -809,32 +840,55 @@ impl Session {
         for (d, s) in layout.shape().iter().zip(&strides) {
             span += resolve_dim(*d, graph)?.saturating_sub(1).saturating_mul(*s);
         }
-        let raw = self.inner.device.download(&buf, (base + span) * elem)?;
         let extents: Vec<u64> = facts
             .shape
             .iter()
             .map(|d| resolve_dim(*d, graph))
             .collect::<Result<_>>()?;
-        let count = extents.iter().product::<u64>() as usize;
-        let mut out = Vec::with_capacity(count * elem as usize);
-        let mut idx = vec![0u64; extents.len()];
-        for _ in 0..count {
-            let flat = base + idx.iter().zip(&strides).map(|(i, s)| i * s).sum::<u64>();
-            let start = (flat * elem) as usize;
-            let end = start + elem as usize;
-            match raw.get(start..end) {
-                Some(slice) => out.extend_from_slice(slice),
-                None => out.extend(std::iter::repeat_n(0u8, elem as usize)),
-            }
-            for axis in (0..extents.len()).rev() {
-                idx[axis] += 1;
-                if idx[axis] < extents[axis] {
-                    break;
-                }
-                idx[axis] = 0;
-            }
-        }
-        Ok(out)
+        Ok(ReadPlan {
+            buf,
+            bytes: (base + span) * elem,
+            gather: Some(Gather {
+                base,
+                strides,
+                extents,
+                elem,
+            }),
+        })
+    }
+
+    /// Pull the bytes a [`ReadPlan`] names. Awaited: see [`Backend::download`].
+    pub(crate) async fn read_bytes(&self, plan: ReadPlan) -> Result<Vec<u8>> {
+        let raw = self.inner.device.download(&plan.buf, plan.bytes).await?;
+        Ok(match plan.gather {
+            None => raw,
+            Some(g) => g.apply(&raw),
+        })
+    }
+
+    /// Bytes of an already-resolved value, blocking. Native only: on wasm a
+    /// readback can only be awaited.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn read_bytes_locked(
+        &self,
+        resolving: &ResolveGuard<'_>,
+        graph: &GraphRef,
+        id: Id,
+    ) -> Result<Vec<u8>> {
+        let plan = self.read_plan_locked(resolving, graph, id)?;
+        pollster::block_on(self.read_bytes(plan))
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    pub(crate) fn read_bytes_locked(
+        &self,
+        _resolving: &ResolveGuard<'_>,
+        _graph: &GraphRef,
+        _id: Id,
+    ) -> Result<Vec<u8>> {
+        Err(Error::Device(
+            "a blocking readback is not available on wasm; await the async readback".into(),
+        ))
     }
 
     /// The class member this plan selected for `id`.
@@ -2146,6 +2200,51 @@ fn splat_bytes(s: fusor_ir::dtype::Splat) -> Vec<u8> {
         Splat::F16(v) | Splat::BF16(v) => v.to_le_bytes().to_vec(),
         Splat::U32(v) => v.to_le_bytes().to_vec(),
         Splat::I32(v) => v.to_le_bytes().to_vec(),
+    }
+}
+
+/// A readback, planned under the graph lock and executed after it.
+pub(crate) struct ReadPlan {
+    buf: Buf,
+    bytes: u64,
+    gather: Option<Gather>,
+}
+
+/// How to pull a value out of a padded device layout.
+struct Gather {
+    base: u64,
+    strides: Vec<u64>,
+    extents: Vec<u64>,
+    elem: u64,
+}
+
+impl Gather {
+    fn apply(&self, raw: &[u8]) -> Vec<u8> {
+        let elem = self.elem as usize;
+        let count = self.extents.iter().product::<u64>() as usize;
+        let mut out = Vec::with_capacity(count * elem);
+        let mut idx = vec![0u64; self.extents.len()];
+        for _ in 0..count {
+            let flat = self.base
+                + idx
+                    .iter()
+                    .zip(&self.strides)
+                    .map(|(i, s)| i * s)
+                    .sum::<u64>();
+            let start = (flat as usize) * elem;
+            match raw.get(start..start + elem) {
+                Some(slice) => out.extend_from_slice(slice),
+                None => out.extend(std::iter::repeat_n(0u8, elem)),
+            }
+            for axis in (0..self.extents.len()).rev() {
+                idx[axis] += 1;
+                if idx[axis] < self.extents[axis] {
+                    break;
+                }
+                idx[axis] = 0;
+            }
+        }
+        out
     }
 }
 

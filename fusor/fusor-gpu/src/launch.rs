@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use web_time::{Duration, Instant};
 
 use fusor_ir::Result;
 use fusor_ir::error::Error;
@@ -63,6 +63,53 @@ pub fn dispatches_per_submit(total: usize, backend: wgpu::Backend) -> usize {
         METAL_SUBMIT_CHUNK
     } else {
         usize::MAX
+    }
+}
+
+/// The completion of one `map_async`, as a future.
+///
+/// Resolves with the map result when the callback runs, or with `Err(())`
+/// if wgpu drops the callback without calling it. A single-slot channel with
+/// a waker: enough for one map, and free of any async-runtime dependency.
+#[derive(Clone, Default)]
+struct MapDone(Arc<Mutex<MapDoneState>>);
+
+#[derive(Default)]
+struct MapDoneState {
+    result: Option<std::result::Result<(), wgpu::BufferAsyncError>>,
+    waker: Option<std::task::Waker>,
+}
+
+impl MapDone {
+    fn complete(self, result: std::result::Result<(), wgpu::BufferAsyncError>) {
+        let waker = {
+            let mut state = self.0.lock();
+            state.result = Some(result);
+            state.waker.take()
+        };
+        if let Some(w) = waker {
+            w.wake();
+        }
+    }
+}
+
+impl std::future::Future for MapDone {
+    type Output = std::result::Result<std::result::Result<(), wgpu::BufferAsyncError>, ()>;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Self::Output> {
+        let mut state = self.0.lock();
+        if let Some(result) = state.result.take() {
+            return std::task::Poll::Ready(Ok(result));
+        }
+        // The callback's clone is the only other handle; once it is gone
+        // without completing, the map was rejected.
+        if Arc::strong_count(&self.0) == 1 {
+            return std::task::Poll::Ready(Err(()));
+        }
+        state.waker = Some(cx.waker().clone());
+        std::task::Poll::Pending
     }
 }
 
@@ -328,6 +375,33 @@ impl Launcher {
             ));
         }
         self.write_uniforms(&binds[0], uniforms)?;
+        if trace_dispatch() {
+            // Every binding's buffer, and whether any two are the same
+            // buffer: D3D12 forbids one resource bound as both a read-only
+            // input and the output of a dispatch, and WARP answers that with
+            // a device removal rather than a validation error.
+            let mut seen: Vec<usize> = Vec::new();
+            let mut aliased = false;
+            let desc: Vec<String> = binds
+                .iter()
+                .enumerate()
+                .map(|(i, b)| {
+                    let addr = b.addr();
+                    if seen.contains(&addr) {
+                        aliased = true;
+                    }
+                    seen.push(addr);
+                    let size = b.downcast_ref::<GpuBuffer>().map_or(0, |g| g.size);
+                    format!("{i}:{size}B@{addr:x}")
+                })
+                .collect();
+            eprintln!(
+                "[trace] binds {} grid={grid:?} [{}]{}",
+                gpu.name,
+                desc.join(" "),
+                if aliased { " ALIASED" } else { "" }
+            );
+        }
         let bind_group = self.bind_group(gpu, binds)?;
         let record = CommandRecord::Dispatch {
             name: gpu.name,
@@ -700,6 +774,27 @@ impl Launcher {
         }
     }
 
+    /// Resolve once every submission so far has retired on the device.
+    ///
+    /// The fence is `Queue::on_submitted_work_done`, awaited: on the web it
+    /// completes on the browser's event loop, and natively the device is
+    /// polled to completion first so the await is already resolved. This is
+    /// what a benchmark times against — a readback would add its own copy.
+    pub async fn wait_async(&self) -> Result<()> {
+        self.lost.check()?;
+        let done = MapDone::default();
+        let signal = done.clone();
+        self.queue
+            .on_submitted_work_done(move || signal.complete(Ok(())));
+        #[cfg(not(target_arch = "wasm32"))]
+        self.poll_wait()?;
+        done.await
+            .map_err(|_| Error::Device("the submitted-work callback never fired".into()))?
+            .map_err(|e| Error::Device(format!("submitted-work callback failed: {e}")))?;
+        self.in_flight.store(0, Ordering::Relaxed);
+        self.lost.check()
+    }
+
     /// Spin in `Poll` mode for [`POLL_SPIN`], then block.
     ///
     /// A lost device is reported as an error naming the loss, both before
@@ -737,10 +832,16 @@ impl Launcher {
 
     /// Copy a device buffer into a `COPY_DST | MAP_READ` staging buffer, map
     /// it, and return the bytes. **This is one of the three host syncs.**
-    pub fn readback(&self, pool: &BufferPool, src: &Buf, bytes: u64) -> Result<Vec<u8>> {
+    ///
+    /// Async because on WebGPU a buffer map completes only when control
+    /// returns to the browser's event loop: the map is awaited, never spun
+    /// on. Natively the device is polled to completion first and the await
+    /// is already resolved when it is reached, so blocking callers wrap this
+    /// in `pollster` at no cost.
+    pub async fn readback(&self, pool: &BufferPool, src: &Buf, bytes: u64) -> Result<Vec<u8>> {
         let bytes = crate::pool::padded_copy_size(bytes);
         let staging = pool.alloc_with_usage(bytes, READBACK_USAGE)?;
-        match self.readback_into(src, &staging, bytes) {
+        match self.readback_into(src, &staging, bytes).await {
             Ok(out) => {
                 pool.recycle(staging);
                 Ok(out)
@@ -759,7 +860,7 @@ impl Launcher {
 
     /// Copy `src` into `staging`, map it, and return the bytes. On `Ok` the
     /// staging buffer is unmapped again; on `Err` its map state is unknown.
-    fn readback_into(&self, src: &Buf, staging: &Buf, bytes: u64) -> Result<Vec<u8>> {
+    async fn readback_into(&self, src: &Buf, staging: &Buf, bytes: u64) -> Result<Vec<u8>> {
         let trace = trace_dispatch();
         let state = |what: &str| {
             if trace {
@@ -786,13 +887,14 @@ impl Launcher {
             .downcast_ref::<GpuBuffer>()
             .ok_or_else(|| Error::Device("staging buffer is not pooled".into()))?;
         let slice = gpu.buffer.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
+        let done = MapDone::default();
+        let signal = done.clone();
+        slice.map_async(wgpu::MapMode::Read, move |r| signal.complete(r));
+        // Natively this drives the map to completion; on the web the device
+        // is polled by the browser and this returns at once.
         self.poll_wait()?;
         state("map");
-        rx.recv()
+        done.await
             .map_err(|_| {
                 // wgpu drops the callback unfired when it rejects the map
                 // outright, which on a lost device it does without a word.

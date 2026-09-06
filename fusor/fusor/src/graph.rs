@@ -557,6 +557,21 @@ impl GraphRef {
             .resolve_locked(&resolving, std::slice::from_ref(&tensor))?;
         self.state.session.read_bytes_locked(&resolving, self, id)
     }
+
+    /// [`Self::read_back`], awaited. The graph lock spans the resolve and
+    /// the readback plan; the download runs after it, holding its own
+    /// handle on the buffer (see `Session::read_plan_locked`).
+    pub(crate) async fn read_back_async(&self, id: Id) -> Result<Vec<u8>> {
+        let plan = {
+            let tensor = self.tensor(id);
+            let resolving = self.state.resolve_lock.lock();
+            self.state
+                .session
+                .resolve_locked(&resolving, std::slice::from_ref(&tensor))?;
+            self.state.session.read_plan_locked(&resolving, self, id)?
+        };
+        self.state.session.read_bytes(plan).await
+    }
 }
 
 /// A program under construction.

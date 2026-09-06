@@ -123,6 +123,13 @@ impl Tensor {
         construction::upload(&self.graph, facts.dtype, &facts.shape, bytes)
     }
 
+    /// [`Self::detach`], awaited.
+    pub async fn detach_async(&self) -> Result<Tensor> {
+        let facts = self.facts();
+        let bytes = self.graph.read_back_async(self.id).await?;
+        construction::upload(&self.graph, facts.dtype, &facts.shape, bytes)
+    }
+
     /// Attach host bytes to this external leaf, invalidating any device copy.
     /// The next resolve re-uploads. This is the decode loop's per-step input
     /// path: the leaf node (and so the graph) is unchanged, only its bytes

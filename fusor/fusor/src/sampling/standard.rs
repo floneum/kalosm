@@ -53,18 +53,41 @@ impl Default for StandardSamplerParams {
 /// and survives every filter, so short-circuiting to it is equivalent to
 /// sampling a distribution collapsed onto one token.
 pub fn sample(logits: &Tensor, params: StandardSamplerParams) -> Result<GpuSampledToken> {
+    let previous = if params.repetition_penalty > 1.0 {
+        row::previous_tokens(logits.graph())
+    } else {
+        Vec::new()
+    };
+    sample_with_previous(logits, params, &previous)
+}
+
+/// [`sample`], awaited. The only readback a draw can need — the previously
+/// drawn tokens, for the repetition penalty — is awaited, so this is the
+/// form a browser can use.
+pub async fn sample_async(
+    logits: &Tensor,
+    params: StandardSamplerParams,
+) -> Result<GpuSampledToken> {
+    let previous = if params.repetition_penalty > 1.0 {
+        row::previous_tokens_async(logits.graph()).await
+    } else {
+        Vec::new()
+    };
+    sample_with_previous(logits, params, &previous)
+}
+
+fn sample_with_previous(
+    logits: &Tensor,
+    params: StandardSamplerParams,
+    previous: &[u32],
+) -> Result<GpuSampledToken> {
     let n = row::row_len(logits)?;
     let graph = logits.graph().clone();
 
     // Repetition penalty, then temperature — both on the raw row, before the
     // sort.
     let column = row::sanitized_column(logits, n)?;
-    let previous = if params.repetition_penalty > 1.0 {
-        row::previous_tokens(&graph)
-    } else {
-        Vec::new()
-    };
-    let column = row::apply_repetition_penalty(&column, n, params.repetition_penalty, &previous)?;
+    let column = row::apply_repetition_penalty(&column, n, params.repetition_penalty, previous)?;
     let column = if params.temperature != 0.0 {
         column.div_scalar(params.temperature)?
     } else {

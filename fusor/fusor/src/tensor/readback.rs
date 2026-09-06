@@ -384,8 +384,41 @@ impl Tensor {
     pub fn to_bytes(&self) -> Result<Vec<u8>> {
         Ok(self.as_slice()?.bytes)
     }
-    /// Asynchronously read every element as `f32`.
+
+    /// [`Self::as_slice`], awaited. The only readback that works on the
+    /// web, where a buffer map completes on the browser's event loop; the
+    /// blocking forms above return an error there.
+    pub async fn as_slice_async(&self) -> Result<TensorSlice> {
+        let facts = self.facts();
+        let bytes = self.graph.read_back_async(self.id).await?;
+        Ok(TensorSlice::new(
+            bytes,
+            Layout::contiguous(&facts.shape),
+            facts.dtype,
+        ))
+    }
+    /// [`Self::to_scalar`], awaited.
+    pub async fn to_scalar_async<D: Element>(&self) -> Result<D> {
+        self.as_slice_async().await?.scalar::<D>()
+    }
+    /// [`Self::to_flat`], awaited.
+    pub async fn to_flat_async<D: Element>(&self) -> Result<Vec<D>> {
+        self.as_slice_async().await?.to_flat::<D>()
+    }
+    /// [`Self::to_vec_f32`], awaited.
     pub async fn to_vec_f32_async(&self) -> Result<Vec<f32>> {
-        self.as_slice()?.to_vec_f32()
+        self.as_slice_async().await?.to_vec_f32()
+    }
+    /// [`Self::to_vec_u32`], awaited.
+    pub async fn to_vec_u32_async(&self) -> Result<Vec<u32>> {
+        self.to_flat_async::<u32>().await
+    }
+    /// [`Self::to_vec_i32`], awaited.
+    pub async fn to_vec_i32_async(&self) -> Result<Vec<i32>> {
+        self.to_flat_async::<i32>().await
+    }
+    /// [`Self::to_bytes`], awaited.
+    pub async fn to_bytes_async(&self) -> Result<Vec<u8>> {
+        Ok(self.as_slice_async().await?.bytes)
     }
 }

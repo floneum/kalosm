@@ -9,6 +9,7 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+web-time.workspace = true
 fusor-ir.workspace = true
 smallvec.workspace = true
 rustc-hash.workspace = true

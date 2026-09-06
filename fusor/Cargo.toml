@@ -10,6 +10,7 @@ members = [
     "fusor-cpu",
     "fusor",
     "fusor-conformance",
+    "webgpu-runner",
 ]
 
 # Fusor is a standalone workspace, deliberately excluded from the repository
@@ -34,7 +35,8 @@ fusor-cost = { path = "fusor-cost", version = "0.1.0" }
 fusor-gguf = { path = "fusor-gguf", version = "0.1.0" }
 fusor-gpu = { path = "fusor-gpu", version = "0.1.0" }
 fusor-cpu = { path = "fusor-cpu", version = "0.1.0" }
-fusor = { path = "fusor", version = "0.1.0" }
+fusor = { path = "fusor", version = "0.1.0", default-features = false }
+fusor-conformance = { path = "fusor-conformance", version = "0.1.0", default-features = false }
 
 # --- shared external, pinned once -------------------------------------------
 smallvec = { version = "1.15", features = ["union"] }
@@ -45,6 +47,8 @@ bytemuck = { version = "1.25", features = ["derive"] }
 parking_lot = "0.12"
 lru = "0.14"
 pollster = "0.4"
+# `std::time` that does not panic on wasm32; a re-export of std everywhere else.
+web-time = "1"
 memmap2 = "0.9"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

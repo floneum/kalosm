@@ -9,6 +9,7 @@ rust-version.workspace = true
 repository.workspace = true
 
 [dependencies]
+web-time.workspace = true
 fusor-ir.workspace = true
 fusor-tile.workspace = true
 fusor-cost.workspace = true
@@ -18,7 +19,6 @@ rustc-hash.workspace = true
 half.workspace = true
 parking_lot.workspace = true
 lru.workspace = true
-pollster.workspace = true
 wgpu.workspace = true
 naga = { workspace = true, features = ["wgsl-out"] }
 
@@ -50,3 +50,8 @@ default = []
 # to per-stride-class regions and an f32-accumulated f16-output kernel pays a
 # staging tile plus a per-lane cast: footprint, never correctness.
 fork-metal = []
+
+# Blocking on a GPU future is a native-only convenience: on the web the
+# device is driven by the browser's event loop, so everything is awaited.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster.workspace = true

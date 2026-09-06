@@ -81,13 +81,13 @@ pub fn cases() -> Cases {
         "layers",
         "linear_with_bias",
         LINEAR_SPEC,
-        |s, sh, seed| linear_case(s, true, sh, seed),
+        async move |s: &Session, sh: &[u64], seed: u32| linear_case(s, true, sh, seed).await,
     ));
     cases.push_case(fuzz_case(
         "layers",
         "linear_without_bias",
         LINEAR_SPEC,
-        |s, sh, seed| linear_case(s, false, sh, seed),
+        async move |s: &Session, sh: &[u64], seed: u32| linear_case(s, false, sh, seed).await,
     ));
     cases.push_case(fuzz_case(
         "layers",
@@ -215,7 +215,7 @@ pub fn cases() -> Cases {
 /// `Linear::forward` is `mat_mul_transposed_rhs` plus a broadcast bias — the
 /// transposed form specifically, so `d_weight` lands in the weight's own
 /// `[out, in]` layout and the optimizer's flat slice stays a view.
-fn linear_case(session: &Session, bias: bool, shape: &[u64], seed: u32) -> CaseResult {
+async fn linear_case(session: &Session, bias: bool, shape: &[u64], seed: u32) -> CaseResult {
     let (rows, inn, out) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
     let x_data = Domain::Wide.sample(seed, rows * inn);
     let w_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, out * inn);
@@ -242,15 +242,16 @@ fn linear_case(session: &Session, bias: bool, shape: &[u64], seed: u32) -> CaseR
         session,
         &[rows as u64, out as u64],
         Dtype::F32,
-        &read(&y)?,
+        &read(&y).await?,
         &expected,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
 /// Both parameters and the input must receive a gradient, each in its own
 /// layout.
-fn linear_grads(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn linear_grads(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (rows, inn, out) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
     let x_data = Domain::Wide.sample(seed, rows * inn);
     let w_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, out * inn);
@@ -264,7 +265,7 @@ fn linear_grads(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let y = layer.forward(&t::<2>(x.clone())).into_dyn();
 
     // d_weight[o, i] = sum over rows of x[r, i], independent of o.
-    let d_w = gradient_of(&graph, &y, &w)?;
+    let d_w = gradient_of(&graph, &y, &w).await?;
     if d_w.len() != out * inn {
         return Err(format!(
             "d_weight has {} elements, want {}: it must land in the weight's own [out, in] \
@@ -287,12 +288,12 @@ fn linear_grads(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     )?;
 
     // Each bias element is broadcast over `rows` rows.
-    let d_b = gradient_of(&graph, &y, &b)?;
+    let d_b = gradient_of(&graph, &y, &b).await?;
     let want_b = vec![rows as f32; out];
     crate::compare::approx_or_relative_eq(backend_of(session), &[out], &want_b, &d_b, 1e-5, 1e-5)?;
 
     // d_x[r, i] = sum over outputs of w[o, i].
-    let d_x = gradient_of(&graph, &y, &x)?;
+    let d_x = gradient_of(&graph, &y, &x).await?;
     let want_x: Vec<f32> = (0..rows * inn)
         .map(|n| (0..out).map(|o| w_data[o * inn + n % inn]).sum())
         .collect();
@@ -315,7 +316,7 @@ fn sample_tokens(seed: u32, len: usize, vocab: usize) -> Vec<u32> {
     tokens
 }
 
-fn embedding_layer(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn embedding_layer(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (vocab, emb) = (shape[0] as usize, shape[1] as usize);
     let (t0, t1) = (shape[2], shape[3]);
     let tokens = sample_tokens(seed, (t0 * t1) as usize, vocab);
@@ -336,15 +337,16 @@ fn embedding_layer(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         session,
         &[t0, t1, emb as u64],
         Dtype::F32,
-        &read(&y)?,
+        &read(&y).await?,
         &expected,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
 /// One token appearing twice gets the summed gradient — the layer inherits
 /// that from `Gather`'s declared adjoint rather than implementing it.
-fn embedding_layer_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn embedding_layer_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (vocab, emb) = (shape[0] as usize, shape[1] as usize);
     let (t0, t1) = (shape[2], shape[3]);
     let tokens = sample_tokens(seed, (t0 * t1) as usize, vocab);
@@ -355,7 +357,7 @@ fn embedding_layer_backward(session: &Session, shape: &[u64], seed: u32) -> Case
         .map_err(|e| -> CaseError { e.to_string().into() })?;
     let layer = Embedding::new(t::<2>(table_value.clone()));
     let y = layer.forward::<2, 3>(&ids::<2>(token_value)).into_dyn();
-    let grad = gradient_of(&graph, &y, &table_value)?;
+    let grad = gradient_of(&graph, &y, &table_value).await?;
 
     let mut counts = vec![0.0f32; vocab];
     for id in &tokens {
@@ -375,7 +377,7 @@ fn embedding_layer_backward(session: &Session, shape: &[u64], seed: u32) -> Case
 
 const EPS: f32 = 1e-5;
 
-fn layer_norm_layer(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn layer_norm_layer(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (rows, width) = (shape[0] as usize, shape[1] as usize);
     let data = Domain::Wide.sample(seed, rows * width);
     let weight = Domain::Custom(0.5, 1.5).sample(seed ^ 0x9e37_79b9, width);
@@ -401,15 +403,16 @@ fn layer_norm_layer(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         session,
         &[rows as u64, width as u64],
         Dtype::F32,
-        &read(&y)?,
+        &read(&y).await?,
         &expected,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
 /// `LayerNormNd` normalizes over the trailing `axes` axes at once, so the
 /// statistic is taken over the flattened tail rather than the last axis alone.
-fn layer_norm_nd(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn layer_norm_nd(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (a, bdim, c) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
     let data = Domain::Wide.sample(seed, a * bdim * c);
     let weight = Domain::Custom(0.5, 1.5).sample(seed ^ 0x9e37_79b9, bdim * c);
@@ -430,11 +433,11 @@ fn layer_norm_nd(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
             expected.push((v - mean) * inv * weight[j]);
         }
     }
-    expect_values(session, shape, Dtype::F32, &read(&y)?, &expected)?;
+    expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await?;
     Ok(())
 }
 
-fn rms_norm_layer(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn rms_norm_layer(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (rows, width) = (shape[0] as usize, shape[1] as usize);
     let data = Domain::Wide.sample(seed, rows * width);
     let weight = Domain::Custom(0.5, 1.5).sample(seed ^ 0x9e37_79b9, width);
@@ -457,12 +460,13 @@ fn rms_norm_layer(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         session,
         &[rows as u64, width as u64],
         Dtype::F32,
-        &read(&y)?,
+        &read(&y).await?,
         &expected,
-    )?;
+    )
+    .await?;
 
     // The weight is a parameter and must be trained.
-    let d_w = gradient_of(&graph, &y, &w)?;
+    let d_w = gradient_of(&graph, &y, &w).await?;
     if d_w.len() != width {
         return Err(format!("the rms_norm weight gradient has {} elements", d_w.len()).into());
     }
@@ -470,7 +474,7 @@ fn rms_norm_layer(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 }
 
 /// `ConvNd` over a 1-d signal, against a direct host convolution.
-fn conv_layer(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn conv_layer(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (batch, in_ch, out_ch, k) = (
         shape[0] as usize,
         shape[1] as usize,
@@ -518,44 +522,46 @@ fn conv_layer(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         session,
         &[batch as u64, out_ch as u64, ow as u64],
         Dtype::F32,
-        &read(&y)?,
+        &read(&y).await?,
         &expected,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
 /// One gradient-descent step on a two-layer MLP must reduce the loss. This is
 /// the smallest end-to-end statement that the forward, the tape and the
 /// parameter update agree with each other.
-fn mlp_step(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn mlp_step(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     const LR: f32 = 0.05;
     let (rows, inn, out) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
     let x_data = Domain::Wide.sample(seed, rows * inn);
     let mut w1 = Domain::Wide.sample(seed ^ 0x9e37_79b9, out * inn);
     let mut w2 = Domain::Wide.sample(seed.wrapping_add(1), out);
 
-    let loss_at = |w1: &[f32], w2: &[f32]| -> Result<(f32, Vec<f32>, Vec<f32>), CaseError> {
-        let graph = graph_of(session);
-        let x = upload(graph.handle(), &dims(&[rows as u64, inn as u64]), &x_data)?;
-        let a = upload(graph.handle(), &dims(&[out as u64, inn as u64]), w1)?;
-        let b = upload(graph.handle(), &dims(&[out as u64]), w2)?;
-        let hidden = Linear::new(t::<2>(a.clone()), None)
-            .forward(&t::<2>(x))
-            .into_dyn()
-            .relu()
-            .map_err(|e| -> CaseError { e.to_string().into() })?;
-        let out_v = hidden
-            .mul_(&b)
-            .and_then(|v| v.sqr())
-            .map_err(|e| -> CaseError { e.to_string().into() })?;
-        let loss = crate::suite::support::loss_of(&out_v)?;
-        let value = crate::suite::support::read_scalar(&loss)?;
-        let d_a = gradient_of(&graph, &out_v, &a)?;
-        let d_b = gradient_of(&graph, &out_v, &b)?;
-        Ok((value, d_a, d_b))
-    };
+    let loss_at =
+        async move |w1: &[f32], w2: &[f32]| -> Result<(f32, Vec<f32>, Vec<f32>), CaseError> {
+            let graph = graph_of(session);
+            let x = upload(graph.handle(), &dims(&[rows as u64, inn as u64]), &x_data)?;
+            let a = upload(graph.handle(), &dims(&[out as u64, inn as u64]), w1)?;
+            let b = upload(graph.handle(), &dims(&[out as u64]), w2)?;
+            let hidden = Linear::new(t::<2>(a.clone()), None)
+                .forward(&t::<2>(x))
+                .into_dyn()
+                .relu()
+                .map_err(|e| -> CaseError { e.to_string().into() })?;
+            let out_v = hidden
+                .mul_(&b)
+                .and_then(|v| v.sqr())
+                .map_err(|e| -> CaseError { e.to_string().into() })?;
+            let loss = crate::suite::support::loss_of(&out_v)?;
+            let value = crate::suite::support::read_scalar(&loss).await?;
+            let d_a = gradient_of(&graph, &out_v, &a).await?;
+            let d_b = gradient_of(&graph, &out_v, &b).await?;
+            Ok((value, d_a, d_b))
+        };
 
-    let (before, d_a, d_b) = loss_at(&w1, &w2)?;
+    let (before, d_a, d_b) = loss_at(&w1, &w2).await?;
     // A relu can dead-end the whole sampled net; a zero gradient legitimately
     // moves nothing.
     if d_a.iter().chain(&d_b).all(|g| *g == 0.0) {
@@ -567,7 +573,7 @@ fn mlp_step(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     for (w, g) in w2.iter_mut().zip(&d_b) {
         *w -= LR * g;
     }
-    let (after, _, _) = loss_at(&w1, &w2)?;
+    let (after, _, _) = loss_at(&w1, &w2).await?;
     if after.is_nan() || after >= before {
         return Err(format!(
             "one step of gradient descent moved the loss from {before} to {after}; the \
@@ -588,7 +594,7 @@ fn one_hot(labels: &[u32], classes: usize) -> Vec<f32> {
 }
 
 /// `softmax_cross_entropy(logits, one-hot targets)`.
-fn cross_entropy_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn cross_entropy_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (rows, classes) = (shape[0] as usize, shape[1] as usize);
     let logits = Domain::Custom(-2.0, 2.0).sample(seed, rows * classes);
     let labels = fill_indices(seed ^ 0x5eed, rows, classes as u32);
@@ -613,14 +619,15 @@ fn cross_entropy_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult
         session,
         &[rows as u64],
         Dtype::F32,
-        &read(&loss)?,
+        &read(&loss).await?,
         &expected,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
 /// The analytic gradient: `(softmax - onehot) * grad / rows`.
-fn cross_entropy_grad(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn cross_entropy_grad(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (rows, classes) = (shape[0] as usize, shape[1] as usize);
     let logits = Domain::Custom(-2.0, 2.0).sample(seed, rows * classes);
     let labels = fill_indices(seed ^ 0x5eed, rows, classes as u32);
@@ -631,7 +638,7 @@ fn cross_entropy_grad(session: &Session, shape: &[u64], seed: u32) -> CaseResult
     let t = upload(graph.handle(), &dims(shape), &targets)?;
     let loss =
         softmax_cross_entropy(&l, &t, 1).map_err(|e| -> CaseError { e.to_string().into() })?;
-    let grad = gradient_of(&graph, &loss, &l)?;
+    let grad = gradient_of(&graph, &loss, &l).await?;
 
     let mut want = vec![0.0f32; rows * classes];
     for (r, row) in logits.chunks(classes).enumerate() {
@@ -656,7 +663,7 @@ fn cross_entropy_grad(session: &Session, shape: &[u64], seed: u32) -> CaseResult
 /// The folded one-vs-all BCE the trainer's distillation loss is built from.
 /// Written as a plain softplus chain; `softplus_bce_adjoint` is what turns its
 /// backward into the single-sigmoid form, and the numbers must not change.
-fn bce_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn bce_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (rows, classes) = (shape[0] as usize, shape[1] as usize);
     let logits = Domain::Custom(-3.0, 3.0).sample(seed, rows * classes);
     let targets = Domain::Custom(0.0, 1.0).sample(seed ^ 0x9e37_79b9, rows * classes);
@@ -673,10 +680,10 @@ fn bce_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .zip(&targets)
         .map(|(z, y)| z.max(0.0) - z * y + (1.0 + (-z.abs()).exp()).ln())
         .collect();
-    expect_values(session, shape, Dtype::F32, &read(&loss)?, &expected)?;
+    expect_values(session, shape, Dtype::F32, &read(&loss).await?, &expected).await?;
 
     // dL/dz = sigmoid(z) - y, which is what the rewrite must preserve.
-    let grad = gradient_of(&graph, &loss, &l)?;
+    let grad = gradient_of(&graph, &loss, &l).await?;
     let want: Vec<f32> = logits
         .iter()
         .zip(&targets)
@@ -693,7 +700,7 @@ fn bce_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     Ok(())
 }
 
-fn distillation_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn distillation_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     const T: f32 = 2.0;
     let len = (shape[0] * shape[1]) as usize;
     let student = Domain::Custom(-2.0, 2.0).sample(seed, len);
@@ -703,20 +710,20 @@ fn distillation_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult 
     let s = upload(graph.handle(), &dims(shape), &student)?;
     let t = upload(graph.handle(), &dims(shape), &teacher)?;
     let loss = distillation_loss(&s, &t, T).map_err(|e| -> CaseError { e.to_string().into() })?;
-    let got = read(&loss)?;
+    let got = read(&loss).await?;
     if got.iter().any(|v| !v.is_finite()) {
         return Err("the distillation loss produced a non-finite value".into());
     }
     // The gradient must reach the student and must not reach the teacher's
     // values as if they were trainable in the same step.
-    let d_s = gradient_of(&graph, &loss, &s)?;
+    let d_s = gradient_of(&graph, &loss, &s).await?;
     if d_s.iter().all(|v| *v == 0.0) {
         return Err("the student received an identically-zero distillation gradient".into());
     }
     Ok(())
 }
 
-fn mse_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn mse_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let len = (shape[0] * shape[1]) as usize;
     let a_data = Domain::Wide.sample(seed, len);
     let b_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, len);
@@ -730,7 +737,7 @@ fn mse_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .map(|(x, y)| (x - y) * (x - y))
         .sum::<f32>()
         / len as f32;
-    let got = crate::suite::support::read_scalar(&loss)?;
+    let got = crate::suite::support::read_scalar(&loss).await?;
     if (got - want).abs() > 1e-4 * want.abs().max(1.0) {
         return Err(format!("mse is {got}, want {want}").into());
     }
@@ -740,7 +747,7 @@ fn mse_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 /// One AdamW step on a quadratic must move the parameter toward the optimum
 /// by roughly the learning rate, with the decoupled decay applied to the
 /// parameter and not to the gradient.
-fn adamw_case(session: &Session, shape: &[u64], _seed: u32) -> CaseResult {
+async fn adamw_case(session: &Session, shape: &[u64], _seed: u32) -> CaseResult {
     const LR: f32 = 0.1;
     let n = shape[0] as usize;
     let start = vec![1.0f32; n];
@@ -750,7 +757,7 @@ fn adamw_case(session: &Session, shape: &[u64], _seed: u32) -> CaseResult {
         .sqr()
         .and_then(|s| s.sum_all())
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let g = gradient_of(&graph, &loss, &p)?;
+    let g = gradient_of(&graph, &loss, &p).await?;
     let grad = upload(graph.handle(), &dims(&[n as u64]), &g)?;
 
     let mut opt = AdamW::new(LR);
@@ -761,7 +768,8 @@ fn adamw_case(session: &Session, shape: &[u64], _seed: u32) -> CaseResult {
         updated
             .first()
             .ok_or_else(|| -> CaseError { "AdamW::step returned no parameters".into() })?,
-    )?;
+    )
+    .await?;
 
     for (i, v) in after.iter().enumerate() {
         if *v >= start[i] {
@@ -788,7 +796,7 @@ fn adamw_case(session: &Session, shape: &[u64], _seed: u32) -> CaseResult {
 /// Global-norm clipping scales every gradient by one shared factor, so the
 /// direction is preserved and the norm lands exactly on the cap. The data
 /// stays in [1, 2), so the global norm always exceeds the cap.
-fn clip_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn clip_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     const CAP: f32 = 1.0;
     let (n0, n1) = (shape[0] as usize, shape[1] as usize);
     let a_data = Domain::Custom(1.0, 2.0).sample(seed, n0);
@@ -802,7 +810,7 @@ fn clip_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let mut total = 0.0f32;
     let mut flat = Vec::new();
     for t in &clipped {
-        for v in read(t)? {
+        for v in read(t).await? {
             total += v * v;
             flat.push(v);
         }
@@ -836,7 +844,7 @@ fn clip_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 /// The schedule is host-computed, so this needs no device at all — but it
 /// runs per session anyway, because a schedule that disagrees between
 /// backends would be a very confusing bug to find later.
-fn cosine_case(_session: &Session, shape: &[u64], _seed: u32) -> CaseResult {
+async fn cosine_case(_session: &Session, shape: &[u64], _seed: u32) -> CaseResult {
     const PEAK: f32 = 1.0;
     const FLOOR: f32 = 0.1;
     let warmup = shape[0];

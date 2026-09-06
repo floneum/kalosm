@@ -215,14 +215,14 @@ pub fn cases() -> Cases {
             "elementwise",
             name,
             FORWARD_SPEC,
-            move |session, shape, seed| {
+            async move |session: &Session, shape: &[u64], seed: u32| {
                 let data = domain.sample(seed, dense_len(&dims(shape)));
                 non_vacuous(name, &data, reference)?;
                 let graph = graph_of(session);
                 let x = upload(graph.handle(), &dims(shape), &data)?;
                 let y = op(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
                 let expected: Vec<f32> = data.iter().copied().map(reference).collect();
-                expect_values(session, shape, Dtype::F32, &read(&y)?, &expected)
+                expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await
             },
         ));
     }
@@ -244,8 +244,8 @@ pub fn cases() -> Cases {
             "elementwise",
             name,
             ELEMENTWISE_SPEC,
-            move |session, shape, seed| {
-                tensor_comparison_case(session, name, shape, seed, op, reference)
+            async move |session: &Session, shape: &[u64], seed: u32| {
+                tensor_comparison_case(session, name, shape, seed, op, reference).await
             },
         ));
     }
@@ -254,7 +254,9 @@ pub fn cases() -> Cases {
             "elementwise",
             name,
             ELEMENTWISE_SPEC,
-            move |session, shape, seed| broadcast_case(session, shape, seed, op, reference),
+            async move |session: &Session, shape: &[u64], seed: u32| {
+                broadcast_case(session, shape, seed, op, reference).await
+            },
         ));
     }
 
@@ -264,14 +266,16 @@ pub fn cases() -> Cases {
         "elementwise",
         "approximate_exp",
         ELEMENTWISE_SPEC,
-        |session, shape, seed| approximate_exp_case(session, "approximate_exp", shape, seed, 5e-3),
+        async move |session: &Session, shape: &[u64], seed: u32| {
+            approximate_exp_case(session, "approximate_exp", shape, seed, 5e-3).await
+        },
     ));
     cases.push_case(fuzz_case(
         "elementwise",
         "less_approximate_exp",
         ELEMENTWISE_SPEC,
-        |session, shape, seed| {
-            approximate_exp_case(session, "less_approximate_exp", shape, seed, 5e-2)
+        async move |session: &Session, shape: &[u64], seed: u32| {
+            approximate_exp_case(session, "less_approximate_exp", shape, seed, 5e-2).await
         },
     ));
 
@@ -299,25 +303,31 @@ pub fn cases() -> Cases {
         "elementwise",
         "std_ops_add_sub",
         ELEMENTWISE_SPEC,
-        |s, shape, seed| expr_case(s, shape, seed, |a, b| a.add(b)?.sub(b), |x, y| (x + y) - y),
+        async move |s: &Session, shape: &[u64], seed: u32| {
+            expr_case(s, shape, seed, |a, b| a.add(b)?.sub(b), |x, y| (x + y) - y).await
+        },
     ));
     cases.push_case(fuzz_case(
         "elementwise",
         "std_ops_mul_div",
         ELEMENTWISE_SPEC,
-        |s, shape, seed| expr_case(s, shape, seed, |a, b| a.mul(b)?.div(b), |x, y| (x * y) / y),
+        async move |s: &Session, shape: &[u64], seed: u32| {
+            expr_case(s, shape, seed, |a, b| a.mul(b)?.div(b), |x, y| (x * y) / y).await
+        },
     ));
     cases.push_case(fuzz_case(
         "elementwise",
         "std_ops_neg",
         ELEMENTWISE_SPEC,
-        |s, shape, seed| expr_case(s, shape, seed, |a, b| a.neg()?.sub(b), |x, y| -x - y),
+        async move |s: &Session, shape: &[u64], seed: u32| {
+            expr_case(s, shape, seed, |a, b| a.neg()?.sub(b), |x, y| -x - y).await
+        },
     ));
     cases.push_case(fuzz_case(
         "elementwise",
         "std_ops_scalar",
         ELEMENTWISE_SPEC,
-        |s, shape, seed| {
+        async move |s: &Session, shape: &[u64], seed: u32| {
             expr_case(
                 s,
                 shape,
@@ -325,6 +335,7 @@ pub fn cases() -> Cases {
                 |a, b| a.mul_scalar(3.0)?.add_scalar(-1.0)?.sub(b),
                 |x, y| (x * 3.0 - 1.0) - y,
             )
+            .await
         },
     ));
 
@@ -344,7 +355,7 @@ fn backend_of(session: &Session) -> &'static str {
 /// A tensor-tensor comparison: 1.0/0.0 forward, zero gradient to **both**
 /// parents. The tape validates that every requires-grad parent receives a
 /// gradient, so an absent rule and a zero rule are different outcomes.
-fn tensor_comparison_case(
+async fn tensor_comparison_case(
     session: &Session,
     name: &'static str,
     shape: &[u64],
@@ -367,16 +378,16 @@ fn tensor_comparison_case(
     let b = upload(graph.handle(), &dimv, &rhs)?;
     let y = op(&a, &b).map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let actual = read(&y)?;
+    let actual = read(&y).await?;
     let expected: Vec<f32> = lhs
         .iter()
         .zip(&rhs)
         .map(|(x, y)| reference(*x, *y))
         .collect();
-    expect_values(session, shape, Dtype::F32, &actual, &expected)?;
+    expect_values(session, shape, Dtype::F32, &actual, &expected).await?;
 
-    assert_all_zero(name, &gradient_of(&graph, &y, &a)?)?;
-    assert_all_zero(name, &gradient_of(&graph, &y, &b)?)?;
+    assert_all_zero(name, &gradient_of(&graph, &y, &a).await?)?;
+    assert_all_zero(name, &gradient_of(&graph, &y, &b).await?)?;
     Ok(())
 }
 
@@ -386,7 +397,7 @@ fn tensor_comparison_case(
 /// `Restride { multiplier: 0 }` — so this tests that the frontend's
 /// right-aligned rules hold and that a stride-0 axis's adjoint is a sum over
 /// that axis.
-fn broadcast_case(
+async fn broadcast_case(
     session: &Session,
     shape: &[u64],
     seed: u32,
@@ -402,13 +413,13 @@ fn broadcast_case(
     let b = upload(graph.handle(), &dims(&[cols]), &rhs)?;
     let y = op(&a, &b).map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let actual = read(&y)?;
+    let actual = read(&y).await?;
     let expected: Vec<f32> = (0..(rows * cols) as usize)
         .map(|i| reference(lhs[i], rhs[i % cols as usize]))
         .collect();
-    expect_values(session, &[rows, cols], Dtype::F32, &actual, &expected)?;
+    expect_values(session, &[rows, cols], Dtype::F32, &actual, &expected).await?;
 
-    let d_rhs = gradient_of(&graph, &y, &b)?;
+    let d_rhs = gradient_of(&graph, &y, &b).await?;
     if d_rhs.len() != cols as usize {
         return Err(format!(
             "the broadcast operand's gradient has {} elements, not {cols}: a stride-0 \
@@ -422,15 +433,16 @@ fn broadcast_case(
     let probe_b = upload(probe_graph.handle(), &dims(&[cols]), &rhs)?;
     let probe_y = op(&probe_a, &probe_b).map_err(|e| -> CaseError { e.to_string().into() })?;
     let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[cols as usize], &rhs, &mut |probe| {
+    let numeric = finite_difference_gradient(&[cols as usize], &rhs, |probe| {
         read_probe_loss(&probe_b, &probe_loss, probe)
-    })?;
+    })
+    .await?;
     assert_gradient_matches_finite_difference(&d_rhs, &numeric)?;
     Ok(())
 }
 
 /// A two-operand expression checked forward and on the left gradient.
-fn expr_case(
+async fn expr_case(
     session: &Session,
     shape: &[u64],
     seed: u32,
@@ -447,30 +459,31 @@ fn expr_case(
     let b = upload(graph.handle(), &dimv, &rhs)?;
     let y = build(&a, &b).map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let actual = read(&y)?;
+    let actual = read(&y).await?;
     let expected: Vec<f32> = lhs
         .iter()
         .zip(&rhs)
         .map(|(x, y)| reference(*x, *y))
         .collect();
-    expect_values(session, shape, Dtype::F32, &actual, &expected)?;
+    expect_values(session, shape, Dtype::F32, &actual, &expected).await?;
 
-    let analytic = gradient_of(&graph, &y, &a)?;
+    let analytic = gradient_of(&graph, &y, &a).await?;
     let probe_graph = graph_of(session);
     let probe_a = upload(probe_graph.handle(), &dimv, &lhs)?;
     let probe_b = upload(probe_graph.handle(), &dimv, &rhs)?;
     let probe_y = build(&probe_a, &probe_b).map_err(|e| -> CaseError { e.to_string().into() })?;
     let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[len], &lhs, &mut |probe| {
+    let numeric = finite_difference_gradient(&[len], &lhs, |probe| {
         read_probe_loss(&probe_a, &probe_loss, probe)
-    })?;
+    })
+    .await?;
     assert_gradient_matches_finite_difference(&analytic, &numeric)?;
     Ok(())
 }
 
 /// An approximate exponential: within `tol` of `exp` in relative terms, and
 /// differentiable to itself.
-fn approximate_exp_case(
+async fn approximate_exp_case(
     session: &Session,
     name: &'static str,
     shape: &[u64],
@@ -492,13 +505,13 @@ fn approximate_exp_case(
     };
     let y = y.map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let actual = read(&y)?;
+    let actual = read(&y).await?;
     let exact: Vec<f32> = data.iter().map(|v| v.exp()).collect();
     relative_eq(backend_of(session), &[len], &exact, &actual, tol)?;
 
     // d(exp(x))/dx = exp(x), whichever approximation is in use, so the
     // gradient must equal the forward output.
-    let analytic = gradient_of(&graph, &y, &x)?;
+    let analytic = gradient_of(&graph, &y, &x).await?;
     assert_gradient_matches_finite_difference(&analytic, &actual)?;
     Ok(())
 }
@@ -516,7 +529,7 @@ fn approximate_exp_op(x: &Tensor, name: &str) -> Option<fusor::Result<Tensor>> {
 /// `where_cond`: condition, on_true and on_false all share one shape and one
 /// dtype, because there is no bool. The condition receives a zero gradient and
 /// the branches receive the mask and its complement.
-fn where_cond_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn where_cond_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let len = dense_len(&dims(shape));
     let cond: Vec<f32> = Domain::Wide
         .sample(seed, len)
@@ -535,7 +548,7 @@ fn where_cond_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .where_cond(&t, &f)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let actual = read(&y)?;
+    let actual = read(&y).await?;
     let expected: Vec<f32> = (0..len)
         .map(|i| {
             if cond[i] != 0.0 {
@@ -545,12 +558,12 @@ fn where_cond_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
             }
         })
         .collect();
-    expect_values(session, shape, Dtype::F32, &actual, &expected)?;
+    expect_values(session, shape, Dtype::F32, &actual, &expected).await?;
 
-    assert_all_zero("where_cond condition", &gradient_of(&graph, &y, &c)?)?;
+    assert_all_zero("where_cond condition", &gradient_of(&graph, &y, &c).await?)?;
 
-    let d_true = gradient_of(&graph, &y, &t)?;
-    let d_false = gradient_of(&graph, &y, &f)?;
+    let d_true = gradient_of(&graph, &y, &t).await?;
+    let d_false = gradient_of(&graph, &y, &f).await?;
     for i in 0..len {
         let (want_t, want_f) = if cond[i] != 0.0 {
             (1.0, 0.0)

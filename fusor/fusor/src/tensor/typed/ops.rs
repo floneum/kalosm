@@ -14,7 +14,6 @@ use fusor_ir::shape::Dim;
 
 use crate::Result;
 use crate::device::ok;
-use crate::tensor::readback::TensorSlice;
 use crate::tensor::typed::{Axis, Element, Tensor, dims_of};
 
 /// A padding argument for [`Tensor::pad_axis`]: `usize` pads both sides
@@ -197,14 +196,14 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     /// Returns `Result`: an `await` point is where a caller has somewhere to
     /// put the error.
     pub fn to_vec_f32_async(&self) -> impl Future<Output = Result<Vec<f32>>> + 'static {
-        let slice: Result<TensorSlice> = self.as_dyn().as_slice();
-        std::future::ready(slice.and_then(|s| s.to_vec_f32()))
+        let value = self.as_dyn().clone();
+        async move { value.as_slice_async().await?.to_vec_f32() }
     }
 
     /// [`Tensor::to_flat`] behind the same future.
     pub fn to_flat_async(&self) -> impl Future<Output = Result<Vec<T>>> + 'static {
-        let slice: Result<TensorSlice> = self.as_dyn().as_slice();
-        std::future::ready(slice.and_then(|s| s.to_flat::<T>()))
+        let value = self.as_dyn().clone();
+        async move { value.as_slice_async().await?.to_flat::<T>() }
     }
 }
 

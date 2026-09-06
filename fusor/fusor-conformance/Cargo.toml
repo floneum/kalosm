@@ -10,7 +10,7 @@ repository.workspace = true
 publish = false
 
 [dependencies]
-fusor.workspace = true
+fusor = { workspace = true, default-features = false, features = ["gpu"] }
 fusor-ir.workspace = true
 fusor-tile.workspace = true
 fusor-cost.workspace = true
@@ -18,7 +18,19 @@ fusor-gguf.workspace = true
 rustc-hash.workspace = true
 fixedbitset.workspace = true
 half.workspace = true
+web-time.workspace = true
 log = "0.4"
+burn = { version = "0.21.0", default-features = false, features = ["std", "webgpu", "fusion"], optional = true }
+
+[features]
+# The CPU backend is native-only; a wasm build runs the suite on WebGPU alone.
+default = ["cpu"]
+cpu = ["fusor/cpu"]
+# Burn's WebGPU backend as the baseline the benchmark page compares against.
+burn-bench = ["dep:burn"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster.workspace = true
 
 [[bin]]
 name = "fusor-conformance"

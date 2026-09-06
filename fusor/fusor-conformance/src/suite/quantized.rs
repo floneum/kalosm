@@ -155,7 +155,9 @@ pub fn cases() -> Cases {
                 "quantized",
                 name,
                 DEQUANT_SPEC,
-                move |s, shape, seed| dequantize_case(s, fmt, layout, shape, seed),
+                async move |s: &Session, shape: &[u64], seed: u32| {
+                    dequantize_case(s, fmt, layout, shape, seed).await
+                },
             ));
         }
     }
@@ -171,8 +173,8 @@ pub fn cases() -> Cases {
                 continue;
             }
             let name = format!("dequantize_defn_{}_{}", fmt_name(fmt), layout_name(layout));
-            cases.push("quantized", name, move |s| {
-                dequantize_defn_case(s, fmt, layout)
+            cases.push("quantized", name, async move |s: &Session| {
+                dequantize_defn_case(s, fmt, layout).await
             });
         }
     }
@@ -182,7 +184,9 @@ pub fn cases() -> Cases {
             "quantized",
             name,
             QMATMUL_SPEC,
-            move |s, shape, seed| qmatmul_case(s, fmt, shape, seed),
+            async move |s: &Session, shape: &[u64], seed: u32| {
+                qmatmul_case(s, fmt, shape, seed).await
+            },
         ));
     }
     for fmt in QFmt::ALL {
@@ -191,7 +195,9 @@ pub fn cases() -> Cases {
             "quantized",
             name,
             REPACK_SPEC,
-            move |s, shape, seed| repack_case(s, fmt, shape, seed),
+            async move |s: &Session, shape: &[u64], seed: u32| {
+                repack_case(s, fmt, shape, seed).await
+            },
         ));
     }
 
@@ -209,7 +215,9 @@ pub fn cases() -> Cases {
     ));
     for fmt in QFmt::ALL {
         let name = format!("qmatmul_coop_shape_{}", fmt_name(fmt));
-        cases.push("quantized", name, move |s| qmatmul_coop_shape(s, fmt));
+        cases.push("quantized", name, async move |s: &Session| {
+            qmatmul_coop_shape(s, fmt).await
+        });
     }
     // ... and the same geometry with the defn as the *only* class member, so
     // the unpack `Map` really does run inside the staging fill.
@@ -223,7 +231,9 @@ pub fn cases() -> Cases {
                 fmt_name(fmt),
                 layout_name(layout)
             );
-            cases.push("quantized", name, move |s| defn_coop_shape(s, fmt, layout));
+            cases.push("quantized", name, async move |s: &Session| {
+                defn_coop_shape(s, fmt, layout).await
+            });
         }
     }
     cases.push(
@@ -248,7 +258,7 @@ pub fn cases() -> Cases {
 /// into row-major at read, so the loader must not reverse again: a double
 /// reverse hands back a transposed `[cols, rows]` matrix whose block stream
 /// still decodes to the same flat values, and only the dims betray the swap.
-fn qmatrix_load_orientation(session: &Session) -> CaseResult {
+async fn qmatrix_load_orientation(session: &Session) -> CaseResult {
     use fusor::Dim;
     use fusor_gguf::{GgmlType, Gguf, GgufMetadata, GgufTensor, VarBuilder};
 
@@ -304,16 +314,18 @@ fn qmatrix_load_orientation(session: &Session) -> CaseResult {
         &loaded
             .dequantize()
             .map_err(|e| -> CaseError { format!("dequantize(load): {e}").into() })?,
-    )?;
+    )
+    .await?;
     let via_parts = read(
         &reference
             .dequantize()
             .map_err(|e| -> CaseError { format!("dequantize(parts): {e}").into() })?,
-    )?;
+    )
+    .await?;
     // Same class either way once the shapes agree, so also pin both against
     // the scalar host decode of the same blocks.
-    expect_values(session, &shape, Dtype::F32, &via_load, &via_parts)?;
-    expect_values(session, &shape, Dtype::F32, &via_load, &expected)?;
+    expect_values(session, &shape, Dtype::F32, &via_load, &via_parts).await?;
+    expect_values(session, &shape, Dtype::F32, &via_load, &expected).await?;
     Ok(())
 }
 
@@ -324,7 +336,7 @@ fn qmatrix_load_orientation(session: &Session) -> CaseResult {
 /// The oracle is the dequantized dense matmul of the same weight. A mismatch
 /// means the staging-fill decode addresses the block differently from the
 /// reference decode.
-fn qmatmul_coop_shape(session: &Session, fmt: QFmt) -> CaseResult {
+async fn qmatmul_coop_shape(session: &Session, fmt: QFmt) -> CaseResult {
     const M: u64 = 64;
     const N: u64 = 64;
     let layout = QLayout::Native;
@@ -353,7 +365,8 @@ fn qmatmul_coop_shape(session: &Session, fmt: QFmt) -> CaseResult {
     let got = read(
         &a.matmul_t(&w)
             .map_err(|e| -> CaseError { e.to_string().into() })?,
-    )?;
+    )
+    .await?;
 
     // The oracle: the same contraction against the dequantized weight.
     let qm = QMatrix {
@@ -369,7 +382,8 @@ fn qmatmul_coop_shape(session: &Session, fmt: QFmt) -> CaseResult {
     let want = read(
         &a.matmul_t(&dense)
             .map_err(|e| -> CaseError { e.to_string().into() })?,
-    )?;
+    )
+    .await?;
 
     crate::compare::approx_or_relative_eq(
         backend_of(session),
@@ -390,7 +404,7 @@ fn qmatmul_coop_shape(session: &Session, fmt: QFmt) -> CaseResult {
 /// The oracle is the host decode uploaded dense, so a mismatch means the
 /// staging fill addresses the block stream differently from
 /// `cpu_dequantize_block`.
-fn defn_coop_shape(session: &Session, fmt: QFmt, layout: QLayout) -> CaseResult {
+async fn defn_coop_shape(session: &Session, fmt: QFmt, layout: QLayout) -> CaseResult {
     const M: u64 = 64;
     const N: u64 = 64;
     let be = fmt.block_elements() as u64;
@@ -425,13 +439,15 @@ fn defn_coop_shape(session: &Session, fmt: QFmt, layout: QLayout) -> CaseResult 
     let got = read(
         &a.matmul_t(&dense)
             .map_err(|e| -> CaseError { e.to_string().into() })?,
-    )?;
+    )
+    .await?;
 
     let oracle = upload(graph.handle(), &dims(&[N, k]), &decoded)?;
     let want = read(
         &a.matmul_t(&oracle)
             .map_err(|e| -> CaseError { e.to_string().into() })?,
-    )?;
+    )
+    .await?;
 
     crate::compare::approx_or_relative_eq(
         backend_of(session),
@@ -466,7 +482,7 @@ fn layout_name(layout: QLayout) -> &'static str {
 /// `[rows, blocks-per-row]` from [`DEQUANT_SPEC`]; the block stream is
 /// row-major in blocks, so `rows * blocks` consecutive blocks decode to a
 /// `[rows, blocks * block_elements]` matrix.
-fn dequantize_case(
+async fn dequantize_case(
     session: &Session,
     fmt: QFmt,
     layout: QLayout,
@@ -483,7 +499,7 @@ fn dequantize_case(
         .map_err(|e| -> CaseError { format!("{fmt:?}/{layout:?}: {e}").into() })?;
 
     let shape = [rows, k];
-    let got = read(&dense)?;
+    let got = read(&dense).await?;
     if got.len() != expected.len() {
         return Err(format!(
             "{fmt:?}/{layout:?} decoded {} elements, the reference decodes {}",
@@ -492,7 +508,7 @@ fn dequantize_case(
         )
         .into());
     }
-    expect_values(session, &shape, Dtype::F32, &got, &expected)?;
+    expect_values(session, &shape, Dtype::F32, &got, &expected).await?;
     Ok(())
 }
 
@@ -501,7 +517,7 @@ fn dequantize_case(
 /// definitional expansion, with the sugar absent. `dequantize` unions the
 /// two and extraction is free to pick either; `dequantize_slow` builds the
 /// expansion alone.
-fn dequantize_defn_case(session: &Session, fmt: QFmt, layout: QLayout) -> CaseResult {
+async fn dequantize_defn_case(session: &Session, fmt: QFmt, layout: QLayout) -> CaseResult {
     let (bytes, expected) = quantized_rows(fmt, layout);
     let graph = graph_of(session);
     let qm = matrix_from_parts(
@@ -517,7 +533,7 @@ fn dequantize_defn_case(session: &Session, fmt: QFmt, layout: QLayout) -> CaseRe
         .map_err(|e| -> CaseError { format!("{fmt:?}/{layout:?}: {e}").into() })?;
 
     let shape = [ROWS, fmt.block_elements() as u64];
-    let got = read(&dense)?;
+    let got = read(&dense).await?;
     if got.len() != expected.len() {
         return Err(format!(
             "{fmt:?}/{layout:?} decoded {} elements, the reference decodes {}",
@@ -526,14 +542,14 @@ fn dequantize_defn_case(session: &Session, fmt: QFmt, layout: QLayout) -> CaseRe
         )
         .into());
     }
-    expect_values(session, &shape, Dtype::F32, &got, &expected)?;
+    expect_values(session, &shape, Dtype::F32, &got, &expected).await?;
     Ok(())
 }
 
 /// An activation against a quantized weight. The result must equal the dense
 /// matmul against the reference-decoded weight, whichever program extraction
 /// picked.
-fn qmatmul_case(session: &Session, fmt: QFmt, shape: &[u64], seed: u32) -> CaseResult {
+async fn qmatmul_case(session: &Session, fmt: QFmt, shape: &[u64], seed: u32) -> CaseResult {
     let (batch, rows, blocks) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
     let layout = QLayout::Native;
     let k = blocks * fmt.block_elements() as usize;
@@ -556,7 +572,7 @@ fn qmatmul_case(session: &Session, fmt: QFmt, shape: &[u64], seed: u32) -> CaseR
     }
     // A quantized dot accumulates in f32 over up to 256 terms, so the bar is
     // relative to the result rather than absolute.
-    let got = read(&y)?;
+    let got = read(&y).await?;
     crate::compare::approx_or_relative_eq(
         backend_of(session),
         &[batch, rows],
@@ -573,7 +589,7 @@ fn qmatmul_case(session: &Session, fmt: QFmt, shape: &[u64], seed: u32) -> CaseR
 /// second slab. An sgemv addressing that fold with a raw `ProgramId(X)` would
 /// recompute slab 0's rows and never write past the fold. The harness sets
 /// `FUSOR_VERIFY_MEMBERS`, so this geometry races every contraction family.
-fn qgemv_grid_past_the_dimension_cap(session: &Session) -> CaseResult {
+async fn qgemv_grid_past_the_dimension_cap(session: &Session) -> CaseResult {
     // Two slabs, with a remainder so the fold is not exact: 65,792 groups
     // dispatch as [32896, 2, 1].
     const MANY_ROWS: usize = 65_792;
@@ -594,7 +610,7 @@ fn qgemv_grid_past_the_dimension_cap(session: &Session) -> CaseResult {
     let y = a
         .matmul_t(&w)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let got = read(&y)?;
+    let got = read(&y).await?;
 
     let mut expected = vec![0.0f32; MANY_ROWS];
     for (r, slot) in expected.iter_mut().enumerate() {
@@ -613,7 +629,7 @@ fn qgemv_grid_past_the_dimension_cap(session: &Session) -> CaseResult {
 
 /// Gradients flow to the activation only; the quantized weight is
 /// non-trainable through this route (QAT keeps a separate f32 master).
-fn qmatmul_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn qmatmul_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (batch, rows, blocks) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
     let fmt = QFmt::Q8_0;
     let layout = QLayout::Native;
@@ -629,7 +645,7 @@ fn qmatmul_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     // d_act[b, t] = sum over rows of w[r, t], under an all-ones seed.
-    let d_a = crate::suite::support::gradient_of(&graph, &y, &a)?;
+    let d_a = crate::suite::support::gradient_of(&graph, &y, &a).await?;
     let want: Vec<f32> = (0..batch * k)
         .map(|n| (0..rows).map(|r| weights[r * k + n % k]).sum())
         .collect();
@@ -643,7 +659,10 @@ fn qmatmul_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     )?;
 
     // And nothing must claim to differentiate the quantized weight itself.
-    if crate::suite::support::gradient_of(&graph, &y, &qm.tensor).is_ok() {
+    if crate::suite::support::gradient_of(&graph, &y, &qm.tensor)
+        .await
+        .is_ok()
+    {
         return Err(
             "a gradient was produced for a quantized weight; that route is not \
                     trainable and QAT keeps a separate f32 master"
@@ -655,7 +674,7 @@ fn qmatmul_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 
 /// `Native -> F32Scales -> Native` must be byte-identical, and the forward
 /// direction must decode to the same values.
-fn repack_case(_session: &Session, fmt: QFmt, shape: &[u64], seed: u32) -> CaseResult {
+async fn repack_case(_session: &Session, fmt: QFmt, shape: &[u64], seed: u32) -> CaseResult {
     let blocks = shape[0] as usize;
     let (native, values) = block_rows(fmt, QLayout::Native, seed, blocks);
 
@@ -712,7 +731,7 @@ fn repack_case(_session: &Session, fmt: QFmt, shape: &[u64], seed: u32) -> CaseR
 
 /// Both layouts are legal inputs everywhere, so a matrix uploaded in either
 /// one must produce the same numbers on the same device.
-fn layouts_agree(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn layouts_agree(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let rows = shape[0];
     for fmt in QFmt::ALL {
         let be = fmt.block_elements() as u64;
@@ -734,7 +753,7 @@ fn layouts_agree(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let b = matrix_from_parts(&graph, fmt, QLayout::F32Scales, &widened, rows, be)?
             .dequantize()
             .map_err(|e| -> CaseError { format!("{fmt:?} f32 scales: {e}").into() })?;
-        let (va, vb) = (read(&a)?, read(&b)?);
+        let (va, vb) = (read(&a).await?, read(&b).await?);
         crate::compare::exact_eq(backend_of(session), &[va.len()], &va, &vb).map_err(
             |e| -> CaseError {
                 format!(
@@ -757,7 +776,7 @@ fn layouts_agree(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 /// The lookup is `Dequant` then `Gather`; with `FUSOR_VERIFY_MEMBERS` this
 /// case value-checks the fused `GatherMode::QuantizedRows` member against the
 /// decode-then-pick members.
-fn index_select_rows(session: &Session) -> CaseResult {
+async fn index_select_rows(session: &Session) -> CaseResult {
     // Out of order, one repeat, and neither end of the table first.
     const PICKS: &[u32] = &[2, 0, 2, 1];
 
@@ -789,14 +808,15 @@ fn index_select_rows(session: &Session) -> CaseResult {
                     decoded[at..at + cols].iter().copied()
                 })
                 .collect();
-            let got = read(&picked)?;
+            let got = read(&picked).await?;
             expect_values(
                 session,
                 &[PICKS.len() as u64, cols as u64],
                 Dtype::F32,
                 &got,
                 &want,
-            )?;
+            )
+            .await?;
 
             // The picks are not the identity, so a lookup that ignored `idx`
             // would have to be caught above. Say so, rather than trusting it.
@@ -820,14 +840,15 @@ fn index_select_rows(session: &Session) -> CaseResult {
                 )
                 .into());
             }
-            let got_half = read(&half)?;
+            let got_half = read(&half).await?;
             expect_values(
                 session,
                 &[PICKS.len() as u64, cols as u64],
                 Dtype::F16,
                 &got_half,
                 &want,
-            )?;
+            )
+            .await?;
         }
     }
 
@@ -861,7 +882,7 @@ fn index_select_rows(session: &Session) -> CaseResult {
 /// Two claims: the byte-appended stream must decode to the concatenation of
 /// the parts, and `q_mat_mul` against the concatenated weight must equal the
 /// three separate products stacked — both against the host reference.
-fn concat_rows(session: &Session) -> CaseResult {
+async fn concat_rows(session: &Session) -> CaseResult {
     // Unequal row counts: equal parts would hide an offset bug in the byte
     // append.
     const PARTS: [(u32, usize); 3] = [(3_100, 3), (3_200, 2), (3_300, 4)];
@@ -886,8 +907,8 @@ fn concat_rows(session: &Session) -> CaseResult {
             let dense = cat
                 .dequantize()
                 .map_err(|e| -> CaseError { format!("{fmt:?}/{layout:?}: {e}").into() })?;
-            let got = read(&dense)?;
-            expect_values(session, &[total, cols], Dtype::F32, &got, &want)?;
+            let got = read(&dense).await?;
+            expect_values(session, &[total, cols], Dtype::F32, &got, &want).await?;
         }
     }
 
@@ -910,7 +931,8 @@ fn concat_rows(session: &Session) -> CaseResult {
         let fused = read(
             &cat.q_mat_mul(&a)
                 .map_err(|e| -> CaseError { format!("{fmt:?} fused: {e}").into() })?,
-        )?;
+        )
+        .await?;
 
         // The same products, one projection per part, written into the
         // columns the concatenation puts them in.
@@ -920,7 +942,8 @@ fn concat_rows(session: &Session) -> CaseResult {
             let y = read(
                 &m.q_mat_mul(&a)
                     .map_err(|e| -> CaseError { format!("{fmt:?} part: {e}").into() })?,
-            )?;
+            )
+            .await?;
             for b in 0..BATCH {
                 for r in 0..rows {
                     separate[b * total as usize + at + r] = y[b * rows + r];

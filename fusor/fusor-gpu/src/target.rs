@@ -5,7 +5,7 @@ use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::Arc;
-use std::time::Instant;
+use web_time::Instant;
 
 use fusor_ir::Result;
 use fusor_ir::cost::DeviceFacts;
@@ -340,7 +340,8 @@ impl GpuTarget {
         })
     }
 
-    /// `pollster`-blocking convenience for non-async callers.
+    /// `pollster`-blocking convenience for non-async callers. Native only.
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn new_blocking() -> Result<Self> {
         pollster::block_on(Self::new())
     }
@@ -370,10 +371,15 @@ impl GpuTarget {
         plan.hash
     }
 
+    /// [`Launcher::wait_async`]: every submission so far has retired.
+    pub async fn wait_async(&self) -> Result<()> {
+        self.launcher.wait_async().await
+    }
+
     /// Read a device buffer back to the host. **One of exactly three host
     /// syncs.**
     pub async fn readback(&self, buf: &Buf, bytes: u64) -> Result<Vec<u8>> {
-        self.launcher.readback(&self.pool, buf, bytes)
+        self.launcher.readback(&self.pool, buf, bytes).await
     }
 
     /// The whole-plan entry point `fusor::Session` calls.
@@ -533,23 +539,29 @@ impl GpuTarget {
             let cursor = BuildCursor::new();
             let lowered: Vec<Mutexed<(Lowered, Option<Artifact>)>> =
                 (0..len).map(|_| Mutexed::default()).collect();
+            let worker = || {
+                while let Some(j) = cursor.take(len) {
+                    let built = self
+                        .lower_uncached(plan, graph, &items[j], binds, &pack)
+                        .and_then(|l| {
+                            let a = self.try_pipeline_for(&l.ir, l.ph)?;
+                            Ok((l, a))
+                        });
+                    *lowered[j].0.lock() = Some(built);
+                }
+            };
+            // wasm32-unknown-unknown has no threads to spawn; one worker
+            // drains the cursor on the calling thread.
+            #[cfg(target_arch = "wasm32")]
+            worker();
+            #[cfg(not(target_arch = "wasm32"))]
             std::thread::scope(|scope| {
                 let threads = std::thread::available_parallelism()
                     .map(|n| n.get())
                     .unwrap_or(1)
                     .min(len);
                 for _ in 0..threads {
-                    scope.spawn(|| {
-                        while let Some(j) = cursor.take(len) {
-                            let built = self
-                                .lower_uncached(plan, graph, &items[j], binds, &pack)
-                                .and_then(|l| {
-                                    let a = self.try_pipeline_for(&l.ir, l.ph)?;
-                                    Ok((l, a))
-                                });
-                            *lowered[j].0.lock() = Some(built);
-                        }
-                    });
+                    scope.spawn(worker);
                 }
             });
             let lowered: Vec<(Lowered, Option<Artifact>)> = lowered

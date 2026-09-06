@@ -50,13 +50,17 @@ pub fn cases() -> Cases {
         "indexing_scatter",
         "index_select_dim0",
         TABLE_SPEC,
-        |s, shape, seed| index_select_case(s, shape, seed, 0),
+        async move |s: &Session, shape: &[u64], seed: u32| {
+            index_select_case(s, shape, seed, 0).await
+        },
     ));
     cases.push_case(fuzz_case(
         "indexing_scatter",
         "index_select_dim1",
         TABLE_SPEC,
-        |s, shape, seed| index_select_case(s, shape, seed, 1),
+        async move |s: &Session, shape: &[u64], seed: u32| {
+            index_select_case(s, shape, seed, 1).await
+        },
     ));
     cases.push_case(fuzz_case(
         "indexing_scatter",
@@ -181,7 +185,7 @@ pub fn cases() -> Cases {
 ///
 /// The backward is `Scatter{Add}`: under an all-ones seed, position `p` along
 /// `dim` receives the number of times `p` appears in the index vector.
-fn index_select_case(session: &Session, shape: &[u64], seed: u32, dim: usize) -> CaseResult {
+async fn index_select_case(session: &Session, shape: &[u64], seed: u32, dim: usize) -> CaseResult {
     let (vocab, width) = (shape[0] as usize, shape[1] as usize);
     let table = Domain::Wide.sample(seed, vocab * width);
     let n = Rng::new(seed ^ 0x5eed).range(1, 6) as usize;
@@ -212,9 +216,9 @@ fn index_select_case(session: &Session, shape: &[u64], seed: u32, dim: usize) ->
         }
         (vec![shape[0], n as u64], out)
     };
-    expect_values(session, &out_shape, Dtype::F32, &read(&y)?, &expected)?;
+    expect_values(session, &out_shape, Dtype::F32, &read(&y).await?, &expected).await?;
 
-    let grad = gradient_of(&graph, &y, &t)?;
+    let grad = gradient_of(&graph, &y, &t).await?;
     let mut want = vec![0.0f32; vocab * width];
     for id in &idx {
         if dim == 0 {
@@ -241,7 +245,7 @@ fn index_select_case(session: &Session, shape: &[u64], seed: u32, dim: usize) ->
 /// The property the whole area exists for, isolated: a row read twice gets
 /// exactly twice the gradient, and a row never read gets an explicit zero
 /// rather than no gradient at all.
-fn dup_grad_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn dup_grad_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (vocab, width) = (shape[0] as usize, shape[1] as usize);
     let table = Domain::Wide.sample(seed, vocab * width);
     let n = Rng::new(seed ^ 0x5eed).range(2, 8) as usize;
@@ -254,7 +258,7 @@ fn dup_grad_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let y = t
         .index_select(0, &i)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let grad = gradient_of(&graph, &y, &t)?;
+    let grad = gradient_of(&graph, &y, &t).await?;
 
     let counts = counts_of(&idx, vocab);
     for row in 0..vocab {
@@ -275,7 +279,7 @@ fn dup_grad_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 }
 
 /// `embedding(ids: [B, T] u32) -> [B, T, W]`.
-fn embedding_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn embedding_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (vocab, width) = (shape[0] as usize, shape[1] as usize);
     let (batch, tokens) = (shape[2], shape[3]);
     let table = Domain::Wide.sample(seed, vocab * width);
@@ -299,14 +303,14 @@ fn embedding_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         expected.extend_from_slice(&table[base..base + width]);
     }
     let out_shape = [batch, tokens, shape[1]];
-    expect_values(session, &out_shape, Dtype::F32, &read(&y)?, &expected)?;
+    expect_values(session, &out_shape, Dtype::F32, &read(&y).await?, &expected).await?;
     Ok(())
 }
 
 /// Trainer constraint 3: there is no hand-written embedding backward. The
 /// adjoint is `Scatter{Add}`, so the table's gradient is the per-row token
 /// count.
-fn embedding_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn embedding_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (vocab, width) = (shape[0] as usize, shape[1] as usize);
     let (batch, tokens) = (shape[2], shape[3]);
     let table = Domain::Wide.sample(seed, vocab * width);
@@ -319,7 +323,7 @@ fn embedding_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult
     let y = t
         .embedding(&ids_t)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let grad = gradient_of(&graph, &y, &t)?;
+    let grad = gradient_of(&graph, &y, &t).await?;
 
     let counts = counts_of(&ids, vocab);
     let want: Vec<f32> = (0..vocab * width).map(|i| counts[i / width]).collect();
@@ -337,7 +341,7 @@ fn embedding_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult
 /// `gather_last`: one column per row, picked by a rank-1 index as long as the
 /// row count. The row-offset adjustment is the whole point — an
 /// implementation that forgets it reads row 0 every time.
-fn gather_last_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn gather_last_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (vocab, width) = (shape[0] as usize, shape[1] as usize);
     let table = Domain::Wide.sample(seed, vocab * width);
     let picks = fill_indices(seed ^ 0x9e37_79b9, vocab, shape[1] as u32);
@@ -355,13 +359,20 @@ fn gather_last_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .enumerate()
         .map(|(r, c)| table[r * width + *c as usize])
         .collect();
-    expect_values(session, &[shape[0]], Dtype::F32, &read(&y)?, &expected)?;
+    expect_values(
+        session,
+        &[shape[0]],
+        Dtype::F32,
+        &read(&y).await?,
+        &expected,
+    )
+    .await?;
     Ok(())
 }
 
 /// Its adjoint is a one-hot scatter: exactly one 1 per row, in the picked
 /// column.
-fn gather_last_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn gather_last_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (vocab, width) = (shape[0] as usize, shape[1] as usize);
     let table = Domain::Wide.sample(seed, vocab * width);
     let picks = fill_indices(seed ^ 0x9e37_79b9, vocab, shape[1] as u32);
@@ -373,7 +384,7 @@ fn gather_last_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResu
     let y = t
         .gather_last(&i)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let grad = gradient_of(&graph, &y, &t)?;
+    let grad = gradient_of(&graph, &y, &t).await?;
 
     let mut want = vec![0.0f32; vocab * width];
     for (r, c) in picks.iter().enumerate() {
@@ -391,7 +402,7 @@ fn gather_last_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResu
 }
 
 /// `scatter_add(axis, idx, updates)`: `base` plus the updates at their rows.
-fn scatter_add_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn scatter_add_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (vocab, width) = (shape[0] as usize, shape[1] as usize);
     let base = Domain::Wide.sample(seed, vocab * width);
     let n = Rng::new(seed ^ 0x5eed).range(1, 4) as usize;
@@ -413,7 +424,7 @@ fn scatter_add_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
             expected[*row as usize * width + c] += updates[row_n * width + c];
         }
     }
-    expect_values(session, shape, Dtype::F32, &read(&y)?, &expected)?;
+    expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await?;
     Ok(())
 }
 
@@ -422,7 +433,7 @@ fn scatter_add_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 /// to agree here, and only a colliding index distinguishes them from a
 /// last-writer-wins scatter. The modulus sits below the update count, so
 /// every run has a collision.
-fn scatter_add_dups(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn scatter_add_dups(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (vocab, width) = (shape[0] as usize, shape[1] as usize);
     let base = vec![0.0f32; vocab * width];
     let n = Rng::new(seed ^ 0x5eed).range(3, 6) as usize;
@@ -453,7 +464,7 @@ fn scatter_add_dups(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .max_by(|a, b| a.1.total_cmp(b.1))
         .map(|(r, _)| r)
         .unwrap_or(0);
-    let got = read(&y)?;
+    let got = read(&y).await?;
     for c in 0..width {
         let want = expected[hot * width + c];
         let have = got.get(hot * width + c).copied().unwrap_or(f32::NAN);
@@ -466,13 +477,13 @@ fn scatter_add_dups(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
             .into());
         }
     }
-    expect_values(session, shape, Dtype::F32, &got, &expected)?;
+    expect_values(session, shape, Dtype::F32, &got, &expected).await?;
     Ok(())
 }
 
 /// The adjoint of `Scatter{Add}` passes the gradient through to the base
 /// unchanged and gathers it into the updates.
-fn scatter_add_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn scatter_add_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (vocab, width) = (shape[0] as usize, shape[1] as usize);
     let base = Domain::Wide.sample(seed, vocab * width);
     let n = Rng::new(seed ^ 0x5eed).range(1, 4) as usize;
@@ -488,7 +499,7 @@ fn scatter_add_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResu
         .scatter_add(0, &i, &u)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let d_base = gradient_of(&graph, &y, &b)?;
+    let d_base = gradient_of(&graph, &y, &b).await?;
     if let Some((row_n, v)) = d_base
         .iter()
         .enumerate()
@@ -496,7 +507,7 @@ fn scatter_add_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResu
     {
         return Err(format!("scatter_add base gradient {row_n} is {v}, not 1").into());
     }
-    let d_upd = gradient_of(&graph, &y, &u)?;
+    let d_upd = gradient_of(&graph, &y, &u).await?;
     if let Some((row_n, v)) = d_upd
         .iter()
         .enumerate()
@@ -510,7 +521,7 @@ fn scatter_add_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResu
 /// `Scatter{Set}` overwrites, and the base's gradient is zero in the written
 /// region. The uniqueness proof holds by construction: the sampled indices
 /// are deduplicated before upload.
-fn scatter_set_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn scatter_set_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (vocab, width) = (shape[0] as usize, shape[1] as usize);
     let base = Domain::Wide.sample(seed, vocab * width);
     let mut idx: Vec<u32> = Vec::new();
@@ -537,9 +548,9 @@ fn scatter_set_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
             expected[*row as usize * width + c] = updates[row_n * width + c];
         }
     }
-    expect_values(session, shape, Dtype::F32, &read(&y)?, &expected)?;
+    expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await?;
 
-    let d_base = gradient_of(&graph, &y, &b)?;
+    let d_base = gradient_of(&graph, &y, &b).await?;
     for row in 0..vocab {
         let want = f32::from(!idx.contains(&(row as u32)));
         for c in 0..width {
@@ -559,7 +570,7 @@ fn scatter_set_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 /// `unique` is a caller-supplied proof and `verify_l0` rejects `Set` without
 /// it — otherwise the result would depend on which lane wrote last. A refusal
 /// path, so the shapes stay fixed.
-fn scatter_set_unproven(session: &Session) -> CaseResult {
+async fn scatter_set_unproven(session: &Session) -> CaseResult {
     let graph = graph_of(session);
     let b = upload(
         graph.handle(),
@@ -584,7 +595,7 @@ fn scatter_set_unproven(session: &Session) -> CaseResult {
 }
 
 /// `i((p, ..))` on a rank-2: exactly one bare index, and it removes its axis.
-fn index_rank2(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn index_rank2(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (r, c) = (shape[0] as usize, shape[1] as usize);
     let data = Domain::Wide.sample(seed, r * c);
     let p = Rng::new(seed ^ 0x5eed).range(0, shape[0] - 1) as usize;
@@ -598,14 +609,15 @@ fn index_rank2(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         session,
         &[shape[1]],
         Dtype::F32,
-        &read(&y)?,
+        &read(&y).await?,
         &data[p * c..(p + 1) * c],
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
 /// A bare index alongside `Full` and a `Range`.
-fn index_rank3(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn index_rank3(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (a, b, c) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
     let data = Domain::Wide.sample(seed, a * b * c);
     let mut rng = Rng::new(seed ^ 0x5eed);
@@ -628,14 +640,15 @@ fn index_rank3(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         session,
         &[shape[0], len as u64],
         Dtype::F32,
-        &read(&y)?,
+        &read(&y).await?,
         &expected,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
 /// Rank 4 with `RangeTo` and `RangeFrom` alongside the pick.
-fn index_rank4(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn index_rank4(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (a, b, c, d) = (
         shape[0] as usize,
         shape[1] as usize,
@@ -665,16 +678,17 @@ fn index_rank4(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         session,
         &[hi as u64, shape[2], (d - q) as u64],
         Dtype::F32,
-        &read(&y)?,
+        &read(&y).await?,
         &expected,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
 /// A pick at a nonzero position with narrowed neighbours. This is the
 /// two-node path (`slice` then `squeeze`): a `StrideSpec` offset rides on the
 /// axis it names, and a dropped axis has no output axis left to carry it.
-fn index_nonzero_pick(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn index_nonzero_pick(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (a, b, c) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
     let data = Domain::Wide.sample(seed, a * b * c);
     let mut rng = Rng::new(seed ^ 0x5eed);
@@ -699,15 +713,16 @@ fn index_nonzero_pick(session: &Session, shape: &[u64], seed: u32) -> CaseResult
         session,
         &[len1 as u64, len2 as u64],
         Dtype::F32,
-        &read(&y)?,
+        &read(&y).await?,
         &expected,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
 /// `i()` is a view, so its adjoint is ones in the selected region and zeros
 /// everywhere else.
-fn index_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn index_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (r, c) = (shape[0] as usize, shape[1] as usize);
     let data = Domain::Wide.sample(seed, r * c);
     let mut rng = Rng::new(seed ^ 0x5eed);
@@ -720,7 +735,7 @@ fn index_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let y = x
         .i((p, lo..lo + len))
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let grad = gradient_of(&graph, &y, &x)?;
+    let grad = gradient_of(&graph, &y, &x).await?;
     let want: Vec<f32> = (0..r * c)
         .map(|n| f32::from(n / c == p && (lo..lo + len).contains(&(n % c))))
         .collect();

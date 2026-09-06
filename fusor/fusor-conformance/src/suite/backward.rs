@@ -105,7 +105,9 @@ pub fn cases() -> Cases {
             "backward",
             name,
             ELEMENTWISE_SPEC,
-            move |s, shape, seed| chain_case(s, name, build, domain, shape, seed),
+            async move |s: &Session, shape: &[u64], seed: u32| {
+                chain_case(s, name, build, domain, shape, seed).await
+            },
         ));
     }
     for (name, build) in comparisons() {
@@ -115,7 +117,9 @@ pub fn cases() -> Cases {
             "backward",
             case,
             FORWARD_SPEC,
-            move |s, shape, seed| zero_grad_case(s, name, build, shape, seed),
+            async move |s: &Session, shape: &[u64], seed: u32| {
+                zero_grad_case(s, name, build, shape, seed).await
+            },
         ));
     }
 
@@ -210,7 +214,7 @@ pub fn cases() -> Cases {
 
 /// Forward stays unchecked here — the `elementwise` area owns that — and the
 /// adjoint is compared against central differences.
-fn chain_case(
+async fn chain_case(
     session: &Session,
     name: &'static str,
     build: Build,
@@ -224,14 +228,15 @@ fn chain_case(
     let x = upload(graph.handle(), &dimv, &data)?;
     let y = build(&x, shape).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
-    let analytic = gradient_of(&graph, &y, &x)?;
+    let analytic = gradient_of(&graph, &y, &x).await?;
     let probe_graph = graph_of(session);
     let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
     let probe_y = build(&probe_x, shape).map_err(|e| -> CaseError { e.to_string().into() })?;
     let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&usize_shape(shape), &data, &mut |probe| {
+    let numeric = finite_difference_gradient(&usize_shape(shape), &data, |probe| {
         read_probe_loss(&probe_x, &probe_loss, probe)
-    })?;
+    })
+    .await?;
     assert_gradient_matches_finite_difference(&analytic, &numeric)
         .map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
     Ok(())
@@ -240,7 +245,7 @@ fn chain_case(
 /// A comparison's gradient must be **present and zero**. `gradient_of`
 /// returning `Err` means no rule fired at all, which the tape treats as an
 /// error and so does this case.
-fn zero_grad_case(
+async fn zero_grad_case(
     session: &Session,
     name: &'static str,
     build: Build,
@@ -253,7 +258,7 @@ fn zero_grad_case(
     let y = build(&x, shape).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
     // The forward is 1/0 in the operand dtype — no third value.
-    let out = read(&y)?;
+    let out = read(&y).await?;
     if let Some((i, v)) = out
         .iter()
         .enumerate()
@@ -262,20 +267,22 @@ fn zero_grad_case(
         return Err(format!("{name}: element {i} is {v}; a comparison is 1.0 or 0.0").into());
     }
 
-    let grad = gradient_of(&graph, &y, &x).map_err(|e| -> CaseError {
-        format!(
-            "{name}: no gradient reached the operand ({e}). A comparison differentiates to \
+    let grad = gradient_of(&graph, &y, &x)
+        .await
+        .map_err(|e| -> CaseError {
+            format!(
+                "{name}: no gradient reached the operand ({e}). A comparison differentiates to \
              zero, not to nothing — every requires-grad parent must receive one."
-        )
-        .into()
-    })?;
+            )
+            .into()
+        })?;
     crate::compare::assert_all_zero(name, &grad)?;
     Ok(())
 }
 
 /// `clamp`'s adjoint is the `(x > lo) * (x < hi)` mask. The data straddles
 /// both bounds, so a rule that masks only one end fails.
-fn clamp_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn clamp_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     const LO: f32 = -0.2;
     const HI: f32 = 0.2;
     let len = len_of(shape);
@@ -291,9 +298,9 @@ fn clamp_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let expected: Vec<f32> = data.iter().map(|v| v.clamp(LO, HI)).collect();
-    expect_values(session, shape, Dtype::F32, &read(&y)?, &expected)?;
+    expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await?;
 
-    let grad = gradient_of(&graph, &y, &x)?;
+    let grad = gradient_of(&graph, &y, &x).await?;
     let want: Vec<f32> = data.iter().map(|v| f32::from(*v > LO && *v < HI)).collect();
     if !want.contains(&0.0) || !want.contains(&1.0) {
         return Err(
@@ -306,7 +313,7 @@ fn clamp_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 
 /// `where_cond(cond, a, b)`: `a` receives `grad * mask`, `b` receives
 /// `grad * (1 - mask)`.
-fn where_cond_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn where_cond_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let len = len_of(shape);
     let cond_src = Domain::Wide.sample(seed, len);
     let a_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, len);
@@ -333,10 +340,10 @@ fn where_cond_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
             }
         })
         .collect();
-    expect_values(session, shape, Dtype::F32, &read(&y)?, &expected)?;
+    expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await?;
 
-    let d_a = gradient_of(&graph, &y, &a)?;
-    let d_b = gradient_of(&graph, &y, &b)?;
+    let d_a = gradient_of(&graph, &y, &a).await?;
+    let d_b = gradient_of(&graph, &y, &b).await?;
     let want_b: Vec<f32> = picks.iter().map(|m| 1.0 - m).collect();
     crate::compare::approx_or_relative_eq(backend_of(session), &[len], &picks, &d_a, 1e-5, 1e-5)?;
     crate::compare::approx_or_relative_eq(backend_of(session), &[len], &want_b, &d_b, 1e-5, 1e-5)?;
@@ -344,7 +351,7 @@ fn where_cond_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 }
 
 /// The condition operand receives zeros — present, not absent.
-fn where_cond_zero(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn where_cond_zero(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let len = len_of(shape);
     let cond_src = Domain::Wide.sample(seed, len);
     let graph = graph_of(session);
@@ -362,16 +369,18 @@ fn where_cond_zero(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let y = c
         .where_cond(&a, &b)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let d_c = gradient_of(&graph, &y, &c).map_err(|e| -> CaseError {
-        format!("no gradient reached the condition ({e}); it must receive zeros").into()
-    })?;
+    let d_c = gradient_of(&graph, &y, &c)
+        .await
+        .map_err(|e| -> CaseError {
+            format!("no gradient reached the condition ({e}); it must receive zeros").into()
+        })?;
     crate::compare::assert_all_zero("where_cond condition", &d_c)?;
     Ok(())
 }
 
 /// `pow(a, b)`: `d_a = b * a^(b-1)`, `d_b = a^b * ln(a)`. The base stays
 /// positive so `ln(a)` is defined.
-fn pow_tensor_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn pow_tensor_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let len = len_of(shape);
     let a_data = Domain::Custom(0.5, 2.0).sample(seed, len);
     let b_data = Domain::Custom(0.5, 2.5).sample(seed ^ 0x9e37_79b9, len);
@@ -389,9 +398,9 @@ fn pow_tensor_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .zip(&b_data)
         .map(|(x, y)| x.powf(*y))
         .collect();
-    expect_values(session, shape, Dtype::F32, &read(&y)?, &expected)?;
+    expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await?;
 
-    let d_a = gradient_of(&graph, &y, &a)?;
+    let d_a = gradient_of(&graph, &y, &a).await?;
     let want_a: Vec<f32> = a_data
         .iter()
         .zip(&b_data)
@@ -399,7 +408,7 @@ fn pow_tensor_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .collect();
     crate::compare::approx_or_relative_eq(backend_of(session), &[len], &want_a, &d_a, 1e-3, 1e-3)?;
 
-    let d_b = gradient_of(&graph, &y, &b)?;
+    let d_b = gradient_of(&graph, &y, &b).await?;
     let want_b: Vec<f32> = a_data
         .iter()
         .zip(&b_data)
@@ -411,7 +420,7 @@ fn pow_tensor_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 
 /// A stride-0 axis's adjoint is a sum over that axis. `[r, c] + [c]` reads
 /// each bias element `r` times, so each gets a gradient of `r`.
-fn broadcast_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn broadcast_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (rows, cols) = (shape[0] as usize, shape[1] as usize);
     let x_data = Domain::Wide.sample(seed, rows * cols);
     let bias = Domain::Wide.sample(seed ^ 0x9e37_79b9, cols);
@@ -427,9 +436,9 @@ fn broadcast_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .enumerate()
         .map(|(i, v)| v + bias[i % cols])
         .collect();
-    expect_values(session, shape, Dtype::F32, &read(&y)?, &expected)?;
+    expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await?;
 
-    let d_b = gradient_of(&graph, &y, &b)?;
+    let d_b = gradient_of(&graph, &y, &b).await?;
     let want = vec![rows as f32; cols];
     crate::compare::approx_or_relative_eq(backend_of(session), &[cols], &want, &d_b, 1e-5, 1e-5)?;
     Ok(())
@@ -437,7 +446,7 @@ fn broadcast_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 
 /// The same, through a multiply, where the summed gradient is data dependent
 /// rather than a constant.
-fn broadcast_mul_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn broadcast_mul_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (rows, cols) = (shape[0] as usize, shape[1] as usize);
     let x_data = Domain::Wide.sample(seed, rows * cols);
     let scale = Domain::Custom(0.5, 1.5).sample(seed ^ 0x9e37_79b9, cols);
@@ -448,13 +457,13 @@ fn broadcast_mul_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult
         .mul_(&s)
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let d_s = gradient_of(&graph, &y, &s)?;
+    let d_s = gradient_of(&graph, &y, &s).await?;
     let want: Vec<f32> = (0..cols)
         .map(|c| (0..rows).map(|r| x_data[r * cols + c]).sum())
         .collect();
     crate::compare::approx_or_relative_eq(backend_of(session), &[cols], &want, &d_s, 1e-4, 1e-4)?;
 
-    let d_x = gradient_of(&graph, &y, &x)?;
+    let d_x = gradient_of(&graph, &y, &x).await?;
     let want_x: Vec<f32> = (0..rows * cols).map(|i| scale[i % cols]).collect();
     crate::compare::approx_or_relative_eq(
         backend_of(session),
@@ -474,7 +483,7 @@ fn broadcast_mul_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult
 /// the tanh approximation's derivative is what a rule that differentiates the
 /// *exact* gelu would get subtly wrong, and central differences at 1e-3 do
 /// not separate the two.
-fn gelu_analytic(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn gelu_analytic(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let len = len_of(shape);
     let data = Domain::Custom(-2.5, 2.5).sample(seed, len);
     let graph = graph_of(session);
@@ -485,8 +494,8 @@ fn gelu_analytic(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     // The forward must be the tanh approximation, not the erf one, or the
     // analytic derivative below is being compared against the wrong function.
     let expected: Vec<f32> = data.iter().copied().map(host_gelu).collect();
-    expect_values(session, shape, Dtype::F32, &read(&y)?, &expected)?;
-    let grad = gradient_of(&graph, &y, &x)?;
+    expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await?;
+    let grad = gradient_of(&graph, &y, &x).await?;
     let want: Vec<f32> = data.iter().copied().map(host_gelu_grad).collect();
     crate::compare::approx_or_relative_eq(backend_of(session), &[len], &want, &grad, 2e-3, 2e-3)?;
     Ok(())
@@ -508,7 +517,7 @@ fn host_gelu_grad(x: f32) -> f32 {
 /// the case pins it: an implementation that answers 1 there makes a dead unit
 /// come back to life. The first element is forced to exactly 0 so the kink is
 /// present at every sampled shape.
-fn relu_kink(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn relu_kink(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let len = len_of(shape);
     let mut data = Domain::Wide.sample(seed, len);
     data[0] = 0.0;
@@ -519,9 +528,9 @@ fn relu_kink(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     let expected: Vec<f32> = data.iter().map(|v| v.max(0.0)).collect();
-    expect_values(session, shape, Dtype::F32, &read(&y)?, &expected)?;
+    expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await?;
 
-    let grad = gradient_of(&graph, &y, &x)?;
+    let grad = gradient_of(&graph, &y, &x).await?;
     let want: Vec<f32> = data.iter().map(|v| f32::from(*v > 0.0)).collect();
     crate::compare::approx_or_relative_eq(backend_of(session), &[len], &want, &grad, 1e-6, 1e-6)?;
     Ok(())
@@ -532,7 +541,7 @@ fn relu_kink(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 ///
 /// Without it the round inside would differentiate to zero everywhere and no
 /// quantization-aware model would train at all.
-fn straight_through_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn straight_through_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let len = len_of(shape);
     let data = Domain::Custom(-1.0, 1.0).sample(seed, len);
     let graph = graph_of(session);
@@ -546,9 +555,9 @@ fn straight_through_case(session: &Session, shape: &[u64], seed: u32) -> CaseRes
         .iter()
         .map(|v| (v / 0.25).round().clamp(-7.0, 7.0) * 0.25)
         .collect();
-    expect_values(session, shape, Dtype::F32, &read(&q)?, &expected)?;
+    expect_values(session, shape, Dtype::F32, &read(&q).await?, &expected).await?;
 
-    let grad = gradient_of(&graph, &q, &x)?;
+    let grad = gradient_of(&graph, &q, &x).await?;
     let want = vec![1.0f32; len];
     crate::compare::approx_or_relative_eq(backend_of(session), &[len], &want, &grad, 1e-6, 1e-6)
         .map_err(|e| -> CaseError {
@@ -562,7 +571,7 @@ fn straight_through_case(session: &Session, shape: &[u64], seed: u32) -> CaseRes
 }
 
 /// `detach` re-leafs a value, so nothing upstream of it receives a gradient.
-fn detach_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn detach_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let data = Domain::Wide.sample(seed, len_of(shape));
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
@@ -576,9 +585,9 @@ fn detach_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 
     // The detached copy holds the same values...
     let expected: Vec<f32> = data.iter().map(|v| 3.0 * v * v).collect();
-    expect_values(session, shape, Dtype::F32, &read(&y)?, &expected)?;
+    expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await?;
     // ...but the tape no longer runs through it.
-    if gradient_of(&graph, &y, &x).is_ok() {
+    if gradient_of(&graph, &y, &x).await.is_ok() {
         return Err("a gradient reached through detach(); it must cut the tape".into());
     }
     Ok(())
@@ -588,7 +597,7 @@ fn detach_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 /// own rule fires — that is what the pending-children counter buys. The
 /// gradient of `x*x + x` is `2x + 1`, and a rule that fires on the first
 /// adjoint alone gives `x + 1`.
-fn diamond_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn diamond_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let len = len_of(shape);
     let data = Domain::Wide.sample(seed, len);
     let graph = graph_of(session);
@@ -597,7 +606,7 @@ fn diamond_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .mul(&x)
         .and_then(|sq| sq.add(&x))
         .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let grad = gradient_of(&graph, &y, &x)?;
+    let grad = gradient_of(&graph, &y, &x).await?;
     let want: Vec<f32> = data.iter().map(|v| 2.0 * v + 1.0).collect();
     crate::compare::approx_or_relative_eq(backend_of(session), &[len], &want, &grad, 1e-4, 1e-4)
         .map_err(|e| -> CaseError {
@@ -609,7 +618,7 @@ fn diamond_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 
 /// `backward_seeded` is the loss-scale entry point: a seed of `s` scales every
 /// gradient by `s`.
-fn seeded_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn seeded_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     const SCALE: f32 = 8.0;
     let len = len_of(shape);
     let data = Domain::Wide.sample(seed, len);
@@ -627,7 +636,7 @@ fn seeded_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let g = grads
         .get(&x)
         .ok_or_else(|| -> CaseError { "no gradient for the seeded backward".into() })?;
-    let got = read(&g)?;
+    let got = read(&g).await?;
     let want: Vec<f32> = data.iter().map(|v| SCALE * 2.0 * v).collect();
     crate::compare::approx_or_relative_eq(backend_of(session), &[len], &want, &got, 1e-4, 1e-4)?;
     Ok(())
@@ -635,7 +644,7 @@ fn seeded_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 
 /// Two graphs are two tapes. Differentiating across them is a user error, not
 /// a silent zero. An error path, so it stays at a fixed shape.
-fn cross_graph(session: &Session) -> CaseResult {
+async fn cross_graph(session: &Session) -> CaseResult {
     const SHAPE: &[u64] = &[3, 4];
     const LEN: usize = 12;
     let a = graph_of(session);
@@ -652,7 +661,7 @@ fn cross_graph(session: &Session) -> CaseResult {
 /// A multi-input expression must hand a gradient to *every* requires-grad
 /// operand. The classic failure is a rule that returns only `d_lhs`. `b` is
 /// a divisor, so it stays away from zero.
-fn every_parent(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn every_parent(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let len = len_of(shape);
     let a_data = Domain::Wide.sample(seed, len);
     let b_data = Domain::Positive.sample(seed ^ 0x9e37_79b9, len);
@@ -668,9 +677,11 @@ fn every_parent(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
     for (label, operand) in [("a", &a), ("b", &b), ("c", &c)] {
-        let grad = gradient_of(&graph, &y, operand).map_err(|e| -> CaseError {
-            format!("operand {label} received no gradient: {e}").into()
-        })?;
+        let grad = gradient_of(&graph, &y, operand)
+            .await
+            .map_err(|e| -> CaseError {
+                format!("operand {label} received no gradient: {e}").into()
+            })?;
         if grad.len() != len {
             return Err(format!("operand {label}'s gradient has {} elements", grad.len()).into());
         }

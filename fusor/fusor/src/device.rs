@@ -113,6 +113,7 @@ impl Device {
     /// The GPU backend, blocking on adapter acquisition. `Err` when there is
     /// no usable adapter — the caller is expected to fall back.
     #[cfg(feature = "gpu")]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn gpu_blocking() -> Result<Self> {
         Ok(Self::Gpu(Gpu(Inner::new(Backend::gpu_blocking()?)?)))
     }
@@ -125,6 +126,7 @@ impl Device {
 
     /// The GPU if one is usable, otherwise the CPU.
     #[cfg(all(feature = "gpu", feature = "cpu"))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn auto() -> Self {
         Self::gpu_blocking().unwrap_or_else(|_| Self::cpu())
     }
@@ -133,12 +135,14 @@ impl Device {
     /// back to, so an unusable adapter is a panic; use [`Device::gpu_blocking`]
     /// to handle it.
     #[cfg(all(feature = "gpu", not(feature = "cpu")))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn auto() -> Self {
         Self::gpu_blocking().expect("no usable GPU adapter, and the `cpu` feature is off")
     }
 
     /// The CPU: the only backend this build has.
     #[cfg(all(feature = "cpu", not(feature = "gpu")))]
+    #[cfg(not(target_arch = "wasm32"))]
     pub fn auto() -> Self {
         Self::cpu()
     }
@@ -215,6 +219,11 @@ impl Device {
     /// If the wait fails, which means the device is gone.
     pub fn wait(&self) {
         self.session().wait().expect("device wait");
+    }
+
+    /// [`Self::wait`], awaited: the only form that completes in a browser.
+    pub async fn wait_async(&self) -> Result<()> {
+        self.session().wait_async().await
     }
 }
 

@@ -51,7 +51,7 @@ pub fn cases() -> Cases {
     cases
 }
 
-fn run_fold(
+async fn run_fold(
     session: &Session,
     carrier: Carrier,
     rows: u64,
@@ -62,7 +62,7 @@ fn run_fold(
     let dimv = dims(&[rows, axis]);
     let x = upload(graph.handle(), &dimv, data)?;
     let y = fold(&x, carrier)?;
-    read(&y)
+    read(&y).await
 }
 
 fn fold(x: &Tensor, carrier: Carrier) -> Result<Tensor, CaseError> {
@@ -75,11 +75,11 @@ fn fold(x: &Tensor, carrier: Carrier) -> Result<Tensor, CaseError> {
 ///
 /// Slot 0 is the row max and slot 1 the shifted sum, so `slot0 + ln(slot1)` is
 /// log-sum-exp: the value the two-pass form computes in two traversals.
-fn shift_stabilized_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn shift_stabilized_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (rows, axis) = (shape[0], shape[1]);
     let data = Domain::Wide.sample(seed, (rows * axis) as usize);
     let carrier = oracle::shift_stabilized_sum(UnOp::Exp, Dtype::F32);
-    let actual = run_fold(session, carrier, rows, axis, &data)?;
+    let actual = run_fold(session, carrier, rows, axis, &data).await?;
 
     // Two passes: the max, then the sum of the shifted exponentials.
     let mut expected = Vec::with_capacity((rows * 2) as usize);
@@ -89,7 +89,7 @@ fn shift_stabilized_case(session: &Session, shape: &[u64], seed: u32) -> CaseRes
         expected.push(m);
         expected.push(l);
     }
-    expect_values(session, &[rows, 2], Dtype::F32, &actual, &expected)?;
+    expect_values(session, &[rows, 2], Dtype::F32, &actual, &expected).await?;
 
     // And the value the carrier exists for: a log-sum-exp that stays finite
     // where the naive `sum(exp(x))` overflows.
@@ -109,11 +109,11 @@ fn shift_stabilized_case(session: &Session, shape: &[u64], seed: u32) -> CaseRes
 ///
 /// Every slot is checked, not just the one the answer is read from: a merge that
 /// updates only slot 0 would still produce a plausible `n`.
-fn welford_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn welford_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let (rows, axis) = (shape[0], shape[1]);
     let data = Domain::Wide.sample(seed, (rows * axis) as usize);
     let carrier = oracle::welford(Dtype::F32);
-    let actual = run_fold(session, carrier, rows, axis, &data)?;
+    let actual = run_fold(session, carrier, rows, axis, &data).await?;
 
     let mut expected = Vec::with_capacity((rows * 3) as usize);
     for row in data.chunks(axis as usize) {
@@ -122,7 +122,7 @@ fn welford_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         let m2: f32 = row.iter().map(|v| (v - mean) * (v - mean)).sum();
         expected.extend([n, mean, m2]);
     }
-    expect_values(session, &[rows, 3], Dtype::F32, &actual, &expected)?;
+    expect_values(session, &[rows, 3], Dtype::F32, &actual, &expected).await?;
 
     // `m2 / n` is the biased variance the two-pass form computes.
     for (i, chunk) in actual.chunks(3).enumerate() {
@@ -145,10 +145,10 @@ fn welford_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 /// where the rescale `l_a * exp(m_a - m)` meets `0 * exp((-inf) - (-inf))` and
 /// an unguarded spelling returns NaN — and merging `(-inf, NaN)` against a real
 /// partial propagates it into the answer.
-fn identity_lane_case(session: &Session) -> CaseResult {
+async fn identity_lane_case(session: &Session) -> CaseResult {
     let data = vec![2.5f32, -1.0, 7.25];
     let carrier = oracle::shift_stabilized_sum(UnOp::Exp, Dtype::F32);
-    let actual = run_fold(session, carrier, 3, 1, &data)?;
+    let actual = run_fold(session, carrier, 3, 1, &data).await?;
     let expected: Vec<f32> = data.iter().flat_map(|v| [*v, 1.0]).collect();
     for (i, (g, e)) in actual.iter().zip(&expected).enumerate() {
         if !g.is_finite() {

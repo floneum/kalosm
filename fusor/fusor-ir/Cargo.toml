@@ -10,6 +10,7 @@ repository.workspace = true
 
 # No wgpu, no SIMD, no device access, no filesystem.
 [dependencies]
+web-time.workspace = true
 smallvec.workspace = true
 rustc-hash.workspace = true
 fixedbitset.workspace = true

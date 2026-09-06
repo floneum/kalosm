@@ -1006,13 +1006,22 @@ impl<T: Element> ToVec for HostSlice<3, T> {
 impl<const R: usize, T: Element> Tensor<R, T> {
     /// Resolve up to this value and copy it back to the host.
     ///
-    /// Returns a ready future: fusor's readback is synchronous, and the
-    /// `async` shape is what a caller driving a runtime expects to await.
+    /// The dispatch runs when the future is first polled; the copy back is
+    /// awaited. On the web that await is the only way a readback completes;
+    /// natively it is already resolved by the time it is reached.
     pub fn as_slice(&self) -> impl Future<Output = Result<HostSlice<R, T>>> + 'static {
-        std::future::ready(self.read())
+        let raw = self.raw.clone();
+        async move {
+            Ok(HostSlice {
+                slice: raw.as_slice_async().await?,
+                _t: PhantomData,
+            })
+        }
     }
 
-    /// The blocking spelling of [`Tensor::as_slice`].
+    /// The blocking spelling of [`Tensor::as_slice`]. Native only in
+    /// effect: on the web it returns an error, since nothing can block on
+    /// the device there.
     pub fn read(&self) -> Result<HostSlice<R, T>> {
         Ok(HostSlice {
             slice: self.raw.as_slice()?,

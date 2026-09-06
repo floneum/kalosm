@@ -9,6 +9,7 @@
 //! firings, launch counts or plan hashes — correctness of every candidate
 //! kernel at random sizes is the whole contract.
 
+pub mod bench;
 pub mod compare;
 pub mod harness;
 pub mod suite;

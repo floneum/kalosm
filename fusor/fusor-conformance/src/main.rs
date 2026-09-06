@@ -9,14 +9,17 @@
 
 use std::process::ExitCode;
 
+#[cfg(not(target_arch = "wasm32"))]
 use fusor_conformance::harness::{self, Outcome, sessions};
 
 /// Prints every `log` record at warn level or above to stderr. wgpu reports
 /// the driver's actual failure — the DX12 HRESULT behind a lost device, a
 /// D3D12 debug-layer message — only through `log`, and without a logger it
 /// is discarded and the run shows nothing but "Device is lost".
+#[cfg(not(target_arch = "wasm32"))]
 struct StderrLog;
 
+#[cfg(not(target_arch = "wasm32"))]
 impl log::Log for StderrLog {
     fn enabled(&self, metadata: &log::Metadata) -> bool {
         metadata.level() <= log::Level::Warn
@@ -29,8 +32,18 @@ impl log::Log for StderrLog {
     fn flush(&self) {}
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 static LOGGER: StderrLog = StderrLog;
 
+// The binary drives the suite blocking; a browser runs it through the
+// library's async entry points (`sessions_async`, `run_all_async`).
+#[cfg(target_arch = "wasm32")]
+fn main() -> ExitCode {
+    eprintln!("fusor-conformance has no wasm binary; use the library's async harness");
+    ExitCode::FAILURE
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 fn main() -> ExitCode {
     let _ = log::set_logger(&LOGGER).map(|()| log::set_max_level(log::LevelFilter::Warn));
     // Race every class member of every launch, value-checking each against

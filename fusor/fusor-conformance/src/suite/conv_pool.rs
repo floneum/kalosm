@@ -72,20 +72,23 @@ pub fn cases() -> Cases {
         GROUPED_CONV_SPEC,
         grouped_conv,
     ));
-    cases.push_case(fuzz_case("conv_pool", "pool", POOL_SPEC, |s, sh, seed| {
-        pool_case(s, Pool::Avg, sh, seed)
-    }));
+    cases.push_case(fuzz_case(
+        "conv_pool",
+        "pool",
+        POOL_SPEC,
+        async move |s: &Session, sh: &[u64], seed: u32| pool_case(s, Pool::Avg, sh, seed).await,
+    ));
     cases.push_case(fuzz_case(
         "conv_pool",
         "pool_max",
         POOL_SPEC,
-        |s, sh, seed| pool_case(s, Pool::Max, sh, seed),
+        async move |s: &Session, sh: &[u64], seed: u32| pool_case(s, Pool::Max, sh, seed).await,
     ));
     cases.push_case(fuzz_case(
         "conv_pool",
         "pool_min",
         POOL_SPEC,
-        |s, sh, seed| pool_case(s, Pool::Min, sh, seed),
+        async move |s: &Session, sh: &[u64], seed: u32| pool_case(s, Pool::Min, sh, seed).await,
     ));
     cases.push_case(fuzz_case(
         "conv_pool",
@@ -138,7 +141,7 @@ fn host_conv1d(
     (out_len, out)
 }
 
-fn conv1d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn conv1d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let [batch, in_ch, len, out_ch, k] = [
         shape[0] as usize,
         shape[1] as usize,
@@ -182,12 +185,13 @@ fn conv1d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         session,
         &[batch as u64, out_ch as u64, out_len as u64],
         Dtype::F32,
-        &read(&y)?,
+        &read(&y).await?,
         &expected,
-    )?;
+    )
+    .await?;
 
     // The bias gradient is one per output position per batch.
-    let d_bias = gradient_of(&graph, &y, &b)?;
+    let d_bias = gradient_of(&graph, &y, &b).await?;
     let want = (batch * out_len) as f32;
     for (i, v) in d_bias.iter().enumerate() {
         if (v - want).abs() > 1e-3 * want {
@@ -195,7 +199,7 @@ fn conv1d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         }
     }
 
-    let d_w = gradient_of(&graph, &y, &w)?;
+    let d_w = gradient_of(&graph, &y, &w).await?;
     let probe_graph = graph_of(session);
     let probe_x = upload(
         probe_graph.handle(),
@@ -218,14 +222,15 @@ fn conv1d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     )
     .map_err(|e| -> CaseError { e.to_string().into() })?;
     let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[out_ch * in_ch * k], &w_data, &mut |probe| {
+    let numeric = finite_difference_gradient(&[out_ch * in_ch * k], &w_data, |probe| {
         read_probe_loss(&probe_w, &probe_loss, probe)
-    })?;
+    })
+    .await?;
     assert_gradient_matches_finite_difference(&d_w, &numeric)?;
     Ok(())
 }
 
-fn conv2d_strided(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn conv2d_strided(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let [batch, in_ch, h, w_ext, out_ch, k] = [
         shape[0] as usize,
         shape[1] as usize,
@@ -278,9 +283,10 @@ fn conv2d_strided(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         session,
         &[batch as u64, out_ch as u64, out_h as u64, out_w as u64],
         Dtype::F32,
-        &read(&y)?,
+        &read(&y).await?,
         &expected,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
@@ -288,7 +294,7 @@ fn conv2d_strided(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
 /// `shape` is `[batch, groups, per_group_in, per_group_out, len, k]` — the
 /// per-group channel counts are sampled and multiplied so groups always
 /// divides both.
-fn grouped_conv(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn grouped_conv(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let [batch, groups, per_group_in, per_group_out, len, k] = [
         shape[0] as usize,
         shape[1] as usize,
@@ -343,9 +349,10 @@ fn grouped_conv(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
         session,
         &[batch as u64, out_ch as u64, out_len as u64],
         Dtype::F32,
-        &read(&y)?,
+        &read(&y).await?,
         &expected,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
@@ -357,7 +364,7 @@ enum Pool {
 }
 
 /// A non-overlapping pool over the last axis of `[1, ch, window * positions]`.
-fn pool_case(session: &Session, kind: Pool, shape: &[u64], seed: u32) -> CaseResult {
+async fn pool_case(session: &Session, kind: Pool, shape: &[u64], seed: u32) -> CaseResult {
     let [ch, window, positions] = [shape[0] as usize, shape[1] as usize, shape[2] as usize];
     let len = window * positions;
     let data = Domain::Wide.sample(seed, ch * len);
@@ -386,9 +393,10 @@ fn pool_case(session: &Session, kind: Pool, shape: &[u64], seed: u32) -> CaseRes
         session,
         &[1, ch as u64, positions as u64],
         Dtype::F32,
-        &read(&y)?,
+        &read(&y).await?,
         &expected,
-    )?;
+    )
+    .await?;
     Ok(())
 }
 
@@ -397,7 +405,7 @@ fn pool_case(session: &Session, kind: Pool, shape: &[u64], seed: u32) -> CaseRes
 /// extremum) or nothing, and **no element receives a contribution from two
 /// windows**. That last clause is the one a scatter would be needed for, and
 /// it is what this case falsifies.
-fn non_overlapping_adjoint_is_mask(session: &Session) -> CaseResult {
+async fn non_overlapping_adjoint_is_mask(session: &Session) -> CaseResult {
     const LEN: usize = 8;
     const WINDOW: usize = 4;
     // Distinct values, so every window has a unique maximum and the tie rule
@@ -409,7 +417,7 @@ fn non_overlapping_adjoint_is_mask(session: &Session) -> CaseResult {
     let y = pool_max(&x, &[PoolSize::new(WINDOW, WINDOW)])
         .map_err(|e| -> CaseError { e.to_string().into() })?;
 
-    let grad = gradient_of(&graph, &y, &x)?;
+    let grad = gradient_of(&graph, &y, &x).await?;
     if grad.len() != LEN {
         return Err(format!(
             "the pool adjoint produced {} values, want {LEN}",
@@ -454,7 +462,7 @@ fn non_overlapping_adjoint_is_mask(session: &Session) -> CaseResult {
     Ok(())
 }
 
-fn upsample_nearest2d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
+async fn upsample_nearest2d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let [c, h, w, scale] = [shape[0], shape[1], shape[2], shape[3]];
     let data = Domain::Wide.sample(seed, (c * h * w) as usize);
 
@@ -486,12 +494,13 @@ fn upsample_nearest2d(session: &Session, shape: &[u64], seed: u32) -> CaseResult
         session,
         &[1, c, h * scale, w * scale],
         Dtype::F32,
-        &read(&y)?,
+        &read(&y).await?,
         &expected,
-    )?;
+    )
+    .await?;
 
     // Each source element feeds `scale^2` outputs, so its gradient is that.
-    let grad = gradient_of(&graph, &y, &x)?;
+    let grad = gradient_of(&graph, &y, &x).await?;
     let want = (scale * scale) as f32;
     if let Some((i, v)) = grad
         .iter()

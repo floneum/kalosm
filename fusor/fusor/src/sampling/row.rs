@@ -389,7 +389,29 @@ pub(crate) fn remember(graph: &GraphRef, token: Id) {
 /// This resolves the remembered token tensors, so it is only ever called when
 /// a penalty above `1` is actually requested.
 pub(crate) fn previous_tokens(graph: &GraphRef) -> Vec<u32> {
-    let ids = {
+    let ids = remembered_ids(graph);
+    ids.iter()
+        .filter_map(|id| graph.tensor(*id).to_vec_u32().ok())
+        .filter_map(|v| v.first().copied())
+        .collect()
+}
+
+/// [`previous_tokens`], awaited.
+pub(crate) async fn previous_tokens_async(graph: &GraphRef) -> Vec<u32> {
+    let mut out = Vec::new();
+    for id in remembered_ids(graph) {
+        if let Ok(v) = graph.tensor(id).to_vec_u32_async().await
+            && let Some(first) = v.first()
+        {
+            out.push(*first);
+        }
+    }
+    out
+}
+
+/// The remembered token ids for `graph`, newest last, without resolving.
+fn remembered_ids(graph: &GraphRef) -> Vec<Id> {
+    {
         let Ok(log) = history().lock() else {
             return Vec::new();
         };
@@ -398,11 +420,7 @@ pub(crate) fn previous_tokens(graph: &GraphRef) -> Vec<u32> {
             .find(|(g, _)| g.upgrade().is_some_and(|g| GraphRef::as_ptr(&g) == key))
             .map(|(_, ids)| ids.clone())
             .unwrap_or_default()
-    };
-    ids.iter()
-        .filter_map(|id| graph.tensor(*id).to_vec_u32().ok())
-        .filter_map(|v| v.first().copied())
-        .collect()
+    }
 }
 
 /// Apply the repetition penalty to a `[n, 1]` logits column.

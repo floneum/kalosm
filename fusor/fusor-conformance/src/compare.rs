@@ -5,6 +5,7 @@
 //! multi-dimensional index on failure.
 
 use std::fmt::{self, Debug, Display};
+use std::future::Future;
 
 use fusor::Dtype;
 
@@ -279,18 +280,22 @@ pub const FD_ABS_TOL: f32 = 1e-2;
 pub const FD_REL_TOL: f32 = 1e-2;
 
 /// A scalar loss as a function of one input tensor's flat values.
-pub type LossFn<'a> = &'a mut dyn FnMut(&[f32]) -> Result<f32, CaseError>;
+/// A loss evaluated at a probe point: each evaluation is a readback, so the
+/// callback hands back a future. The probe is passed by value so the future
+/// owns it and borrows only what the callback captured.
+pub trait LossFn<Fut: Future<Output = Result<f32, CaseError>>>: FnMut(Vec<f32>) -> Fut {}
+impl<Fut: Future<Output = Result<f32, CaseError>>, F: FnMut(Vec<f32>) -> Fut> LossFn<Fut> for F {}
 
 /// One element's numeric derivative: a central difference whose step shrinks
 /// until the two one-sided slopes agree.
 ///
 /// `base` is `loss(data)` at the unperturbed point — the same value for every
 /// element, so the caller evaluates it once.
-fn refined_partial(
+async fn refined_partial<Fut: Future<Output = Result<f32, CaseError>>>(
     base: f32,
     slot: usize,
     probe: &mut [f32],
-    loss: LossFn<'_>,
+    loss: &mut impl LossFn<Fut>,
 ) -> Result<f32, CaseError> {
     let original = probe[slot];
     let mut eps = FD_EPSILON;
@@ -301,10 +306,10 @@ fn refined_partial(
     for _ in 0..=FD_REFINEMENTS {
         probe[slot] = original + eps;
         let h_up = probe[slot] - original;
-        let up = loss(probe)?;
+        let up = loss(probe.to_vec()).await?;
         probe[slot] = original - eps;
         let h_down = original - probe[slot];
-        let down = loss(probe)?;
+        let down = loss(probe.to_vec()).await?;
         probe[slot] = original;
         // `eps` has fallen below an ulp of `original`: no step left to take.
         // On a later try the previous candidate stands; on the first, no
@@ -362,10 +367,10 @@ fn refined_partial(
 ///
 /// `loss` is re-evaluated `2 * data.len() + 1` times (more where the step
 /// refines), so this only ever runs at small shapes.
-pub fn finite_difference_gradient(
+pub async fn finite_difference_gradient<Fut: Future<Output = Result<f32, CaseError>>>(
     shape: &[usize],
     data: &[f32],
-    loss: LossFn<'_>,
+    mut loss: impl LossFn<Fut>,
 ) -> Result<Vec<f32>, CaseError> {
     let expected: usize = shape.iter().product();
     if expected != data.len() {
@@ -376,10 +381,10 @@ pub fn finite_difference_gradient(
         .into());
     }
     let mut probe = data.to_vec();
-    let base = loss(&probe)?;
+    let base = loss(probe.clone()).await?;
     let mut grad = vec![0.0f32; data.len()];
     for (i, g) in grad.iter_mut().enumerate() {
-        *g = refined_partial(base, i, &mut probe, &mut *loss)?;
+        *g = refined_partial(base, i, &mut probe, &mut loss).await?;
     }
     Ok(grad)
 }

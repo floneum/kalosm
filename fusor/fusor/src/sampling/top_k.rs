@@ -26,6 +26,14 @@ impl GpuSampledToken {
             .copied()
             .ok_or_else(|| Error::Shape("the sampled token tensor came back empty".into()))
     }
+
+    /// [`Self::to_u32`], awaited: the form a browser can use.
+    pub async fn to_u32_async(&self) -> Result<u32> {
+        let v = self.value.to_vec_u32_async().await?;
+        v.first()
+            .copied()
+            .ok_or_else(|| Error::Shape("the sampled token tensor came back empty".into()))
+    }
 }
 
 /// `(values, indices)` of the k largest entries along the last axis.
