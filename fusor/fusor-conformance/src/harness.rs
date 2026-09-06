@@ -530,6 +530,8 @@ pub struct Report {
     pub case: String,
     pub backend: &'static str,
     pub outcome: Outcome,
+    /// Wall time of the case body, so a slow shard names its slow case.
+    pub secs: f32,
 }
 
 fn panic_message(payload: Box<dyn Any + Send>) -> String {
@@ -611,6 +613,7 @@ pub fn run_all(mut progress: impl FnMut(&Report)) -> Vec<Report> {
                 case: case.name.clone(),
                 backend: "none",
                 outcome: Outcome::Skipped("no device available".to_string()),
+                secs: 0.0,
             };
             progress(&report);
             out.push(report);
@@ -620,10 +623,13 @@ pub fn run_all(mut progress: impl FnMut(&Report)) -> Vec<Report> {
     for case in registry.iter() {
         for session in &sessions {
             let _guard = is_gpu(session).then(gpu_test_guard);
+            let started = web_time::Instant::now();
+            let outcome = run_one(case, session);
             let report = Report {
                 case: case.name.clone(),
                 backend: backend_name(session),
-                outcome: run_one(case, session),
+                outcome,
+                secs: started.elapsed().as_secs_f32(),
             };
             progress(&report);
             out.push(report);
@@ -688,10 +694,13 @@ impl Harness {
         for case in self.selected(&registry) {
             for session in &sessions {
                 let _guard = is_gpu(session).then(gpu_test_guard);
+                let started = web_time::Instant::now();
+                let outcome = run_one(case, session);
                 out.push(Report {
                     case: case.name.clone(),
                     backend: backend_name(session),
-                    outcome: run_one(case, session),
+                    outcome,
+                    secs: started.elapsed().as_secs_f32(),
                 });
             }
         }
@@ -710,10 +719,13 @@ impl Harness {
         let mut out = Vec::new();
         for case in self.selected(&registry) {
             for session in sessions {
+                let started = web_time::Instant::now();
+                let outcome = run_one_async(case, session).await;
                 let report = Report {
                     case: case.name.clone(),
                     backend: backend_name(session),
-                    outcome: run_one_async(case, session).await,
+                    outcome,
+                    secs: started.elapsed().as_secs_f32(),
                 };
                 progress(&report);
                 out.push(report);
@@ -739,11 +751,11 @@ pub fn summarize(reports: &[Report]) -> usize {
     let mut failures = 0;
     for r in reports {
         match &r.outcome {
-            Outcome::Pass => println!("ok      {} [{}]", r.case, r.backend),
+            Outcome::Pass => println!("ok      {} [{}] {:.1}s", r.case, r.backend, r.secs),
             Outcome::Skipped(why) => println!("skip    {} [{}]: {why}", r.case, r.backend),
             Outcome::Fail(err) => {
                 failures += 1;
-                println!("FAILED  {} [{}]: {err}", r.case, r.backend);
+                println!("FAILED  {} [{}] {:.1}s: {err}", r.case, r.backend, r.secs);
             }
         }
     }
