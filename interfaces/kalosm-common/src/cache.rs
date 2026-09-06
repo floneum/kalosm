@@ -158,7 +158,7 @@ impl Cache {
                 let safe_file = crate::opfs::sanitize_name(file);
 
                 let token = self.huggingface_token.clone().or_else(huggingface_token);
-                let url = format!("https://huggingface.co/{model_id}/resolve/{revision}/{file}");
+                let url = huggingface_resolve_url(model_id, revision, file);
                 let client = reqwest::Client::new();
 
                 // 1. HEAD request to get expected Content-Length
@@ -342,7 +342,7 @@ impl Cache {
                 file,
             } => {
                 let token = self.huggingface_token.clone().or_else(huggingface_token);
-                let url = format!("https://huggingface.co/{model_id}/resolve/{revision}/{file}");
+                let url = huggingface_resolve_url(model_id, revision, file);
                 let client = reqwest::Client::new();
                 let head = client
                     .head(&url)
@@ -827,7 +827,10 @@ fn huggingface_token() -> Option<String> {
     (!token.is_empty()).then_some(token)
 }
 
-#[cfg(not(target_arch = "wasm32"))]
+/// The download URL of one file at one revision. A revision such as
+/// `refs/pr/5` is a single path segment to the hub, so its slashes are
+/// percent-encoded; sent raw, the hub answers 404.
 fn huggingface_resolve_url(model_id: &str, revision: &str, file: &str) -> String {
+    let revision = revision.replace('/', "%2F");
     format!("https://huggingface.co/{model_id}/resolve/{revision}/{file}")
 }

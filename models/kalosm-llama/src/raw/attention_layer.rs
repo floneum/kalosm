@@ -185,7 +185,7 @@ impl SeparateAttention {
                 let query_width = num_heads * head_dim;
                 let key_width = num_key_value_heads * head_dim;
                 let value_width = key_width;
-                let mut qkv = attention_qkv.mat_mul(&hidden_states);
+                let mut qkv = attention_qkv.mat_mul(hidden_states);
                 if let Some(bias) = &self.bias {
                     qkv = qkv.add_(&bias.bias_qkv);
                 }
@@ -195,9 +195,9 @@ impl SeparateAttention {
                     qkv.narrow(Minus1, query_width + key_width, value_width),
                 )
             } else {
-                let mut q = self.attention_wq.mat_mul(&hidden_states);
-                let mut k = self.attention_wk.mat_mul(&hidden_states);
-                let mut v = self.attention_wv.mat_mul(&hidden_states);
+                let mut q = self.attention_wq.mat_mul(hidden_states);
+                let mut k = self.attention_wk.mat_mul(hidden_states);
+                let mut v = self.attention_wv.mat_mul(hidden_states);
                 if let Some(bias) = &self.bias {
                     q = q.add_(&bias.bias_q);
                     k = k.add_(&bias.bias_k);
@@ -239,7 +239,7 @@ impl GroupedAttention {
         start_pos: usize,
         positions: Option<&Tensor<1, u32>>,
     ) -> (Tensor<4>, Tensor<4>, Tensor<4>) {
-        let qkv = self.attention_qkv.mat_mul(&x);
+        let qkv = self.attention_qkv.mat_mul(x);
 
         let query_pos = num_heads * head_dim;
         let kv_width = num_key_value_heads * head_dim;

@@ -120,6 +120,19 @@ async fn run(name: &'static str, source: LlamaSource) -> Row {
         }
     };
     row.load = t.elapsed().as_secs_f64();
+    // A warm turn first: the first resolve of a shape compiles and tunes
+    // its kernels, which is a one-off cost the steady state never pays.
+    {
+        let mut chat = model.chat();
+        let mut warm = chat(&"Say hello.".to_string());
+        let mut n = 0;
+        while warm.next().await.is_some() {
+            n += 1;
+            if n >= 8 {
+                break;
+            }
+        }
+    }
     let mut chat = model.chat();
     let mut response = chat(&PROMPT.to_string());
     let t = Instant::now();
