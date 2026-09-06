@@ -205,20 +205,12 @@ jobs:
         env:
           FUSOR_CONFORMANCE_REQUIRE_GPU: "1"
           WGPU_DX12_COMPILER: Dxc
-          # Every kernel WARP runs, and one dispatch per submission with the
-          # device state after each: a WARP device loss is otherwise
-          # reported asynchronously with no kernel named.
-          FUSOR_WGSL_DUMP: wgsl-dump
-          FUSOR_TRACE_DISPATCH: "1"
-          FUSOR_DUMP_EXEC: "1"
+          # To name the kernel behind a WARP device loss, add
+          # `FUSOR_TRACE_DISPATCH: "1"` (one submit and wait per dispatch,
+          # with the D3D12 removed reason after each) and
+          # `FUSOR_WGSL_DUMP: wgsl-dump`; both cost far too much to leave on.
         run: |
           cp warp/d3d10warp.dll dxc/dxcompiler.dll dxc/dxil.dll bin/
           for suite in ${{ matrix.shard.suites }}; do
             bin/fusor-conformance.exe "$suite" ${{ matrix.shard.args }}
           done
-      - uses: actions/upload-artifact@v4
-        if: failure()
-        with:
-          name: wgsl-dump-windows-${{ matrix.shard.name }}
-          path: wgsl-dump
-          retention-days: 3
