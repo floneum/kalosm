@@ -21,6 +21,8 @@ use crate::{
     GpuSamplerConfig, InferenceSettings, LlamaResultFuture, LlamaSession, LlamaSourceError, Task,
     UnstructuredGenerationTask,
 };
+#[cfg(feature = "vision")]
+use kalosm_language_model::ContentChunk;
 
 impl ModelBuilder for LlamaBuilder {
     type Model = Llama;
@@ -69,6 +71,20 @@ impl TextCompletionModel<GenerationParameters> for Llama {
         let sampler = GpuSamplerConfig::from_generation_parameters(&sampler);
         let on_token = Box::new(on_token);
         let text = msg.text();
+        #[cfg(feature = "vision")]
+        let images = {
+            let msg = msg.resolve_media_sources().await?;
+            let mut images = Vec::new();
+            for chunk in msg.chunks() {
+                if let ContentChunk::Media(media) = chunk {
+                    if let Some(bytes) = &media.source().as_bytes() {
+                        images.push((image::load_from_memory(bytes)?, media.hints().clone()))
+                    }
+                }
+            }
+            images
+        };
+        #[cfg(not(feature = "vision"))]
         let images = {
             if msg.has_media() {
                 return Err(LlamaModelError::MediaUnsupported);
@@ -147,6 +163,9 @@ where
             let sampler =
                 CpuSampler::new(GpuSamplerConfig::from_generation_parameters(&sampler), seed);
             let on_token = Box::new(on_token);
+            #[cfg(feature = "vision")]
+            let resolved_message = text.resolve_media_sources().await?;
+            #[cfg(not(feature = "vision"))]
             let resolved_message = {
                 if text.has_media() {
                     return Err(LlamaModelError::MediaUnsupported);

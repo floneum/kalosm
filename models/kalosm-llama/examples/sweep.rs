@@ -1,9 +1,8 @@
 #![recursion_limit = "256"]
-//! Run every `LlamaSource` preset (or a subset) through one chat turn and
-//! report load time, time to first token, decode rate and the text, with a
-//! cheap degeneration check. `sweep --list` shows which presets are cached;
-//! `sweep --cached` runs only those; `sweep a b c` runs named presets;
-//! `sweep --all` runs everything, downloading as it goes.
+//! Run `LlamaSource` presets through one chat turn and report load time,
+//! time to first token, decode rate and the text, with a cheap degeneration
+//! check. `sweep a b c` runs the named presets; `sweep --all` runs every
+//! preset, downloading as it goes.
 
 use kalosm_llama::prelude::*;
 use std::io::Write;
@@ -73,6 +72,7 @@ presets!(
     wizard_lm_7b_v2,
     solar_10_7b,
     solar_10_7b_instruct,
+    qwen_2_5_3b_vl_chat_q4,
 );
 
 const PROMPT: &str = "In two or three sentences, explain why the sky is blue.";
@@ -189,35 +189,23 @@ fn main() {
         .try_init();
     let args: Vec<String> = std::env::args().skip(1).collect();
     let all = presets();
-    if args.iter().any(|a| a == "--list") {
-        for (name, make) in &all {
-            println!(
-                "{:<36} {}",
-                name,
-                if make().is_cached() {
-                    "cached"
-                } else {
-                    "missing"
-                }
-            );
-        }
-        return;
-    }
     let selected: Vec<(&'static str, fn() -> LlamaSource)> = if args.iter().any(|a| a == "--all") {
         all
-    } else if args.is_empty() || args.iter().any(|a| a == "--cached") {
-        all.into_iter().filter(|(_, m)| m().is_cached()).collect()
     } else {
         all.into_iter()
             .filter(|(n, _)| args.iter().any(|a| a == n))
             .collect()
     };
+    if selected.is_empty() {
+        eprintln!("usage: sweep <preset>... | --all");
+        return;
+    }
     pollster::block_on(async {
         let mut rows = Vec::new();
         for (name, make) in selected {
             let source = make();
-            if !source.is_cached() && free_gb() < 4.0 {
-                eprintln!("skipping {name}: not cached and under 4 GB free");
+            if free_gb() < 4.0 {
+                eprintln!("skipping {name}: under 4 GB free for a download");
                 continue;
             }
             println!("\n===== {name} =====");

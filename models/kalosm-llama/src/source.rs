@@ -191,17 +191,6 @@ impl LlamaSource {
     /// For the llama family of models, this is typically 1
     /// For the mistral family of models, this is typically 8
     ///
-    /// Whether every file this source needs is already in the cache, so
-    /// building it will not download anything.
-    pub fn is_cached(&self) -> bool {
-        self.model
-            .iter()
-            .chain(self.vision_model.iter())
-            .chain(self.tokenizer.iter())
-            .chain(self.config.iter())
-            .all(|file| self.cache.exists(file))
-    }
-
     /// This is determined automatically for any gguf models
     pub fn with_group_query_attention(mut self, group_query_attention: u8) -> Self {
         self.group_query_attention = group_query_attention;

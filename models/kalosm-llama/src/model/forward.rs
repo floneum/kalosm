@@ -19,9 +19,6 @@ impl LlamaModel {
         if tokens.is_empty() {
             return Err(LlamaModelError::EmptyInput);
         }
-        if !images.is_empty() {
-            return Err(LlamaModelError::MediaUnsupported);
-        }
 
         #[cfg(debug_assertions)]
         {
@@ -42,7 +39,7 @@ impl LlamaModel {
         let token_start = trace_enabled.then(Instant::now);
         let build_start = trace_enabled.then(Instant::now);
         let mut cache = cache;
-        let logits = model.forward(tokens, device, cache.as_deref_mut());
+        let logits = model.forward(tokens, images, device, cache.as_deref_mut());
         if let Some(start) = build_start {
             tracing::info!(
                 "forward_graph_build path={path} decode_eligible={decode_eligible} elapsed={:?}",

@@ -2,8 +2,8 @@ use std::sync::{Arc, Mutex};
 
 use crate::chat_template::HuggingFaceChatTemplate;
 use crate::raw::attention_layer::LlamaAttention;
-use crate::raw::rope::RopeImplementation;
-use crate::LlamaSourceError;
+use crate::raw::rope::{RopeAt, RopeImplementation};
+use crate::{LlamaImage, LlamaSourceError};
 use attention_layer::AttentionBias;
 use attention_layer::AttentionVariant;
 use attention_layer::FeedForwardVariant;
@@ -20,7 +20,27 @@ use weight::Weight;
 mod attention_layer;
 pub mod cache;
 mod rope;
+#[cfg(feature = "vision")]
+mod vision;
 mod weight;
+
+/// One token's rope position on the `(time, height, width)` axes; every
+/// axis agrees for a text token.
+#[cfg(feature = "vision")]
+pub(crate) use vision::RopePosition;
+#[cfg(not(feature = "vision"))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct RopePosition(pub(crate) [u32; 3]);
+#[cfg(not(feature = "vision"))]
+impl RopePosition {
+    pub(crate) fn text(p: u32) -> Self {
+        Self([p; 3])
+    }
+    pub(crate) fn scalar(self) -> Option<u32> {
+        let [t, h, w] = self.0;
+        (t == h && h == w).then_some(t)
+    }
+}
 
 use cache::LlamaCache;
 
@@ -45,6 +65,10 @@ pub struct LlamaConfig {
     pub(crate) sliding_window_type: Option<usize>,
     #[allow(dead_code)]
     pub(crate) sliding_window_size: Option<usize>,
+    /// The multi-axis rope's frequency sections (Qwen-VL), or `None`.
+    pub(crate) mrope_sections: Option<Vec<usize>>,
+    pub(crate) vision_start_token: Option<u32>,
+    pub(crate) image_pad_token: Option<u32>,
 }
 
 impl LlamaConfig {
@@ -74,7 +98,17 @@ pub struct Model {
     /// absolute position, both `[1]` `u32`. Only their *bytes* change per
     /// step, so every step reuses one graph and replays one plan.
     step_inputs: std::sync::OnceLock<(Tensor<1, u32>, Tensor<1, u32>)>,
+    /// The embedding-row step's persistent leaves: one `[1, 1, hidden]`
+    /// embedding and its `[1, head_dim / 2]` cos and sin rows. Only their
+    /// bytes change per step, so an image prompt's tokens all replay one
+    /// graph.
+    embed_inputs: std::sync::OnceLock<(Tensor<3>, Tensor<2>, Tensor<2>)>,
+    #[cfg(feature = "vision")]
+    vision_encoder: Option<vision::QwenVisionTransformer>,
 }
+
+/// Each image's token range in the expanded prompt and its embeddings.
+type ImageEmbeds = Vec<(std::ops::Range<usize>, Tensor<2>)>;
 
 /// The embedded token inputs produced by [`Model::encode_tokens`], ready to be
 /// run through the transformer layers.
@@ -82,6 +116,23 @@ pub(crate) struct EncodedTokens {
     embeddings: Tensor<3>,
     seq_len: usize,
     index_pos: usize,
+    /// One rope position per token. `None` when every token sits at
+    /// `index_pos + i`, which is every text-only model.
+    positions: Option<Vec<RopePosition>>,
+}
+
+/// The `(cos, sin)` tables of an encoded sequence's positions, when any of
+/// them needs more than a table row.
+fn tables_for(
+    rope: &RopeImplementation,
+    positions: Option<&[RopePosition]>,
+    device: &Device,
+) -> Option<(Tensor<2>, Tensor<2>)> {
+    let positions = positions?;
+    if positions.iter().all(|p| p.scalar().is_some()) {
+        return None;
+    }
+    Some(rope.tables_for(positions, device))
 }
 
 pub(crate) trait LlamaVarSource {
@@ -101,7 +152,7 @@ impl LlamaVarSource for ShardedVarBuilder {
 
 /// A GGUF tensor as a dense rank-1 `f32` value (norm weights, biases,
 /// `rope_freqs.weight`).
-fn dense_1d(device: &Device, raw: &RawTensorBytes) -> Result<Tensor<1>> {
+pub(crate) fn dense_1d(device: &Device, raw: &RawTensorBytes) -> Result<Tensor<1>> {
     let n: u64 = raw.shape.iter().product();
     match raw.fmt {
         // The dtype is data read out of the file; the rank is not.
@@ -126,6 +177,7 @@ fn dense_1d(device: &Device, raw: &RawTensorBytes) -> Result<Tensor<1>> {
 impl Model {
     pub fn from_gguf<S: LlamaVarSource>(
         source: &mut S,
+        vision_bytes: Option<Vec<u8>>,
         device: &Device,
         override_stop_token_string: Option<String>,
         override_chat_template: Option<String>,
@@ -212,11 +264,21 @@ impl Model {
                 (&*architecture == "gemma3").then_some(GEMMA_DEFAULT_ROPE_FREQUENCY_SLIDING)
             });
 
-        if source.get(".rope.dimension_sections").is_ok() {
-            return Err(LlamaSourceError::MissingGgufEntry(
-                "mrope (Qwen-VL) models are not supported by the fusor port yet".to_string(),
-            ));
-        }
+        // A multi-axis rope (Qwen-VL): frequency sections per position axis.
+        let mrope_sections: Option<Vec<usize>> = source
+            .get(".rope.dimension_sections")
+            .ok()
+            .and_then(|v| v.to_array().ok())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.to_u32().ok())
+                    .filter(|&n| n > 0)
+                    .map(|n| n as usize)
+                    .collect()
+            });
+        let token_id = |text: &str| tokens.iter().position(|v| v == text).map(|i| i as u32);
+        let vision_start_token = token_id("<|vision_start|>");
+        let image_pad_token = token_id("<|image_pad|>");
 
         let context_length = source.get(".context_length")?.to_u32()? as usize;
         let head_dim = source
@@ -245,6 +307,9 @@ impl Model {
             rope_scaling,
             sliding_window_type,
             sliding_window_size,
+            mrope_sections,
+            vision_start_token,
+            image_pad_token,
         };
         let config = Arc::new(config);
 
@@ -265,9 +330,10 @@ impl Model {
             Err(_) => tok_embeddings_q.clone(),
         };
         let mut layers = Vec::with_capacity(block_count);
-        let interleaved_rope = architecture.as_str() != "qwen2"
-            && architecture.as_str() != "qwen3"
-            && architecture.as_str() != "gemma3";
+        let interleaved_rope = !matches!(
+            architecture.as_str(),
+            "qwen2" | "qwen2vl" | "qwen3" | "gemma3"
+        );
         for layer_idx in 0..block_count {
             let prefix = format!("blk.{layer_idx}");
             let attention_variant = if let Ok(attention_qkv) =
@@ -403,6 +469,13 @@ impl Model {
             })
         }
 
+        #[cfg(feature = "vision")]
+        let vision_encoder = vision_bytes
+            .map(|bytes| vision::QwenVisionTransformer::from_gguf(bytes, device))
+            .transpose()?;
+        #[cfg(not(feature = "vision"))]
+        let _ = vision_bytes;
+
         Ok(Self {
             config,
             tok_embeddings: tok_embeddings_q,
@@ -412,6 +485,9 @@ impl Model {
             output,
             masks: Mutex::new(MaskCache::new()),
             step_inputs: std::sync::OnceLock::new(),
+            embed_inputs: std::sync::OnceLock::new(),
+            #[cfg(feature = "vision")]
+            vision_encoder,
         })
     }
 
@@ -446,6 +522,7 @@ impl Model {
             let all_tokens = &all_tokens[start..];
             if let Some(cache) = cache.as_mut() {
                 cache.tokens = all_tokens.to_vec();
+                cache.rope_position = 0;
             }
             assert!(all_tokens.len() <= self.config.context_length);
             (all_tokens.to_vec(), 0)
@@ -460,25 +537,141 @@ impl Model {
         (tokens, index_pos)
     }
 
+    /// Expand every `<|vision_start|><|image_pad|>` pair into one pad token
+    /// per merged image token, and embed the images. Returns the expanded
+    /// tokens, each image's `(token range, embeddings)` and its merged grid.
+    #[cfg(feature = "vision")]
+    #[allow(clippy::type_complexity)]
+    fn expand_images(
+        &self,
+        raw_tokens: &[u32],
+        images: &[LlamaImage],
+    ) -> Result<(Vec<u32>, ImageEmbeds, Vec<[u32; 2]>)> {
+        let (Some(vision), Some(start_token), Some(pad_token)) = (
+            &self.vision_encoder,
+            self.config.vision_start_token,
+            self.config.image_pad_token,
+        ) else {
+            return Ok((raw_tokens.to_vec(), Vec::new(), Vec::new()));
+        };
+        let mut encoded = Vec::with_capacity(images.len());
+        for (image, hints) in images {
+            let (patches, grid) =
+                vision.preprocess_image(image, hints.min_tokens(), hints.max_tokens());
+            encoded.push((vision.forward_image(&patches, grid)?, grid));
+        }
+        let mut encoded = encoded.into_iter();
+        let mut tokens = Vec::with_capacity(raw_tokens.len());
+        let mut ranges = Vec::new();
+        let mut grids = Vec::new();
+        let mut it = raw_tokens.iter().copied().peekable();
+        while let Some(token) = it.next() {
+            tokens.push(token);
+            if token == start_token && it.peek() == Some(&pad_token) {
+                let Some((embeds, grid)) = encoded.next() else {
+                    return Err(fusor::Error::Shape(
+                        "an image placeholder in the prompt has no image".into(),
+                    ));
+                };
+                it.next();
+                let start = tokens.len();
+                let n = vision.tokens_for(grid);
+                tokens.extend(std::iter::repeat_n(pad_token, n));
+                ranges.push((start..start + n, embeds));
+                let m = vision.spatial_merge_size as u32;
+                grids.push([grid[1] / m, grid[2] / m]);
+            }
+        }
+        Ok((tokens, ranges, grids))
+    }
+
     pub fn encode_tokens(
         &self,
         raw_tokens: &[u32],
+        images: &[LlamaImage],
         device: &Device,
-        cache: Option<&mut LlamaCache>,
-    ) -> EncodedTokens {
-        let (tokens, index_pos) = self.plan_tokens(raw_tokens, cache);
+        mut cache: Option<&mut LlamaCache>,
+    ) -> Result<EncodedTokens> {
+        #[cfg(feature = "vision")]
+        let (expanded, image_embeds, grids) = self.expand_images(raw_tokens, images)?;
+        #[cfg(not(feature = "vision"))]
+        let (expanded, image_embeds, grids): (Vec<u32>, ImageEmbeds, Vec<[u32; 2]>) = {
+            let _ = images;
+            (raw_tokens.to_vec(), Vec::new(), Vec::new())
+        };
+        let (tokens, index_pos) = self.plan_tokens(&expanded, cache.as_deref_mut());
         let seq_len = tokens.len();
+        // A trimmed window no longer lines up with the image ranges; the
+        // pads then embed as ordinary tokens.
+        let image_embeds = if seq_len == expanded.len() {
+            image_embeds
+        } else {
+            Vec::new()
+        };
         let ids = Tensor::from_slice(device, [seq_len], &tokens);
-        let mut embeddings = self.tok_embeddings.rows_at(&ids).unsqueeze(0);
+        let mut text = self.tok_embeddings.rows_at(&ids);
         if let Some(scale) = self.tok_embedding_scale {
-            embeddings = embeddings.mul_scalar(scale);
+            text = text.mul_scalar(scale);
         }
+        let embeddings = if image_embeds.is_empty() {
+            text.unsqueeze(0)
+        } else {
+            let mut pieces = Vec::with_capacity(2 * image_embeds.len() + 1);
+            let mut at = 0;
+            for (range, embeds) in image_embeds {
+                if range.start > at {
+                    pieces.push(text.narrow(0, at, range.start - at));
+                }
+                pieces.push(embeds);
+                at = range.end;
+            }
+            if at < seq_len {
+                pieces.push(text.narrow(0, at, seq_len - at));
+            }
+            // One vision pass: materialized here rather than re-derived by
+            // every step that narrows a row out of it.
+            Tensor::cat(pieces, 0).materialize().unsqueeze(0)
+        };
 
-        EncodedTokens {
+        let start = cache
+            .as_deref()
+            .map_or(index_pos as u32, |c| c.rope_position);
+        let positions = match (
+            self.config.mrope_sections.as_ref(),
+            self.config.vision_start_token,
+            self.config.image_pad_token,
+        ) {
+            (Some(_), Some(start_token), Some(pad_token)) => {
+                #[cfg(feature = "vision")]
+                let (positions, next) =
+                    vision::rope_index(&tokens, start_token, pad_token, &grids, start);
+                #[cfg(not(feature = "vision"))]
+                let (positions, next) = {
+                    let _ = (start_token, pad_token, grids);
+                    let positions: Vec<RopePosition> = (0..seq_len as u32)
+                        .map(|i| RopePosition::text(start + i))
+                        .collect();
+                    (positions, start + seq_len as u32)
+                };
+                if let Some(cache) = cache {
+                    cache.rope_position = next;
+                }
+                Some(positions)
+            }
+            _ => {
+                if let Some(cache) = cache {
+                    cache.rope_position = start + seq_len as u32;
+                }
+                None
+            }
+        };
+
+        Ok(EncodedTokens {
             embeddings,
             seq_len,
             index_pos,
-        }
+            positions,
+        })
     }
 
     /// The `(MaskKind, mask tensor)` a `[q_len, k_len]` score block needs.
@@ -510,9 +703,105 @@ impl Model {
     /// rank 1: the reshape is a pure `Restride` view, and a view cannot be
     /// the root of a resolve on its own (nothing would land in a buffer).
     /// The row-major bytes are identical either way.
+    /// The fixed-cache token loop: every id is one replayed decode step.
+    fn forward_fixed_tokens(
+        &self,
+        tokens: &[u32],
+        device: &Device,
+        cache: &mut LlamaCache,
+    ) -> Result<Tensor<2>> {
+        let (steps, _index_pos) = self.plan_tokens(tokens, Some(cache));
+        let n = steps.len();
+        let mut logits = None;
+        let base = cache.rope_position as usize;
+        cache.rope_position += n as u32;
+        for (i, tok) in steps.iter().enumerate() {
+            let want_logits = i + 1 == n;
+            let out = self.decode_step(*tok, base + i, device, cache, want_logits);
+            self.commit_step(out.as_ref(), device, cache)?;
+            logits = out.or(logits);
+        }
+        logits.ok_or_else(|| fusor::Error::Shape("forward of no tokens".into()))
+    }
+
+    /// The fixed-cache embedding loop an image prompt takes.
+    fn forward_fixed_embeds(
+        &self,
+        tokens: &[u32],
+        images: &[LlamaImage],
+        device: &Device,
+        cache: &mut LlamaCache,
+    ) -> Result<Tensor<2>> {
+        // Image tokens are embeddings, not ids, and sit at multi-axis
+        // rope positions. Every token of the prompt — text included,
+        // so the caches' armed appends stay with one graph — runs as
+        // an embedding-row step: the row and its rope rows are leaf
+        // bytes, so the whole prompt replays one graph. The token
+        // graph's memo is stale after this and rebuilds on the next
+        // text token.
+        cache.decode_graph = None;
+        let encoded = self.encode_tokens(tokens, images, device, Some(cache))?;
+        let rope = &self.layers[0].rope_cache;
+        let n = encoded.seq_len;
+        let positions: Vec<RopePosition> = match encoded.positions {
+            Some(p) => p,
+            None => (0..n)
+                .map(|i| RopePosition::text((encoded.index_pos + i) as u32))
+                .collect(),
+        };
+        let (cos, sin) = rope.rows_host(&positions);
+        let half = rope.half();
+        let rows = encoded.embeddings.to_vec_f32();
+        let hidden = rows.len() / n;
+        let mut logits = None;
+        for i in 0..n {
+            let out = self.embed_step(
+                &rows[i * hidden..(i + 1) * hidden],
+                &cos[i * half..(i + 1) * half],
+                &sin[i * half..(i + 1) * half],
+                device,
+                cache,
+                i + 1 == n,
+            );
+            self.commit_step(out.as_ref(), device, cache)?;
+            logits = out.or(logits);
+        }
+        logits.ok_or_else(|| fusor::Error::Shape("forward of no tokens".into()))
+    }
+
+    /// Resolve one step's outputs and commit the caches, the fixed-cache
+    /// step protocol: this step's KV writes (always) plus the logits on the
+    /// sampled step, then every cache adopts its written buffer so the
+    /// *same* graph runs the next step.
+    ///
+    /// The batch is the one genuinely rank-heterogeneous list here: a
+    /// `[1, vocab]` logits row beside `[1, kv_heads, len, dim]` cache
+    /// writes. That is what `resolve` takes and why the caches hand their
+    /// pending roots over as `Dyn`.
+    fn commit_step(
+        &self,
+        out: Option<&Tensor<2>>,
+        device: &Device,
+        cache: &mut LlamaCache,
+    ) -> Result<()> {
+        let mut batch = Vec::with_capacity(2 * cache.blocks.len() + 1);
+        if let Some(out) = out {
+            batch.push(out.clone().into_dyn());
+        }
+        for block in &cache.blocks {
+            block.pending_into(&mut batch);
+        }
+        device.session().resolve(&batch)?;
+        for block in &mut cache.blocks {
+            block.commit();
+        }
+        Ok(())
+    }
+
     pub fn forward(
         &self,
         tokens: &[u32],
+        images: &[LlamaImage],
         device: &Device,
         mut cache: Option<&mut LlamaCache>,
     ) -> Result<Tensor<2>> {
@@ -521,36 +810,12 @@ impl Model {
             .is_some_and(|c| c.blocks.first().is_some_and(|b| b.is_fixed()))
         {
             let cache = cache.as_deref_mut().expect("checked above");
-            let (steps, index_pos) = self.plan_tokens(tokens, Some(cache));
-            let n = steps.len();
-            let mut logits = None;
-            for (i, tok) in steps.iter().enumerate() {
-                let want_logits = i + 1 == n;
-                let out = self.decode_step(*tok, index_pos + i, device, cache, want_logits);
-                // One resolve per step: this step's KV writes (always) plus
-                // the logits on the sampled step. Then every cache adopts its
-                // written buffer so the *same* graph runs the next step.
-                //
-                // The batch is the one genuinely rank-heterogeneous list here:
-                // a `[1, vocab]` logits row beside `[1, kv_heads, len, dim]`
-                // cache writes. That is what `resolve` takes and why the caches
-                // hand their pending roots over as `Dyn`.
-                let mut batch = Vec::with_capacity(2 * cache.blocks.len() + 1);
-                if let Some(out) = &out {
-                    batch.push(out.clone().into_dyn());
-                }
-                for block in &cache.blocks {
-                    block.pending_into(&mut batch);
-                }
-                device.session().resolve(&batch)?;
-                for block in &mut cache.blocks {
-                    block.commit();
-                }
-                logits = out.or(logits);
+            if !images.is_empty() {
+                return self.forward_fixed_embeds(tokens, images, device, cache);
             }
-            return logits.ok_or_else(|| fusor::Error::Shape("forward of no tokens".into()));
+            return self.forward_fixed_tokens(tokens, device, cache);
         }
-        let hidden = self.forward_last_hidden_f32(tokens, device, cache)?;
+        let hidden = self.forward_last_hidden_f32(tokens, images, device, cache)?;
         Ok(self.output.mat_mul(&hidden))
     }
 
@@ -600,25 +865,85 @@ impl Model {
         }
         // The nodes below may not be the memoized ones (a grown store mints a
         // new leaf), so the memo dies here and is re-established only by a
-        // step that actually builds the head.
+        // step that actually builds the head. The embedding-row memo dies
+        // with it: the appends this step arms are not its.
         cache.decode_graph = None;
+        cache.embed_graph = None;
 
         let mut layer_in = self.tok_embeddings.rows_at(ids).unsqueeze(0);
         if let Some(scale) = self.tok_embedding_scale {
             layer_in = layer_in.mul_scalar(scale);
         }
+        let at = RopeAt::Leaf(pos);
+        let logits = self.decode_layers(layer_in, at, cache, want_logits);
+        if let Some(logits) = &logits {
+            cache.decode_graph = Some(logits.clone());
+        }
+        logits
+    }
 
+    /// [`Self::decode_step`] for an embedding row at explicit rope rows: the
+    /// step an image prompt's tokens take. Same memo discipline, on
+    /// `cache.embed_graph`.
+    fn embed_step(
+        &self,
+        row: &[f32],
+        cos: &[f32],
+        sin: &[f32],
+        device: &Device,
+        cache: &mut LlamaCache,
+        want_logits: bool,
+    ) -> Option<Tensor<2>> {
+        let (emb, cos_slot, sin_slot) = self.embed_inputs.get_or_init(|| {
+            let hidden = Dim::Const(row.len() as u64);
+            let half = Dim::Const(cos.len() as u64);
+            (
+                Tensor::leaf(device, [Dim::Const(1), Dim::Const(1), hidden]),
+                Tensor::leaf(device, [Dim::Const(1), half]),
+                Tensor::leaf(device, [Dim::Const(1), half]),
+            )
+        });
+        emb.set_elements(row);
+        cos_slot.set_elements(cos);
+        sin_slot.set_elements(sin);
+
+        if let Some(logits) = cache.embed_graph.clone() {
+            if cache.blocks.iter().all(|block| block.can_replay(1)) {
+                for block in &mut cache.blocks {
+                    block
+                        .replay_append(1)
+                        .expect("can_replay was checked for every block");
+                }
+                return want_logits.then_some(logits);
+            }
+        }
+        cache.embed_graph = None;
+        let at = RopeAt::Rows {
+            cos: cos_slot,
+            sin: sin_slot,
+        };
+        let logits = self.decode_layers(emb.clone(), at, cache, want_logits);
+        if let Some(logits) = &logits {
+            cache.embed_graph = Some(logits.clone());
+        }
+        logits
+    }
+
+    /// One `[1, 1, hidden]` embedding through every layer against the
+    /// fixed caches, and the head when `want_logits`.
+    fn decode_layers(
+        &self,
+        mut layer_in: Tensor<3>,
+        at: RopeAt<'_>,
+        cache: &mut LlamaCache,
+        want_logits: bool,
+    ) -> Option<Tensor<2>> {
         for (i, layer) in self.layers.iter().enumerate() {
             let residual = layer_in.clone();
             let x = layer.attention_norm.forward(&layer_in);
             // One query sees every cached key: structurally maskless.
-            let mut attn = layer.forward(
-                &x,
-                (MaskKind::None, None),
-                position,
-                Some(pos),
-                Some(&mut cache.blocks[i]),
-            );
+            let mut attn =
+                layer.forward(&x, (MaskKind::None, None), at, Some(&mut cache.blocks[i]));
             if let Some(post_attention_norm) = &layer.post_attention_norm {
                 attn = post_attention_norm.forward(&attn);
             }
@@ -643,18 +968,17 @@ impl Model {
         }
         let x = self.norm.forward(&layer_in);
         let hidden = x.reshape_dims([Dim::Const(1), x.extent(2)]);
-        let logits = self.output.mat_mul(&hidden);
-        cache.decode_graph = Some(logits.clone());
-        Some(logits)
+        Some(self.output.mat_mul(&hidden))
     }
 
     pub(crate) fn forward_last_hidden_f32(
         &self,
         tokens: &[u32],
+        images: &[LlamaImage],
         device: &Device,
         mut cache: Option<&mut LlamaCache>,
     ) -> Result<Tensor<2>> {
-        let encoded = self.encode_tokens(tokens, device, cache.as_deref_mut());
+        let encoded = self.encode_tokens(tokens, images, device, cache.as_deref_mut())?;
         if encoded.seq_len <= 1 {
             return self.forward_last_hidden_from_embeddings(encoded, device, cache);
         }
@@ -669,6 +993,7 @@ impl Model {
             embeddings,
             seq_len,
             index_pos,
+            positions,
         } = encoded;
         let mut last = None;
         for i in 0..seq_len {
@@ -676,6 +1001,7 @@ impl Model {
                 embeddings: embeddings.narrow(1, i, 1),
                 seq_len: 1,
                 index_pos: index_pos + i,
+                positions: positions.as_ref().map(|p| vec![p[i]]),
             };
             last = Some(self.forward_last_hidden_from_embeddings(
                 step,
@@ -696,8 +1022,23 @@ impl Model {
             embeddings: mut layer_in,
             seq_len,
             index_pos,
+            positions,
         } = encoded;
         let graph = device.graph().clone();
+        let tables = tables_for(&self.layers[0].rope_cache, positions.as_deref(), device);
+        // Every token of this call shares one placement: a multi-token call
+        // is text at consecutive offsets, and an image token arrives alone.
+        let mut row = None;
+        let at = match (positions.as_deref(), tables.as_ref()) {
+            (Some(p), Some((cos, sin))) if seq_len == 1 && p[0].scalar().is_none() => {
+                row = Some((cos.clone(), sin.clone()));
+                let (cos, sin) = row.as_ref().expect("just set");
+                RopeAt::Rows { cos, sin }
+            }
+            (Some(p), _) => RopeAt::Offset(p[0].0[0] as usize),
+            (None, _) => RopeAt::Offset(index_pos),
+        };
+        let _ = &row;
 
         for (i, layer) in self.layers.iter().enumerate() {
             let residual = layer_in.clone();
@@ -709,7 +1050,7 @@ impl Model {
                 .unwrap_or(0) as usize
                 + seq_len;
             let (kind, mask) = self.mask_for(&graph, seq_len, k_len, layer.sliding_window_size)?;
-            let mut attn = layer.forward(&x, (kind, mask.as_ref()), index_pos, None, cache_block);
+            let mut attn = layer.forward(&x, (kind, mask.as_ref()), at, cache_block);
             if let Some(post_attention_norm) = &layer.post_attention_norm {
                 attn = post_attention_norm.forward(&attn);
             }

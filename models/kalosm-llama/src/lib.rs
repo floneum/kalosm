@@ -78,6 +78,10 @@ use std::sync::Mutex;
 use std::task::{Context, Poll};
 pub use tokenizer::{LlamaTokenizer, LlamaTokenizerError};
 
+/// An image in a prompt, with the token budget the caller hinted.
+#[cfg(feature = "vision")]
+pub(crate) type LlamaImage = (image::DynamicImage, kalosm_language_model::MediaHints);
+#[cfg(not(feature = "vision"))]
 pub(crate) type LlamaImage = ();
 
 /// Re-export half::f16 for users who want to use f16 activation types

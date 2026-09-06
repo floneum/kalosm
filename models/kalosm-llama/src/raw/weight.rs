@@ -52,6 +52,53 @@ impl Weight {
         }
     }
 
+    /// The runtime tensor underneath.
+    #[cfg_attr(not(feature = "vision"), allow(dead_code))]
+    fn tensor(&self) -> &Dyn {
+        match self {
+            Self::Quantized(q) => &q.tensor,
+            Self::Dense(d) => d,
+        }
+    }
+
+    /// A leaf of the same dtype, format and shape with no contents of its
+    /// own: the slot a replayed graph binds each block's weight into.
+    #[cfg_attr(not(feature = "vision"), allow(dead_code))]
+    pub(crate) fn slot(&self, graph: &Graph) -> Result<Self> {
+        match self {
+            Self::Dense(d) => Ok(Self::Dense(graph.leaf("", &d.shape(), d.dtype())?)),
+            Self::Quantized(q) => {
+                let (Dim::Const(rows), Dim::Const(cols)) = (q.rows, q.cols) else {
+                    return Err(fusor::Error::Shape(
+                        "a quantized weight slot needs constant extents".into(),
+                    ));
+                };
+                let blocks = rows * (cols / u64::from(q.fmt.block_elements()).max(1));
+                let bytes = vec![0u8; (blocks * u64::from(q.fmt.block_bytes(q.layout))) as usize];
+                Ok(Self::Quantized(QMatrix::from_raw_bytes(
+                    graph,
+                    q.fmt,
+                    q.layout,
+                    [q.rows, q.cols],
+                    &bytes,
+                )?))
+            }
+        }
+    }
+
+    /// Put the weight on the device now, so a slot can adopt its buffer.
+    #[cfg_attr(not(feature = "vision"), allow(dead_code))]
+    pub(crate) fn upload(&self) -> Result<()> {
+        self.tensor().upload()
+    }
+
+    /// Rebind this slot to `from`'s device buffer; see
+    /// [`fusor::tensor::Dyn::adopt_buffer`].
+    #[cfg_attr(not(feature = "vision"), allow(dead_code))]
+    pub(crate) fn adopt(&self, from: &Self) -> Result<()> {
+        self.tensor().adopt_buffer(from.tensor())
+    }
+
     /// The quantized matrix, when the weight is one.
     pub(crate) fn quantized(&self) -> Option<&QMatrix> {
         match self {

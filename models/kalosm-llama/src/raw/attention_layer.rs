@@ -1,4 +1,4 @@
-use crate::raw::rope::RopeImplementation;
+use crate::raw::rope::{RopeAt, RopeImplementation};
 
 use crate::raw::weight::Weight;
 use fusor::cache::{KvCache, MaskKind};
@@ -177,8 +177,7 @@ impl SeparateAttention {
         num_key_value_heads: usize,
         hidden_states: &Tensor<3>,
         rope_cache: &RopeImplementation,
-        start_pos: usize,
-        positions: Option<&Tensor<1, u32>>,
+        at: RopeAt<'_>,
     ) -> (Tensor<4>, Tensor<4>, Tensor<4>) {
         let (query_states, key_states, value_states) =
             if let Some(attention_qkv) = &self.attention_qkv {
@@ -216,8 +215,7 @@ impl SeparateAttention {
         }
         let value = split_heads(&value_states, num_key_value_heads, head_dim);
 
-        let (query, key) =
-            rope_cache.forward(&query, &key, start_pos, self.interleaved_rope, positions);
+        let (query, key) = rope_cache.forward(&query, &key, self.interleaved_rope, at);
         (query, key, value)
     }
 }
@@ -236,8 +234,7 @@ impl GroupedAttention {
         num_key_value_heads: usize,
         x: &Tensor<3>,
         rope_cache: &RopeImplementation,
-        start_pos: usize,
-        positions: Option<&Tensor<1, u32>>,
+        at: RopeAt<'_>,
     ) -> (Tensor<4>, Tensor<4>, Tensor<4>) {
         let qkv = self.attention_qkv.mat_mul(x);
 
@@ -251,8 +248,7 @@ impl GroupedAttention {
         let key = split_heads(&key_states, num_key_value_heads, head_dim);
         let value = split_heads(&value_states, num_key_value_heads, head_dim);
 
-        let (query, key) =
-            rope_cache.forward(&query, &key, start_pos, self.interleaved_rope, positions);
+        let (query, key) = rope_cache.forward(&query, &key, self.interleaved_rope, at);
         (query, key, value)
     }
 }
@@ -278,8 +274,7 @@ impl LlamaAttention {
         &self,
         hidden_states: &Tensor<3>,
         mask: (MaskKind, Option<&Tensor<2>>),
-        start_pos: usize,
-        positions: Option<&Tensor<1, u32>>,
+        at: RopeAt<'_>,
         cache: Option<&mut KvCache>,
     ) -> Tensor<3> {
         let [b_sz, q_len, _] = hidden_states.shape();
@@ -295,8 +290,7 @@ impl LlamaAttention {
                 num_key_value_heads,
                 hidden_states,
                 &self.rope_cache,
-                start_pos,
-                positions,
+                at,
             ),
             AttentionVariant::Grouped(ref attention) => attention.forward(
                 num_heads,
@@ -304,8 +298,7 @@ impl LlamaAttention {
                 num_key_value_heads,
                 hidden_states,
                 &self.rope_cache,
-                start_pos,
-                positions,
+                at,
             ),
         };
 

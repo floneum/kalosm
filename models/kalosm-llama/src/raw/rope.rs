@@ -1,4 +1,4 @@
-use super::{LlamaConfig, RopeScalingConfig};
+use super::{LlamaConfig, RopePosition, RopeScalingConfig};
 use fusor::composite::base_inverse_frequency;
 use fusor::{Device, Tensor};
 use std::f32::consts::PI;
@@ -38,11 +38,33 @@ pub(crate) fn create_inverse_frequency(
     inverse_frequency
 }
 
+/// Where a rope application reads its angles from.
+#[derive(Clone, Copy)]
+pub(crate) enum RopeAt<'a> {
+    /// Token `i` of the activation sits at absolute position `start + i`.
+    Offset(usize),
+    /// The decode loop's form: a `[1]` `u32` position leaf whose bytes
+    /// change per step, so one graph serves every step.
+    Leaf(&'a Tensor<1, u32>),
+    /// Explicit `[seq, head_dim / 2]` tables, one row per token: the
+    /// multi-axis rope of a token inside an image, whose angles are not one
+    /// table row.
+    Rows {
+        cos: &'a Tensor<2>,
+        sin: &'a Tensor<2>,
+    },
+}
+
 /// A `[context, head_dim / 2]` sin/cos table over custom inverse frequencies.
 #[derive(Clone)]
 pub(crate) struct RopeImplementation {
     cos: Tensor<2>,
     sin: Tensor<2>,
+    inverse_frequency: Vec<f32>,
+    /// A multi-axis rope's frequency sections: section `s` takes its
+    /// position from axis `s % 3` of `(time, height, width)`. `None` is the
+    /// one-axis rope every text-only model uses.
+    mrope_sections: Option<Vec<usize>>,
 }
 
 impl RopeImplementation {
@@ -53,7 +75,10 @@ impl RopeImplementation {
             config.head_dimension,
             rope_theta,
         );
-        Self::from_inverse_frequency(&inverse_frequency, config.context_length, device)
+        let mut rope =
+            Self::from_inverse_frequency(&inverse_frequency, config.context_length, device);
+        rope.mrope_sections = config.mrope_sections.clone();
+        rope
     }
 
     pub(crate) fn from_inverse_frequency(
@@ -77,7 +102,57 @@ impl RopeImplementation {
         Self {
             sin: Tensor::from_slice(device, shape, &sin),
             cos: Tensor::from_slice(device, shape, &cos),
+            inverse_frequency: inverse_frequency.to_vec(),
+            mrope_sections: None,
         }
+    }
+
+    /// The `[tokens, head_dim / 2]` cos and sin rows of explicit per-token
+    /// positions. A one-axis rope reads the time axis; a multi-axis rope
+    /// reads each frequency section's own axis.
+    pub(crate) fn tables_for(
+        &self,
+        positions: &[RopePosition],
+        device: &Device,
+    ) -> (Tensor<2>, Tensor<2>) {
+        let (cos, sin) = self.rows_host(positions);
+        let shape = [positions.len(), self.half()];
+        (
+            Tensor::from_slice(device, shape, &cos),
+            Tensor::from_slice(device, shape, &sin),
+        )
+    }
+
+    /// The width of one table row: `head_dim / 2`.
+    pub(crate) fn half(&self) -> usize {
+        self.inverse_frequency.len()
+    }
+
+    /// [`Self::tables_for`] as host rows, `positions.len() * half` each.
+    pub(crate) fn rows_host(&self, positions: &[RopePosition]) -> (Vec<f32>, Vec<f32>) {
+        let half = self.inverse_frequency.len();
+        // Axis per frequency index.
+        let axis_of: Vec<usize> = match &self.mrope_sections {
+            Some(sections) => {
+                let mut axes = Vec::with_capacity(half);
+                for (s, len) in sections.iter().enumerate() {
+                    axes.extend(std::iter::repeat_n(s % 3, *len));
+                }
+                axes.resize(half, 0);
+                axes
+            }
+            None => vec![0; half],
+        };
+        let mut cos = Vec::with_capacity(positions.len() * half);
+        let mut sin = Vec::with_capacity(positions.len() * half);
+        for pos in positions {
+            for (f, axis) in self.inverse_frequency.iter().zip(&axis_of) {
+                let angle = pos.0[*axis] as f64 * *f as f64;
+                cos.push(angle.cos() as f32);
+                sin.push(angle.sin() as f32);
+            }
+        }
+        (cos, sin)
     }
 
     /// Rotate `q` and `k` at `start_pos`. `interleaved` pairs `(2i, 2i+1)`
@@ -90,16 +165,19 @@ impl RopeImplementation {
         &self,
         query: &Tensor<4>,
         key: &Tensor<4>,
-        start_pos: usize,
         interleaved: bool,
-        positions: Option<&Tensor<1, u32>>,
+        at: RopeAt<'_>,
     ) -> (Tensor<4>, Tensor<4>) {
         let (cos, sin) = (&self.cos, &self.sin);
-        match (positions, interleaved) {
-            (Some(p), true) => query.rope_interleaved_pair_at(key, cos, sin, p),
-            (Some(p), false) => query.rope_pair_at(key, cos, sin, p),
-            (None, true) => query.rope_interleaved_pair(key, cos, sin, start_pos as u64),
-            (None, false) => query.rope_pair(key, cos, sin, start_pos as u64),
+        match (at, interleaved) {
+            (RopeAt::Leaf(p), true) => query.rope_interleaved_pair_at(key, cos, sin, p),
+            (RopeAt::Leaf(p), false) => query.rope_pair_at(key, cos, sin, p),
+            (RopeAt::Offset(start), true) => {
+                query.rope_interleaved_pair(key, cos, sin, start as u64)
+            }
+            (RopeAt::Offset(start), false) => query.rope_pair(key, cos, sin, start as u64),
+            (RopeAt::Rows { cos, sin }, true) => query.rope_interleaved_pair(key, cos, sin, 0),
+            (RopeAt::Rows { cos, sin }, false) => query.rope_pair(key, cos, sin, 0),
         }
     }
 }

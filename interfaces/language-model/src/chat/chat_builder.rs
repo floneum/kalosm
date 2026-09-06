@@ -217,6 +217,7 @@ impl<M: CreateChatSession> Chat<M> {
             task: OnceLock::new(),
             queued_tokens: None,
             result: None,
+            received: None,
         }
     }
 
@@ -252,6 +253,7 @@ impl<M: CreateChatSession> Chat<M> {
             task: OnceLock::new(),
             queued_tokens: None,
             result: None,
+            received: None,
         }
     }
 
@@ -435,6 +437,10 @@ pub struct ChatResponseBuilder<
     task: OnceLock<RwLock<BoxedTaskFuture>>,
     #[allow(clippy::type_complexity)]
     result: Option<Receiver<Result<(M::ChatSession, BoxedAny), M::Error>>>,
+    /// The task's result once the stream has received it: the one-shot is
+    /// consumed by the stream when the task finishes, so a later `await` on
+    /// the same response reads it from here instead.
+    received: Option<Result<BoxedAny, M::Error>>,
     queued_tokens: Option<UnboundedReceiver<String>>,
 }
 
@@ -473,6 +479,7 @@ impl<'a, M: CreateChatSession, Constraints, Sampler>
             sampler: self.sampler,
             queued_tokens: None,
             result: None,
+            received: None,
             task: OnceLock::new(),
         }
     }
@@ -553,6 +560,7 @@ impl<'a, M: CreateChatSession, Constraints, Sampler>
             sampler: Some(sampler),
             queued_tokens: None,
             result: None,
+            received: None,
             task: OnceLock::new(),
         }
     }
@@ -675,8 +683,13 @@ where
                 // The result channel is ready as soon as the task completes.
                 // Pluck the updated session out and put it back into Chat.
                 if let Some(rx) = myself.result.as_mut() {
-                    if let Ok(Some(Ok((session, _)))) = rx.try_recv() {
-                        myself.chat_session.session = Some(Ok(session));
+                    match rx.try_recv() {
+                        Ok(Some(Ok((session, boxed)))) => {
+                            myself.chat_session.session = Some(Ok(session));
+                            myself.received = Some(Ok(boxed));
+                        }
+                        Ok(Some(Err(err))) => myself.received = Some(Err(err)),
+                        _ => {}
                     }
                 }
                 if let Some(token) = &mut myself.queued_tokens {
@@ -713,7 +726,12 @@ where
 
         Box::pin(async move {
             self.task.into_inner().unwrap().into_inner().unwrap().await;
-            let result = self.result.take().unwrap().await.unwrap();
+            let result = match self.received.take() {
+                // The stream already took the task's result.
+                Some(Ok(boxed)) => Ok((self.chat_session.session_take()?, boxed)),
+                Some(Err(err)) => Err(err),
+                None => self.result.take().unwrap().await.unwrap(),
+            };
             match result {
                 Ok((session, boxed)) => {
                     self.chat_session.session = Some(Ok(session));
@@ -809,8 +827,13 @@ where
                 *task = Box::pin(async move {});
                 drop(task);
                 if let Some(rx) = myself.result.as_mut() {
-                    if let Ok(Some(Ok((session, _)))) = rx.try_recv() {
-                        myself.chat_session.session = Some(Ok(session));
+                    match rx.try_recv() {
+                        Ok(Some(Ok((session, boxed)))) => {
+                            myself.chat_session.session = Some(Ok(session));
+                            myself.received = Some(Ok(boxed));
+                        }
+                        Ok(Some(Err(err))) => myself.received = Some(Err(err)),
+                        _ => {}
                     }
                 }
                 if let Some(token) = &mut myself.queued_tokens {
@@ -849,7 +872,12 @@ where
 
         Box::pin(async move {
             self.task.into_inner().unwrap().into_inner().unwrap().await;
-            let result = self.result.take().unwrap().await.unwrap();
+            let result = match self.received.take() {
+                // The stream already took the task's result.
+                Some(Ok(boxed)) => Ok((self.chat_session.session_take()?, boxed)),
+                Some(Err(err)) => Err(err),
+                None => self.result.take().unwrap().await.unwrap(),
+            };
             match result {
                 Ok((session, boxed)) => {
                     self.chat_session.session = Some(Ok(session));

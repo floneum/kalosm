@@ -649,7 +649,7 @@ mod tests {
             let legacy = legacy_pre_tokenizer(config.ty).unwrap();
 
             for sample in SAMPLES {
-                let native_splits = native.split(sample);
+                let native_splits = native_splits(&native, sample);
                 let legacy_splits = legacy_splits(&legacy, sample).unwrap();
                 assert_eq!(
                     native_splits, legacy_splits,
@@ -831,6 +831,16 @@ mod tests {
         }
 
         unreachable!("all bytes are covered by the byte-level alphabet")
+    }
+
+    fn native_splits(native: &super::PreTokenizer, text: &str) -> Vec<String> {
+        let mut buffers = super::PreTokenizationBuffers::default();
+        native.split_into_ranges(text, &mut buffers);
+        buffers
+            .pieces
+            .iter()
+            .map(|range| range.as_str(text).to_string())
+            .collect()
     }
 
     fn legacy_splits<'a>(

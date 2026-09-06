@@ -462,9 +462,29 @@ impl LlamaModel {
             None
         };
 
-        if builder.source.vision_model.is_some() {
-            return Err(LlamaSourceError::VisionFeatureDisabled);
-        }
+        // The vision tower's own file, when the preset has one.
+        #[cfg(feature = "vision")]
+        let vision_bytes = match &builder.source.vision_model {
+            Some(vision_model) => {
+                let vision_source = format!("Vision Model ({vision_model})");
+                let mut create_progress = ModelLoadingProgress::downloading_progress(vision_source);
+                Some(
+                    builder
+                        .source
+                        .cache
+                        .get_bytes(vision_model, |progress| handler(create_progress(progress)))
+                        .await?,
+                )
+            }
+            None => None,
+        };
+        #[cfg(not(feature = "vision"))]
+        let vision_bytes: Option<Vec<u8>> = {
+            if builder.source.vision_model.is_some() {
+                return Err(LlamaSourceError::VisionFeatureDisabled);
+            }
+            None
+        };
 
         let source = format!("Model ({})", builder.source.model[0]);
         let mut create_progress = ModelLoadingProgress::downloading_progress(source);
@@ -501,6 +521,7 @@ impl LlamaModel {
                 };
                 let model = Model::from_gguf(
                     &mut source,
+                    vision_bytes,
                     &device,
                     override_stop_token_string,
                     override_chat_template,

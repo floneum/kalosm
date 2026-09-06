@@ -30,6 +30,16 @@ pub struct LlamaCache {
     /// Held here and not on the `Model` because the graph names this cache's
     /// store leaves: two caches against one model are two graphs.
     pub(crate) decode_graph: Option<Tensor<2>>,
+    /// The same memo for the embedding-row step an image prompt runs: its
+    /// input is a `[1, 1, hidden]` embedding leaf and explicit rope rows,
+    /// not a token id. One of the two memos is live at a time; the other
+    /// rebuilds on its next use, since the caches' armed appends belong to
+    /// whichever graph ran last.
+    pub(crate) embed_graph: Option<Tensor<2>>,
+    /// The rope position of the next token. Equal to `tokens.len()` for a
+    /// text-only history; an image's tokens advance it by the larger side
+    /// of their grid rather than by their count.
+    pub(crate) rope_position: u32,
 }
 
 impl LlamaCache {
@@ -53,6 +63,8 @@ impl LlamaCache {
             tokens: Vec::new(),
             blocks,
             decode_graph: None,
+            embed_graph: None,
+            rope_position: 0,
         }
     }
 
@@ -65,5 +77,7 @@ impl LlamaCache {
         // dropping the root here is what keeps that from being an invariant
         // spread across two files.
         self.decode_graph = None;
+        self.embed_graph = None;
+        self.rope_position = 0;
     }
 }
