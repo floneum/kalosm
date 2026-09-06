@@ -620,6 +620,7 @@ impl GpuTarget {
             let gpu = artifact
                 .downcast_ref::<GpuArtifact>()
                 .ok_or_else(|| Error::Device("artifact is not a gpu pipeline".into()))?;
+            crate::launch::trace_binds(gpu.name, item.grid, &item.buffers);
             let bind_group = self.launcher.bind_group(gpu, &item.buffers)?;
             records.push(CommandRecord::Dispatch {
                 name: gpu.name,

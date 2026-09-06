@@ -119,6 +119,36 @@ fn trace_dispatch() -> bool {
     *ON.get_or_init(|| std::env::var_os("FUSOR_TRACE_DISPATCH").is_some())
 }
 
+/// Under `FUSOR_TRACE_DISPATCH`, every binding's buffer and whether any two
+/// are the same buffer: D3D12 forbids one resource bound as both a read-only
+/// input and the output of a dispatch, and WARP answers that with a device
+/// removal rather than a validation error.
+pub(crate) fn trace_binds(name: &str, grid: [u32; 3], binds: &[Buf]) {
+    if !trace_dispatch() {
+        return;
+    }
+    let mut seen: Vec<usize> = Vec::new();
+    let mut aliased = false;
+    let desc: Vec<String> = binds
+        .iter()
+        .enumerate()
+        .map(|(i, b)| {
+            let addr = b.addr();
+            if seen.contains(&addr) {
+                aliased = true;
+            }
+            seen.push(addr);
+            let size = b.downcast_ref::<GpuBuffer>().map_or(0, |g| g.size);
+            format!("{i}:{size}B@{addr:x}")
+        })
+        .collect();
+    eprintln!(
+        "[trace] binds {name} grid={grid:?} [{}]{}",
+        desc.join(" "),
+        if aliased { " ALIASED" } else { "" }
+    );
+}
+
 /// One kernel's aggregated timing across a resolve.
 #[derive(Clone, Debug, PartialEq)]
 pub struct KernelProfileRow {
@@ -375,33 +405,7 @@ impl Launcher {
             ));
         }
         self.write_uniforms(&binds[0], uniforms)?;
-        if trace_dispatch() {
-            // Every binding's buffer, and whether any two are the same
-            // buffer: D3D12 forbids one resource bound as both a read-only
-            // input and the output of a dispatch, and WARP answers that with
-            // a device removal rather than a validation error.
-            let mut seen: Vec<usize> = Vec::new();
-            let mut aliased = false;
-            let desc: Vec<String> = binds
-                .iter()
-                .enumerate()
-                .map(|(i, b)| {
-                    let addr = b.addr();
-                    if seen.contains(&addr) {
-                        aliased = true;
-                    }
-                    seen.push(addr);
-                    let size = b.downcast_ref::<GpuBuffer>().map_or(0, |g| g.size);
-                    format!("{i}:{size}B@{addr:x}")
-                })
-                .collect();
-            eprintln!(
-                "[trace] binds {} grid={grid:?} [{}]{}",
-                gpu.name,
-                desc.join(" "),
-                if aliased { " ALIASED" } else { "" }
-            );
-        }
+        trace_binds(gpu.name, grid, binds);
         let bind_group = self.bind_group(gpu, binds)?;
         let record = CommandRecord::Dispatch {
             name: gpu.name,
@@ -549,10 +553,14 @@ impl Launcher {
                     self.encode_one_submit(&chunk, timestamps, mode, dispatch_ix, total)?;
                 if trace {
                     let poll = self.device.poll(wgpu::PollType::wait_indefinitely());
-                    let state = match (&poll, self.lost.reason()) {
-                        (_, Some(reason)) => format!("LOST ({reason})"),
-                        (Err(e), None) => format!("poll error: {e}"),
-                        (Ok(_), None) => "ok".to_string(),
+                    let state = match (&poll, self.lost.reason(), self.removed_reason()) {
+                        (_, Some(reason), _) => format!("LOST ({reason})"),
+                        // D3D12 fences complete instantly once the device
+                        // is removed, so a clean wait proves nothing; the
+                        // driver's own removal reason names the dispatch.
+                        (_, None, Some(hr)) => format!("REMOVED ({hr})"),
+                        (Err(e), None, None) => format!("poll error: {e}"),
+                        (Ok(_), None, None) => "ok".to_string(),
                     };
                     if let CommandRecord::Dispatch { name, grid, .. } = record {
                         eprintln!("[trace] dispatch {name} grid={grid:?} -> {state}");
@@ -800,6 +808,22 @@ impl Launcher {
     /// A lost device is reported as an error naming the loss, both before
     /// and after polling: wgpu itself turns a poll on a lost device into a
     /// fatal panic that never says why the device went away.
+    /// The D3D12 device-removed reason, if the device has been removed;
+    /// `None` on every other backend and on a healthy device.
+    fn removed_reason(&self) -> Option<String> {
+        #[cfg(windows)]
+        {
+            // SAFETY: the hal device is only borrowed for the duration of
+            // one query that does not touch any wgpu-owned state.
+            let hal = unsafe { self.device.as_hal::<wgpu::hal::api::Dx12>() }?;
+            unsafe { hal.raw_device().GetDeviceRemovedReason() }
+                .err()
+                .map(|e| e.to_string())
+        }
+        #[cfg(not(windows))]
+        None
+    }
+
     pub fn poll_wait(&self) -> Result<()> {
         self.lost.check()?;
         self.poll_wait_inner()?;

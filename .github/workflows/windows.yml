@@ -151,15 +151,18 @@ jobs:
         run: |
           # The WARP and DXC DLLs must sit next to every test binary that
           # opens the adapter: each archive extracts under its own
-          # workspace's target/ci.
-          mkdir -p target/ci/deps fusor/target/ci/deps
+          # workspace's target/ci. nextest refuses to extract into an
+          # existing target dir, so the DLLs go in after the extraction
+          # (`list` extracts without running anything).
+          cargo nextest list --archive-file root-tests.tar.zst --workspace-remap . --extract-to . > /dev/null
+          cargo nextest list --archive-file fusor-tests.tar.zst --workspace-remap fusor --extract-to fusor > /dev/null
           cp warp/d3d10warp.dll dxc/dxcompiler.dll dxc/dxil.dll target/ci/deps/
           cp warp/d3d10warp.dll dxc/dxcompiler.dll dxc/dxil.dll fusor/target/ci/deps/
           # WARP/DX12 tests share one software adapter inside each binary;
           # keep them serialized to avoid backend aborts.
-          cargo nextest run --archive-file root-tests.tar.zst --workspace-remap . --extract-to . --test-threads 1 \
+          cargo nextest run --archive-file root-tests.tar.zst --workspace-remap . --extract-to . --extract-overwrite --test-threads 1 \
             -E 'not (package(rbert) | package(rwhisper) | package(kalosm-parse-macro))'
-          cargo nextest run --archive-file fusor-tests.tar.zst --workspace-remap fusor --extract-to fusor --test-threads 1
+          cargo nextest run --archive-file fusor-tests.tar.zst --workspace-remap fusor --extract-to fusor --extract-overwrite --test-threads 1
 
   conformance:
     needs: build
