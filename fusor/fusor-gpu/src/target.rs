@@ -669,14 +669,14 @@ impl GpuTarget {
                 self.launcher.timestamp_query_set(focus_pairs.len()),
                 TimingMode::Sparse(&focus_live),
             )
-        } else if self.launcher.can_time_whole(total) {
-            (self.launcher.timestamp_query_set(total), TimingMode::All)
         } else if let Some(start) = std::env::var("FUSOR_TIME_RANGE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
         {
-            // Times live dispatches `[start, start+cap)` of an over-cap plan
-            // and prints each span.
+            // Times live dispatches `[start, start+cap)` of any plan and
+            // prints each span as `TSPAN <index> <kernel> <us>`: the
+            // per-kernel profile of one resolve, for finding where a step's
+            // time goes.
             let live = records.iter().filter(|r| !r.is_empty_dispatch()).count();
             let cap = (wgpu::QUERY_SET_MAX_QUERIES as usize / 2).min(live.saturating_sub(start));
             if cap == 0 {
@@ -688,6 +688,8 @@ impl GpuTarget {
                     TimingMode::Range { start, n: cap },
                 )
             }
+        } else if self.launcher.can_time_whole(total) {
+            (self.launcher.timestamp_query_set(total), TimingMode::All)
         } else {
             (None, TimingMode::All)
         };

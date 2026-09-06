@@ -1344,124 +1344,180 @@ pub(crate) fn lower_sgemv(mut ctx: Ctx<'_>, op: &Launch, p: SgemvParams) -> Resu
     let b_row_base = ctx.b.mul(batch_idx, k_e);
 
     let acc_local = ctx.b.local(ElementType::Scalar(acc_elem));
-    let acc_read = ctx.b.load_local(acc_local.clone());
-    let init = ctx.b.zero(acc_elem);
-    let k_index = ctx.b.local(ElementType::Scalar(ScalarElement::U32));
-    let kk = ctx.b.load_local(k_index.clone());
-
     let vector = p.vector.max(1);
-    let stride = ctx.b.u32(block * vector);
-    let step = ctx.b.mul(kk, stride);
-    // Each lane owns `vector` consecutive elements of k. Overlapping lanes
-    // and vector offsets would double-count the interior of the window, and
-    // contiguous ownership lets a quantized operand amortize its block
-    // decode: the `vector` elements of one iteration land in one block, so
-    // their scale subexpressions hash-cons to a single evaluation.
-    let lane_base = {
-        let v_e = ctx.b.u32(vector);
-        let scaled = ctx.b.mul(lane.clone(), v_e);
-        ctx.b.add(step.clone(), scaled)
-    };
-    // When the loop's stride divides k exactly, every index the body ever
-    // forms is in range. A constant-true mask routes dense loads to the
-    // unclamped straight-line path and quantized loads to the direct decode —
-    // the clamp `Min` a mask forces is opaque to the aligned-window algebra.
-    // Inexact shapes keep the per-element bound check.
-    let exact = shape.k.max(1) % (block * vector).max(1) == 0;
-    let mut partial = acc_read;
-    for v in 0..vector {
-        let v_off = ctx.b.u32(v);
-        let k = ctx.b.add(lane_base.clone(), v_off);
-        let mask = if exact {
-            ctx.b.bool(true)
-        } else {
-            let k_bound = ctx.b.u32(shape.k.max(1));
-            ctx.b.compare(TileCompareOp::Lt, k.clone(), k_bound)
+    let pass = (block * vector).max(1);
+
+    // One pass of the k loop starting at `step`: the lane's partial,
+    // continued from its accumulator. `masked` bounds each element against
+    // k; only the tail past the last full pass needs it. A constant-true
+    // mask routes dense loads to the unclamped straight-line path and
+    // quantized loads to the direct decode — the clamp `Min` a mask forces
+    // is opaque to the aligned-window algebra, so masking every pass of an
+    // inexact k cost one decode per element on a block-quantized operand.
+    let pass_at = |ctx: &mut Ctx<'_>,
+                   step: TileExpr,
+                   masked: bool,
+                   from: &fusor_ir::ir::kernel::Local,
+                   vector: u32|
+     -> Result<TileExpr> {
+        // Each lane owns `vector` consecutive elements of k. Overlapping
+        // lanes and vector offsets would double-count the interior of the
+        // window, and contiguous ownership lets a quantized operand amortize
+        // its block decode: the `vector` elements of one iteration land in
+        // one block, so their scale subexpressions hash-cons to a single
+        // evaluation.
+        let lane_base = {
+            let v_e = ctx.b.u32(vector);
+            let scaled = ctx.b.mul(lane.clone(), v_e);
+            ctx.b.add(step, scaled)
         };
-        let mut avs = Vec::with_capacity(a_views.len());
-        for src in &a_views {
-            let src = match src {
-                StagedSource::Const(lit) => {
-                    avs.push(lit.clone());
-                    continue;
-                }
-                StagedSource::Mem(s) => s,
+        let mut partial = ctx.b.load_local(from.clone());
+        for v in 0..vector {
+            let v_off = ctx.b.u32(v);
+            let k = ctx.b.add(lane_base.clone(), v_off);
+            let mask = if masked {
+                let k_bound = ctx.b.u32(shape.k.max(1));
+                ctx.b.compare(TileCompareOp::Lt, k.clone(), k_bound)
+            } else {
+                ctx.b.bool(true)
             };
-            let fill = ctx.b.zero(source_element(src));
-            avs.push(ctx.b.load(
-                src.clone(),
-                Addr::Rc2 {
-                    row: row.clone(),
-                    col: k.clone(),
-                },
-                mask.clone(),
-                fill,
-            ));
-        }
-        let mut bvs = Vec::with_capacity(b_views.len());
-        for src in &b_views {
-            let src = match src {
-                StagedSource::Const(lit) => {
-                    bvs.push(lit.clone());
-                    continue;
-                }
-                StagedSource::Mem(s) => s,
-            };
-            let fill = ctx.b.zero(source_element(src));
-            let b_row = ctx.b.add(b_row_base.clone(), k.clone());
-            bvs.push(ctx.b.load(
-                src.clone(),
-                Addr::Rc2 {
-                    row: b_row,
-                    col: col.clone(),
-                },
-                mask.clone(),
-                fill,
-            ));
-        }
-        let a_coord_exprs = match &a_coords {
-            Some(c) => c.at(&mut ctx, &row, &k),
-            None => Vec::new(),
-        };
-        let b_coord_exprs = match &b_coords {
-            Some(c) => {
-                let b_row = ctx.b.add(b_row_base.clone(), k.clone());
-                c.at(&mut ctx, &b_row, &col)
+            let mut avs = Vec::with_capacity(a_views.len());
+            for src in &a_views {
+                let src = match src {
+                    StagedSource::Const(lit) => {
+                        avs.push(lit.clone());
+                        continue;
+                    }
+                    StagedSource::Mem(s) => s,
+                };
+                let fill = ctx.b.zero(source_element(src));
+                avs.push(ctx.b.load(
+                    src.clone(),
+                    Addr::Rc2 {
+                        row: row.clone(),
+                        col: k.clone(),
+                    },
+                    mask.clone(),
+                    fill,
+                ));
             }
-            None => Vec::new(),
-        };
-        let av = ctx.eval_scalar(&a.pre, &avs, &a_coord_exprs)?;
-        let bv = ctx.eval_scalar(&b.pre, &bvs, &b_coord_exprs)?;
-        let mut av = ctx.b.cast(av, ElementType::Scalar(acc_elem));
-        let mut bv = ctx.b.cast(bv, ElementType::Scalar(acc_elem));
-        // A masked-out k lane contributes a zero, not `pre(0)`. The loads
-        // above fill 0, but `pre` is an arbitrary scalar program over them:
-        // `exp(s*scale - m) / l` turns an all-zero fill into `inf`, and
-        // `fma(inf, 0, acc)` is NaN into the whole k-sum.
-        if !exact {
-            let zero = ctx.b.zero(acc_elem);
-            av = ctx.b.select(mask.clone(), av, zero.clone());
-            bv = ctx.b.select(mask.clone(), bv, zero);
+            let mut bvs = Vec::with_capacity(b_views.len());
+            for src in &b_views {
+                let src = match src {
+                    StagedSource::Const(lit) => {
+                        bvs.push(lit.clone());
+                        continue;
+                    }
+                    StagedSource::Mem(s) => s,
+                };
+                let fill = ctx.b.zero(source_element(src));
+                let b_row = ctx.b.add(b_row_base.clone(), k.clone());
+                bvs.push(ctx.b.load(
+                    src.clone(),
+                    Addr::Rc2 {
+                        row: b_row,
+                        col: col.clone(),
+                    },
+                    mask.clone(),
+                    fill,
+                ));
+            }
+            let a_coord_exprs = match &a_coords {
+                Some(c) => c.at(ctx, &row, &k),
+                None => Vec::new(),
+            };
+            let b_coord_exprs = match &b_coords {
+                Some(c) => {
+                    let b_row = ctx.b.add(b_row_base.clone(), k.clone());
+                    c.at(ctx, &b_row, &col)
+                }
+                None => Vec::new(),
+            };
+            let av = ctx.eval_scalar(&a.pre, &avs, &a_coord_exprs)?;
+            let bv = ctx.eval_scalar(&b.pre, &bvs, &b_coord_exprs)?;
+            let mut av = ctx.b.cast(av, ElementType::Scalar(acc_elem));
+            let mut bv = ctx.b.cast(bv, ElementType::Scalar(acc_elem));
+            // A masked-out k lane contributes a zero, not `pre(0)`. The
+            // loads above fill 0, but `pre` is an arbitrary scalar program
+            // over them: `exp(s*scale - m) / l` turns an all-zero fill into
+            // `inf`, and `fma(inf, 0, acc)` is NaN into the whole k-sum.
+            if masked {
+                let zero = ctx.b.zero(acc_elem);
+                av = ctx.b.select(mask.clone(), av, zero.clone());
+                bv = ctx.b.select(mask.clone(), bv, zero);
+            }
+            partial = ctx.b.fma(av, bv, partial);
         }
-        partial = ctx.b.fma(av, bv, partial);
-    }
+        Ok(partial)
+    };
 
     // The loop advances `block * vector` elements of k per iteration — the
     // stride the body actually indexes with — so that is what the count
-    // divides by. `chunk` stays a schedule knob in name only until a kernel
-    // gives it a meaning the body honors.
-    let chunks = shape.k.div_ceil((block * vector).max(1)).max(1);
-    let count = ctx.b.u32(chunks);
-    body.push(Stmt::Loop {
-        count: Some(count),
-        index: Some(k_index),
-        accumulators: vec![Accumulator {
-            local: acc_local.clone(),
-            init,
-            update: partial,
-        }],
-        body: Vec::new(),
-    });
+    // divides by: the full passes, unmasked, then the tail if k leaves one.
+    let full = shape.k.max(1) / pass;
+    let rem = shape.k.max(1) % pass;
+    if full > 0 {
+        let k_index = ctx.b.local(ElementType::Scalar(ScalarElement::U32));
+        let kk = ctx.b.load_local(k_index.clone());
+        let stride = ctx.b.u32(pass);
+        let step = ctx.b.mul(kk, stride);
+        let update = pass_at(&mut ctx, step, false, &acc_local, vector)?;
+        let init = ctx.b.zero(acc_elem);
+        let count = ctx.b.u32(full);
+        body.push(Stmt::Loop {
+            count: Some(count),
+            index: Some(k_index),
+            accumulators: vec![Accumulator {
+                local: acc_local.clone(),
+                init,
+                update,
+            }],
+            body: Vec::new(),
+        });
+    } else {
+        // A k shorter than one pass: no full pass to loop over, and an
+        // unmasked body under a zero count is not provably in range.
+        let zero = ctx.b.zero(acc_elem);
+        body.push(Stmt::StoreLocal {
+            dst: acc_local.clone(),
+            value: zero,
+        });
+    }
+    // The tail: the remainder spread evenly over the lanes as one unmasked
+    // pass of `rem / block` elements per lane, then the few elements that
+    // do not divide as one masked pass of one element per lane. Each is a
+    // one-iteration loop over its own accumulator seeded from the previous
+    // stage's: a loop's accumulator may only be written by that loop.
+    let mut acc_local = acc_local;
+    let mut at = full * pass;
+    let stages = [(rem / block, false), (rem % block, true)];
+    for (count, masked) in stages {
+        if count == 0 {
+            continue;
+        }
+        let (vector_n, span) = if masked {
+            (1, count)
+        } else {
+            (count, count * block)
+        };
+        let tail_local = ctx.b.local(ElementType::Scalar(acc_elem));
+        let step = ctx.b.u32(at);
+        let update = pass_at(&mut ctx, step, masked, &tail_local, vector_n)?;
+        let init = ctx.b.load_local(acc_local.clone());
+        let one = ctx.b.u32(1);
+        body.push(Stmt::Loop {
+            count: Some(one),
+            index: None,
+            accumulators: vec![Accumulator {
+                local: tail_local.clone(),
+                init,
+                update,
+            }],
+            body: Vec::new(),
+        });
+        acc_local = tail_local;
+        at += span;
+    }
 
     let lane_partial = ctx.b.load_local(acc_local);
     let fixed_subgroup = ctx.caps.subgroups.is_some_and(|s| s.is_fixed()) && block == width;
@@ -1602,108 +1658,10 @@ fn lower_sgemv_subgroup_cols(
         ctx.b.add(g, s)
     };
 
-    let k_index = ctx.b.local(ElementType::Scalar(ScalarElement::U32));
-    let kk = ctx.b.load_local(k_index.clone());
     let vector = p.vector.max(1);
-    let stride = ctx.b.u32(width * vector);
-    let step = ctx.b.mul(kk, stride);
-    // Each lane owns `vector` elements of the subgroup's pass. At
-    // `parts == 1` they are consecutive — the same contiguous-ownership
-    // contract as the whole-workgroup path. At `parts > 1` the window is
-    // `parts` runs of `run` consecutive elements spaced `gap` apart:
-    // `gap / run` adjacent lanes pack their runs into each gap, and a lane's
-    // runs interleave across `parts` gaps, so the pass still covers exactly
-    // `width * vector` consecutive k. A window that revisits a bit-packed
-    // word at each of its k offsets makes the word loads hash-cons to one
-    // evaluation instead of one per run.
-    let lane_base = if parts <= 1 {
-        let v_e = ctx.b.u32(vector);
-        let scaled = ctx.b.mul(sg_lane.clone(), v_e);
-        ctx.b.add(step, scaled)
-    } else {
-        let lanes_per_gap = p.gap / run;
-        let lpg_e = ctx.b.u32(lanes_per_gap);
-        let block_idx = ctx.b.binary(
-            TileBinaryOp::Div,
-            sg_lane.clone(),
-            lpg_e.clone(),
-            NumericContract::RELAXED,
-        );
-        let within = ctx.b.binary(
-            TileBinaryOp::Rem,
-            sg_lane.clone(),
-            lpg_e,
-            NumericContract::RELAXED,
-        );
-        let span_e = ctx.b.u32(p.gap * parts);
-        let run_e = ctx.b.u32(run);
-        let blk = ctx.b.mul(block_idx, span_e);
-        let packed = ctx.b.mul(within, run_e);
-        let local = ctx.b.add(blk, packed);
-        ctx.b.add(step, local)
-    };
-    // Same constant-true routing as the whole-workgroup path: an exact k
-    // keeps the unclamped straight-line loads and the aligned-window word
-    // sharing; an exact n keeps the column loads and stores unmasked.
-    let exact = shape.k.max(1).is_multiple_of((width * vector).max(1));
+    let pass = (width * vector).max(1);
     let col_exact = n.is_multiple_of(p.cols);
     let n_e = ctx.b.u32(n);
-
-    // The pass's activation window, evaluated once and reused by every
-    // column this subgroup owns.
-    let mut a_vals: Vec<(TileExpr, TileExpr, TileExpr)> = Vec::with_capacity(vector as usize);
-    for v in 0..vector {
-        // Constant offset of window element `v` from the lane base: run
-        // `v / run` sits `gap`-multiples out, position `v % run` within it.
-        // At `parts == 1` this folds back to `v`.
-        let off = if parts <= 1 {
-            v
-        } else {
-            (v / run) * p.gap + (v % run)
-        };
-        let v_off = ctx.b.u32(off);
-        let k = ctx.b.add(lane_base.clone(), v_off);
-        let mask = if exact {
-            ctx.b.bool(true)
-        } else {
-            let k_bound = ctx.b.u32(shape.k.max(1));
-            ctx.b.compare(TileCompareOp::Lt, k.clone(), k_bound)
-        };
-        let mut avs = Vec::with_capacity(a_views.len());
-        for src in a_views {
-            let src = match src {
-                StagedSource::Const(lit) => {
-                    avs.push(lit.clone());
-                    continue;
-                }
-                StagedSource::Mem(s) => s,
-            };
-            let fill = ctx.b.zero(source_element(src));
-            avs.push(ctx.b.load(
-                src.clone(),
-                Addr::Rc2 {
-                    row: row.clone(),
-                    col: k.clone(),
-                },
-                mask.clone(),
-                fill,
-            ));
-        }
-        let a_coord_exprs = match a_coords {
-            Some(c) => c.at(&mut ctx, &row, &k),
-            None => Vec::new(),
-        };
-        let av = ctx.eval_scalar(&a.pre, &avs, &a_coord_exprs)?;
-        let mut av = ctx.b.cast(av, ElementType::Scalar(acc_elem));
-        // A masked-out k lane contributes a zero, not `pre(0)` — see the
-        // whole-workgroup path for why the load's own zero fill is not
-        // enough once `pre` is an arbitrary scalar program.
-        if !exact {
-            let zero = ctx.b.zero(acc_elem);
-            av = ctx.b.select(mask.clone(), av, zero);
-        }
-        a_vals.push((k, mask, av));
-    }
 
     // One accumulator per owned column, all advanced by the same loop.
     let cols_of_subgroup: Vec<(TileExpr, TileExpr)> = (0..cps)
@@ -1718,69 +1676,249 @@ fn lower_sgemv_subgroup_cols(
             (col, ok)
         })
         .collect();
-    let mut accs = Vec::with_capacity(cps as usize);
-    for (col, col_ok) in &cols_of_subgroup {
-        let acc_local = ctx.b.local(ElementType::Scalar(acc_elem));
-        let mut partial = ctx.b.load_local(acc_local.clone());
-        for (k, mask, av) in &a_vals {
-            let load_mask = if col_exact {
-                mask.clone()
+    let locals: Vec<_> = (0..cps)
+        .map(|_| ctx.b.local(ElementType::Scalar(acc_elem)))
+        .collect();
+
+    // One pass of the k loop starting at `step`: every owned column's
+    // partial, continued from its accumulator local.
+    //
+    // `masked` bounds each element against k. Only the tail past the last
+    // full pass needs it: a full pass is in bounds by construction, and an
+    // unmasked pass keeps the unclamped straight-line loads and the
+    // aligned-window word sharing a quantized decode hash-conses onto. A
+    // k that is not a multiple of the pass used to mask *every* pass, and
+    // on a block-quantized operand that meant one decode per element —
+    // 100× the cost of the exact loop — for every model whose hidden width
+    // is not a multiple of 1024.
+    let pass_at = |ctx: &mut Ctx<'_>,
+                   step: TileExpr,
+                   masked: bool,
+                   from: &[fusor_ir::ir::kernel::Local],
+                   vector: u32,
+                   contiguous: bool|
+     -> Result<Vec<TileExpr>> {
+        // Each lane owns `vector` elements of the subgroup's pass. At
+        // `parts == 1` they are consecutive — the same contiguous-ownership
+        // contract as the whole-workgroup path. At `parts > 1` the window is
+        // `parts` runs of `run` consecutive elements spaced `gap` apart:
+        // `gap / run` adjacent lanes pack their runs into each gap, and a
+        // lane's runs interleave across `parts` gaps, so the pass still
+        // covers exactly `width * vector` consecutive k. A window that
+        // revisits a bit-packed word at each of its k offsets makes the word
+        // loads hash-cons to one evaluation instead of one per run.
+        let lane_base = if contiguous || parts <= 1 {
+            let v_e = ctx.b.u32(vector);
+            let scaled = ctx.b.mul(sg_lane.clone(), v_e);
+            ctx.b.add(step, scaled)
+        } else {
+            let lanes_per_gap = p.gap / run;
+            let lpg_e = ctx.b.u32(lanes_per_gap);
+            let block_idx = ctx.b.binary(
+                TileBinaryOp::Div,
+                sg_lane.clone(),
+                lpg_e.clone(),
+                NumericContract::RELAXED,
+            );
+            let within = ctx.b.binary(
+                TileBinaryOp::Rem,
+                sg_lane.clone(),
+                lpg_e,
+                NumericContract::RELAXED,
+            );
+            let span_e = ctx.b.u32(p.gap * parts);
+            let run_e = ctx.b.u32(run);
+            let blk = ctx.b.mul(block_idx, span_e);
+            let packed = ctx.b.mul(within, run_e);
+            let local = ctx.b.add(blk, packed);
+            ctx.b.add(step, local)
+        };
+
+        // The pass's activation window, evaluated once and reused by every
+        // column this subgroup owns.
+        let mut a_vals: Vec<(TileExpr, TileExpr, TileExpr)> = Vec::with_capacity(vector as usize);
+        for v in 0..vector {
+            // Constant offset of window element `v` from the lane base: run
+            // `v / run` sits `gap`-multiples out, position `v % run` within
+            // it. At `parts == 1` this folds back to `v`.
+            let off = if contiguous || parts <= 1 {
+                v
             } else {
-                ctx.b.and(mask.clone(), col_ok.clone())
+                (v / run) * p.gap + (v % run)
             };
-            let mut bvs = Vec::with_capacity(b_views.len());
-            for src in b_views {
+            let v_off = ctx.b.u32(off);
+            let k = ctx.b.add(lane_base.clone(), v_off);
+            let mask = if masked {
+                let k_bound = ctx.b.u32(shape.k.max(1));
+                ctx.b.compare(TileCompareOp::Lt, k.clone(), k_bound)
+            } else {
+                ctx.b.bool(true)
+            };
+            let mut avs = Vec::with_capacity(a_views.len());
+            for src in a_views {
                 let src = match src {
                     StagedSource::Const(lit) => {
-                        bvs.push(lit.clone());
+                        avs.push(lit.clone());
                         continue;
                     }
                     StagedSource::Mem(s) => s,
                 };
                 let fill = ctx.b.zero(source_element(src));
-                let b_row = ctx.b.add(b_row_base.clone(), k.clone());
-                bvs.push(ctx.b.load(
+                avs.push(ctx.b.load(
                     src.clone(),
                     Addr::Rc2 {
-                        row: b_row,
-                        col: col.clone(),
+                        row: row.clone(),
+                        col: k.clone(),
                     },
-                    load_mask.clone(),
+                    mask.clone(),
                     fill,
                 ));
             }
-            let b_coord_exprs = match b_coords {
-                Some(c) => {
-                    let b_row = ctx.b.add(b_row_base.clone(), k.clone());
-                    c.at(&mut ctx, &b_row, col)
-                }
+            let a_coord_exprs = match a_coords {
+                Some(c) => c.at(ctx, &row, &k),
                 None => Vec::new(),
             };
-            let bv = ctx.eval_scalar(&b.pre, &bvs, &b_coord_exprs)?;
-            let mut bv = ctx.b.cast(bv, ElementType::Scalar(acc_elem));
-            if !exact {
+            let av = ctx.eval_scalar(&a.pre, &avs, &a_coord_exprs)?;
+            let mut av = ctx.b.cast(av, ElementType::Scalar(acc_elem));
+            // A masked-out k lane contributes a zero, not `pre(0)` — see the
+            // whole-workgroup path for why the load's own zero fill is not
+            // enough once `pre` is an arbitrary scalar program.
+            if masked {
                 let zero = ctx.b.zero(acc_elem);
-                bv = ctx.b.select(mask.clone(), bv, zero);
+                av = ctx.b.select(mask.clone(), av, zero);
             }
-            partial = ctx.b.fma(av.clone(), bv, partial);
+            a_vals.push((k, mask, av));
         }
-        let init = ctx.b.zero(acc_elem);
-        accs.push(Accumulator {
-            local: acc_local,
-            init,
-            update: partial,
-        });
-    }
 
-    let chunks = shape.k.div_ceil((width * vector).max(1)).max(1);
-    let count = ctx.b.u32(chunks);
-    let locals: Vec<_> = accs.iter().map(|a| a.local.clone()).collect();
-    body.push(Stmt::Loop {
-        count: Some(count),
-        index: Some(k_index),
-        accumulators: accs,
-        body: Vec::new(),
-    });
+        let mut partials = Vec::with_capacity(cps as usize);
+        for (local, (col, col_ok)) in from.iter().zip(&cols_of_subgroup) {
+            let mut partial = ctx.b.load_local(local.clone());
+            for (k, mask, av) in &a_vals {
+                let load_mask = if col_exact {
+                    mask.clone()
+                } else {
+                    ctx.b.and(mask.clone(), col_ok.clone())
+                };
+                let mut bvs = Vec::with_capacity(b_views.len());
+                for src in b_views {
+                    let src = match src {
+                        StagedSource::Const(lit) => {
+                            bvs.push(lit.clone());
+                            continue;
+                        }
+                        StagedSource::Mem(s) => s,
+                    };
+                    let fill = ctx.b.zero(source_element(src));
+                    let b_row = ctx.b.add(b_row_base.clone(), k.clone());
+                    bvs.push(ctx.b.load(
+                        src.clone(),
+                        Addr::Rc2 {
+                            row: b_row,
+                            col: col.clone(),
+                        },
+                        load_mask.clone(),
+                        fill,
+                    ));
+                }
+                let b_coord_exprs = match b_coords {
+                    Some(c) => {
+                        let b_row = ctx.b.add(b_row_base.clone(), k.clone());
+                        c.at(ctx, &b_row, col)
+                    }
+                    None => Vec::new(),
+                };
+                let bv = ctx.eval_scalar(&b.pre, &bvs, &b_coord_exprs)?;
+                let mut bv = ctx.b.cast(bv, ElementType::Scalar(acc_elem));
+                if masked {
+                    let zero = ctx.b.zero(acc_elem);
+                    bv = ctx.b.select(mask.clone(), bv, zero);
+                }
+                partial = ctx.b.fma(av.clone(), bv, partial);
+            }
+            partials.push(partial);
+        }
+        Ok(partials)
+    };
+
+    // The full passes, unmasked; then the tail, if k leaves one.
+    let full = shape.k.max(1) / pass;
+    let rem = shape.k.max(1) % pass;
+    if full > 0 {
+        let k_index = ctx.b.local(ElementType::Scalar(ScalarElement::U32));
+        let kk = ctx.b.load_local(k_index.clone());
+        let stride = ctx.b.u32(pass);
+        let step = ctx.b.mul(kk, stride);
+        let updates = pass_at(&mut ctx, step, false, &locals, vector, false)?;
+        let accs: Vec<Accumulator> = locals
+            .iter()
+            .zip(updates)
+            .map(|(local, update)| Accumulator {
+                local: local.clone(),
+                init: ctx.b.zero(acc_elem),
+                update,
+            })
+            .collect();
+        let count = ctx.b.u32(full);
+        body.push(Stmt::Loop {
+            count: Some(count),
+            index: Some(k_index),
+            accumulators: accs,
+            body: Vec::new(),
+        });
+    } else {
+        // A k shorter than one pass: no full pass to loop over, and an
+        // unmasked body under a zero count is not provably in range.
+        for local in &locals {
+            let zero = ctx.b.zero(acc_elem);
+            body.push(Stmt::StoreLocal {
+                dst: local.clone(),
+                value: zero,
+            });
+        }
+    }
+    // The tail: the remainder spread evenly over the lanes as one unmasked
+    // contiguous pass of `rem / width` elements per lane, then the few
+    // elements that do not divide as one masked pass of one element per
+    // lane. Each is a one-iteration loop over its own accumulators seeded
+    // from the previous stage's: a loop's accumulator may only be written
+    // by that loop, so a stage cannot store into an earlier stage's locals.
+    let mut locals = locals;
+    let mut at = full * pass;
+    let stages = [(rem / width, false), (rem % width, true)];
+    for (count, masked) in stages {
+        if count == 0 {
+            continue;
+        }
+        let (vector_n, span) = if masked {
+            (1, count)
+        } else {
+            (count, count * width)
+        };
+        let tail_locals: Vec<_> = (0..cps)
+            .map(|_| ctx.b.local(ElementType::Scalar(acc_elem)))
+            .collect();
+        let step = ctx.b.u32(at);
+        let tail = pass_at(&mut ctx, step, masked, &tail_locals, vector_n, true)?;
+        let accs: Vec<Accumulator> = tail_locals
+            .iter()
+            .zip(locals.iter())
+            .zip(tail)
+            .map(|((local, from), update)| Accumulator {
+                local: local.clone(),
+                init: ctx.b.load_local(from.clone()),
+                update,
+            })
+            .collect();
+        let one = ctx.b.u32(1);
+        body.push(Stmt::Loop {
+            count: Some(one),
+            index: None,
+            accumulators: accs,
+            body: Vec::new(),
+        });
+        locals = tail_locals;
+        at += span;
+    }
 
     // Each column's partials never leave its subgroup, so the close is a
     // subgroup sum and the store is that subgroup's lane 0.
