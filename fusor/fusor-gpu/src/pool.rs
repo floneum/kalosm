@@ -581,3 +581,23 @@ fn hw_memsize() -> Option<u64> {
         (rc == 0 && value > 0).then_some(value)
     }
 }
+
+// Explicit auto-trait impls; see the note on `Launcher`.
+//
+// SAFETY: `pool_fields_are_send_sync` asserts `Send + Sync` for every field
+// type, which is exactly what the auto impls would require.
+unsafe impl Send for BufferPool {}
+unsafe impl Sync for BufferPool {}
+
+#[allow(dead_code)]
+fn pool_fields_are_send_sync() {
+    fn assert<T: Send + Sync>() {}
+    assert::<Arc<wgpu::Device>>();
+    assert::<Arc<wgpu::Queue>>();
+    assert::<Mutex<lru::LruCache<PoolKey, Vec<Buf>>>>();
+    assert::<Mutex<BufferPoolCounters>>();
+    assert::<Mutex<u64>>();
+    assert::<bool>();
+    assert::<Mutex<Vec<StagingChunk>>>();
+    assert::<crate::device::LostFlag>();
+}

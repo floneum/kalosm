@@ -36,5 +36,5 @@ jobs:
       working-directory: fusor/webgpu-runner
       base-path: ${{ github.event.repository.name }}
       debug-symbols: false
-      dx-cli-version: 0.7.7
+      dx-cli-version: 0.7.10
       runs-on: ubuntu-24.04

@@ -2509,6 +2509,7 @@ dependencies = [
  "pollster",
  "rustc-hash 2.1.2",
  "smallvec 1.15.1",
+ "web-time",
 ]
 
 [[package]]
@@ -2532,6 +2533,7 @@ dependencies = [
  "serde",
  "serde_json",
  "smallvec 1.15.1",
+ "web-time",
 ]
 
 [[package]]
@@ -2579,6 +2581,7 @@ dependencies = [
  "pollster",
  "rustc-hash 2.1.2",
  "smallvec 1.15.1",
+ "web-time",
  "wgpu",
 ]
 
@@ -2590,6 +2593,7 @@ dependencies = [
  "half",
  "rustc-hash 2.1.2",
  "smallvec 1.15.1",
+ "web-time",
 ]
 
 [[package]]

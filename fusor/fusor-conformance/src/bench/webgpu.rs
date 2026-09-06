@@ -667,8 +667,6 @@ fixed_cases! {
     dense_matmul_square => dense_matmul_square_case(256);
     dense_batched_matmul => dense_batched_matmul_case(8, 64, 96);
     conv1d_small => conv1d_small_case(256);
-    top_k_large => top_k_case(65_537, 64, topk_values(65_537));
-    top_k_qwen_vocab => top_k_case(151_936, 40, deterministic_values(151_936, 28, 0.01));
     q8_0_qgemv => q8_0_qgemv_case([4096, 896]);
     q4k_qgemv => q4k_qgemv_case([2048, 1024]);
     q4k_paired_silu => q4k_paired_silu_case([2048, 1024]);

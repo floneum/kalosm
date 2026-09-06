@@ -242,3 +242,24 @@ async fn pick_adapter(instance: &wgpu::Instance, opts: &DeviceOptions) -> Result
         .await
         .map_err(|e| Error::Device(format!("request_adapter: {e}")))
 }
+
+// Explicit auto-trait impls; see the note on `GpuTarget`.
+//
+// SAFETY: `device_fields_are_send_sync` asserts `Send + Sync` for every
+// field type, which is exactly what the auto impls would require.
+unsafe impl Send for GpuDevice {}
+unsafe impl Sync for GpuDevice {}
+
+#[allow(dead_code)]
+fn device_fields_are_send_sync() {
+    fn assert<T: Send + Sync>() {}
+    assert::<wgpu::Device>();
+    assert::<wgpu::Queue>();
+    assert::<wgpu::Adapter>();
+    assert::<Caps>();
+    assert::<DeviceFacts>();
+    assert::<wgpu::Limits>();
+    assert::<wgpu::Features>();
+    assert::<wgpu::AdapterInfo>();
+    assert::<LostFlag>();
+}

@@ -154,8 +154,10 @@ registry! {
     dense_matmul_square,
     dense_batched_matmul,
     conv1d_small,
-    top_k_large,
-    top_k_qwen_vocab,
+    // `top_k_large` / `top_k_qwen_vocab` are not registered: the current
+    // sampling path is an `n x n` rank-by-counting sort, so 65k and 152k
+    // logits are 17 GB and 92 GB of device memory. They return with a real
+    // top-k kernel.
     q8_0_qgemv,
     q4k_qgemv,
     q4k_paired_silu,

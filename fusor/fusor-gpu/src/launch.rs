@@ -860,6 +860,12 @@ impl Launcher {
 
     /// Copy `src` into `staging`, map it, and return the bytes. On `Ok` the
     /// staging buffer is unmapped again; on `Err` its map state is unknown.
+    ///
+    /// Nothing of wgpu's lives across the `await`: a future holding a
+    /// `BufferSlice` (a borrow of the `wgpu::Buffer`) would have every
+    /// `Send` check of a caller's future walk into wgpu-core's resource
+    /// graph and overflow the recursion limit. The map is issued and later
+    /// read out by two synchronous halves around one await on [`MapDone`].
     async fn readback_into(&self, src: &Buf, staging: &Buf, bytes: u64) -> Result<Vec<u8>> {
         let trace = trace_dispatch();
         let state = |what: &str| {
@@ -883,13 +889,7 @@ impl Launcher {
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
             state("copy");
         }
-        let gpu = staging
-            .downcast_ref::<GpuBuffer>()
-            .ok_or_else(|| Error::Device("staging buffer is not pooled".into()))?;
-        let slice = gpu.buffer.slice(..);
-        let done = MapDone::default();
-        let signal = done.clone();
-        slice.map_async(wgpu::MapMode::Read, move |r| signal.complete(r));
+        let done = self.begin_map(staging)?;
         // Natively this drives the map to completion; on the web the device
         // is polled by the browser and this returns at once.
         self.poll_wait()?;
@@ -906,7 +906,29 @@ impl Launcher {
                 }
             })?
             .map_err(|e| Error::Device(format!("buffer map failed: {e}")))?;
-        let out = slice.get_mapped_range().to_vec();
+        Self::finish_map(staging)
+    }
+
+    /// Issue the map of the whole staging buffer; the returned signal
+    /// completes when the callback runs.
+    fn begin_map(&self, staging: &Buf) -> Result<MapDone> {
+        let gpu = staging
+            .downcast_ref::<GpuBuffer>()
+            .ok_or_else(|| Error::Device("staging buffer is not pooled".into()))?;
+        let done = MapDone::default();
+        let signal = done.clone();
+        gpu.buffer
+            .slice(..)
+            .map_async(wgpu::MapMode::Read, move |r| signal.complete(r));
+        Ok(done)
+    }
+
+    /// Copy the mapped bytes out and unmap.
+    fn finish_map(staging: &Buf) -> Result<Vec<u8>> {
+        let gpu = staging
+            .downcast_ref::<GpuBuffer>()
+            .ok_or_else(|| Error::Device("staging buffer is not pooled".into()))?;
+        let out = gpu.buffer.slice(..).get_mapped_range().to_vec();
         gpu.buffer.unmap();
         Ok(out)
     }
@@ -1073,4 +1095,32 @@ impl BuildCursor {
 /// The plan's cache key: the plan is the key.
 pub const fn plan_key(plan: &Plan) -> PlanHash {
     plan.hash
+}
+
+// Explicit auto-trait impls, for the reason given on `GpuTarget`: a future
+// that captures `&Launcher` (every awaited readback and fence does) would
+// otherwise have the solver walk these fields into wgpu-core's recursive
+// resource graph and overflow the recursion limit in any crate that holds
+// such a future across an `await` in a `Send` future.
+//
+// SAFETY: `launcher_fields_are_send_sync` asserts `Send + Sync` for every
+// field type, which is exactly what the auto impls would require.
+unsafe impl Send for Launcher {}
+unsafe impl Sync for Launcher {}
+
+#[allow(dead_code)]
+fn launcher_fields_are_send_sync() {
+    fn assert<T: Send + Sync>() {}
+    assert::<Arc<wgpu::Device>>();
+    assert::<Arc<wgpu::Queue>>();
+    assert::<wgpu::Backend>();
+    assert::<GpuConfig>();
+    assert::<crate::device::LostFlag>();
+    assert::<AtomicUsize>();
+    assert::<AtomicU64>();
+    assert::<AtomicBool>();
+    assert::<Mutex<Vec<KernelProfile>>>();
+    assert::<Mutex<Option<Vec<f64>>>>();
+    assert::<Mutex<Option<usize>>>();
+    assert::<Mutex<lru::LruCache<BindGroupKey, BindGroupEntry>>>();
 }

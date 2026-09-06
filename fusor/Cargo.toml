@@ -73,3 +73,8 @@ naga = { git = "https://github.com/ealmloff/wgpu", rev = "c4f55cabaadc22b942c1dd
 inherits = "dev"
 opt-level = 1
 debug = "line-tables-only"
+
+# The web bundle: `wasm-opt` aborts on the DWARF 5 units a current rustc
+# emits ("compile unit size was incorrect"), so release strips debuginfo.
+[profile.release]
+strip = "debuginfo"
