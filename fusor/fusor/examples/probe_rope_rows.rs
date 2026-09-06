@@ -9,7 +9,9 @@ fn main() {
     let k: Vec<f32> = (0..heads * hd).map(|i| (i as f32 * 0.11).cos()).collect();
     let q = Tensor::<4>::from_slice(&device, [1, heads, 1, hd], &q);
     let k = Tensor::<4>::from_slice(&device, [1, heads, 1, hd], &k);
-    let inv: Vec<f32> = (0..half).map(|i| 1.0 / 10_000f32.powf(2.0 * i as f32 / hd as f32)).collect();
+    let inv: Vec<f32> = (0..half)
+        .map(|i| 1.0 / 10_000f32.powf(2.0 * i as f32 / hd as f32))
+        .collect();
     let mut cos = Vec::new();
     let mut sin = Vec::new();
     for p in 0..ctx {
@@ -29,10 +31,22 @@ fn main() {
     pos.set_elements(&[p as u32]);
     let (qc, kc) = q.rope_pair_at(&k, &cos_t, &sin_t, &pos);
     let diff = |a: &Tensor<4>, b: &Tensor<4>| {
-        a.to_flat().iter().zip(b.to_flat()).map(|(x, y)| (x - y).abs()).fold(0f32, f32::max)
+        a.to_flat()
+            .iter()
+            .zip(b.to_flat())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0f32, f32::max)
     };
-    println!("q: table@p vs row@0 {:.6}, table@p vs leaf {:.6}", diff(&qa, &qb), diff(&qa, &qc));
-    println!("k: table@p vs row@0 {:.6}, table@p vs leaf {:.6}", diff(&ka, &kb), diff(&ka, &kc));
+    println!(
+        "q: table@p vs row@0 {:.6}, table@p vs leaf {:.6}",
+        diff(&qa, &qb),
+        diff(&qa, &qc)
+    );
+    println!(
+        "k: table@p vs row@0 {:.6}, table@p vs leaf {:.6}",
+        diff(&ka, &kb),
+        diff(&ka, &kc)
+    );
     println!("q table@p {:?}", &qa.to_flat()[..8]);
     println!("q row@0   {:?}", &qb.to_flat()[..8]);
 }
