@@ -79,7 +79,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: x86_64-pc-windows-msvc
-      - uses: taiki-e/install-action@nextest
+      # A direct download: `taiki-e/install-action` fails on the runner's
+      # bash startup often enough to cost whole runs.
+      - name: Install nextest
+        shell: bash
+        run: curl -LsSf https://get.nexte.st/latest/windows-tar | tar zxf - -C "$HOME/.cargo/bin"
       - uses: Swatinem/rust-cache@v2
         with:
           # Distinct from the Linux cache so we don't ever try to restore
