@@ -14,7 +14,7 @@ use crate::tensor::{Tensor, splat_one, splat_zero};
 use crate::{Error, Result};
 
 /// Mint a `Leaf::Buffer` with no host bytes and no device buffer.
-fn leaf_buffer_node(graph: &GraphRef, dtype: Dtype, shape: &[Dim]) -> Result<Tensor> {
+pub(crate) fn leaf_buffer_node(graph: &GraphRef, dtype: Dtype, shape: &[Dim]) -> Result<Tensor> {
     Tensor::emit(
         graph,
         Logical::Leaf(LeafKind::Buffer {

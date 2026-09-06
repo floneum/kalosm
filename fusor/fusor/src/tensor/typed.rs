@@ -341,6 +341,13 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     pub fn detach(&self) -> Self {
         Self::wrap("detach", self.raw.detach())
     }
+
+    /// [`Tensor::detach`] on the device: the value is resolved and a fresh
+    /// leaf adopts its buffer, with no host round trip.
+    #[track_caller]
+    pub fn materialize(&self) -> Self {
+        Self::wrap("materialize", self.raw.materialize())
+    }
 }
 
 impl<const R: usize, T: Element> Tensor<R, T> {

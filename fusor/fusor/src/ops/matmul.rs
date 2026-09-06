@@ -49,16 +49,30 @@ impl Tensor {
     /// Batch dims must be pairwise [`fusor_ir::shape::Dim::known_eq`]; there
     /// is no implicit batch broadcast.
     pub fn matmul(&self, rhs: &Tensor) -> Result<Tensor> {
-        self.contract_2d(rhs, false)
+        self.contract_2d(rhs, false, None)
     }
 
     /// `self @ rhs^T`. The **same node** as [`Tensor::matmul`]; only `b`'s two
     /// trailing labels swap.
     pub fn matmul_t(&self, rhs: &Tensor) -> Result<Tensor> {
-        self.contract_2d(rhs, true)
+        self.contract_2d(rhs, true, None)
     }
 
-    fn contract_2d(&self, rhs: &Tensor, transposed_rhs: bool) -> Result<Tensor> {
+    /// [`Tensor::matmul_t`] accumulating in `acc` instead of the dense
+    /// side's compute dtype. `F16` on f16 operands is what admits the f16
+    /// cooperative tiles, which the device offers only with an f16
+    /// accumulator; a caller chooses it where the sum is short enough or
+    /// the consumer tolerant enough for f16 partials.
+    pub fn matmul_t_acc(&self, rhs: &Tensor, acc: Dtype) -> Result<Tensor> {
+        self.contract_2d(rhs, true, Some(acc))
+    }
+
+    fn contract_2d(
+        &self,
+        rhs: &Tensor,
+        transposed_rhs: bool,
+        acc: Option<Dtype>,
+    ) -> Result<Tensor> {
         // A block-quantized weight is a legal contraction operand on exactly
         // one side: an ordinary `Contract` decodes the blocks on the way into
         // its staging fill, and the extractor prices that against
@@ -103,7 +117,8 @@ impl Tensor {
         }
         // The accumulator is the *dense* side's compute dtype: a quantized
         // format has none of its own.
-        let acc = if q_lhs { rhs.dtype() } else { self.dtype() }.compute_dtype();
+        let acc =
+            acc.unwrap_or_else(|| if q_lhs { rhs.dtype() } else { self.dtype() }.compute_dtype());
         let spec = matmul_spec(batch, transposed_rhs)?;
 
         // A quantized side enters the contraction as its *dequantize class*,

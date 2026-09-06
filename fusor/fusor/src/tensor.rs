@@ -123,6 +123,25 @@ impl Tensor {
         construction::upload(&self.graph, facts.dtype, &facts.shape, bytes)
     }
 
+    /// Put this external leaf's bytes on the device now; see
+    /// [`crate::session::Session::upload_leaf`].
+    pub fn upload(&self) -> Result<()> {
+        self.graph.session().upload_leaf(self)
+    }
+
+    /// The device-side [`Self::detach`]: resolve this value and hand its
+    /// buffer to a fresh external leaf, with no host round trip. What a
+    /// long chain of launches flushes through so one resolve never has to
+    /// hold every intermediate of the whole chain live at once.
+    pub fn materialize(&self) -> Result<Tensor> {
+        let facts = self.facts();
+        let leaf = construction::leaf_buffer_node(&self.graph, facts.dtype, &facts.shape)?;
+        self.graph.session().resolve(std::slice::from_ref(self))?;
+        leaf.adopt_buffer(self)?;
+        self.clear_device_buf();
+        Ok(leaf)
+    }
+
     /// [`Self::detach`], awaited.
     pub async fn detach_async(&self) -> Result<Tensor> {
         let facts = self.facts();

@@ -395,6 +395,24 @@ impl Session {
         Arc::clone(&self.inner.semantics)
     }
 
+    /// Put an external leaf's host bytes on the device now, bound to the
+    /// leaf, without resolving anything that reads it. A no-op once the leaf
+    /// has a device buffer. What a weight needs before another leaf can
+    /// [`Tensor::adopt_buffer`] it.
+    pub fn upload_leaf(&self, leaf: &Tensor) -> Result<()> {
+        if leaf.graph.device_buf(leaf.id).is_some() {
+            return Ok(());
+        }
+        let graph = leaf.graph.clone();
+        let _resolving = graph.state().resolve_lock.lock();
+        if self.leaf_buffer(&graph, leaf.id)?.is_none() {
+            return Err(Error::Plan(
+                "upload_leaf targets an external leaf; this value is computed".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Saturate, extract, lower, emit and dispatch everything `values` needs.
     ///
     /// Atomic against every other resolve and readback on the same graph; the
@@ -1026,11 +1044,20 @@ impl Session {
                 .device
                 .target()
                 .alloc(bytes, buffer.persistence)?;
-            to_bind.push((
-                buffer.value,
-                buf.clone(),
-                Some(Arc::new(buffer.layout.clone())),
-            ));
+            // Only a requested value keeps its buffer bound to the graph. A
+            // launch root that is merely an intermediate of this resolve
+            // gets scratch that returns to the pool with the plan; binding
+            // it too would pin every intermediate of every resolve for the
+            // life of the graph — a 32-block vision tower held 22 GB of
+            // hidden states that way. A later read of an intermediate
+            // recomputes it.
+            if wanted.contains(&buffer.value) {
+                to_bind.push((
+                    buffer.value,
+                    buf.clone(),
+                    Some(Arc::new(buffer.layout.clone())),
+                ));
+            }
             supplied.insert(buffer.value, buf);
         }
         graph.bind_classes(&to_bind);
