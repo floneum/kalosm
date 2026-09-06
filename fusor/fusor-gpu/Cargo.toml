@@ -23,11 +23,12 @@ wgpu.workspace = true
 naga = { workspace = true, features = ["wgsl-out"] }
 
 [dev-dependencies]
+# `wgsl-in` feeds the WARP probe test dumped kernels as text.
 # `wgsl-out` is test-only: the single-slot fold golden asserts textual equality
 # of the emitted shader, which is the check that a change to the reduction
 # primitive did not move the fast path. Nothing in the shipped build writes WGSL
 # text — modules go to `create_shader_module_trusted` as naga IR.
-naga = { workspace = true, features = ["wgsl-out"] }
+naga = { workspace = true, features = ["wgsl-out", "wgsl-in"] }
 
 [target.'cfg(target_vendor = "apple")'.dependencies]
 wgpu = { version = "29", default-features = false, features = ["metal"] }

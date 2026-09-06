@@ -263,3 +263,24 @@ fn device_fields_are_send_sync() {
     assert::<wgpu::AdapterInfo>();
     assert::<LostFlag>();
 }
+
+/// The D3D12 device-removed reason, if the device has been removed; `None`
+/// on every other backend and on a healthy device. D3D12 fences complete
+/// instantly once the device is removed, so a clean wait proves nothing;
+/// this is the only signal that names the dispatch that removed it.
+pub fn removed_reason(device: &wgpu::Device) -> Option<String> {
+    #[cfg(windows)]
+    {
+        // SAFETY: the hal device is only borrowed for the duration of one
+        // query that does not touch any wgpu-owned state.
+        let hal = unsafe { device.as_hal::<wgpu::hal::api::Dx12>() }?;
+        unsafe { hal.raw_device().GetDeviceRemovedReason() }
+            .err()
+            .map(|e| e.to_string())
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = device;
+        None
+    }
+}

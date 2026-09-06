@@ -553,7 +553,11 @@ impl Launcher {
                     self.encode_one_submit(&chunk, timestamps, mode, dispatch_ix, total)?;
                 if trace {
                     let poll = self.device.poll(wgpu::PollType::wait_indefinitely());
-                    let state = match (&poll, self.lost.reason(), self.removed_reason()) {
+                    let state = match (
+                        &poll,
+                        self.lost.reason(),
+                        crate::device::removed_reason(&self.device),
+                    ) {
                         (_, Some(reason), _) => format!("LOST ({reason})"),
                         // D3D12 fences complete instantly once the device
                         // is removed, so a clean wait proves nothing; the
@@ -808,22 +812,6 @@ impl Launcher {
     /// A lost device is reported as an error naming the loss, both before
     /// and after polling: wgpu itself turns a poll on a lost device into a
     /// fatal panic that never says why the device went away.
-    /// The D3D12 device-removed reason, if the device has been removed;
-    /// `None` on every other backend and on a healthy device.
-    fn removed_reason(&self) -> Option<String> {
-        #[cfg(windows)]
-        {
-            // SAFETY: the hal device is only borrowed for the duration of
-            // one query that does not touch any wgpu-owned state.
-            let hal = unsafe { self.device.as_hal::<wgpu::hal::api::Dx12>() }?;
-            unsafe { hal.raw_device().GetDeviceRemovedReason() }
-                .err()
-                .map(|e| e.to_string())
-        }
-        #[cfg(not(windows))]
-        None
-    }
-
     pub fn poll_wait(&self) -> Result<()> {
         self.lost.check()?;
         self.poll_wait_inner()?;

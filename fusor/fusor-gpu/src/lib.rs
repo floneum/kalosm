@@ -24,7 +24,7 @@ pub mod target;
 mod uniforms;
 
 pub use bindings::{BindingDesc, bindings_from_module};
-pub use device::GpuDevice;
+pub use device::{GpuDevice, removed_reason};
 pub use emit::emit;
 pub use launch::Launcher;
 pub use plan_cache::PlanCache;
