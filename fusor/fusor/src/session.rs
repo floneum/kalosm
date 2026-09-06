@@ -2,7 +2,6 @@
 //! extractor and the plan cache; `resolve` is the one place saturation,
 //! extraction and dispatch happen.
 
-#[cfg(feature = "cpu")]
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
@@ -21,9 +20,7 @@ use fusor_ir::dtype::{Dtype, Persistence};
 use fusor_ir::egraph::{EGraph, Id, Rule, Saturate, SaturationBudget, SaturationDelta};
 use fusor_ir::extract::{ExtractBudget, Extractor, Plan, ReplayKey};
 use fusor_ir::ir::launch::Effect;
-#[cfg(feature = "cpu")]
 use fusor_ir::ir::launch::Launch;
-#[cfg(feature = "cpu")]
 use fusor_ir::ir::logical::BufferId;
 use fusor_ir::ir::logical::{LeafKind, Logical};
 use fusor_ir::ir::{Op, OpDefRegistry, Semantics};
@@ -37,7 +34,6 @@ use rustc_hash::FxHashMap;
 
 use crate::composite::register_macro_ops;
 use crate::graph::GraphRef;
-#[cfg(feature = "cpu")]
 use crate::graph::WeakGraphRef;
 use crate::tensor::Tensor;
 use crate::{Error, Result};
@@ -265,10 +261,9 @@ pub(crate) struct SessionInner {
     /// and the candidate arms production sampling is working through.
     #[cfg(feature = "gpu")]
     explore: parking_lot::Mutex<explore::ExploreState>,
-    /// Verified CPU plans and native launch lists, keyed by an unsaturated
-    /// term modulo fresh step-buffer names.
-    #[cfg(feature = "cpu")]
-    cpu_structural: parking_lot::Mutex<FxHashMap<CpuStructuralKey, CpuStructuralEntry>>,
+    /// Verified plans (and, on the CPU, native launch lists), keyed by an
+    /// unsaturated term modulo fresh step-buffer names.
+    structural: parking_lot::Mutex<FxHashMap<StructuralKey, StructuralEntry>>,
     launches: AtomicU64,
     in_flight: AtomicU32,
 }
@@ -285,53 +280,53 @@ struct CpuExecutable {
     launches: Vec<CpuExecutableLaunch>,
 }
 
-#[cfg(feature = "cpu")]
+/// The raw (unsaturated) term below a root set, with every step buffer leaf
+/// renamed positionally: what a plan is a function of, once buffers are
+/// rebound.
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct CpuTerm {
+struct CanonicalTerm {
     nodes: Vec<Op>,
     roots: Vec<Id>,
 }
 
-#[cfg(feature = "cpu")]
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct CpuStructuralKey {
+struct StructuralKey {
     graph: usize,
     dim_values: u64,
-    term: CpuTerm,
+    term: CanonicalTerm,
 }
 
-#[cfg(feature = "cpu")]
-struct CpuStructuralEntry {
+struct StructuralEntry {
     graph: WeakGraphRef,
     roots: Vec<Id>,
     inputs: Vec<Id>,
     plan: Arc<Plan>,
-    executable: Arc<CpuExecutable>,
+    /// The CPU's compiled launch list. The GPU target keeps its own plan
+    /// cache, so a replayed plan finds its pipelines there.
+    executable: Option<Arc<CpuExecutable>>,
 }
 
-#[cfg(feature = "cpu")]
-struct CpuStructuralHit {
+struct StructuralHit {
     roots: Vec<Id>,
     plan: Arc<Plan>,
-    executable: Arc<CpuExecutable>,
+    executable: Option<Arc<CpuExecutable>>,
     inputs: FxHashMap<Id, Buf>,
 }
 
-#[cfg(feature = "cpu")]
-struct CpuTemplateBindings {
+/// How a structural hit runs an old plan for new values: the fresh input
+/// leaves stand in for the recorded ones, and the recorded outputs are
+/// allocated under the requested values' ids.
+struct TemplateBindings {
     inputs: FxHashMap<Id, Buf>,
     outputs: Vec<Id>,
-    executable: Arc<CpuExecutable>,
+    #[cfg_attr(not(feature = "cpu"), allow(dead_code))]
+    executable: Option<Arc<CpuExecutable>>,
 }
 
-/// Uninhabited without the `cpu` backend: `run` still names the type, and a
-/// GPU resolve never has one to pass.
+/// Uninhabited without the `cpu` backend: the memo still names the type, and
+/// a GPU resolve never has one to hold.
 #[cfg(not(feature = "cpu"))]
 enum CpuExecutable {}
-
-/// Uninhabited without the `cpu` backend; see [`CpuExecutable`].
-#[cfg(not(feature = "cpu"))]
-enum CpuTemplateBindings {}
 
 impl Session {
     /// Create a planner, compiler, and execution session for `device`.
@@ -373,8 +368,7 @@ impl Session {
                 #[cfg(feature = "gpu")]
                 explore: parking_lot::Mutex::new(explore::ExploreState::default()),
                 saturation: SaturationMemo::default(),
-                #[cfg(feature = "cpu")]
-                cpu_structural: parking_lot::Mutex::new(FxHashMap::default()),
+                structural: parking_lot::Mutex::new(FxHashMap::default()),
                 launches: AtomicU64::new(0),
                 in_flight: AtomicU32::new(0),
             }),
@@ -456,17 +450,24 @@ impl Session {
         }
 
         // Inference frontends commonly rebuild the same expression with a
-        // fresh `from_slice` leaf on every call. On CPU, reuse the already
-        // verified plan and compiled executable for an isomorphic raw term,
-        // rebinding only the fresh input and requested output buffers. This
-        // deliberately runs before saturation and extraction: those dominate
-        // the cost of replaying a model on an append-only graph.
-        #[cfg(feature = "cpu")]
-        if self.inner.device.is_cpu()
-            && let Some(hit) = self.cpu_structural_hit(&graph, values)
-        {
+        // fresh `from_slice` leaf on every call, so the graph grows with every
+        // call and the replay key (a hash over every id) can never hit. Reuse
+        // the already verified, already tuned plan — and on the CPU its
+        // compiled executable — for an isomorphic raw term, rebinding only
+        // the fresh input and requested output buffers. This deliberately
+        // runs before saturation and extraction: those dominate the cost of
+        // replaying a model on an append-only graph. On the GPU a graph
+        // unchanged since its last saturation is left to the replay memo,
+        // which is where the online explorer samples its arms.
+        let structural_eligible = self.inner.device.is_cpu() || {
+            let g = graph.state().egraph.lock();
+            g.saturated_at_len != Some(g.len())
+        };
+        let __t_key = Instant::now();
+        if structural_eligible && let Some(hit) = self.structural_hit(&graph, values) {
+            let __key_us = __t_key.elapsed().as_micros();
             let old_values: Vec<Tensor> = hit.roots.iter().map(|id| graph.tensor(*id)).collect();
-            let bindings = CpuTemplateBindings {
+            let bindings = TemplateBindings {
                 inputs: hit.inputs,
                 outputs: values.iter().map(|value| value.id).collect(),
                 executable: hit.executable,
@@ -475,7 +476,7 @@ impl Session {
             let (launched, _) = self.run(&graph, &hit.plan, &old_values, Some(&bindings))?;
             if resolve_profile() {
                 eprintln!(
-                    "[profile] structural replay hit: run {} us ({} launches)",
+                    "[profile] structural replay hit: key {__key_us} us, run {} us ({} launches)",
                     started.elapsed().as_micros(),
                     launched
                 );
@@ -680,12 +681,7 @@ impl Session {
             .launches
             .fetch_add(launched as u64, Ordering::Relaxed);
         self.inner.in_flight.fetch_add(1, Ordering::Relaxed);
-        #[cfg(feature = "cpu")]
-        if let Some(executable) = executable {
-            self.insert_cpu_structural(&graph, &roots, Arc::clone(&plan), executable);
-        }
-        #[cfg(not(feature = "cpu"))]
-        let _ = executable;
+        self.insert_structural(&graph, &roots, Arc::clone(&plan), executable);
         Ok(())
     }
 
@@ -717,11 +713,10 @@ impl Session {
         Ok(())
     }
 
-    #[cfg(feature = "cpu")]
-    fn cpu_structural_hit(&self, graph: &GraphRef, values: &[Tensor]) -> Option<CpuStructuralHit> {
+    fn structural_hit(&self, graph: &GraphRef, values: &[Tensor]) -> Option<StructuralHit> {
         let roots: Vec<Id> = values.iter().map(|value| value.id).collect();
-        let (key, current_inputs) = cpu_cache_key(graph, &roots)?;
-        let mut entries = self.inner.cpu_structural.lock();
+        let (key, current_inputs) = structural_key(graph, &roots)?;
+        let mut entries = self.inner.structural.lock();
         entries.retain(|_, entry| entry.graph.strong_count() > 0);
         let entry = entries.get(&key)?;
         if !entry
@@ -741,33 +736,32 @@ impl Session {
                 .or_else(|| self.leaf_buffer(graph, current).ok().flatten())?;
             inputs.insert(old, buffer);
         }
-        Some(CpuStructuralHit {
+        Some(StructuralHit {
             roots: entry.roots.clone(),
             plan: Arc::clone(&entry.plan),
-            executable: Arc::clone(&entry.executable),
+            executable: entry.executable.clone(),
             inputs,
         })
     }
 
-    #[cfg(feature = "cpu")]
-    fn insert_cpu_structural(
+    fn insert_structural(
         &self,
         graph: &GraphRef,
         roots: &[Id],
         plan: Arc<Plan>,
-        executable: Arc<CpuExecutable>,
+        executable: Option<Arc<CpuExecutable>>,
     ) {
-        let Some((key, inputs)) = cpu_cache_key(graph, roots) else {
+        let Some((key, inputs)) = structural_key(graph, roots) else {
             return;
         };
-        let mut entries = self.inner.cpu_structural.lock();
+        let mut entries = self.inner.structural.lock();
         entries.retain(|_, entry| entry.graph.strong_count() > 0);
         if entries.len() >= fusor_cost::replay::CAPACITY && !entries.contains_key(&key) {
             entries.clear();
         }
         entries.insert(
             key,
-            CpuStructuralEntry {
+            StructuralEntry {
                 graph: GraphRef::downgrade(graph),
                 roots: roots.to_vec(),
                 inputs,
@@ -946,19 +940,13 @@ impl Session {
         graph: &GraphRef,
         plan: &Plan,
         values: &[Tensor],
-        template: Option<&CpuTemplateBindings>,
+        template: Option<&TemplateBindings>,
     ) -> Result<(usize, Option<Arc<CpuExecutable>>)> {
         // What the extractor selected for each requested value.
         let wanted: Vec<Id> = values
             .iter()
             .map(|v| self.selected(graph, plan, v.id))
             .collect();
-        #[cfg(not(feature = "cpu"))]
-        let output_aliases: FxHashMap<Id, Id> = {
-            let _ = template;
-            FxHashMap::default()
-        };
-        #[cfg(feature = "cpu")]
         let output_aliases: FxHashMap<Id, Id> = template
             .map(|bindings| {
                 wanted
@@ -997,7 +985,6 @@ impl Session {
                 }
             }
         }
-        #[cfg(feature = "cpu")]
         if let Some(template) = template {
             for (id, buf) in &template.inputs {
                 supplied.insert(*id, buf.clone());
@@ -1107,7 +1094,7 @@ impl Session {
                     graph,
                     plan,
                     &mut supplied,
-                    template.map(|bindings| Arc::clone(&bindings.executable)),
+                    template.and_then(|bindings| bindings.executable.clone()),
                 )?;
                 Ok((launched, Some(executable)))
             }
@@ -1318,6 +1305,9 @@ impl Session {
                     .iter()
                     .any(|m| g.semantics().effect(&g.node(*m).op) != Effect::Pure)
             }) {
+                if log {
+                    eprintln!("[tune] not raced: the plan has an in-place launch");
+                }
                 return Ok(base);
             }
         }
@@ -1340,6 +1330,12 @@ impl Session {
                 .collect()
         };
         if probe.iter().all(Vec::is_empty) {
+            if log {
+                eprintln!(
+                    "[tune] not raced: no launch of {} offers a variant above {min_macs} macs",
+                    base.launches.len()
+                );
+            }
             return Ok(base);
         }
 
@@ -1752,8 +1748,7 @@ fn dump_exec() -> bool {
 /// Canonicalize an unsaturated term while replacing each runtime buffer name
 /// with its traversal-order input slot. The resulting ordinary Op vector
 /// provides exact equality and hashing without a parallel hand-written matcher.
-#[cfg(feature = "cpu")]
-fn canonical_cpu_term(graph: &GraphRef, roots: &[Id]) -> Option<(CpuTerm, Vec<Id>)> {
+fn canonical_term(graph: &GraphRef, roots: &[Id]) -> Option<(CanonicalTerm, Vec<Id>)> {
     fn rebuild(op: &Op, source: Id, children: &[Id], inputs: &mut Vec<Id>) -> Option<Op> {
         let child = |index: usize| children.get(index).copied();
         Some(match op {
@@ -1877,16 +1872,15 @@ fn canonical_cpu_term(graph: &GraphRef, roots: &[Id]) -> Option<(CpuTerm, Vec<Id
         .iter()
         .map(|root| visit(&graph, *root, &mut memo, &mut nodes, &mut inputs))
         .collect::<Option<Vec<_>>>()?;
-    Some((CpuTerm { nodes, roots }, inputs))
+    Some((CanonicalTerm { nodes, roots }, inputs))
 }
 
-#[cfg(feature = "cpu")]
-fn cpu_cache_key(graph: &GraphRef, roots: &[Id]) -> Option<(CpuStructuralKey, Vec<Id>)> {
-    let (term, inputs) = canonical_cpu_term(graph, roots)?;
+fn structural_key(graph: &GraphRef, roots: &[Id]) -> Option<(StructuralKey, Vec<Id>)> {
+    let (term, inputs) = canonical_term(graph, roots)?;
     let mut dims = rustc_hash::FxHasher::default();
     graph.dim_bindings().hash(&mut dims);
     Some((
-        CpuStructuralKey {
+        StructuralKey {
             graph: GraphRef::as_ptr(graph) as usize,
             dim_values: dims.finish(),
             term,
@@ -2479,15 +2473,15 @@ fn resolve_elements(shape: &[Dim], graph: &GraphRef) -> Result<u64> {
     Ok(acc.max(1))
 }
 
-#[cfg(all(test, feature = "cpu"))]
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::graph::Graph;
 
-    #[test]
-    #[cfg(feature = "cpu")]
-    fn a_fresh_step_leaf_reuses_the_cpu_plan_and_executable() {
-        let session = Session::new(Backend::cpu().unwrap()).unwrap();
+    /// The same expression rebuilt over a fresh input leaf must run the
+    /// recorded plan again rather than extract another: the graph grew, so
+    /// the replay key cannot hit, and the structural memo is what remains.
+    fn a_fresh_step_leaf_reuses_the_plan(session: Session) {
         let graph = Graph::new(&session);
         let run = |values: &[f32]| {
             let x =
@@ -2499,13 +2493,28 @@ mod tests {
         };
 
         assert_eq!(run(&[1.0, 2.0, 3.0]), vec![2.0, 3.0, 4.0]);
-        assert_eq!(session.inner.cpu_structural.lock().len(), 1);
+        assert_eq!(session.inner.structural.lock().len(), 1);
 
         assert_eq!(run(&[10.0, 11.0, 12.0]), vec![11.0, 12.0, 13.0]);
         assert_eq!(
-            session.inner.cpu_structural.lock().len(),
+            session.inner.structural.lock().len(),
             1,
             "a replay hit must not extract and record another plan"
         );
+    }
+
+    #[test]
+    #[cfg(feature = "cpu")]
+    fn a_fresh_step_leaf_reuses_the_cpu_plan_and_executable() {
+        a_fresh_step_leaf_reuses_the_plan(Session::new(Backend::cpu().unwrap()).unwrap());
+    }
+
+    #[test]
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    fn a_fresh_step_leaf_reuses_the_gpu_plan() {
+        let Ok(backend) = Backend::gpu_blocking() else {
+            return;
+        };
+        a_fresh_step_leaf_reuses_the_plan(Session::new(backend).unwrap());
     }
 }
