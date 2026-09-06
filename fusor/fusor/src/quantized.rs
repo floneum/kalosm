@@ -205,42 +205,9 @@ impl QMatrix {
 
     /// `act @ self^T`: the activation contracts against the quantized rows,
     /// which is the orientation a GGUF weight is stored in. `[.., k]` in,
-    /// `[.., rows]` out.
-    ///
-    /// A rank-1 activation routes through a `[1, k]` view and reshapes back.
-    /// A rank-3-or-higher activation folds leading axes into the row axis
-    /// (since the weight is rank 2) and restores them on the way out.
+    /// `[.., rows]` out. See [`contract_rows`] for the rank rules.
     pub fn q_mat_mul(&self, act: &Tensor) -> Result<Tensor> {
-        match act.rank() {
-            1 => {
-                let k = act.dim(0);
-                let out = act
-                    .reshape_dims(&[Dim::Const(1), k])?
-                    .matmul_t(&self.tensor)?;
-                out.reshape_dims(&[self.rows])
-            }
-            2 => act.matmul_t(&self.tensor),
-            _ => {
-                let shape = act.shape();
-                let (lead, k) = shape.split_at(shape.len() - 1);
-                let mut rows: u64 = 1;
-                for d in lead {
-                    let Dim::Const(n) = d else {
-                        return Err(Error::Shape(format!(
-                            "a rank-{} activation folds its leading axes into the row axis, \
-                             which needs them constant; {d} is symbolic",
-                            act.rank()
-                        )));
-                    };
-                    rows *= n;
-                }
-                let flat = act.reshape_dims(&[Dim::Const(rows), k[0]])?;
-                let out = flat.matmul_t(&self.tensor)?;
-                let mut back: Vec<Dim> = lead.to_vec();
-                back.push(self.rows);
-                out.reshape_dims(&back)
-            }
-        }
+        contract_rows(act, &self.tensor, self.rows)
     }
 
     /// The rows named by `idx`, decoded to `F32`. `[n]` in, `[n, cols]` out.
@@ -352,5 +319,44 @@ impl QMatrix {
             [Dim::Const(rows), Dim::Const(cols_n)],
             &bytes,
         )
+    }
+}
+
+/// `act @ weight^T` against a `[rows, k]` weight stored row-major, the
+/// orientation a GGUF weight is stored in. `[.., k]` in, `[.., rows]` out.
+/// The weight may be block-quantized or dense; the dtype rules are
+/// [`Tensor::matmul_t`]'s.
+///
+/// A rank-1 activation routes through a `[1, k]` view and reshapes back.
+/// A rank-3-or-higher activation folds leading axes into the row axis
+/// (since the weight is rank 2) and restores them on the way out.
+pub fn contract_rows(act: &Tensor, weight: &Tensor, rows: Dim) -> Result<Tensor> {
+    match act.rank() {
+        1 => {
+            let k = act.dim(0);
+            let out = act.reshape_dims(&[Dim::Const(1), k])?.matmul_t(weight)?;
+            out.reshape_dims(&[rows])
+        }
+        2 => act.matmul_t(weight),
+        _ => {
+            let shape = act.shape();
+            let (lead, k) = shape.split_at(shape.len() - 1);
+            let mut folded: u64 = 1;
+            for d in lead {
+                let Dim::Const(n) = d else {
+                    return Err(Error::Shape(format!(
+                        "a rank-{} activation folds its leading axes into the row axis, \
+                         which needs them constant; {d} is symbolic",
+                        act.rank()
+                    )));
+                };
+                folded *= n;
+            }
+            let flat = act.reshape_dims(&[Dim::Const(folded), k[0]])?;
+            let out = flat.matmul_t(weight)?;
+            let mut back: Vec<Dim> = lead.to_vec();
+            back.push(rows);
+            out.reshape_dims(&back)
+        }
     }
 }

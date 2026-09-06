@@ -1,9 +1,10 @@
 use crate::raw::rope::RopeImplementation;
 
+use crate::raw::weight::Weight;
 use fusor::cache::{KvCache, MaskKind};
 use fusor::layers::RmsNorm;
 use fusor::Minus1;
-use fusor::{QMatrix, Tensor};
+use fusor::Tensor;
 
 pub enum FeedForwardVariant {
     // Used by the Llama, Qwen, and Gemma models
@@ -34,34 +35,34 @@ impl FeedForwardVariant {
 }
 
 pub struct PhiFeedForward {
-    pub up: QMatrix,
-    pub down: QMatrix,
+    pub up: Weight,
+    pub down: Weight,
     pub feed_forward_length: usize,
 }
 
 impl PhiFeedForward {
     pub(crate) fn forward(&self, x: &Tensor<3>) -> Tensor<3> {
-        let up_states = x.q_mat_mul(&self.up);
+        let up_states = self.up.mat_mul(x);
         let len = self.feed_forward_length;
         let gate = up_states.narrow(Minus1, 0, len).silu();
         let up_states = up_states.narrow(Minus1, len, len).mul(&gate);
-        up_states.q_mat_mul(&self.down)
+        self.down.mat_mul(&up_states)
     }
 }
 
 pub struct LlamaFeedForward {
-    gate: QMatrix,
-    gate_up: Option<QMatrix>,
+    gate: Weight,
+    gate_up: Option<Weight>,
     gate_bias: Option<Tensor<1>>,
-    down: QMatrix,
+    down: Weight,
     down_bias: Option<Tensor<1>>,
-    up: QMatrix,
+    up: Weight,
     up_bias: Option<Tensor<1>>,
 }
 
 impl LlamaFeedForward {
-    pub(crate) fn new(gate: QMatrix, down: QMatrix, up: QMatrix) -> Self {
-        let gate_up = QMatrix::concat_rows(&[&gate, &up]).ok();
+    pub(crate) fn new(gate: Weight, down: Weight, up: Weight) -> Self {
+        let gate_up = Weight::concat_rows(&[&gate, &up]);
         Self {
             gate,
             gate_up,
@@ -74,7 +75,7 @@ impl LlamaFeedForward {
     }
 
     pub(crate) fn forward(&self, x: &Tensor<3>) -> Tensor<3> {
-        let up = self.activation(x).q_mat_mul(&self.down);
+        let up = self.down.mat_mul(&self.activation(x));
         match &self.down_bias {
             Some(bias) => up.add_(bias),
             None => up,
@@ -93,7 +94,7 @@ impl LlamaFeedForward {
         if self.down_bias.is_some() {
             return None;
         }
-        let projected = self.activation(x).q_mat_mul(&self.down);
+        let projected = self.down.mat_mul(&self.activation(x));
         Some(projected.add(first).add(second))
     }
 
@@ -101,20 +102,20 @@ impl LlamaFeedForward {
         match &self.gate_up {
             Some(gate_up) if self.gate_bias.is_none() && self.up_bias.is_none() => {
                 // SwiGLU over one fused gate|up projection.
-                let pair_len = gate_up.rows.as_const().expect("gguf rows are const") as usize / 2;
-                let projected = x.q_mat_mul(gate_up);
+                let pair_len = gate_up.rows().as_const().expect("gguf rows are const") as usize / 2;
+                let projected = gate_up.mat_mul(x);
                 let gate = projected.narrow(Minus1, 0, pair_len);
                 let up = projected.narrow(Minus1, pair_len, pair_len);
                 gate.silu().mul(&up)
             }
             _ => {
-                let mut w1 = x.q_mat_mul(&self.gate);
+                let mut w1 = self.gate.mat_mul(x);
                 if let Some(bias) = &self.gate_bias {
                     w1 = w1.add_(bias);
                 }
                 let w1 = w1.silu();
 
-                let mut w3 = x.q_mat_mul(&self.up);
+                let mut w3 = self.up.mat_mul(x);
                 if let Some(bias) = &self.up_bias {
                     w3 = w3.add_(bias);
                 }
@@ -150,13 +151,13 @@ impl AttentionBias {
 }
 
 pub struct SeparateAttention {
-    pub attention_wq: QMatrix,
+    pub attention_wq: Weight,
     /// The row-concatenated `q|k|v` projection, when the three formats agree.
-    pub attention_qkv: Option<QMatrix>,
+    pub attention_qkv: Option<Weight>,
     pub attention_q_norm: Option<RmsNorm>,
-    pub attention_wk: QMatrix,
+    pub attention_wk: Weight,
     pub attention_k_norm: Option<RmsNorm>,
-    pub attention_wv: QMatrix,
+    pub attention_wv: Weight,
     pub bias: Option<AttentionBias>,
     pub interleaved_rope: bool,
 }
@@ -184,7 +185,7 @@ impl SeparateAttention {
                 let query_width = num_heads * head_dim;
                 let key_width = num_key_value_heads * head_dim;
                 let value_width = key_width;
-                let mut qkv = hidden_states.q_mat_mul(attention_qkv);
+                let mut qkv = attention_qkv.mat_mul(&hidden_states);
                 if let Some(bias) = &self.bias {
                     qkv = qkv.add_(&bias.bias_qkv);
                 }
@@ -194,9 +195,9 @@ impl SeparateAttention {
                     qkv.narrow(Minus1, query_width + key_width, value_width),
                 )
             } else {
-                let mut q = hidden_states.q_mat_mul(&self.attention_wq);
-                let mut k = hidden_states.q_mat_mul(&self.attention_wk);
-                let mut v = hidden_states.q_mat_mul(&self.attention_wv);
+                let mut q = self.attention_wq.mat_mul(&hidden_states);
+                let mut k = self.attention_wk.mat_mul(&hidden_states);
+                let mut v = self.attention_wv.mat_mul(&hidden_states);
                 if let Some(bias) = &self.bias {
                     q = q.add_(&bias.bias_q);
                     k = k.add_(&bias.bias_k);
@@ -222,7 +223,7 @@ impl SeparateAttention {
 }
 
 pub struct GroupedAttention {
-    pub attention_qkv: QMatrix,
+    pub attention_qkv: Weight,
     pub interleaved_rope: bool,
 }
 
@@ -238,7 +239,7 @@ impl GroupedAttention {
         start_pos: usize,
         positions: Option<&Tensor<1, u32>>,
     ) -> (Tensor<4>, Tensor<4>, Tensor<4>) {
-        let qkv = x.q_mat_mul(&self.attention_qkv);
+        let qkv = self.attention_qkv.mat_mul(&x);
 
         let query_pos = num_heads * head_dim;
         let kv_width = num_key_value_heads * head_dim;
@@ -258,7 +259,7 @@ impl GroupedAttention {
 
 pub struct LlamaAttention {
     pub attention_variant: AttentionVariant,
-    pub attention_wo: QMatrix,
+    pub attention_wo: Weight,
     pub attention_norm: RmsNorm,
     pub post_attention_norm: Option<RmsNorm>,
     pub feed_forward_variant: FeedForwardVariant,
@@ -358,9 +359,10 @@ impl LlamaAttention {
             }
         }
 
-        attn_output
-            .transpose(1, 2)
-            .reshape([b_sz, q_len, hidden_size])
-            .q_mat_mul(&self.attention_wo)
+        self.attention_wo.mat_mul(
+            &attn_output
+                .transpose(1, 2)
+                .reshape([b_sz, q_len, hidden_size]),
+        )
     }
 }
