@@ -1,13 +1,13 @@
-//! Device-removal probe.
+//! Device-removal regression probe for DX12/WARP.
 //!
-//! On DX12/WARP the sampling suite loses the device on one kernel shape:
-//! a contraction whose activation `pre` reads four n×n matrices, so the
-//! dispatch binds the uniforms, one vector, four read-only matrices and the
-//! output. Everything else in the suite passes. This test runs that exact
-//! dumped kernel, its passing sibling, and a synthetic family that varies
-//! one property at a time, each on a fresh device, and reports which ones
-//! remove the device. On every other backend all of them pass, which keeps
-//! the harness honest.
+//! WARP's DXIL JIT removes the device on a `select(0, 1, cmp)` between
+//! float constants feeding an `fma`, which is how scalar compares used to
+//! lower; the same predicates through `f32(cmp)` casts are fine. This test
+//! runs the kernel shapes that used to remove the device, in the form the
+//! emitter now produces, plus a synthetic family over binding count,
+//! subgroup use and clamping, each on a fresh device, and reports any that
+//! remove it. On every other backend all of them pass, which keeps the
+//! harness honest.
 
 use std::borrow::Cow;
 
@@ -64,10 +64,9 @@ fn synthetic(srvs: usize, subgroup: bool, clamp: bool) -> Variant {
 
 #[derive(Clone, Copy)]
 enum Pre {
-    /// The pairs kernel's activation: `(m0 == m1) * (m2 > m3) + (m0 > m1)`
-    /// built from `select(0, 1, cmp)` and `fma`.
-    CompareSelect,
-    /// The same predicates through `f32(bool)` casts.
+    /// The pairs kernel's activation, `(m0 == m1) * (m2 > m3) + (m0 > m1)`,
+    /// with the predicates as `f32(bool)` casts feeding an `fma`. The
+    /// `select(0f, 1f, cmp)` form of the same thing removes the device.
     CompareCast,
     /// A plain sum of the four loads.
     Sum,
@@ -95,9 +94,6 @@ fn contraction(k: usize, pre: Pre) -> Variant {
             ));
         }
         let av = match pre {
-            Pre::CompareSelect => format!(
-                "fma(select(0f, 1f, (m2_{j} == m3_{j})), select(0f, 1f, (m4_{j} > m5_{j})), select(0f, 1f, (m2_{j} > m3_{j})))"
-            ),
             Pre::CompareCast => {
                 format!("fma(f32(m2_{j} == m3_{j}), f32(m4_{j} > m5_{j}), f32(m2_{j} > m3_{j}))")
             }
@@ -113,7 +109,6 @@ fn contraction(k: usize, pre: Pre) -> Variant {
     }
     w.push_str("    let total: f32 = subgroupAdd(acc);\n    if (lane == 0u) {\n        global_6[row] = total;\n    }\n    return;\n}\n");
     let pre_name = match pre {
-        Pre::CompareSelect => "compare-select",
         Pre::CompareCast => "compare-cast",
         Pre::Sum => "sum",
     };
@@ -126,47 +121,23 @@ fn contraction(k: usize, pre: Pre) -> Variant {
 }
 
 fn variants() -> Vec<Variant> {
-    let pairs = include_str!("data/warp_sgemv_cols_pairs.wgsl");
     let outer = include_str!("data/warp_sgemv_cols_outer.wgsl");
-    let mut v = vec![
-        // The passing sibling first: the harness itself must be clean.
-        Variant {
-            label: "dump outer product (passes on WARP in CI)".into(),
-            wgsl: outer.into(),
-            sizes: vec![4, 144, 144, 5184],
-            grid: 648,
-        },
-        Variant {
-            label: "dump pairs contraction, exact sizes".into(),
-            wgsl: pairs.into(),
-            sizes: vec![4, 144, 5184, 5184, 5184, 5184, 144],
-            grid: 36,
-        },
-        Variant {
-            label: "dump pairs contraction, all bindings 8 KiB".into(),
-            wgsl: pairs.into(),
-            sizes: vec![8192; 7],
-            grid: 36,
-        },
-        Variant {
-            label: "dump pairs contraction, grid 1".into(),
-            wgsl: pairs.into(),
-            sizes: vec![4, 144, 5184, 5184, 5184, 5184, 144],
-            grid: 1,
-        },
-    ];
+    let mut v = vec![Variant {
+        label: "dump outer product".into(),
+        wgsl: outer.into(),
+        sizes: vec![4, 144, 144, 5184],
+        grid: 648,
+    }];
     for srvs in 1..=6 {
         v.push(synthetic(srvs, true, true));
     }
     v.push(synthetic(5, false, true));
     v.push(synthetic(5, true, false));
     for (k, pre) in [
-        (8, Pre::CompareSelect),
-        (32, Pre::CompareSelect),
+        (8, Pre::CompareCast),
         (32, Pre::CompareCast),
         (32, Pre::Sum),
-        (128, Pre::CompareSelect),
-        (128, Pre::Sum),
+        (128, Pre::CompareCast),
         (256, Pre::Sum),
     ] {
         v.push(contraction(k, pre));

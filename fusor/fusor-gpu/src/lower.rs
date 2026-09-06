@@ -1337,9 +1337,11 @@ impl<'a> Ctx<'a> {
                 let r = self.eval_scalar(b, args, coords)?;
                 let elem = l.element();
                 let c = self.b.compare(*op, l, r);
-                let one = self.one_of(elem);
-                let zero = self.zero_of(elem);
-                self.b.select(c, one, zero)
+                // `f32(cmp)`, never `select(0, 1, cmp)`: WARP's DXIL JIT
+                // removes the device on a select between float constants
+                // feeding an fma (fusor-gpu/tests/warp_probe.rs), and the
+                // cast is the same value on every backend.
+                self.b.cast(c, elem)
             }
             K::Select { c, t, f } => {
                 let cv = self.eval_scalar(c, args, coords)?;
@@ -1390,21 +1392,6 @@ impl<'a> Ctx<'a> {
                 self.b.vector(scalar, vec![z; lanes as usize])
             }
             ElementType::CoopMatrix { scalar, .. } => self.b.zero(scalar),
-        }
-    }
-
-    fn one_of(&mut self, elem: ElementType) -> TileExpr {
-        let scalar = match elem {
-            ElementType::Scalar(s) => s,
-            ElementType::Vector { scalar, .. } | ElementType::CoopMatrix { scalar, .. } => scalar,
-        };
-        match scalar {
-            ScalarElement::F32 => self.b.f32(1.0),
-            ScalarElement::F16 => self.b.lit(TileLiteral::F16(half::f16::ONE.to_bits())),
-            ScalarElement::BF16 => self.b.lit(TileLiteral::BF16(half::bf16::ONE.to_bits())),
-            ScalarElement::U32 => self.b.u32(1),
-            ScalarElement::I32 => self.b.i32(1),
-            ScalarElement::Bool => self.b.bool(true),
         }
     }
 
