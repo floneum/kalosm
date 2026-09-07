@@ -2,7 +2,7 @@
 //! extractor and the plan cache; `resolve` is the one place saturation,
 //! extraction and dispatch happen.
 
-use std::hash::{Hash, Hasher};
+use std::hash::Hash;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use web_time::Instant;
@@ -17,20 +17,20 @@ use fusor_ir::CORE_RULES;
 use fusor_ir::cost::CostModel;
 use fusor_ir::device::Caps;
 use fusor_ir::dtype::{Dtype, Persistence};
-use fusor_ir::egraph::{EGraph, Id, Rule, Saturate, SaturationBudget, SaturationDelta};
+use fusor_ir::egraph::{ClassId, EGraph, Id, Rule, Saturate, SaturationBudget, SaturationDelta};
 use fusor_ir::extract::{ExtractBudget, Extractor, Plan, ReplayKey};
 use fusor_ir::ir::launch::Effect;
 use fusor_ir::ir::launch::Launch;
 use fusor_ir::ir::logical::BufferId;
 use fusor_ir::ir::logical::{LeafKind, Logical};
-use fusor_ir::ir::{Op, OpDefRegistry, Semantics};
+use fusor_ir::ir::{Level, Op, OpDefRegistry, Semantics};
 use fusor_ir::saturate::Driver;
-use fusor_ir::shape::Dim;
+use fusor_ir::shape::{Dim, Layout, SymId};
 #[cfg(feature = "cpu")]
 use fusor_ir::target::{Artifact, LowerCtx, Uniforms};
 use fusor_ir::target::{Buf, Target};
 use fusor_tile::{Planner, SCHED_RULES};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::composite::register_macro_ops;
 use crate::graph::GraphRef;
@@ -261,9 +261,18 @@ pub(crate) struct SessionInner {
     /// and the candidate arms production sampling is working through.
     #[cfg(feature = "gpu")]
     explore: parking_lot::Mutex<explore::ExploreState>,
-    /// Verified plans (and, on the CPU, native launch lists), keyed by an
-    /// unsaturated term modulo fresh step-buffer names.
-    structural: parking_lot::Mutex<FxHashMap<StructuralKey, StructuralEntry>>,
+    /// The CPU's compiled launch lists, per plan and per binding (its
+    /// lowering folds the symbols' values in). The GPU target keeps its
+    /// own pipeline cache.
+    #[cfg(feature = "cpu")]
+    cpu_executables: parking_lot::Mutex<FxHashMap<(u128, u64), Arc<CpuExecutable>>>,
+    /// Shape families: terms equal modulo the constants of their step
+    /// buffers and views. A family whose constants vary across calls gets a
+    /// symbolic twin term planned once and re-bound per call.
+    families: parking_lot::Mutex<FxHashMap<FamilyKey, Family>>,
+    /// The concrete twin `family_step` just recorded for the values now
+    /// being planned, so the plan they extract to is filed under it.
+    pending_twin: parking_lot::Mutex<Option<(FamilyKey, Vec<Id>)>>,
     launches: AtomicU64,
     in_flight: AtomicU32,
 }
@@ -289,44 +298,135 @@ struct CanonicalTerm {
     roots: Vec<Id>,
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct StructuralKey {
-    graph: usize,
-    dim_values: u64,
-    term: CanonicalTerm,
-}
-
-struct StructuralEntry {
-    graph: WeakGraphRef,
-    roots: Vec<Id>,
-    inputs: Vec<Id>,
-    plan: Arc<Plan>,
-    /// The CPU's compiled launch list. The GPU target keeps its own plan
-    /// cache, so a replayed plan finds its pipelines there.
-    executable: Option<Arc<CpuExecutable>>,
-}
-
-struct StructuralHit {
-    roots: Vec<Id>,
-    plan: Arc<Plan>,
-    executable: Option<Arc<CpuExecutable>>,
-    inputs: FxHashMap<Id, Buf>,
-}
-
-/// How a structural hit runs an old plan for new values: the fresh input
-/// leaves stand in for the recorded ones, and the recorded outputs are
-/// allocated under the requested values' ids.
-struct TemplateBindings {
-    inputs: FxHashMap<Id, Buf>,
-    outputs: Vec<Id>,
-    #[cfg_attr(not(feature = "cpu"), allow(dead_code))]
-    executable: Option<Arc<CpuExecutable>>,
-}
-
 /// Uninhabited without the `cpu` backend: the memo still names the type, and
 /// a GPU resolve never has one to hold.
 #[cfg(not(feature = "cpu"))]
 enum CpuExecutable {}
+
+/// A term with the constants of its step-buffer shapes and view specs
+/// abstracted into slots: what two calls of one model step have in common
+/// when only a sequence length or a view offset moved.
+struct FamilyTerm {
+    /// The term with every abstracted constant spelled as a slot symbol
+    /// (see [`slot_dim`]), step buffers renamed positionally.
+    term: CanonicalTerm,
+    /// The abstracted constants, slot order.
+    consts: Vec<u64>,
+    /// The graph node each canonical node came from.
+    sources: Vec<Id>,
+    /// The step buffers, in the order the term names them.
+    inputs: Vec<Id>,
+}
+
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct FamilyKey {
+    graph: usize,
+    term: CanonicalTerm,
+}
+
+/// What the session knows about one shape family.
+struct Family {
+    graph: WeakGraphRef,
+    /// The constants of the first call seen.
+    consts: Vec<u64>,
+    /// Slots that have differed between two calls: the twin's symbols.
+    varying: Vec<bool>,
+    /// Which symbol each varying slot takes: slots whose values have agreed
+    /// in every call seen share one, so a length that a term spells in its
+    /// leaf shape, its views and its reshapes stays one extent to the
+    /// planner. A slot pair that later disagrees splits and rebuilds.
+    group: Vec<usize>,
+    /// Members planned concretely, one per distinct constant vector, newest
+    /// last: a shape seen again replays its own plan, whose kernels were
+    /// selected for its exact extents. Bounded by [`CONCRETE_SHAPES`].
+    concrete: Vec<Twin>,
+    /// The symbolic twin, built once the family has shown more distinct
+    /// shapes than [`CONCRETE_SHAPES`]: from then on every new shape is a
+    /// re-binding, not an extraction.
+    symbolic: Option<Twin>,
+    /// The symbolic twin could not be built or planned (an op that needs the
+    /// constant); every new shape of this family plans concretely.
+    blocked: bool,
+}
+
+/// Distinct shapes a family replays concretely before it goes symbolic. A
+/// batch of embeddings sees a handful of padded lengths and every one of
+/// them deserves the kernels its exact extents select; a decode loop sees a
+/// new length every token and would extract forever.
+const CONCRETE_SHAPES: usize = 2;
+
+/// The symbolic twin of a family: the same term with the varying slots as
+/// symbols, so one plan serves every member. The twin's nodes live in the
+/// graph beside the members' and are the ids a replay hits on.
+#[derive(Clone)]
+struct Twin {
+    /// The constant vector this twin is exact for; empty for the symbolic
+    /// twin.
+    consts: Vec<u64>,
+    syms: Vec<Option<SymId>>,
+    roots: Vec<Id>,
+    /// The twin's step-buffer leaves and the index of the member input each
+    /// stands in for: a fresh leaf where the shape carries a symbol, the
+    /// building member's own leaf otherwise. Every call rebinds them to its
+    /// member's buffers.
+    leaves: Vec<(Id, usize)>,
+    /// The plan the twin's roots last extracted to. The twin's nodes never
+    /// change, so a hit runs it directly: no saturation walk, no replay key.
+    plan: Option<Arc<Plan>>,
+}
+
+/// `layout` with every symbol replaced by its binding. A derived stride
+/// (the row-major sentinel) is recomputed from the concrete shape.
+fn concrete_layout(layout: &Layout, bindings: &FxHashMap<SymId, u64>) -> Result<Layout> {
+    let value = |d: Dim| -> Result<Dim> {
+        match d {
+            Dim::Sym(s) => bindings.get(&s).map(|v| Dim::Const(*v)).ok_or_else(|| {
+                Error::Plan(format!(
+                    "shape family output layout mentions unbound symbol {s}"
+                ))
+            }),
+            c => Ok(c),
+        }
+    };
+    let shape: Vec<Dim> = layout
+        .shape()
+        .iter()
+        .map(|d| value(*d))
+        .collect::<Result<_>>()?;
+    if layout.is_contiguous() {
+        return Ok(Layout::contiguous(&shape));
+    }
+    let row_major = Layout::row_major_strides(&shape);
+    let strides: Vec<Dim> = layout
+        .strides()
+        .iter()
+        .enumerate()
+        .map(|(axis, d)| match d {
+            Dim::Sym(s) if s.0 == u32::MAX => Ok(row_major[axis]),
+            d => value(*d),
+        })
+        .collect::<Result<_>>()?;
+    Layout::from_parts(value(layout.offset())?, &shape, &strides)
+}
+
+/// Family slots are spelled as symbols above any the graph mints and above
+/// the derived range ([`fusor_ir::shape::DERIVED_END`]).
+const FAMILY_SLOT_BASE: u32 = fusor_ir::shape::DERIVED_END;
+
+fn slot_dim(slot: usize) -> Dim {
+    Dim::Sym(SymId(FAMILY_SLOT_BASE + slot as u32))
+}
+
+fn slot_of(d: Dim) -> Option<usize> {
+    match d {
+        // `SymId(u32::MAX)` is `Layout::row_major_strides`' derived-stride
+        // sentinel, not a slot.
+        Dim::Sym(s) if s.0 >= FAMILY_SLOT_BASE && s.0 != u32::MAX => {
+            Some((s.0 - FAMILY_SLOT_BASE) as usize)
+        }
+        _ => None,
+    }
+}
 
 impl Session {
     /// Create a planner, compiler, and execution session for `device`.
@@ -368,7 +468,10 @@ impl Session {
                 #[cfg(feature = "gpu")]
                 explore: parking_lot::Mutex::new(explore::ExploreState::default()),
                 saturation: SaturationMemo::default(),
-                structural: parking_lot::Mutex::new(FxHashMap::default()),
+                #[cfg(feature = "cpu")]
+                cpu_executables: parking_lot::Mutex::new(FxHashMap::default()),
+                families: parking_lot::Mutex::new(FxHashMap::default()),
+                pending_twin: parking_lot::Mutex::new(None),
                 launches: AtomicU64::new(0),
                 in_flight: AtomicU32::new(0),
             }),
@@ -428,8 +531,19 @@ impl Session {
         resolving: &ResolveGuard<'_>,
         values: &[Tensor],
     ) -> Result<()> {
+        self.resolve_locked_plan(resolving, values).map(|_| ())
+    }
+
+    /// [`Self::resolve_locked`], also handing back the plan when the values
+    /// were planned and run here (`None` when a memo or a restatement ran
+    /// them instead).
+    fn resolve_locked_plan(
+        &self,
+        resolving: &ResolveGuard<'_>,
+        values: &[Tensor],
+    ) -> Result<Option<Arc<Plan>>> {
         if values.is_empty() {
-            return Ok(());
+            return Ok(None);
         }
         let graph = values[0].graph.clone();
         for v in values {
@@ -442,50 +556,77 @@ impl Session {
 
         // Every requested value already has a device buffer: nothing to plan.
         if values.iter().all(|v| graph.device_buf(v.id).is_some()) {
-            return Ok(());
+            return Ok(None);
         }
 
         if self.inner.in_flight.load(Ordering::Relaxed) >= MAX_INFLIGHT_PLANS {
             self.wait()?;
         }
 
-        // Inference frontends commonly rebuild the same expression with a
-        // fresh `from_slice` leaf on every call, so the graph grows with every
-        // call and the replay key (a hash over every id) can never hit. Reuse
-        // the already verified, already tuned plan — and on the CPU its
-        // compiled executable — for an isomorphic raw term, rebinding only
-        // the fresh input and requested output buffers. This deliberately
-        // runs before saturation and extraction: those dominate the cost of
-        // replaying a model on an append-only graph. On the GPU a graph
-        // unchanged since its last saturation is left to the replay memo,
-        // which is where the online explorer samples its arms.
-        let structural_eligible = self.inner.device.is_cpu() || {
-            let g = graph.state().egraph.lock();
-            g.saturated_at_len != Some(g.len())
-        };
-        let __t_key = Instant::now();
-        if structural_eligible && let Some(hit) = self.structural_hit(&graph, values) {
-            let __key_us = __t_key.elapsed().as_micros();
-            let old_values: Vec<Tensor> = hit.roots.iter().map(|id| graph.tensor(*id)).collect();
-            let bindings = TemplateBindings {
-                inputs: hit.inputs,
-                outputs: values.iter().map(|value| value.id).collect(),
-                executable: hit.executable,
-            };
-            let started = Instant::now();
-            let (launched, _) = self.run(&graph, &hit.plan, &old_values, Some(&bindings))?;
+        // A value below the roots that already has a device buffer is an
+        // input, not something to recompute: a reader of one chunk of a
+        // resolved batch must not re-run the whole batch. Planning cannot
+        // see bindings, so the term is restated over a leaf adopting that
+        // buffer, resolved, and the requested values take the results.
+        // A resolve the replay memo already answers — an unchanged graph
+        // under the roots it last hashed, a decode step — takes that path,
+        // where the online explorer samples its arms and the step's own
+        // last outputs stay roots rather than becoming inputs. Everything
+        // else (a grown graph, or new roots over an unchanged one such as
+        // the next chunk of a resolved batch) is restated and memoized
+        // structurally first.
+        // A requested pure view of an unresolved computed value plans that
+        // value first: every chunk of a batch needs the same producers, and
+        // computing the whole once leaves each chunk a copy of a bound buffer
+        // (the restatement below) instead of a run of the whole batch.
+        let bases = self.unresolved_view_bases(&graph, values);
+        if !bases.is_empty() {
+            let bases: Vec<Tensor> = bases.into_iter().map(|id| graph.tensor(id)).collect();
+            self.resolve_locked(resolving, &bases)?;
+        }
+        let replays = self.replay_would_hit(&graph, values);
+        if !replays && let Some(cut) = self.cut_at_bound(&graph, values)? {
             if resolve_profile() {
                 eprintln!(
-                    "[profile] structural replay hit: key {__key_us} us, run {} us ({} launches)",
-                    started.elapsed().as_micros(),
-                    launched
+                    "[profile] cut at bound values: {:?} -> {:?}",
+                    values.iter().map(|v| v.id).collect::<Vec<_>>(),
+                    cut.iter().map(|v| v.id).collect::<Vec<_>>()
                 );
             }
-            self.inner
-                .launches
-                .fetch_add(launched as u64, Ordering::Relaxed);
-            self.inner.in_flight.fetch_add(1, Ordering::Relaxed);
-            return Ok(());
+            self.resolve_locked(resolving, &cut)?;
+            for (value, root) in values.iter().zip(&cut) {
+                if let Some(buf) = graph.device_buf(root.id) {
+                    let layout = graph.device_layout(root.id).map(Arc::new);
+                    graph.bind_classes(&[(value.id, buf, layout)]);
+                }
+            }
+            return Ok(None);
+        }
+
+        // Inference frontends rebuild the same expression with fresh
+        // `from_slice` leaves on every call, often with a length or a view
+        // offset moved: the graph grows every call and the replay key (a
+        // hash over the ids the roots reach) can never hit. Shape families
+        // catch that: the first call records the term with its constants
+        // abstracted, an identical later call re-binds the recorded nodes'
+        // step buffers and replays their plan, and a call whose constants
+        // differ plans one symbolic twin that every call after re-binds.
+        // This runs before saturation and extraction, which dominate a
+        // replay on an append-only graph. A graph unchanged since its last
+        // saturation is left to the replay memo, which is where the online
+        // explorer samples its arms.
+        if !replays
+            && let Some(term) = {
+                let roots: Vec<Id> = values.iter().map(|v| v.id).collect();
+                let term = canonical_family(&graph, &roots);
+                if resolve_profile() && term.is_none() {
+                    eprintln!("[profile] shape family: term not canonicalizable");
+                }
+                term
+            }
+            && self.family_step(resolving, &graph, values, term)?
+        {
+            return Ok(None);
         }
 
         let caps = self.caps();
@@ -501,7 +642,8 @@ impl Session {
         let (plan, roots, key, missed) = {
             let mut g = graph.state().egraph.lock();
             // The root set is per-resolve: planning covers exactly the values
-            // this call requested.
+            // this call requested. The bindings ride along as costing hints.
+            g.dim_hints = graph.dim_bindings().into_iter().collect();
             g.clear_roots();
             for v in values {
                 g.add_root(v.id);
@@ -520,7 +662,10 @@ impl Session {
             // saturation is exactly the graph saturation last ran on
             // (`add` is the only structural mutation), so there is nothing
             // to do.
-            let __skipped = g.saturated_at_len == Some(g.len());
+            // Saturation is scoped to what the roots reach, so an unchanged
+            // arena is saturated for these roots only if they are the roots
+            // it last ran for.
+            let __skipped = g.saturated_at_len == Some(g.len()) && g.saturated_roots == g.roots();
             let memo_eligible = !__skipped && g.len() <= SATURATION_MEMO_MAX_NODES;
             let __replayed = memo_eligible && self.inner.saturation.replay(&mut g);
             if !__skipped && !__replayed {
@@ -550,6 +695,7 @@ impl Session {
                 }
             }
             g.saturated_at_len = Some(g.len());
+            g.saturated_roots = g.roots().to_vec();
             let __sat_us = __t_sat.elapsed().as_micros();
 
             let roots: Vec<Id> = g.roots().to_vec();
@@ -663,7 +809,7 @@ impl Session {
         }
 
         let __t_run = Instant::now();
-        let (launched, executable) = self.run(&graph, &plan, values, None)?;
+        let (launched, executable) = self.run(&graph, &plan, values)?;
         #[cfg(feature = "gpu")]
         if let Some(sel) = explored {
             // Reads the profile the armed clock captured; must run before the
@@ -681,8 +827,25 @@ impl Session {
             .launches
             .fetch_add(launched as u64, Ordering::Relaxed);
         self.inner.in_flight.fetch_add(1, Ordering::Relaxed);
-        self.insert_structural(&graph, &roots, Arc::clone(&plan), executable);
-        Ok(())
+        #[cfg(feature = "cpu")]
+        if let Some(executable) = executable {
+            self.inner
+                .cpu_executables
+                .lock()
+                .insert((plan.hash.0, dims_hash(&graph)), executable);
+        }
+        #[cfg(not(feature = "cpu"))]
+        let _ = executable;
+        // The concrete twin recorded for these values gets the plan they
+        // extracted to, so their shape's next call runs it directly.
+        if let Some((key, roots)) = self.inner.pending_twin.lock().take()
+            && roots.iter().zip(values).all(|(r, v)| *r == v.id)
+            && let Some(fam) = self.inner.families.lock().get_mut(&key)
+            && let Some(t) = fam.concrete.iter_mut().find(|t| t.roots == roots)
+        {
+            t.plan = Some(Arc::clone(&plan));
+        }
+        Ok(Some(plan))
     }
 
     /// Submit whatever is encoded without waiting.
@@ -713,62 +876,482 @@ impl Session {
         Ok(())
     }
 
-    fn structural_hit(&self, graph: &GraphRef, values: &[Tensor]) -> Option<StructuralHit> {
-        let roots: Vec<Id> = values.iter().map(|value| value.id).collect();
-        let (key, current_inputs) = structural_key(graph, &roots)?;
-        let mut entries = self.inner.structural.lock();
-        entries.retain(|_, entry| entry.graph.strong_count() > 0);
-        let entry = entries.get(&key)?;
-        if !entry
-            .graph
-            .upgrade()
-            .is_some_and(|owner| GraphRef::ptr_eq(&owner, graph))
-        {
-            return None;
-        }
-        let mut inputs = FxHashMap::default();
-        for (&old, current) in entry.inputs.iter().zip(current_inputs) {
-            if old == current {
-                continue;
+    /// For each requested value that is a chain of pure views over a computed
+    /// value with no device buffer, that base value (deduplicated).
+    fn unresolved_view_bases(&self, graph: &GraphRef, values: &[Tensor]) -> Vec<Id> {
+        let g = graph.state().egraph.lock();
+        let mut out: Vec<Id> = Vec::new();
+        for value in values {
+            let mut id = value.id;
+            loop {
+                match logical_children(&g, id) {
+                    Some(kids) if matches!(g.node(id).op, Op::Union(..)) && kids.len() == 1 => {
+                        id = kids[0];
+                    }
+                    Some(kids)
+                        if matches!(g.node(id).op, Op::Logical(Logical::Restride { .. })) =>
+                    {
+                        id = kids[0];
+                    }
+                    _ => break,
+                }
             }
-            let buffer = graph
-                .device_buf(current)
-                .or_else(|| self.leaf_buffer(graph, current).ok().flatten())?;
-            inputs.insert(old, buffer);
+            if id != value.id
+                && !matches!(g.node(id).op, Op::Logical(Logical::Leaf(_)))
+                && graph.device_buf(id).is_none()
+                && !out.contains(&id)
+            {
+                out.push(id);
+            }
         }
-        Some(StructuralHit {
-            roots: entry.roots.clone(),
-            plan: Arc::clone(&entry.plan),
-            executable: entry.executable.clone(),
-            inputs,
-        })
+        out
     }
 
-    fn insert_structural(
+    /// Whether the replay memo holds a plan for exactly these values on the
+    /// graph as it stands: its key is the closure hash the graph last cached
+    /// for this root set at this length.
+    fn replay_would_hit(&self, graph: &GraphRef, values: &[Tensor]) -> bool {
+        let g = graph.state().egraph.lock();
+        let Some((roots, len, hash)) = &g.l0_term_memo else {
+            return false;
+        };
+        if *len != g.len()
+            || roots.len() != values.len()
+            || roots.iter().zip(values).any(|(r, v)| *r != v.id)
+        {
+            return false;
+        }
+        let binding: Vec<Dim> = graph
+            .dim_bindings()
+            .into_iter()
+            .map(|(s, _)| Dim::Sym(s))
+            .collect();
+        let key = ReplayKey {
+            l0_term: *hash,
+            device: self.inner.cost.facts().fingerprint(),
+            binding: fusor_cost::replay::binding_hash(&binding),
+        };
+        self.inner.replay.get(key).is_some()
+    }
+
+    /// `values`' term with every bound non-leaf value below the roots
+    /// replaced by a fresh external leaf adopting its buffer. `None` when
+    /// nothing below the roots is bound — the common case — so no node is
+    /// minted; otherwise the restated roots, hash-consed onto the original
+    /// term wherever nothing changed.
+    fn cut_at_bound(&self, graph: &GraphRef, values: &[Tensor]) -> Result<Option<Vec<Tensor>>> {
+        let roots: Vec<Id> = values.iter().map(|v| v.id).collect();
+        // Cheap pre-check under the leaf lock: any bound value at all?
+        let bound: FxHashSet<Id> = graph.bound_values();
+        if bound.is_empty() || bound.iter().all(|id| roots.contains(id)) {
+            return Ok(None);
+        }
+        let mut g = graph.state().egraph.lock();
+        let Some(order) = logical_postorder(&g, &roots) else {
+            return Ok(None);
+        };
+        // A root is requested by class: its Logical member below a union
+        // spelling is the root itself, not an input to cut at.
+        let root_classes: FxHashSet<ClassId> = roots.iter().map(|r| g.class_of(*r)).collect();
+        let mut memo: FxHashMap<Id, Id> = FxHashMap::default();
+        let mut cut_any = false;
+        for id in order {
+            let node = g.node(id).clone();
+            let kids = logical_children(&g, id).expect("walked above");
+            let is_root = root_classes.contains(&g.class_of(id));
+            let is_leaf = matches!(node.op, Op::Logical(Logical::Leaf(_)));
+            let out = if let Op::Union(..) = node.op {
+                let mapped: Vec<Id> = kids.iter().map(|c| memo[c]).collect();
+                match mapped.as_slice() {
+                    [one] => *one,
+                    [x, y] if *x == kids[0] && *y == kids[1] => id,
+                    [x, y] => g.union(*x, *y)?,
+                    _ => id,
+                }
+            } else if !is_root && !is_leaf && bound.contains(&id) {
+                if resolve_profile() {
+                    eprintln!("[profile]   cutting {id} ({:?})", node.op.tag());
+                }
+                let facts = g.facts(id).clone();
+                let leaf = g.add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
+                    name: graph.fresh_buffer_id(),
+                    dtype: facts.dtype,
+                    shape: facts.shape.clone(),
+                })))?;
+                if let Some(buf) = graph.device_buf(id) {
+                    let layout = graph.device_layout(id).map(Arc::new);
+                    graph.bind_leaf(leaf, buf, layout);
+                }
+                cut_any = true;
+                leaf
+            } else if is_leaf {
+                id
+            } else {
+                let children: Vec<Id> = kids.iter().map(|c| memo[c]).collect();
+                if children == kids {
+                    id
+                } else {
+                    let rebuilt = rebuild_op(&node.op, &children, &mut |d| d).ok_or_else(|| {
+                        Error::Plan("a bound intermediate lies below a lowered launch".into())
+                    })?;
+                    g.add(rebuilt)?
+                }
+            };
+            memo.insert(id, out);
+        }
+        if !cut_any {
+            return Ok(None);
+        }
+        let out: Vec<Id> = roots.iter().map(|r| memo[r]).collect();
+        drop(g);
+        Ok(Some(out.into_iter().map(|id| graph.tensor(id)).collect()))
+    }
+
+    /// Run `values` through their shape family: the concrete twin recorded
+    /// for exactly these constants, or the symbolic twin once the family has
+    /// shown more shapes than it keeps concrete plans for. `Ok(false)` when
+    /// this call is a new shape the family still plans concretely (and
+    /// records), or the family is blocked.
+    fn family_step(
+        &self,
+        resolving: &ResolveGuard<'_>,
+        graph: &GraphRef,
+        values: &[Tensor],
+        term: FamilyTerm,
+    ) -> Result<bool> {
+        let key = FamilyKey {
+            graph: GraphRef::as_ptr(graph) as usize,
+            term: term.term.clone(),
+        };
+        let own_nodes = || Twin {
+            consts: term.consts.clone(),
+            syms: vec![None; term.consts.len()],
+            roots: term
+                .term
+                .roots
+                .iter()
+                .map(|r| term.sources[r.index()])
+                .collect(),
+            leaves: (0..term.inputs.len())
+                .map(|ix| (term.inputs[ix], ix))
+                .collect(),
+            plan: None,
+        };
+        let twin = {
+            let mut fams = self.inner.families.lock();
+            fams.retain(|_, f| f.graph.strong_count() > 0);
+            if fams.len() >= fusor_cost::replay::CAPACITY && !fams.contains_key(&key) {
+                fams.clear();
+            }
+            let is_new = !fams.contains_key(&key);
+            let fam = fams.entry(key.clone()).or_insert_with(|| Family {
+                graph: GraphRef::downgrade(graph),
+                consts: term.consts.clone(),
+                varying: vec![false; term.consts.len()],
+                group: vec![0; term.consts.len()],
+                concrete: vec![own_nodes()],
+                symbolic: None,
+                blocked: false,
+            });
+            let own_roots: Vec<Id> = values.iter().map(|v| v.id).collect();
+            if is_new {
+                if resolve_profile() {
+                    eprintln!(
+                        "[profile] shape family: first sighting ({} slots, {} families)",
+                        term.consts.len(),
+                        fams.len()
+                    );
+                }
+                *self.inner.pending_twin.lock() = Some((key, own_roots));
+                return Ok(false);
+            }
+            // These values are a recorded twin's own roots: plan them directly.
+            let is_own = |t: &Twin| t.roots.iter().zip(values).all(|(r, v)| *r == v.id);
+            if fam.concrete.iter().chain(fam.symbolic.iter()).any(is_own) {
+                return Ok(false);
+            }
+            if let Some(i) = fam.concrete.iter().position(|t| t.consts == term.consts) {
+                // This exact shape again: its own plan, newest last.
+                let t = fam.concrete.remove(i);
+                fam.concrete.push(t);
+                fam.concrete.last().cloned().expect("pushed")
+            } else if fam.blocked || fam.concrete.len() < CONCRETE_SHAPES {
+                // A new shape the family still plans concretely.
+                if fam.concrete.len() >= CONCRETE_SHAPES {
+                    fam.concrete.remove(0);
+                }
+                fam.concrete.push(own_nodes());
+                if resolve_profile() {
+                    eprintln!(
+                        "[profile] shape family: new shape ({} of {} concrete)",
+                        fam.concrete.len(),
+                        CONCRETE_SHAPES
+                    );
+                }
+                *self.inner.pending_twin.lock() = Some((key, own_roots));
+                return Ok(false);
+            } else {
+                // Shapes keep changing: the symbolic twin. Slots that have
+                // differed from the first shape are its symbols, grouped by
+                // value history (two slots share a symbol only while they
+                // have agreed in every call); a group that splits rebuilds.
+                let mut widened = fam.symbolic.is_none();
+                for (slot, (a, b)) in fam.consts.iter().zip(&term.consts).enumerate() {
+                    if a != b && !fam.varying[slot] {
+                        fam.varying[slot] = true;
+                        widened = true;
+                    }
+                }
+                let mut by_value: FxHashMap<(usize, u64, u64), usize> = FxHashMap::default();
+                let mut regrouped = fam.group.clone();
+                for slot in 0..term.consts.len() {
+                    if !fam.varying[slot] {
+                        continue;
+                    }
+                    let next = by_value.len();
+                    regrouped[slot] = *by_value
+                        .entry((fam.group[slot], fam.consts[slot], term.consts[slot]))
+                        .or_insert(next);
+                }
+                let split = (0..term.consts.len()).any(|a| {
+                    fam.varying[a]
+                        && (0..a).any(|b| {
+                            fam.varying[b]
+                                && fam.group[a] == fam.group[b]
+                                && regrouped[a] != regrouped[b]
+                        })
+                });
+                widened |= split;
+                fam.group = regrouped;
+                if widened {
+                    match self.build_twin(graph, &term, &fam.varying, &fam.group) {
+                        Ok(twin) => fam.symbolic = Some(twin),
+                        Err(err) => {
+                            if resolve_profile() {
+                                eprintln!("[profile] shape family blocked: {err}");
+                            }
+                            fam.blocked = true;
+                            fam.symbolic = None;
+                            fam.concrete.push(own_nodes());
+                            return Ok(false);
+                        }
+                    }
+                }
+                fam.symbolic.clone().expect("built above")
+            }
+        };
+        let symbolic = twin.consts.is_empty();
+        let __t = Instant::now();
+        for (slot, sym) in twin.syms.iter().enumerate() {
+            if let Some(sym) = sym {
+                graph.bind_dim(*sym, term.consts[slot]);
+            }
+        }
+        // The member's step buffers stand behind the twin's leaves. A leaf
+        // that is this member's own node (a weight) already holds its buffer.
+        for (leaf, input_ix) in &twin.leaves {
+            let source = term.inputs[*input_ix];
+            if *leaf == source {
+                continue;
+            }
+            let Some(buf) = graph
+                .device_buf(source)
+                .or(self.leaf_buffer(graph, source)?)
+            else {
+                return Ok(false);
+            };
+            let layout = graph.device_layout(source).map(Arc::new);
+            graph.bind_classes(&[(*leaf, buf, layout)]);
+        }
+        let twin_values: Vec<Tensor> = twin.roots.iter().map(|id| graph.tensor(*id)).collect();
+        // The twin's roots are still bound to the last call's outputs; a
+        // bound value is "nothing to plan", so they are unbound first.
+        for root in &twin.roots {
+            graph.clear_class_device_buf(*root);
+        }
+        // The twin's own nodes never change between calls, so once its plan
+        // is known a hit runs that plan directly. A symbolic twin that fails
+        // to plan blocks the family; a concrete one that fails is dropped.
+        let outcome = match twin.plan.clone() {
+            Some(plan) => self.run(graph, &plan, &twin_values).map(|(launched, _)| {
+                self.inner
+                    .launches
+                    .fetch_add(launched as u64, Ordering::Relaxed);
+                self.inner.in_flight.fetch_add(1, Ordering::Relaxed);
+                None
+            }),
+            None => self.resolve_locked_plan(resolving, &twin_values),
+        };
+        let planned = match outcome {
+            Ok(planned) => planned,
+            Err(err) => {
+                if resolve_profile() {
+                    eprintln!("[profile] shape family blocked at planning: {err}");
+                }
+                for root in &twin.roots {
+                    graph.clear_class_device_buf(*root);
+                }
+                if let Some(fam) = self.inner.families.lock().get_mut(&key) {
+                    if symbolic {
+                        fam.blocked = true;
+                        fam.symbolic = None;
+                    } else {
+                        fam.concrete.retain(|t| t.roots != twin.roots);
+                    }
+                }
+                return Ok(false);
+            }
+        };
+        if let Some(plan) = planned
+            && let Some(fam) = self.inner.families.lock().get_mut(&key)
+            && let Some(t) = fam
+                .concrete
+                .iter_mut()
+                .chain(fam.symbolic.iter_mut())
+                .find(|t| t.roots == twin.roots)
+        {
+            t.plan = Some(plan);
+        }
+        // The member's value is concrete, so its binding carries the twin's
+        // layout with this call's values in place of the symbols.
+        let bindings: FxHashMap<SymId, u64> = graph.dim_bindings().into_iter().collect();
+        for (value, root) in values.iter().zip(&twin.roots) {
+            let Some(buf) = graph.device_buf(*root) else {
+                return Err(Error::Plan(format!(
+                    "shape family twin root {root} resolved without a buffer"
+                )));
+            };
+            let layout = match graph.device_layout(*root) {
+                Some(layout) => Some(Arc::new(concrete_layout(&layout, &bindings)?)),
+                None => None,
+            };
+            graph.bind_classes(&[(value.id, buf, layout)]);
+        }
+        if resolve_profile() {
+            eprintln!(
+                "[profile] shape family hit: {} ({} symbol(s), {} us)",
+                if symbolic { "symbolic" } else { "concrete" },
+                twin.syms.iter().flatten().count(),
+                __t.elapsed().as_micros()
+            );
+        }
+        // `FUSOR_VERIFY_FAMILIES`: also plan this member concretely and
+        // compare every output byte-for-byte. A twin computing something
+        // its member does not is a compiler bug in symbolic lowering.
+        if verify_families() {
+            let mut from_twin = Vec::with_capacity(values.len());
+            for value in values {
+                from_twin.push(self.read_bytes_locked(resolving, graph, value.id)?);
+                graph.clear_class_device_buf(value.id);
+            }
+            let saved = self.inner.families.lock().remove(&key);
+            self.resolve_locked(resolving, values)?;
+            if let Some(saved) = saved {
+                self.inner.families.lock().insert(key, saved);
+            }
+            for (o, (value, twin_bytes)) in values.iter().zip(&from_twin).enumerate() {
+                let concrete = self.read_bytes_locked(resolving, graph, value.id)?;
+                let dtype = graph.facts(value.id).dtype;
+                if !agrees(dtype, &concrete, twin_bytes) {
+                    let detail = (dtype == Dtype::F32)
+                        .then(|| first_mismatch(&concrete, twin_bytes))
+                        .flatten()
+                        .map_or_else(String::new, |(i, p, q, w)| {
+                            format!(" (elem {i}: concrete {p} vs twin {q}, worst |d| {w})")
+                        });
+                    return Err(Error::Plan(format!(
+                        "shape family twin disagrees with its member on output {o} ({} vs {} \
+                         bytes){detail}",
+                        concrete.len(),
+                        twin_bytes.len()
+                    )));
+                }
+            }
+            eprintln!(
+                "[verify] shape family twin agrees on {} output(s)",
+                values.len()
+            );
+        }
+        Ok(true)
+    }
+
+    /// Mint the family's symbolic twin: the canonical term rebuilt into the
+    /// graph with every varying slot a fresh symbol and every other slot its
+    /// constant. Step buffers with a symbolic shape become fresh leaves; all
+    /// other leaves are the members' own nodes, and hash-consing folds every
+    /// unchanged node onto the member's.
+    fn build_twin(
         &self,
         graph: &GraphRef,
-        roots: &[Id],
-        plan: Arc<Plan>,
-        executable: Option<Arc<CpuExecutable>>,
-    ) {
-        let Some((key, inputs)) = structural_key(graph, roots) else {
-            return;
+        term: &FamilyTerm,
+        varying: &[bool],
+        group: &[usize],
+    ) -> Result<Twin> {
+        let mut g = graph.state().egraph.lock();
+        let mut by_group: FxHashMap<usize, SymId> = FxHashMap::default();
+        let syms: Vec<Option<SymId>> = varying
+            .iter()
+            .zip(group)
+            .map(|(v, grp)| v.then(|| *by_group.entry(*grp).or_insert_with(|| g.fresh_sym())))
+            .collect();
+        let mut subst = |d: Dim| -> Dim {
+            match slot_of(d) {
+                Some(slot) => match syms[slot] {
+                    Some(sym) => Dim::Sym(sym),
+                    None => Dim::Const(term.consts[slot]),
+                },
+                None => d,
+            }
         };
-        let mut entries = self.inner.structural.lock();
-        entries.retain(|_, entry| entry.graph.strong_count() > 0);
-        if entries.len() >= fusor_cost::replay::CAPACITY && !entries.contains_key(&key) {
-            entries.clear();
+        let mut map: Vec<Id> = Vec::with_capacity(term.term.nodes.len());
+        let mut leaves = Vec::new();
+        for (k, op) in term.term.nodes.iter().enumerate() {
+            let id = match op {
+                Op::Logical(Logical::Leaf(LeafKind::Buffer { name, dtype, shape })) => {
+                    let input_ix = name.0 as usize;
+                    let symbolic = shape
+                        .iter()
+                        .any(|d| slot_of(*d).is_some_and(|slot| syms[slot].is_some()));
+                    let id = if symbolic {
+                        g.add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
+                            name: graph.fresh_buffer_id(),
+                            dtype: *dtype,
+                            shape: shape.iter().map(|d| subst(*d)).collect(),
+                        })))?
+                    } else {
+                        term.inputs[input_ix]
+                    };
+                    leaves.push((id, input_ix));
+                    id
+                }
+                Op::Logical(Logical::Leaf(LeafKind::Const { .. })) => {
+                    let rebuilt = rebuild_op(op, &[], &mut subst).expect("a leaf rebuilds");
+                    g.add(rebuilt)?
+                }
+                Op::Logical(Logical::Leaf(_)) => term.sources[k],
+                Op::Union(a, b) => g.union(map[a.index()], map[b.index()])?,
+                other => {
+                    let children: Vec<Id> = g
+                        .semantics()
+                        .children(other)
+                        .iter()
+                        .map(|c| map[c.index()])
+                        .collect();
+                    let rebuilt = rebuild_op(other, &children, &mut subst).ok_or_else(|| {
+                        Error::Plan("a shape family term holds an op it cannot rebuild".into())
+                    })?;
+                    g.add(rebuilt)?
+                }
+            };
+            map.push(id);
         }
-        entries.insert(
-            key,
-            StructuralEntry {
-                graph: GraphRef::downgrade(graph),
-                roots: roots.to_vec(),
-                inputs,
-                plan,
-                executable,
-            },
-        );
+        Ok(Twin {
+            consts: Vec::new(),
+            syms,
+            roots: term.term.roots.iter().map(|r| map[r.index()]).collect(),
+            leaves,
+            plan: None,
+        })
     }
 
     /// Dispatches issued since construction, not encoder submissions.
@@ -940,24 +1523,47 @@ impl Session {
         graph: &GraphRef,
         plan: &Plan,
         values: &[Tensor],
-        template: Option<&TemplateBindings>,
     ) -> Result<(usize, Option<Arc<CpuExecutable>>)> {
         // What the extractor selected for each requested value.
         let wanted: Vec<Id> = values
             .iter()
             .map(|v| self.selected(graph, plan, v.id))
             .collect();
-        let output_aliases: FxHashMap<Id, Id> = template
-            .map(|bindings| {
-                wanted
-                    .iter()
-                    .copied()
-                    .zip(bindings.outputs.iter().copied())
-                    .collect()
-            })
-            .unwrap_or_default();
         let launch_roots: rustc_hash::FxHashSet<Id> =
             plan.launches.iter().map(|launch| launch.root).collect();
+        // An in-place launch that writes through a *persistent* leaf (a
+        // cache store) produces that leaf's next contents, so its output
+        // stays bound whether or not it was requested: the cache commits it
+        // after the step, and it aliases the store, pinning nothing. One that
+        // writes through a step-local buffer (a `cat` scattering onto a
+        // constant) must not: that buffer returns to the pool with the plan.
+        let in_place_roots: rustc_hash::FxHashSet<Id> = {
+            let g = graph.state().egraph.lock();
+            plan.launches
+                .iter()
+                .filter(|launch| {
+                    launch.members.iter().any(|m| {
+                        let node = g.node(*m);
+                        match g.semantics().effect(&node.op) {
+                            Effect::Pure => false,
+                            Effect::InPlace(role) => g
+                                .semantics()
+                                .children(&node.op)
+                                .get(role.0 as usize)
+                                .is_some_and(|written| {
+                                    matches!(
+                                        g.node(*written).op,
+                                        Op::Logical(Logical::Leaf(
+                                            LeafKind::Buffer { .. } | LeafKind::Param { .. }
+                                        ))
+                                    ) && graph.device_buf(*written).is_some()
+                                }),
+                        }
+                    })
+                })
+                .map(|launch| launch.root)
+                .collect()
+        };
         // Every external leaf the plan reads, uploaded once. A `Persistent`
         // leaf keeps its buffer across resolves. The classification runs once
         // over the distinct bound values under one lock apiece rather than
@@ -985,28 +1591,11 @@ impl Session {
                 }
             }
         }
-        if let Some(template) = template {
-            for (id, buf) in &template.inputs {
-                supplied.insert(*id, buf.clone());
-            }
-        }
         // Root outputs are allocated here rather than inside the backend so
         // the handle survives for readback. The root set is built once;
         // rescanning the launch list per buffer would be quadratic.
         let mut to_bind: Vec<(Id, Buf, Option<Arc<fusor_ir::shape::Layout>>)> = Vec::new();
         for buffer in &plan.buffers {
-            if let Some(target) = output_aliases.get(&buffer.value).copied() {
-                let elements = resolve_buffer_elements(buffer.elements, &buffer.layout, graph)?;
-                let bytes = (elements * buffer.dtype.byte_size()).max(4);
-                let buf = self
-                    .inner
-                    .device
-                    .target()
-                    .alloc(bytes, buffer.persistence)?;
-                to_bind.push((target, buf.clone(), Some(Arc::new(buffer.layout.clone()))));
-                supplied.insert(buffer.value, buf);
-                continue;
-            }
             if supplied.contains_key(&buffer.value) {
                 continue;
             }
@@ -1038,7 +1627,7 @@ impl Session {
             // life of the graph — a 32-block vision tower held 22 GB of
             // hidden states that way. A later read of an intermediate
             // recomputes it.
-            if wanted.contains(&buffer.value) {
+            if wanted.contains(&buffer.value) || in_place_roots.contains(&buffer.value) {
                 to_bind.push((
                     buffer.value,
                     buf.clone(),
@@ -1089,13 +1678,14 @@ impl Session {
             #[cfg(feature = "cpu")]
             Backend::Cpu(target) => {
                 let target = Arc::clone(target);
-                let (launched, executable) = self.run_cpu(
-                    target.as_ref(),
-                    graph,
-                    plan,
-                    &mut supplied,
-                    template.and_then(|bindings| bindings.executable.clone()),
-                )?;
+                let cached = self
+                    .inner
+                    .cpu_executables
+                    .lock()
+                    .get(&(plan.hash.0, dims_hash(graph)))
+                    .cloned();
+                let (launched, executable) =
+                    self.run_cpu(target.as_ref(), graph, plan, &mut supplied, cached)?;
                 Ok((launched, Some(executable)))
             }
         }
@@ -1197,7 +1787,9 @@ impl Session {
             .map(|s| s.0)
             .chain(dims.iter().map(|(s, _)| s.0))
             .chain(scalars.iter().map(|(s, _)| s.0))
-            .filter(|s| *s != u32::MAX)
+            // Derived symbols have no word: the CPU lowering evaluates
+            // them through the binding.
+            .filter(|s| *s < fusor_ir::shape::DERIVED_BASE)
             .max()
             .map(|m| m as usize + 1)
             .unwrap_or(1);
@@ -1339,17 +1931,6 @@ impl Session {
             return Ok(base);
         }
 
-        // A member sweep is a correctness pass, not a benchmark: its timings
-        // are discarded below, so one execution covers each candidate. Normal
-        // autotuning keeps the repeated samples and per-dispatch timestamps it
-        // needs for stable comparisons.
-        let repetitions = if verify_members { 1 } else { TUNE_RUNS };
-        #[cfg(feature = "gpu")]
-        let _clock = (!verify_members).then(|| TuningClock::new(&self.inner.device));
-
-        let Some(reference) = self.timed_run(guard, graph, &base, values, repetitions)? else {
-            return Ok(base);
-        };
         // The plan's identity across processes: every launch signature in
         // order. A cached combination is only replayable onto the same plan
         // shape, so this is what it is keyed on.
@@ -1360,6 +1941,30 @@ impl Session {
                 .map(|l| fusor_cost::extract::launch_signature(&g, l))
                 .collect::<Vec<_>>()
                 .join(";")
+        };
+        // A combination this machine has already raced to a verdict is
+        // applied as recorded, not raced again: the race costs seconds per
+        // plan shape (every candidate is built, compiled and timed several
+        // times), and re-running it in every process would put that on
+        // every first transcription or embedding. Production sampling keeps
+        // exploring from there. The member sweep must measure everything.
+        if !verify_members
+            && let Some(picks) = self.inner.tune.combo(&plan_sig)
+            && let Some(plan) = self.apply_combo(graph, roots, &base, &picks, min_macs, log)?
+        {
+            return Ok(plan);
+        }
+
+        // A member sweep is a correctness pass, not a benchmark: its timings
+        // are discarded below, so one execution covers each candidate. Normal
+        // autotuning keeps the repeated samples and per-dispatch timestamps it
+        // needs for stable comparisons.
+        let repetitions = if verify_members { 1 } else { TUNE_RUNS };
+        #[cfg(feature = "gpu")]
+        let _clock = (!verify_members).then(|| TuningClock::new(&self.inner.device));
+
+        let Some(reference) = self.timed_run(guard, graph, &base, values, repetitions)? else {
+            return Ok(base);
         };
         // What this pass actually adopts, per launch, so the combination can
         // be recorded rather than reassembled from per-launch minima that
@@ -1643,6 +2248,64 @@ impl Session {
         Ok(best)
     }
 
+    /// Rebuild a recorded tuning combination onto `base`: launch by launch,
+    /// the variant the race adopted, re-derived against the plan as it stands
+    /// after the earlier substitutions (a substitution can change what the
+    /// next launch's alternatives are). `None` when a recorded pick no longer
+    /// exists — a renamed kernel family — so the caller races afresh.
+    fn apply_combo(
+        &self,
+        graph: &GraphRef,
+        roots: &[Id],
+        base: &Arc<Plan>,
+        picks: &[Option<String>],
+        min_macs: u64,
+        log: bool,
+    ) -> Result<Option<Arc<Plan>>> {
+        if picks.len() != base.launches.len() {
+            return Ok(None);
+        }
+        let mut best = Arc::clone(base);
+        let mut applied = 0usize;
+        for (ix, pick) in picks.iter().enumerate() {
+            let Some(name) = pick else {
+                continue;
+            };
+            let variants = {
+                let g = graph.state().egraph.lock();
+                self.inner.extractor.launch_variants(
+                    &g,
+                    roots,
+                    &best,
+                    ix,
+                    self.inner.cost.as_ref(),
+                    min_macs,
+                )
+            };
+            let Some((_, plan)) = variants.into_iter().find(|(n, _)| n == name) else {
+                if log {
+                    eprintln!(
+                        "[tune] recorded pick `{name}` for launch {ix} no longer exists; racing"
+                    );
+                }
+                return Ok(None);
+            };
+            best = Arc::new(plan);
+            applied += 1;
+        }
+        if applied > 0 {
+            let g = graph.state().egraph.lock();
+            self.inner.extractor.verify_plan(&g, &best)?;
+        }
+        if log {
+            eprintln!(
+                "[tune] applied the recorded combination: {applied} of {} launches substituted",
+                picks.len()
+            );
+        }
+        Ok(Some(best))
+    }
+
     /// Run `plan` `repetitions` times, keep the fastest, and read every
     /// requested value back. `None` when nothing was readable.
     fn timed_run(
@@ -1657,7 +2320,7 @@ impl Session {
         let mut gpu_us: Option<Vec<f64>> = None;
         for _ in 0..repetitions {
             let t = Instant::now();
-            let _ = self.run(graph, plan, values, None)?;
+            let _ = self.run(graph, plan, values)?;
             self.inner.device.target().wait()?;
             self.inner.in_flight.store(0, Ordering::Relaxed);
             nanos = nanos.min(t.elapsed().as_nanos() as u64);
@@ -1732,6 +2395,13 @@ pub(crate) fn autotune_min_macs() -> u64 {
 
 /// Whether `FUSOR_RESOLVE_PROFILE` is set. Read once: `resolve` is the hot
 /// path and an env lookup per call is a per-resolve allocation.
+/// Whether `FUSOR_VERIFY_FAMILIES` is set: every shape-family hit is
+/// cross-checked against a concrete plan of the same member.
+fn verify_families() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("FUSOR_VERIFY_FAMILIES").is_some())
+}
+
 fn resolve_profile() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FUSOR_RESOLVE_PROFILE").is_some())
@@ -1745,149 +2415,253 @@ fn dump_exec() -> bool {
     *ON.get_or_init(|| std::env::var_os("FUSOR_DUMP_EXEC").is_some())
 }
 
-/// Canonicalize an unsaturated term while replacing each runtime buffer name
-/// with its traversal-order input slot. The resulting ordinary Op vector
-/// provides exact equality and hashing without a parallel hand-written matcher.
-fn canonical_term(graph: &GraphRef, roots: &[Id]) -> Option<(CanonicalTerm, Vec<Id>)> {
-    fn rebuild(op: &Op, source: Id, children: &[Id], inputs: &mut Vec<Id>) -> Option<Op> {
-        let child = |index: usize| children.get(index).copied();
-        Some(match op {
+/// `op` over `children`, with every extent-carrying field passed through
+/// `dims`. `None` for a lowered launch: only raw terms are canonicalized.
+fn rebuild_op(op: &Op, children: &[Id], dims: &mut dyn FnMut(Dim) -> Dim) -> Option<Op> {
+    let child = |index: usize| children.get(index).copied();
+    Some(match op {
+        Op::Logical(Logical::Leaf(LeafKind::Buffer { name, dtype, shape })) => {
+            Op::Logical(Logical::Leaf(LeafKind::Buffer {
+                name: *name,
+                dtype: *dtype,
+                shape: shape.iter().map(|d| dims(*d)).collect(),
+            }))
+        }
+        Op::Logical(Logical::Leaf(LeafKind::Const { value, shape })) => {
+            Op::Logical(Logical::Leaf(LeafKind::Const {
+                value: *value,
+                shape: shape.iter().map(|d| dims(*d)).collect(),
+            }))
+        }
+        Op::Logical(Logical::Leaf(leaf)) => Op::Logical(Logical::Leaf(leaf.clone())),
+        Op::Logical(Logical::Map { expr, outs, .. }) => Op::Logical(Logical::Map {
+            expr: expr.clone(),
+            ins: children.iter().copied().collect(),
+            outs: *outs,
+        }),
+        Op::Logical(Logical::Fold {
+            carrier, axis, acc, ..
+        }) => Op::Logical(Logical::Fold {
+            carrier: carrier.clone(),
+            axis: *axis,
+            acc: *acc,
+            ins: children.iter().copied().collect(),
+        }),
+        Op::Logical(Logical::Contract {
+            spec, acc, outs, ..
+        }) => Op::Logical(Logical::Contract {
+            spec: spec.clone(),
+            acc: *acc,
+            a: child(0)?,
+            b: child(1)?,
+            outs: *outs,
+        }),
+        Op::Logical(Logical::Restride { specs, bounds, .. }) => Op::Logical(Logical::Restride {
+            specs: specs
+                .iter()
+                .map(|spec| {
+                    let mut spec = *spec;
+                    spec.size = dims(spec.size);
+                    spec.offset = dims(spec.offset);
+                    spec
+                })
+                .collect(),
+            bounds: *bounds,
+            x: child(0)?,
+        }),
+        Op::Logical(Logical::Window { specs, .. }) => Op::Logical(Logical::Window {
+            specs: specs.clone(),
+            x: child(0)?,
+        }),
+        Op::Logical(Logical::Gather { axis, .. }) => Op::Logical(Logical::Gather {
+            axis: *axis,
+            x: child(0)?,
+            idx: child(1)?,
+        }),
+        Op::Logical(Logical::Scatter {
+            axis,
+            combine,
+            unique,
+            ..
+        }) => Op::Logical(Logical::Scatter {
+            axis: *axis,
+            combine: *combine,
+            base: child(0)?,
+            idx: child(1)?,
+            upd: child(2)?,
+            unique: *unique,
+        }),
+        Op::Logical(Logical::Dequant { fmt, layout, .. }) => Op::Logical(Logical::Dequant {
+            fmt: *fmt,
+            layout: *layout,
+            x: child(0)?,
+        }),
+        Op::Logical(Logical::Project { slot, .. }) => Op::Logical(Logical::Project {
+            slot: *slot,
+            x: child(0)?,
+        }),
+        Op::Launch(Launch::Ext { def, ops, attrs }) => {
+            let mut ops = ops.clone();
+            if ops.len() != children.len() {
+                return None;
+            }
+            for (operand, child) in ops.iter_mut().zip(children) {
+                operand.src = *child;
+                let layout = &operand.layout;
+                let shape: Vec<Dim> = layout.shape().iter().map(|d| dims(*d)).collect();
+                // A contiguous operand keeps its strides derived from its
+                // shape, the spelling the IR uses for symbolic extents.
+                operand.layout = if layout.is_contiguous() {
+                    Layout::contiguous(&shape)
+                } else {
+                    let strides: Vec<Dim> = layout.strides().iter().map(|d| dims(*d)).collect();
+                    Layout::from_parts(dims(layout.offset()), &shape, &strides).ok()?
+                };
+            }
+            Op::Launch(Launch::Ext {
+                def: *def,
+                ops,
+                attrs: *attrs,
+            })
+        }
+        Op::Union(..) => Op::Union(child(0)?, child(1)?),
+        Op::Launch(_) => return None,
+    })
+}
+
+/// Canonicalize an unsaturated term: each runtime buffer name becomes its
+/// traversal-order input slot, and (`abstract_consts`) each constant extent
+/// of a step buffer's shape or a view spec becomes a slot symbol whose value
+/// is collected. The resulting ordinary Op vector provides exact equality and
+/// hashing without a parallel hand-written matcher.
+/// The children a raw-term walk follows: a `Union`'s Logical members only
+/// (a value handed out as its class root is a `Union` whose other members
+/// are the launches saturation minted). `None` when a Union has none.
+fn logical_children(g: &EGraph, id: Id) -> Option<Vec<Id>> {
+    let node = g.node(id);
+    match node.op {
+        Op::Union(a, b) => {
+            let logical: Vec<Id> = [a, b]
+                .into_iter()
+                .filter(|c| g.node(*c).level == Level::Logical)
+                .collect();
+            (!logical.is_empty()).then_some(logical)
+        }
+        _ => Some(node.children.iter().copied().collect()),
+    }
+}
+
+/// Every node of the raw term below `roots`, children before parents, each
+/// once. Iterative: a decoder's term is thousands of nodes deep.
+fn logical_postorder(g: &EGraph, roots: &[Id]) -> Option<Vec<Id>> {
+    let mut order = Vec::new();
+    // 1: expanded (its marker is on the stack), 2: emitted.
+    let mut state: FxHashMap<Id, u8> = FxHashMap::default();
+    let mut stack: Vec<(Id, bool)> = roots.iter().rev().map(|r| (*r, false)).collect();
+    while let Some((id, expanded)) = stack.pop() {
+        match state.get(&id) {
+            Some(2) => continue,
+            Some(1) if !expanded => continue,
+            _ => {}
+        }
+        if expanded {
+            state.insert(id, 2);
+            order.push(id);
+            continue;
+        }
+        state.insert(id, 1);
+        stack.push((id, true));
+        for c in logical_children(g, id)?.into_iter().rev() {
+            if state.get(&c) != Some(&2) {
+                stack.push((c, false));
+            }
+        }
+    }
+    Some(order)
+}
+
+fn canonicalize(graph: &GraphRef, roots: &[Id], abstract_consts: bool) -> Option<FamilyTerm> {
+    let g = graph.state().egraph.lock();
+    let order = logical_postorder(&g, roots)?;
+    let mut memo: FxHashMap<Id, Id> = FxHashMap::default();
+    let mut nodes: Vec<Op> = Vec::with_capacity(order.len());
+    let mut sources: Vec<Id> = Vec::with_capacity(order.len());
+    let mut inputs: Vec<Id> = Vec::new();
+    let mut consts: Vec<u64> = Vec::new();
+    for id in order {
+        let node = g.node(id);
+        let kids = logical_children(&g, id)?;
+        // One Logical member stands for its union.
+        if matches!(node.op, Op::Union(..)) && kids.len() == 1 {
+            let canonical = memo[&kids[0]];
+            memo.insert(id, canonical);
+            continue;
+        }
+        let children: Vec<Id> = kids.iter().map(|c| memo[c]).collect();
+        let mut slot = |d: Dim| -> Dim {
+            match d {
+                Dim::Const(v) if abstract_consts => {
+                    consts.push(v);
+                    slot_dim(consts.len() - 1)
+                }
+                other => other,
+            }
+        };
+        let op = match &node.op {
             Op::Logical(Logical::Leaf(LeafKind::Buffer { dtype, shape, .. })) => {
                 let name = BufferId(inputs.len() as u32);
-                inputs.push(source);
+                inputs.push(id);
+                let shape = shape.iter().map(|d| slot(*d)).collect();
                 Op::Logical(Logical::Leaf(LeafKind::Buffer {
                     name,
                     dtype: *dtype,
-                    shape: shape.clone(),
+                    shape,
                 }))
             }
-            Op::Logical(Logical::Leaf(leaf)) => Op::Logical(Logical::Leaf(leaf.clone())),
-            Op::Logical(Logical::Map { expr, outs, .. }) => Op::Logical(Logical::Map {
-                expr: expr.clone(),
-                ins: children.iter().copied().collect(),
-                outs: *outs,
-            }),
-            Op::Logical(Logical::Fold {
-                carrier, axis, acc, ..
-            }) => Op::Logical(Logical::Fold {
-                carrier: carrier.clone(),
-                axis: *axis,
-                acc: *acc,
-                ins: children.iter().copied().collect(),
-            }),
-            Op::Logical(Logical::Contract {
-                spec, acc, outs, ..
-            }) => Op::Logical(Logical::Contract {
-                spec: spec.clone(),
-                acc: *acc,
-                a: child(0)?,
-                b: child(1)?,
-                outs: *outs,
-            }),
-            Op::Logical(Logical::Restride { specs, bounds, .. }) => {
-                Op::Logical(Logical::Restride {
-                    specs: specs.clone(),
-                    bounds: *bounds,
-                    x: child(0)?,
-                })
-            }
-            Op::Logical(Logical::Window { specs, .. }) => Op::Logical(Logical::Window {
-                specs: specs.clone(),
-                x: child(0)?,
-            }),
-            Op::Logical(Logical::Gather { axis, .. }) => Op::Logical(Logical::Gather {
-                axis: *axis,
-                x: child(0)?,
-                idx: child(1)?,
-            }),
-            Op::Logical(Logical::Scatter {
-                axis,
-                combine,
-                unique,
-                ..
-            }) => Op::Logical(Logical::Scatter {
-                axis: *axis,
-                combine: *combine,
-                base: child(0)?,
-                idx: child(1)?,
-                upd: child(2)?,
-                unique: *unique,
-            }),
-            Op::Logical(Logical::Dequant { fmt, layout, .. }) => Op::Logical(Logical::Dequant {
-                fmt: *fmt,
-                layout: *layout,
-                x: child(0)?,
-            }),
-            Op::Logical(Logical::Project { slot, .. }) => Op::Logical(Logical::Project {
-                slot: *slot,
-                x: child(0)?,
-            }),
-            Op::Launch(Launch::Ext { def, ops, attrs }) => {
-                let mut ops = ops.clone();
-                if ops.len() != children.len() {
+            other => match rebuild_op(other, &children, &mut slot) {
+                Some(op) => op,
+                None => {
+                    if resolve_profile() {
+                        eprintln!("[profile]   not canonicalizable: {id} is {:?}", other.tag());
+                    }
                     return None;
                 }
-                for (operand, child) in ops.iter_mut().zip(children) {
-                    operand.src = *child;
-                }
-                Op::Launch(Launch::Ext {
-                    def: *def,
-                    ops,
-                    attrs: *attrs,
-                })
-            }
-            Op::Union(..) => Op::Union(child(0)?, child(1)?),
-            Op::Launch(_) => return None,
-        })
-    }
-
-    fn visit(
-        graph: &EGraph,
-        id: Id,
-        memo: &mut FxHashMap<Id, Id>,
-        nodes: &mut Vec<Op>,
-        inputs: &mut Vec<Id>,
-    ) -> Option<Id> {
-        if let Some(id) = memo.get(&id).copied() {
-            return Some(id);
-        }
-        let node = graph.node(id);
-        let children = node
-            .children
-            .iter()
-            .map(|child| visit(graph, *child, memo, nodes, inputs))
-            .collect::<Option<Vec<_>>>()?;
-        let op = rebuild(&node.op, id, &children, inputs)?;
+            },
+        };
         let canonical = Id(nodes.len() as u32);
         nodes.push(op);
+        sources.push(id);
         memo.insert(id, canonical);
-        Some(canonical)
     }
-
-    let graph = graph.state().egraph.lock();
-    let mut memo = FxHashMap::default();
-    let mut nodes = Vec::new();
-    let mut inputs = Vec::new();
-    let roots = roots
-        .iter()
-        .map(|root| visit(&graph, *root, &mut memo, &mut nodes, &mut inputs))
-        .collect::<Option<Vec<_>>>()?;
-    Some((CanonicalTerm { nodes, roots }, inputs))
-}
-
-fn structural_key(graph: &GraphRef, roots: &[Id]) -> Option<(StructuralKey, Vec<Id>)> {
-    let (term, inputs) = canonical_term(graph, roots)?;
-    let mut dims = rustc_hash::FxHasher::default();
-    graph.dim_bindings().hash(&mut dims);
-    Some((
-        StructuralKey {
-            graph: GraphRef::as_ptr(graph) as usize,
-            dim_values: dims.finish(),
-            term,
-        },
+    let roots = roots.iter().map(|r| memo[r]).collect();
+    Some(FamilyTerm {
+        term: CanonicalTerm { nodes, roots },
+        consts,
+        sources,
         inputs,
-    ))
+    })
 }
+
+/// The family form of `roots`' term. `None` when the term reaches a lowered
+/// launch, or abstracts nothing.
+fn canonical_family(graph: &GraphRef, roots: &[Id]) -> Option<FamilyTerm> {
+    let t = canonicalize(graph, roots, true)?;
+    (!t.consts.is_empty()).then_some(t)
+}
+
+/// `hash(sym, value)` over the graph's dim bindings: what a CPU executable,
+/// which folds the values in, is specific to.
+#[cfg(feature = "cpu")]
+fn dims_hash(graph: &GraphRef) -> u64 {
+    use std::hash::Hasher;
+    let mut h = rustc_hash::FxHasher::default();
+    for (sym, value) in graph.dim_bindings() {
+        sym.hash(&mut h);
+        value.hash(&mut h);
+    }
+    h.finish()
+}
+
 fn saturation_memo_disabled() -> bool {
     static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *OFF.get_or_init(|| std::env::var_os("FUSOR_NO_SAT_MEMO").is_some())
@@ -2406,12 +3180,9 @@ fn restate_layout(
 }
 
 fn resolve_dim(d: Dim, graph: &GraphRef) -> Result<u64> {
-    match d {
-        Dim::Const(v) => Ok(v),
-        Dim::Sym(s) => graph
-            .dim_binding(s)
-            .ok_or_else(|| Error::Plan(format!("dim {s} is unbound at dispatch"))),
-    }
+    // A derived symbol evaluates through the symbols its expression reaches.
+    d.evaluate(&mut |s| graph.dim_binding(s))
+        .ok_or_else(|| Error::Plan(format!("dim {d} is unbound at dispatch")))
 }
 
 /// The `row_major_strides` placeholder (`SymId(u32::MAX)`): a stride past a
@@ -2493,14 +3264,132 @@ mod tests {
         };
 
         assert_eq!(run(&[1.0, 2.0, 3.0]), vec![2.0, 3.0, 4.0]);
-        assert_eq!(session.inner.structural.lock().len(), 1);
+        assert_eq!(session.inner.families.lock().len(), 1);
 
         assert_eq!(run(&[10.0, 11.0, 12.0]), vec![11.0, 12.0, 13.0]);
         assert_eq!(
-            session.inner.structural.lock().len(),
+            session.inner.families.lock().len(),
             1,
             "a replay hit must not extract and record another plan"
         );
+    }
+
+    /// A model step rebuilt with a longer cache every call (a `cat` onto a
+    /// re-leafed cache, a view at a moving offset, a contraction over the
+    /// cache length): from the second call on the session plans a symbolic
+    /// twin, and every call's values must equal the host's.
+    #[test]
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    fn a_shape_family_twin_computes_what_its_members_do() {
+        let Ok(backend) = Backend::gpu_blocking() else {
+            return;
+        };
+        let session = Session::new(backend).unwrap();
+        let graph = Graph::new(&session);
+        let h = graph.handle();
+        const D: usize = 8;
+        let w_host: Vec<f32> = (0..D * D)
+            .map(|i| ((i * 7) % 11) as f32 * 0.1 - 0.4)
+            .collect();
+        let w = Tensor::from_elements(h, &[Dim::Const(D as u64), Dim::Const(D as u64)], &w_host)
+            .unwrap();
+        let mut cache_host: Vec<f32> = Vec::new();
+        for step in 0..(CONCRETE_SHAPES + 4) {
+            let new_row: Vec<f32> = (0..D).map(|j| (step * D + j) as f32 * 0.05 - 0.3).collect();
+            // The step: cache' = cat(cache, row); q = row @ w; scores =
+            // q @ cache'^T (contraction over D, N = len); s = softmax(scores);
+            // out = s @ cache' (contraction over len); tail = cache' narrowed
+            // at the moving offset `step`.
+            let row =
+                Tensor::from_elements(h, &[Dim::Const(1), Dim::Const(D as u64)], &new_row).unwrap();
+            let cache = if cache_host.is_empty() {
+                row.clone()
+            } else {
+                let prev = Tensor::from_elements(
+                    h,
+                    &[
+                        Dim::Const((cache_host.len() / D) as u64),
+                        Dim::Const(D as u64),
+                    ],
+                    &cache_host,
+                )
+                .unwrap();
+                Tensor::cat(&[prev, row.clone()], 0).unwrap()
+            };
+            cache_host.extend_from_slice(&new_row);
+            let len = cache_host.len() / D;
+            let q = row.matmul(&w).unwrap();
+            let scores = q.matmul(&cache.t().unwrap()).unwrap();
+            let s = scores.softmax(1).unwrap();
+            let out = s.matmul(&cache).unwrap();
+            let tail = cache.narrow(0, step, 1).unwrap();
+            let got_out: Vec<f32> = bytemuck::cast_slice(&h.read_back(out.id).unwrap()).to_vec();
+            let got_tail: Vec<f32> = bytemuck::cast_slice(&h.read_back(tail.id).unwrap()).to_vec();
+            let got_cache: Vec<f32> =
+                bytemuck::cast_slice(&h.read_back(cache.id).unwrap()).to_vec();
+
+            // Host reference.
+            let q_h: Vec<f32> = (0..D)
+                .map(|j| (0..D).map(|k| new_row[k] * w_host[k * D + j]).sum())
+                .collect();
+            let sc: Vec<f32> = (0..len)
+                .map(|r| (0..D).map(|k| q_h[k] * cache_host[r * D + k]).sum())
+                .collect();
+            let m = sc.iter().cloned().fold(f32::MIN, f32::max);
+            let e: Vec<f32> = sc.iter().map(|v| (v - m).exp()).collect();
+            let z: f32 = e.iter().sum();
+            let out_h: Vec<f32> = (0..D)
+                .map(|j| (0..len).map(|r| e[r] / z * cache_host[r * D + j]).sum())
+                .collect();
+            let close = |a: &[f32], b: &[f32]| {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-4)
+            };
+            assert!(
+                close(&got_cache, &cache_host),
+                "step {step}: cache {got_cache:?}"
+            );
+            assert!(
+                close(&got_tail, &cache_host[step * D..(step + 1) * D]),
+                "step {step}: tail {got_tail:?}"
+            );
+            assert!(
+                close(&got_out, &out_h),
+                "step {step}: out {got_out:?} vs {out_h:?}"
+            );
+        }
+        assert!(
+            session
+                .inner
+                .families
+                .lock()
+                .values()
+                .any(|f| f.symbolic.is_some()),
+            "the step's shape family never went symbolic"
+        );
+    }
+
+    /// The smallest moving-offset view: a fresh `[len, D]` leaf narrowed at
+    /// row `step`. The twin's view offset is a derived symbol.
+    #[test]
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    fn a_shape_family_twin_reads_a_view_at_a_symbolic_offset() {
+        let Ok(backend) = Backend::gpu_blocking() else {
+            return;
+        };
+        let session = Session::new(backend).unwrap();
+        let graph = Graph::new(&session);
+        let h = graph.handle();
+        const D: usize = 4;
+        for step in 0..(CONCRETE_SHAPES + 4) {
+            let len = step + 2;
+            let host: Vec<f32> = (0..len * D).map(|i| i as f32).collect();
+            let x =
+                Tensor::from_elements(h, &[Dim::Const(len as u64), Dim::Const(D as u64)], &host)
+                    .unwrap();
+            let tail = x.narrow(0, step, 1).unwrap().add_scalar(0.0).unwrap();
+            let got: Vec<f32> = bytemuck::cast_slice(&h.read_back(tail.id).unwrap()).to_vec();
+            assert_eq!(got, host[step * D..(step + 1) * D], "step {step}");
+        }
     }
 
     #[test]

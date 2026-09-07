@@ -1426,15 +1426,40 @@ pub fn launch_work(graph: &EGraph, base: &Plan, launch_ix: usize) -> u64 {
     let Some(launch) = base.launches.get(launch_ix) else {
         return 0;
     };
+    // A symbolic extent is priced at its bound value (the graph's dim hints),
+    // not a nominal one: a symbolic plan's launches are as much work as a
+    // concrete plan's, and deserve the same tuning.
+    let hinted_facts = |f: &ValueFacts| -> ValueFacts {
+        let mut f = f.clone();
+        f.shape = f.shape.iter().map(|d| graph.hinted(*d)).collect();
+        f
+    };
+    let hinted_op = |op: &Op| -> Op {
+        let mut op = op.clone();
+        match &mut op {
+            Op::Launch(Launch::Map { space, .. }) | Op::Launch(Launch::Fold { space, .. }) => {
+                space.dims = space.dims.iter().map(|d| graph.hinted(*d)).collect();
+            }
+            Op::Launch(Launch::Contract { m, n, k, batch, .. }) => {
+                *m = graph.hinted(*m);
+                *n = graph.hinted(*n);
+                *k = graph.hinted(*k);
+                *batch = graph.hinted(*batch);
+            }
+            _ => {}
+        }
+        op
+    };
     let mut total: u64 = 0;
     for m in &launch.members {
         let node = graph.node(*m);
         let ins: SmallVec<[ValueFacts; 4]> = node
             .children
             .iter()
-            .map(|c| graph.facts(*c).clone())
+            .map(|c| hinted_facts(graph.facts(*c)))
             .collect();
-        let w = graph.semantics().work(&node.op, &ins, graph.facts(*m));
+        let out = hinted_facts(graph.facts(*m));
+        let w = graph.semantics().work(&hinted_op(&node.op), &ins, &out);
         total = total
             .saturating_add(w.macs)
             .saturating_add(w.transcendentals.saturating_mul(TRANS_WEIGHT))
@@ -1442,7 +1467,8 @@ pub fn launch_work(graph: &EGraph, base: &Plan, launch_ix: usize) -> u64 {
     }
     for b in &launch.bindings {
         total = total.saturating_add(
-            crate::realize::bytes_of(graph.facts(b.value)).saturating_mul(BYTE_WEIGHT),
+            crate::realize::bytes_of(&hinted_facts(graph.facts(b.value)))
+                .saturating_mul(BYTE_WEIGHT),
         );
     }
     total

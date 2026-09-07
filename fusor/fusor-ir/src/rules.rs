@@ -168,25 +168,47 @@ pub(crate) fn operand_dtypes(b: &Builder<'_>, ops: &[Operand]) -> Vec<Dtype> {
 }
 
 /// Apply a relative restride spec vector to a dense row-major input shape.
-/// Returns `None` when a stride or offset is not decidable.
+///
+/// A symbolic offset or stride composes into a derived symbol
+/// ([`Dim::add`], [`Dim::mul`]) the backends evaluate at dispatch. Returns
+/// `None` only when a stride or offset is genuinely opaque (a row-major
+/// stride past a symbolic axis, or overflow): a view of those cannot be
+/// stated as one layout, and a rule must decline rather than invent one.
 pub(crate) fn composed_layout(specs: &[StrideSpec], in_shape: &[Dim]) -> Option<Layout> {
+    use crate::shape::OPAQUE_SYM;
     let in_strides = Layout::row_major_strides(in_shape);
+    let opaque = |d: Dim| matches!(d, Dim::Sym(s) if s == OPAQUE_SYM);
     let mut shape: Vec<Dim> = Vec::with_capacity(specs.len());
     let mut strides: Vec<Dim> = Vec::with_capacity(specs.len());
-    let mut offset: u64 = 0;
+    let mut offset = Dim::Const(0);
     for s in specs {
         shape.push(s.size);
-        let base = in_strides.get(s.input_dim as usize)?.as_const()?;
+        // A broadcast axis at offset 0 names no input axis at all: a scalar
+        // widened to a vector has none to name.
+        if s.multiplier == 0 && s.offset.known_eq(Dim::Const(0)) {
+            strides.push(Dim::Const(0));
+            continue;
+        }
+        let base = *in_strides.get(s.input_dim as usize)?;
         // Accumulated for every spec, including a stride-0 one: an axis being
         // broadcast says nothing about where in the input it starts.
-        offset = offset.checked_add(s.offset.as_const()?.checked_mul(base)?)?;
+        if !s.offset.known_eq(Dim::Const(0)) {
+            offset = offset.add(s.offset.mul(base));
+            if opaque(offset) {
+                return None;
+            }
+        }
         if s.multiplier == 0 {
             strides.push(Dim::Const(0));
             continue;
         }
-        strides.push(Dim::Const(base.checked_mul(u64::from(s.multiplier))?));
+        let stride = base.mul(Dim::Const(u64::from(s.multiplier)));
+        if opaque(stride) {
+            return None;
+        }
+        strides.push(stride);
     }
-    Layout::from_parts(Dim::Const(offset), &shape, &strides).ok()
+    Layout::from_parts(offset, &shape, &strides).ok()
 }
 
 /// The plain affine layout a whole view spine denotes over its base, or

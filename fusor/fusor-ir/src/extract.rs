@@ -140,6 +140,10 @@ pub struct Plan {
     pub launches: Vec<Dispatch>,
     pub buffers: Vec<BufferPlan>,
     pub symbols: Vec<crate::shape::SymId>,
+    /// The subset of `symbols` that are runtime scalars (`Leaf::Uniform`),
+    /// carried as `f32` words. Every other symbol is an extent, offset or
+    /// stride: a `u32` word, whether or not a buffer layout mentions it.
+    pub scalar_symbols: Vec<crate::shape::SymId>,
     pub hash: PlanHash,
     pub cost: Picoseconds,
 }

@@ -4,15 +4,18 @@
 //! Two modes:
 //!
 //! * **cat** (the default): an append is a `cat` node and the whole cache is a
-//!   fresh value each step. Correct anywhere, but every step's graph differs
-//!   from the last, so a decode loop replans per token.
+//!   fresh value each step with a concrete length. Every step's graph differs
+//!   from the last; the session's shape families keep that from replanning
+//!   per token.
 //! * **fixed** ([`TensorCache::fixed`]): a fixed-capacity external leaf, an
 //!   append is one `Scatter{Set}` at a device-side write index, and the
 //!   readable cache is a `Dim::Sym`-length narrow of the scatter's output.
 //!   Every step reuses the *same* nodes — only leaf bytes and the symbol's
 //!   binding change — which is what lets a decode loop replay one plan per
 //!   token. After the step's resolve, [`TensorCache::commit`] re-points the
-//!   leaf at the buffer the scatter produced (no host round trip).
+//!   leaf at the buffer the scatter produced (no host round trip); a caller
+//!   that never commits still sees every append, since appends chain through
+//!   the uncommitted output, and [`TensorCache::detach`] commits for it.
 
 use fusor_ir::dtype::Dtype;
 use fusor_ir::ir::logical::{LeafKind, Logical};
@@ -147,10 +150,35 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         self.data.as_ref()
     }
 
-    /// Replace the cached value with a detached leaf after it resolves.
+    /// Cut the cached value off from the graph that produced it. A fixed
+    /// cache commits: its store already holds every append, so this is the
+    /// step's [`TensorCache::commit`] (resolving the pending write first if
+    /// nothing has yet). A cat-mode cache re-leafs the value through the host.
+    #[track_caller]
     pub fn detach(&mut self) {
+        if self.fixed.is_some() {
+            if let Some(out) = self.pending()
+                && out.graph().device_buf(out.id).is_none()
+            {
+                ok(
+                    "TensorCache::detach",
+                    out.graph().session().resolve(std::slice::from_ref(&out)),
+                );
+            }
+            self.commit();
+            return;
+        }
         if let Some(value) = self.data.as_ref().cloned() {
             self.data = Some(value.detach());
+        }
+    }
+
+    /// Replace the cached value with a device-side leaf holding its buffer:
+    /// [`TensorCache::detach`] without the host round trip. The value must
+    /// have resolved (see [`Tensor::materialize`]).
+    pub fn materialize(&mut self) {
+        if let Some(value) = self.data.as_ref().cloned() {
+            self.data = Some(value.materialize());
         }
     }
 
@@ -262,8 +290,14 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
             f.sym = Some(graph.named_sym(&f.sym_name));
             f.store = Some(store);
         }
-        let store = f.store.clone().expect("minted above");
         let sym = f.sym.expect("minted with the store");
+        // An append before the last one's commit writes through that output,
+        // so nothing is lost when a caller resolves several appends at once;
+        // `commit` then adopts the final output.
+        let store = f
+            .out
+            .clone()
+            .unwrap_or_else(|| f.store.clone().expect("minted above"));
 
         // Write positions for this chunk.
         let positions: Vec<u32> = (0..added)

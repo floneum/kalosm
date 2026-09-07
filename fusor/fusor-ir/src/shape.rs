@@ -13,7 +13,11 @@ pub struct SymId(pub u32);
 
 impl fmt::Display for SymId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "s{}", self.0)
+        if self.is_derived() {
+            write!(f, "d{}", self.0 - DERIVED_BASE)
+        } else {
+            write!(f, "s{}", self.0)
+        }
     }
 }
 
@@ -52,6 +56,141 @@ impl Dim {
     }
 
     pub const ONE: Dim = Dim::Const(1);
+}
+
+/// Symbolic dim arithmetic. A product or sum that does not fold to a
+/// constant becomes a *derived symbol*: a `SymId` standing for this
+/// expression over other dims, interned process-wide so equal expressions
+/// are one symbol and `known_eq` stays structural. A derived symbol has no
+/// binding of its own; [`Dim::evaluate`] computes it from the bindings of
+/// the symbols it reaches, and the backends materialize it into the uniform
+/// block at dispatch like any other dim. This is what lets a view at a
+/// symbolic offset, or a stride past a symbolic extent, stay exact instead
+/// of collapsing to a placeholder the lowering cannot read.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum DimExpr {
+    Add(Dim, Dim),
+    Mul(Dim, Dim),
+}
+
+/// Derived symbols occupy `[DERIVED_BASE, DERIVED_END)`: above any symbol a
+/// graph mints, below the session's shape-family slot placeholders.
+pub const DERIVED_BASE: u32 = u32::MAX - (1 << 30);
+pub const DERIVED_END: u32 = u32::MAX - (1 << 24);
+
+/// The placeholder a non-decidable extent carries (overflow, or the
+/// row-major derived stride the backends recompute from a shape).
+pub const OPAQUE_SYM: SymId = SymId(u32::MAX);
+
+struct DerivedTable {
+    by_expr: std::collections::HashMap<DimExpr, u32>,
+    exprs: Vec<DimExpr>,
+}
+
+fn derived_table() -> &'static std::sync::Mutex<DerivedTable> {
+    static TABLE: std::sync::OnceLock<std::sync::Mutex<DerivedTable>> = std::sync::OnceLock::new();
+    TABLE.get_or_init(|| {
+        std::sync::Mutex::new(DerivedTable {
+            by_expr: std::collections::HashMap::new(),
+            exprs: Vec::new(),
+        })
+    })
+}
+
+impl SymId {
+    /// Whether this symbol stands for a [`DimExpr`] over other dims.
+    pub const fn is_derived(self) -> bool {
+        self.0 >= DERIVED_BASE && self.0 < DERIVED_END
+    }
+
+    /// The expression a derived symbol stands for.
+    pub fn derived_expr(self) -> Option<DimExpr> {
+        if !self.is_derived() {
+            return None;
+        }
+        let table = derived_table().lock().unwrap_or_else(|e| e.into_inner());
+        table.exprs.get((self.0 - DERIVED_BASE) as usize).cloned()
+    }
+}
+
+impl Dim {
+    fn derived(expr: DimExpr) -> Dim {
+        let mut table = derived_table().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(&i) = table.by_expr.get(&expr) {
+            return Dim::Sym(SymId(DERIVED_BASE + i));
+        }
+        let i = table.exprs.len() as u32;
+        if DERIVED_BASE + i >= DERIVED_END {
+            return Dim::Sym(OPAQUE_SYM);
+        }
+        table.exprs.push(expr.clone());
+        table.by_expr.insert(expr, i);
+        Dim::Sym(SymId(DERIVED_BASE + i))
+    }
+
+    /// `self + other`, folded when both are constant; `0` is the identity.
+    pub fn add(self, other: Dim) -> Dim {
+        match (self, other) {
+            (Dim::Const(x), Dim::Const(y)) => {
+                x.checked_add(y).map_or(Dim::Sym(OPAQUE_SYM), Dim::Const)
+            }
+            (Dim::Const(0), d) | (d, Dim::Const(0)) => d,
+            (Dim::Sym(s), _) | (_, Dim::Sym(s)) if s == OPAQUE_SYM => Dim::Sym(OPAQUE_SYM),
+            (a, b) => {
+                // Commutative: one symbol per unordered pair.
+                let (lo, hi) = if dim_key(a) <= dim_key(b) {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+                Dim::derived(DimExpr::Add(lo, hi))
+            }
+        }
+    }
+
+    /// `self * other`, folded when both are constant; `1` is the identity
+    /// and `0` annihilates.
+    pub fn mul(self, other: Dim) -> Dim {
+        match (self, other) {
+            (Dim::Const(x), Dim::Const(y)) => {
+                x.checked_mul(y).map_or(Dim::Sym(OPAQUE_SYM), Dim::Const)
+            }
+            (Dim::Const(0), _) | (_, Dim::Const(0)) => Dim::Const(0),
+            (Dim::Const(1), d) | (d, Dim::Const(1)) => d,
+            (Dim::Sym(s), _) | (_, Dim::Sym(s)) if s == OPAQUE_SYM => Dim::Sym(OPAQUE_SYM),
+            (a, b) => {
+                let (lo, hi) = if dim_key(a) <= dim_key(b) {
+                    (a, b)
+                } else {
+                    (b, a)
+                };
+                Dim::derived(DimExpr::Mul(lo, hi))
+            }
+        }
+    }
+
+    /// The value under `resolve`, which answers for the graph's own symbols;
+    /// derived symbols evaluate through their expressions. `None` when a
+    /// symbol reached is unbound or the placeholder.
+    pub fn evaluate(self, resolve: &mut dyn FnMut(SymId) -> Option<u64>) -> Option<u64> {
+        match self {
+            Dim::Const(v) => Some(v),
+            Dim::Sym(s) if s == OPAQUE_SYM => None,
+            Dim::Sym(s) => match s.derived_expr() {
+                Some(DimExpr::Add(a, b)) => a.evaluate(resolve)?.checked_add(b.evaluate(resolve)?),
+                Some(DimExpr::Mul(a, b)) => a.evaluate(resolve)?.checked_mul(b.evaluate(resolve)?),
+                None => resolve(s),
+            },
+        }
+    }
+}
+
+/// A total order on dims for canonicalizing commutative expressions.
+fn dim_key(d: Dim) -> (u8, u64) {
+    match d {
+        Dim::Const(v) => (0, v),
+        Dim::Sym(s) => (1, u64::from(s.0)),
+    }
 }
 
 impl From<u64> for Dim {
@@ -199,20 +338,16 @@ impl Layout {
         })
     }
 
-    /// Row-major strides. A stride past a `Sym` axis is itself symbolic and
-    /// is materialized into the uniform block at dispatch.
+    /// Row-major strides. A stride past a `Sym` axis is the product of the
+    /// extents inside it as a derived symbol ([`Dim::mul`]), materialized
+    /// into the uniform block at dispatch; only overflow leaves the opaque
+    /// placeholder.
     pub fn row_major_strides(shape: &[Dim]) -> SmallVec<[Dim; 6]> {
         let mut out: SmallVec<[Dim; 6]> = smallvec::smallvec![Dim::Const(1); shape.len()];
-        let mut acc: Option<u64> = Some(1);
+        let mut acc = Dim::Const(1);
         for axis in (0..shape.len()).rev() {
-            out[axis] = match acc {
-                Some(v) => Dim::Const(v),
-                None => Dim::Sym(SymId(u32::MAX)),
-            };
-            acc = match (acc, shape[axis]) {
-                (Some(a), Dim::Const(d)) => a.checked_mul(d),
-                _ => None,
-            };
+            out[axis] = acc;
+            acc = acc.mul(shape[axis]);
         }
         out
     }

@@ -138,6 +138,10 @@ impl DimBinding {
     }
 
     pub(crate) fn get(&self, sym: SymId) -> Option<u64> {
+        if sym.is_derived() {
+            // A derived symbol consults the symbols its expression reaches.
+            return Dim::Sym(sym).evaluate(&mut |s| self.get(s));
+        }
         let hit = self.values.get(&sym).copied();
         if hit.is_some() {
             self.consulted.lock().insert(sym);
@@ -164,16 +168,13 @@ impl DimBinding {
     /// not in `consulted`: it cannot reach the emitted module, only the
     /// workgroup count.
     fn require_for_grid(&self, dim: Dim) -> Result<u64> {
-        let value = match dim {
-            Dim::Const(v) => Some(v),
-            Dim::Sym(s) => {
-                let hit = self.values.get(&s).copied();
-                if hit.is_some() {
-                    self.grid.lock().symbols.insert(s);
-                }
-                hit
+        let value = dim.evaluate(&mut |s| {
+            let hit = self.values.get(&s).copied();
+            if hit.is_some() {
+                self.grid.lock().symbols.insert(s);
             }
-        };
+            hit
+        });
         value.ok_or_else(|| Error::Plan(format!("dim {dim} is unbound at dispatch")))
     }
 
@@ -1607,7 +1608,7 @@ impl<'a> Ctx<'a> {
         else {
             return Ok(index);
         };
-        let offset = plan.layout.offset().as_const().unwrap_or(0);
+        let offset = self.binding.require(plan.layout.offset())?;
 
         let mut acc: Option<TileExpr> = (offset != 0).then(|| {
             let o = u32::try_from(offset).unwrap_or(u32::MAX);

@@ -95,14 +95,23 @@ impl Saturate for CoreSaturate {
         let mut fired = FixedBitSet::with_capacity(rules.len().saturating_mul(64));
 
         // Creation order is already a topological order: children are
-        // strictly smaller ids. Nodes below the frontier were fully offered
-        // in an earlier pass over this same graph; a rule's applicability
-        // depends only on the node and its (immutable) child facts, and
-        // re-offering rules that mint fresh ids re-expands an already-
-        // saturated region without bound.
-        let from = graph.saturation_frontier.min(initial);
-        let mut work: VecDeque<Id> = (from..initial).map(|i| Id(i as u32)).collect();
+        // strictly smaller ids. Only what the roots reach is offered: a
+        // node no root reaches is never selected, and offering it would
+        // mint alternatives for it without bound as the arena accumulates
+        // the terms of earlier resolves. A node offered every rule by an
+        // earlier pass is marked, and a rule's applicability depends only
+        // on the node and its (immutable) child facts, so it is not
+        // re-offered — re-offering id-minting rules re-expands an already-
+        // saturated region.
+        let reachable = graph.reachable_from_roots();
+        let mut work: VecDeque<Id> = reachable
+            .ones()
+            .map(|i| Id(i as u32))
+            .filter(|id| !graph.is_offered(*id))
+            .collect();
         let mut next: Vec<Id> = Vec::new();
+        // Every node popped and offered its whole candidate list.
+        let mut done: Vec<Id> = Vec::new();
 
         'rounds: while rounds < budget.max_rounds && !work.is_empty() {
             rounds += 1;
@@ -113,6 +122,7 @@ impl Saturate for CoreSaturate {
                 }
                 let candidates = &by_head[tag_index(graph.node(id).op.tag())];
                 if candidates.is_empty() {
+                    done.push(id);
                     continue;
                 }
                 let node = graph.node(id).clone();
@@ -147,6 +157,7 @@ impl Saturate for CoreSaturate {
                         }
                     }
                 }
+                done.push(id);
             }
             work.extend(next.drain(..));
             if fired_this_round == 0 {
@@ -163,8 +174,12 @@ impl Saturate for CoreSaturate {
         // `StrictlyLowering` rule is idempotent by hash-consing, so
         // re-offering one is a memo hit; that is what lets this ignore the
         // fired set and the node ceiling entirely.
-        if !saturated || missing_l1(graph) {
-            applications += lower_everything(graph, caps, rules, &by_head, &mut fired_counts);
+        if !saturated || missing_l1(graph, &reachable) {
+            applications +=
+                lower_everything(graph, caps, rules, &by_head, &mut fired_counts, &reachable);
+        }
+        for id in done {
+            graph.mark_offered(id);
         }
 
         // Advance the frontier: nodes below it have been offered every rule.
@@ -199,8 +214,11 @@ impl Saturate for CoreSaturate {
 /// Whether any non-leaf Logical value still has no Launch spelling. This is the
 /// extractor's only contract with saturation, so it is checked rather than
 /// assumed.
-fn missing_l1(graph: &EGraph) -> bool {
-    (0..graph.len()).any(|i| {
+fn missing_l1(graph: &EGraph, reachable: &FixedBitSet) -> bool {
+    // Nodes minted during this pass sit past the reachable set's bound and
+    // are reachable by construction.
+    let minted = reachable.len()..graph.len();
+    reachable.ones().chain(minted).any(|i| {
         let id = Id(i as u32);
         let node = graph.node(id);
         if node.level != Level::Logical
@@ -221,14 +239,26 @@ fn lower_everything(
     rules: &[Rule],
     by_head: &HeadTable,
     fired_counts: &mut [u32],
+    reachable: &FixedBitSet,
 ) -> u32 {
     let mut applications = 0u32;
-    let mut i = 0usize;
-    // New ids appear as the pass runs; walking to the current length keeps
-    // the floor total without a second sweep.
-    while i < graph.len() {
-        let id = Id(i as u32);
-        i += 1;
+    // The reachable set, then every id minted past it as the pass runs;
+    // walking to the current length keeps the floor total without a second
+    // sweep.
+    let bound = reachable.len();
+    let mut pending: Vec<Id> = reachable.ones().map(|i| Id(i as u32)).collect();
+    pending.reverse();
+    let mut minted = bound;
+    loop {
+        let id = match pending.pop() {
+            Some(id) => id,
+            None if minted < graph.len() => {
+                let id = Id(minted as u32);
+                minted += 1;
+                id
+            }
+            None => break,
+        };
         if graph.node(id).level != Level::Logical {
             continue;
         }

@@ -447,26 +447,19 @@ fn fold_extent(
 }
 
 /// `Logical::Restride` -> a copying `Map` whose operand carries the composed
-/// view. When the composition is not decidable the operand falls to a
-/// per-element address computation rather than to an invented contiguous
-/// layout.
+/// view. When the composition is not expressible as one layout the rule
+/// declines: an operand over the source's own contiguous layout would read
+/// the wrong elements, and nothing downstream reconstructs the specs.
 pub fn lower_restride(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Logical(Logical::Restride { specs, x, .. }) = &node.op else {
         return None;
     };
     let in_shape = f.operand(0)?.shape.clone();
     let dtype = f.dtype(0)?;
-    let operand = match composed_layout(specs, &in_shape) {
-        Some(layout) => Operand {
-            src: *x,
-            layout,
-            access: AccessPlan::Alias,
-        },
-        None => Operand {
-            src: *x,
-            layout: Layout::contiguous(&in_shape),
-            access: AccessPlan::Gather,
-        },
+    let operand = Operand {
+        src: *x,
+        layout: composed_layout(specs, &in_shape)?,
+        access: AccessPlan::Alias,
     };
     let k = b
         .add_launch(Launch::Map {

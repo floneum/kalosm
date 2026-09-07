@@ -8,7 +8,7 @@ use crate::error::{Error, Result};
 use crate::facts::ValueFacts;
 use crate::ir::logical::{LeafKind, Logical};
 use crate::scalar::{ScalarExpr, ScalarKind};
-use crate::shape::{Dim, Dims, Layout, StrideSpec, SymId};
+use crate::shape::{Dim, Dims, Layout, StrideSpec};
 use smallvec::SmallVec;
 
 /// Infer the result facts of a Logical node from its operands' facts.
@@ -340,9 +340,9 @@ fn check_restride_specs(specs: &[StrideSpec], in_rank: usize) -> Result<()> {
 /// Composition is **relative to the current strides**, which is what makes a
 /// view survive an upstream layout rewrite.
 ///
-/// A product or sum that is not decidable over `Const` dims becomes the
-/// symbolic stride placeholder `Dim::Sym(SymId(u32::MAX))`, the same
-/// convention `Layout::row_major_strides` already uses.
+/// A product or sum over a symbolic dim becomes a derived symbol
+/// ([`Dim::add`], [`Dim::mul`]), evaluated from the bindings at dispatch;
+/// only overflow falls to the opaque placeholder.
 pub fn restride_layout(input: &Layout, specs: &[StrideSpec]) -> Result<Layout> {
     check_restride_specs(specs, input.rank())?;
     let in_strides = input.strides();
@@ -354,48 +354,22 @@ pub fn restride_layout(input: &Layout, specs: &[StrideSpec]) -> Result<Layout> {
             if s.multiplier == 0 {
                 Dim::Const(0)
             } else {
-                dim_mul(in_strides[s.input_dim as usize], s.multiplier as u64)
+                in_strides[s.input_dim as usize].mul(Dim::Const(s.multiplier as u64))
             }
         })
         .collect();
 
+    // A symbolic offset or stride stays exact as a derived symbol (see
+    // `Dim::add`), so a view at a runtime offset reads the right element.
     let mut offset = input.offset();
     for s in specs {
         if s.offset.known_eq(Dim::Const(0)) {
             continue;
         }
         let stride = in_strides[s.input_dim as usize];
-        offset = dim_add(offset, dim_mul_dim(s.offset, stride));
+        offset = offset.add(s.offset.mul(stride));
     }
     Layout::from_parts(offset, &shape, &strides)
-}
-
-/// The placeholder a non-decidable stride/offset carries.
-const OPAQUE: Dim = Dim::Sym(SymId(u32::MAX));
-
-fn dim_mul(a: Dim, b: u64) -> Dim {
-    match a {
-        Dim::Const(v) => v.checked_mul(b).map_or(OPAQUE, Dim::Const),
-        Dim::Sym(_) if b == 1 => a,
-        Dim::Sym(_) => OPAQUE,
-    }
-}
-
-fn dim_mul_dim(a: Dim, b: Dim) -> Dim {
-    match (a, b) {
-        (Dim::Const(x), Dim::Const(y)) => x.checked_mul(y).map_or(OPAQUE, Dim::Const),
-        (Dim::Const(0), _) | (_, Dim::Const(0)) => Dim::Const(0),
-        (Dim::Const(1), other) | (other, Dim::Const(1)) => other,
-        _ => OPAQUE,
-    }
-}
-
-fn dim_add(a: Dim, b: Dim) -> Dim {
-    match (a, b) {
-        (Dim::Const(x), Dim::Const(y)) => x.checked_add(y).map_or(OPAQUE, Dim::Const),
-        (Dim::Const(0), other) | (other, Dim::Const(0)) => other,
-        _ => OPAQUE,
-    }
 }
 
 // ---------------------------------------------------------------------------

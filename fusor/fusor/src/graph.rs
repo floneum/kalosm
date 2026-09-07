@@ -513,6 +513,23 @@ impl GraphRef {
 
     /// Register each `(value, buffer, layout)` under every id of the value's
     /// e-class, for the whole batch under one lock apiece.
+    /// Every computed (non-leaf) value that currently carries a device
+    /// buffer: what a later resolve may read as an input instead of
+    /// recomputing.
+    pub(crate) fn bound_values(&self) -> rustc_hash::FxHashSet<Id> {
+        let ids: Vec<Id> = self.state.leaves.lock().device.keys().copied().collect();
+        let g = self.state.egraph.lock();
+        ids.into_iter()
+            .filter(|id| !matches!(g.node(*id).op, Op::Logical(Logical::Leaf(_))))
+            .collect()
+    }
+
+    /// Bind one buffer under a leaf id alone. A leaf is its own class, so
+    /// this needs no e-graph lock and may run while one is held.
+    pub(crate) fn bind_leaf(&self, id: Id, buf: Buf, layout: Option<Arc<fusor_ir::shape::Layout>>) {
+        self.state.leaves.lock().device.insert(id, (buf, layout));
+    }
+
     pub(crate) fn bind_classes(&self, items: &[(Id, Buf, Option<Arc<fusor_ir::shape::Layout>>)]) {
         let classes: Vec<Arc<[Id]>> = {
             let mut g = self.state.egraph.lock();

@@ -39,7 +39,9 @@ pub fn derive_plan(
     cost: fusor_ir::cost::Picoseconds,
 ) -> Result<Plan> {
     let buffers = derive_buffers(graph, extraction, realized)?;
-    let symbols = symbols_of(graph, realized);
+    let (dims, scalar_symbols) = classified_symbols_of(graph, realized);
+    let mut symbols = dims;
+    symbols.extend(scalar_symbols.iter().copied());
 
     let mut launches = Vec::with_capacity(realized.components.len());
     for c in &realized.components {
@@ -58,6 +60,7 @@ pub fn derive_plan(
         launches,
         buffers,
         symbols,
+        scalar_symbols,
         hash,
         cost,
     })
@@ -273,6 +276,14 @@ fn layout_elements(shape: &[Dim]) -> Dim {
 /// Every `SymId` the uniform block must carry, in binding order: dims
 /// ascending, then scalars ascending, matching `Uniforms::to_bytes`.
 pub fn symbols_of(graph: &EGraph, realized: &Realized) -> Vec<SymId> {
+    let (mut dims, scalars) = classified_symbols_of(graph, realized);
+    dims.extend(scalars);
+    dims
+}
+
+/// [`symbols_of`] split into `(dims, scalars)`: the extents, offsets and
+/// strides the kernels index by, and the runtime scalars they read.
+pub fn classified_symbols_of(graph: &EGraph, realized: &Realized) -> (Vec<SymId>, Vec<SymId>) {
     let mut dims: Vec<SymId> = Vec::new();
     let mut scalars: Vec<SymId> = Vec::new();
 
@@ -291,9 +302,7 @@ pub fn symbols_of(graph: &EGraph, realized: &Realized) -> Vec<SymId> {
     // A symbol used as an extent is bound as a dim; it must not also be
     // emitted as a scalar.
     scalars.retain(|s| !dims.contains(s));
-
-    dims.extend(scalars);
-    dims
+    (dims, scalars)
 }
 
 /// `hash(realized DAG term + M + theta + DeviceFacts::fingerprint)`.

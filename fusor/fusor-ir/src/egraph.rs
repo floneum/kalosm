@@ -7,7 +7,7 @@ use crate::facts::ValueFacts;
 use crate::ir::launch::Launch;
 use crate::ir::logical::Logical;
 use crate::ir::{Children, Level, Node, Op, OpTag, Semantics};
-use crate::shape::SymId;
+use crate::shape::{Dim, SymId};
 use fixedbitset::FixedBitSet;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
@@ -71,6 +71,21 @@ pub struct EGraph {
     /// re-offering below the frontier can only re-mint. Advanced by the
     /// saturation driver only when a pass finishes unbudgeted.
     pub saturation_frontier: usize,
+    /// Nodes that have been offered every rule, by id. Saturation is scoped
+    /// to the roots' reachable closure, so this — not a prefix of the arena
+    /// — is what says a node needs no further offering: a node reachable
+    /// only from a later root set is offered then, and a node no root ever
+    /// reaches again is never re-lowered.
+    offered: FixedBitSet,
+    /// The current dim bindings, as a hint for costing: extraction and the
+    /// tuner's work gate price a symbolic extent at its bound value rather
+    /// than a nominal one, so a symbolic plan is tuned like a concrete one.
+    /// Set by the session before it plans; never read by a rule.
+    pub dim_hints: FxHashMap<SymId, u64>,
+    /// The root set the last completed saturation ran for. With the walk
+    /// scoped to what the roots reach, an unchanged arena under a *new*
+    /// root set may still hold unoffered nodes.
+    pub saturated_roots: Vec<Id>,
     /// The node count as of the last completed saturation on this graph.
     /// `add` is the only structural mutation, so `saturated_at_len ==
     /// Some(len())` means the graph is exactly the one saturation last ran
@@ -107,9 +122,50 @@ impl EGraph {
             },
             class_ids_memo: (usize::MAX, FxHashMap::default()),
             saturation_frontier: 0,
+            offered: FixedBitSet::new(),
+            dim_hints: FxHashMap::default(),
+            saturated_roots: Vec::new(),
             saturated_at_len: None,
             l0_term_memo: None,
         }
+    }
+
+    /// `d` at its hinted value when every symbol it reaches is bound, else
+    /// `d` itself.
+    pub fn hinted(&self, d: Dim) -> Dim {
+        match d.evaluate(&mut |s| self.dim_hints.get(&s).copied()) {
+            Some(v) => Dim::Const(v),
+            None => d,
+        }
+    }
+
+    /// Whether `id` has been offered every rule by an earlier saturation.
+    pub fn is_offered(&self, id: Id) -> bool {
+        self.offered.contains(id.index())
+    }
+
+    pub fn mark_offered(&mut self, id: Id) {
+        self.offered.grow_and_insert(id.index());
+    }
+
+    /// Every id of every class the current roots reach: the nodes an
+    /// extraction over those roots can select, and so the nodes saturation
+    /// has to offer rules to. Closed under class membership and children.
+    pub fn reachable_from_roots(&self) -> FixedBitSet {
+        let mut seen = FixedBitSet::with_capacity(self.nodes.len());
+        let mut stack: Vec<Id> = self.roots.clone();
+        while let Some(id) = stack.pop() {
+            if seen.contains(id.index()) {
+                continue;
+            }
+            for m in self.class_ids(self.class_of(id)) {
+                if seen.put(m.index()) {
+                    continue;
+                }
+                stack.extend(self.nodes[m.index()].children.iter().copied());
+            }
+        }
+        seen
     }
 
     pub fn len(&self) -> usize {
@@ -323,6 +379,7 @@ impl EGraph {
             len: self.nodes.len(),
             parent: self.parent.clone(),
             defns: self.defns.ones().map(|i| i as u32).collect(),
+            offered: self.offered.ones().map(|i| i as u32).collect(),
             roots: self.roots.clone(),
             next_sym: self.next_sym,
         }
@@ -342,6 +399,7 @@ impl EGraph {
             memo: Arc::clone(&self.memo),
             parent: self.parent.clone(),
             defns: self.defns.clone(),
+            offered: self.offered.clone(),
             roots: self.roots.clone(),
             next_sym: self.next_sym,
             pre,
@@ -376,11 +434,20 @@ impl EGraph {
         // The prefix is already equal, so only the tail is copied. The
         // recording's memo is the post-saturation table by construction; the
         // graph adopts it and `Arc::make_mut` forks it if later grown.
+        if !self
+            .offered
+            .ones()
+            .map(|i| i as u32)
+            .eq(pre.offered.iter().copied())
+        {
+            return false;
+        }
         self.nodes.extend_from_slice(&delta.nodes[pre.len..]);
         self.facts.extend_from_slice(&delta.facts[pre.len..]);
         self.memo = Arc::clone(&delta.memo);
         self.parent.clone_from(&delta.parent);
         self.defns.clone_from(&delta.defns);
+        self.offered.clone_from(&delta.offered);
         self.roots.clone_from(&delta.roots);
         self.next_sym = delta.next_sym;
         self.saturation_frontier = self.nodes.len();
@@ -615,6 +682,7 @@ pub struct PreSaturation {
     len: usize,
     parent: Vec<Option<Id>>,
     defns: Vec<u32>,
+    offered: Vec<u32>,
     roots: Vec<Id>,
     next_sym: u32,
 }
@@ -645,6 +713,7 @@ pub struct SaturationDelta {
     memo: Arc<FxHashMap<NodeKey, Id>>,
     parent: Vec<Option<Id>>,
     defns: FixedBitSet,
+    offered: FixedBitSet,
     roots: Vec<Id>,
     next_sym: u32,
 }

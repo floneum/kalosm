@@ -804,28 +804,22 @@ impl Decoder {
     }
 }
 
-/// Set `FUSOR_USE_GPU=1` to run on the GPU; the default is the CPU. A build
-/// with only one backend uses that backend regardless.
+/// The GPU when an adapter is usable, otherwise the CPU. Without the `cpu`
+/// feature an unusable adapter is an error: there is nothing to fall back to.
 async fn default_device() -> Result<Device, WhisperLoadingError> {
-    let use_gpu = std::env::var("FUSOR_USE_GPU").is_ok_and(|v| v == "1");
     #[cfg(all(feature = "cpu", feature = "gpu"))]
     {
-        if use_gpu {
-            Ok(Device::gpu().await?)
-        } else {
-            Ok(Device::cpu())
-        }
+        Ok(Device::gpu().await.unwrap_or_else(|err| {
+            tracing::warn!("no gpu adapter, falling back to cpu: {err}");
+            Device::cpu()
+        }))
     }
     #[cfg(all(feature = "gpu", not(feature = "cpu")))]
     {
-        let _ = use_gpu;
         Ok(Device::gpu().await?)
     }
     #[cfg(all(feature = "cpu", not(feature = "gpu")))]
     {
-        if use_gpu {
-            tracing::warn!("FUSOR_USE_GPU is set but the `gpu` feature is off; using the cpu");
-        }
         Ok(Device::cpu())
     }
 }

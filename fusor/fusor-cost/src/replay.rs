@@ -1,6 +1,7 @@
 //! The replay memo, keyed on the extraction inputs. Validity is "the inputs
 //! are identical".
 
+use fixedbitset::FixedBitSet;
 use fusor_ir::Result;
 use fusor_ir::egraph::{EGraph, Id};
 use fusor_ir::extract::{Plan, PlanHash, ReplayKey};
@@ -169,31 +170,45 @@ impl ReplayCache {
     }
 }
 
-/// Structural fingerprint of the graph a plan was extracted from, **with
+/// Structural fingerprint of the term a plan was extracted from, **with
 /// symbols as symbols**: two dispatches of one shape family produce the same
 /// value, so the key discriminates on the binding rather than on the shape.
 ///
 /// A leaf contributes its dtype and its shape, and a `Const` its value; it
 /// does not contribute its `BufferId`, so a re-upload into a fresh buffer
 /// replays. The key must be injective over everything a cached plan's `Id`s
-/// refer to: the whole graph and the root set, not only the rooted term.
+/// refer to: every member of every class the roots reach, *with its id* —
+/// ids are meaningful only in the arena they index, and an arena is
+/// append-only, so equal ids holding equal nodes is the same term. Nodes the
+/// roots never reach are not hashed: a graph that keeps growing elsewhere
+/// (another model, a readback's own small term) leaves this plan valid.
 pub fn l0_term_hash(graph: &EGraph, roots: &[Id]) -> u64 {
     let mut h = FxHasher::default();
-    // The roots are an extraction *input*: the same term rooted at one value
-    // and at two is two different plans.
     h.write_usize(roots.len());
     for r in roots {
         h.write_u32(r.0);
     }
-    // Every id, not only the root-reachable Logical spine: a cached plan's
-    // `Id`s are meaningful only in the graph it was extracted from, and an id
-    // is determined by everything allocated before it — including nodes this
-    // term never reaches.
-    //
+    // Every id of every class reachable from the roots, in id order so the
+    // hash does not depend on traversal order. A class's members are what
+    // the extractor chooses among, so a plan's ids all lie in this set.
+    let mut seen = FixedBitSet::with_capacity(graph.len());
+    let mut stack: Vec<Id> = roots.to_vec();
+    while let Some(id) = stack.pop() {
+        if seen.contains(id.index()) {
+            continue;
+        }
+        for m in graph.class_ids(graph.class_of(id)) {
+            if seen.put(m.index()) {
+                continue;
+            }
+            stack.extend(graph.node(m).children.iter().copied());
+        }
+    }
     // `Hash for ScalarExpr` writes a cached digest, so this stays O(nodes).
-    for i in 0..graph.len() {
+    for i in seen.ones() {
         let v = Id(i as u32);
         let node = graph.node(v);
+        h.write_u32(v.0);
         node.op.tag().hash(&mut h);
         if let Op::Logical(Logical::Leaf(k)) = &node.op {
             hash_leaf(&mut h, k);

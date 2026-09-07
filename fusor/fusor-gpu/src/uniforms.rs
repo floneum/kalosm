@@ -62,43 +62,24 @@ impl UniformPack {
 
     /// Derive the word layout of binding 0 from a plan.
     ///
-    /// A symbol appears in exactly one of the two groups: `dim_syms` when any
-    /// buffer shape or stride mentions it, `scalar_syms` otherwise. The
-    /// classification is structural, so it does not move when a value does.
+    /// A symbol appears in exactly one of the two groups: `scalar_syms` when
+    /// the plan names it a runtime scalar (a `Leaf::Uniform`), `dim_syms`
+    /// otherwise — an extent, a view offset, a stride — whether or not any
+    /// buffer layout mentions it. The classification is a property of the
+    /// plan, so it does not move when a value does.
     pub(crate) fn new(plan: &Plan) -> Self {
-        let mut mentioned_as_dim: FxHashMap<SymId, ()> = FxHashMap::default();
-        for buf in &plan.buffers {
-            for d in buf.layout.shape().iter().chain(buf.layout.strides()) {
-                if let Dim::Sym(s) = d
-                    && *s != DERIVED_STRIDE
-                {
-                    mentioned_as_dim.insert(*s, ());
-                }
-            }
-            if let Dim::Sym(s) = buf.elements
-                && s != DERIVED_STRIDE
-            {
-                mentioned_as_dim.insert(s, ());
-            }
-            if let Dim::Sym(s) = buf.layout.offset()
-                && s != DERIVED_STRIDE
-            {
-                mentioned_as_dim.insert(s, ());
-            }
-        }
-
         let mut dim_syms = Vec::new();
         let mut scalar_syms = Vec::new();
         for &sym in &plan.symbols {
             if sym == DERIVED_STRIDE {
                 continue;
             }
-            if mentioned_as_dim.contains_key(&sym) {
-                if !dim_syms.contains(&sym) {
-                    dim_syms.push(sym);
+            if plan.scalar_symbols.contains(&sym) {
+                if !scalar_syms.contains(&sym) {
+                    scalar_syms.push(sym);
                 }
-            } else if !scalar_syms.contains(&sym) {
-                scalar_syms.push(sym);
+            } else if !dim_syms.contains(&sym) {
+                dim_syms.push(sym);
             }
         }
 
@@ -146,9 +127,11 @@ impl UniformPack {
     ) -> Result<Uniforms> {
         let mut dims = Vec::with_capacity(self.dim_syms.len() + self.strides.len());
         for sym in &self.dim_syms {
-            let v = binding.get(sym).copied().ok_or_else(|| {
-                Error::Plan(format!("symbolic dim {sym} has no dispatch binding"))
-            })?;
+            let v = Dim::Sym(*sym)
+                .evaluate(&mut |s| binding.get(&s).copied())
+                .ok_or_else(|| {
+                    Error::Plan(format!("symbolic dim {sym} has no dispatch binding"))
+                })?;
             dims.push(u32::try_from(v).map_err(|_| {
                 Error::Plan(format!(
                     "symbolic dim {sym} = {v} does not fit in a u32 word"
@@ -222,9 +205,12 @@ impl UniformPack {
                         "a shape extent is the derived-stride placeholder".into(),
                     ));
                 }
-                Dim::Sym(s) => binding.get(s).copied().ok_or_else(|| {
-                    Error::Plan(format!("derived stride needs unbound symbol {s}"))
-                })?,
+                d @ Dim::Sym(s) => {
+                    d.evaluate(&mut |x| binding.get(&x).copied())
+                        .ok_or_else(|| {
+                            Error::Plan(format!("derived stride needs unbound symbol {s}"))
+                        })?
+                }
             };
             acc = acc
                 .checked_mul(extent)
