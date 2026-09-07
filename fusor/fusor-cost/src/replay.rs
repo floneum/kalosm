@@ -260,29 +260,11 @@ fn hash_shape<H: Hasher>(h: &mut H, shape: &[Dim]) {
                 h.write_u64(*v);
             }
             // A symbolic extent stays symbolic: one plan serves the family and
-            // `ReplayKey::binding` is what discriminates the dispatch.
+            // the dispatch binds it through the uniform block.
             Dim::Sym(s) => {
                 h.write_u8(1);
                 h.write_u32(s.0);
             }
         }
     }
-}
-
-/// Hash of one dim binding — the vector a symbolic plan is dispatched at.
-pub fn binding_hash(dims: &[Dim]) -> u64 {
-    let mut h = FxHasher::default();
-    for d in dims {
-        match d {
-            Dim::Const(v) => {
-                h.write_u8(0);
-                h.write_u64(*v);
-            }
-            Dim::Sym(s) => {
-                h.write_u8(1);
-                h.write_u32(s.0);
-            }
-        }
-    }
-    h.finish()
 }

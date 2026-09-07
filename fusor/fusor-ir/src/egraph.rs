@@ -82,19 +82,22 @@ pub struct EGraph {
     /// than a nominal one, so a symbolic plan is tuned like a concrete one.
     /// Set by the session before it plans; never read by a rule.
     pub dim_hints: FxHashMap<SymId, u64>,
-    /// The root set the last completed saturation ran for. With the walk
-    /// scoped to what the roots reach, an unchanged arena under a *new*
-    /// root set may still hold unoffered nodes.
-    pub saturated_roots: Vec<Id>,
+    /// Root sets whose reachable closure has been offered every rule. The
+    /// arena is append-only and an offered node is never re-fired, so a
+    /// closure once saturated stays saturated whatever is appended later:
+    /// a root set seen here needs no walk at all. Bounded by clearing.
+    pub saturated_root_sets: FxHashSet<Vec<Id>>,
     /// The node count as of the last completed saturation on this graph.
     /// `add` is the only structural mutation, so `saturated_at_len ==
     /// Some(len())` means the graph is exactly the one saturation last ran
     /// on — a decode step that rebuilt only memo hits skips saturation. The
     /// session owns setting it.
     pub saturated_at_len: Option<usize>,
-    /// Memo for the replay key's whole-graph term hash: `(roots, len) ->
-    /// hash`. Valid for the same reason as `saturated_at_len`.
-    pub l0_term_memo: Option<(Vec<Id>, usize, u64)>,
+    /// Memo for the replay key's root-closure hash, per root set. A hash
+    /// covers exactly what its roots reach, which an append cannot change,
+    /// so an entry stays valid for the life of the graph. Bounded by
+    /// clearing.
+    pub l0_term_memo: FxHashMap<Vec<Id>, u64>,
     /// Process-unique identity of this arena. An [`Id`] names a node only
     /// together with the graph it indexes, so anything that caches per-node
     /// work keyed on ids across graphs has to carry this.
@@ -124,9 +127,9 @@ impl EGraph {
             saturation_frontier: 0,
             offered: FixedBitSet::new(),
             dim_hints: FxHashMap::default(),
-            saturated_roots: Vec::new(),
+            saturated_root_sets: FxHashSet::default(),
             saturated_at_len: None,
-            l0_term_memo: None,
+            l0_term_memo: FxHashMap::default(),
         }
     }
 

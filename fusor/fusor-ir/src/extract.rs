@@ -232,10 +232,11 @@ pub trait Extractor: Send + Sync {
 }
 
 /// The replay memo, keyed on the extraction inputs. Validity is "the inputs
-/// are identical".
+/// are identical": the root closure's term (symbols as symbols, so one plan
+/// serves a whole shape family and the values reach the dispatch through the
+/// uniform block) and the device.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReplayKey {
     pub l0_term: u64,
     pub device: u64,
-    pub binding: u64,
 }

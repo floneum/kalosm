@@ -270,9 +270,6 @@ pub(crate) struct SessionInner {
     /// buffers and views. A family whose constants vary across calls gets a
     /// symbolic twin term planned once and re-bound per call.
     families: parking_lot::Mutex<FxHashMap<FamilyKey, Family>>,
-    /// The concrete twin `family_step` just recorded for the values now
-    /// being planned, so the plan they extract to is filed under it.
-    pending_twin: parking_lot::Mutex<Option<(FamilyKey, Vec<Id>)>>,
     launches: AtomicU64,
     in_flight: AtomicU32,
 }
@@ -349,6 +346,10 @@ struct Family {
     blocked: bool,
 }
 
+/// Root sets the per-graph saturation and closure-hash memos hold before
+/// they are cleared: the twins of every live family, with room to spare.
+const ROOT_SET_MEMOS: usize = 256;
+
 /// Distinct shapes a family replays concretely before it goes symbolic. A
 /// batch of embeddings sees a handful of padded lengths and every one of
 /// them deserves the kernels its exact extents select; a decode loop sees a
@@ -370,9 +371,6 @@ struct Twin {
     /// building member's own leaf otherwise. Every call rebinds them to its
     /// member's buffers.
     leaves: Vec<(Id, usize)>,
-    /// The plan the twin's roots last extracted to. The twin's nodes never
-    /// change, so a hit runs it directly: no saturation walk, no replay key.
-    plan: Option<Arc<Plan>>,
 }
 
 /// `layout` with every symbol replaced by its binding. A derived stride
@@ -471,7 +469,6 @@ impl Session {
                 #[cfg(feature = "cpu")]
                 cpu_executables: parking_lot::Mutex::new(FxHashMap::default()),
                 families: parking_lot::Mutex::new(FxHashMap::default()),
-                pending_twin: parking_lot::Mutex::new(None),
                 launches: AtomicU64::new(0),
                 in_flight: AtomicU32::new(0),
             }),
@@ -630,14 +627,6 @@ impl Session {
         }
 
         let caps = self.caps();
-        // The key discriminates on which symbols are bound, never on their
-        // values: one plan serves the whole shape family, and the values
-        // reach the dispatch through the uniform block and `grid_for`.
-        let binding: Vec<Dim> = graph
-            .dim_bindings()
-            .into_iter()
-            .map(|(s, _)| Dim::Sym(s))
-            .collect();
 
         let (plan, roots, key, missed) = {
             let mut g = graph.state().egraph.lock();
@@ -665,7 +654,7 @@ impl Session {
             // Saturation is scoped to what the roots reach, so an unchanged
             // arena is saturated for these roots only if they are the roots
             // it last ran for.
-            let __skipped = g.saturated_at_len == Some(g.len()) && g.saturated_roots == g.roots();
+            let __skipped = g.saturated_root_sets.contains(g.roots());
             let memo_eligible = !__skipped && g.len() <= SATURATION_MEMO_MAX_NODES;
             let __replayed = memo_eligible && self.inner.saturation.replay(&mut g);
             if !__skipped && !__replayed {
@@ -695,23 +684,29 @@ impl Session {
                 }
             }
             g.saturated_at_len = Some(g.len());
-            g.saturated_roots = g.roots().to_vec();
+            if g.saturated_root_sets.len() >= ROOT_SET_MEMOS {
+                g.saturated_root_sets.clear();
+            }
+            let roots_now = g.roots().to_vec();
+            g.saturated_root_sets.insert(roots_now);
             let __sat_us = __t_sat.elapsed().as_micros();
 
             let roots: Vec<Id> = g.roots().to_vec();
             let __t_rest = Instant::now();
-            let l0_term = match &g.l0_term_memo {
-                Some((r, len, hash)) if *len == g.len() && r == &roots => *hash,
-                _ => {
+            let l0_term = match g.l0_term_memo.get(&roots) {
+                Some(hash) => *hash,
+                None => {
                     let hash = fusor_cost::replay::l0_term_hash(&g, &roots);
-                    g.l0_term_memo = Some((roots.clone(), g.len(), hash));
+                    if g.l0_term_memo.len() >= ROOT_SET_MEMOS {
+                        g.l0_term_memo.clear();
+                    }
+                    g.l0_term_memo.insert(roots.clone(), hash);
                     hash
                 }
             };
             let key = ReplayKey {
                 l0_term,
                 device: self.inner.cost.facts().fingerprint(),
-                binding: fusor_cost::replay::binding_hash(&binding),
             };
             // Tuning happens on a memo miss; the winner is what every later
             // resolve of this key replays.
@@ -836,15 +831,6 @@ impl Session {
         }
         #[cfg(not(feature = "cpu"))]
         let _ = executable;
-        // The concrete twin recorded for these values gets the plan they
-        // extracted to, so their shape's next call runs it directly.
-        if let Some((key, roots)) = self.inner.pending_twin.lock().take()
-            && roots.iter().zip(values).all(|(r, v)| *r == v.id)
-            && let Some(fam) = self.inner.families.lock().get_mut(&key)
-            && let Some(t) = fam.concrete.iter_mut().find(|t| t.roots == roots)
-        {
-            t.plan = Some(Arc::clone(&plan));
-        }
         Ok(Some(plan))
     }
 
@@ -912,24 +898,13 @@ impl Session {
     /// for this root set at this length.
     fn replay_would_hit(&self, graph: &GraphRef, values: &[Tensor]) -> bool {
         let g = graph.state().egraph.lock();
-        let Some((roots, len, hash)) = &g.l0_term_memo else {
+        let roots: Vec<Id> = values.iter().map(|v| v.id).collect();
+        let Some(hash) = g.l0_term_memo.get(&roots) else {
             return false;
         };
-        if *len != g.len()
-            || roots.len() != values.len()
-            || roots.iter().zip(values).any(|(r, v)| *r != v.id)
-        {
-            return false;
-        }
-        let binding: Vec<Dim> = graph
-            .dim_bindings()
-            .into_iter()
-            .map(|(s, _)| Dim::Sym(s))
-            .collect();
         let key = ReplayKey {
             l0_term: *hash,
             device: self.inner.cost.facts().fingerprint(),
-            binding: fusor_cost::replay::binding_hash(&binding),
         };
         self.inner.replay.get(key).is_some()
     }
@@ -1035,7 +1010,6 @@ impl Session {
             leaves: (0..term.inputs.len())
                 .map(|ix| (term.inputs[ix], ix))
                 .collect(),
-            plan: None,
         };
         let twin = {
             let mut fams = self.inner.families.lock();
@@ -1053,7 +1027,6 @@ impl Session {
                 symbolic: None,
                 blocked: false,
             });
-            let own_roots: Vec<Id> = values.iter().map(|v| v.id).collect();
             if is_new {
                 if resolve_profile() {
                     eprintln!(
@@ -1062,7 +1035,6 @@ impl Session {
                         fams.len()
                     );
                 }
-                *self.inner.pending_twin.lock() = Some((key, own_roots));
                 return Ok(false);
             }
             // These values are a recorded twin's own roots: plan them directly.
@@ -1088,7 +1060,6 @@ impl Session {
                         CONCRETE_SHAPES
                     );
                 }
-                *self.inner.pending_twin.lock() = Some((key, own_roots));
                 return Ok(false);
             } else {
                 // Shapes keep changing: the symbolic twin. Slots that have
@@ -1169,22 +1140,12 @@ impl Session {
         for root in &twin.roots {
             graph.clear_class_device_buf(*root);
         }
-        // The twin's own nodes never change between calls, so once its plan
-        // is known a hit runs that plan directly. A symbolic twin that fails
-        // to plan blocks the family; a concrete one that fails is dropped.
-        let outcome = match twin.plan.clone() {
-            Some(plan) => self.run(graph, &plan, &twin_values).map(|(launched, _)| {
-                self.inner
-                    .launches
-                    .fetch_add(launched as u64, Ordering::Relaxed);
-                self.inner.in_flight.fetch_add(1, Ordering::Relaxed);
-                None
-            }),
-            None => self.resolve_locked_plan(resolving, &twin_values),
-        };
-        let planned = match outcome {
-            Ok(planned) => planned,
-            Err(err) => {
+        // The twin's own nodes never change between calls, so this is a
+        // replay of its plan through the one memo that holds plans. A
+        // symbolic twin that fails to plan blocks the family; a concrete one
+        // that fails is dropped.
+        if let Err(err) = self.resolve_locked(resolving, &twin_values) {
+            {
                 if resolve_profile() {
                     eprintln!("[profile] shape family blocked at planning: {err}");
                 }
@@ -1201,16 +1162,6 @@ impl Session {
                 }
                 return Ok(false);
             }
-        };
-        if let Some(plan) = planned
-            && let Some(fam) = self.inner.families.lock().get_mut(&key)
-            && let Some(t) = fam
-                .concrete
-                .iter_mut()
-                .chain(fam.symbolic.iter_mut())
-                .find(|t| t.roots == twin.roots)
-        {
-            t.plan = Some(plan);
         }
         // The member's value is concrete, so its binding carries the twin's
         // layout with this call's values in place of the symbols.
@@ -1350,7 +1301,6 @@ impl Session {
             syms,
             roots: term.term.roots.iter().map(|r| map[r.index()]).collect(),
             leaves,
-            plan: None,
         })
     }
 
