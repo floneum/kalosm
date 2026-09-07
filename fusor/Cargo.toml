@@ -1,0 +1,82 @@
+[workspace]
+resolver = "3"
+members = [
+    "fusor-ir",
+    "fusor-tile",
+    "fusor-autograd",
+    "fusor-cost",
+    "fusor-gguf",
+    "fusor-gpu",
+    "fusor-cpu",
+    "fusor",
+    "fusor-conformance",
+]
+# The browser runner is built by `dx` in its own directory and pulls burn; it
+# is its own workspace so `--workspace` commands here never compile it.
+exclude = ["webgpu-runner"]
+
+# Fusor is a standalone workspace, deliberately excluded from the repository
+# root workspace so it owns its compiler dependencies, test matrix, and
+# lockfile. The repository root repeats the vendored naga patch when it builds
+# model crates that depend on Fusor.
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+license = "MIT OR Apache-2.0"
+authors = ["Evan Almloff <evanalmloff@gmail.com>"]
+rust-version = "1.88"
+repository = "https://github.com/floneum/floneum"
+
+[workspace.dependencies]
+# --- internal ---------------------------------------------------------------
+fusor-ir = { path = "fusor-ir", version = "0.1.0" }
+fusor-tile = { path = "fusor-tile", version = "0.1.0" }
+fusor-autograd = { path = "fusor-autograd", version = "0.1.0" }
+fusor-cost = { path = "fusor-cost", version = "0.1.0" }
+fusor-gguf = { path = "fusor-gguf", version = "0.1.0" }
+fusor-gpu = { path = "fusor-gpu", version = "0.1.0" }
+fusor-cpu = { path = "fusor-cpu", version = "0.1.0" }
+fusor = { path = "fusor", version = "0.1.0", default-features = false }
+fusor-conformance = { path = "fusor-conformance", version = "0.1.0", default-features = false }
+
+# --- shared external, pinned once -------------------------------------------
+smallvec = { version = "1.15", features = ["union"] }
+rustc-hash = "2.1"
+fixedbitset = "0.5"
+half = { version = "2.6", features = ["bytemuck"] }
+bytemuck = { version = "1.25", features = ["derive"] }
+parking_lot = "0.12"
+lru = "0.14"
+pollster = "0.4"
+# `std::time` that does not panic on wasm32; a re-export of std everywhere else.
+web-time = "1"
+memmap2 = "0.9"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+rand = "0.9"
+
+# Released wgpu 29.x with `naga-ir`; WebGPU baseline limits are requested at
+# device creation and widened per kernel, never taken from `adapter.limits()`.
+wgpu = { version = "29", default-features = false, features = ["std", "naga-ir"] }
+naga = "29"
+
+# Use Naga from the ealmloff/wgpu fork. It includes the
+# `CooperativeLoad` correctness fix in `bake_ref_count`, so a simdgroup load
+# referenced once cannot sink past the barrier that ordered it.
+[patch.crates-io]
+naga = { git = "https://github.com/ealmloff/wgpu", rev = "c4f55cabaadc22b942c1dd8894bf85f17f2718dc" }
+
+# CI builds: the conformance sweep runs the planner and every raced kernel
+# body on the host, and unoptimized planner code is most of its wall time.
+# `opt-level = 1` keeps the compile close to dev while cutting that several
+# fold; line tables keep backtraces readable.
+[profile.ci]
+inherits = "dev"
+opt-level = 1
+debug = "line-tables-only"
+
+# The web bundle: `wasm-opt` aborts on the DWARF 5 units a current rustc
+# emits ("compile unit size was incorrect"), so release strips debuginfo.
+[profile.release]
+strip = "debuginfo"

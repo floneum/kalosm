@@ -21,9 +21,10 @@ pub enum HybridSearchError {
     #[error("Keyword search failed: {0}")]
     KeywordSearchError(String),
 
-    /// Database operation failed
+    /// Database operation failed. Boxed: `surrealdb::Error` is over a
+    /// hundred bytes and would otherwise size every `Result` in this module.
     #[error("Database error: {0}")]
-    DatabaseError(#[from] surrealdb::Error),
+    DatabaseError(Box<surrealdb::Error>),
 
     /// Document table creation failed
     #[error("Document table creation failed: {0}")]
@@ -48,6 +49,12 @@ pub enum HybridSearchError {
     /// Context addition failed
     #[error("Context addition failed: {0}")]
     ContextError(String),
+}
+
+impl From<surrealdb::Error> for HybridSearchError {
+    fn from(error: surrealdb::Error) -> Self {
+        Self::DatabaseError(Box::new(error))
+    }
 }
 
 impl<E> From<DocumentTableSearchError<E>> for HybridSearchError

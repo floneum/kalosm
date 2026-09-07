@@ -99,11 +99,15 @@ cpu = [
     "kalosm-language?/cpu",
     "kalosm-llama?/cpu",
     "rbert?/cpu",
+    "kalosm-sound?/cpu",
+    "kalosm-vision?/cpu",
 ]
 gpu = [
     "kalosm-language?/gpu",
     "kalosm-llama?/gpu",
     "rbert?/gpu",
+    "kalosm-sound?/gpu",
+    "kalosm-vision?/gpu",
 ]
 full = [
     "bert",

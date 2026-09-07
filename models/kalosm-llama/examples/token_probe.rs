@@ -1,7 +1,7 @@
 #![recursion_limit = "256"]
 
-use fusor::Device;
 use kalosm_llama::prelude::*;
+use kalosm_llama::Device;
 use kalosm_model_types::ModelLoadingProgress;
 use std::time::Instant;
 

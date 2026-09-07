@@ -1,0 +1,21 @@
+name: Configure lavapipe
+description: Point wgpu at Mesa's software Vulkan driver for GPU tests on a GPU-less runner.
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+        icd_dir=/usr/share/vulkan/icd.d
+        lvp_icd="$(find "$icd_dir" -maxdepth 1 -name 'lvp_icd*.json' -print -quit)"
+        if [[ -z "$lvp_icd" ]]; then
+          echo "Lavapipe ICD not found in $icd_dir" >&2
+          ls -la "$icd_dir" >&2 || true
+          exit 1
+        fi
+        echo "Using lavapipe ICD: $lvp_icd"
+        echo "VK_DRIVER_FILES=$lvp_icd" >> "$GITHUB_ENV"
+        echo "WGPU_BACKEND=vulkan" >> "$GITHUB_ENV"
+        echo "MESA_SHADER_CACHE_DISABLE=1" >> "$GITHUB_ENV"
+        echo "LIBGL_ALWAYS_SOFTWARE=1" >> "$GITHUB_ENV"
+        VK_DRIVER_FILES="$lvp_icd" WGPU_BACKEND=vulkan MESA_SHADER_CACHE_DISABLE=1 LIBGL_ALWAYS_SOFTWARE=1 vulkaninfo --summary

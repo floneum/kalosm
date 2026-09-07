@@ -5,7 +5,7 @@ on:
     branches:
       - main
     paths:
-      - fusor-ml/**
+      - fusor/**
       - .github/workflows/webgpu-runner.yml
       - .github/workflows/webgpu-runner-pages.yml
       - Cargo.toml
@@ -16,7 +16,7 @@ on:
     branches:
       - main
     paths:
-      - fusor-ml/**
+      - fusor/**
       - .github/workflows/webgpu-runner.yml
       - .github/workflows/webgpu-runner-pages.yml
       - Cargo.toml
@@ -33,8 +33,8 @@ jobs:
   build:
     uses: dioxuslabs/dioxus-ci/.github/workflows/web-build.yml@main
     with:
-      working-directory: fusor-ml/webgpu-runner
+      working-directory: fusor/webgpu-runner
       base-path: ${{ github.event.repository.name }}
       debug-symbols: false
-      dx-cli-version: 0.7.7
+      dx-cli-version: 0.7.10
       runs-on: ubuntu-24.04

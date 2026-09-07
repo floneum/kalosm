@@ -1,5 +1,4 @@
-use fusor::{Device, VarBuilder};
-use fusor::{Result, Tensor};
+use fusor::{Device, Result, Tensor, VarBuilder};
 
 use super::{BertSelfAttention, BertSelfOutput};
 
@@ -11,11 +10,7 @@ pub(crate) struct BertAttention {
 }
 
 impl BertAttention {
-    pub(crate) fn load(
-        device: &Device,
-        vb: &mut VarBuilder,
-        config: &super::Config,
-    ) -> Result<Self> {
+    pub(crate) fn load(device: &Device, vb: &VarBuilder, config: &super::Config) -> Result<Self> {
         let self_attention = BertSelfAttention::load(device, vb, config)?;
         let self_output = BertSelfOutput::load(device, vb, config)?;
         Ok(Self {
@@ -27,9 +22,9 @@ impl BertAttention {
 
     pub(crate) fn forward(
         &self,
-        hidden_states: &Tensor<3, f32>,
+        hidden_states: &Tensor<3>,
         attention_mask: Option<&Tensor<2, u32>>,
-    ) -> Tensor<3, f32> {
+    ) -> Tensor<3> {
         let _enter = self.span.enter();
         let self_outputs = self.self_attention.forward(hidden_states, attention_mask);
         self.self_output.forward(&self_outputs, hidden_states)

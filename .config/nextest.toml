@@ -1,0 +1,5 @@
+# A test that stalls is killed and named rather than holding the job for
+# GitHub's six-hour ceiling: warned after two minutes, terminated after four.
+[profile.default]
+slow-timeout = { period = "120s", terminate-after = 2 }
+fail-fast = false

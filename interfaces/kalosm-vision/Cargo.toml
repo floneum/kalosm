@@ -12,6 +12,11 @@ keywords = ["ai", "segment-anything"]
 image.workspace = true
 segment-anything-rs.workspace = true
 
+[features]
+default = ["cpu", "gpu"]
+cpu = ["segment-anything-rs/cpu"]
+gpu = ["segment-anything-rs/gpu"]
+
 [dev-dependencies]
 kalosm = { workspace = true, features = ["vision"], default-features = true }
 tokio = { version = "1", features = ["full"] }

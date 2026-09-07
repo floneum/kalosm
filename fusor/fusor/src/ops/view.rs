@@ -1,0 +1,449 @@
+//! The view ops. Every one is a vector of `StrideSpec`s over a single
+//! `Logical::Restride`. `sliding_window_view` is the one exception: it
+//! mints `Logical::Window`, because its adjoint is decided by two integers and
+//! injectivity of a relative stride composition is undecidable under `Sym`.
+
+use std::ops::Range;
+
+use fusor_ir::ir::logical::Logical;
+use fusor_ir::shape::{
+    BoundsProof, Dim, Dims, SlidingWindow, StrideSpec, SymId, reshape_specs, singleton_spec,
+};
+
+use crate::tensor::Tensor;
+use crate::{Error, Result};
+
+/// One entry of a [`Tensor::reshape`] target: a concrete extent or the single
+/// inferred hole.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum Extent {
+    /// A specified extent.
+    Dim(Dim),
+    /// Exactly one of these is permitted; its extent is the element count
+    /// divided by the product of the rest.
+    Hole,
+}
+
+impl From<Dim> for Extent {
+    fn from(d: Dim) -> Self {
+        Self::Dim(d)
+    }
+}
+impl From<usize> for Extent {
+    fn from(d: usize) -> Self {
+        Self::Dim(Dim::Const(d as u64))
+    }
+}
+impl From<u64> for Extent {
+    fn from(d: u64) -> Self {
+        Self::Dim(Dim::Const(d))
+    }
+}
+impl From<SymId> for Extent {
+    fn from(s: SymId) -> Self {
+        Self::Dim(Dim::Sym(s))
+    }
+}
+impl From<()> for Extent {
+    fn from(_: ()) -> Self {
+        Self::Hole
+    }
+}
+
+/// The [`BoundsProof`] a spec vector carries over `in_shape`.
+///
+/// This is [`fusor_autograd::tape::bounds_proof`] verbatim: the frontend and
+/// the adjoint transform must agree on what a view proves. `Static` exactly
+/// when every extent, offset and stride is `Const` **and** the composed reach
+/// stays inside the input's element count; anything else is a runtime mask
+/// obligation.
+///
+/// The reach is composed over the *whole* input, not per axis, so an
+/// axis-merging reshape (`[2,3] -> [6]` reads `dim_with(1, 6, 1)`, addressing
+/// six elements past a dim of extent three) is `Static`.
+pub(crate) fn bounds_for(specs: &[StrideSpec], in_shape: &[Dim]) -> BoundsProof {
+    fusor_autograd::tape::bounds_proof(specs, in_shape)
+}
+
+impl Tensor {
+    /// The one view primitive: a vector of relative [`StrideSpec`]s over a
+    /// single `Logical::Restride`. Every other view op in this file builds a spec
+    /// vector and calls this.
+    pub fn restride(&self, specs: &[StrideSpec]) -> Result<Tensor> {
+        let bounds = bounds_for(specs, &self.shape());
+        self.emit_here(Logical::Restride {
+            specs: specs.iter().copied().collect(),
+            bounds,
+            x: self.id,
+        })
+    }
+
+    /// Rank-changing reshape with at most one inferred [`Extent::Hole`].
+    ///
+    /// Refuses a target whose element count disagrees, and refuses to merge
+    /// axes across a symbolic extent (the merged size would not be a `Dim`).
+    /// Correctness relies on the value being contiguous over each merged group.
+    pub fn reshape(&self, shape: &[Extent]) -> Result<Tensor> {
+        let target = self.resolve_extents(shape)?;
+        let specs = reshape_specs(&self.shape(), &target)?;
+        self.restride(&specs)
+    }
+
+    /// Reshape to a fully specified shape.
+    pub fn reshape_dims(&self, shape: &[Dim]) -> Result<Tensor> {
+        let extents: Vec<Extent> = shape.iter().copied().map(Extent::Dim).collect();
+        self.reshape(&extents)
+    }
+
+    /// Resolve the single `Hole` in a reshape target.
+    fn resolve_extents(&self, shape: &[Extent]) -> Result<Dims> {
+        let holes = shape.iter().filter(|e| **e == Extent::Hole).count();
+        if holes > 1 {
+            return Err(Error::Shape(format!(
+                "reshape accepts at most one hole, got {holes}"
+            )));
+        }
+        if holes == 0 {
+            return Ok(shape
+                .iter()
+                .map(|e| match e {
+                    Extent::Dim(d) => *d,
+                    Extent::Hole => unreachable!(),
+                })
+                .collect());
+        }
+        let total = self.elem_count().ok_or_else(|| {
+            Error::Shape("cannot infer a reshape hole under a symbolic extent".into())
+        })?;
+        let mut known = 1u64;
+        for e in shape {
+            if let Extent::Dim(d) = e {
+                let v = d.as_const().ok_or_else(|| {
+                    Error::Shape("cannot infer a reshape hole beside a symbolic extent".into())
+                })?;
+                known = known.checked_mul(v).ok_or_else(|| {
+                    Error::Shape("reshape target overflows a u64 element count".into())
+                })?;
+            }
+        }
+        if known == 0 || total % known != 0 {
+            return Err(Error::Shape(format!(
+                "reshape hole does not divide: {total} elements over a known product of {known}"
+            )));
+        }
+        let hole = Dim::Const(total / known);
+        Ok(shape
+            .iter()
+            .map(|e| match e {
+                Extent::Dim(d) => *d,
+                Extent::Hole => hole,
+            })
+            .collect())
+    }
+
+    /// Swap two axes.
+    pub fn transpose(&self, d0: usize, d1: usize) -> Result<Tensor> {
+        self.check_axis(d0, "transpose")?;
+        self.check_axis(d1, "transpose")?;
+        let mut order: Vec<usize> = (0..self.rank()).collect();
+        order.swap(d0, d1);
+        self.permute(&order)
+    }
+
+    /// Swap the last two axes. Requires rank >= 2.
+    pub fn t(&self) -> Result<Tensor> {
+        if self.rank() < 2 {
+            return Err(Error::Shape(format!(
+                "t() needs rank >= 2, got rank {}",
+                self.rank()
+            )));
+        }
+        self.transpose(self.rank() - 2, self.rank() - 1)
+    }
+
+    /// Arbitrary axis permutation. `order` must be a true permutation of
+    /// `0..rank`.
+    pub fn permute(&self, order: &[usize]) -> Result<Tensor> {
+        let rank = self.rank();
+        if order.len() != rank {
+            return Err(Error::Shape(format!(
+                "permute needs {rank} axes, got {}",
+                order.len()
+            )));
+        }
+        let mut seen = vec![false; rank];
+        for &a in order {
+            if a >= rank {
+                return Err(Error::Shape(format!(
+                    "permute axis {a} out of range for rank {rank}"
+                )));
+            }
+            if std::mem::replace(&mut seen[a], true) {
+                return Err(Error::Shape(format!("permute axis {a} is repeated")));
+            }
+        }
+        let specs: Vec<StrideSpec> = order
+            .iter()
+            .map(|&a| StrideSpec::dim(a as u32, self.dim(a)))
+            .collect();
+        self.restride(&specs)
+    }
+
+    /// Rank-preserving sub-view, one range per axis.
+    pub fn slice(&self, ranges: &[Range<usize>]) -> Result<Tensor> {
+        if ranges.len() != self.rank() {
+            return Err(Error::Shape(format!(
+                "slice needs one range per axis: {} ranges for rank {}",
+                ranges.len(),
+                self.rank()
+            )));
+        }
+        let mut specs: Vec<StrideSpec> = Vec::with_capacity(ranges.len());
+        for (i, r) in ranges.iter().enumerate() {
+            if r.end < r.start {
+                return Err(Error::Shape(format!(
+                    "slice range {i} is inverted: {}..{}",
+                    r.start, r.end
+                )));
+            }
+            if let Some(extent) = self.dim(i).as_const()
+                && r.end as u64 > extent
+            {
+                return Err(Error::Shape(format!(
+                    "slice range {i} is {}..{} but axis {i} has extent {extent}",
+                    r.start, r.end
+                )));
+            }
+            specs.push(
+                StrideSpec::dim(i as u32, Dim::Const((r.end - r.start) as u64))
+                    .with_offset(Dim::Const(r.start as u64)),
+            );
+        }
+        self.restride(&specs)
+    }
+
+    /// Slice one axis. Unlike [`Tensor::slice`] this leaves every other axis —
+    /// including a symbolic one — untouched.
+    pub fn narrow(&self, dim: usize, start: usize, len: usize) -> Result<Tensor> {
+        self.check_axis(dim, "narrow")?;
+        if let Some(extent) = self.dim(dim).as_const()
+            && (start + len) as u64 > extent
+        {
+            return Err(Error::Shape(format!(
+                "narrow {start}..{} exceeds axis {dim} of extent {extent}",
+                start + len
+            )));
+        }
+        let specs: Vec<StrideSpec> = (0..self.rank())
+            .map(|i| {
+                if i == dim {
+                    StrideSpec::dim(i as u32, Dim::Const(len as u64))
+                        .with_offset(Dim::Const(start as u64))
+                } else {
+                    StrideSpec::dim(i as u32, self.dim(i))
+                }
+            })
+            .collect();
+        self.restride(&specs)
+    }
+
+    /// Split `dim` into `chunks` narrow views of `ceil(extent / chunks)`; the
+    /// last one may be shorter.
+    pub fn chunk(&self, chunks: usize, dim: usize) -> Result<Vec<Tensor>> {
+        self.check_axis(dim, "chunk")?;
+        if chunks == 0 {
+            return Err(Error::Shape("chunk count must be nonzero".into()));
+        }
+        let extent = self
+            .dim(dim)
+            .as_const()
+            .ok_or_else(|| Error::Shape("chunk needs a constant extent".into()))?
+            as usize;
+        let size = extent.div_ceil(chunks).max(1);
+        let mut out = Vec::new();
+        let mut start = 0usize;
+        while start < extent {
+            let len = size.min(extent - start);
+            out.push(self.narrow(dim, start, len)?);
+            start += len;
+        }
+        Ok(out)
+    }
+
+    /// Reshape to rank 1.
+    pub fn flatten_all(&self) -> Result<Tensor> {
+        let n = self
+            .elem_count()
+            .ok_or_else(|| Error::Shape("flatten_all needs a constant element count".into()))?;
+        self.reshape(&[Extent::Dim(Dim::Const(n))])
+    }
+
+    /// Collapse the last `from_end + 1` axes into one. `from_end == 0` is a
+    /// no-op reshape.
+    pub fn flatten_last_n(&self, from_end: usize) -> Result<Tensor> {
+        let rank = self.rank();
+        if from_end + 1 > rank {
+            return Err(Error::Shape(format!(
+                "flatten_last_n({from_end}) needs rank >= {}, got {rank}",
+                from_end + 1
+            )));
+        }
+        let keep = rank - from_end - 1;
+        let shape = self.shape();
+        let merged = shape[keep..]
+            .iter()
+            .try_fold(1u64, |acc, d| acc.checked_mul(d.as_const()?))
+            .ok_or_else(|| Error::Shape("cannot flatten across a symbolic extent".into()))?;
+        let mut target: Vec<Extent> = shape[..keep].iter().copied().map(Extent::Dim).collect();
+        target.push(Extent::Dim(Dim::Const(merged)));
+        self.reshape(&target)
+    }
+
+    /// Collapse the first `from_start + 1` axes into one.
+    pub fn flatten_first_n(&self, from_start: usize) -> Result<Tensor> {
+        let rank = self.rank();
+        if from_start + 1 > rank {
+            return Err(Error::Shape(format!(
+                "flatten_first_n({from_start}) needs rank >= {}, got {rank}",
+                from_start + 1
+            )));
+        }
+        let take = from_start + 1;
+        let shape = self.shape();
+        let merged = shape[..take]
+            .iter()
+            .try_fold(1u64, |acc, d| acc.checked_mul(d.as_const()?))
+            .ok_or_else(|| Error::Shape("cannot flatten across a symbolic extent".into()))?;
+        let mut target: Vec<Extent> = vec![Extent::Dim(Dim::Const(merged))];
+        target.extend(shape[take..].iter().copied().map(Extent::Dim));
+        self.reshape(&target)
+    }
+
+    /// Collapse axes `from..=to` into one.
+    pub fn flatten(&self, from: usize, to: usize) -> Result<Tensor> {
+        if from > to {
+            return Err(Error::Shape(format!(
+                "flatten range {from}..={to} is empty"
+            )));
+        }
+        self.check_axis(to, "flatten")?;
+        let shape = self.shape();
+        let merged = shape[from..=to]
+            .iter()
+            .try_fold(1u64, |acc, d| acc.checked_mul(d.as_const()?))
+            .ok_or_else(|| Error::Shape("cannot flatten across a symbolic extent".into()))?;
+        let mut target: Vec<Extent> = shape[..from].iter().copied().map(Extent::Dim).collect();
+        target.push(Extent::Dim(Dim::Const(merged)));
+        target.extend(shape[to + 1..].iter().copied().map(Extent::Dim));
+        self.reshape(&target)
+    }
+
+    /// Remove one size-1 axis.
+    pub fn squeeze(&self, dim: usize) -> Result<Tensor> {
+        self.squeeze_dims(&[dim])
+    }
+
+    /// Remove several size-1 axes.
+    pub fn squeeze_dims(&self, axes: &[usize]) -> Result<Tensor> {
+        let rank = self.rank();
+        let mut drop = vec![false; rank];
+        for &a in axes {
+            self.check_axis(a, "squeeze")?;
+            if !self.dim(a).known_eq(Dim::Const(1)) {
+                return Err(Error::Shape(format!(
+                    "squeeze axis {a} has extent {} , not 1",
+                    self.dim(a)
+                )));
+            }
+            drop[a] = true;
+        }
+        let specs: Vec<StrideSpec> = (0..rank)
+            .filter(|i| !drop[*i])
+            .map(|i| StrideSpec::dim(i as u32, self.dim(i)))
+            .collect();
+        self.restride(&specs)
+    }
+
+    /// Insert one size-1 axis at `dim` of the *output*.
+    pub fn unsqueeze(&self, dim: usize) -> Result<Tensor> {
+        self.unsqueeze_dims(&[dim])
+    }
+
+    /// Insert several size-1 axes, at the given positions of the output.
+    ///
+    /// The inserted axis is an ordinary size-1 axis (`multiplier == 1`), not
+    /// a stride-0 broadcast axis; the restride adjoint reduces a stride-0
+    /// axis on the way back but not a size-1 axis.
+    pub fn unsqueeze_dims(&self, axes: &[usize]) -> Result<Tensor> {
+        let in_rank = self.rank();
+        let out_rank = in_rank + axes.len();
+        let mut insert = vec![false; out_rank];
+        for &a in axes {
+            if a >= out_rank {
+                return Err(Error::Shape(format!(
+                    "unsqueeze axis {a} out of range for output rank {out_rank}"
+                )));
+            }
+            if std::mem::replace(&mut insert[a], true) {
+                return Err(Error::Shape(format!("unsqueeze axis {a} is repeated")));
+            }
+        }
+        let mut specs: Vec<StrideSpec> = Vec::with_capacity(out_rank);
+        let mut src = 0usize;
+        for slot in insert.iter().take(out_rank) {
+            if *slot {
+                specs.push(singleton_spec(in_rank, src));
+            } else {
+                specs.push(StrideSpec::dim(src as u32, self.dim(src)));
+                src += 1;
+            }
+        }
+        self.restride(&specs)
+    }
+
+    /// Zero-copy overlapping windows: one `Logical::Window`.
+    ///
+    /// Each windowed axis `i` becomes `(extent - window) / step + 1`
+    /// positions, and one new trailing axis of size `window` per spec.
+    pub fn sliding_window_view(&self, specs: &[SlidingWindow]) -> Result<Tensor> {
+        let mut seen: Vec<u32> = Vec::with_capacity(specs.len());
+        for w in specs {
+            if w.axis as usize >= self.rank() {
+                return Err(Error::Shape(format!(
+                    "window axis {} out of range for rank {}",
+                    w.axis,
+                    self.rank()
+                )));
+            }
+            if seen.contains(&w.axis) {
+                return Err(Error::Shape(format!(
+                    "window axis {} appears twice",
+                    w.axis
+                )));
+            }
+            seen.push(w.axis);
+            if w.step == 0 || w.window == 0 {
+                return Err(Error::Shape(
+                    "window size and step must both be nonzero".into(),
+                ));
+            }
+            if let Some(extent) = self.dim(w.axis as usize).as_const()
+                && (w.window as u64) > extent
+            {
+                return Err(Error::Shape(format!(
+                    "window {} does not fit axis {} of extent {extent}",
+                    w.window, w.axis
+                )));
+            }
+        }
+        self.emit_here(Logical::Window {
+            specs: specs.iter().copied().collect(),
+            x: self.id,
+        })
+    }
+
+    /// One windowed axis, the common case.
+    pub fn windows(&self, axis: u32, window: u32, step: u32) -> Result<Tensor> {
+        self.sliding_window_view(&[SlidingWindow::new(axis, window, step)])
+    }
+}

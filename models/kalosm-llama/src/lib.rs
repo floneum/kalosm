@@ -25,6 +25,10 @@
 //! ```
 
 #![warn(missing_docs)]
+#![recursion_limit = "256"]
+
+#[cfg(not(any(feature = "cpu", feature = "gpu")))]
+compile_error!("kalosm-llama: enable at least one backend feature, `cpu` or `gpu`");
 
 mod chat;
 mod chat_template;
@@ -43,15 +47,25 @@ mod tokenizer;
 pub use crate::chat::LlamaChatSession;
 use crate::model::LlamaModel;
 pub use crate::session::LlamaSession;
-use fusor::{
-    AddOp, CastTo, FloatOps, MatmulImpl, MulOp, SimdBinaryOp, SimdReduceOp, SumOp, WasmNotSend,
-    WasmNotSync,
-};
 use futures_util::FutureExt;
 use kalosm_language_model::{TextCompletionBuilder, TextCompletionModelExt};
 pub use kalosm_model_types::FileSource;
 use kalosm_model_types::FutureWasmNotSend;
 use kalosm_model_types::ModelLoadingProgress;
+use kalosm_model_types::WasmNotSend;
+
+/// `Sync` on native targets, nothing on wasm — the marker the former facade
+/// exported under this name.
+#[cfg(not(target_arch = "wasm32"))]
+#[doc(hidden)]
+pub trait WasmNotSync: Sync {}
+#[cfg(not(target_arch = "wasm32"))]
+impl<T: Sync> WasmNotSync for T {}
+#[cfg(target_arch = "wasm32")]
+#[doc(hidden)]
+pub trait WasmNotSync {}
+#[cfg(target_arch = "wasm32")]
+impl<T> WasmNotSync for T {}
 #[cfg(feature = "structured")]
 use kalosm_sample::{LiteralParser, StopOn};
 use model::LlamaModelError;
@@ -64,6 +78,7 @@ use std::sync::Mutex;
 use std::task::{Context, Poll};
 pub use tokenizer::{LlamaTokenizer, LlamaTokenizerError};
 
+/// An image in a prompt, with the token budget the caller hinted.
 #[cfg(feature = "vision")]
 pub(crate) type LlamaImage = (image::DynamicImage, kalosm_language_model::MediaHints);
 #[cfg(not(feature = "vision"))]
@@ -72,9 +87,8 @@ pub(crate) type LlamaImage = ();
 /// Re-export half::f16 for users who want to use f16 activation types
 pub use half::f16;
 
-/// Re-export fusor types needed for the activation type generic
-pub use fusor::Device;
-pub use fusor::{CastTensor, FloatDataType, SimdElement};
+/// Re-export the fusor device handle used to run the model.
+pub use fusor::device::Device;
 
 /// A prelude of commonly used items in kalosm-llama.
 pub mod prelude {
@@ -99,54 +113,50 @@ use std::future::Future;
 use std::pin::Pin;
 
 #[cfg(feature = "structured")]
-trait Runner<F: FloatDataType + SimdElement>:
-    for<'a> FnOnce(&'a LlamaModel<F>) -> Pin<Box<dyn FutureWasmNotSend<Output = ()> + 'a>> + WasmNotSend
+trait Runner:
+    for<'a> FnOnce(&'a LlamaModel) -> Pin<Box<dyn FutureWasmNotSend<Output = ()> + 'a>> + WasmNotSend
 {
 }
 #[cfg(feature = "structured")]
 impl<
-        F: FloatDataType + SimdElement,
-        T: for<'a> FnOnce(&'a LlamaModel<F>) -> Pin<Box<dyn FutureWasmNotSend<Output = ()> + 'a>>
+        T: for<'a> FnOnce(&'a LlamaModel) -> Pin<Box<dyn FutureWasmNotSend<Output = ()> + 'a>>
             + WasmNotSend,
-    > Runner<F> for T
+    > Runner for T
 {
 }
 #[cfg(feature = "structured")]
-type BoxedRunner<F> = Box<dyn Runner<F>>;
+type BoxedRunner = Box<dyn Runner>;
 
-enum Task<F: FloatDataType + SimdElement = f32> {
-    UnstructuredGeneration(UnstructuredGenerationTask<F>),
+enum Task {
+    UnstructuredGeneration(UnstructuredGenerationTask),
     #[cfg(feature = "structured")]
-    StructuredGeneration(StructuredGenerationTask<F>),
+    StructuredGeneration(StructuredGenerationTask),
 }
 
 #[allow(clippy::type_complexity)]
 #[cfg(feature = "structured")]
-struct StructuredGenerationTask<F: FloatDataType + SimdElement = f32> {
-    runner: BoxedRunner<F>,
+struct StructuredGenerationTask {
+    runner: BoxedRunner,
 }
 
-struct UnstructuredGenerationTask<F: FloatDataType + SimdElement = f32> {
-    settings: InferenceSettings<F>,
+struct UnstructuredGenerationTask {
+    settings: InferenceSettings,
     on_token: BoxedTokenCallback,
     finished: futures_channel::oneshot::Sender<Result<(), LlamaModelError>>,
 }
 
-struct LlamaTask<F: FloatDataType + SimdElement = f32> {
-    sender: futures_channel::mpsc::UnboundedSender<Task<F>>,
+struct LlamaTask {
+    sender: futures_channel::mpsc::UnboundedSender<Task>,
     task: Mutex<Pin<Box<dyn FutureWasmNotSend<Output = ()> + 'static>>>,
 }
 
 /// A future that polls the background Llama task when awaited.
-pub(crate) struct LlamaResultFuture<F: FloatDataType + SimdElement, T> {
-    llama: Llama<F>,
+pub(crate) struct LlamaResultFuture<T> {
+    llama: Llama,
     receiver: futures_channel::oneshot::Receiver<T>,
 }
 
-impl<F, T> Future for LlamaResultFuture<F, T>
-where
-    F: FloatDataType + SimdElement,
-{
+impl<T> Future for LlamaResultFuture<T> {
     type Output = Result<T, futures_channel::oneshot::Canceled>;
 
     fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
@@ -164,13 +174,13 @@ where
 }
 
 /// A quantized Llama language model with support for streaming generation.
-pub struct Llama<F: FloatDataType + SimdElement = f32> {
-    config: Arc<LlamaConfig<F>>,
+pub struct Llama {
+    config: Arc<LlamaConfig>,
     tokenizer: Arc<LlamaTokenizer>,
-    inner: Arc<LlamaTask<F>>,
+    inner: Arc<LlamaTask>,
 }
 
-impl<F: FloatDataType + SimdElement> Clone for Llama<F> {
+impl Clone for Llama {
     fn clone(&self) -> Self {
         Self {
             config: self.config.clone(),
@@ -209,32 +219,14 @@ impl Llama {
     pub fn builder() -> LlamaBuilder {
         LlamaBuilder::default()
     }
-}
 
-impl<F> Llama<F>
-where
-    F: FloatDataType
-        + SimdElement
-        + Default
-        + CastTo<f32>
-        + CastTensor<f32>
-        + WasmNotSend
-        + WasmNotSync
-        + FloatOps
-        + MatmulImpl
-        + 'static,
-    f32: CastTo<F> + CastTensor<F>,
-    MulOp: SimdBinaryOp<F>,
-    AddOp: SimdBinaryOp<F>,
-    SumOp: SimdReduceOp<F>,
-{
     /// Get the tokenizer for the model.
     pub fn tokenizer(&self) -> &Arc<LlamaTokenizer> {
         &self.tokenizer
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn from_build(mut model: LlamaModel<F>) -> Self {
+    fn from_build(mut model: LlamaModel) -> Self {
         use futures_util::StreamExt;
 
         let (task_sender, mut task_receiver) = futures_channel::mpsc::unbounded();
@@ -291,23 +283,7 @@ where
     }
 }
 
-impl<F> Deref for Llama<F>
-where
-    F: FloatDataType
-        + SimdElement
-        + Default
-        + CastTo<f32>
-        + CastTensor<f32>
-        + WasmNotSend
-        + WasmNotSync
-        + FloatOps
-        + MatmulImpl
-        + 'static,
-    f32: CastTo<F> + CastTensor<F>,
-    MulOp: SimdBinaryOp<F>,
-    AddOp: SimdBinaryOp<F>,
-    SumOp: SimdReduceOp<F>,
-{
+impl Deref for Llama {
     type Target = dyn Fn(&str) -> TextCompletionBuilder<Self>;
 
     fn deref(&self) -> &Self::Target {
@@ -347,25 +323,13 @@ where
 }
 
 /// A builder with configuration for a Llama model.
-pub struct LlamaBuilder<F: FloatDataType + SimdElement = f32> {
+#[derive(Default)]
+pub struct LlamaBuilder {
     source: source::LlamaSource,
     device: Option<Device>,
-    flash_attn: bool,
-    _marker: std::marker::PhantomData<F>,
 }
 
-impl<F: FloatDataType + SimdElement> Default for LlamaBuilder<F> {
-    fn default() -> Self {
-        Self {
-            source: Default::default(),
-            device: None,
-            flash_attn: false,
-            _marker: std::marker::PhantomData,
-        }
-    }
-}
-
-impl<F: FloatDataType + SimdElement> LlamaBuilder<F> {
+impl LlamaBuilder {
     /// Create a new Llama builder with default settings.
     pub fn new() -> Self {
         Self::default()
@@ -377,12 +341,6 @@ impl<F: FloatDataType + SimdElement> LlamaBuilder<F> {
         self
     }
 
-    /// Set whether to use Flash Attention.
-    pub fn with_flash_attn(mut self, use_flash_attn: bool) -> Self {
-        self.flash_attn = use_flash_attn;
-        self
-    }
-
     /// Set the device to run the model with. (Defaults to an accelerator if available, otherwise the CPU)
     pub fn with_device(mut self, device: Device) -> Self {
         self.device = Some(device);
@@ -391,66 +349,46 @@ impl<F: FloatDataType + SimdElement> LlamaBuilder<F> {
 
     /// Get the device or the default device if not set.
     pub(crate) async fn get_device(&self) -> Device {
-        match self.device.clone() {
-            Some(device) => device,
-            None => Device::auto().await,
+        if let Some(device) = self.device.clone() {
+            return device;
+        }
+        #[cfg(all(feature = "gpu", feature = "cpu"))]
+        {
+            Device::gpu().await.unwrap_or_else(|err| {
+                tracing::warn!("no gpu adapter, falling back to cpu: {err}");
+                Device::cpu()
+            })
+        }
+        #[cfg(all(feature = "gpu", not(feature = "cpu")))]
+        {
+            Device::gpu()
+                .await
+                .unwrap_or_else(|err| panic!("no gpu adapter, and the `cpu` feature is off: {err}"))
+        }
+        #[cfg(not(feature = "gpu"))]
+        {
+            Device::cpu()
         }
     }
-}
 
-impl<F: FloatDataType + SimdElement + Default + FloatOps + MatmulImpl> LlamaBuilder<F>
-where
-    F: CastTo<f32> + CastTensor<f32> + WasmNotSend + WasmNotSync + 'static,
-    f32: CastTo<F> + CastTensor<F>,
-    MulOp: SimdBinaryOp<F>,
-    AddOp: SimdBinaryOp<F>,
-    SumOp: SimdReduceOp<F>,
-{
     /// Build the model with a handler for progress as the download and loading progresses.
-    ///
-    /// ```rust, no_run
-    /// use kalosm_llama::prelude::*;
-    /// use kalosm_model_types::ModelLoadingProgress;
-    /// # #[tokio::main]
-    /// # async fn main() -> Result<(), anyhow::Error> {
-    /// // Create a new llama model with a loading handler
-    /// let model = Llama::builder()
-    ///     .build_with_loading_handler(|progress| match progress {
-    ///         ModelLoadingProgress::Downloading { source, progress } => {
-    ///             let progress_percent = (progress.progress * 100) as u32;
-    ///             let elapsed = progress
-    ///                 .start_time
-    ///                 .expect("start time is available on native targets")
-    ///                 .elapsed()
-    ///                 .as_secs_f32();
-    ///             println!("Downloading file {source} {progress_percent}% ({elapsed}s)");
-    ///         }
-    ///         ModelLoadingProgress::Loading { progress } => {
-    ///             let progress = (progress * 100.0) as u32;
-    ///             println!("Loading model {progress}%");
-    ///         }
-    ///     })
-    ///     .await?;
-    /// # Ok(())
-    /// # }
-    /// ```
     pub async fn build_with_loading_handler(
         self,
         handler: impl FnMut(ModelLoadingProgress) + WasmNotSend + WasmNotSync + 'static,
-    ) -> Result<Llama<F>, LlamaSourceError> {
+    ) -> Result<Llama, LlamaSourceError> {
         let model = LlamaModel::from_builder(self, handler).await?;
 
         Ok(Llama::from_build(model))
     }
 
     /// Build the model (this will download the model if it is not already downloaded)
-    pub async fn build(self) -> Result<Llama<F>, LlamaSourceError> {
+    pub async fn build(self) -> Result<Llama, LlamaSourceError> {
         self.build_with_loading_handler(ModelLoadingProgress::multi_bar_loading_indicator())
             .await
     }
 }
 
-pub(crate) struct InferenceSettings<F: FloatDataType + SimdElement = f32> {
+pub(crate) struct InferenceSettings {
     /// The prompt to use.
     pub(crate) prompt: String,
 
@@ -464,7 +402,7 @@ pub(crate) struct InferenceSettings<F: FloatDataType + SimdElement = f32> {
     pub(crate) sampler: GpuSamplerConfig,
 
     /// The session to use.
-    pub(crate) session: LlamaSession<F>,
+    pub(crate) session: LlamaSession,
 
     /// The maximum number of tokens to generate.
     pub(crate) max_tokens: u32,

@@ -1,0 +1,48 @@
+[package]
+name = "fusor"
+description = "fusor user-facing facade: const-rank tensors, layers, sessions, and optimizers"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+web-time.workspace = true
+fusor-ir.workspace = true
+fusor-tile.workspace = true
+fusor-autograd.workspace = true
+fusor-cost.workspace = true
+fusor-gguf.workspace = true
+fusor-gpu = { workspace = true, optional = true }
+fusor-cpu = { workspace = true, optional = true }
+smallvec.workspace = true
+rustc-hash.workspace = true
+half.workspace = true
+bytemuck.workspace = true
+parking_lot.workspace = true
+
+[features]
+default = ["cpu", "gpu"]
+# Each backend is its own crate; a facade built without one never links it.
+# At least one must be on.
+cpu = ["dep:fusor-cpu"]
+gpu = ["dep:fusor-gpu"]
+
+[[example]]
+name = "coop_attn_repro"
+required-features = ["gpu"]
+
+[[example]]
+name = "qgemv_bench"
+required-features = ["gpu"]
+
+[[example]]
+name = "sym_decode_spike"
+required-features = ["gpu"]
+
+# Blocking on a GPU future is a native-only convenience: on the web the
+# device is driven by the browser's event loop, so everything is awaited.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster.workspace = true

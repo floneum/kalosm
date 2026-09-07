@@ -9,8 +9,8 @@ authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["llm", "llama", "mistral", "agents", "nlp"]
 
 [dependencies]
-fusor = { workspace = true, default-features = false }
-fusor-gguf = { workspace = true }
+fusor = { path = "../../fusor/fusor", default-features = false }
+fusor-gguf = { path = "../../fusor/fusor-gguf" }
 kalosm-tokenizer.workspace = true
 
 half = { version = "2.3.1" }
@@ -48,7 +48,7 @@ pretty_assertions = "1.4.1"
 kalosm = { workspace = true, features = [
     "language",
     "structured",
-], default-features = true }
+], default-features = false }
 anyhow.workspace = true
 kalosm-streams.workspace = true
 reqwest = { version = "0.12" }
@@ -67,3 +67,19 @@ hf-tokenizer-json = ["dep:tokenizers"]
 [[example]]
 name = "structured"
 required-features = ["structured"]
+
+[[example]]
+name = "infer"
+required-features = ["cpu"]
+
+[[example]]
+name = "infer_local"
+required-features = ["gpu"]
+
+[[example]]
+name = "span_probe"
+required-features = ["gpu"]
+
+[[example]]
+name = "token_probe"
+required-features = ["gpu"]

@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use kalosm_llama::prelude::*;
 use kalosm_model_types::ModelLoadingProgress;
 
@@ -25,6 +27,16 @@ where
     println!(
         "llama_forward_profile tokens={tokens} elapsed={elapsed:?} per_token_ms={per_token_ms:.3}"
     );
+    if tokens >= measured {
+        if let Ok(max_ms) = std::env::var("KALOSM_PROFILE_LLAMA_MAX_MS") {
+            if let Ok(max_ms) = max_ms.parse::<f64>() {
+                assert!(
+                    per_token_ms <= max_ms,
+                    "decode regression: {per_token_ms:.3} ms/token exceeds {max_ms:.3} ms/token"
+                );
+            }
+        }
+    }
 }
 
 fn env_usize(name: &str, default: usize) -> usize {

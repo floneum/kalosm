@@ -1,3 +1,5 @@
+#![recursion_limit = "256"]
+
 use kalosm_llama::*;
 use kalosm_model_types::ModelLoadingProgress;
 use prelude::{StreamExt, TextCompletionModelExt};

@@ -11,8 +11,8 @@ keywords = ["ai", "whisper", "transcription"]
 [dependencies]
 cpal = "0.15.1"
 rand.workspace = true
-fusor = { workspace = true, default-features = false }
-fusor-gguf.workspace = true
+fusor = { path = "../../fusor/fusor", default-features = false }
+fusor-gguf = { path = "../../fusor/fusor-gguf" }
 byteorder = "1.4.3"
 tokenizers = { workspace = true, features = ["fancy-regex"] }
 serde_json = "1.0.107"

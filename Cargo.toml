@@ -30,21 +30,14 @@ members = [
     "interfaces/kalosm-parse-macro",
     "interfaces/kalosm-common",
     "interfaces/kalosm-model-types",
-    "fusor-ml/core",
-    "fusor-ml/gguf",
-    "fusor-ml/cli",
-    "fusor-ml/cpu",
-    "fusor-ml/conformance",
-    "fusor-ml/fusor",
-    "fusor-ml/types",
-    "fusor-ml/tile-ir",
-    "fusor-ml/tile-ir-kernels",
-    "fusor-ml/tile-ir-runtime",
-    "fusor-ml/webgpu-runner",
 ]
+# `fusor` is a standalone crate with its own `[workspace]`; keep the parent
+# workspace from trying to absorb it.
+exclude = ["fusor"]
 
-[patch.crates-io]
-wgpu = { git = "https://github.com/ealmloff/wgpu", branch = "yield-now" }
+# The repository root repeats Fusor's vendored naga patch below because model
+# crates are built from this workspace and Cargo applies patches at the build
+# root, not at a path dependency's workspace root.
 
 [workspace.dependencies]
 kalosm = { path = "./interfaces/kalosm", version = "0.4.0", default-features = false }
@@ -61,20 +54,12 @@ rbert = { path = "./models/rbert", version = "0.4.0", default-features = false }
 kalosm-llama = { path = "./models/kalosm-llama", version = "0.4.0", default-features = false }
 kalosm-tokenizer = { path = "./models/kalosm-tokenizer", version = "0.4.0" }
 rwhisper = { path = "./models/rwhisper", version = "0.4.0", default-features = false }
-segment-anything-rs = { path = "./models/segment-anything-rs", version = "0.5.0" }
-fusor = { path = "./fusor-ml/fusor", version = "0.1.0", default-features = false }
-fusor-core = { path = "./fusor-ml/core", version = "0.1.0" }
-fusor-gguf = { path = "./fusor-ml/gguf", version = "0.1.0" }
-fusor-tile-ir = { path = "./fusor-ml/tile-ir", version = "0.1.0" }
-fusor-tile-ir-kernels = { path = "./fusor-ml/tile-ir-kernels", version = "0.1.0" }
-fusor-tile-ir-runtime = { path = "./fusor-ml/tile-ir-runtime", version = "0.1.0" }
-fusor-types = { path = "./fusor-ml/types", version = "0.1.0" }
+segment-anything-rs = { path = "./models/segment-anything-rs", version = "0.5.0", default-features = false }
 tokenizers = { version = "0.21.0", default-features = false }
 thiserror = "2.0.7"
 anyhow = "1.0.94"
 image = "0.25"
 rand = "0.9"
-criterion = { version = "0.8", features = ["async_futures"] }
 futures-util = { version = "0.3.31", default-features = false, features = ["std"] }
 futures-channel = { version = "0.3.31", default-features = false, features = ["std"] }
 web-time = "1.1.0"
@@ -390,3 +375,16 @@ codegen-units = 1
 
 [profile.dev.package."*"]
 opt-level = 3
+
+# CI builds: dev semantics without full debuginfo. Debuginfo is a large share
+# of a cold compile and of link time, and a CI failure only needs the line
+# tables a backtrace reads.
+[profile.ci]
+inherits = "dev"
+debug = "line-tables-only"
+
+# Fusor's kernels use Naga from the ealmloff/wgpu fork, including the
+# `CooperativeLoad` correctness fix in `bake_ref_count`. Patch tables only apply
+# from the build root, so the same revision is named in Fusor's own workspace.
+[patch.crates-io]
+naga = { git = "https://github.com/ealmloff/wgpu", rev = "c4f55cabaadc22b942c1dd8894bf85f17f2718dc" }

@@ -1,0 +1,19 @@
+[package]
+name = "fusor-cost"
+description = "fusor picosecond roofline and the one extraction"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+web-time.workspace = true
+fusor-ir.workspace = true
+smallvec.workspace = true
+rustc-hash.workspace = true
+fixedbitset.workspace = true
+parking_lot.workspace = true
+serde.workspace = true
+serde_json.workspace = true

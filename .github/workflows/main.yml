@@ -14,10 +14,7 @@ on:
       - floneum/*/src/**
       - floneum/*/examples/**
       - floneum/*/Cargo.toml
-      - fusor-ml/*/src/**
-      - fusor-ml/*/tests/**
-      - fusor-ml/*/examples/**
-      - fusor-ml/*/Cargo.toml
+      - fusor/**
       - src/**
       - .github/**
       - Cargo.toml
@@ -37,10 +34,7 @@ on:
       - floneum/*/src/**
       - floneum/*/examples/**
       - floneum/*/Cargo.toml
-      - fusor-ml/*/src/**
-      - fusor-ml/*/tests/**
-      - fusor-ml/*/examples/**
-      - fusor-ml/*/Cargo.toml
+      - fusor/**
       - src/**
       - .github/**
       - Cargo.toml
@@ -50,133 +44,187 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# Shape: one `build` job per platform compiles everything once — it is the
+# only job that saves the `linux-build` cache slot, and it archives every
+# test binary with `cargo nextest archive`. Every other job on the platform
+# `needs` it and either restores that slot (doc: it links the same .rlibs)
+# or just downloads an artifact (tests, conformance shards: no toolchain, no
+# compile). Clippy runs check-mode, whose artifacts are different, so it
+# keeps its own slot.
+#
 # `CARGO_INCREMENTAL=0` keeps the cache lean — `Swatinem/rust-cache` wipes
-# incremental artifacts before saving, so building them just to throw them
-# away wastes wall time. Backtraces on test failures help diagnose CI-only
-# flakes without re-runs.
+# incremental artifacts before saving. One feature set for every build job:
+# each distinct set is a separate full compile and a separate cache slot.
 env:
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  FEATURES: kalosm/language,kalosm/llama,kalosm/bert,kalosm/structured,kalosm/fs-documents,kalosm/sound,kalosm/sound-denoise,kalosm/sound-source,kalosm/sound-voice-detection,kalosm/vision,kalosm/remote,kalosm/scrape,kalosm/surrealdb-local
 
 jobs:
-  check:
+  build:
     if: github.event.pull_request.draft == false
-    name: Check
+    name: Build
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       # Checkout MUST come before `Swatinem/rust-cache` so the cache key
-      # hashes the real `Cargo.lock`. Without it every job gets the same
-      # toolchain-only key and clobbers the previous job's cache.
+      # hashes the real lock files.
       - uses: actions/checkout@v6
+      - name: Free disk space
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet /opt/ghc
+          docker system prune -af || true
+          df -h
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
-          # Cache is split by compile mode. `cargo check` / `clippy` only
-          # emit metadata (.rmeta); `cargo test` / `test --doc` need
-          # codegen (.rlib). They must NOT share a slot: the fast check
-          # job always wins the per-key save race and stores a
-          # metadata-only cache, so the test/doc jobs restore a "full
-          # match" that contains none of the .rlib artifacts they need
-          # and rebuild every dependency from scratch (~700 crates, 30
-          # min). Keep the check-mode jobs (`check`, `clippy`) on their
-          # own key. `cache-all-crates` includes registry sources
-          # (~hundreds of MB) but means dep-only churn doesn't blow the
-          # entire cache.
-          shared-key: "linux-check"
+          # Codegen-mode slot. Saved from PRs too, keyed on the lock files: a
+          # PR whose lock differs from main never restored anything before,
+          # and every job compiled ~800 crates cold. Both workspaces: the
+          # fusor workspace has its own target dir, and an unlisted
+          # workspace is never cached.
+          shared-key: "linux-build"
+          workspaces: |
+            . -> target
+            fusor -> target
+          cache-on-failure: "true"
           cache-all-crates: "true"
-          # Only push cache from main, so PR-only caches don't churn the
-          # 10GB-per-repo Actions cache budget.
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - name: Check workspace
-        run: cargo check --all --examples --tests --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape
+          cache-workspace-crates: "true"
+      - name: Build test archives and the conformance binary
+        run: |
+          # The whole workspace, so feature unification matches the doc job's
+          # and it reuses every rlib from this cache; the two model crates
+          # whose tests need downloads are skipped when the archive runs.
+          cargo nextest archive --cargo-profile ci --workspace --lib --bins --tests --examples \
+            --features $FEATURES --archive-file root-tests.tar.zst
+          cargo nextest archive --cargo-profile ci --manifest-path fusor/Cargo.toml --workspace \
+            --lib --bins --tests --examples --archive-file fusor-tests.tar.zst
+          cargo build --profile ci --manifest-path fusor/Cargo.toml -p fusor-conformance
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-tests
+          path: |
+            root-tests.tar.zst
+            fusor-tests.tar.zst
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fusor-conformance-linux
+          path: fusor/target/ci/fusor-conformance
+          retention-days: 1
 
   test:
-    if: github.event.pull_request.draft == false
+    needs: build
     name: Test Suite
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
-      - name: Free disk space
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          df -h
-          sudo rm -rf /opt/hostedtoolcache
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
-          docker system prune -af || true
-          df -h
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libwebkit2gtk-4.1-dev libgtk-3-dev libasound2-dev libayatana-appindicator3-dev libxdo-dev mesa-vulkan-drivers vulkan-tools
       - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@nextest
+      - uses: actions/download-artifact@v4
         with:
-          # Codegen-mode cache slot, separate from the check-mode jobs so
-          # the restored cache holds the .rlib artifacts `cargo test`
-          # needs. See the `check` job for why the modes can't share.
-          shared-key: "linux-build"
-          cache-all-crates: "true"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          name: linux-tests
       - name: Configure lavapipe
-        shell: bash
-        run: |
-          set -euo pipefail
-
-          icd_dir=/usr/share/vulkan/icd.d
-          if [[ ! -d "$icd_dir" ]]; then
-            echo "Vulkan ICD directory was not installed: $icd_dir" >&2
-            exit 1
-          fi
-
-          lvp_icd="$(find "$icd_dir" -maxdepth 1 -name 'lvp_icd*.json' -print -quit)"
-          if [[ -z "$lvp_icd" ]]; then
-            echo "Lavapipe ICD not found in $icd_dir" >&2
-            ls -la "$icd_dir" >&2
-            exit 1
-          fi
-
-          echo "Using lavapipe ICD: $lvp_icd"
-          echo "VK_DRIVER_FILES=$lvp_icd" >> "$GITHUB_ENV"
-          echo "WGPU_BACKEND=vulkan" >> "$GITHUB_ENV"
-          echo "MESA_SHADER_CACHE_DISABLE=1" >> "$GITHUB_ENV"
-          echo "LIBGL_ALWAYS_SOFTWARE=1" >> "$GITHUB_ENV"
-
-          VK_DRIVER_FILES="$lvp_icd" WGPU_BACKEND=vulkan MESA_SHADER_CACHE_DISABLE=1 LIBGL_ALWAYS_SOFTWARE=1 vulkaninfo --summary
+        uses: ./.github/actions/lavapipe
       - name: Run tests
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FUSOR_CONFORMANCE_REQUIRE_GPU: "1"
-        run: cargo test --lib --bins --tests --examples --workspace --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape --exclude fusor-core --exclude rbert --exclude rwhisper
+        run: |
+          # rbert and rwhisper need model downloads; so does kalosm's
+          # hybrid-search integration test (a BERT chunker from HuggingFace).
+          cargo nextest run --archive-file root-tests.tar.zst --workspace-remap . --extract-to . \
+            -E 'not (package(rbert) | package(rwhisper) | binary(hybrid_test))'
+          cargo nextest run --archive-file fusor-tests.tar.zst --workspace-remap fusor --extract-to fusor
 
-  doc:
-    if: github.event.pull_request.draft == false
-    name: Docs
+  # Shards balanced from measured per-suite times. A filter ending in `::`
+  # matches one suite exactly (the harness matches by substring), and
+  # `--shard=I/N` splits one suite's cases round-robin over N runners.
+  conformance:
+    needs: build
+    name: Conformance (${{ matrix.shard.name }})
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - { name: core, suites: "smoke:: elementwise:: reductions:: multi_slot:: views:: indexing_scatter:: dtypes::", args: "" }
+          - { name: matmul, suites: "matmul:: conv_pool::", args: "" }
+          - { name: norm-layers, suites: "normalization:: layers::", args: "" }
+          - { name: attention-backward, suites: "attention_rope:: backward::", args: "" }
+          - { name: quantized, suites: "quantized::", args: "" }
+          - { name: sampling-0, suites: "sampling::", args: "--shard=0/8" }
+          - { name: sampling-1, suites: "sampling::", args: "--shard=1/8" }
+          - { name: sampling-2, suites: "sampling::", args: "--shard=2/8" }
+          - { name: sampling-3, suites: "sampling::", args: "--shard=3/8" }
+          - { name: sampling-4, suites: "sampling::", args: "--shard=4/8" }
+          - { name: sampling-5, suites: "sampling::", args: "--shard=5/8" }
+          - { name: sampling-6, suites: "sampling::", args: "--shard=6/8" }
+          - { name: sampling-7, suites: "sampling::", args: "--shard=7/8" }
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          sparse-checkout: .github
+      - name: Install lavapipe
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends mesa-vulkan-drivers vulkan-tools
+      - name: Configure lavapipe
+        uses: ./.github/actions/lavapipe
+      - uses: actions/download-artifact@v4
+        with:
+          name: fusor-conformance-linux
+          path: bin
+      - name: Run conformance shard
+        env:
+          FUSOR_CONFORMANCE_REQUIRE_GPU: "1"
+        run: |
+          chmod +x bin/fusor-conformance
+          for suite in ${{ matrix.shard.suites }}; do
+            bin/fusor-conformance "$suite" ${{ matrix.shard.args }}
+          done
+
+  # Doctests are edition-2021 here, so rustdoc compiles and links every one
+  # separately against the full dependency tree — about ten minutes serial
+  # for ~135 of them. Three runners: the two crates that hold most of them,
+  # and everything else.
+  doc:
+    needs: build
+    name: Docs (${{ matrix.shard.name }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - { name: language-model, args: "-p kalosm-language-model" }
+          - { name: kalosm, args: "-p kalosm" }
+          - { name: rest, args: "--workspace --exclude kalosm-language-model --exclude kalosm" }
     steps:
       - uses: actions/checkout@v6
       - name: Free disk space
         shell: bash
         run: |
           set -euo pipefail
-
-          df -h
-          sudo rm -rf /opt/hostedtoolcache
-          sudo rm -rf /usr/local/lib/android
-          sudo rm -rf /usr/share/dotnet
-          sudo rm -rf /opt/ghc
+          sudo rm -rf /opt/hostedtoolcache /usr/local/lib/android /usr/share/dotnet /opt/ghc
           docker system prune -af || true
           df -h
       - name: Install system dependencies
@@ -187,28 +235,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:
-          # Codegen-mode cache slot shared with `test` (both build
-          # .rlib artifacts), kept apart from the check-mode jobs.
+          # The slot `build` saved, same profile and feature set: doctests
+          # link those .rlibs, so only the doctests compile here.
           shared-key: "linux-build"
+          workspaces: |
+            . -> target
+            fusor -> target
           cache-all-crates: "true"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo test --doc --workspace --features kalosm/language,kalosm/llama,kalosm/bert,kalosm/structured,kalosm/fs-documents,kalosm/sound,kalosm/sound-denoise,kalosm/sound-source,kalosm/sound-voice-detection,kalosm/vision,kalosm/remote,kalosm/scrape,kalosm/surrealdb-local
+          cache-workspace-crates: "true"
+          save-if: "false"
+      - run: cargo test --profile ci --doc ${{ matrix.shard.args }} --features $FEATURES
+      - if: matrix.shard.name == 'rest'
+        run: cargo test --profile ci --manifest-path fusor/Cargo.toml --doc --workspace
 
-  fmt:
-    if: github.event.pull_request.draft == false
-    name: Rustfmt
-    runs-on: ubuntu-24.04
-    steps:
-      - uses: actions/checkout@v6
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: rustfmt
-      - run: cargo fmt --all -- --check
-
+  # Clippy is `cargo check` plus lints over the same targets, so there is no
+  # separate check job.
   clippy:
     if: github.event.pull_request.draft == false
     name: Clippy
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@v6
       - name: Install system dependencies
@@ -221,8 +267,29 @@ jobs:
           components: clippy
       - uses: Swatinem/rust-cache@v2
         with:
-          # Check-mode cache slot shared with `check` (metadata only).
+          # Check-mode slot (metadata only), apart from the codegen slot: a
+          # metadata-only cache holds none of the .rlibs the build needs.
           shared-key: "linux-check"
+          workspaces: |
+            . -> target
+            fusor -> target
+          cache-on-failure: "true"
           cache-all-crates: "true"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo clippy --workspace --examples --tests --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape -- -D warnings
+          cache-workspace-crates: "true"
+      - run: |
+          cargo clippy --workspace --examples --tests --features $FEATURES -- -D warnings
+          cargo clippy --manifest-path fusor/Cargo.toml --workspace --all-targets -- -D warnings
+
+  fmt:
+    if: github.event.pull_request.draft == false
+    name: Rustfmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: |
+          cargo fmt --all -- --check
+          cargo fmt --manifest-path fusor/Cargo.toml --all -- --check

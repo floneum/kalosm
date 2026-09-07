@@ -14,10 +14,7 @@ on:
       - floneum/*/src/**
       - floneum/*/examples/**
       - floneum/*/Cargo.toml
-      - fusor-ml/*/src/**
-      - fusor-ml/*/tests/**
-      - fusor-ml/*/examples/**
-      - fusor-ml/*/Cargo.toml
+      - fusor/**
       - src/**
       - .github/**
       - Cargo.toml
@@ -37,43 +34,119 @@ on:
       - floneum/*/src/**
       - floneum/*/examples/**
       - floneum/*/Cargo.toml
-      - fusor-ml/*/src/**
-      - fusor-ml/*/tests/**
-      - fusor-ml/*/examples/**
-      - fusor-ml/*/Cargo.toml
+      - fusor/**
       - src/**
       - .github/**
       - Cargo.toml
       - Cargo.lock
-
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# Shape: `build` compiles everything once and is the only saver of the
+# `macos-stable` cache slot; the test run and the five conformance shards
+# `need` it and only download what it archived.
 env:
   CARGO_INCREMENTAL: 0
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  FEATURES: kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape
 
 jobs:
-  test:
+  build:
     if: github.event.pull_request.draft == false
-    name: Mac Test Suite
+    name: Mac (build)
     runs-on: macos-latest
+    timeout-minutes: 45
     steps:
-      # Checkout before rust-cache so the cache key hashes Cargo.lock
+      # Checkout before rust-cache so the cache key hashes the lock files
       # instead of just the toolchain.
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
       - uses: Swatinem/rust-cache@v2
         with:
           shared-key: "macos-stable"
+          workspaces: |
+            . -> target
+            fusor -> target
+          cache-on-failure: "true"
           cache-all-crates: "true"
-          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: "true"
+      - name: Build test archives and the conformance binary
+        run: |
+          cargo nextest archive --cargo-profile ci --workspace --lib --bins --tests \
+            --features $FEATURES --archive-file root-tests.tar.zst
+          cargo nextest archive --cargo-profile ci --manifest-path fusor/Cargo.toml --workspace \
+            --lib --bins --tests --examples --archive-file fusor-tests.tar.zst
+          cargo build --profile ci --manifest-path fusor/Cargo.toml -p fusor-conformance
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos-tests
+          path: |
+            root-tests.tar.zst
+            fusor-tests.tar.zst
+          retention-days: 1
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fusor-conformance-macos
+          path: fusor/target/ci/fusor-conformance
+          retention-days: 1
+
+  tests:
+    needs: build
+    name: Mac (tests)
+    runs-on: macos-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@nextest
+      - uses: actions/download-artifact@v4
+        with:
+          name: macos-tests
       - name: Run tests
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           FUSOR_CONFORMANCE_REQUIRE_GPU: "1"
-        run: cargo test --all --tests --features kalosm/language,kalosm/sound,kalosm/vision,kalosm/remote,kalosm/scrape --exclude fusor-core
+        run: |
+          cargo nextest run --archive-file root-tests.tar.zst --workspace-remap . --extract-to .
+          cargo nextest run --archive-file fusor-tests.tar.zst --workspace-remap fusor --extract-to fusor
+
+  conformance:
+    needs: build
+    name: Mac (${{ matrix.shard.name }})
+    runs-on: macos-latest
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        shard:
+          - { name: core, suites: "smoke:: elementwise:: reductions:: multi_slot:: views:: indexing_scatter:: dtypes::", args: "" }
+          - { name: matmul, suites: "matmul:: conv_pool::", args: "" }
+          - { name: norm-layers, suites: "normalization:: layers::", args: "" }
+          - { name: attention-backward, suites: "attention_rope:: backward::", args: "" }
+          - { name: quantized, suites: "quantized::", args: "" }
+          - { name: sampling-0, suites: "sampling::", args: "--shard=0/8" }
+          - { name: sampling-1, suites: "sampling::", args: "--shard=1/8" }
+          - { name: sampling-2, suites: "sampling::", args: "--shard=2/8" }
+          - { name: sampling-3, suites: "sampling::", args: "--shard=3/8" }
+          - { name: sampling-4, suites: "sampling::", args: "--shard=4/8" }
+          - { name: sampling-5, suites: "sampling::", args: "--shard=5/8" }
+          - { name: sampling-6, suites: "sampling::", args: "--shard=6/8" }
+          - { name: sampling-7, suites: "sampling::", args: "--shard=7/8" }
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: fusor-conformance-macos
+          path: bin
+      - name: Run conformance shard
+        env:
+          FUSOR_CONFORMANCE_REQUIRE_GPU: "1"
+        run: |
+          chmod +x bin/fusor-conformance
+          for suite in ${{ matrix.shard.suites }}; do
+            bin/fusor-conformance "$suite" ${{ matrix.shard.args }}
+          done

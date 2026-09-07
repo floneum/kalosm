@@ -9,11 +9,17 @@ authors = ["Evan Almloff <evanalmloff@gmail.com>"]
 keywords = ["ai", "segment-anything", "segmentation", "computer-vision"]
 
 [dependencies]
-fusor = { workspace = true, features = ["cpu", "gpu"] }
+fusor = { path = "../../fusor/fusor", default-features = false }
+fusor-gguf = { path = "../../fusor/fusor-gguf" }
 kalosm-common = { workspace = true }
 kalosm-model-types.workspace = true
 thiserror.workspace = true
 image.workspace = true
+
+[features]
+default = ["cpu", "gpu"]
+cpu = ["fusor/cpu"]
+gpu = ["fusor/gpu"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }

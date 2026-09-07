@@ -1,0 +1,58 @@
+[package]
+name = "fusor-gpu"
+description = "fusor wgpu Target: capability probing, naga emission, pooled allocator, plan cache"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[dependencies]
+web-time.workspace = true
+fusor-ir.workspace = true
+fusor-tile.workspace = true
+fusor-cost.workspace = true
+fusor-gguf.workspace = true
+smallvec.workspace = true
+rustc-hash.workspace = true
+half.workspace = true
+parking_lot.workspace = true
+lru.workspace = true
+wgpu.workspace = true
+naga = { workspace = true, features = ["wgsl-out"] }
+
+[dev-dependencies]
+# `wgsl-in` feeds the WARP probe test dumped kernels as text.
+# `wgsl-out` is test-only: the single-slot fold golden asserts textual equality
+# of the emitted shader, which is the check that a change to the reduction
+# primitive did not move the fast path. Nothing in the shipped build writes WGSL
+# text — modules go to `create_shader_module_trusted` as naga IR.
+naga = { workspace = true, features = ["wgsl-out", "wgsl-in"] }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+wgpu = { version = "29", default-features = false, features = ["metal"] }
+
+[target.'cfg(windows)'.dependencies]
+wgpu = { version = "29", default-features = false, features = ["dx12"] }
+
+[target.'cfg(any(target_os = "linux", target_os = "android", target_os = "freebsd"))'.dependencies]
+wgpu = { version = "29", default-features = false, features = ["vulkan"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# The web backend's handles are `Rc`-based; this feature marks them Send/Sync
+# on the single-threaded wasm target so the pool and plan cache type-check.
+wgpu = { version = "29", default-features = false, features = ["webgpu", "fragile-send-sync-non-atomic-wasm"] }
+
+[features]
+default = []
+# The wgpu fork contributes exactly two capabilities: workgroup-alias byte-arena
+# packing and mixed-precision cooperative store. Without it the arena falls back
+# to per-stride-class regions and an f32-accumulated f16-output kernel pays a
+# staging tile plus a per-lane cast: footprint, never correctness.
+fork-metal = []
+
+# Blocking on a GPU future is a native-only convenience: on the web the
+# device is driven by the browser's event loop, so everything is awaited.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+pollster.workspace = true
