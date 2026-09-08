@@ -65,12 +65,23 @@ pub(crate) fn lower_kmap(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Result
     let mut stmts: Vec<Stmt> = Vec::new();
     match tiling.dim {
         None => {
-            let index = ctx.global_index(block);
-            let args = ops
-                .iter()
-                .map(|o| ctx.load_mapped(o, index.clone(), space_total))
-                .collect::<Result<_>>()?;
-            stmts.push(store(index, args)?);
+            // The grid was divided by `tm`, so a lane owns `tm` elements.
+            // They sit a grid apart, not consecutively, so a workgroup's
+            // lanes stay on consecutive elements and the accesses coalesce.
+            let lane = ctx.global_index(block);
+            let span = ctx.grid_threads(block);
+            for t in 0..tm {
+                let index = if t == 0 {
+                    lane.clone()
+                } else {
+                    b.add(lane.clone(), b.mul(span.clone(), b.u32(t)))
+                };
+                let args = ops
+                    .iter()
+                    .map(|o| ctx.load_mapped(o, index.clone(), space_total))
+                    .collect::<Result<_>>()?;
+                stmts.push(store(index, args)?);
+            }
         }
         Some(dim) => {
             let axis = dim as usize;

@@ -1,12 +1,13 @@
 //! The [`crate::egraph::RuleTag::StrictlyLowering`] floor: one trivial,
 //! always-legal Logical -> Launch lowering per Logical op, the driver's
-//! fallback on budget exhaustion. Each emits [`ScheduleDomain::Point`].
+//! fallback on budget exhaustion. Each emits [`ScheduleDomain::Point`], except
+//! the elementwise `Map`, which carries its linear tiling domain from birth.
 
 use crate::carrier::Carrier;
 use crate::dtype::Dtype;
 use crate::egraph::{Builder, Facts, Id, RuleTag};
 use crate::ir::launch::{
-    AccessPlan, GatherMode, IndexSpace, Launch, Operand, ScatterMode, ScheduleDomain,
+    AccessPlan, GatherMode, IndexSpace, Launch, MapDomain, Operand, ScatterMode, ScheduleDomain,
 };
 use crate::ir::logical::{Label, Logical};
 use crate::ir::{Level, Node, Op, OpTag};
@@ -185,7 +186,17 @@ pub fn lower_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opt
         .iter()
         .map(|&s| alias_operand_of(s, &b.facts_of(s).shape.clone()))
         .collect();
-    let k = floor_map(b, space_of(f), expr.clone(), ops)?;
+    // Minted with its tiling domain in place: an additive `Map` alternative
+    // regresses extraction (see `fusor_tile::rules`), and left as `Point` the
+    // launch has nothing for the extractor to choose or the tuner to race.
+    let k = b
+        .add_launch(Launch::Map {
+            space: space_of(f),
+            body: expr.clone(),
+            ops,
+            sched: ScheduleDomain::Map(MapDomain::linear_over(f.caps(), &f.own().shape).into()),
+        })
+        .ok()?;
     b.union(id, k).ok()
 }
 
