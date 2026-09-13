@@ -179,6 +179,7 @@ fn gather(
         body,
         byte_arena: None,
         sym_slots: Default::default(),
+        proven_extents: Default::default(),
         name: "cpu_gather",
     })
 }
@@ -333,6 +334,7 @@ fn scatter(
         body,
         byte_arena: None,
         sym_slots: Default::default(),
+        proven_extents: Default::default(),
         name: "cpu_scatter",
     })
 }

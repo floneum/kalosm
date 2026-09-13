@@ -1012,6 +1012,20 @@ pub struct KernelIr {
     pub body: Vec<Stmt>,
     pub byte_arena: Option<ByteArenaToken>,
     pub name: &'static str,
+    /// Symbolic extents every index in this body is known to stay inside.
+    ///
+    /// The companion to `sym_slots`. A load with a constant-true mask has to
+    /// be provably in range, and `verify_kernel` decides that against a
+    /// *constant* extent — a uniform word gives it nothing to compare. But
+    /// the bound is not unknown, only symbolic: a contraction sizes its grid
+    /// from the very extent it then indexes, so `row < rows` holds by
+    /// construction at every binding. Naming that extent here lets the
+    /// verifier discharge the obligation by structural equality instead of
+    /// arithmetic, and is what keeps a symbolic-shaped contraction's loads
+    /// unmasked. Masking them instead would be worse than a tax: the mask
+    /// available bounds `k`, not the row, so it silences the check without
+    /// proving the thing that could go wrong.
+    pub proven_extents: SmallVec<[Dim; 2]>,
     /// Where in binding 0 each symbol this kernel addresses through lives.
     ///
     /// A `TileLayout` extent or stride may be a `Dim::Sym`, and the emitter
@@ -1023,6 +1037,12 @@ pub struct KernelIr {
 }
 
 impl KernelIr {
+    /// Whether an index into a `extent`-long axis is covered by a bound this
+    /// kernel's lowering discharged.
+    pub fn extent_is_proven(&self, extent: Dim) -> bool {
+        self.proven_extents.iter().any(|d| d.known_eq(extent))
+    }
+
     /// The binding-0 slot holding `sym`'s value, if this kernel addresses
     /// through it.
     pub fn sym_slot(&self, sym: SymId) -> Option<u32> {

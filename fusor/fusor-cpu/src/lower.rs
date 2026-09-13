@@ -179,6 +179,7 @@ fn compose(
         body,
         byte_arena: None,
         sym_slots: Default::default(),
+        proven_extents: Default::default(),
         name,
     })
 }

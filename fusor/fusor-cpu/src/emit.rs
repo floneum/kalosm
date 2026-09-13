@@ -1525,6 +1525,7 @@ mod tests {
             body,
             byte_arena: None,
             sym_slots: Default::default(),
+            proven_extents: Default::default(),
             name: "reverse",
         };
 
@@ -1573,6 +1574,7 @@ mod tests {
             }],
             byte_arena: None,
             sym_slots: Default::default(),
+            proven_extents: Default::default(),
             name: "fma",
         };
         compile(&ir, crate::caps::cpu_caps(), None).unwrap().prog
@@ -1653,6 +1655,7 @@ mod tests {
             body,
             byte_arena: None,
             sym_slots: Default::default(),
+            proven_extents: Default::default(),
             name: "access",
         };
 
@@ -1731,6 +1734,7 @@ mod tests {
             body,
             byte_arena: None,
             sym_slots: Default::default(),
+            proven_extents: Default::default(),
             name: "vector_select",
         };
 
@@ -1776,6 +1780,7 @@ mod tests {
                 }],
                 byte_arena: None,
                 sym_slots: Default::default(),
+                proven_extents: Default::default(),
                 name: "widen",
             };
             let art = compile(&ir, crate::caps::cpu_caps(), None).unwrap();
@@ -1869,6 +1874,7 @@ mod tests {
             }],
             byte_arena: None,
             sym_slots: Default::default(),
+            proven_extents: Default::default(),
             name: "wg_sum",
         };
         let data: Vec<f32> = (0..BLOCK).map(|i| i as f32).collect();
@@ -1902,6 +1908,7 @@ mod tests {
             }],
             byte_arena: None,
             sym_slots: Default::default(),
+            proven_extents: Default::default(),
             name: "sg_max",
         };
         let data = vec![1.0, -2.0, 7.5, 3.0, 0.0, -9.0, 2.0, 4.0];
@@ -1973,6 +1980,7 @@ mod tests {
             ],
             byte_arena: None,
             sym_slots: Default::default(),
+            proven_extents: Default::default(),
             name: "gemv_epilogue",
         };
 
@@ -2079,6 +2087,7 @@ mod tests {
             ],
             byte_arena: None,
             sym_slots: Default::default(),
+            proven_extents: Default::default(),
             name: "scatter_add",
         };
 
@@ -2164,6 +2173,7 @@ mod tests {
             }],
             byte_arena: None,
             sym_slots: Default::default(),
+            proven_extents: Default::default(),
             name: "det",
         };
         let data: Vec<f32> = (0..N).map(|i| (i as f32) * 0.001 - 2.0).collect();
@@ -2193,6 +2203,7 @@ mod tests {
             }],
             byte_arena: None,
             sym_slots: Default::default(),
+            proven_extents: Default::default(),
             name: "count",
         };
         let threads = crate::caps::CpuCaps::threads() as u64;
@@ -2260,6 +2271,7 @@ mod tests {
             }],
             byte_arena: None,
             sym_slots: Default::default(),
+            proven_extents: Default::default(),
             name: "divergent",
         };
         let got = run_f32(&ir, &[], BLOCK as usize);
@@ -2323,6 +2335,7 @@ mod tests {
             body,
             byte_arena: None,
             sym_slots: Default::default(),
+            proven_extents: Default::default(),
             name: "swap",
         };
         let got = run_f32(&ir, &[vec![0.0], vec![1.0, 2.0]], 2);

@@ -100,12 +100,12 @@ pub(crate) struct Dims {
 
 impl Dims {
     /// Rows of the A matrix: `batch * m`.
-    fn a_rows(&self) -> Dim {
+    pub(crate) fn a_rows(&self) -> Dim {
         self.batch * self.m
     }
 
     /// Rows of the B matrix: `batch * k`.
-    fn b_rows(&self) -> Dim {
+    pub(crate) fn b_rows(&self) -> Dim {
         self.batch * self.k
     }
 }
@@ -676,18 +676,25 @@ pub(crate) fn lower_coop(
 /// and has to be pinned. Taking the bound as an expression lets it be a
 /// uniform word, which is what keeps a symbolic output extent out of the
 /// body.
-fn workgroup_index(ctx: &mut Ctx<'_>, groups: TileExpr) -> TileExpr {
-    let id = flat_workgroup_index(ctx);
+/// Clamp an axis coordinate to its own extent.
+///
+/// A dispatch may over-cover — `distribute_workgroups` folds onto a second
+/// slab past the per-dimension cap — so the tail of the last slab has to be
+/// pinned. Doing it per axis rather than on the flat index is what leaves the
+/// bound *checkable*: `min(id / gpr, rows - 1)` is bounded by `rows - 1`
+/// whatever `gpr` turns out to be, where the same clamp applied to the flat
+/// index leaves a quotient by a uniform word that nothing can bound.
+fn clamp_to_extent(ctx: &mut Ctx<'_>, index: TileExpr, extent: TileExpr) -> TileExpr {
     let one = ctx.b.u32(1);
     let last = ctx
         .b
-        .binary(TileBinaryOp::Sub, groups, one, NumericContract::RELAXED);
+        .binary(TileBinaryOp::Sub, extent, one, NumericContract::RELAXED);
     ctx.b
-        .binary(TileBinaryOp::Min, id, last, NumericContract::RELAXED)
+        .binary(TileBinaryOp::Min, index, last, NumericContract::RELAXED)
 }
 
-/// [`workgroup_index`] against a count already known at lowering, which lets
-/// the clamp be dropped entirely when the grid covers the work exactly.
+/// The flat workgroup index against a count known at lowering, which lets the
+/// clamp be dropped entirely when the grid covers the work exactly.
 fn workgroup_index_const(ctx: &mut Ctx<'_>, grid: [u32; 3], groups: u32) -> TileExpr {
     let id = flat_workgroup_index(ctx);
     let covered = u64::from(grid[0]) * u64::from(grid[1]) * u64::from(grid[2]);
@@ -1408,45 +1415,55 @@ pub(crate) fn lower_sgemv(mut ctx: Ctx<'_>, op: &Launch, p: SgemvParams) -> Resu
         crate::lower::grid_for_tiles([(a_rows, 1), (dims.n, 1)], &ctx.binding, &ctx.caps.limits)?;
     let rows_e = ctx.dim_expr(a_rows)?;
     let n_e = ctx.dim_expr(dims.n)?;
-    let groups = ctx.b.mul(rows_e, n_e.clone());
-    let wg = workgroup_index(&mut ctx, groups);
+    let wg = flat_workgroup_index(&mut ctx);
     // `wg` enumerates `[batch, m, n]` row-major: `row` is the A matrix row
     // (`batch * m + m_idx` — exactly the flat `wg / n`), and B's row is the
     // batch's k block plus the loop's own k.
-    let row = ctx.b.binary(
-        TileBinaryOp::Div,
-        wg.clone(),
-        n_e.clone(),
-        NumericContract::RELAXED,
-    );
+    let row = {
+        let q = ctx.b.binary(
+            TileBinaryOp::Div,
+            wg.clone(),
+            n_e.clone(),
+            NumericContract::RELAXED,
+        );
+        clamp_to_extent(&mut ctx, q, rows_e.clone())
+    };
     let col = ctx.b.binary(
         TileBinaryOp::Rem,
         wg.clone(),
         n_e.clone(),
         NumericContract::RELAXED,
     );
-    let m_e = ctx.dim_expr(dims.m)?;
-    let batch_idx = ctx.b.binary(
-        TileBinaryOp::Div,
-        row.clone(),
-        m_e,
-        NumericContract::RELAXED,
-    );
     let k_e = ctx.dim_expr(dims.k)?;
-    let b_row_base = ctx.b.mul(batch_idx, k_e.clone());
+    // One batch means one B matrix, so its row is just `k` — no divide by m,
+    // no multiply by k. That is not only two instructions: it leaves the B
+    // address bounded by the loop count alone, which is what lets a
+    // constant-extent weight view keep its unmasked load when the
+    // *activation* side's extents are symbolic.
+    let b_row_base = if dims.batch.known_eq(Dim::Const(1)) {
+        ctx.b.u32(0)
+    } else {
+        let m_e = ctx.dim_expr(dims.m)?;
+        let batch_idx = ctx.b.binary(
+            TileBinaryOp::Div,
+            row.clone(),
+            m_e,
+            NumericContract::RELAXED,
+        );
+        ctx.b.mul(batch_idx, k_e.clone())
+    };
 
     let acc_local = ctx.b.local(ElementType::Scalar(acc_elem));
     let vector = p.vector.max(1);
     let pass = (block * vector).max(1);
-    // A symbolic extent masks every load, whatever the caller asks for.
-    // An unmasked load is one the kernel verifier has to prove in range, and
-    // it proves that against a *constant* extent; this kernel's extents are
-    // uniform words, so there is nothing to prove against. The mask against
-    // k is what makes each load safe by itself, at every length the dispatch
-    // may bind, without putting any length back into the body.
-    let force_mask = [dims.m, dims.n, dims.k, dims.batch]
-        .iter()
-        .any(|d| d.as_const().is_none());
+    // Every axis this body indexes is covered by the grid it was dispatched
+    // with: the workgroup index is clamped to `rows * groups_per_row`, and
+    // the k loop runs `k / pass` whole passes. Those extents are uniform
+    // words, so no arithmetic in the kernel verifier can bound an index
+    // against them — declaring them here is what keeps these loads unmasked.
+    for extent in [dims.m, dims.n, dims.k, dims.batch, a_rows, b_rows] {
+        ctx.prove_extent(extent);
+    }
 
     // One pass of the k loop starting at `step`: the lane's partial,
     // continued from its accumulator. `masked` bounds each element against
@@ -1461,7 +1478,6 @@ pub(crate) fn lower_sgemv(mut ctx: Ctx<'_>, op: &Launch, p: SgemvParams) -> Resu
                    from: &fusor_ir::ir::kernel::Local,
                    vector: u32|
      -> Result<TileExpr> {
-        let masked = masked || force_mask;
         // Each lane owns `vector` consecutive elements of k. Overlapping
         // lanes and vector offsets would double-count the interior of the
         // window, and contiguous ownership lets a quantized operand amortize
@@ -1484,8 +1500,8 @@ pub(crate) fn lower_sgemv(mut ctx: Ctx<'_>, op: &Launch, p: SgemvParams) -> Resu
                 ctx.b.bool(true)
             };
             let mut avs = Vec::with_capacity(a_views.len());
-            for src in &a_views {
-                let src = match src {
+            for staged in &a_views {
+                let src = match staged {
                     StagedSource::Const(lit) => {
                         avs.push(lit.clone());
                         continue;
@@ -1504,8 +1520,8 @@ pub(crate) fn lower_sgemv(mut ctx: Ctx<'_>, op: &Launch, p: SgemvParams) -> Resu
                 ));
             }
             let mut bvs = Vec::with_capacity(b_views.len());
-            for src in &b_views {
-                let src = match src {
+            for staged in &b_views {
+                let src = match staged {
                     StagedSource::Const(lit) => {
                         bvs.push(lit.clone());
                         continue;
@@ -1799,29 +1815,38 @@ fn lower_sgemv_subgroup_cols(
         ctx.b
             .binary(TileBinaryOp::Div, up, cols_e, NumericContract::RELAXED)
     };
-    let groups = {
-        let rows_e = ctx.dim_expr(rows)?;
-        ctx.b.mul(rows_e, gpr_e.clone())
+    let rows_e = ctx.dim_expr(rows)?;
+    let wg = flat_workgroup_index(&mut ctx);
+    let row = {
+        let q = ctx.b.binary(
+            TileBinaryOp::Div,
+            wg.clone(),
+            gpr_e.clone(),
+            NumericContract::RELAXED,
+        );
+        clamp_to_extent(&mut ctx, q, rows_e)
     };
-    let wg = workgroup_index(&mut ctx, groups);
-    let row = ctx.b.binary(
-        TileBinaryOp::Div,
-        wg.clone(),
-        gpr_e.clone(),
-        NumericContract::RELAXED,
-    );
     let col_group = ctx
         .b
         .binary(TileBinaryOp::Rem, wg, gpr_e, NumericContract::RELAXED);
-    let m_e = ctx.dim_expr(dims.m)?;
-    let batch_idx = ctx.b.binary(
-        TileBinaryOp::Div,
-        row.clone(),
-        m_e,
-        NumericContract::RELAXED,
-    );
     let k_e = ctx.dim_expr(dims.k)?;
-    let b_row_base = ctx.b.mul(batch_idx, k_e.clone());
+    // One batch means one B matrix, so its row is just `k` — no divide by m,
+    // no multiply by k. That is not only two instructions: it leaves the B
+    // address bounded by the loop count alone, which is what lets a
+    // constant-extent weight view keep its unmasked load when the
+    // *activation* side's extents are symbolic.
+    let b_row_base = if dims.batch.known_eq(Dim::Const(1)) {
+        ctx.b.u32(0)
+    } else {
+        let m_e = ctx.dim_expr(dims.m)?;
+        let batch_idx = ctx.b.binary(
+            TileBinaryOp::Div,
+            row.clone(),
+            m_e,
+            NumericContract::RELAXED,
+        );
+        ctx.b.mul(batch_idx, k_e.clone())
+    };
 
     let sg = ctx.b.builtin(Builtin::SubgroupId);
     let sg_lane = ctx.b.builtin(Builtin::SubgroupLane);
@@ -1858,15 +1883,14 @@ fn lower_sgemv_subgroup_cols(
     let locals: Vec<_> = (0..cps)
         .map(|_| ctx.b.local(ElementType::Scalar(acc_elem)))
         .collect();
-    // A symbolic extent masks every load, whatever the caller asks for.
-    // An unmasked load is one the kernel verifier has to prove in range, and
-    // it proves that against a *constant* extent; this kernel's extents are
-    // uniform words, so there is nothing to prove against. The mask against
-    // k is what makes each load safe by itself, at every length the dispatch
-    // may bind, without putting any length back into the body.
-    let force_mask = [dims.m, dims.n, dims.k, dims.batch]
-        .iter()
-        .any(|d| d.as_const().is_none());
+    // Every axis this body indexes is covered by the grid it was dispatched
+    // with: the workgroup index is clamped to `rows * groups_per_row`, and
+    // the k loop runs `k / pass` whole passes. Those extents are uniform
+    // words, so no arithmetic in the kernel verifier can bound an index
+    // against them — declaring them here is what keeps these loads unmasked.
+    for extent in [dims.m, dims.n, dims.k, dims.batch, rows, dims.b_rows()] {
+        ctx.prove_extent(extent);
+    }
 
     // One pass of the k loop starting at `step`: every owned column's
     // partial, continued from its accumulator local.
@@ -1886,7 +1910,6 @@ fn lower_sgemv_subgroup_cols(
                    vector: u32,
                    contiguous: bool|
      -> Result<Vec<TileExpr>> {
-        let masked = masked || force_mask;
         // Each lane owns `vector` elements of the subgroup's pass. At
         // `parts == 1` they are consecutive — the same contiguous-ownership
         // contract as the whole-workgroup path. At `parts > 1` the window is
@@ -1944,8 +1967,8 @@ fn lower_sgemv_subgroup_cols(
                 ctx.b.bool(true)
             };
             let mut avs = Vec::with_capacity(a_views.len());
-            for src in a_views {
-                let src = match src {
+            for staged in a_views {
+                let src = match staged {
                     StagedSource::Const(lit) => {
                         avs.push(lit.clone());
                         continue;
@@ -1989,8 +2012,8 @@ fn lower_sgemv_subgroup_cols(
                     ctx.b.and(mask.clone(), col_ok.clone())
                 };
                 let mut bvs = Vec::with_capacity(b_views.len());
-                for src in b_views {
-                    let src = match src {
+                for staged in b_views {
+                    let src = match staged {
                         StagedSource::Const(lit) => {
                             bvs.push(lit.clone());
                             continue;

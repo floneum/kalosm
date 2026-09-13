@@ -70,6 +70,7 @@ pub(crate) fn lower(
             body: Vec::new(),
             byte_arena: None,
             sym_slots: Default::default(),
+            proven_extents: Default::default(),
             name,
         });
     }
@@ -192,6 +193,7 @@ fn lower_jit(
         body,
         byte_arena: None,
         sym_slots: Default::default(),
+        proven_extents: Default::default(),
         name: "cpu_contract_jit",
     })
 }

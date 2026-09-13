@@ -945,6 +945,9 @@ pub(crate) struct Ctx<'a> {
     /// says so here; a load whose operand is at least this long then needs
     /// no mask at all.
     proven_index_lt: Option<u64>,
+    /// Symbolic extents this lowering has discharged a bound for; see
+    /// [`fusor_ir::ir::kernel::KernelIr::proven_extents`].
+    proven_extents: smallvec::SmallVec<[Dim; 2]>,
 }
 
 impl<'a> Ctx<'a> {
@@ -1018,6 +1021,7 @@ impl<'a> Ctx<'a> {
             slot_of,
             pack,
             proven_index_lt: None,
+            proven_extents: smallvec::SmallVec::new(),
         })
     }
 
@@ -1025,6 +1029,18 @@ impl<'a> Ctx<'a> {
     /// See [`Self::proven_index_lt`].
     pub(crate) fn prove_index_lt(&mut self, bound: u64) {
         self.proven_index_lt = Some(bound);
+    }
+
+    /// Declare that every index this body forms stays inside `extent`.
+    ///
+    /// For a symbolic extent, which no arithmetic in the verifier can check:
+    /// the caller must have derived its grid (and any clamp on the flat
+    /// workgroup index) from this same extent, which is what makes the bound
+    /// hold at every binding. See `KernelIr::proven_extents`.
+    pub(crate) fn prove_extent(&mut self, extent: Dim) {
+        if extent.as_const().is_none() && !self.proven_extents.contains(&extent) {
+            self.proven_extents.push(extent);
+        }
     }
 
     /// Whether an index into a `count`-element operand is provably in range.
@@ -1963,6 +1979,7 @@ impl<'a> Ctx<'a> {
             },
             name,
             sym_slots: self.pack.dim_slots(),
+            proven_extents: self.proven_extents,
         }
     }
 }
