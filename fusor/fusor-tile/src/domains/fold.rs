@@ -34,6 +34,40 @@ pub fn fold_domain(k: Dim, cx: &DomainCtx<'_>) -> FoldDomain {
     fold_domain_for(k, 1, 4, cx)
 }
 
+/// Order the strategies of a reduction with `outputs` independent outputs so
+/// the one a seeded extraction takes is the one that fits the device.
+///
+/// **The seed is the answer.** Extraction prices the member it is handed and
+/// does not walk a fold's alternatives, so whatever sorts first is what runs
+/// — on a browser especially, where there is no GPU clock and the tuner
+/// cannot race its way out of a bad first guess.
+///
+/// A lane group of `L` reducing `k` elements issues `L * (ceil(k/L) +
+/// log2(L))` slots per output: every lane runs every accumulate step and
+/// every tree stage, whether or not it holds a value. So the widest group is
+/// the most wasteful — and it was seeded *first*. Measured on this device, a
+/// 40-element reduction ran 35.5 us over 2 lanes and 393 us over 256.
+///
+/// But a narrow group is only free while there is other work to fill the
+/// machine. `outputs * L` lanes are resident, and below
+/// [`Caps::saturation_lanes`] the device is idling, which is why the same
+/// 128-element reduction wants 8 lanes at 4096 outputs and 16 at 2048.
+///
+/// So: saturate first, then waste least. Among the strategies that keep the
+/// device busy, the least wasteful leads; if none do, the widest does,
+/// because then parallelism is what is scarce.
+fn seed_order(s: FoldStrat, k: u64, outputs: u64, caps: &Caps) -> (u8, u64) {
+    let lanes = u64::from(s.lane_group(caps.subgroup_width().max(1)).max(1));
+    let target = u64::from(caps.saturation_lanes() / 2).max(1);
+    let issued = lanes.saturating_mul(k.div_ceil(lanes).saturating_add(u64::from(lanes.ilog2())));
+    match outputs.saturating_mul(lanes) {
+        resident if resident >= target => (0, issued),
+        // Short of the device: the widest group wins, so order by the lanes
+        // it is *missing*.
+        resident => (1, target.saturating_sub(resident)),
+    }
+}
+
 /// Every legal reduction strategy for an axis of extent `k` carrying `lanes`
 /// accumulator lanes of `acc_bytes` each.
 ///
@@ -47,6 +81,19 @@ pub fn fold_domain(k: Dim, cx: &DomainCtx<'_>) -> FoldDomain {
 /// arena function, so a strategy over the cap would assert, not merely run
 /// slow. A wide enough carrier can empty the domain.
 pub fn fold_domain_for(k: Dim, lanes: u64, acc_bytes: u64, cx: &DomainCtx<'_>) -> FoldDomain {
+    fold_domain_sized(k, 0, lanes, acc_bytes, cx)
+}
+
+/// [`fold_domain_for`] told how many independent outputs the reduction has,
+/// which is what decides whether a narrow lane group leaves the device idle.
+/// See [`seed_order`].
+pub fn fold_domain_sized(
+    k: Dim,
+    outputs: u64,
+    lanes: u64,
+    acc_bytes: u64,
+    cx: &DomainCtx<'_>,
+) -> FoldDomain {
     let caps = cx.caps;
     let max_block = caps.limits.max_compute_invocations_per_workgroup;
     let max_storage = u64::from(caps.limits.max_compute_workgroup_storage_size);
@@ -102,7 +149,15 @@ pub fn fold_domain_for(k: Dim, lanes: u64, acc_bytes: u64, cx: &DomainCtx<'_>) -
         }
     }
 
-    out.sort_by_key(|s| (seed_rank(*s), fold_order(s)));
+    match k.as_const().filter(|k| *k > 0) {
+        // A known axis and a known output count order the strategies by what
+        // they cost this device; see `seed_order`.
+        Some(k) if outputs > 0 => {
+            out.sort_by_key(|s| (seed_order(*s, k, outputs, caps), fold_order(s)))
+        }
+        // A symbolic extent keeps the shape-only order.
+        _ => out.sort_by_key(|s| (seed_rank(*s), fold_order(s))),
+    }
     out.truncate(MAX_STRATEGIES);
 
     FoldDomain {

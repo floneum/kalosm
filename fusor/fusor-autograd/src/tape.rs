@@ -227,6 +227,20 @@ pub trait TapeExt: Tape {
         upd: Val,
         unique: bool,
     ) -> Result<Val> {
+        self.scatter_set_run(axis, base, idx, upd, unique, None)
+    }
+
+    /// [`Self::scatter_set`] where the caller knows `idx` is the contiguous
+    /// run `start .. start + updates`. See `Logical::Scatter::run`.
+    fn scatter_set_run(
+        &mut self,
+        axis: u32,
+        base: Val,
+        idx: Val,
+        upd: Val,
+        unique: bool,
+        run: Option<u32>,
+    ) -> Result<Val> {
         self.add(Logical::Scatter {
             axis,
             combine: ScatterCombine::Set,
@@ -234,6 +248,7 @@ pub trait TapeExt: Tape {
             idx,
             upd,
             unique,
+            run,
         })
     }
 
@@ -334,6 +349,8 @@ impl Tape for GraphTape<'_> {
             idx,
             upd,
             unique: false,
+            // A gradient scatter's indices are the caller's token ids.
+            run: None,
         })
     }
 

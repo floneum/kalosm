@@ -71,6 +71,9 @@ impl Dim {
 pub enum DimExpr {
     Add(Dim, Dim),
     Mul(Dim, Dim),
+    /// Truncating division. Not commutative, so unlike the other two it is
+    /// interned in the order written.
+    Div(Dim, Dim),
 }
 
 /// Derived symbols occupy `[DERIVED_BASE, DERIVED_END)`: above any symbol a
@@ -170,6 +173,35 @@ impl Dim {
         }
     }
 
+    /// `self / other`, truncating: folded when both are constant, `1` the
+    /// right identity, else a derived symbol.
+    ///
+    /// A tiled loop count is `extent / tile`, and a kernel that wants to
+    /// iterate a symbolic extent needs to name that quotient without
+    /// resolving the extent — resolving it is exactly what bakes the length
+    /// into the body.
+    fn divided(self, other: Dim) -> Dim {
+        match (self, other) {
+            (_, Dim::Const(0)) => Dim::Sym(OPAQUE_SYM),
+            (Dim::Const(x), Dim::Const(y)) => Dim::Const(x / y),
+            (d, Dim::Const(1)) => d,
+            (Dim::Sym(s), _) | (_, Dim::Sym(s)) if s == OPAQUE_SYM => Dim::Sym(OPAQUE_SYM),
+            (a, b) => Dim::derived(DimExpr::Div(a, b)),
+        }
+    }
+
+    /// `self / other` rounded up.
+    ///
+    /// The divisor has to be known: rounding up is `(a + b - 1) / b`, and
+    /// the algebra has no subtraction to spell `b - 1` with. Every caller
+    /// divides by a tile width, which is a compile-time choice.
+    pub fn ceil_div(self, other: Dim) -> Dim {
+        match other {
+            Dim::Const(0) | Dim::Sym(_) => Dim::Sym(OPAQUE_SYM),
+            Dim::Const(d) => (self + Dim::Const(d - 1)) / other,
+        }
+    }
+
     /// The value under `resolve`, which answers for the graph's own symbols;
     /// derived symbols evaluate through their expressions. `None` when a
     /// symbol reached is unbound or the placeholder.
@@ -180,6 +212,7 @@ impl Dim {
             Dim::Sym(s) => match s.derived_expr() {
                 Some(DimExpr::Add(a, b)) => a.evaluate(resolve)?.checked_add(b.evaluate(resolve)?),
                 Some(DimExpr::Mul(a, b)) => a.evaluate(resolve)?.checked_mul(b.evaluate(resolve)?),
+                Some(DimExpr::Div(a, b)) => a.evaluate(resolve)?.checked_div(b.evaluate(resolve)?),
                 None => resolve(s),
             },
         }
@@ -197,6 +230,13 @@ impl std::ops::Mul for Dim {
     type Output = Dim;
     fn mul(self, other: Dim) -> Dim {
         self.times(other)
+    }
+}
+
+impl std::ops::Div for Dim {
+    type Output = Dim;
+    fn div(self, other: Dim) -> Dim {
+        self.divided(other)
     }
 }
 
@@ -390,10 +430,25 @@ impl Layout {
 
 /// One sub-axis of a logical axis. Strides may be zero (broadcast) or
 /// collide (im2col); plain per-axis strides cannot express a conv operand.
+///
+/// `Dim`, not `u32`: an extent the caller cannot name at lowering time — a
+/// KV cache's length, a growing sequence — has to survive into the address
+/// map, or the only way to build the map is to bake the length and compile a
+/// fresh kernel for every value it takes.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SubAxis {
-    pub extent: u32,
-    pub stride: u32,
+    pub extent: Dim,
+    pub stride: Dim,
+}
+
+impl SubAxis {
+    /// The pair as constants, when both are known.
+    pub const fn as_consts(self) -> Option<(u64, u64)> {
+        match (self.extent.as_const(), self.stride.as_const()) {
+            (Some(e), Some(s)) => Some((e, s)),
+            _ => None,
+        }
+    }
 }
 
 /// One logical axis, decomposed most-significant-first by divmod.
@@ -403,10 +458,15 @@ pub struct AxisGroup {
 }
 
 impl AxisGroup {
-    pub fn affine(extent: u32, stride: u32) -> Self {
+    pub fn affine(extent: Dim, stride: Dim) -> Self {
         Self {
             sub_axes: smallvec::smallvec![SubAxis { extent, stride }],
         }
+    }
+
+    /// [`Self::affine`] over constants, for the many callers that have them.
+    pub fn affine_const(extent: u32, stride: u32) -> Self {
+        Self::affine(Dim::Const(u64::from(extent)), Dim::Const(u64::from(stride)))
     }
 }
 
@@ -417,12 +477,23 @@ pub struct MultiFlattenMap {
 }
 
 impl MultiFlattenMap {
-    pub fn affine(extents: &[u32], strides: &[u32]) -> Self {
+    pub fn affine(extents: &[Dim], strides: &[Dim]) -> Self {
         Self {
             groups: extents
                 .iter()
                 .zip(strides)
                 .map(|(&e, &s)| AxisGroup::affine(e, s))
+                .collect(),
+        }
+    }
+
+    /// [`Self::affine`] over constants.
+    pub fn affine_const(extents: &[u32], strides: &[u32]) -> Self {
+        Self {
+            groups: extents
+                .iter()
+                .zip(strides)
+                .map(|(&e, &s)| AxisGroup::affine_const(e, s))
                 .collect(),
         }
     }
@@ -437,13 +508,18 @@ impl MultiFlattenMap {
 
     /// Contiguous unit-stride run length as this axis's coordinate
     /// increments — the coalescing metric for picking the lane axis.
+    /// A symbolic sub-axis stops the run: its stride cannot be compared
+    /// against one, and a run that cannot be proven is not one.
     pub fn axis_unit_run(&self, axis: usize) -> u32 {
         let mut run = 1u32;
         for sub in self.groups[axis].sub_axes.iter().rev() {
-            if sub.stride != run {
+            let Some((extent, stride)) = sub.as_consts() else {
+                break;
+            };
+            if stride != u64::from(run) {
                 break;
             }
-            run = run.saturating_mul(sub.extent);
+            run = run.saturating_mul(u32::try_from(extent).unwrap_or(u32::MAX));
         }
         run
     }

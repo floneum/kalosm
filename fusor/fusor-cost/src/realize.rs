@@ -264,6 +264,66 @@ fn coop_padding(graph: &EGraph, member: Id, theta: Option<SchedPoint>) -> Work {
     }
 }
 
+/// Lane slots a fold issues beyond the values it reduces.
+///
+/// A reduction of `k` elements is not `k` units of work whatever the
+/// strategy: a lane group of `L` runs `ceil(k / L)` accumulate steps on all
+/// `L` lanes and then `log2(L)` tree stages on them, so it issues
+/// `L * (ceil(k / L) + log2(L))` slots to reduce `k` values. Only the excess
+/// is charged here; the `k` itself is already in the node's work.
+///
+/// Without this a fold's work did not mention its lane group at all, so every
+/// strategy priced identically and the choice fell to the seed order. On a
+/// 40-element reduction the seeded subgroup collective measured 94.9 us
+/// where a 2-lane group measured 35.5 us, and a 256-lane tree — which the
+/// seed ranked *second* — measured 393 us, eleven times the best.
+///
+/// The waste is real work: the lanes past `k` hold the identity and still run
+/// every stage. It composes with the occupancy term rather than replacing
+/// it, which is what keeps a wide group attractive when there are too few
+/// outputs to fill the device without one.
+fn fold_issue(graph: &EGraph, member: Id, theta: Option<SchedPoint>, caps: &Caps) -> Work {
+    let Op::Launch(Launch::Fold { space, axis, .. }) = &graph.node(member).op else {
+        return Work::default();
+    };
+    let width = caps.subgroup_width().max(1);
+    let lanes = u64::from(match theta {
+        Some(SchedPoint::Fold(s)) => s.lane_group(width),
+        // The floor carries no parameters and both emitters read it the same
+        // way: the subgroup collective where the device has subgroups, the
+        // workgroup-wide tree where it does not.
+        Some(SchedPoint::Point) | None if caps.subgroups.is_some() => width,
+        Some(SchedPoint::Point) | None => caps
+            .limits
+            .max_compute_invocations_per_workgroup
+            .clamp(1, 256),
+        _ => return Work::default(),
+    })
+    .max(1);
+    let axis = *axis as usize;
+    let Some(k) = space
+        .dims
+        .get(axis)
+        .and_then(|d| d.as_const())
+        .filter(|k| *k > 0)
+    else {
+        return Work::default();
+    };
+    let outputs = space
+        .dims
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != axis)
+        .map(|(_, d)| d.as_const().unwrap_or(1).max(1))
+        .fold(1u64, |a, b| a.saturating_mul(b));
+    let stages = u64::from(lanes.max(1).ilog2());
+    let issued = lanes.saturating_mul(k.div_ceil(lanes).saturating_add(stages));
+    Work {
+        macs: issued.saturating_sub(k).saturating_mul(outputs),
+        ..Work::default()
+    }
+}
+
 /// Realize `(sigma, m, theta)` from `roots` and cut it into launches.
 ///
 /// A class with no `sigma` entry is [`Error::Plan`]; so is a selection whose
@@ -586,6 +646,98 @@ pub struct Geometry {
     pub workgroups: u64,
 }
 
+/// How much cheaper a re-read served by the last-level cache is than one
+/// served by DRAM. Not free, which is the point, but nearly so.
+const CACHE_REREAD_DISCOUNT: u64 = 32;
+
+/// The bytes a tiled operand is charged for, given how many times its
+/// tiling reads it.
+///
+/// The first pass is a real DRAM pass. The rest are charged at
+/// [`CACHE_REREAD_DISCOUNT`], because an operand a small matmul re-reads is
+/// sitting in cache and the traffic is real but cheap.
+fn charged_bytes(bytes: u64, rereads: u32) -> u64 {
+    let extra = u64::from(rereads.saturating_sub(1));
+    bytes.saturating_add(bytes / CACHE_REREAD_DISCOUNT * extra)
+}
+
+/// How many times a contraction's *tiling* re-reads each of its operands.
+///
+/// The iteration space cannot tell the schedules apart. It is the same
+/// whether a workgroup owns a 128x128 block of the output or a single
+/// column of it, so every family was charged identical DRAM traffic and the
+/// choice fell to terms that favour the simplest kernel. That is how a
+/// matrix-vector schedule came to win a 256x256 by 256x256 product, at five
+/// times the runtime of the tiled alternative sitting next to it in the
+/// domain.
+///
+/// The tile is what actually decides. A workgroup covering `bm x bn` of the
+/// output sweeps the left operand once per column tile and the right once
+/// per row tile, so the left is read `ceil(n / bn)` times and the right
+/// `ceil(m / bm)`. A wider tile reads less, which is the entire reason to
+/// want one.
+fn contract_rereads(
+    graph: &EGraph,
+    extraction: &Extraction,
+    root: Id,
+) -> Result<rustc_hash::FxHashMap<Id, u32>> {
+    let mut out = rustc_hash::FxHashMap::default();
+    // The same value can be realized as a `Contract` or, through the generic
+    // floor, as a plain `Fold`. Both are members of one class, and the fold
+    // has to be priced as the contraction it is computing or it looks free:
+    // a fold over the contraction space reduces each output element on its
+    // own, which is a 1x1 tile and the most reuse a schedule can lose.
+    let node = match &graph.node(root).op {
+        Op::Launch(Launch::Contract { .. }) => root,
+        Op::Launch(Launch::Fold { .. }) => {
+            match graph
+                .members(graph.class_of(root))
+                .into_iter()
+                .find(|m| matches!(&graph.node(*m).op, Op::Launch(Launch::Contract { .. })))
+            {
+                Some(sibling) => sibling,
+                None => return Ok(out),
+            }
+        }
+        _ => return Ok(out),
+    };
+    let Op::Launch(Launch::Contract { m, n, a, b, .. }) = &graph.node(node).op else {
+        return Ok(out);
+    };
+    // The schedule states its own tile; this function does not know the
+    // families. See `SchedPoint::output_tile`.
+    let Some((bm, bn)) = extraction
+        .theta
+        .get(&root)
+        .copied()
+        .and_then(|theta| theta.output_tile())
+    else {
+        return Ok(out);
+    };
+    let extent = |d: &Dim| d.as_const().unwrap_or(1).max(1);
+    let (m, n) = (extent(m), extent(n));
+    // A matrix-vector product has no operand reuse for a tiling to keep or
+    // lose: one side is swept once whatever the schedule does. Only a
+    // matrix-matrix product is worth pricing this way, and pretending
+    // otherwise made the decode path's gemv chase a term that does not
+    // exist there.
+    if m == 1 || n == 1 {
+        return Ok(out);
+    }
+    let times = |whole: u64, tile: u32| -> u32 {
+        u32::try_from(whole.div_ceil(u64::from(tile.max(1))).max(1)).unwrap_or(u32::MAX)
+    };
+    let (a_reread, b_reread) = (times(n, bn), times(m, bm));
+    for (side, reread) in [(a, a_reread), (b, b_reread)] {
+        for op in &side.ops {
+            let src = select(graph, extraction, op.src)?;
+            let slot = out.entry(src).or_insert(reread);
+            *slot = (*slot).max(reread);
+        }
+    }
+    Ok(out)
+}
+
 pub fn geometry(theta: Option<SchedPoint>, space: &IndexSpace, caps: &Caps) -> Geometry {
     let width = caps.subgroup_width().max(1);
     let default_block = caps
@@ -896,6 +1048,7 @@ fn build_component(
         let theta_m = extraction.theta.get(m).copied();
         w = w.add(staging_rework(graph, *m, theta_m));
         w = w.add(coop_padding(graph, *m, theta_m));
+        w = w.add(fold_issue(graph, *m, theta_m, caps));
         let materialized = extraction.is_materialized(*m) || roots.contains(m);
         if materialized {
             writes = writes.saturating_add(bytes_of(out));
@@ -908,8 +1061,10 @@ fn build_component(
     }
 
     // Distinct external operands, with the reread factor the consuming
-    // iteration space implies.
+    // iteration space implies — except for a contraction, whose tiling
+    // decides it (see `contract_rereads`).
     let mut ext: Vec<(Id, u64, u32)> = Vec::new();
+    let tiled_rereads = contract_rereads(graph, extraction, root)?;
     for m in &members {
         let iters = iterations_of(&index_space(graph, *m));
         for c in graph.node(*m).children.iter() {
@@ -922,10 +1077,24 @@ fn build_component(
             }
             let facts = graph.facts(c);
             let elems = elements_of(facts).max(1);
-            let reread = iters.div_ceil(elems).max(1).min(u32::MAX as u64) as u32;
+            // A tiled contraction reports its reuse as bytes rather than as
+            // a reread count: `effective_read_bytes` treats a cache-resident
+            // operand's rereads as free, and every tiling of a small matmul
+            // is cache-resident, so a count would vanish there. Confined to
+            // this one node kind so no other launch's traffic changes.
+            let (bytes, reread) = match tiled_rereads.get(&c) {
+                Some(eff) => (charged_bytes(bytes_of(facts), *eff), 1),
+                None => (
+                    bytes_of(facts),
+                    iters.div_ceil(elems).max(1).min(u32::MAX as u64) as u32,
+                ),
+            };
             match ext.iter_mut().find(|(id, _, _)| *id == c) {
-                Some(slot) => slot.2 = slot.2.max(reread),
-                None => ext.push((c, bytes_of(facts), reread)),
+                Some(slot) => {
+                    slot.1 = slot.1.max(bytes);
+                    slot.2 = slot.2.max(reread);
+                }
+                None => ext.push((c, bytes, reread)),
             }
         }
     }
@@ -1004,12 +1173,23 @@ pub fn fold_footprint(graph: &EGraph, id: Id) -> Option<(u64, u64)> {
 
 /// Whether this device can actually run `id` at `theta`.
 ///
-/// Only the fold clause is stated here: it is the only one whose footprint
-/// depends on a node property the schedule domain was generated before
-/// knowing. `PROMOTE` carries the pre-promotion domain over verbatim, but the
-/// inherited strategies were admitted at one accumulator lane and the
-/// promoted nest holds `lanes` of them.
+/// Two clauses. The fold one is here because its footprint depends on a node
+/// property the schedule domain was generated before knowing: `PROMOTE`
+/// carries the pre-promotion domain over verbatim, but the inherited
+/// strategies were admitted at one accumulator lane and the promoted nest
+/// holds `lanes` of them.
+///
+/// The split-K one is here because no emitter implements it. A split needs
+/// its partials combined by a second launch and both backends build one
+/// kernel per launch, so `lower_coop` refuses outright. The coop domain
+/// offers the splits anyway, which made them selectable: a cost change
+/// elsewhere was enough to make one win, and eight quantized cases stopped
+/// lowering. Selecting a point no emitter can build mints a crash rather
+/// than a slow plan, so it is not legal until something can run it.
 pub fn point_is_legal(graph: &EGraph, id: Id, theta: SchedPoint, caps: &Caps) -> bool {
+    if matches!(theta, SchedPoint::Coop { splits, .. } if splits > 1) {
+        return false;
+    }
     let Some((lanes, acc_bytes)) = fold_footprint(graph, id) else {
         return true;
     };

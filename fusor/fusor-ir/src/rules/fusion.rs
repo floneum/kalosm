@@ -163,7 +163,7 @@ pub(crate) fn operand_groups(o: &Operand) -> Option<SmallVec<[AxisGroup; 4]>> {
             .iter()
             .zip(o.layout.strides())
             .map(|(d, s)| {
-                Some(AxisGroup::affine(
+                Some(AxisGroup::affine_const(
                     u32::try_from(d.as_const()?).ok()?,
                     u32::try_from(s.as_const()?).ok()?,
                 ))
@@ -192,13 +192,13 @@ pub(crate) fn widen_groups(
     for (j, d) in space.dims.iter().enumerate() {
         let extent = extent_of(d)?;
         if vec_axes.contains(&(j as u32)) {
-            groups.push(AxisGroup::affine(extent, 0));
+            groups.push(AxisGroup::affine_const(extent, 0));
             continue;
         }
         let g = src.get(i);
         i += 1;
         let Some(g) = g else {
-            groups.push(AxisGroup::affine(extent, 0));
+            groups.push(AxisGroup::affine_const(extent, 0));
             continue;
         };
         // A group's sub-extents multiply to the axis it describes. A `1` where
@@ -207,11 +207,11 @@ pub(crate) fn widen_groups(
         let width: u64 = g
             .sub_axes
             .iter()
-            .try_fold(1u64, |a, s| a.checked_mul(u64::from(s.extent)))?;
+            .try_fold(1u64, |a, s| a.checked_mul(s.extent.as_const()?))?;
         if width == u64::from(extent) {
             groups.push(g.clone());
         } else if width == 1 {
-            groups.push(AxisGroup::affine(extent, 0));
+            groups.push(AxisGroup::affine_const(extent, 0));
         } else {
             return None;
         }
@@ -232,10 +232,7 @@ pub(crate) fn operand_from_groups(
     space: &IndexSpace,
 ) -> Option<Operand> {
     if groups.iter().all(|g| g.sub_axes.len() == 1) {
-        let strides: Vec<Dim> = groups
-            .iter()
-            .map(|g| Dim::Const(u64::from(g.sub_axes[0].stride)))
-            .collect();
+        let strides: Vec<Dim> = groups.iter().map(|g| g.sub_axes[0].stride).collect();
         let shape: Vec<Dim> = space.dims.iter().copied().collect();
         return Some(Operand {
             src: o.src,
@@ -288,7 +285,7 @@ fn dense_read_map(
         .iter()
         .zip(&strides)
         .map(|(d, s)| {
-            Some(AxisGroup::affine(
+            Some(AxisGroup::affine_const(
                 u32::try_from(d.as_const()?).ok()?,
                 u32::try_from(s.as_const()?).ok()?,
             ))

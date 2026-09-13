@@ -8,7 +8,7 @@
 
 use crate::dtype::{NumericContract, QFmt, QLayout};
 use crate::error::Result;
-use crate::shape::MultiFlattenMap;
+use crate::shape::{Dim, MultiFlattenMap, SymId};
 use rustc_hash::FxHasher;
 use smallvec::SmallVec;
 use std::fmt;
@@ -137,8 +137,16 @@ pub enum BufferAccess {
 /// A concrete Kernel layout: extents plus a logical-to-storage index map.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileLayout {
-    pub extents: SmallVec<[u32; 4]>,
-    pub indexing: MultiFlattenMap,
+    /// `Dim`, not `u32`: a tile whose extent is a sequence length has to
+    /// carry it symbolically, or the only way to address the tile is to bake
+    /// the length and compile a fresh kernel for every value it takes.
+    pub extents: SmallVec<[Dim; 4]>,
+    /// Behind an `Arc` because it is the bulk of a layout and layouts are
+    /// cloned constantly: every load and store in a kernel body carries a
+    /// `StorageView`, and copying three `SmallVec`s per node is the cost this
+    /// avoids. It also keeps `TileExprKind::Load` small enough that the node
+    /// enum is not dominated by one variant.
+    pub indexing: Arc<MultiFlattenMap>,
     pub level: MemoryLevel,
 }
 
@@ -149,18 +157,59 @@ impl TileLayout {
             strides[axis] = strides[axis + 1] * extents[axis + 1];
         }
         Self {
-            extents: extents.iter().copied().collect(),
-            indexing: MultiFlattenMap::affine(extents, &strides),
+            extents: extents.iter().map(|e| Dim::Const(u64::from(*e))).collect(),
+            indexing: Arc::new(MultiFlattenMap::affine_const(extents, &strides)),
             level,
         }
     }
 
-    pub fn element_count(&self) -> u64 {
-        self.extents.iter().map(|e| *e as u64).product()
+    /// [`Self::contiguous`] over extents that need not be known yet. The
+    /// strides are the running row-major products, which `Dim`'s arithmetic
+    /// carries symbolically.
+    pub fn contiguous_dims(level: MemoryLevel, extents: &[Dim]) -> Self {
+        let mut strides = vec![Dim::Const(1); extents.len()];
+        for axis in (0..extents.len().saturating_sub(1)).rev() {
+            strides[axis] = strides[axis + 1] * extents[axis + 1];
+        }
+        Self {
+            extents: extents.iter().copied().collect(),
+            indexing: Arc::new(MultiFlattenMap::affine(extents, &strides)),
+            level,
+        }
+    }
+
+    /// Elements this tile holds, or `None` when an extent is not yet known.
+    pub fn element_count(&self) -> Option<u64> {
+        self.extents
+            .iter()
+            .try_fold(1u64, |a, e| a.checked_mul(e.as_const()?))
+    }
+
+    /// [`Self::element_count`] for a caller that has already established the
+    /// extents are constant; a symbolic one counts as 0.
+    pub fn element_count_or_zero(&self) -> u64 {
+        self.element_count().unwrap_or(0)
     }
 
     pub fn is_affine(&self) -> bool {
         self.indexing.is_affine()
+    }
+
+    /// Extent `axis` as a constant.
+    ///
+    /// Only a `Storage` tile may be symbolic: a workgroup or private tile is
+    /// an actual WGSL array declaration and its length has to be spellable at
+    /// compile time. Callers on those paths use this and are entitled to the
+    /// `Some`.
+    pub fn const_extent(&self, axis: usize) -> Option<u32> {
+        u32::try_from(self.extents.get(axis)?.as_const()?).ok()
+    }
+
+    /// Every extent as a constant, or `None` if any is symbolic.
+    pub fn const_extents(&self) -> Option<SmallVec<[u32; 4]>> {
+        (0..self.extents.len())
+            .map(|a| self.const_extent(a))
+            .collect()
     }
 }
 
@@ -963,6 +1012,44 @@ pub struct KernelIr {
     pub body: Vec<Stmt>,
     pub byte_arena: Option<ByteArenaToken>,
     pub name: &'static str,
+    /// Symbolic extents every index in this body is known to stay inside.
+    ///
+    /// The companion to `sym_slots`. A load with a constant-true mask has to
+    /// be provably in range, and `verify_kernel` decides that against a
+    /// *constant* extent — a uniform word gives it nothing to compare. But
+    /// the bound is not unknown, only symbolic: a contraction sizes its grid
+    /// from the very extent it then indexes, so `row < rows` holds by
+    /// construction at every binding. Naming that extent here lets the
+    /// verifier discharge the obligation by structural equality instead of
+    /// arithmetic, and is what keeps a symbolic-shaped contraction's loads
+    /// unmasked. Masking them instead would be worse than a tax: the mask
+    /// available bounds `k`, not the row, so it silences the check without
+    /// proving the thing that could go wrong.
+    pub proven_extents: SmallVec<[Dim; 2]>,
+    /// Where in binding 0 each symbol this kernel addresses through lives.
+    ///
+    /// A `TileLayout` extent or stride may be a `Dim::Sym`, and the emitter
+    /// turns one into a load of this slot rather than a literal. That is the
+    /// whole point of the symbolic layout: the *slot* is structural, so the
+    /// body is byte-identical across every value the symbol takes and the
+    /// artifact cache hits instead of compiling a kernel per sequence length.
+    pub sym_slots: SmallVec<[(SymId, u32); 4]>,
+}
+
+impl KernelIr {
+    /// Whether an index into a `extent`-long axis is covered by a bound this
+    /// kernel's lowering discharged.
+    pub fn extent_is_proven(&self, extent: Dim) -> bool {
+        self.proven_extents.iter().any(|d| d.known_eq(extent))
+    }
+
+    /// The binding-0 slot holding `sym`'s value, if this kernel addresses
+    /// through it.
+    pub fn sym_slot(&self, sym: SymId) -> Option<u32> {
+        self.sym_slots
+            .iter()
+            .find_map(|(s, slot)| (*s == sym).then_some(*slot))
+    }
 }
 
 /// How workgroup tiles are packed.
@@ -1063,13 +1150,19 @@ pub fn cooperative_store_layout_supported(layout: &TileLayout) -> bool {
     if !layout.is_affine() || layout.extents.len() != 2 {
         return false;
     }
-    let strides: SmallVec<[u32; 2]> = layout
+    let strides: SmallVec<[Dim; 2]> = layout
         .indexing
         .groups
         .iter()
         .map(|g| g.sub_axes[0].stride)
         .collect();
-    strides[0] == 1 || strides[1] == 1
+    // A cooperative store spells its stride as an immediate, so a symbolic
+    // one is not storable this way; lowering gates on this predicate and
+    // picks a different point rather than baking the value.
+    if strides.iter().any(|s| s.as_const().is_none()) {
+        return false;
+    }
+    strides[0].known_eq(Dim::Const(1)) || strides[1].known_eq(Dim::Const(1))
 }
 
 // ---------------------------------------------------------------------------

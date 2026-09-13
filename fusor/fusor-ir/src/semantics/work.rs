@@ -406,7 +406,7 @@ fn coop_staged_bytes(sched: &ScheduleDomain, elem: ScalarElement) -> u64 {
     crate::verify_launch::coop_tiles(geom, elem, staging)
         .decls
         .iter()
-        .map(|t| t.layout.element_count() * t.element.byte_size())
+        .map(|t| t.layout.element_count_or_zero() * t.element.byte_size())
         .sum()
 }
 

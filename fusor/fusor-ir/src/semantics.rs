@@ -88,6 +88,12 @@ impl Semantics for CoreSemantics {
     fn effect(&self, op: &Op) -> Effect {
         effect_of(op)
     }
+
+    /// Whether running this operator twice lands the same bytes as once.
+    /// See [`is_repeatable`].
+    fn repeatable(&self, op: &Op) -> bool {
+        is_repeatable(op)
+    }
 }
 
 /// Purity of one operator.
@@ -106,6 +112,34 @@ pub fn effect_of(op: &Op) -> Effect {
             Effect::InPlace(BufferRole(0))
         }
         Op::Logical(_) | Op::Launch(_) | Op::Union(..) => Effect::Pure,
+    }
+}
+
+/// Whether running this operator twice lands the same bytes as running it
+/// once.
+///
+/// Distinct from [`effect_of`], and the distinction matters. An in-place node
+/// is pinned in the materialized set so it is never inlined into two
+/// consumers; that is about *where* it may be placed. This is about whether
+/// the thing may be *repeated*, which is what timing a plan does — a race
+/// runs the candidate and the incumbent several times each and compares
+/// their outputs.
+///
+/// A `Set` scatter is repeatable. `derive_bindings` gives its value a buffer
+/// of its own and marks only that binding read-write; the base arrives as an
+/// ordinary read. The nest computes `covered ? update : base` and writes it,
+/// so a second run reads the same base and writes the same bytes.
+///
+/// An `Atomic` scatter is not. It accumulates into its target, so a second
+/// run doubles every update.
+///
+/// Conflating the two cost real performance: the tuner refused to race any
+/// plan holding an in-place launch, and a convolution pads through a `Set`
+/// scatter, so no convolution could ever have any of its schedules measured.
+pub fn is_repeatable(op: &Op) -> bool {
+    match op {
+        Op::Launch(Launch::Scatter { mode, .. }) => !matches!(mode, ScatterMode::Atomic),
+        Op::Logical(_) | Op::Launch(_) | Op::Union(..) => true,
     }
 }
 
@@ -141,7 +175,7 @@ impl ArenaPlanner for SumArenaPlanner {
         Ok(tiles
             .decls
             .iter()
-            .map(|t| (t.layout.element_count() * t.element.byte_size()) as u32)
+            .map(|t| (t.layout.element_count_or_zero() * t.element.byte_size()) as u32)
             .sum())
     }
 

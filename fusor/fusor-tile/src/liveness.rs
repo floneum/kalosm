@@ -459,7 +459,7 @@ impl Walk {
                     tile: tile.clone(),
                     range: LiveRange::point(position),
                     element: tile.element,
-                    elements: tile.layout.element_count().min(u32::MAX as u64) as u32,
+                    elements: tile.layout.element_count_or_zero().min(u32::MAX as u64) as u32,
                     accesses: Vec::new(),
                     scoped: None,
                     coop: false,

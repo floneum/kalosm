@@ -75,8 +75,9 @@ pub(crate) fn lower_kregion(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) ->
     let out_view = ctx.linear_view(out)?;
     let out_elem = out_view.buffer.element;
     let count = out_view.layout.element_count();
-    let elements = u32::try_from(count)
-        .map_err(|_| Error::Plan("region output exceeds a u32 element count".into()))?
+    let elements = count
+        .and_then(|c| u32::try_from(c).ok())
+        .ok_or_else(|| Error::Plan("region output has no constant element count".into()))?
         .max(1);
 
     // The members share one index space, so the live-outs' element count is

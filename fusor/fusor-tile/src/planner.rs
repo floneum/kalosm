@@ -619,6 +619,8 @@ pub fn synth_ir(tiles: &Tiles) -> KernelIr {
         block: 1,
         body,
         byte_arena: None,
+        sym_slots: Default::default(),
+        proven_extents: Default::default(),
         name: "workgroup_bytes",
     }
 }

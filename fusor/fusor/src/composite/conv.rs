@@ -40,7 +40,9 @@ pub fn pad_with_zeros(x: &Tensor, axis: u32, left: u64, right: u64) -> Result<Te
     let dtype = facts.dtype;
     let id = x.graph.build(|t| {
         let base = t.zeros_shaped(dtype, &padded)?;
-        t.scatter_set(axis, base, iid, xid, true)
+        // The index is `left .. left + len` by construction, so the kernel
+        // can invert it by subtraction instead of searching.
+        t.scatter_set_run(axis, base, iid, xid, true, u32::try_from(left).ok())
     })?;
     Ok(x.graph.tensor(id))
 }

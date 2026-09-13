@@ -281,8 +281,14 @@ pub(crate) fn workgroup_global(
     byte_offset: u32,
 ) -> Result<Handle<GlobalVariable>, EmitError> {
     debug_assert_eq!(byte_offset, 0, "standalone tiles are not aliased");
-    let count = std::num::NonZeroU32::new(decl.layout.element_count() as u32)
-        .ok_or_else(|| EmitError::Unsupported("empty workgroup tile".into()))?;
+    // A workgroup array's length is a WGSL type parameter, so a symbolic
+    // extent has no spelling here. Lowering only ever stages constant tiles.
+    let count = decl
+        .layout
+        .element_count()
+        .and_then(|c| u32::try_from(c).ok())
+        .and_then(std::num::NonZeroU32::new)
+        .ok_or_else(|| EmitError::Unsupported("empty or symbolic workgroup tile".into()))?;
     let ty = array_type(module, decl.element, ArraySize::Constant(count))?;
     Ok(module.global_variables.append(
         GlobalVariable {
@@ -398,7 +404,14 @@ pub(crate) fn create_workgroup_globals(em: &mut Emitter<'_>) -> Result<(), EmitE
                             "a shared workgroup region needs one stride class".into(),
                         ));
                     }
-                    elements = elements.max(tile.layout.element_count() as u32);
+                    let own_elements = tile
+                        .layout
+                        .element_count()
+                        .and_then(|c| u32::try_from(c).ok())
+                        .ok_or_else(|| {
+                            EmitError::Unsupported("symbolic workgroup tile extent".into())
+                        })?;
+                    elements = elements.max(own_elements);
                 }
                 let count = std::num::NonZeroU32::new(elements)
                     .ok_or_else(|| EmitError::Unsupported("empty workgroup region".into()))?;

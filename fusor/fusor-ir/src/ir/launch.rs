@@ -86,6 +86,10 @@ pub enum Launch {
         combine: crate::ir::logical::ScatterCombine,
         ops: Vec<Operand>,
         sched: ScheduleDomain,
+        /// Carried from `Logical::Scatter::run`: the index is the contiguous
+        /// run starting here, so a lane can invert it by subtraction instead
+        /// of searching every update for its own output.
+        run: Option<u32>,
     },
 
     /// A multi-output region: the same rewrite as producer inlining,
@@ -365,7 +369,7 @@ impl Operand {
                 .iter()
                 .zip(self.layout.strides())
                 .map(|(d, s)| {
-                    Some(crate::shape::AxisGroup::affine(
+                    Some(crate::shape::AxisGroup::affine_const(
                         u32::try_from(d.as_const()?).ok()?,
                         u32::try_from(s.as_const()?).ok()?,
                     ))
@@ -381,12 +385,16 @@ impl Operand {
             let mut below = 1u64;
             for sub in g.sub_axes.iter().rev() {
                 let divisor = div_after.checked_mul(below)?;
+                // The compile-time map is the affine fast path and is built
+                // only from constants; a symbolic sub-axis declines it, and
+                // the caller addresses through binding-0 words instead.
+                let (extent, stride) = sub.as_consts()?;
                 terms.push(AddressTerm {
                     divisor: u32::try_from(divisor).ok()?,
-                    modulus: sub.extent,
-                    stride: sub.stride,
+                    modulus: u32::try_from(extent).ok()?,
+                    stride: u32::try_from(stride).ok()?,
                 });
-                below = below.checked_mul(u64::from(sub.extent))?;
+                below = below.checked_mul(extent)?;
             }
             div_after = div_after.checked_mul(below)?;
         }
@@ -575,6 +583,40 @@ pub enum SchedPoint {
     Map(MapTiling),
 }
 
+impl SchedPoint {
+    /// The block of the output one workgroup of this schedule covers, for a
+    /// schedule a contraction can run under.
+    ///
+    /// **This is where operand reuse comes from, and it belongs to the
+    /// schedule rather than to whoever is pricing it.** A workgroup covering
+    /// `bm x bn` sweeps the left operand once per column tile and the right
+    /// once per row tile, so the tile alone says how many times a
+    /// contraction reads each side. The cost model asks; it does not know
+    /// the families itself.
+    ///
+    /// The match is exhaustive on purpose. A schedule family added without
+    /// an answer here does not compile, where before it would simply have
+    /// been priced as reading its operands once and won every contraction it
+    /// was offered for: a matrix-vector schedule took a 256-cube product at
+    /// 839 us over a cooperative one at 28 us, because nothing charged it
+    /// for sweeping the whole right operand once per output row.
+    ///
+    /// `None` is not "unknown", it is "not a contraction schedule".
+    pub const fn output_tile(&self) -> Option<(u32, u32)> {
+        match self {
+            Self::Coop { geom, .. } => Some(geom.output_tile()),
+            Self::Sgemm(p) => Some(p.output_tile()),
+            Self::Sgemv(p) => Some(p.output_tile()),
+            // The generic floor: every output element reduced on its own, so
+            // neither side is tiled and the reuse loss is total.
+            Self::Fold(_) => Some((1, 1)),
+            // Elementwise, and the no-schedule floor. Neither runs a
+            // contraction.
+            Self::Map(_) | Self::Point => None,
+        }
+    }
+}
+
 /// Cooperative-matrix tile geometry. [`Self::subgroup_split`] is the
 /// template every other geometry factorization follows: a closed-form
 /// objective with an explicit feasibility predicate.
@@ -630,6 +672,11 @@ impl CoopGeom {
 
     pub const fn lanes(&self, subgroup_width: u32) -> u32 {
         self.rg * self.cg * subgroup_width
+    }
+
+    /// The output block one workgroup covers. See [`SchedPoint::output_tile`].
+    pub const fn output_tile(&self) -> (u32, u32) {
+        (self.bm, self.bn)
     }
 
     /// Structural legality, independent of workgroup-memory footprint.
@@ -689,6 +736,11 @@ pub struct SgemmParams {
 }
 
 impl SgemmParams {
+    /// The output block one workgroup covers. See [`SchedPoint::output_tile`].
+    pub const fn output_tile(&self) -> (u32, u32) {
+        (self.bm, self.bn)
+    }
+
     /// `tm | bm`, `tn | bn`, 32..=max lanes, staged footprint within the
     /// workgroup-storage limit.
     pub const fn legal(&self, elem_bytes: u32, max_wg_storage: u32, max_lanes: u32) -> bool {
@@ -746,6 +798,14 @@ pub struct SgemvParams {
 }
 
 impl SgemvParams {
+    /// The output block one workgroup covers: one row of `cols`. The family
+    /// exists precisely because it does not tile the reduced side, and that
+    /// is what makes it expensive on a matrix-matrix product.
+    /// See [`SchedPoint::output_tile`].
+    pub const fn output_tile(&self) -> (u32, u32) {
+        (1, self.cols)
+    }
+
     /// Consecutive elements per run of the lane's k window.
     pub const fn run(&self) -> u32 {
         if self.parts <= 1 {
@@ -930,5 +990,74 @@ impl WindowAdjoint {
             window,
             is_mask: window.is_non_overlapping(),
         }
+    }
+}
+
+#[cfg(test)]
+mod sched_point_tests {
+    use super::*;
+
+    /// Every schedule a contraction can run under states the output block one
+    /// workgroup covers, and the elementwise ones state that they are not
+    /// contraction schedules. The cost model reads operand reuse off this and
+    /// nothing else, so a family that answered `None` here would be charged
+    /// for reading its operands once and would win every contraction it was
+    /// offered for.
+    #[test]
+    fn every_contraction_schedule_states_its_output_tile() {
+        let geom = CoopGeom {
+            bm: 64,
+            bn: 32,
+            bk: 8,
+            n_passes: 1,
+            subgroups: 1,
+            rg: 1,
+            cg: 1,
+        };
+        let coop = SchedPoint::Coop {
+            geom,
+            splits: 1,
+            staging: 1,
+        };
+        assert_eq!(coop.output_tile(), Some((64, 32)));
+
+        let sgemm = SchedPoint::Sgemm(SgemmParams {
+            double_buffer: false,
+            bm: 16,
+            bn: 32,
+            bk: 8,
+            tm: 2,
+            tn: 2,
+        });
+        assert_eq!(sgemm.output_tile(), Some((16, 32)));
+
+        // One row of `cols`: an sgemv does not tile the reduced side, which
+        // is exactly why it re-reads the other operand once per output row.
+        let sgemv = SchedPoint::Sgemv(SgemvParams {
+            vector: 32,
+            subgroups: 2,
+            cols: 4,
+            parts: 4,
+            gap: 32,
+        });
+        assert_eq!(sgemv.output_tile(), Some((1, 4)));
+
+        // The generic floor tiles neither side.
+        assert_eq!(
+            SchedPoint::Fold(FoldStrat::Subgroup).output_tile(),
+            Some((1, 1))
+        );
+
+        // Not contraction schedules at all.
+        assert_eq!(SchedPoint::Point.output_tile(), None);
+        assert_eq!(
+            SchedPoint::Map(MapTiling {
+                dim: None,
+                tm: 1,
+                vector: 1,
+            })
+            .output_tile(),
+            None
+        );
     }
 }

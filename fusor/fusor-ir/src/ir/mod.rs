@@ -151,6 +151,11 @@ pub trait Semantics: Send + Sync {
 
     /// Purity. An `InPlace` node is pinned in the materialized set.
     fn effect(&self, op: &Op) -> Effect;
+
+    /// Whether running this operator twice lands the same bytes as running
+    /// it once, which is what timing a plan asks of it. Distinct from
+    /// [`Self::effect`]: see `semantics::is_repeatable`.
+    fn repeatable(&self, op: &Op) -> bool;
 }
 
 /// Identity of an entry in the open op registry.

@@ -17,7 +17,7 @@ use crate::carrier::Carrier;
 use crate::dtype::Dtype;
 use crate::egraph::{Builder, Facts, Id, RuleTag};
 use crate::ir::launch::{
-    AccessPlan, GatherMode, IndexSpace, Launch, Operand, ScatterMode, ScheduleDomain,
+    AccessPlan, GatherMode, IndexSpace, Launch, MapDomain, Operand, ScatterMode, ScheduleDomain,
 };
 use crate::ir::logical::{Label, Logical};
 use crate::ir::{Level, Node, Op, OpTag};
@@ -204,7 +204,14 @@ pub fn lower_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opt
             space: space_of(f),
             body: expr.clone(),
             ops,
-            sched: ScheduleDomain::Point,
+            // The tiling domain belongs on the node as it is minted, not on a
+            // sibling: `fusor_tile::rules` explains why an additive `Map`
+            // domain regresses extraction, so this replaces `Point` rather
+            // than competing with it. Left as `Point` the launch has no
+            // schedule alternatives at all — nothing for the extractor to
+            // choose between and nothing the tuner can race — so every
+            // elementwise kernel ran one output per thread.
+            sched: ScheduleDomain::Map(MapDomain::linear_over(f.caps(), &f.own().shape)),
         })
         .ok()?;
     b.union(id, k).ok()
@@ -361,16 +368,19 @@ fn contract_operand(
 ) -> Option<Operand> {
     let strides = Layout::row_major_strides(shape);
     // A label repeated within one operand is a diagonal read: its strides add.
-    let stride_of = |l: Label| -> Option<u32> {
-        let mut acc: u64 = 0;
+    // `Dim`, not `u32`: a contraction over a sequence length has to reach the
+    // address map with the length still symbolic. `Dim`'s arithmetic carries
+    // the sum for the diagonal case.
+    let stride_of = |l: Label| -> Option<Dim> {
+        let mut acc = Dim::Const(0);
         for (i, x) in labels.iter().enumerate() {
             if *x == l {
-                acc = acc.checked_add(strides.get(i)?.as_const()?)?;
+                acc = acc + *strides.get(i)?;
             }
         }
-        u32::try_from(acc).ok()
+        Some(acc)
     };
-    let label_extent = |l: Label| -> Option<u32> {
+    let label_extent = |l: Label| -> Option<Dim> {
         let d = spec
             .a
             .iter()
@@ -382,13 +392,12 @@ fn contract_operand(
                     .position(|x| *x == l)
                     .and_then(|i| b_shape.get(i))
             })?;
-        u32::try_from(d.as_const()?).ok()
+        Some(*d)
     };
 
     let mut groups: SmallVec<[AxisGroup; 4]> = SmallVec::new();
     for (axis, l) in spec.out.iter().copied().enumerate() {
-        let extent = u32::try_from(out_shape.get(axis)?.as_const()?).ok()?;
-        groups.push(AxisGroup::affine(extent, stride_of(l)?));
+        groups.push(AxisGroup::affine(*out_shape.get(axis)?, stride_of(l)?));
     }
     let mut subs: SmallVec<[SubAxis; 2]> = SmallVec::new();
     for l in contracted {
@@ -399,8 +408,8 @@ fn contract_operand(
     }
     if subs.is_empty() {
         subs.push(SubAxis {
-            extent: 1,
-            stride: 0,
+            extent: Dim::Const(1),
+            stride: Dim::Const(0),
         });
     }
     groups.push(AxisGroup { sub_axes: subs });
@@ -509,7 +518,7 @@ fn window_map(
 ) -> Option<MultiFlattenMap> {
     let mut groups: SmallVec<[AxisGroup; 4]> = SmallVec::new();
     for (axis, extent) in out_shape.iter().enumerate() {
-        let extent = u32::try_from(extent.as_const()?).ok()?;
+        let extent = *extent;
         // Output axes past the input rank are the appended window offsets,
         // in the order `Logical::Window` pushed them.
         let (src_axis, step) = if axis < in_shape.len() {
@@ -522,11 +531,11 @@ fn window_map(
             let w = specs.get(axis - in_shape.len())?;
             (w.axis as usize, 1)
         };
-        let base = u32::try_from(in_strides.get(src_axis)?.as_const()?).ok()?;
+        let base = *in_strides.get(src_axis)?;
         groups.push(AxisGroup {
             sub_axes: smallvec::smallvec![SubAxis {
                 extent,
-                stride: base.checked_mul(step)?,
+                stride: base * Dim::Const(u64::from(step)),
             }],
         });
     }
@@ -564,6 +573,7 @@ pub fn lower_scatter(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
         base,
         idx,
         upd,
+        run,
         ..
     }) = &node.op
     else {
@@ -581,6 +591,7 @@ pub fn lower_scatter(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
                 alias_operand_of(*upd, &f.operand(2)?.shape.clone()),
             ],
             sched: ScheduleDomain::Point,
+            run: *run,
         })
         .ok()?;
     b.union(id, k).ok()

@@ -114,8 +114,15 @@ pub(crate) fn requested_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     };
     // wasm32 never requests SUBGROUP: the browser's WebGPU surface does not
     // expose it, and the `WgTree` fold is the working fallback.
+    // `FUSOR_NO_SUBGROUP=1` drops the bit on a device that has it. With
+    // `FUSOR_NO_COOP` it reproduces a browser's feature set natively, which
+    // is the only way to measure the schedules a page actually runs: wasm
+    // requests neither, so a native run otherwise exercises a different
+    // path entirely.
     #[cfg(not(target_arch = "wasm32"))]
-    want(wgpu::Features::SUBGROUP);
+    if std::env::var_os("FUSOR_NO_SUBGROUP").is_none() {
+        want(wgpu::Features::SUBGROUP);
+    }
     want(wgpu::Features::SHADER_F16);
     want(wgpu::Features::PIPELINE_CACHE);
     // wasm32 never requests timestamps: the tuner's clock reads its query
@@ -132,8 +139,15 @@ pub(crate) fn requested_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     // Cooperative matrices are experimental: requesting the bit additionally
     // needs `unsafe ExperimentalFeatures::enabled()` on the descriptor, which
     // `device::request_device` supplies. wasm32 requests neither.
+    // `FUSOR_NO_COOP=1` drops the bit on a device that has it, which is the
+    // only way to measure the schedule a browser actually gets: wasm never
+    // requests cooperative matrices, so the page runs a path a native run
+    // never exercises. A matrix-vector kernel winning a matrix-matrix
+    // product hid there for exactly that reason.
     #[cfg(not(target_arch = "wasm32"))]
-    want(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
+    if std::env::var_os("FUSOR_NO_COOP").is_none() {
+        want(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
+    }
     // The second experimental bit, EXPERIMENTAL_WORKGROUP_MEMORY_ALIAS, exists
     // only on the wgpu fork; released wgpu 29 does not define it. The
     // byte-arena emitter does not depend on it (see `emit::types`), so its

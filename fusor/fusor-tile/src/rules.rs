@@ -13,7 +13,7 @@ use fusor_ir::ir::launch::{Launch, Operand, ScheduleDomain};
 use fusor_ir::ir::{Level, Node, Op, OpTag};
 use fusor_ir::rule;
 
-use crate::domains::{DomainCtx, default_planner, fold_domain_for, map_domain};
+use crate::domains::{DomainCtx, default_planner, fold_domain_sized, map_domain};
 
 rule!(
     TILE_FOLD,
@@ -80,8 +80,19 @@ pub fn tile_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opt
     // A symbolic `Vector` slot extent is allocatable on neither backend; the
     // rule declines rather than guessing a footprint.
     let lanes = carrier.lanes()?;
-    let dom = fold_domain_for(
+    // The independent outputs of this reduction: every axis but the reduced
+    // one. `seed_order` needs them to tell a narrow lane group that fills the
+    // device from one that leaves it idle.
+    let outputs = space
+        .dims
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != *axis as usize)
+        .map(|(_, d)| d.as_const().unwrap_or(1).max(1))
+        .fold(1u64, |a, b| a.saturating_mul(b));
+    let dom = fold_domain_sized(
         k,
+        outputs,
         lanes,
         acc.byte_size(),
         &DomainCtx::new(f.caps(), default_planner()),

@@ -178,6 +178,8 @@ fn compose(
         block,
         body,
         byte_arena: None,
+        sym_slots: Default::default(),
+        proven_extents: Default::default(),
         name,
     })
 }
@@ -654,7 +656,7 @@ fn resolved_address_map(cx: &LowerCtx<'_>, operand: &Operand) -> Result<AddressM
         _ => extents
             .into_iter()
             .zip(strides)
-            .map(|(extent, stride)| AxisGroup::affine(extent, stride))
+            .map(|(extent, stride)| AxisGroup::affine_const(extent, stride))
             .collect(),
     };
 
@@ -667,13 +669,21 @@ fn resolved_address_map(cx: &LowerCtx<'_>, operand: &Operand) -> Result<AddressM
                 .checked_mul(below)
                 .and_then(|value| u32::try_from(value).ok())
                 .ok_or_else(|| Error::Legality("CPU operand divisor exceeds u32".into()))?;
+            // The CPU lowering resolves every dim before it builds an
+            // address map, so a symbolic one here is a bug, not a shape.
+            let as_u32 = |d: fusor_ir::shape::Dim| -> Result<u32> {
+                d.as_const()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .ok_or_else(|| Error::Legality(format!("CPU address term is symbolic: {d:?}")))
+            };
+            let extent = as_u32(axis.extent)?;
             terms.push(AddressTerm {
                 divisor,
-                modulus: axis.extent,
-                stride: axis.stride,
+                modulus: extent,
+                stride: as_u32(axis.stride)?,
             });
             below = below
-                .checked_mul(u64::from(axis.extent))
+                .checked_mul(u64::from(extent))
                 .ok_or_else(|| Error::Legality("CPU operand extent product overflows".into()))?;
         }
         div_after = div_after

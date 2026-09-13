@@ -162,6 +162,7 @@ fn gpu_scatter_atomic(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -
         combine,
         ops,
         sched,
+        run,
     }) = &node.op
     else {
         return None;
@@ -180,6 +181,7 @@ fn gpu_scatter_atomic(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -
             combine: *combine,
             ops: ops.clone(),
             sched: sched.clone(),
+            run: *run,
         })
         .ok()?;
     b.union(id, alt).ok()

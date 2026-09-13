@@ -265,8 +265,24 @@ pub struct GpuTarget {
     /// exactly as [`Self::pipelines`] is; a check-then-insert would let a
     /// whole cohort past an empty entry for the same body.
     verified: parking_lot::Mutex<lru::LruCache<u128, VerifySlot>>,
-    launcher: Launcher,
+    /// A plan's word layout and the buffer holding its last-written words.
+    ///
+    /// Both are pure functions of the plan and its binding, and a step that
+    /// dispatches the same plan again — a decode loop, a benchmark round —
+    /// binds it identically every time. Rebuilding the layout, repacking the
+    /// words, taking a buffer from the pool and pushing it across to the
+    /// driver once per dispatch is then four pieces of work to arrive at
+    /// bytes that are already there.
+    packs: parking_lot::Mutex<lru::LruCache<u128, PackSlot>>,
+    launcher: Arc<Launcher>,
     config: GpuConfig,
+}
+
+/// A plan's cached uniform layout and the buffer its `words` are already in.
+struct PackSlot {
+    pack: Arc<UniformPack>,
+    words: Vec<u8>,
+    buffer: Buf,
 }
 
 // `GpuTarget` is `Send + Sync` by construction — every field is asserted so
@@ -295,7 +311,8 @@ fn gpu_target_fields_are_send_sync() {
     assert::<parking_lot::Mutex<lru::LruCache<u128, PipelineSlot>>>();
     assert::<parking_lot::Mutex<lru::LruCache<String, Artifact>>>();
     assert::<parking_lot::Mutex<lru::LruCache<u128, VerifySlot>>>();
-    assert::<Launcher>();
+    assert::<parking_lot::Mutex<lru::LruCache<u128, PackSlot>>>();
+    assert::<Arc<Launcher>>();
     assert::<GpuConfig>();
 }
 
@@ -318,7 +335,21 @@ impl GpuTarget {
         let lost = device.lost().clone();
         let pool = BufferPool::new(wgpu_device.clone(), queue.clone(), &config, lost.clone());
         let cache = PlanCache::with_facts(device.facts(), config.cache_dir.clone());
-        let launcher = Launcher::new(wgpu_device, queue, backend, config.clone(), lost);
+        let launcher = Arc::new(Launcher::new(
+            wgpu_device,
+            queue,
+            backend,
+            config.clone(),
+            lost,
+        ));
+        // The pool submits recorded work before an upload can jump ahead of
+        // it on the queue; see `BufferPool::flush`.
+        pool.set_flush({
+            let launcher = Arc::clone(&launcher);
+            Arc::new(move || {
+                let _ = launcher.flush();
+            })
+        });
         Ok(Self {
             device,
             pool,
@@ -333,6 +364,9 @@ impl GpuTarget {
                 NonZeroUsize::new(ARTIFACT_CAPACITY).expect("ARTIFACT_CAPACITY is nonzero"),
             )),
             pipelines_by_source: parking_lot::Mutex::new(lru::LruCache::new(
+                NonZeroUsize::new(ARTIFACT_CAPACITY).expect("ARTIFACT_CAPACITY is nonzero"),
+            )),
+            packs: parking_lot::Mutex::new(lru::LruCache::new(
                 NonZeroUsize::new(ARTIFACT_CAPACITY).expect("ARTIFACT_CAPACITY is nonzero"),
             )),
             launcher,
@@ -417,15 +451,10 @@ impl GpuTarget {
             eprint!("GAPSTEP outside={:.2} ", outside.unwrap_or(0.0));
         }
         // One pack for the whole resolve; every lowering this resolve drives
-        // needs it.
-        let pack = Arc::new(UniformPack::new(plan));
-        let uniforms = pack.fill(plan, &binds.dims, &binds.scalars)?;
-
-        // Phase 1: serial, plan order.
-        let uniform_buf = self
-            .pool
-            .alloc_with_usage(pack.byte_len(), crate::pool::TENSOR_USAGE)?;
-        self.launcher.write_uniforms(&uniform_buf, &uniforms)?;
+        // needs it. Phase 1 is folded in: the words this binding packs to are
+        // compared against what the plan's buffer already holds, and an
+        // unchanged binding keeps both.
+        let (pack, uniform_buf) = self.uniform_words(plan, binds)?;
 
         // `plan.buffers` excludes external leaves. Every binding must still
         // resolve, so the caller-owned buffers seed the map before anything
@@ -910,12 +939,9 @@ impl GpuTarget {
                     // here rather than reused.
                     Some((artifact, grid, ph)) => {
                         let grid = match &entry.grid_space {
-                            Some(spec) => crate::lower::grid_from(
-                                &spec.space,
-                                spec.block,
-                                binding,
-                                &self.caps().limits,
-                            )?,
+                            Some(spec) => {
+                                crate::lower::grid_from(spec, binding, &self.caps().limits)?
+                            }
                             None => grid,
                         };
                         Some((artifact, grid, ph))
@@ -1331,6 +1357,46 @@ impl Target for GpuTarget {
 }
 
 impl GpuTarget {
+    /// This plan's uniform layout, and a buffer holding the words this
+    /// binding packs to.
+    ///
+    /// Writes only when the words differ from what the plan's cached buffer
+    /// already holds, and allocates a fresh buffer when they do rather than
+    /// overwriting one a submitted dispatch may still be reading. See the
+    /// `packs` field for why this is worth doing at all.
+    fn uniform_words(&self, plan: &Plan, binds: &BindingEnv) -> Result<(Arc<UniformPack>, Buf)> {
+        let key = plan.hash.0;
+        let cached = {
+            let mut packs = self.packs.lock();
+            packs
+                .get(&key)
+                .map(|s| (Arc::clone(&s.pack), s.words.clone(), s.buffer.clone()))
+        };
+        let pack = match &cached {
+            Some((pack, _, _)) => Arc::clone(pack),
+            None => Arc::new(UniformPack::new(plan)),
+        };
+        let words = pack.fill(plan, &binds.dims, &binds.scalars)?.to_bytes();
+        if let Some((_, had, buffer)) = cached
+            && had == words
+        {
+            return Ok((pack, buffer));
+        }
+        let buffer = self
+            .pool
+            .alloc_with_usage(pack.byte_len(), crate::pool::TENSOR_USAGE)?;
+        self.launcher.write_uniform_bytes(&buffer, &words)?;
+        self.packs.lock().put(
+            key,
+            PackSlot {
+                pack: Arc::clone(&pack),
+                words,
+                buffer: buffer.clone(),
+            },
+        );
+        Ok((pack, buffer))
+    }
+
     /// Under `FUSOR_CACHE_STATS`, print every retained-object count this
     /// target owns, once per 64 resolves, so growth across a long run can be
     /// attributed to a cache rather than guessed at.

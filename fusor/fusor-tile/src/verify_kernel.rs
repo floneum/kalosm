@@ -26,7 +26,9 @@ use fusor_ir::ir::kernel::{
     LowerError, ScalarElement, Source, Stmt, TileExpr, TileExprKind, TileLiteral,
     cooperative_store_layout_supported,
 };
+use fusor_ir::shape::Dim;
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 use std::sync::Arc;
 
 use crate::arena::scalar_of;
@@ -485,6 +487,11 @@ struct BoundEnv {
     /// how wide its subgroups are cannot prove anything indexed by them.
     subgroups: Option<(u32, u32)>,
     locals: FxHashMap<usize, u64>,
+    /// Symbolic extents the lowering discharged a bound for. No arithmetic
+    /// here can bound an index against a uniform word, so an axis whose
+    /// extent is one of these is taken as covered — see
+    /// [`KernelIr::proven_extents`] for why that is a check and not a claim.
+    proven: SmallVec<[Dim; 2]>,
 }
 
 /// Every `Load` is masked or provably in range.
@@ -502,6 +509,7 @@ pub(crate) fn check_loads(ir: &KernelIr, caps: &Caps) -> Result<()> {
         block: ir.block,
         subgroups: caps.subgroups.map(|s| (s.min, s.max)),
         locals: FxHashMap::default(),
+        proven: ir.proven_extents.clone(),
     };
     let mut seen = FxHashSet::default();
     check_loads_in(&ir.body, &mut env, &mut seen)
@@ -608,16 +616,26 @@ fn load_in_range(src: &Source, addr: &Addr, env: &BoundEnv) -> bool {
         Source::Storage(view) => &view.layout,
         Source::Quantized(view) => &view.data.layout,
     };
-    match addr {
-        Addr::Linear(index) => {
-            max_value(index, env).is_some_and(|max| max < layout.element_count())
+    // One axis is in range when its extent is known and the index's bound is
+    // under it, or when the extent is symbolic and the lowering named it.
+    let axis_ok = |index: &TileExpr, extent: Dim| -> bool {
+        match extent.as_const() {
+            Some(count) => max_value(index, env).is_some_and(|max| max < count),
+            None => env.proven.iter().any(|d| d.known_eq(extent)),
         }
+    };
+    match addr {
+        Addr::Linear(index) => match layout.element_count() {
+            Some(count) => max_value(index, env).is_some_and(|max| max < count),
+            // A layout with a symbolic extent has no element count; the whole
+            // space is covered when every axis is.
+            None => layout.extents.iter().all(|e| axis_ok(index, *e)),
+        },
         Addr::Rc2 { row, col } => {
-            if layout.extents.len() != 2 {
+            let [rows, cols] = layout.extents[..] else {
                 return false;
-            }
-            max_value(row, env).is_some_and(|max| max < u64::from(layout.extents[0]))
-                && max_value(col, env).is_some_and(|max| max < u64::from(layout.extents[1]))
+            };
+            axis_ok(row, rows) && axis_ok(col, cols)
         }
     }
 }

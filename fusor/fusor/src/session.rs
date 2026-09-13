@@ -56,6 +56,27 @@ const TUNE_RUNS: usize = 4;
 /// Measured on the launch's own kernel span wherever a device timer exists,
 /// and on the whole plan only when one does not.
 const TUNE_MARGIN: f64 = 0.08;
+/// Share of the plan a *kernel* must hold before its launches are worth
+/// probing.
+///
+/// Aggregated by launch signature, not per launch: a transformer dispatches
+/// the same few kernels once per layer, so the thing worth tuning is the
+/// kernel, and one layer's share of the plan understates it by the layer
+/// count. Below this, building and timing every candidate costs more than
+/// any win it could find — and on a 1,771-launch plan that search was most
+/// of a cold tune.
+const TUNE_MIN_SHARE: f64 = 0.005;
+/// Candidates one cold race may measure, across every launch of the plan.
+///
+/// A candidate costs a replan plus a shader compile plus [`TUNE_RUNS`] whole
+/// plan executions — hundreds of milliseconds. A transformer's plan holds
+/// launches in the thousands, so without a ceiling the first embed or
+/// transcription of a process spends minutes racing, most of it on kernels
+/// too small to matter. The budget is spent widest-span-first, so what it
+/// does buy is the plan's own hot kernels; the rest keep the cost model's
+/// pick and are measured by the production explorer later, one substitution
+/// at a time.
+const TUNE_MAX_RACES: usize = 48;
 
 /// Class members the tune race has caught computing wrong values, process
 /// wide. Every entry is a live miscompile: a member of some e-class whose
@@ -1895,49 +1916,27 @@ impl Session {
         };
         let log = std::env::var_os("FUSOR_AUTOTUNE_LOG").is_some();
 
-        // Timing a plan re-runs it, and an in-place node makes a re-run
-        // destructive, so an impure plan is never raced. It is still tuned:
-        // the production explorer substitutes one candidate exactly once, in
+        // Timing a plan re-runs it, so a plan holding a launch that does not
+        // survive repetition is never raced. It is still tuned: the
+        // production explorer substitutes one candidate exactly once, in
         // place of the incumbent's own dispatch.
+        //
+        // The question is repetition, not purity — see
+        // `semantics::is_repeatable`. Asking for purity instead ruled out
+        // every plan that pads, concatenates or assigns into a slice, because
+        // all of those are a `Set` scatter, which re-runs to the same bytes.
         {
             let g = graph.state().egraph.lock();
             if base.launches.iter().any(|l| {
                 l.members
                     .iter()
-                    .any(|m| g.semantics().effect(&g.node(*m).op) != Effect::Pure)
+                    .any(|m| !g.semantics().repeatable(&g.node(*m).op))
             }) {
                 if log {
-                    eprintln!("[tune] not raced: the plan has an in-place launch");
+                    eprintln!("[tune] not raced: the plan has a launch that cannot be repeated");
                 }
                 return Ok(base);
             }
-        }
-
-        // One probe pass over the base plan. `launch_variants` holds the work
-        // gate, so "every launch offered nothing" is "not worth tuning".
-        let probe: Vec<Vec<(String, Plan)>> = {
-            let g = graph.state().egraph.lock();
-            (0..base.launches.len())
-                .map(|ix| {
-                    self.inner.extractor.launch_variants(
-                        &g,
-                        roots,
-                        &base,
-                        ix,
-                        self.inner.cost.as_ref(),
-                        min_macs,
-                    )
-                })
-                .collect()
-        };
-        if probe.iter().all(Vec::is_empty) {
-            if log {
-                eprintln!(
-                    "[tune] not raced: no launch of {} offers a variant above {min_macs} macs",
-                    base.launches.len()
-                );
-            }
-            return Ok(base);
         }
 
         // The plan's identity across processes: every launch signature in
@@ -1975,6 +1974,35 @@ impl Session {
         let Some(reference) = self.timed_run(guard, graph, &base, values, repetitions)? else {
             return Ok(base);
         };
+
+        // Which launches are worth probing at all, decided on the reference
+        // run's own per-kernel spans and aggregated by launch signature: a
+        // transformer dispatches the same few kernels once per layer, so the
+        // thing worth tuning is the kernel, and one layer's share of the plan
+        // understates it by the layer count. Without device timestamps there
+        // is nothing to decide on and every launch qualifies, as before.
+        let worth_probing: Vec<bool> = match &reference.gpu_us {
+            Some(spans) => {
+                let sigs: Vec<String> = {
+                    let g = graph.state().egraph.lock();
+                    base.launches
+                        .iter()
+                        .map(|l| fusor_cost::extract::launch_signature(&g, l))
+                        .collect()
+                };
+                let mut by_sig: std::collections::HashMap<&str, f64> =
+                    std::collections::HashMap::new();
+                for (sig, us) in sigs.iter().zip(spans) {
+                    *by_sig.entry(sig.as_str()).or_default() += *us;
+                }
+                let floor: f64 = spans.iter().sum::<f64>() * TUNE_MIN_SHARE;
+                sigs.iter()
+                    .map(|sig| by_sig.get(sig.as_str()).is_some_and(|s| *s >= floor))
+                    .collect()
+            }
+            None => vec![true; base.launches.len()],
+        };
+
         // What this pass actually adopts, per launch, so the combination can
         // be recorded rather than reassembled from per-launch minima that
         // were never measured together.
@@ -2002,16 +2030,33 @@ impl Session {
             );
         }
 
-        for (ix, probed) in probe.into_iter().enumerate() {
-            if probed.is_empty() {
-                continue;
+        // Widest span first: the budget is finite, and a launch that holds
+        // more of the plan is where it buys the most.
+        let mut order: Vec<usize> = (0..base.launches.len())
+            .filter(|ix| worth_probing.get(*ix).copied().unwrap_or(true))
+            .collect();
+        if let Some(spans) = &reference.gpu_us {
+            order.sort_by(|a, b| {
+                let get = |i: &usize| spans.get(*i).copied().unwrap_or(0.0);
+                get(b)
+                    .partial_cmp(&get(a))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+        }
+        let mut raced_count = 0usize;
+        for ix in order {
+            if !verify_members && raced_count >= TUNE_MAX_RACES {
+                if log {
+                    eprintln!("[tune] race budget of {TUNE_MAX_RACES} spent");
+                }
+                break;
             }
-            // The incumbent is carried across launches, so once a tile has
-            // been adopted the next launch's alternatives must be re-derived
-            // against it; while nothing has moved the probe is still exact.
-            let variants = if Arc::ptr_eq(&best, &base) {
-                probed
-            } else {
+            // Built here, not in one pass up front: a candidate is a replan
+            // of the whole plan, and the budget above means most launches are
+            // never reached. It is derived against `best` rather than `base`
+            // because an adoption at an earlier launch has already moved the
+            // incumbent these alternatives must beat.
+            let variants = {
                 let g = graph.state().egraph.lock();
                 self.inner.extractor.launch_variants(
                     &g,
@@ -2022,6 +2067,9 @@ impl Session {
                     min_macs,
                 )
             };
+            if variants.is_empty() {
+                continue;
+            }
             // What this machine already knows about this launch decides where
             // the time goes: re-confirm a known incumbent, explore a bounded
             // number of never-tried points, skip variants this device has
@@ -2069,6 +2117,7 @@ impl Session {
                 None => variants,
             };
             for (label, candidate) in variants {
+                raced_count += 1;
                 let candidate = Arc::new(candidate);
                 raced.push(Arc::clone(&candidate));
                 let sample = match self.timed_run(guard, graph, &candidate, values, repetitions) {
@@ -2491,6 +2540,7 @@ fn rebuild_op(op: &Op, children: &[Id], dims: &mut dyn FnMut(Dim) -> Dim) -> Opt
             axis,
             combine,
             unique,
+            run,
             ..
         }) => Op::Logical(Logical::Scatter {
             axis: *axis,
@@ -2499,6 +2549,7 @@ fn rebuild_op(op: &Op, children: &[Id], dims: &mut dyn FnMut(Dim) -> Dim) -> Opt
             idx: child(1)?,
             upd: child(2)?,
             unique: *unique,
+            run: *run,
         }),
         Op::Logical(Logical::Dequant { fmt, layout, .. }) => Op::Logical(Logical::Dequant {
             fmt: *fmt,
@@ -2981,19 +3032,55 @@ fn agrees(dtype: Dtype, a: &[u8], b: &[u8]) -> bool {
     if a == b {
         return true;
     }
-    if dtype != Dtype::F32 {
+    // Integers are exact or they are wrong. Floats are compared to the
+    // precision they carry: two members of a class may evaluate the same
+    // expression in a different association or round through a different
+    // intermediate, and for a half-precision result that shows up in the
+    // last bit. Demanding bit equality there reports arithmetic as a
+    // miscompile.
+    let Some(values) = float_elements(dtype, a).zip(float_elements(dtype, b)) else {
         return false;
-    }
-    let f = |s: &[u8]| {
-        s.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect::<Vec<f32>>()
     };
-    let (x, y) = (f(a), f(b));
+    let (x, y) = values;
+    let tol = match dtype {
+        Dtype::F32 => 1e-3,
+        // Half precision holds about three decimal digits, so the same
+        // relative bound would be inside one ulp.
+        _ => 5e-3,
+    };
     let scale = x.iter().fold(1.0f32, |m, v| m.max(v.abs()));
-    x.iter().zip(&y).all(|(p, q)| (p - q).abs() <= 1e-3 * scale)
+    x.iter().zip(&y).all(|(p, q)| (p - q).abs() <= tol * scale)
+}
+
+/// A float buffer's elements as `f32`, or `None` when the dtype is not one.
+fn float_elements(dtype: Dtype, bytes: &[u8]) -> Option<Vec<f32>> {
+    match dtype {
+        Dtype::F32 => Some(
+            bytes
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|c| f32::from_le_bytes(*c))
+                .collect(),
+        ),
+        Dtype::F16 => Some(
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| half::f16::from_le_bytes(*c).to_f32())
+                .collect(),
+        ),
+        Dtype::BF16 => Some(
+            bytes
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|c| half::bf16::from_le_bytes(*c).to_f32())
+                .collect(),
+        ),
+        _ => None,
+    }
 }
 
 /// One element's little-endian bytes, in the splat's own dtype.

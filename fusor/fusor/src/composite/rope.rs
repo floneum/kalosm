@@ -322,8 +322,8 @@ fn rope_pair_with(
             let mut shape = t.shape_of(qi);
             shape[1] = Dim::Const(hq + hk);
             let base = t.zeros_shaped(dtype, &shape)?;
-            let base = t.scatter_set(1, base, lower, qi, true)?;
-            let both = t.scatter_set(1, base, upper, ki, true)?;
+            let base = t.scatter_set_run(1, base, lower, qi, true, Some(0))?;
+            let both = t.scatter_set_run(1, base, upper, ki, true, u32::try_from(hq).ok())?;
             rope_defn(t, both, ci, si, &ops)
         },
     )?;

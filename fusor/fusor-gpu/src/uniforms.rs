@@ -162,6 +162,19 @@ impl UniformPack {
         self.sym_index.get(&sym).copied()
     }
 
+    /// Every symbolic extent this pack carries, paired with its word index.
+    ///
+    /// The emitter needs this to render a `Dim::Sym` extent as a load rather
+    /// than a literal, and it travels with the kernel because the emitter runs
+    /// long after the pack is gone.
+    pub(crate) fn dim_slots(&self) -> smallvec::SmallVec<[(SymId, u32); 4]> {
+        self.dim_syms
+            .iter()
+            .enumerate()
+            .map(|(i, s)| (*s, i as u32))
+            .collect()
+    }
+
     /// Word index of a runtime scalar at binding 0.
     pub(crate) fn scalar_slot(&self, sym: SymId) -> Option<u32> {
         self.scalar_index.get(&sym).copied()

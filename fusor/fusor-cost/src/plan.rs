@@ -655,6 +655,7 @@ fn hash_l0<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &Logical) {
             idx,
             upd,
             unique,
+            run,
         } => {
             h.write_u32(*axis);
             combine.hash(h);
@@ -662,6 +663,7 @@ fn hash_l0<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &Logical) {
             h.write_u32(idx.0);
             h.write_u32(upd.0);
             h.write_u8(u8::from(*unique));
+            run.hash(h);
         }
         Logical::Dequant { fmt, layout, x } => {
             fmt.hash(h);

@@ -13,7 +13,7 @@ use fusor_ir::ir::kernel::{
     TileExprKind, TileLiteral, TileReduceOp,
 };
 use fusor_ir::scalar::{BinOp, CmpOp, UnOp};
-use fusor_ir::shape::AxisGroup;
+use fusor_ir::shape::{AxisGroup, Dim};
 use fusor_ir::target::EmitError;
 use naga::{
     BinaryOperator, Block, Expression, GlobalVariable, Handle, Literal, LocalVariable,
@@ -325,6 +325,84 @@ impl Emitter<'_> {
         self.bin(body, op, value, rhs)
     }
 
+    /// A `u32` expression for one dimension.
+    ///
+    /// A constant is an immediate; a symbol is a load of its word in binding
+    /// 0. That distinction is the whole reason the tile level carries `Dim`:
+    /// a sequence length reaching this point as a literal would make the
+    /// kernel body a function of the length, and every new length would miss
+    /// the artifact cache and pay a fresh shader compile.
+    pub(crate) fn dim_value(
+        &mut self,
+        body: &mut Block,
+        dim: Dim,
+    ) -> Result<Handle<Expression>, EmitError> {
+        match dim {
+            Dim::Const(v) => {
+                let v = u32::try_from(v).map_err(|_| {
+                    EmitError::Unsupported(format!("extent {v} does not fit in a u32"))
+                })?;
+                Ok(self.u32_lit(v))
+            }
+            Dim::Sym(sym) => {
+                let slot = self.ir.sym_slot(sym).ok_or_else(|| {
+                    EmitError::Unsupported(format!("symbol {sym} has no uniform slot"))
+                })?;
+                let uniform =
+                    self.ir.buffers.first().cloned().ok_or_else(|| {
+                        EmitError::Unsupported("kernel has no uniform block".into())
+                    })?;
+                let global = self.buffer_global(&uniform)?;
+                let base = self.global_var(global);
+                let index = self.u32_lit(slot);
+                let pointer = self.emit_expr(body, Expression::Access { base, index });
+                Ok(self.emit_load(body, pointer))
+            }
+        }
+    }
+
+    /// `value * dim`, an immediate multiply when `dim` is known.
+    pub(crate) fn mul_dim_u32(
+        &mut self,
+        body: &mut Block,
+        value: Handle<Expression>,
+        dim: Dim,
+    ) -> Result<Handle<Expression>, EmitError> {
+        if let Some(k) = dim_as_u32(dim) {
+            return Ok(self.mul_literal_u32(body, value, k));
+        }
+        let rhs = self.dim_value(body, dim)?;
+        Ok(self.bin(body, BinaryOperator::Multiply, value, rhs))
+    }
+
+    /// `value / dim`, an immediate (shift when a power of two) when known.
+    pub(crate) fn div_dim_u32(
+        &mut self,
+        body: &mut Block,
+        value: Handle<Expression>,
+        dim: Dim,
+    ) -> Result<Handle<Expression>, EmitError> {
+        if let Some(k) = dim_as_u32(dim) {
+            return Ok(self.div_literal_u32(body, value, k));
+        }
+        let rhs = self.dim_value(body, dim)?;
+        Ok(self.bin(body, BinaryOperator::Divide, value, rhs))
+    }
+
+    /// `value % dim`, an immediate (mask when a power of two) when known.
+    pub(crate) fn mod_dim_u32(
+        &mut self,
+        body: &mut Block,
+        value: Handle<Expression>,
+        dim: Dim,
+    ) -> Result<Handle<Expression>, EmitError> {
+        if let Some(k) = dim_as_u32(dim) {
+            return Ok(self.mod_literal_u32(body, value, k));
+        }
+        let rhs = self.dim_value(body, dim)?;
+        Ok(self.bin(body, BinaryOperator::Modulo, value, rhs))
+    }
+
     pub(crate) fn add_u32(
         &mut self,
         body: &mut Block,
@@ -390,15 +468,15 @@ impl Emitter<'_> {
                 remaining
             } else {
                 let extent = sub[axis].extent;
-                let c = self.mod_literal_u32(body, remaining, extent);
-                remaining = self.div_literal_u32(body, remaining, extent);
+                let c = self.mod_dim_u32(body, remaining, extent)?;
+                remaining = self.div_dim_u32(body, remaining, extent)?;
                 c
             };
             let stride = sub[axis].stride;
-            if stride == 0 || self.u32_literal_of(sub_coord) == Some(0) {
+            if stride.known_eq(Dim::Const(0)) || self.u32_literal_of(sub_coord) == Some(0) {
                 continue;
             }
-            let term = self.mul_literal_u32(body, sub_coord, stride);
+            let term = self.mul_dim_u32(body, sub_coord, stride)?;
             terms.push(term);
         }
         let mut iter = terms.into_iter();
@@ -1110,8 +1188,15 @@ impl Emitter<'_> {
                 // count: a symbolic buffer's decl extent would change the
                 // emitted body per sequence length.
                 let count = view.buffer.layout.element_count();
-                match u32::try_from(count) {
-                    Ok(count) if count > 0 => {
+                // A symbolic extent is still clampable: the bound is
+                // `arrayLength`, a runtime value. Only a buffer provably
+                // empty (or past a u32) falls back to the guarded form.
+                let clampable = match count {
+                    Some(c) => c > 0 && c <= u64::from(u32::MAX),
+                    None => true,
+                };
+                if clampable {
+                    {
                         let index = self.addr_index(body, view, addr)?;
                         let index = self.add_literal_u32(body, index, view.offset);
                         let global = self.buffer_global(&view.buffer)?;
@@ -1140,9 +1225,8 @@ impl Emitter<'_> {
                         self.forced_names.push((selected, format!("masked_{n}")));
                         Ok(selected)
                     }
-                    // A buffer whose extent does not fit a u32 (or is empty)
-                    // has no clamp constant, so it keeps the guarded form.
-                    _ => {
+                } else {
+                    {
                         let view = view.clone();
                         let addr = addr.clone();
                         self.masked_value(body, element, fill_h, mask_h, move |em, accept| {
@@ -1177,10 +1261,19 @@ impl Emitter<'_> {
                                 "quantized Rc2 read through a split axis".into(),
                             ));
                         };
-                        if sub.stride == 0 {
+                        let stride = sub
+                            .stride
+                            .as_const()
+                            .and_then(|v| u32::try_from(v).ok())
+                            .ok_or_else(|| {
+                                EmitError::Unsupported(
+                                    "quantized Rc2 read through a symbolic stride".into(),
+                                )
+                            })?;
+                        if stride == 0 {
                             continue;
                         }
-                        let term = if sub.stride == 1 {
+                        let term = if stride == 1 {
                             coord.clone()
                         } else {
                             TileExpr::new(
@@ -1188,7 +1281,7 @@ impl Emitter<'_> {
                                     op: fusor_ir::ir::kernel::TileBinaryOp::Mul,
                                     left: coord.clone(),
                                     right: TileExpr::new(
-                                        TileExprKind::Literal(TileLiteral::U32(sub.stride)),
+                                        TileExprKind::Literal(TileLiteral::U32(stride)),
                                         u32_e,
                                     ),
                                     numeric: fusor_ir::dtype::NumericContract::RELAXED,
@@ -1230,13 +1323,9 @@ impl Emitter<'_> {
                 // element-space view whose extents bound the flat index; the
                 // `Linear` arm's view is the raw word stream and its extent
                 // clamps the wrong unit.
-                let total: u64 = q
-                    .data
-                    .layout
-                    .extents
-                    .iter()
-                    .map(|&e| u64::from(e))
-                    .product();
+                // `0` when an extent is symbolic, which skips the clamp
+                // below and keeps the guarded form.
+                let total: u64 = q.data.layout.element_count_or_zero();
                 if element_view && total > 0 && total <= u64::from(u32::MAX) {
                     let clamped = TileExpr::new(
                         TileExprKind::Binary {
@@ -1363,4 +1452,9 @@ pub(crate) fn tile_literal(lit: TileLiteral) -> Result<Expression, EmitError> {
         TileLiteral::Bool(v) => Literal::Bool(v),
         TileLiteral::BF16(_) => return Err(EmitError::MissingCapability("shader-bf16")),
     }))
+}
+
+/// A dim that is a `u32` immediate.
+fn dim_as_u32(dim: Dim) -> Option<u32> {
+    u32::try_from(dim.as_const()?).ok()
 }

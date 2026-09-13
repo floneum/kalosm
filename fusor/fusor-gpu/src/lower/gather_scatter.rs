@@ -386,9 +386,13 @@ fn scatter_shape(ctx: &Ctx<'_>, op: &Launch) -> Result<ScatterShape> {
 /// hands the update space), so an axis index taken from it cannot be
 /// identified with an axis of the destination this nest walks.
 fn scatter_dense(mut ctx: Ctx<'_>, op: &Launch, tiling: MapTiling) -> Result<KernelIr> {
-    let Launch::Scatter { combine, ops, .. } = op else {
+    let Launch::Scatter {
+        combine, ops, run, ..
+    } = op
+    else {
         return Err(Error::Plan("scatter_dense on a non-Scatter node".into()));
     };
+    let run = *run;
     let shape = scatter_shape(&ctx, op)?;
     let base = ops
         .first()
@@ -435,6 +439,79 @@ fn scatter_dense(mut ctx: Ctx<'_>, op: &Launch, tiling: MapTiling) -> Result<Ker
     let bins_e = ctx.b.u32(shape.bins);
     let row_span = ctx.b.u32(shape.bins.saturating_mul(shape.inner).max(1));
     let updates_e = ctx.b.u32(shape.updates);
+
+    // A contiguous index inverts by subtraction, so no lane has to look for
+    // itself: the output at bin `d` takes update `d - start`, and is
+    // untouched when that is past the end. Unsigned wrapping does the lower
+    // bound too — `d < start` wraps to something far above `updates`.
+    if let (Some(start), ScatterCombine::Set) = (run, combine) {
+        let start_e = ctx.b.u32(start);
+        let zero = ctx.b.u32(0);
+        let mut stores = Vec::with_capacity(offsets.len());
+        for flat in &offsets {
+            let flat = flat.clone();
+            let live = ctx
+                .b
+                .compare(TileCompareOp::Lt, flat.clone(), bound.clone());
+            let o = ctx.b.binary(
+                TileBinaryOp::Div,
+                flat.clone(),
+                row_span.clone(),
+                NumericContract::RELAXED,
+            );
+            let dest = {
+                let q = ctx.b.binary(
+                    TileBinaryOp::Div,
+                    flat.clone(),
+                    inner_e.clone(),
+                    NumericContract::RELAXED,
+                );
+                ctx.b.binary(
+                    TileBinaryOp::Rem,
+                    q,
+                    bins_e.clone(),
+                    NumericContract::RELAXED,
+                )
+            };
+            let within = ctx.b.binary(
+                TileBinaryOp::Rem,
+                flat.clone(),
+                inner_e.clone(),
+                NumericContract::RELAXED,
+            );
+
+            let u = ctx.b.binary(
+                TileBinaryOp::Sub,
+                dest,
+                start_e.clone(),
+                NumericContract::RELAXED,
+            );
+            let covered = ctx
+                .b
+                .compare(TileCompareOp::Lt, u.clone(), updates_e.clone());
+            // The read has to be in bounds whether or not it is used.
+            let u_safe = ctx.b.select(covered.clone(), u, zero.clone());
+            let upd_index = {
+                let row = ctx.b.mul(o, updates_e.clone());
+                let row = ctx.b.add(row, u_safe);
+                let scaled = ctx.b.mul(row, inner_e.clone());
+                ctx.b.add(scaled, within)
+            };
+            let v = ctx.load_operand(&upd, upd_index)?;
+            let v = ctx.b.cast(v, ElementType::Scalar(acc_elem));
+            let seed = ctx.load_mapped(&base, flat.clone(), total)?;
+            let seed = ctx.b.cast(seed, ElementType::Scalar(acc_elem));
+            let value = ctx.b.select(covered, v, seed);
+            let value = ctx.b.cast(value, out_elem);
+            stores.push(Stmt::Store {
+                dst: out_view.clone(),
+                addr: Addr::Linear(flat),
+                value,
+                mask: live,
+            });
+        }
+        return Ok(ctx.finish("scatter_run", grid, block, stores));
+    }
 
     // One index read per update, shared by every accumulator this lane
     // carries: `u_bin` does not depend on the output element, so the `tm`

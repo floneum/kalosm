@@ -114,14 +114,21 @@ struct GridReads {
     specs: Vec<GridSpec>,
 }
 
-/// The index space and workgroup width one [`grid_for`] call folded.
+/// What one [`grid_for`] call folded.
 ///
 /// This is the whole of a dispatch grid's dependence on the binding: replaying
 /// it at another binding is exactly what re-lowering would have computed.
 #[derive(Clone, Debug, PartialEq, Eq)]
-pub(crate) struct GridSpec {
-    pub space: IndexSpace,
-    pub block: u32,
+pub(crate) enum GridSpec {
+    /// `ceil(prod(space) / block)`: one workgroup per `block` elements of a
+    /// flattened index space.
+    Flat { space: IndexSpace, block: u32 },
+    /// `prod(ceil(dim / tile))`: a space tiled per axis, which is not the
+    /// same count as flattening first — a contraction whose `n` does not
+    /// divide its column tile rounds up once per row, not once overall.
+    Tiled {
+        tiles: smallvec::SmallVec<[(Dim, u32); 4]>,
+    },
 }
 
 impl DimBinding {
@@ -195,7 +202,7 @@ impl DimBinding {
             }
             first
         };
-        (grid_from(&spec.space, spec.block, self, limits).ok()? == grid).then_some(spec)
+        (grid_from(&spec, self, limits).ok()? == grid).then_some(spec)
     }
 
     /// Every symbol whose value the emitted module can depend on.
@@ -221,34 +228,64 @@ pub(crate) fn grid_for(
     binding: &DimBinding,
     limits: &Limits,
 ) -> Result<[u32; 3]> {
-    binding.grid.lock().specs.push(GridSpec {
+    let spec = GridSpec::Flat {
         space: space.clone(),
         block,
-    });
-    grid_from(space, block, binding, limits)
+    };
+    binding.grid.lock().specs.push(spec.clone());
+    grid_from(&spec, binding, limits)
+}
+
+/// [`grid_for`] for a per-axis tiled space: one workgroup per tile of every
+/// axis, rounded up independently.
+pub(crate) fn grid_for_tiles(
+    tiles: impl IntoIterator<Item = (Dim, u32)>,
+    binding: &DimBinding,
+    limits: &Limits,
+) -> Result<[u32; 3]> {
+    let spec = GridSpec::Tiled {
+        tiles: tiles.into_iter().collect(),
+    };
+    binding.grid.lock().specs.push(spec.clone());
+    grid_from(&spec, binding, limits)
+}
+
+/// Workgroups a [`GridSpec`] covers, before the per-dimension fold.
+pub(crate) fn groups_from(spec: &GridSpec, binding: &DimBinding) -> Result<u32> {
+    let groups = match spec {
+        GridSpec::Flat { space, block } => {
+            let mut elements: u64 = 1;
+            for dim in &space.dims {
+                elements = elements
+                    .checked_mul(binding.require_for_grid(*dim)?)
+                    .ok_or_else(|| Error::Plan("index space overflows a u64".into()))?;
+            }
+            elements.div_ceil(u64::from((*block).max(1)))
+        }
+        GridSpec::Tiled { tiles } => {
+            let mut groups: u64 = 1;
+            for (dim, tile) in tiles {
+                let extent = binding.require_for_grid(*dim)?;
+                groups = groups
+                    .checked_mul(extent.div_ceil(u64::from((*tile).max(1))).max(1))
+                    .ok_or_else(|| Error::Plan("tiled grid overflows a u64".into()))?;
+            }
+            groups
+        }
+    };
+    u32::try_from(groups).map_err(|_| Error::Plan(format!("{groups} workgroups exceeds a u32")))
 }
 
 /// Fold a grid without recording the fold. [`grid_for`] is this plus the
 /// record the artifact cache replays; a caller that already *holds* a
 /// [`GridSpec`] is evaluating that record, not making a new one.
 pub(crate) fn grid_from(
-    space: &IndexSpace,
-    block: u32,
+    spec: &GridSpec,
     binding: &DimBinding,
     limits: &Limits,
 ) -> Result<[u32; 3]> {
-    let mut elements: u64 = 1;
-    for dim in &space.dims {
-        elements = elements
-            .checked_mul(binding.require_for_grid(*dim)?)
-            .ok_or_else(|| Error::Plan("index space overflows a u64".into()))?;
-    }
-    let block = u64::from(block.max(1));
-    let groups = elements.div_ceil(block);
-    let groups = u32::try_from(groups)
-        .map_err(|_| Error::Plan(format!("{groups} workgroups exceeds a u32")))?;
     Ok(distribute_workgroups(
-        groups,
+        groups_from(spec, binding)?,
         limits.max_compute_workgroups_per_dimension,
     ))
 }
@@ -256,8 +293,8 @@ pub(crate) fn grid_from(
 /// An N-D strided operand seen as a 2-D matrix.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct MatrixView {
-    pub rows: u32,
-    pub cols: u32,
+    pub rows: Dim,
+    pub cols: Dim,
     pub offset: u32,
     pub layout: TileLayout,
 }
@@ -271,12 +308,12 @@ pub(crate) struct MatrixView {
 /// per load. Extent-1 axes are dropped from the decomposition, saving a
 /// divmod per load.
 ///
-/// The plan guarantees these strides, so a failure is [`Error::Plan`].
+/// Extents stay `Dim`. A KV-cache read is a narrow of a fixed capacity, so
+/// its strides are constants and only the length is symbolic; resolving that
+/// length here is what used to put it in the kernel body and recompile the
+/// attention kernel at every new sequence length.
 ///
-/// `row_dims` may be `0` or `rank`: a contraction whose `n` (or `k`) extent
-/// is 1 has *no* axes on that side, and its operand is a one-column (or
-/// one-row) matrix. An empty side contributes a single index of 0, so its
-/// stride never enters an address.
+/// The plan guarantees these strides, so a failure is [`Error::Plan`].
 pub(crate) fn flatten_matrix_layout_split(
     layout: &Layout,
     row_dims: usize,
@@ -289,50 +326,51 @@ pub(crate) fn flatten_matrix_layout_split(
         )));
     }
 
-    let mut shape = SmallVec::<[u64; 6]>::new();
-    for d in layout.shape() {
-        shape.push(binding.require(*d)?);
-    }
-    let mut strides = SmallVec::<[u64; 6]>::new();
+    let shape: SmallVec<[Dim; 6]> = layout.shape().iter().copied().collect();
+    let mut strides = SmallVec::<[Dim; 6]>::new();
     for (axis, s) in layout.strides().iter().enumerate() {
         // A `row_major_strides` placeholder means the plan carried a stride it
-        // never derived. Recompute it from the (now concrete) shape rather
-        // than emitting the placeholder.
+        // never derived. Recompute it from the shape rather than emitting the
+        // placeholder.
         let v = match s {
-            Dim::Sym(sym) if *sym == crate::uniforms::DERIVED_STRIDE => {
-                shape.iter().skip(axis + 1).product::<u64>()
-            }
-            other => binding.require(*other)?,
+            Dim::Sym(sym) if *sym == crate::uniforms::DERIVED_STRIDE => shape
+                .iter()
+                .skip(axis + 1)
+                .copied()
+                .fold(Dim::Const(1), |a, d| a * d),
+            other => *other,
         };
         strides.push(v);
     }
 
-    let rows: u64 = shape[..row_dims].iter().product();
-    let cols: u64 = shape[row_dims..].iter().product();
-    let rows_u32 = u32::try_from(rows)
-        .map_err(|_| Error::Plan(format!("{rows} rows exceeds a u32 coordinate")))?;
-    let cols_u32 = u32::try_from(cols)
-        .map_err(|_| Error::Plan(format!("{cols} cols exceeds a u32 coordinate")))?;
+    let product = |dims: &[Dim]| dims.iter().copied().fold(Dim::Const(1), |a, d| a * d);
+    let rows = product(&shape[..row_dims]);
+    let cols = product(&shape[row_dims..]);
     let offset = u32::try_from(binding.require(layout.offset())?)
         .map_err(|_| Error::Plan("layout offset exceeds a u32".into()))?;
 
     let side_is_affine = |lo: usize, hi: usize| -> bool {
         (lo..hi)
             .zip(lo + 1..hi)
-            .all(|(axis, next)| strides[axis] == strides[next].saturating_mul(shape[next]))
+            .all(|(axis, next)| strides[axis].known_eq(strides[next] * shape[next]))
     };
 
     // An empty side is a single index of 0; stride 0 keeps it out of the
     // address rather than reaching past the end of `strides`.
-    let innermost = |lo: usize, hi: usize| -> u64 { if lo == hi { 0 } else { strides[hi - 1] } };
+    let innermost = |lo: usize, hi: usize| -> Dim {
+        if lo == hi {
+            Dim::Const(0)
+        } else {
+            strides[hi - 1]
+        }
+    };
     let tile_layout = if side_is_affine(0, row_dims) && side_is_affine(row_dims, rank) {
-        let row_stride = u32::try_from(innermost(0, row_dims))
-            .map_err(|_| Error::Plan("row stride exceeds a u32".into()))?;
-        let col_stride = u32::try_from(innermost(row_dims, rank))
-            .map_err(|_| Error::Plan("col stride exceeds a u32".into()))?;
         TileLayout {
-            extents: smallvec::smallvec![rows_u32, cols_u32],
-            indexing: MultiFlattenMap::affine(&[rows_u32, cols_u32], &[row_stride, col_stride]),
+            extents: smallvec::smallvec![rows, cols],
+            indexing: std::sync::Arc::new(MultiFlattenMap::affine(
+                &[rows, cols],
+                &[innermost(0, row_dims), innermost(row_dims, rank)],
+            )),
             level: MemoryLevel::Storage,
         }
     } else {
@@ -341,36 +379,34 @@ pub(crate) fn flatten_matrix_layout_split(
             for axis in lo..hi {
                 // Extent-1 axes contribute nothing to the flat coordinate
                 // decomposition; dropping them saves a divmod per load.
-                if shape[axis] == 1 {
+                if shape[axis].known_eq(Dim::Const(1)) {
                     continue;
                 }
                 sub_axes.push(SubAxis {
-                    extent: u32::try_from(shape[axis])
-                        .map_err(|_| Error::Plan("sub-axis extent exceeds a u32".into()))?,
-                    stride: u32::try_from(strides[axis])
-                        .map_err(|_| Error::Plan("sub-axis stride exceeds a u32".into()))?,
+                    extent: shape[axis],
+                    stride: strides[axis],
                 });
             }
             if sub_axes.is_empty() {
                 sub_axes.push(SubAxis {
-                    extent: 1,
-                    stride: 0,
+                    extent: Dim::Const(1),
+                    stride: Dim::Const(0),
                 });
             }
             Ok(AxisGroup { sub_axes })
         };
         TileLayout {
-            extents: smallvec::smallvec![rows_u32, cols_u32],
-            indexing: MultiFlattenMap {
+            extents: smallvec::smallvec![rows, cols],
+            indexing: std::sync::Arc::new(MultiFlattenMap {
                 groups: smallvec::smallvec![group(0, row_dims)?, group(row_dims, rank)?],
-            },
+            }),
             level: MemoryLevel::Storage,
         }
     };
 
     Ok(MatrixView {
-        rows: rows_u32,
-        cols: cols_u32,
+        rows,
+        cols,
         offset,
         layout: tile_layout,
     })
@@ -390,23 +426,37 @@ pub(crate) fn flatten_matrix_layout_split(
 pub(crate) fn matrix_split_for(
     layout: &Layout,
     binding: &DimBinding,
-    rows: u64,
-    cols: u64,
+    rows: Dim,
+    cols: Dim,
 ) -> Result<usize> {
     let rank = layout.rank();
-    let mut extents = SmallVec::<[u64; 6]>::new();
-    for d in layout.shape() {
-        extents.push(binding.require(*d)?);
+    let extents: SmallVec<[Dim; 6]> = layout.shape().iter().copied().collect();
+    let product = |dims: &[Dim]| dims.iter().copied().fold(Dim::Const(1), |a, d| a * d);
+    // Structural first: two symbolic products that are the same expression
+    // are the same extent, and matching them costs no binding read. Only a
+    // shape that does not line up symbolically falls back to resolving, and
+    // that read is what makes the kernel a function of the length.
+    let structural = (0..=rank).rev().find(|split| {
+        product(&extents[..*split]).known_eq(rows) && product(&extents[*split..]).known_eq(cols)
+    });
+    if let Some(split) = structural {
+        return Ok(split);
     }
+    let mut values = SmallVec::<[u64; 6]>::new();
+    for d in &extents {
+        values.push(binding.require(*d)?);
+    }
+    let rows = binding.require(rows)?;
+    let cols = binding.require(cols)?;
     (0..=rank)
         .rev()
         .find(|split| {
-            extents[..*split].iter().product::<u64>() == rows
-                && extents[*split..].iter().product::<u64>() == cols
+            values[..*split].iter().product::<u64>() == rows
+                && values[*split..].iter().product::<u64>() == cols
         })
         .ok_or_else(|| {
             Error::Plan(format!(
-                "no axis split of {extents:?} yields {rows} rows by {cols} columns"
+                "no axis split of {values:?} yields {rows} rows by {cols} columns"
             ))
         })
 }
@@ -658,6 +708,27 @@ impl Kernel {
         numeric: NumericContract,
     ) -> TileExpr {
         let ty = left.element();
+        // Fold `u32` index arithmetic on the spot. Index expressions are now
+        // built out of dims rather than resolved numbers, so a shape that
+        // *is* constant arrives as `Div(Add(64, 3), 4)` where it used to
+        // arrive as `16`. The kernel verifier's range proof reads literals,
+        // not expression trees, and without this every constant-shaped
+        // contraction loses the proof that made its loads unmasked.
+        if let (Some(a), Some(b)) = (const_u32(&left), const_u32(&right)) {
+            let folded = match op {
+                TileBinaryOp::Add => Some(a.wrapping_add(b)),
+                TileBinaryOp::Sub => Some(a.wrapping_sub(b)),
+                TileBinaryOp::Mul => Some(a.wrapping_mul(b)),
+                TileBinaryOp::Div if b != 0 => Some(a / b),
+                TileBinaryOp::Rem if b != 0 => Some(a % b),
+                TileBinaryOp::Min => Some(a.min(b)),
+                TileBinaryOp::Max => Some(a.max(b)),
+                _ => None,
+            };
+            if let Some(v) = folded {
+                return self.u32(v);
+            }
+        }
         self.intern(
             TileExprKind::Binary {
                 op,
@@ -862,6 +933,21 @@ pub(crate) struct Ctx<'a> {
     /// `Plan` value -> index into [`Self::buffers`].
     slot_of: FxHashMap<Id, usize>,
     pack: std::sync::Arc<UniformPack>,
+    /// An upper bound every linear index in this body is known to be under,
+    /// when the nest could prove one.
+    ///
+    /// A load is masked because its index might run past the operand, and
+    /// the mask is not free: an unproven index is clamped against
+    /// `arrayLength` and the value wrapped in a `select` (see
+    /// `emit::expr`, `Source::Storage`), three instructions an element on a
+    /// kernel whose whole body is a load, an add and a store. A nest whose
+    /// dispatch covers its space exactly knows no lane is past the end and
+    /// says so here; a load whose operand is at least this long then needs
+    /// no mask at all.
+    proven_index_lt: Option<u64>,
+    /// Symbolic extents this lowering has discharged a bound for; see
+    /// [`fusor_ir::ir::kernel::KernelIr::proven_extents`].
+    proven_extents: smallvec::SmallVec<[Dim; 2]>,
 }
 
 impl<'a> Ctx<'a> {
@@ -934,7 +1020,32 @@ impl<'a> Ctx<'a> {
             buffers,
             slot_of,
             pack,
+            proven_index_lt: None,
+            proven_extents: smallvec::SmallVec::new(),
         })
+    }
+
+    /// Declare that every linear index this body computes is below `bound`.
+    /// See [`Self::proven_index_lt`].
+    pub(crate) fn prove_index_lt(&mut self, bound: u64) {
+        self.proven_index_lt = Some(bound);
+    }
+
+    /// Declare that every index this body forms stays inside `extent`.
+    ///
+    /// For a symbolic extent, which no arithmetic in the verifier can check:
+    /// the caller must have derived its grid (and any clamp on the flat
+    /// workgroup index) from this same extent, which is what makes the bound
+    /// hold at every binding. See `KernelIr::proven_extents`.
+    pub(crate) fn prove_extent(&mut self, extent: Dim) {
+        if extent.as_const().is_none() && !self.proven_extents.contains(&extent) {
+            self.proven_extents.push(extent);
+        }
+    }
+
+    /// Whether an index into a `count`-element operand is provably in range.
+    fn index_is_proven(&self, count: u64) -> bool {
+        self.proven_index_lt.is_some_and(|b| b <= count)
     }
 
     /// The bound buffer for a plan value.
@@ -1121,8 +1232,8 @@ impl<'a> Ctx<'a> {
     pub(crate) fn contract_side_sources(
         &mut self,
         side: &ContractSide,
-        rows: u32,
-        cols: u32,
+        rows: Dim,
+        cols: Dim,
     ) -> Result<Vec<StagedSource>> {
         side.ops
             .iter()
@@ -1142,15 +1253,10 @@ impl<'a> Ctx<'a> {
     pub(crate) fn contract_operand_view(
         &self,
         operand: &Operand,
-        rows: u32,
-        cols: u32,
+        rows: Dim,
+        cols: Dim,
     ) -> Result<fusor_ir::ir::kernel::StorageView> {
-        let split = matrix_split_for(
-            &operand.layout,
-            &self.binding,
-            u64::from(rows),
-            u64::from(cols),
-        )?;
+        let split = matrix_split_for(&operand.layout, &self.binding, rows, cols)?;
         self.matrix_view(operand, split)
     }
 
@@ -1177,13 +1283,20 @@ impl<'a> Ctx<'a> {
                     .map_err(|_| Error::Plan(format!("extent {v} exceeds a u32")))?;
                 Ok(self.b.u32(v))
             }
-            Dim::Sym(s) => {
-                let slot = self
-                    .pack
-                    .dim_slot(s)
-                    .ok_or_else(|| Error::Plan(format!("symbol {s} has no uniform slot")))?;
-                Ok(self.uniform_word(slot))
-            }
+            Dim::Sym(s) => match self.pack.dim_slot(s) {
+                Some(slot) => Ok(self.uniform_word(slot)),
+                // A symbol the pack does not carry — a derived expression
+                // over other dims, or one no buffer layout mentions — has no
+                // word to read, so it folds. The read lands in `consulted`
+                // and the kernel is cached per value: correct, just not
+                // shared across lengths the way a slotted symbol is.
+                None => {
+                    let v = self.binding.require(dim)?;
+                    let v = u32::try_from(v)
+                        .map_err(|_| Error::Plan(format!("extent {v} exceeds a u32")))?;
+                    Ok(self.b.u32(v))
+                }
+            },
         }
     }
 
@@ -1233,6 +1346,24 @@ impl<'a> Ctx<'a> {
         let block_e = self.b.u32(block);
         let base = self.b.mul(group, block_e);
         self.b.add(base, lane)
+    }
+
+    /// How many threads this dispatch launches, as an expression.
+    ///
+    /// The span a grid-stride loop steps by: thread `i` of `n` covers
+    /// `i, i + n, i + 2n, ...`, so consecutive threads stay on consecutive
+    /// elements at every step and the loads keep coalescing. Read from
+    /// `@builtin(num_workgroups)` for the same reason [`Self::global_index`]
+    /// does, so the dispatch extents never get baked into the body.
+    pub(crate) fn grid_threads(&mut self, block: u32) -> TileExpr {
+        use fusor_ir::ir::kernel::WorkgroupAxis;
+        let x = self.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::X));
+        let y = self.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::Y));
+        let z = self.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::Z));
+        let xy = self.b.mul(x, y);
+        let groups = self.b.mul(xy, z);
+        let block_e = self.b.u32(block);
+        self.b.mul(groups, block_e)
     }
 
     /// The value this launch writes: the launch root when it is bound for
@@ -1476,14 +1607,55 @@ impl<'a> Ctx<'a> {
     /// its `%`: `flat` is masked below the space total by the caller, so the
     /// quotient is already in range.
     fn symbolic_operand_address(&mut self, operand: &Operand, flat: TileExpr) -> Result<TileExpr> {
-        if matches!(
-            operand.access,
-            fusor_ir::ir::launch::AccessPlan::Unflatten(_)
-        ) {
-            return Err(Error::Plan(format!(
-                "a symbolic Unflatten window is not lowerable; operand {} laid out {:?}",
-                operand.src, operand.layout
-            )));
+        // An `Unflatten` window states its own decomposition rather than
+        // deriving one from the layout, so it is walked here in the same
+        // order [`Operand::address_map`] walks it — groups outermost-last,
+        // sub-axes most-significant-first — with every extent and stride read
+        // as a dim instead of folded into a literal.
+        if let fusor_ir::ir::launch::AccessPlan::Unflatten(map) = &operand.access {
+            let mut terms: Vec<(Dim, Dim, Dim)> = Vec::new();
+            let mut div_after = Dim::Const(1);
+            for g in map.groups.iter().rev() {
+                let mut below = Dim::Const(1);
+                for sub in g.sub_axes.iter().rev() {
+                    terms.push((div_after * below, sub.extent, sub.stride));
+                    below = below * sub.extent;
+                }
+                div_after = div_after * below;
+            }
+            let mut acc: Option<TileExpr> = None;
+            for (divisor, modulus, stride) in terms {
+                // A one-wide axis and a broadcast axis both contribute zero.
+                if modulus.known_eq(Dim::Const(1)) || stride.known_eq(Dim::Const(0)) {
+                    continue;
+                }
+                let mut e = flat.clone();
+                if !divisor.known_eq(Dim::Const(1)) {
+                    let d = self.dim_expr(divisor)?;
+                    e = self
+                        .b
+                        .binary(TileBinaryOp::Div, e, d, NumericContract::RELAXED);
+                }
+                let m = self.dim_expr(modulus)?;
+                e = self
+                    .b
+                    .binary(TileBinaryOp::Rem, e, m, NumericContract::RELAXED);
+                if !stride.known_eq(Dim::Const(1)) {
+                    let s = self.dim_expr(stride)?;
+                    e = self.b.mul(e, s);
+                }
+                acc = Some(match acc {
+                    Some(a) => self.b.add(a, e),
+                    None => e,
+                });
+            }
+            let mut out = acc.unwrap_or_else(|| self.b.u32(0));
+            let offset = operand.layout.offset();
+            if !offset.known_eq(Dim::Const(0)) {
+                let o = self.dim_expr(offset)?;
+                out = self.b.add(out, o);
+            }
+            return Ok(out);
         }
         let layout = operand.layout.clone();
         // A contiguous offset-0 layout is the identity over its own space —
@@ -1755,7 +1927,14 @@ impl<'a> Ctx<'a> {
             }
             _ => self.b.u32(1),
         };
-        let mask = self.b.compare(TileCompareOp::Lt, index.clone(), bound);
+        // A nest that proved its indices stay inside an operand this long
+        // needs no test: the mask is true and the load issues straight,
+        // without the `arrayLength` clamp and `select` an unproven index
+        // carries. See `Ctx::proven_index_lt`.
+        let mask = match view.buffer.layout.element_count() {
+            Some(count) if self.index_is_proven(count) => self.b.bool(true),
+            _ => self.b.compare(TileCompareOp::Lt, index.clone(), bound),
+        };
         let fill = self.zero_of(elem);
         Ok(self
             .b
@@ -1799,6 +1978,8 @@ impl<'a> Ctx<'a> {
                 None
             },
             name,
+            sym_slots: self.pack.dim_slots(),
+            proven_extents: self.proven_extents,
         }
     }
 }
@@ -1911,5 +2092,13 @@ pub(crate) fn lower(
             node.op.tag() as u32,
             kernels.len()
         )))
+    }
+}
+
+/// A `u32` literal, for the builder's index folding.
+fn const_u32(e: &TileExpr) -> Option<u32> {
+    match e.kind() {
+        TileExprKind::Literal(fusor_ir::ir::kernel::TileLiteral::U32(v)) => Some(*v),
+        _ => None,
     }
 }

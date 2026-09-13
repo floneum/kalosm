@@ -15,7 +15,7 @@ pub use sgemm::legal as sgemm_legal;
 pub use sgemv::legal as sgemv_legal;
 
 pub use coop::{coop_domain, coop_tiles, stage_element};
-pub use fold::{emitted_block, fold_domain, fold_domain_for};
+pub use fold::{emitted_block, fold_domain, fold_domain_for, fold_domain_sized};
 pub use map::map_domain;
 pub use sgemm::sgemm_domain;
 pub use sgemv::sgemv_domain;

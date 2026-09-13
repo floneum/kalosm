@@ -754,6 +754,5 @@ fn unit_stride(view: &StorageView, axis: usize) -> bool {
             .groups
             .get(axis)
             .and_then(|g| g.sub_axes.first())
-            .map(|s| s.stride)
-            == Some(1)
+            .is_some_and(|s| s.stride.known_eq(fusor_ir::shape::Dim::Const(1)))
 }

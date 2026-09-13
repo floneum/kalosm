@@ -15,6 +15,7 @@ use fusor_ir::ir::kernel::{
     Addr, CoopMatrixRole, CoopSrc, ElementType, ScalarElement, StorageView, Tile, TileExpr,
     TileLayout, cooperative_store_layout_supported,
 };
+use fusor_ir::shape::Dim;
 use fusor_ir::target::EmitError;
 use naga::{
     AddressSpace, ArraySize, Barrier, Block, CooperativeData, CooperativeRole, Expression,
@@ -30,7 +31,23 @@ pub(crate) fn tile_shape(tile: &Tile) -> Result<[u32; 2], EmitError> {
             "a workgroup tile must be rank-2".into(),
         ));
     }
-    Ok([tile.layout.extents[0], tile.layout.extents[1]])
+    Ok([
+        const_dim(tile.layout.extents[0])?,
+        const_dim(tile.layout.extents[1])?,
+    ])
+}
+
+/// A `Dim` that has to be an immediate here.
+///
+/// Every cooperative shape is a WGSL type parameter or an immediate operand,
+/// so it cannot come from a uniform word. Lowering only reaches this code
+/// after gating on constant shapes, so the error is a guard, not a path.
+fn const_dim(dim: Dim) -> Result<u32, EmitError> {
+    dim.as_const()
+        .and_then(|v| u32::try_from(v).ok())
+        .ok_or_else(|| {
+            EmitError::Unsupported(format!("a cooperative shape must be constant, got {dim:?}"))
+        })
 }
 
 /// A workgroup tile's row stride, requiring a row-major affine layout.
@@ -48,8 +65,8 @@ fn layout_row_major_stride(layout: &TileLayout) -> Result<u32, EmitError> {
         .indexing
         .groups
         .iter()
-        .map(|g| g.sub_axes[0].stride)
-        .collect();
+        .map(|g| const_dim(g.sub_axes[0].stride))
+        .collect::<Result<_, _>>()?;
     if strides[1] != 1 {
         return Err(EmitError::Unsupported(
             "a workgroup tile must be row-major".into(),
@@ -69,8 +86,8 @@ fn cooperative_store_layout(layout: &TileLayout) -> Result<(u32, bool), EmitErro
         .indexing
         .groups
         .iter()
-        .map(|g| g.sub_axes[0].stride)
-        .collect();
+        .map(|g| const_dim(g.sub_axes[0].stride))
+        .collect::<Result<_, _>>()?;
     if strides[1] == 1 {
         Ok((strides[0], true))
     } else {

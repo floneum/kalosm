@@ -854,11 +854,11 @@ pub(crate) fn as_alias_over(o: &Operand, space: &IndexSpace) -> Option<Operand> 
     let mut strides: Vec<Dim> = Vec::with_capacity(space.rank());
     for (g, d) in map.groups.iter().zip(&space.dims) {
         let s = g.sub_axes[0];
-        if u64::from(s.extent) != d.as_const()? {
+        if !s.extent.known_eq(*d) {
             return None;
         }
         shape.push(*d);
-        strides.push(Dim::Const(u64::from(s.stride)));
+        strides.push(s.stride);
     }
     Some(Operand {
         src: o.src,

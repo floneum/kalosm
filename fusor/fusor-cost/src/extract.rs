@@ -1395,10 +1395,16 @@ fn sample_points(domain: &ScheduleDomain) -> SmallVec<[SchedPoint; 8]> {
             }
         }
         other => {
-            // Two points off a non-coop family: enough to tell the family
-            // apart from Coop.
+            // The whole domain, capped. Two points used to be taken from
+            // here — enough to tell one family from another, but not to
+            // choose within one: an elementwise map offers four tilings and
+            // exactly one of them was ever timed, so three of its four
+            // schedules could not be measured however wrong the model's
+            // ranking was. These domains are small (at most `MAX_TILINGS`
+            // tilings, `MAX_STRATEGIES` fold strategies), so the whole
+            // thing fits inside the per-launch variant budget.
             let n = other.len();
-            for i in [0usize, n / 2] {
+            for i in 0..n.min(TUNE_MAX_VARIANTS) {
                 if let Some(p) = other.point(i)
                     && !out.contains(&p)
                 {

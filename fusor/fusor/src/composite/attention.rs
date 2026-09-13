@@ -479,8 +479,8 @@ pub fn attention_grads(
             let mut shape = t.shape_of(dk);
             shape[2] = Dim::Const(lk * 2);
             let base = t.zeros_shaped(dtype, &shape)?;
-            let base = t.scatter_set(2, base, index, dk, true)?;
-            t.scatter_set(2, base, index_upper, dv, true)
+            let base = t.scatter_set_run(2, base, index, dk, true, Some(0))?;
+            t.scatter_set_run(2, base, index_upper, dv, true, u32::try_from(lk).ok())
         },
     )?;
 

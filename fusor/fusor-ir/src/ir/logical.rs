@@ -83,6 +83,16 @@ pub enum Logical {
         idx: Id,
         upd: Id,
         unique: bool,
+        /// `Some(start)` when `idx` is exactly the contiguous run
+        /// `start .. start + updates`, which is what padding, `cat`,
+        /// `stack`, `repeat` and `slice_assign` all build.
+        ///
+        /// Without it a scatter has to *search*: the destination is one lane
+        /// per output element and each lane walks every update looking for
+        /// its own index, `O(out x updates)` comparisons to move `out`
+        /// elements. A run makes the inverse arithmetic — an output at
+        /// `o` takes update `o - start` — and the search disappears.
+        run: Option<u32>,
     },
 
     Dequant {

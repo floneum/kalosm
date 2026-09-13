@@ -129,6 +129,8 @@ impl Tensor {
             idx: idx.id,
             upd: updates.id,
             unique,
+            // A caller-supplied index is arbitrary.
+            run: None,
         })
     }
 

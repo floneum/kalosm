@@ -321,16 +321,16 @@ fn unflatten_of(
     let mut groups: SmallVec<[AxisGroup; 4]> = SmallVec::new();
     let mut offset: u64 = 0;
     for s in specs {
-        let extent = u32::try_from(s.size.as_const()?).ok()?;
+        let extent = s.size;
         let base = base_strides.get(s.input_dim as usize)?.as_const()?;
         // A spec's offset is in units of its own input axis, so it scales by
         // that axis's stride whether or not the axis is broadcast.
         offset = offset.checked_add(s.offset.as_const()?.checked_mul(base)?)?;
-        let stride = if s.multiplier == 0 {
+        let stride = Dim::Const(if s.multiplier == 0 {
             0
         } else {
-            u32::try_from(base.checked_mul(u64::from(s.multiplier))?).ok()?
-        };
+            base.checked_mul(u64::from(s.multiplier))?
+        });
         groups.push(AxisGroup {
             sub_axes: smallvec::smallvec![SubAxis { extent, stride }],
         });

@@ -182,11 +182,12 @@ pub(crate) fn form_of(layout: &TileLayout, addr: &Addr) -> AccessForm {
             _ => AccessForm::Gather,
         },
         Addr::Rc2 { row, col } => {
-            let unit_col = layout
-                .indexing
-                .groups
-                .get(1)
-                .is_some_and(|g| g.sub_axes.len() == 1 && g.sub_axes[0].stride == 1);
+            let unit_col = layout.indexing.groups.get(1).is_some_and(|g| {
+                g.sub_axes.len() == 1
+                    && g.sub_axes[0]
+                        .stride
+                        .known_eq(fusor_ir::shape::Dim::Const(1))
+            });
             let row_uniform = matches!(lane_affine(row), Some(LaneAffine { coeff: 0, .. }));
             let col_aff = lane_affine(col);
             match (unit_col, row_uniform, col_aff) {

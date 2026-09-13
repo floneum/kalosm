@@ -216,10 +216,11 @@ fn elements(l: &Layout) -> Option<u64> {
 fn decompose(l: &Layout) -> Option<MultiFlattenMap> {
     let mut groups: SmallVec<[AxisGroup; 4]> = SmallVec::new();
     for (d, s) in l.shape().iter().zip(l.strides()) {
-        let extent = u32::try_from(d.as_const()?).ok()?;
-        let stride = u32::try_from(s.as_const()?).ok()?;
         groups.push(AxisGroup {
-            sub_axes: smallvec::smallvec![SubAxis { extent, stride }],
+            sub_axes: smallvec::smallvec![SubAxis {
+                extent: *d,
+                stride: *s,
+            }],
         });
     }
     (!groups.is_empty()).then_some(MultiFlattenMap { groups })

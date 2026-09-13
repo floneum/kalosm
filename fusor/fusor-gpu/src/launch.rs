@@ -307,9 +307,36 @@ pub struct Launcher {
     /// handles do not hold the buffer, so the pool's `strong_count == 1`
     /// recycling is unaffected.
     bind_groups: Mutex<lru::LruCache<BindGroupKey, BindGroupEntry>>,
+    /// Work recorded but not yet handed to the queue.
+    ///
+    /// Opening an encoder, closing it and submitting cost about 6.4 us of
+    /// host time between them in a browser, where every call crosses the
+    /// wasm boundary — against a kernel that often runs in less. Paid once
+    /// per resolve, that is most of what a small dispatch costs. An encoder
+    /// left open across resolves pays it once per flush instead.
+    ///
+    /// Nothing observes the difference: submissions execute in order, so a
+    /// dispatch recorded later still sees an earlier one's writes, which is
+    /// the same guarantee the pool already recycles buffers on. What does
+    /// observe it is anything that waits for results, so [`Self::flush`]
+    /// runs first in every one of those (see its callers).
+    pending: Mutex<Option<Pending>>,
     /// Set by the driver's device-lost callback; every poll checks it.
     lost: crate::device::LostFlag,
 }
+
+/// An open encoder and how many dispatches it holds.
+struct Pending {
+    encoder: wgpu::CommandEncoder,
+    dispatches: usize,
+}
+
+/// Dispatches an open encoder may hold before it is submitted anyway.
+///
+/// Deferring is free in host time and costs latency: nothing runs until the
+/// flush. A bound keeps a long round from sitting entirely in one command
+/// buffer, and is high enough that the per-submit cost is amortized away.
+const MAX_PENDING_DISPATCHES: usize = 32;
 
 /// What a cached bind group was built from.
 #[derive(Clone, PartialEq, Eq, Hash)]
@@ -355,6 +382,7 @@ impl Launcher {
             bind_groups: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(BIND_GROUP_CAPACITY).expect("nonzero"),
             )),
+            pending: Mutex::new(None),
         }
     }
 
@@ -419,10 +447,16 @@ impl Launcher {
     /// Upload binding 0. Scalars like the learning rate and sequence length
     /// are uniform words here, so they never enter a kernel's identity.
     pub fn write_uniforms(&self, slot0: &Buf, uniforms: &Uniforms) -> Result<()> {
+        self.write_uniform_bytes(slot0, &uniforms.to_bytes())
+    }
+
+    /// [`Self::write_uniforms`] over words already packed, so a caller that
+    /// keeps the last words to compare against does not pack them twice.
+    pub fn write_uniform_bytes(&self, slot0: &Buf, words: &[u8]) -> Result<()> {
         let gpu = slot0
             .downcast_ref::<GpuBuffer>()
             .ok_or_else(|| Error::Device("binding 0 is not a pooled buffer".into()))?;
-        let mut bytes = uniforms.to_bytes();
+        let mut bytes = words.to_vec();
         if bytes.is_empty() {
             bytes.extend_from_slice(&0u32.to_le_bytes());
         }
@@ -517,6 +551,23 @@ impl Launcher {
         // A dispatch whose grid contains a zero launches nothing and still
         // costs a pass boundary, so it never reaches the encoder.
         let live: Vec<&CommandRecord> = records.iter().filter(|r| !r.is_empty_dispatch()).collect();
+        // The fast path: no timestamps, no per-dispatch trace, and a policy
+        // that would have put the whole resolve in one submission anyway.
+        // Record into the open encoder and let [`Self::flush`] submit it.
+        // A timed resolve keeps its own submission: the query set is resolved
+        // against it, and the tuner's measurement must not depend on when
+        // some other resolve happened to flush.
+        if timestamps.is_none()
+            && !trace_dispatch()
+            && dispatches_per_submit(
+                live.iter()
+                    .filter(|r| matches!(r, CommandRecord::Dispatch { .. }))
+                    .count(),
+                self.backend,
+            ) == usize::MAX
+        {
+            return self.record_pending(&live);
+        }
         let total = live
             .iter()
             .filter(|r| matches!(r, CommandRecord::Dispatch { .. }))
@@ -594,6 +645,128 @@ impl Launcher {
         }
         self.in_flight.fetch_add(1, Ordering::Relaxed);
         self.apply_back_pressure()
+    }
+
+    /// Record `live` into the open encoder, opening one if there is none and
+    /// submitting when it has grown past [`MAX_PENDING_DISPATCHES`].
+    fn record_pending(&self, live: &[&CommandRecord]) -> Result<()> {
+        let dispatches = live
+            .iter()
+            .filter(|r| matches!(r, CommandRecord::Dispatch { .. }))
+            .count();
+        let full = {
+            let mut slot = self.pending.lock();
+            let pending = slot.get_or_insert_with(|| Pending {
+                encoder: self
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("Resolver Encoder"),
+                    }),
+                dispatches: 0,
+            });
+            self.record_into(&mut pending.encoder, live)?;
+            pending.dispatches += dispatches;
+            pending.dispatches >= MAX_PENDING_DISPATCHES
+        };
+        self.dispatches
+            .fetch_add(dispatches as u64, Ordering::Relaxed);
+        if full {
+            self.flush()?;
+        }
+        Ok(())
+    }
+
+    /// Record copies and dispatches into `encoder`, untimed.
+    ///
+    /// The untraced, untimed shape of [`Self::encode_one_submit`]'s loop:
+    /// consecutive dispatches share a pass up to [`dispatches_per_pass`],
+    /// and a copy closes the current one because a pass takes only
+    /// dispatches.
+    fn record_into(
+        &self,
+        encoder: &mut wgpu::CommandEncoder,
+        records: &[&CommandRecord],
+    ) -> Result<()> {
+        let per_pass = dispatches_per_pass(
+            records
+                .iter()
+                .filter(|r| matches!(r, CommandRecord::Dispatch { .. }))
+                .count(),
+        );
+        let mut at = 0usize;
+        while at < records.len() {
+            match records[at] {
+                CommandRecord::CopyBuffer {
+                    src,
+                    src_offset,
+                    dst,
+                    dst_offset,
+                    bytes,
+                } => {
+                    let s = src
+                        .downcast_ref::<GpuBuffer>()
+                        .ok_or_else(|| Error::Device("copy source is not pooled".into()))?;
+                    let d = dst
+                        .downcast_ref::<GpuBuffer>()
+                        .ok_or_else(|| Error::Device("copy destination is not pooled".into()))?;
+                    encoder.copy_buffer_to_buffer(
+                        &s.buffer,
+                        *src_offset,
+                        &d.buffer,
+                        *dst_offset,
+                        *bytes,
+                    );
+                    at += 1;
+                }
+                CommandRecord::Dispatch { .. } => {
+                    let run_start = at;
+                    let mut run_end = at;
+                    while run_end < records.len()
+                        && matches!(records[run_end], CommandRecord::Dispatch { .. })
+                        && run_end - run_start < per_pass
+                    {
+                        run_end += 1;
+                    }
+                    let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                        label: Some("fusor resolve"),
+                        timestamp_writes: None,
+                    });
+                    for record in &records[run_start..run_end] {
+                        let CommandRecord::Dispatch {
+                            name,
+                            pipeline,
+                            bind_group,
+                            grid,
+                        } = record
+                        else {
+                            unreachable!("the run is all dispatches");
+                        };
+                        pass.push_debug_group(name);
+                        pass.set_pipeline(pipeline);
+                        pass.set_bind_group(0, bind_group.as_ref(), &[]);
+                        pass.dispatch_workgroups(grid[0], grid[1], grid[2]);
+                        pass.pop_debug_group();
+                    }
+                    drop(pass);
+                    at = run_end;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Submit whatever is recorded and not yet handed to the queue.
+    ///
+    /// Every path that waits on a result calls this first: a reader that
+    /// skipped it would map a buffer whose dispatch is still sitting in an
+    /// unsubmitted encoder and read whatever was there before.
+    pub fn flush(&self) -> Result<()> {
+        let Some(pending) = self.pending.lock().take() else {
+            return Ok(());
+        };
+        self.queue.submit([pending.encoder.finish()]);
+        self.in_flight.fetch_add(1, Ordering::Relaxed);
+        Ok(())
     }
 
     /// One `wgpu::CommandEncoder`, consecutive dispatches packed into as few
@@ -794,6 +967,7 @@ impl Launcher {
     /// what a benchmark times against — a readback would add its own copy.
     pub async fn wait_async(&self) -> Result<()> {
         self.lost.check()?;
+        self.flush()?;
         let done = MapDone::default();
         let signal = done.clone();
         self.queue
@@ -814,6 +988,9 @@ impl Launcher {
     /// fatal panic that never says why the device went away.
     pub fn poll_wait(&self) -> Result<()> {
         self.lost.check()?;
+        // Anything still in the open encoder has not reached the queue, so
+        // waiting for "every submitted dispatch" would not wait for it.
+        self.flush()?;
         self.poll_wait_inner()?;
         self.lost.check()
     }
@@ -911,6 +1088,9 @@ impl Launcher {
                 bytes,
             };
             self.encode_command_records(&[record], None, TimingMode::All)?;
+            // The copy is queued behind the dispatches that filled `src`, and
+            // the map below waits on the queue, so it has to be on it.
+            self.flush()?;
         }
         if trace {
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
@@ -1000,6 +1180,7 @@ impl Launcher {
         if slots == 0 {
             return Ok(Vec::new());
         }
+        self.flush()?;
         // `resolve_query_set` writes 8 bytes per query into a 256-aligned
         // destination.
         let bytes = ((slots as u64) * 8).div_ceil(256).max(1) * 256;

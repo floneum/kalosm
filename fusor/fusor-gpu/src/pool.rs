@@ -66,6 +66,15 @@ pub struct BufferPool {
     ceiling_bytes: Mutex<u64>,
     poison: bool,
     upload_staging: Mutex<Vec<StagingChunk>>,
+    /// Submits whatever the launcher has recorded and not yet queued.
+    ///
+    /// An upload goes onto the queue the moment it is issued, and the queue
+    /// runs in issue order, so an upload into a buffer some unsubmitted
+    /// dispatch still writes would land *first* and be overwritten. The pool
+    /// recycles a buffer as soon as no caller holds a handle, which is
+    /// before its dispatch has necessarily been submitted, so that pairing is
+    /// reachable. Flushing first restores the order.
+    flush: Mutex<Option<Arc<dyn Fn() + Send + Sync>>>,
     lost: crate::device::LostFlag,
 }
 
@@ -112,7 +121,22 @@ impl BufferPool {
             ceiling_bytes: Mutex::new(ceiling),
             poison: config.poison_allocations,
             upload_staging: Mutex::new(Vec::new()),
+            flush: Mutex::new(None),
             lost,
+        }
+    }
+
+    /// Install the hook that submits the launcher's recorded work. See the
+    /// `flush` field.
+    pub fn set_flush(&self, flush: Arc<dyn Fn() + Send + Sync>) {
+        *self.flush.lock() = Some(flush);
+    }
+
+    /// Run the flush hook, if one is installed.
+    fn flush_pending(&self) {
+        let hook = self.flush.lock().clone();
+        if let Some(hook) = hook {
+            hook();
         }
     }
 
@@ -199,6 +223,10 @@ impl BufferPool {
     pub fn create_buffer_init(&self, data: &[u8], usage: wgpu::BufferUsages) -> Result<Buf> {
         let size = padded_copy_size(data.len() as u64);
         let buf = self.alloc_with_usage(size, usage)?;
+        // Before the write reaches the queue: the buffer may have been
+        // recycled out from under a dispatch that is recorded but not yet
+        // submitted. See the `flush` field.
+        self.flush_pending();
         let gpu = buf
             .downcast_ref::<GpuBuffer>()
             .ok_or_else(|| Error::Device("pool handed back a foreign buffer".into()))?;

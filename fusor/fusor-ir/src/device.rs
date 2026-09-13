@@ -104,6 +104,21 @@ pub struct Caps {
 }
 
 impl Caps {
+    /// Lanes that have to be resident before this device is busy.
+    ///
+    /// The single source of the figure: `seed_facts_gpu` and
+    /// `seed_facts_cpu` publish it as `DeviceFacts::saturation_lanes`, and
+    /// the schedule domains order their candidates against it. A schedule
+    /// that reaches it is using the machine; past that, more lanes are
+    /// waste, and the two statements have to agree or the seed and the cost
+    /// model disagree about the same schedule.
+    pub fn saturation_lanes(&self) -> u32 {
+        match self.kind {
+            DeviceKind::Gpu => 65_536,
+            DeviceKind::Cpu => self.threads.max(1).saturating_mul(8),
+        }
+    }
+
     /// A coop config, a *fixed* subgroup width, and enough workgroup width.
     pub fn coop_supported(&self) -> bool {
         !self.coop.is_empty()
