@@ -1,5 +1,9 @@
 # Measured performance after optimization
 
+Historical measurements for the first optimization round, commit `12155f1de`.
+See [NEXT.md](NEXT.md) for the subsequent symbolic planner, subgroup backend,
+owned executable, and current benchmark method.
+
 Date: 2026-09-13. Apple M2 Max, native Metal. These are warmed GPU kernel
 measurements on six synthetic graphs, not end-to-end training results.
 

@@ -1,4 +1,4 @@
-//! THROWAWAY: logical values have shapes and indexing semantics, never storage layouts.
+use crate::index::{Expr, reduction_index};
 pub type Id = usize;
 
 #[derive(Clone, Copy, Debug)]
@@ -177,7 +177,7 @@ impl Graph {
         }
     }
     /// A logical element address. Views compose here, before storage exists.
-    pub fn resolve_index(&self, id: Id, i: usize) -> (Id, usize) {
+    pub fn reference_index(&self, id: Id, i: usize) -> (Id, usize) {
         match &self.values[id].op {
             Op::View(view, x) => {
                 let src = &self.values[*x].shape;
@@ -201,65 +201,53 @@ impl Graph {
                         })
                         .sum(),
                 };
-                self.resolve_index(*x, j)
+                self.reference_index(*x, j)
             }
             _ => (id, i),
         }
     }
-    pub fn resolve_expr(&self, id: Id, i: &str) -> (Id, String) {
+    pub fn resolve_index(&self, id: Id, i: usize) -> (Id, usize) {
+        let (base, index) = self.index_map(id, Expr::constant(i));
+        (base, index.eval(&|_| unreachable!("constant index")))
+    }
+    /// Views compose in the same typed expression used by the proof and emitter.
+    pub fn index_map(&self, id: Id, i: Expr) -> (Id, Expr) {
         match &self.values[id].op {
             Op::View(view, x) => {
                 let src = &self.values[*x].shape;
                 let dst = &self.values[id].shape;
-                let terms = match view {
-                    View::Reshape => return self.resolve_expr(*x, i),
-                    View::Permute(axes) => axes
-                        .iter()
-                        .enumerate()
-                        .map(|(a, b)| {
-                            format!(
-                                "((({i}) / {}u) % {}u) * {}u",
-                                stride(dst, a),
-                                dst[a],
-                                stride(src, *b)
-                            )
-                        })
-                        .collect::<Vec<_>>(),
-                    View::Broadcast => src
-                        .iter()
-                        .enumerate()
-                        .filter(|(_, d)| **d != 1)
-                        .map(|(a, _)| {
-                            format!(
-                                "((({i}) / {}u) % {}u) * {}u",
-                                stride(dst, a),
-                                dst[a],
-                                stride(src, a)
-                            )
-                        })
-                        .collect(),
+                let coord = |axis| i.clone().div(stride(dst, axis)).modulo(dst[axis]);
+                let mapped = match view {
+                    View::Reshape => i,
+                    View::Permute(axes) => Expr::sum(
+                        axes.iter()
+                            .enumerate()
+                            .map(|(a, b)| coord(a).scale(stride(src, *b))),
+                    ),
+                    View::Broadcast => Expr::sum(
+                        src.iter()
+                            .enumerate()
+                            .filter(|(_, d)| **d != 1)
+                            .map(|(a, _)| coord(a).scale(stride(src, a))),
+                    ),
                 };
-                self.resolve_expr(
-                    *x,
-                    &if terms.is_empty() {
-                        "0u".into()
-                    } else {
-                        format!("({})", terms.join(" + "))
-                    },
-                )
+                self.index_map(*x, mapped)
             }
-            _ => (id, i.into()),
+            _ => (id, i),
         }
+    }
+    pub fn reduction_index(&self, source: Id, axis: usize, output: Expr, reduction: Expr) -> Expr {
+        reduction_index(&self.values[source].shape, axis, output, reduction)
     }
     pub fn read_indices(&self, id: Id, i: usize) -> Vec<(Id, usize)> {
         match &self.values[id].op {
-            Op::Point(_, xs) => xs.iter().map(|x| self.resolve_index(*x, i)).collect(),
+            Op::Point(_, xs) => xs.iter().map(|x| self.reference_index(*x, i)).collect(),
             Op::Reduce(_, x, axis) => {
                 let shape = &self.values[*x].shape;
                 let inner = stride(shape, *axis);
                 (0..shape[*axis])
                     .map(|r| {
-                        self.resolve_index(
+                        self.reference_index(
                             *x,
                             (i / inner) * shape[*axis] * inner + r * inner + i % inner,
                         )

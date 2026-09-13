@@ -1,6 +1,4 @@
-//! Pure region enumeration and late storage assignment. Exhaustive over
-//! contiguous cuts in ONE topological order, with a heuristic storage packer.
-//! This is deliberately not a claim of globally optimal GPU fusion.
+use crate::analysis::Analysis;
 use crate::graph::{Graph, Id, Op};
 use crate::storage::{Allocation, Packing, Slot, allocate};
 pub const BLOCK: usize = 64;
@@ -9,6 +7,9 @@ pub fn scratch(id: Id) -> Id {
 }
 #[derive(Clone, Debug)]
 pub struct Config {
+    pub use_subgroups: bool,
+    pub subgroup_width: Option<u32>,
+    pub audit_indices: bool,
     pub legacy: bool,
     pub serial_limit: usize,
     pub forwarding: bool,
@@ -20,6 +21,9 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
+            use_subgroups: true,
+            subgroup_width: None,
+            audit_indices: false,
             legacy: false,
             serial_limit: 32,
             forwarding: true,
@@ -28,6 +32,24 @@ impl Default for Config {
             packing: Packing::BestFit,
             fuse: true,
         }
+    }
+}
+impl Config {
+    pub fn for_device(&self, gpu: &fusor_gpu::GpuDevice) -> Self {
+        let mut out = self.clone();
+        out.subgroup_width = if self.use_subgroups && !self.legacy {
+            gpu.caps()
+                .subgroups
+                .filter(|s| s.is_fixed())
+                .map(|s| s.assumed())
+        } else {
+            None
+        };
+        out
+    }
+    fn collective(&self) -> Option<fusor_gpu::reduction::CollectivePlan> {
+        self.subgroup_width
+            .and_then(|w| fusor_gpu::reduction::CollectivePlan::new(BLOCK as u32, w))
     }
 }
 #[derive(Clone, Debug)]
@@ -41,6 +63,8 @@ pub struct Region {
 }
 #[derive(Clone, Debug)]
 pub struct Plan {
+    pub collective: Option<fusor_gpu::reduction::CollectivePlan>,
+    pub index_recipes: usize,
     pub legacy: bool,
     pub serial_limit: usize,
     pub forwarded: Vec<Id>,
@@ -58,52 +82,6 @@ fn gcd(a: usize, b: usize) -> usize {
     if b == 0 { a } else { gcd(b, a % b) }
 }
 
-/// Derive logical dependencies and finite access proofs once, then reuse them
-/// for every candidate cut and ownership partition. No allocation decisions.
-struct Analysis {
-    dependencies: Vec<Vec<Id>>,
-    reads: Vec<Vec<(usize, Id, usize)>>,
-}
-impl Analysis {
-    fn new(g: &Graph, stages: &[Id], forwarded: &[Id]) -> Self {
-        let mut out = Self {
-            dependencies: vec![vec![]; g.values.len()],
-            reads: vec![vec![]; g.values.len()],
-        };
-        for id in stages {
-            out.dependencies[*id] = g.stage_dependencies(*id, forwarded);
-            for i in 0..g.values[*id].len() {
-                out.reads[*id].extend(g.stage_reads(*id, i, forwarded).into_iter().map(
-                    |(src, j)| {
-                        assert!(j < g.values[src].len(), "logical read outside source");
-                        (i, src, j)
-                    },
-                ));
-            }
-        }
-        out
-    }
-}
-
-/// Exhaustively proves same-workgroup ownership for the selected finite
-/// shapes, independent of offsets and strides in the physical allocation.
-fn owned(g: &Graph, members: &[Id], groups: usize, analysis: &Analysis) -> bool {
-    for id in members {
-        if !analysis.dependencies[*id]
-            .iter()
-            .any(|src| members.contains(src))
-        {
-            continue;
-        }
-        let share = g.values[*id].len() / groups;
-        for &(i, src, j) in &analysis.reads[*id] {
-            if members.contains(&src) && i / share != j / (g.values[src].len() / groups) {
-                return false;
-            }
-        }
-    }
-    true
-}
 fn region(
     g: &Graph,
     members: &[Id],
@@ -129,20 +107,11 @@ fn region(
         })
         .collect();
     let mut best: Option<Region> = None;
-    // External traffic is independent of group count; derive it once.
-    let reads: usize = members
-        .iter()
-        .map(|id| {
-            analysis.reads[*id]
-                .iter()
-                .filter(|(_, src, _)| !members.contains(src))
-                .count()
-        })
-        .sum();
+    let reads = analysis.external_reads(g, members);
     let writes: usize = exports.iter().map(|id| g.values[*id].len()).sum();
     let traffic_bytes = (reads + writes) * 4;
     for groups in (1..=divisor.min(65535)).filter(|x| divisor % x == 0) {
-        if !owned(g, members, groups, analysis) {
+        if !analysis.owned(g, members, groups) {
             rejected[0] += 1;
             continue;
         }
@@ -163,12 +132,18 @@ fn region(
                 });
             }
             if tree_fold(g, *id, cfg.serial_limit) {
-                slots.push(Slot {
-                    id: scratch(*id),
-                    len: BLOCK,
-                    first,
-                    last: first,
-                });
+                let len = cfg
+                    .collective()
+                    .map(|p| p.scratch_elements() as usize)
+                    .unwrap_or(BLOCK);
+                if len > 0 {
+                    slots.push(Slot {
+                        id: scratch(*id),
+                        len,
+                        first,
+                        last: first,
+                    });
+                }
             }
         }
         let shared = allocate(slots, cfg.packing);
@@ -255,7 +230,7 @@ pub fn compile(g: &Graph, cfg: &Config) -> Result<Plan, String> {
         .filter(|id| !forwarded.contains(id))
         .collect();
     let n = stages.len();
-    let analysis = Analysis::new(g, &stages, &forwarded);
+    let analysis = Analysis::new(g, &stages, &forwarded, cfg.audit_indices);
     assert!(
         n > 0 && n <= 12,
         "prototype enumerates at most 12 compute stages"
@@ -310,6 +285,8 @@ pub fn compile(g: &Graph, cfg: &Config) -> Result<Plan, String> {
             .is_none_or(|b| (score_ns, global.len) < (b.score_ns, b.global.len))
         {
             best = Some(Plan {
+                collective: cfg.collective(),
+                index_recipes: analysis.recipes,
                 legacy: cfg.legacy,
                 serial_limit: cfg.serial_limit,
                 forwarded: forwarded.clone(),

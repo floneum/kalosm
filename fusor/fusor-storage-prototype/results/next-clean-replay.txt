@@ -1,0 +1,123 @@
+Integration smoke check: staged code tree 9ccc17c55967e04b219bc0dbfbaf07565dc9c83f
+Small timing batches are validation only, not headline performance measurements.
+
+
+BENCH reshape_reduce [16, 128] GPU=Apple M2 Max iterations=20 rounds=12 shared_cap=2048 B
+  Frozen baseline: 5 retained buffers; pool churn PASS
+  Frozen baseline: changing inputs and update bounds PASS (3 inputs)
+  Frozen baseline: failed/empty/resolved capture rejection and cleanup PASS
+  Prototype: 1 dispatches; shared_peak=8 B; global=64 B; plan=0.035 ms; correctness=PASS (3 inputs)
+  Legacy policies: 1 dispatches; shared_peak=768 B; global=64 B; correctness=PASS (3 inputs)
+  Portable tree: 1 dispatches; shared_peak=256 B; global=64 B; correctness=PASS (3 inputs)
+  Prototype: GPU median=5.986 us/step range=4.396..6.727; host median=64.395 us/step
+    GPU samples: 4.433, 4.450, 4.396, 5.044, 4.929, 6.213, 6.319, 6.648, 6.344, 6.167, 6.727, 5.806
+  Legacy policies: GPU median=10.986 us/step range=8.175..15.642; host median=64.511 us/step
+    GPU samples: 8.175, 8.473, 9.183, 10.415, 10.858, 11.090, 10.883, 15.042, 15.381, 15.390, 14.048, 15.642
+  legacy/optimized GPU ratio=1.835x
+  Portable tree: GPU median=8.872 us/step range=4.392..9.548; host median=64.430 us/step
+    GPU samples: 4.612, 4.392, 5.235, 4.790, 8.954, 8.829, 9.108, 9.250, 9.548, 9.037, 8.423, 8.915
+  portable/prototype GPU ratio=1.482x
+  Existing Fusor: GPU median=52.891 us/step range=24.748..56.308; host median=129.429 us/step
+    GPU samples: 24.748, 27.756, 30.108, 39.273, 39.823, 56.308, 54.904, 52.835, 56.163, 56.087, 54.573, 52.946
+  existing/prototype GPU ratio=8.835x; baseline dispatches=3
+  Captured baseline replay correctness: PASS
+
+BENCH softmax [16, 128] GPU=Apple M2 Max iterations=20 rounds=12 shared_cap=2048 B
+  Frozen baseline: 5 retained buffers; pool churn PASS
+  Frozen baseline: changing inputs and update bounds PASS (3 inputs)
+  Frozen baseline: failed/empty/resolved capture rejection and cleanup PASS
+  Prototype: 1 dispatches; shared_peak=524 B; global=8192 B; plan=0.103 ms; correctness=PASS (3 inputs)
+  Legacy policies: 1 dispatches; shared_peak=1024 B; global=8192 B; correctness=PASS (3 inputs)
+  Portable tree: 1 dispatches; shared_peak=772 B; global=8192 B; correctness=PASS (3 inputs)
+  Prototype: GPU median=10.104 us/step range=9.890..12.371; host median=64.221 us/step
+    GPU samples: 11.275, 9.981, 11.773, 10.917, 11.310, 10.115, 10.094, 9.890, 9.985, 9.996, 9.938, 12.371
+  Legacy policies: GPU median=19.651 us/step range=18.254..20.783; host median=64.312 us/step
+    GPU samples: 20.060, 20.775, 20.092, 20.783, 20.183, 19.242, 18.356, 18.354, 18.254, 18.308, 18.262, 20.590
+  legacy/optimized GPU ratio=1.945x
+  Portable tree: GPU median=14.271 us/step range=13.979..16.625; host median=64.354 us/step
+    GPU samples: 16.625, 14.217, 14.815, 16.546, 15.992, 14.290, 14.250, 13.979, 14.252, 14.240, 14.231, 14.542
+  portable/prototype GPU ratio=1.412x
+  Existing Fusor: GPU median=54.340 us/step range=49.067..57.842; host median=128.682 us/step
+    GPU samples: 56.790, 56.469, 56.473, 52.944, 57.842, 57.023, 50.231, 49.067, 49.783, 49.879, 51.215, 55.735
+  existing/prototype GPU ratio=5.378x; baseline dispatches=3
+  Captured baseline replay correctness: PASS
+
+BENCH fanout [16, 128] GPU=Apple M2 Max iterations=20 rounds=12 shared_cap=2048 B
+  Frozen baseline: 4 retained buffers; pool churn PASS
+  Frozen baseline: changing inputs and update bounds PASS (3 inputs)
+  Frozen baseline: failed/empty/resolved capture rejection and cleanup PASS
+  Prototype: 1 dispatches; shared_peak=520 B; global=8256 B; plan=0.029 ms; correctness=PASS (3 inputs)
+  Legacy policies: 1 dispatches; shared_peak=1536 B; global=8256 B; correctness=PASS (3 inputs)
+  Portable tree: 1 dispatches; shared_peak=768 B; global=8256 B; correctness=PASS (3 inputs)
+  Prototype: GPU median=8.036 us/step range=4.685..9.331; host median=64.445 us/step
+    GPU samples: 4.779, 4.685, 5.202, 4.846, 6.550, 9.058, 8.848, 9.071, 7.371, 9.181, 8.702, 9.331
+  Legacy policies: GPU median=15.402 us/step range=9.381..16.806; host median=64.493 us/step
+    GPU samples: 9.779, 9.381, 12.371, 12.604, 12.165, 16.621, 16.806, 16.221, 14.744, 16.344, 16.060, 16.804
+  legacy/optimized GPU ratio=1.917x
+  Portable tree: GPU median=9.785 us/step range=6.231..11.379; host median=64.500 us/step
+    GPU samples: 6.660, 6.231, 8.800, 8.250, 8.865, 11.310, 11.379, 11.283, 11.223, 11.213, 9.875, 9.696
+  portable/prototype GPU ratio=1.218x
+  Existing Fusor: GPU median=43.669 us/step range=25.625..44.685; host median=128.527 us/step
+    GPU samples: 25.625, 25.879, 32.502, 44.002, 43.746, 43.735, 43.275, 43.692, 43.646, 44.685, 43.248, 44.410
+  existing/prototype GPU ratio=5.434x; baseline dispatches=2
+  Captured baseline replay correctness: PASS
+
+BENCH transpose [16, 128] GPU=Apple M2 Max iterations=20 rounds=12 shared_cap=2048 B
+  Frozen baseline: 4 retained buffers; pool churn PASS
+  Frozen baseline: changing inputs and update bounds PASS (3 inputs)
+  Frozen baseline: failed/empty/resolved capture rejection and cleanup PASS
+  Prototype: 1 dispatches; shared_peak=0 B; global=512 B; plan=0.015 ms; correctness=PASS (3 inputs)
+  Legacy policies: 2 dispatches; shared_peak=512 B; global=8704 B; correctness=PASS (3 inputs)
+  Portable tree: 1 dispatches; shared_peak=0 B; global=512 B; correctness=PASS (3 inputs)
+  Prototype: GPU median=12.778 us/step range=11.594..13.358; host median=64.444 us/step
+    GPU samples: 12.527, 11.594, 13.240, 13.358, 12.840, 12.773, 12.783, 12.906, 11.915, 12.804, 12.646, 11.696
+  Legacy policies: GPU median=31.992 us/step range=28.494..32.529; host median=64.981 us/step
+    GPU samples: 28.494, 32.221, 32.335, 32.252, 30.806, 31.423, 31.762, 32.529, 31.071, 32.504, 32.319, 31.319
+  legacy/optimized GPU ratio=2.504x
+  Portable tree: GPU median=12.710 us/step range=11.071..13.088; host median=64.590 us/step
+    GPU samples: 12.304, 12.419, 12.571, 13.048, 11.071, 12.004, 12.969, 13.088, 12.596, 12.825, 12.940, 12.890
+  portable/prototype GPU ratio=0.995x
+  Existing Fusor: GPU median=17.025 us/step range=15.713..17.890; host median=65.454 us/step
+    GPU samples: 17.044, 17.010, 15.713, 17.890, 17.721, 16.988, 17.346, 17.396, 16.748, 16.950, 16.779, 17.040
+  existing/prototype GPU ratio=1.332x; baseline dispatches=2
+  Captured baseline replay correctness: PASS
+
+BENCH global_reduce [16, 128] GPU=Apple M2 Max iterations=20 rounds=12 shared_cap=2048 B
+  Frozen baseline: 4 retained buffers; pool churn PASS
+  Frozen baseline: changing inputs and update bounds PASS (3 inputs)
+  Frozen baseline: failed/empty/resolved capture rejection and cleanup PASS
+  Prototype: 2 dispatches; shared_peak=8 B; global=68 B; plan=0.015 ms; correctness=PASS (3 inputs)
+  Legacy policies: 2 dispatches; shared_peak=768 B; global=68 B; correctness=PASS (3 inputs)
+  Portable tree: 2 dispatches; shared_peak=256 B; global=68 B; correctness=PASS (3 inputs)
+  Prototype: GPU median=18.028 us/step range=16.677..18.581; host median=64.908 us/step
+    GPU samples: 16.977, 17.490, 16.677, 18.348, 18.169, 18.131, 17.738, 18.581, 18.440, 18.160, 17.788, 17.925
+  Legacy policies: GPU median=23.192 us/step range=20.190..23.833; host median=65.121 us/step
+    GPU samples: 22.379, 22.725, 22.421, 23.663, 20.190, 21.613, 23.833, 23.377, 23.408, 23.481, 23.142, 23.242
+  legacy/optimized GPU ratio=1.286x
+  Portable tree: GPU median=20.086 us/step range=18.946..20.894; host median=65.096 us/step
+    GPU samples: 19.635, 20.183, 18.946, 20.267, 19.802, 20.606, 19.242, 19.990, 20.894, 20.877, 19.550, 20.587
+  portable/prototype GPU ratio=1.114x
+  Existing Fusor: GPU median=15.217 us/step range=13.604..15.906; host median=65.586 us/step
+    GPU samples: 15.494, 13.604, 15.906, 15.690, 14.381, 15.125, 14.471, 14.617, 15.308, 14.871, 15.581, 15.644
+  existing/prototype GPU ratio=0.844x; baseline dispatches=2
+  Captured baseline replay correctness: PASS
+
+BENCH reuse [16, 128] GPU=Apple M2 Max iterations=20 rounds=12 shared_cap=2048 B
+  Frozen baseline: 7 retained buffers; pool churn PASS
+  Frozen baseline: changing inputs and update bounds PASS (3 inputs)
+  Frozen baseline: failed/empty/resolved capture rejection and cleanup PASS
+  Prototype: 1 dispatches; shared_peak=0 B; global=8192 B; plan=0.040 ms; correctness=PASS (3 inputs)
+  Legacy policies: 5 dispatches; shared_peak=0 B; global=16384 B; correctness=PASS (3 inputs)
+  Portable tree: 1 dispatches; shared_peak=0 B; global=8192 B; correctness=PASS (3 inputs)
+  Prototype: GPU median=5.256 us/step range=4.381..5.642; host median=64.228 us/step
+    GPU samples: 5.367, 4.519, 5.037, 5.365, 5.125, 5.396, 5.006, 5.148, 4.381, 5.425, 5.396, 5.642
+  Legacy policies: GPU median=28.114 us/step range=27.010..29.025; host median=65.592 us/step
+    GPU samples: 28.656, 27.625, 28.333, 28.692, 28.627, 27.894, 27.619, 27.823, 27.606, 27.010, 29.025, 28.915
+  legacy/optimized GPU ratio=5.349x
+  Portable tree: GPU median=5.368 us/step range=4.533..5.531; host median=64.244 us/step
+    GPU samples: 5.335, 5.365, 5.394, 5.371, 4.533, 5.377, 4.931, 5.204, 5.085, 5.531, 5.431, 5.421
+  portable/prototype GPU ratio=1.021x
+  Existing Fusor: GPU median=31.354 us/step range=26.767..32.783; host median=66.739 us/step
+    GPU samples: 32.362, 30.573, 31.971, 31.444, 32.421, 31.265, 28.860, 29.981, 26.767, 29.675, 32.783, 32.337
+  existing/prototype GPU ratio=5.965x; baseline dispatches=5
+  Captured baseline replay correctness: PASS

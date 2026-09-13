@@ -1,7 +1,9 @@
 //! THROWAWAY: can logical-access stages fuse without owning physical layouts?
+mod analysis;
 mod bench;
 mod emit;
 mod graph;
+mod index;
 mod plan;
 mod run;
 mod storage;
@@ -82,6 +84,10 @@ fn show(g: &Graph, p: &Plan, cfg: &Config, ms: f64, detail: bool) {
             allocations(g, &r.shared);
         }
     }
+    println!(
+        "  symbolic access recipes={}; collective={:?}",
+        p.index_recipes, p.collective
+    );
     if detail {
         println!("  Global allocations (lifetimes are dispatch positions):");
         allocations(g, &p.global);
@@ -96,6 +102,10 @@ fn execute(
     detail: bool,
     iterations: usize,
 ) -> Result<()> {
+    let device_cfg = gpu
+        .map(|gpu| cfg.for_device(gpu))
+        .unwrap_or_else(|| cfg.clone());
+    let cfg = &device_cfg;
     let start = Instant::now();
     let p = plan::compile(g, cfg)?;
     let ms = start.elapsed().as_secs_f64() * 1000.0;
@@ -142,7 +152,7 @@ fn main() -> Result<()> {
     };
     if has("--help") {
         println!(
-            "--bench                  Matched warm GPU benchmark, including original prototype\n--legacy                 Original emission and scheduling policies\n--no-forwarding          Materialize scalar producers"
+            "--bench                  Matched GPU benchmark: Fusor, native, tree, legacy policies\n--legacy                 Original emission and scheduling policies\n--no-forwarding          Materialize scalar producers\n--no-subgroups           Use portable workgroup-tree reductions\n--audit-indices          Check symbolic maps/proofs against a finite oracle (small shapes)"
         );
         println!(
             "THROWAWAY Fusor storage/fusion prototype\n\ncargo run -p fusor-storage-prototype --release -- [options]\n\n--all                    Run every built-in case\n--case NAME              {}\n--plan-only              Plan and validate WGSL without requesting a GPU\n--baseline               Also execute the current Fusor compiler\n--rows N --cols N        Shape (default 16 × 128; cols positive/even)\n--shared-bytes N         Workgroup budget (default 2048)\n--global-bytes N         Output/intermediate arena budget\n--packing MODE           bestfit | colored | dedicated\n--no-fusion              One dispatch per compute stage\n--details                Print interference lifetimes and allocation offsets\n--dump-wgsl              Print generated shaders\n--iterations N           Steps per timing batch (default 50)\n--interactive            Explore cases and policies in a terminal",
@@ -157,6 +167,8 @@ fn main() -> Result<()> {
         .parse::<usize>()?
         .max(1);
     let mut cfg = Config::default();
+    cfg.use_subgroups = !has("--no-subgroups");
+    cfg.audit_indices = has("--audit-indices");
     cfg.forwarding = !has("--no-forwarding");
     if has("--legacy") {
         cfg.legacy = true;

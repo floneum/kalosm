@@ -90,8 +90,7 @@ pub(crate) fn collective_tree(
     let Some(w) = width else { return false };
     matches!(element, ElementType::Scalar(s) if s != ScalarElement::Bool)
         && group_size == block
-        && block >= w
-        && block.is_multiple_of(w)
+        && crate::reduction::CollectivePlan::new(block, w).is_some()
 }
 
 /// One walk of the whole body, run before any expression is lowered. Everything

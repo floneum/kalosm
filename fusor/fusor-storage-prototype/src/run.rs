@@ -10,7 +10,11 @@ pub fn validate_shader(source: &str) -> Result<()> {
     let module = naga::front::wgsl::parse_str(source).map_err(|e| e.emit_to_string(source))?;
     naga::valid::Validator::new(
         naga::valid::ValidationFlags::all(),
-        naga::valid::Capabilities::empty(),
+        if source.contains("// native subgroup collectives") {
+            naga::valid::Capabilities::SUBGROUP
+        } else {
+            naga::valid::Capabilities::empty()
+        },
     )
     .validate(&module)?;
     Ok(())
@@ -54,6 +58,16 @@ impl Executable {
     pub fn build(gpu: &GpuDevice, g: &Graph, p: &Plan, sources: &[String]) -> Result<Self> {
         let start = Instant::now();
         let device = gpu.device();
+        if let Some(collective) = p.collective {
+            assert_eq!(
+                gpu.caps()
+                    .subgroups
+                    .filter(|s| s.is_fixed())
+                    .map(|s| s.assumed()),
+                Some(collective.width()),
+                "compiled subgroup geometry must match the device"
+            );
+        }
         // Counted u32 loops increment by at most BLOCK. This bound ensures
         // their final increment cannot wrap; the tree loop divides by two.
         assert!(

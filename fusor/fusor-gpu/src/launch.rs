@@ -281,7 +281,7 @@ pub struct GpuArtifact {
 /// Owns the encoder, the in-flight submission window and the profile buffer.
 pub struct Launcher {
     #[cfg(feature = "prototype-capture")]
-    captured: Mutex<Option<Vec<CommandRecord>>>,
+    prepared_capture: Mutex<Option<crate::executable::Capture>>,
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     backend: wgpu::Backend,
@@ -343,7 +343,7 @@ impl Launcher {
     ) -> Self {
         Self {
             #[cfg(feature = "prototype-capture")]
-            captured: Mutex::new(None),
+            prepared_capture: Mutex::new(None),
             device,
             queue,
             backend,
@@ -367,16 +367,55 @@ impl Launcher {
         self.backend
     }
 
-    /// Prototype instrumentation only. The caller must keep the graph alive
-    /// and avoid further pool allocations while replaying captured commands.
+    /// Freeze a synchronous compilation/resolve into an executable that owns
+    /// every bound pool lease. Concurrent work on another thread is excluded.
+    /// An already-resolved no-op is rejected instead of recording an empty run.
+    /// The closure executes normally, including its initial GPU submissions.
     #[cfg(feature = "prototype-capture")]
-    pub fn begin_prototype_capture(&self) {
-        *self.captured.lock() = Some(Vec::new());
-    }
+    pub fn capture_executable(
+        &self,
+        compile: impl FnOnce() -> Result<()>,
+    ) -> Result<crate::executable::GpuExecutable> {
+        {
+            let mut slot = self.prepared_capture.lock();
+            if slot.is_some() {
+                return Err(Error::Device(
+                    "an executable capture is already active".into(),
+                ));
+            }
+            *slot = Some(crate::executable::Capture::new());
+        }
+        let mut cancel = crate::executable::CancelCapture(Some(&self.prepared_capture));
+        compile()?;
+        let captured = self
+            .prepared_capture
+            .lock()
+            .take()
+            .expect("capture remains active");
+        cancel.0 = None;
+        if captured.commands.iter().any(|r| match r {
+            CommandRecord::Dispatch { bind_group, .. } => !captured
+                .groups
+                .contains(&(Arc::as_ptr(bind_group) as usize)),
+            _ => true,
+        }) {
+            return Err(Error::Plan(
+                "capture contains a command without retained binding leases".into(),
+            ));
+        }
 
-    #[cfg(feature = "prototype-capture")]
-    pub fn end_prototype_capture(&self) -> Vec<CommandRecord> {
-        self.captured.lock().take().unwrap_or_default()
+        let inputs = captured
+            .reads
+            .difference(&captured.writes)
+            .map(|addr| captured.buffers[addr].clone())
+            .collect();
+        crate::executable::GpuExecutable::new(
+            self.device.clone(),
+            self.queue.clone(),
+            captured.commands,
+            captured.buffers.into_values().collect(),
+            inputs,
+        )
     }
 
     pub fn config(&self) -> &GpuConfig {
@@ -464,6 +503,38 @@ impl Launcher {
         artifact: &GpuArtifact,
         binds: &[Buf],
     ) -> Result<Arc<wgpu::BindGroup>> {
+        let group = self.bind_group_inner(artifact, binds)?;
+        #[cfg(feature = "prototype-capture")]
+        if let Some(capture) = self
+            .prepared_capture
+            .lock()
+            .as_mut()
+            .filter(|c| c.on_thread())
+        {
+            capture.groups.insert(Arc::as_ptr(&group) as usize);
+            for ((binding, read_only), buffer) in artifact.bindings.iter().zip(binds) {
+                if *binding != 0 && *read_only {
+                    capture.reads.insert(buffer.addr());
+                }
+                if !*read_only {
+                    capture.writes.insert(buffer.addr());
+                }
+            }
+            for buffer in binds {
+                capture
+                    .buffers
+                    .entry(buffer.addr())
+                    .or_insert_with(|| buffer.clone());
+            }
+        }
+        Ok(group)
+    }
+
+    fn bind_group_inner(
+        &self,
+        artifact: &GpuArtifact,
+        binds: &[Buf],
+    ) -> Result<Arc<wgpu::BindGroup>> {
         if binds.len() != artifact.bindings.len() {
             return Err(Error::Device(format!(
                 "kernel {} wants {} bindings, the caller presented {}",
@@ -532,8 +603,15 @@ impl Launcher {
         mode: TimingMode,
     ) -> Result<()> {
         #[cfg(feature = "prototype-capture")]
-        if let Some(capture) = self.captured.lock().as_mut() {
-            capture.extend(records.iter().cloned());
+        if let Some(capture) = self
+            .prepared_capture
+            .lock()
+            .as_mut()
+            .filter(|c| c.on_thread())
+        {
+            capture
+                .commands
+                .extend(records.iter().filter(|r| !r.is_empty_dispatch()).cloned());
         }
         // A dispatch whose grid contains a zero launches nothing and still
         // costs a pass boundary, so it never reaches the encoder.
@@ -1168,6 +1246,8 @@ fn launcher_fields_are_send_sync() {
     assert::<AtomicU64>();
     assert::<AtomicBool>();
     assert::<Mutex<Vec<KernelProfile>>>();
+    #[cfg(feature = "prototype-capture")]
+    assert::<Mutex<Option<crate::executable::Capture>>>();
     assert::<Mutex<Option<Vec<f64>>>>();
     assert::<Mutex<Option<usize>>>();
     assert::<Mutex<lru::LruCache<BindGroupKey, BindGroupEntry>>>();
