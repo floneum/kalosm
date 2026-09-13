@@ -205,6 +205,7 @@ impl KernelProfile {
 }
 
 /// One recorded command, in exact plan order.
+#[derive(Clone)]
 pub enum CommandRecord {
     Dispatch {
         name: &'static str,
@@ -279,6 +280,8 @@ pub struct GpuArtifact {
 
 /// Owns the encoder, the in-flight submission window and the profile buffer.
 pub struct Launcher {
+    #[cfg(feature = "prototype-capture")]
+    captured: Mutex<Option<Vec<CommandRecord>>>,
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
     backend: wgpu::Backend,
@@ -339,6 +342,8 @@ impl Launcher {
         lost: crate::device::LostFlag,
     ) -> Self {
         Self {
+            #[cfg(feature = "prototype-capture")]
+            captured: Mutex::new(None),
             device,
             queue,
             backend,
@@ -360,6 +365,18 @@ impl Launcher {
 
     pub fn backend(&self) -> wgpu::Backend {
         self.backend
+    }
+
+    /// Prototype instrumentation only. The caller must keep the graph alive
+    /// and avoid further pool allocations while replaying captured commands.
+    #[cfg(feature = "prototype-capture")]
+    pub fn begin_prototype_capture(&self) {
+        *self.captured.lock() = Some(Vec::new());
+    }
+
+    #[cfg(feature = "prototype-capture")]
+    pub fn end_prototype_capture(&self) -> Vec<CommandRecord> {
+        self.captured.lock().take().unwrap_or_default()
     }
 
     pub fn config(&self) -> &GpuConfig {
@@ -514,6 +531,10 @@ impl Launcher {
         timestamps: Option<&wgpu::QuerySet>,
         mode: TimingMode,
     ) -> Result<()> {
+        #[cfg(feature = "prototype-capture")]
+        if let Some(capture) = self.captured.lock().as_mut() {
+            capture.extend(records.iter().cloned());
+        }
         // A dispatch whose grid contains a zero launches nothing and still
         // costs a pass boundary, so it never reaches the encoder.
         let live: Vec<&CommandRecord> = records.iter().filter(|r| !r.is_empty_dispatch()).collect();

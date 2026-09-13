@@ -1,0 +1,13 @@
+[package]
+name = "fusor-storage-prototype"
+version = "0.0.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+fusor = { workspace = true, features = ["gpu"] }
+fusor-gpu = { workspace = true, features = ["prototype-capture"] }
+wgpu = { workspace = true, features = ["wgsl"] }
+pollster.workspace = true
+bytemuck.workspace = true
+naga = { workspace = true, features = ["wgsl-in"] }

@@ -1,0 +1,57 @@
+GPU: Apple M2 Max
+
+reshape_reduce  input=[16, 128]  packing=Colored  shared cap=1024 B  fusion=true
+  4 compute stages + 1 views → 1 dispatches; planning=7.519 ms
+  8 legal partitions; ownership rejects=0; capacity rejects=19
+  modeled score=10.44 us (uncalibrated); global arena=64 B
+  R0: [square → pair_sum → sqrt → row_sum] groups=16 shared=768 B global traffic=8256 B
+  WGSL validation: PASS
+  GPU: PASS (3 inputs, poisoned/reused arena), max error=1.144e-5; build=59.74 ms; batched median=25.53 us/step
+
+softmax  input=[16, 128]  packing=Colored  shared cap=1024 B  fusion=true
+  5 compute stages + 4 views → 2 dispatches; planning=11.769 ms
+  14 legal partitions; ownership rejects=0; capacity rejects=33
+  modeled score=21.03 us (uncalibrated); global arena=16384 B
+  R0: [row_max → shift] groups=16 shared=260 B global traffic=24576 B
+  R1: [exp → row_sum → normalize] groups=16 shared=772 B global traffic=16384 B
+  WGSL validation: PASS
+  GPU: PASS (3 inputs, poisoned/reused arena), max error=6.519e-9; build=1.10 ms; batched median=38.48 us/step
+
+fanout  input=[16, 128]  packing=Colored  shared cap=1024 B  fusion=true
+  5 compute stages + 0 views → 2 dispatches; planning=20.416 ms
+  14 legal partitions; ownership rejects=0; capacity rejects=36
+  modeled score=20.72 us (uncalibrated); global arena=16448 B
+  R0: [square → neg → sqrt → join] groups=32 shared=768 B global traffic=24576 B
+  R1: [row_sum] groups=16 shared=256 B global traffic=8256 B
+  WGSL validation: PASS
+  GPU: PASS (3 inputs, poisoned/reused arena), max error=7.629e-6; build=1.00 ms; batched median=25.93 us/step
+
+transpose  input=[16, 128]  packing=Colored  shared cap=1024 B  fusion=true
+  3 compute stages + 1 views → 2 dispatches; planning=3.726 ms
+  2 legal partitions; ownership rejects=18; capacity rejects=6
+  modeled score=21.30 us (uncalibrated); global arena=8704 B
+  R0: [square] groups=32 shared=0 B global traffic=16384 B
+  R1: [neg → row_sum] groups=32 shared=512 B global traffic=8704 B
+  WGSL validation: PASS
+  GPU: PASS (3 inputs, poisoned/reused arena), max error=7.153e-7; build=0.88 ms; batched median=25.82 us/step
+
+global_reduce  input=[16, 128]  packing=Colored  shared cap=1024 B  fusion=true
+  3 compute stages + 0 views → 2 dispatches; planning=1.347 ms
+  3 legal partitions; ownership rejects=0; capacity rejects=5
+  modeled score=20.62 us (uncalibrated); global arena=68 B
+  R0: [square → row_sum] groups=16 shared=768 B global traffic=8256 B
+  R1: [global_sum] groups=1 shared=256 B global traffic=68 B
+  WGSL validation: PASS
+  GPU: PASS (3 inputs, poisoned/reused arena), max error=6.104e-5; build=0.97 ms; batched median=13.27 us/step
+
+reuse  input=[16, 128]  packing=Colored  shared cap=1024 B  fusion=true
+  5 compute stages + 5 views → 5 dispatches; planning=13.817 ms
+  1 legal partitions; ownership rejects=110; capacity rejects=10
+  modeled score=51.00 us (uncalibrated); global arena=16384 B
+  R0: [neg_0] groups=32 shared=0 B global traffic=16384 B
+  R1: [neg_1] groups=32 shared=0 B global traffic=16384 B
+  R2: [neg_2] groups=32 shared=0 B global traffic=16384 B
+  R3: [neg_3] groups=32 shared=0 B global traffic=16384 B
+  R4: [neg_4] groups=32 shared=0 B global traffic=16384 B
+  WGSL validation: PASS
+  GPU: PASS (3 inputs, poisoned/reused arena), max error=0.000e0; build=13.34 ms; batched median=39.11 us/step

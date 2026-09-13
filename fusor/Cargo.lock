@@ -2518,6 +2518,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "fusor-storage-prototype"
+version = "0.0.0"
+dependencies = [
+ "bytemuck",
+ "fusor",
+ "fusor-gpu",
+ "naga",
+ "pollster",
+ "wgpu",
+]
+
+[[package]]
 name = "fusor-tile"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,75 @@
+
+BENCH reshape_reduce [16, 128] GPU=Apple M2 Max iterations=1000 rounds=9 shared_cap=2048 B
+  Prototype: 1 dispatches; shared_peak=256 B; global=64 B; plan=0.494 ms; correctness=PASS (3 inputs)
+  Original prototype: 1 dispatches; shared_peak=768 B; global=64 B; correctness=PASS (3 inputs)
+  Prototype: GPU median=4.084 us/step range=3.907..5.106; host median=5.211 us/step
+    GPU samples: 4.001, 4.016, 4.144, 4.013, 4.084, 4.275, 3.907, 4.456, 5.106
+  Original prototype: GPU median=7.304 us/step range=6.935..8.595; host median=8.982 us/step
+    GPU samples: 6.935, 7.205, 7.205, 7.304, 7.186, 7.313, 7.900, 8.320, 8.595
+  original/optimized GPU ratio=1.788x
+  Existing Fusor: GPU median=5.877 us/step range=5.723..7.754; host median=7.747 us/step
+    GPU samples: 5.874, 5.723, 5.730, 5.877, 5.860, 6.467, 6.376, 6.594, 7.754
+  existing/prototype GPU ratio=1.439x; baseline dispatches=1
+  Captured baseline replay correctness: PASS
+
+BENCH softmax [16, 128] GPU=Apple M2 Max iterations=1000 rounds=9 shared_cap=2048 B
+  Prototype: 1 dispatches; shared_peak=772 B; global=8192 B; plan=1.087 ms; correctness=PASS (3 inputs)
+  Original prototype: 1 dispatches; shared_peak=1024 B; global=8192 B; correctness=PASS (3 inputs)
+  Prototype: GPU median=4.472 us/step range=4.380..4.849; host median=6.457 us/step
+    GPU samples: 4.849, 4.636, 4.523, 4.470, 4.472, 4.395, 4.380, 4.461, 4.586
+  Original prototype: GPU median=5.840 us/step range=5.714..6.043; host median=7.717 us/step
+    GPU samples: 6.043, 5.919, 5.840, 5.776, 5.776, 5.787, 5.714, 5.872, 5.862
+  original/optimized GPU ratio=1.306x
+  Existing Fusor: GPU median=5.249 us/step range=5.158..5.613; host median=6.477 us/step
+    GPU samples: 5.613, 5.418, 5.169, 5.254, 5.226, 5.249, 5.158, 5.201, 5.471
+  existing/prototype GPU ratio=1.174x; baseline dispatches=1
+  Captured baseline replay correctness: PASS
+
+BENCH fanout [16, 128] GPU=Apple M2 Max iterations=1000 rounds=9 shared_cap=2048 B
+  Existing Fusor: ERROR plan: group member %28 lowers at 32 lanes, the group at 256
+  Prototype: 1 dispatches; shared_peak=768 B; global=8256 B; plan=0.804 ms; correctness=PASS (3 inputs)
+  Original prototype: 1 dispatches; shared_peak=1536 B; global=8256 B; correctness=PASS (3 inputs)
+  Prototype: GPU median=4.266 us/step range=3.633..6.044; host median=5.238 us/step
+    GPU samples: 4.871, 5.787, 5.787, 6.044, 4.164, 4.233, 4.266, 4.073, 3.633
+  Original prototype: GPU median=6.777 us/step range=5.661..8.991; host median=7.738 us/step
+    GPU samples: 7.818, 8.991, 8.296, 8.979, 6.777, 6.453, 6.184, 5.804, 5.661
+  original/optimized GPU ratio=1.588x
+
+BENCH transpose [16, 128] GPU=Apple M2 Max iterations=1000 rounds=9 shared_cap=2048 B
+  Prototype: 1 dispatches; shared_peak=0 B; global=512 B; plan=0.310 ms; correctness=PASS (3 inputs)
+  Original prototype: 2 dispatches; shared_peak=512 B; global=8704 B; correctness=PASS (3 inputs)
+  Prototype: GPU median=3.719 us/step range=3.648..3.756; host median=5.200 us/step
+    GPU samples: 3.728, 3.675, 3.664, 3.756, 3.648, 3.721, 3.719, 3.722, 3.678
+  Original prototype: GPU median=9.395 us/step range=9.309..9.679; host median=10.613 us/step
+    GPU samples: 9.584, 9.458, 9.395, 9.480, 9.369, 9.309, 9.679, 9.310, 9.322
+  original/optimized GPU ratio=2.527x
+  Existing Fusor: GPU median=4.794 us/step range=4.606..4.862; host median=7.165 us/step
+    GPU samples: 4.862, 4.795, 4.796, 4.794, 4.606, 4.617, 4.849, 4.635, 4.739
+  existing/prototype GPU ratio=1.289x; baseline dispatches=2
+  Captured baseline replay correctness: PASS
+
+BENCH global_reduce [16, 128] GPU=Apple M2 Max iterations=1000 rounds=9 shared_cap=2048 B
+  Prototype: 2 dispatches; shared_peak=256 B; global=68 B; plan=0.161 ms; correctness=PASS (3 inputs)
+  Original prototype: 2 dispatches; shared_peak=768 B; global=68 B; correctness=PASS (3 inputs)
+  Prototype: GPU median=5.738 us/step range=5.531..5.747; host median=8.063 us/step
+    GPU samples: 5.737, 5.531, 5.597, 5.739, 5.744, 5.747, 5.744, 5.729, 5.738
+  Original prototype: GPU median=6.648 us/step range=6.435..6.839; host median=8.090 us/step
+    GPU samples: 6.647, 6.435, 6.452, 6.655, 6.588, 6.658, 6.648, 6.839, 6.668
+  original/optimized GPU ratio=1.159x
+  Existing Fusor: GPU median=4.259 us/step range=4.136..4.431; host median=5.881 us/step
+    GPU samples: 4.245, 4.136, 4.174, 4.431, 4.324, 4.259, 4.266, 4.246, 4.296
+  existing/prototype GPU ratio=0.742x; baseline dispatches=2
+  Captured baseline replay correctness: PASS
+
+BENCH reuse [16, 128] GPU=Apple M2 Max iterations=1000 rounds=9 shared_cap=2048 B
+  Prototype: 1 dispatches; shared_peak=0 B; global=8192 B; plan=0.651 ms; correctness=PASS (3 inputs)
+  Original prototype: 5 dispatches; shared_peak=0 B; global=16384 B; correctness=PASS (3 inputs)
+  Prototype: GPU median=1.579 us/step range=1.536..1.591; host median=2.691 us/step
+    GPU samples: 1.536, 1.586, 1.591, 1.579, 1.570, 1.590, 1.584, 1.545, 1.572
+  Original prototype: GPU median=8.779 us/step range=8.407..8.914; host median=11.242 us/step
+    GPU samples: 8.407, 8.700, 8.495, 8.779, 8.698, 8.818, 8.780, 8.914, 8.900
+  original/optimized GPU ratio=5.558x
+  Existing Fusor: GPU median=9.714 us/step range=9.301..10.081; host median=13.273 us/step
+    GPU samples: 10.081, 9.537, 9.607, 9.714, 9.835, 9.777, 9.674, 9.815, 9.301
+  existing/prototype GPU ratio=6.151x; baseline dispatches=5
+  Captured baseline replay correctness: PASS

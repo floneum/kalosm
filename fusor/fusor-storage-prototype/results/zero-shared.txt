@@ -1,0 +1,31 @@
+GPU: Apple M2 Max
+
+reuse  input=[16, 128]  packing=BestFit  shared cap=0 B  fusion=true
+  5 compute stages + 5 views → 5 dispatches; planning=12.192 ms
+  1 legal partitions; ownership rejects=110; capacity rejects=10
+  modeled score=51.00 us (uncalibrated); global arena=16384 B
+  R0: [neg_0] groups=32 shared=0 B global traffic=16384 B
+  value                   live   offset B   size B
+  allocated=0 B; peak-live lower bound=0 B; interference edges=0
+  R1: [neg_1] groups=32 shared=0 B global traffic=16384 B
+  value                   live   offset B   size B
+  allocated=0 B; peak-live lower bound=0 B; interference edges=0
+  R2: [neg_2] groups=32 shared=0 B global traffic=16384 B
+  value                   live   offset B   size B
+  allocated=0 B; peak-live lower bound=0 B; interference edges=0
+  R3: [neg_3] groups=32 shared=0 B global traffic=16384 B
+  value                   live   offset B   size B
+  allocated=0 B; peak-live lower bound=0 B; interference edges=0
+  R4: [neg_4] groups=32 shared=0 B global traffic=16384 B
+  value                   live   offset B   size B
+  allocated=0 B; peak-live lower bound=0 B; interference edges=0
+  Global allocations (lifetimes are dispatch positions):
+  value                   live   offset B   size B
+  neg_0                   0..1          0     8192
+  neg_1                   1..2       8192     8192
+  neg_2                   2..3          0     8192
+  neg_3                   3..4       8192     8192
+  neg_4                   4..5          0     8192
+  allocated=16384 B; peak-live lower bound=16384 B; interference edges=4
+  WGSL validation: PASS
+  GPU: PASS (3 inputs, poisoned/reused arena), max error=0.000e0; build=60.23 ms; batched median=39.22 us/step
