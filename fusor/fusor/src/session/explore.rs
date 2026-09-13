@@ -921,9 +921,17 @@ impl Session {
         // Second pass: restructuring candidates for the heaviest launches,
         // raced at diff granularity (see `Gran::Diff`) off the persisted
         // windows.
+        // A round that adopts nothing has changed nothing, so the next one
+        // would rebuild the same signatures, offer the same variants and
+        // reach the same verdicts. Only an adoption earns another round —
+        // without that this pass repeated itself `DIFF_SCAN_TOP_K` times on
+        // every process's first replay hit, which on a transformer is four
+        // rebuilds of a signature per launch plus four rounds of replanning
+        // the heaviest launches, for one answer.
         let mut rounds = 0usize;
         'diff: while rounds < DIFF_SCAN_TOP_K {
             rounds += 1;
+            let adopted_before = adopted;
             let (sigs, labels, works) = {
                 let g = graph.state().egraph.lock();
                 let sigs: Vec<String> = current
@@ -997,6 +1005,9 @@ impl Session {
                         continue 'diff;
                     }
                 }
+            }
+            if adopted == adopted_before {
+                break 'diff;
             }
             break;
         }
