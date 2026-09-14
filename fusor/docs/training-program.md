@@ -52,8 +52,10 @@ products followed by a sum. These partials use the same allocation planner as
 ordinary values; matrix operands never bind to an allocation layout.
 
 The same symbolic index representation drives ownership proofs and emitted view
-addresses, simplifying composed reshape/transpose expressions before shader
-compilation. Contiguous reductions use subgroup collectives when available;
+addresses, keeping bounded batch, row, column and reduction coordinates symbolic
+through composed reshape/transpose expressions until shader emission. Tail and
+gather guards establish the logical bounds once; helpers retain ownership checks
+without repeating the bounds branch. Contiguous reductions use subgroup collectives when available;
 strided reductions distribute adjacent output columns across adjacent lanes.
 Embedding-gradient scatters compact matching indices once per output row and
 reuse the positions across features, preserving the original f32 addition order.
@@ -81,7 +83,7 @@ budget violations return errors. The program has one storage binding and uses
 256 lanes per workgroup. Storage bounds checks remain enabled; statically
 bounded loops omit redundant runtime loop counters.
 
-## Measurements
+## Initial measurements
 
 Apple M2 Max, Metal, f32. These are end-to-end queued training timings with
 readback at batch boundaries, using identical initial weights and data between
@@ -216,24 +218,35 @@ and feature audits are in `training-benchmarks.json`.
 
 ### Browser performance follow-up
 
-The browser compiler now removes redundant leading-coordinate modulo operations
-inside matrix tile bounds guards. Inner coordinates of multidimensional indices
-still wrap at their own extents, and tail loads/stores remain guarded. On the
-M2 Max, this reduces warmed full-transformer training from about 4.3 to 3.2 ms per
-step without changing precision, arithmetic order, the model, or its 99 dispatches.
-A contemporaneous alternating native comparison remains around 2.0 ms per step.
+Matrix coordinates now stay symbolic through all views, allowing the compiler to
+remove divisions and remainders that earlier WGSL emission hid from the index
+simplifier. The same model, f32 precision, optimizer and 99 dispatches are retained.
+In alternating M2 Max / Chrome 152 release runs, median training step time falls
+from about **3.00 to 2.37 ms**. The native comparison falls from about **1.83 to
+1.63 ms**. These are warm step timings, excluding initialization, held-out scoring,
+generation and rendering. The 1 ms browser target has not been reached.
 
-GPU timestamps measured 4.26 ms inside the original training pass versus roughly
-4.30 ms wall time. Instrumented WebGPU API calls consumed about 0.084 ms per step;
-that API measurement excludes other WASM host work. The principal training gain
-comes from shader indexing, not fewer host calls. The 1 ms browser target has not
-been reached.
+GPU timestamps measured **2.33 ms** inside the optimized training pass, against
+about 2.36 ms wall time. Earlier timestamps were 4.26 ms before both indexing
+changes. Most of the remaining training time is still GPU execution. The release UI now
+updates elapsed training time and its step count together, fixing an inflated
+per-step average between the separate half-second throughput updates.
 
-General browser matrix benchmarks also use the shared browser matrix serializer:
-256-square GEMM improves from 0.63 to about 0.10 ms, batched GEMM from 0.11 to 0.033
-ms, and the attention cases from 0.47 to about 0.12 ms. Layer normalization and
-small convolution remain hotspots, around 0.49 and 0.47 ms respectively. The
-recorded measurements and limitations are in [browser-performance.json](browser-performance.json).
+Fused normalization now assigns rows through actual subgroup IDs and lane IDs.
+A runtime occupancy check selects a subgroup collective only when all subgroup
+slots are populated; otherwise the existing workgroup tree runs. The collective
+is evaluated before the leader-only output store, including private intermediate
+tiles. This avoids assuming a relationship between local invocation indices and
+subgroup membership that [WGSL does not guarantee](https://www.w3.org/TR/WGSL/#subgroups).
+Multi-slot carriers retain their existing merge tree.
+
+Layer normalization's GPU pass improves from **0.231 to 0.215 ms**. A full browser
+sweep measured its wall time at 0.489 → 0.453 ms and causal attention at 0.122 →
+0.110 ms. Isolated normalization wall timings were noisy and did not show a
+consistent gain; host overhead remains a limitation for these general cases.
+Dense matrix and convolution timings stay approximately unchanged at 0.10 and
+0.47 ms respectively. All windows and these limitations are retained in the
+`symbolic_address_follow_up` record in [browser-performance.json](browser-performance.json).
 
 The checks include an aligned ordinary Session matrix before changing shapes
 promote its family to a generic symbolic plan, then non-square/tail matrices and
@@ -249,3 +262,19 @@ Larger K tiles, per-job pipeline specialization, a static arena extent, an
 additional subgroup-index clamp, composite-expression caching, and a speed-first
 WASM release profile were measured and discarded. The profile change more than
 doubled the WASM download (11.8 to 27.8 MB) without a useful steady-state gain.
+
+The latest checks pass 82 browser conformance cases and all eight training modes,
+15 native program/slab GPU tests, and three model tests including full parameter
+and Adam-state parity and 400-step training. The normalization oracle includes
+the benchmark's 128 × 512 shape. Its 18 cases also pass under two test-only shader
+mutations: local lane numbers permuted across subgroups, and the occupancy guard
+forced onto its tree fallback. Reproduce those additional checks with:
+
+```sh
+FUSOR_ROW_MODE=permuted-lanes node tests/general.cjs normalization
+FUSOR_ROW_MODE=partial-subgroups node tests/general.cjs normalization
+cargo test --release --manifest-path ../Cargo.toml -p fusor --test slab
+```
+
+Direct storage matrix loads were also measured and discarded; they did not
+improve training. No shader rewriting is used in the production compiler.

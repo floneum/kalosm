@@ -206,7 +206,23 @@ fn map_call(p: &Plan, id: Id, at: &str) -> Result<String> {
 }
 fn load(p: &Plan, id: Id, at: &str) -> Result<String> {
     let bounds = super::index::Bounds::from([(0, u64::from(p.value(id).len() - 1))]);
-    load_expr(p, id, super::index::Expr::var(0), at, &bounds)
+    load_expr(p, id, super::index::Expr::var(0), &[at], &bounds)
+}
+fn index_wgsl(x: &super::index::Expr, variables: &[&str]) -> String {
+    use super::index::Expr;
+    match x {
+        Expr::Const(c) => format!("{c}u"),
+        Expr::Var(v) => format!("({})", variables[*v]),
+        Expr::Sum(xs) => sum(xs.iter().map(|(x, n)| {
+            if *n == 1 {
+                index_wgsl(x, variables)
+            } else {
+                format!("({}*{n}u)", index_wgsl(x, variables))
+            }
+        })),
+        Expr::Div(x, n) => format!("({}/{n}u)", index_wgsl(x, variables)),
+        Expr::Mod(x, n) => format!("({}%{n}u)", index_wgsl(x, variables)),
+    }
 }
 // Every caller supplies an in-range logical index. Gather checks its dynamic
 // index before calling this function; matrix loads are guarded at tile tails.
@@ -214,25 +230,10 @@ fn load_expr(
     p: &Plan,
     id: Id,
     index: super::index::Expr,
-    at: &str,
+    variables: &[&str],
     bounds: &super::index::Bounds,
 ) -> Result<String> {
     use super::index::Expr;
-    fn wgsl(x: &Expr, at: &str) -> String {
-        match x {
-            Expr::Const(c) => format!("{c}u"),
-            Expr::Var(_) => format!("({at})"),
-            Expr::Sum(xs) => sum(xs.iter().map(|(x, n)| {
-                if *n == 1 {
-                    wgsl(x, at)
-                } else {
-                    format!("({}*{n}u)", wgsl(x, at))
-                }
-            })),
-            Expr::Div(x, n) => format!("({}/{n}u)", wgsl(x, at)),
-            Expr::Mod(x, n) => format!("({}%{n}u)", wgsl(x, at)),
-        }
-    }
     let v = p.value(id);
     match &v.op {
         Logical::Leaf(LeafKind::Const { value, .. }) => lit(*value),
@@ -256,17 +257,21 @@ fn load_expr(
                     }),
             )
             .simplify(bounds);
-            load_expr(p, *x, mapped, at, bounds)
+            load_expr(p, *x, mapped, variables, bounds)
         }
         Logical::Map { ins, .. } if v.forwarded => {
             let mut args = ins
                 .iter()
-                .map(|id| load_expr(p, *id, index.clone(), at, bounds))
+                .map(|id| load_expr(p, *id, index.clone(), variables, bounds))
                 .collect::<Result<Vec<_>>>()?;
-            args.push(wgsl(&index, at));
+            args.push(index_wgsl(&index, variables));
             Ok(format!("map_{}({})", v.id.0, args.join(",")))
         }
-        _ => Ok(format!("read_{}({})", v.id.0, wgsl(&index, at))),
+        _ => Ok(format!(
+            "read_{}({})",
+            v.id.0,
+            index_wgsl(&index, variables)
+        )),
     }
 }
 fn store(out: &mut String, p: &Plan, id: Id, at: &str, value: &str) {
@@ -356,11 +361,23 @@ pub(crate) fn shader(
             .iter()
             .find(|j| j.groups > 1 && j.stages.contains(&v.id))
         {
-            format!(" || i/{}u != owner", v.len().div_ceil(job.groups))
+            format!(
+                "if(i/{}u != owner){{return {dtype}(0);}}",
+                v.len().div_ceil(job.groups)
+            )
         } else {
             String::new()
         };
-        writeln!(out,"fn read_{}(i:u32)->{dtype}{{if(i>={}u{bound}){{return {dtype}(0);}}return bitcast<{dtype}>(arena[{}u+i]);}}",v.id.0,v.len(),v.offset.unwrap()).unwrap();
+        // Logical ranges are checked by the caller before view composition.
+        // Keep the ownership mask for values produced inside a multi-group job;
+        // repeating the logical bounds branch here obscures matrix addressing.
+        writeln!(
+            out,
+            "fn read_{}(i:u32)->{dtype}{{{bound}return bitcast<{dtype}>(arena[{}u+i]);}}",
+            v.id.0,
+            v.offset.unwrap()
+        )
+        .unwrap();
     }
     for v in p.values.iter().filter(|v| used_maps.contains(&v.id)) {
         if let Logical::Map { expr, ins, outs } = &v.op {
@@ -646,36 +663,45 @@ fn contraction(
         ns.iter().product(),
         ks.iter().product(),
     );
-    let address = |labels: &[Label], shape: &[u32], r: &str, c: &str, k: &str| {
-        // Batch is within its tile range; row, column and K are guarded at
-        // every load/store below. The leading coordinate cannot wrap, so its
-        // modulo is redundant. In particular, a single-axis coordinate is
-        // just r/c/k. Keeping the modulo here makes browser compilers carry
-        // costly integer division through nested view addressing.
-        let bounded_coord = |at: &str, shape: &[u32], axis: usize| {
-            if axis == 0 && shape[axis] != 1 {
-                let stride = stride(shape, axis);
-                if stride == 1 {
-                    format!("({at})")
-                } else {
-                    format!("(({at}) / {stride}u)")
-                }
-            } else {
-                coord(at, shape, axis)
-            }
-        };
-        sum(labels.iter().enumerate().map(|(axis, label)| {
-            let coordinate = if let Some(i) = batch.iter().position(|l| l == label) {
-                bounded_coord("batch", &bs, i)
+    use super::index::{Bounds, Expr};
+    let bounds = Bounds::from([
+        (0, u64::from(batch_n - 1)),
+        (1, u64::from(m - 1)),
+        (2, u64::from(n - 1)),
+        (3, u64::from(k - 1)),
+    ]);
+    // Keep coordinates symbolic through every view. Their ranges are guaranteed
+    // by the tile loop and tail guards; composition can eliminate reshape and
+    // transpose arithmetic before WGSL hides those relationships from the IR.
+    let address_expr = |labels: &[Label], shape: &[u32]| {
+        Expr::sum(labels.iter().enumerate().map(|(axis, label)| {
+            let (var, dims, i) = if let Some(i) = batch.iter().position(|l| l == label) {
+                (0, &bs, i)
             } else if let Some(i) = rows.iter().position(|l| l == label) {
-                bounded_coord(r, &ms, i)
+                (1, &ms, i)
             } else if let Some(i) = cols.iter().position(|l| l == label) {
-                bounded_coord(c, &ns, i)
+                (2, &ns, i)
             } else {
-                bounded_coord(k, &ks, red.iter().position(|l| l == label).unwrap())
+                (3, &ks, red.iter().position(|l| l == label).unwrap())
             };
-            format!("({coordinate} * {}u)", stride(shape, axis))
+            Expr::var(var)
+                .div(stride(dims, i) as usize)
+                .modulo(dims[i] as usize)
+                .scale(stride(shape, axis) as usize)
         }))
+        .simplify(&bounds)
+    };
+    let address = |labels: &[Label], shape: &[u32], r: &str, c: &str, k: &str| {
+        index_wgsl(&address_expr(labels, shape), &["batch", r, c, k])
+    };
+    let matrix_load = |id: Id, labels: &[Label], shape: &[u32], r: &str, c: &str, k: &str| {
+        load_expr(
+            p,
+            id,
+            address_expr(labels, shape),
+            &["batch", r, c, k],
+            &bounds,
+        )
     };
     let share = v.len().div_ceil(groups);
     let tm = if cooperative { 32 } else { 16 };
@@ -714,20 +740,20 @@ fn contraction(
     writeln!(
         out,
         "if(row<{m}u && ka<{k}u){{va={};}}",
-        load(p, a, &address(&spec.a, &av.shape, "row", "0u", "ka"))?
+        matrix_load(a, &spec.a, &av.shape, "row", "0u", "ka")?
     )
     .unwrap();
     writeln!(
         out,
         "if(col<{n}u && kb<{k}u){{vb={};}}",
-        load(p, b, &address(&spec.b, &bv.shape, "0u", "col", "kb"))?
+        matrix_load(b, &spec.b, &bv.shape, "0u", "col", "kb")?
     )
     .unwrap();
     if cooperative {
         writeln!(
             out,
             "var va2=0.0;if(row+16u<{m}u && ka<{k}u){{va2={};}}tile_a[lane+256u]=va2;",
-            load(p, a, &address(&spec.a, &av.shape, "row+16u", "0u", "ka"))?
+            matrix_load(a, &spec.a, &av.shape, "row+16u", "0u", "ka")?
         )
         .unwrap();
     }

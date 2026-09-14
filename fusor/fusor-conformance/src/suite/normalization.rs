@@ -239,6 +239,22 @@ pub fn cases() -> Cases {
         BWD_SPEC,
         layer_norm_sum_gradient_is_zero,
     ));
+    cases.push_case(fuzz_case(
+        "normalization",
+        "layer_norm_wide_rows",
+        &[FuzzDim::Fixed(128), FuzzDim::Fixed(512)],
+        async |session: &Session, shape: &[u64], seed: u32| {
+            // Match the benchmark's wide rows, including its split statistics
+            // and private intermediates, against independent host arithmetic.
+            let graph = graph_of(session);
+            let data = Domain::Wide.sample(seed, (shape[0] * shape[1]) as usize);
+            let x = upload(graph.handle(), &dims(shape), &data)?;
+            let y = layer_norm_bare(&x, shape[1], true)?;
+            let actual = read(&y).await?;
+            let expected = by_row(&data, shape[1] as usize, host_layer_centered);
+            expect_values(session, shape, Dtype::F32, &actual, &expected).await
+        },
+    ));
     cases
 }
 

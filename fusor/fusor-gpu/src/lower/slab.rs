@@ -4,7 +4,7 @@
 //! Workgroup `s` runs every stage over slab `s` of that stage's index space,
 //! with the workgroup's lanes striding the slab's elements — or, for a fold,
 //! a group of lanes per output row striding the reduced axis and closing
-//! over a workgroup tree — and a storage barrier between stages, since a
+//! over a subgroup collective or workgroup tree — and a barrier between stages, since a
 //! stage reads only what this workgroup wrote. Every stage but the last
 //! stores into its member's own buffer; the last stores into the slab's.
 //! The block is [`slab_block`] of the widest stage's share of one slab.
@@ -270,7 +270,7 @@ fn map_stage(
 
 /// A fold stage: `lpr` lanes per output row stride the slab's rows, each
 /// lane walking every `lpr`th element of the reduced axis with the
-/// carrier's lift and merge, then the group closes over a workgroup tree.
+/// carrier's lift and merge, then closing with a collective or a tree.
 fn fold_stage(
     ctx: &mut Ctx<'_>,
     body: &mut Vec<Stmt>,
@@ -278,6 +278,64 @@ fn fold_stage(
     dst: &Dst,
     slabs: u32,
     lanes: &mut Lanes,
+) -> Result<()> {
+    use fusor_ir::ir::kernel::{Builtin, fast_reduce_op};
+    let subgroup = ctx
+        .caps
+        .subgroups
+        .filter(|s| s.is_fixed())
+        .map(|s| s.assumed())
+        .filter(|width| *width > 0);
+    if let (
+        Some(width),
+        Launch::Fold {
+            space,
+            axis,
+            carrier,
+            ..
+        },
+    ) = (subgroup, stage)
+    {
+        let dims = constant_dims(space)?;
+        let k = *dims.get(*axis as usize).ok_or_else(|| {
+            Error::Plan(format!("fold axis {axis} of a rank-{} space", dims.len()))
+        })?;
+        let rows = dims.iter().product::<u64>() / k.max(1);
+        let per = per_slab(rows, slabs)?;
+        if fast_reduce_op(carrier).is_some()
+            && lanes.block.is_multiple_of(width)
+            && slab_lanes_per_row(lanes.block, u64::from(per), k) >= width
+        {
+            // Local invocation indices have no specified subgroup mapping.
+            // Assign rows using actual subgroup IDs and lanes. Only use this
+            // path when every slot is occupied; otherwise the original tree
+            // covers the workgroup's contiguous local invocation indices.
+            let count = ctx.b.builtin(Builtin::NumSubgroups);
+            let expected = ctx.b.u32(lanes.block / width);
+            let full = ctx.b.compare(TileCompareOp::Eq, count, expected);
+            let mut accept = Vec::new();
+            let mut reject = Vec::new();
+            fold_stage_impl(ctx, &mut accept, stage, dst, slabs, lanes, Some(width))?;
+            fold_stage_impl(ctx, &mut reject, stage, dst, slabs, lanes, None)?;
+            body.push(Stmt::If {
+                condition: full,
+                accept,
+                reject,
+            });
+            return Ok(());
+        }
+    }
+    fold_stage_impl(ctx, body, stage, dst, slabs, lanes, None)
+}
+
+fn fold_stage_impl(
+    ctx: &mut Ctx<'_>,
+    body: &mut Vec<Stmt>,
+    stage: &Launch,
+    dst: &Dst,
+    slabs: u32,
+    lanes: &mut Lanes,
+    subgroup: Option<u32>,
 ) -> Result<()> {
     let Launch::Fold {
         space,
@@ -301,14 +359,17 @@ fn fold_stage(
     let axis = *axis as usize;
     let dims = constant_dims(space)?;
     if axis >= dims.len() {
-        return Err(Error::Plan(format!("fold axis {axis} of a rank-{} space", dims.len())));
+        return Err(Error::Plan(format!(
+            "fold axis {axis} of a rank-{} space",
+            dims.len()
+        )));
     }
     let total: u64 = dims.iter().product();
     let k = dims[axis];
     let inner: u64 = dims[axis + 1..].iter().product();
     let rows = total / k.max(1);
     let per = per_slab(rows, slabs)?;
-    let lpr = slab_lanes_per_row(lanes.block, u64::from(per), k);
+    let lpr = subgroup.unwrap_or_else(|| slab_lanes_per_row(lanes.block, u64::from(per), k));
     let groups = lanes.block / lpr;
     let iters = per.div_ceil(groups).max(1);
 
@@ -317,18 +378,28 @@ fn fold_stage(
     let it = ctx.b.local(ElementType::Scalar(ScalarElement::U32));
     let it_e = ctx.b.load_local(it.clone());
     let lpr_e = ctx.b.u32(lpr);
-    let group = ctx.b.binary(
-        TileBinaryOp::Div,
-        lanes.lane.clone(),
-        lpr_e.clone(),
-        NumericContract::RELAXED,
-    );
-    let sub = ctx.b.binary(
-        TileBinaryOp::Rem,
-        lanes.lane.clone(),
-        lpr_e.clone(),
-        NumericContract::RELAXED,
-    );
+    let (group, sub) = if subgroup.is_some() {
+        use fusor_ir::ir::kernel::Builtin;
+        (
+            ctx.b.builtin(Builtin::SubgroupId),
+            ctx.b.builtin(Builtin::SubgroupLane),
+        )
+    } else {
+        (
+            ctx.b.binary(
+                TileBinaryOp::Div,
+                lanes.lane.clone(),
+                lpr_e.clone(),
+                NumericContract::RELAXED,
+            ),
+            ctx.b.binary(
+                TileBinaryOp::Rem,
+                lanes.lane.clone(),
+                lpr_e.clone(),
+                NumericContract::RELAXED,
+            ),
+        )
+    };
     let groups_e = ctx.b.u32(groups);
     let step = ctx.b.mul(it_e, groups_e);
     let within = ctx.b.add(step, group);
@@ -384,7 +455,8 @@ fn fold_stage(
         lifted.push(ctx.b.select(in_axis.clone(), v, ident));
     }
     let locals: Vec<_> = (0..width).map(|_| ctx.b.local(acc_ty)).collect();
-    let mut merge_args: Vec<TileExpr> = locals.iter().map(|l| ctx.b.load_local(l.clone())).collect();
+    let mut merge_args: Vec<TileExpr> =
+        locals.iter().map(|l| ctx.b.load_local(l.clone())).collect();
     let partials = merge_args.clone();
     merge_args.extend(lifted);
     let mut accumulators = Vec::with_capacity(width);
@@ -398,7 +470,9 @@ fn fold_stage(
             update,
         });
     }
-    let count = ctx.b.u32(u32::try_from(k.div_ceil(u64::from(lpr))).unwrap_or(u32::MAX));
+    let count = ctx
+        .b
+        .u32(u32::try_from(k.div_ceil(u64::from(lpr))).unwrap_or(u32::MAX));
     let mut stmts = vec![Stmt::Loop {
         count: Some(count),
         index: Some(j),
@@ -411,9 +485,23 @@ fn fold_stage(
     // already holds its row.
     let reduced: Vec<TileExpr> = if lpr <= 1 {
         partials
+    } else if subgroup.is_some() {
+        let op = fusor_ir::ir::kernel::fast_reduce_op(carrier)
+            .expect("subgroup admission checked the scalar carrier");
+        // Evaluate the collective before the leader-only store. A tile
+        // destination wraps its value in an If, where a lazy reduction would
+        // run on only the leader and lose the other lanes' contributions.
+        let total = ctx.b.local(acc_ty);
+        stmts.push(Stmt::StoreLocal {
+            dst: total.clone(),
+            value: ctx.b.reduce(op, ReduceKind::Subgroup, partials[0].clone()),
+        });
+        vec![ctx.b.load_local(total)]
     } else {
         while lanes.scratch.len() < width {
-            lanes.scratch.push(ctx.b.tile("slab_scratch", acc_ty, &[lanes.block]));
+            lanes
+                .scratch
+                .push(ctx.b.tile("slab_scratch", acc_ty, &[lanes.block]));
         }
         let scratch: SmallVec<[Tile; 4]> = lanes.scratch[..width].iter().cloned().collect();
         let lhs: SmallVec<[_; 4]> = (0..width).map(|_| ctx.b.local(acc_ty)).collect();

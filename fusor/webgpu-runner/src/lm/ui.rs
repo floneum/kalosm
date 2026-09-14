@@ -243,9 +243,14 @@ pub fn Train() -> Element {
                 }
                 status.set("Training".into());
                 while *running.peek() {
+                    let before = model.step_count();
                     let at = Instant::now();
                     let outcome = model.train(&corpus, STEPS_PER_SYNC).await;
-                    cost.write().train += at.elapsed().as_secs_f32() * 1000.0;
+                    {
+                        let mut c = cost.write();
+                        c.train += at.elapsed().as_secs_f32() * 1000.0;
+                        c.steps += model.step_count() - before;
+                    }
                     match outcome {
                         Ok(step) => {
                             history.write().push((step.step, step.loss, None));
@@ -322,7 +327,6 @@ pub fn Train() -> Element {
                         let steps = model.step_count() - window.1;
                         rate.set(steps as f32 / elapsed);
                         let mut c = cost.write();
-                        c.steps += steps;
                         c.dispatches = model.dispatch_count() - window.2;
                         c.window_steps = steps;
                         window = (Instant::now(), model.step_count(), model.dispatch_count());
