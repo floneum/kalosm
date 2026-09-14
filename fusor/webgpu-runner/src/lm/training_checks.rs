@@ -12,8 +12,8 @@ pub async fn check_training(mode: &str, steps: u32) -> std::result::Result<Strin
                 "expected portable/subgroups/accelerated and 1..=512 steps".into(),
             ));
         }
-        let corpus = Corpus::load();
-        let mut model = Lm::new(corpus.vocab_size(), 0x51ed_c0de).await?;
+        let corpus = Corpus::benchmark();
+        let mut model = Lm::new(corpus.vocab_size(), 0x51ed_c0de, ModelConfig::TINY).await?;
         model
             .compile_training(fusor::program::ProgramOptions {
                 matrix_acceleration: mode == "accelerated",

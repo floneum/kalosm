@@ -8,10 +8,6 @@
 //! which is what makes a quarter-million-parameter model worth watching: the
 //! grammar it has to learn is simple enough to actually learn in a minute.
 
-/// Fraction of the text held out. The tail, so a held-out batch can never
-/// overlap a training batch.
-const TEST_SHARE: f32 = 0.1;
-
 static TEXT: &str = include_str!("../../assets/tinystories.txt");
 
 /// The corpus as token ids, plus the character each id denotes.
@@ -34,9 +30,29 @@ impl Corpus {
     /// derived from the text rather than declared beside it, so the two can
     /// never disagree.
     pub fn load() -> Self {
+        // Split between complete stories, so the held-out tail never contains
+        // the ending of a story whose beginning trained the model.
+        let split = TEXT[..TEXT.len() * 9 / 10]
+            .rfind("\n\n\n")
+            .expect("story boundary");
+        Self::from_text(TEXT, split)
+    }
+
+    /// Freeze both data and sampling for the original performance oracles.
+    #[allow(dead_code)] // Retained by native examples and opt-in browser checks only.
+    pub fn benchmark() -> Self {
+        let text = include_str!("../../assets/tinystories-benchmark.txt");
+        Self::from_text(text, ((text.len() as f32) * 0.9) as usize)
+    }
+
+    fn from_text(text: &str, split: usize) -> Self {
+        assert!(
+            text.is_ascii(),
+            "Corpus preparation must normalize text to ASCII"
+        );
         let mut seen = [false; 128];
-        for c in TEXT.chars() {
-            seen[c as usize & 0x7f] = true;
+        for c in text.bytes() {
+            seen[c as usize] = true;
         }
         let vocab: Vec<char> = (0u32..128)
             .filter(|c| seen[*c as usize])
@@ -48,12 +64,11 @@ impl Corpus {
         for (i, c) in vocab.iter().enumerate() {
             index[(*c as u32 - lowest) as usize] = Some(i as u8);
         }
-        let tokens: Vec<u8> = TEXT
+        let tokens: Vec<u8> = text
             .chars()
             .filter_map(|c| index.get((c as u32).wrapping_sub(lowest) as usize).copied())
             .flatten()
             .collect();
-        let split = ((tokens.len() as f32) * (1.0 - TEST_SHARE)) as usize;
         Self {
             tokens,
             vocab,
@@ -96,6 +111,13 @@ impl Corpus {
         self.tokens.len()
     }
 
+    pub fn split_len(&self, split: Split) -> usize {
+        match split {
+            Split::Train => self.split,
+            Split::Test => self.tokens.len() - self.split,
+        }
+    }
+
     /// A `span + 1`-token window starting at `at`, clamped into `range`.
     ///
     /// The extra token is the last position's target: a window of `span`
@@ -114,7 +136,36 @@ impl Corpus {
     /// A readable excerpt of the training text, for the UI to show what the
     /// model is being asked to imitate.
     pub fn excerpt(&self, chars: usize) -> String {
-        TEXT.chars().take(chars).collect()
+        self.tokens
+            .iter()
+            .take(chars)
+            .map(|id| self.decode(*id as usize))
+            .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expanded_data_round_trips_and_windows_stay_in_their_split() {
+        let corpus = Corpus::load();
+        assert!(corpus.len() > 7_900_000);
+        assert_eq!(corpus.len(), TEXT.len());
+        assert_eq!(corpus.excerpt(corpus.len()), TEXT);
+        assert!(TEXT[corpus.split..].starts_with("\n\n\n"));
+        for split in [Split::Train, Split::Test] {
+            for at in [0, corpus.len() - 1, usize::MAX] {
+                let window = corpus.window(split, at, 512);
+                assert_eq!(window.len(), 513);
+                let offset = window.as_ptr() as usize - corpus.tokens.as_ptr() as usize;
+                match split {
+                    Split::Train => assert!(offset + window.len() <= corpus.split),
+                    Split::Test => assert!(offset >= corpus.split),
+                }
+            }
+        }
     }
 }
 

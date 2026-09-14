@@ -1,6 +1,8 @@
 //! The browser's actual model, without UI dependencies.
 //! `cargo run --release -p fusor --example train_small -- [baseline|fused|single|subgroups|portable|compare] [steps]`
 #![allow(dead_code)]
+#[path = "../../webgpu-runner/src/lm/config.rs"]
+mod config;
 #[path = "../../webgpu-runner/src/lm/corpus.rs"]
 mod corpus;
 #[path = "../../webgpu-runner/src/lm/model.rs"]
@@ -23,12 +25,13 @@ fn main() -> fusor::Result<()> {
                     .into(),
             ));
         }
-        let corpus = corpus::Corpus::load();
+        let corpus = corpus::Corpus::benchmark();
         if mode == "compare" {
             return compare(&corpus, steps).await;
         }
         let start = std::time::Instant::now();
-        let mut model = model::Lm::new(corpus.vocab_size(), 0x51ed_c0de).await?;
+        let mut model =
+            model::Lm::new(corpus.vocab_size(), 0x51ed_c0de, config::ModelConfig::TINY).await?;
         if mode != "baseline" {
             model
                 .compile_training(fusor::program::ProgramOptions {
@@ -42,8 +45,8 @@ fn main() -> fusor::Result<()> {
         let first = model.train(&corpus, 1).await?;
         println!(
             "mode={mode} parameters={} tokens/step={} setup_ms={:.3} first_loss={} plan={:?}",
-            model::parameter_count_for(corpus.vocab_size()),
-            model::TOKENS,
+            config::ModelConfig::TINY.parameters(corpus.vocab_size()),
+            config::ModelConfig::TINY.tokens(),
             start.elapsed().as_secs_f64() * 1000.,
             first.loss,
             model.program_stats()
@@ -76,8 +79,8 @@ fn main() -> fusor::Result<()> {
 // reference executor's occasional retuning pauses from the claimed speedup.
 async fn compare(corpus: &corpus::Corpus, steps: usize) -> fusor::Result<()> {
     let mut models = [
-        model::Lm::new(corpus.vocab_size(), 0x51ed_c0de).await?,
-        model::Lm::new(corpus.vocab_size(), 0x51ed_c0de).await?,
+        model::Lm::new(corpus.vocab_size(), 0x51ed_c0de, config::ModelConfig::TINY).await?,
+        model::Lm::new(corpus.vocab_size(), 0x51ed_c0de, config::ModelConfig::TINY).await?,
     ];
     models[1].compile_training(Default::default()).await?;
     for model in &mut models {
@@ -85,8 +88,8 @@ async fn compare(corpus: &corpus::Corpus, steps: usize) -> fusor::Result<()> {
     }
     println!(
         "parameters={} tokens/step={} plan={:?}",
-        model::parameter_count_for(corpus.vocab_size()),
-        model::TOKENS,
+        config::ModelConfig::TINY.parameters(corpus.vocab_size()),
+        config::ModelConfig::TINY.tokens(),
         models[1].program_stats()
     );
     let mut best = [f64::INFINITY; 2];

@@ -7,11 +7,10 @@ use std::rc::Rc;
 use dioxus::prelude::*;
 use web_time::Instant;
 
+use super::config::{ModelConfig, TrainingConfig};
 use super::corpus::Corpus;
+use super::model::{Attention, Evaluation, Lm, StepStats};
 use super::paint;
-use super::model::{
-    Attention, BLOCKS, CONTEXT, Evaluation, HEADS, Lm, StepStats, TOKENS, parameter_count_for,
-};
 use crate::components::badge::{Badge, BadgeVariant};
 use crate::components::button::{Button, ButtonSize, ButtonVariant};
 use crate::components::card::{Card, CardContent, CardDescription, CardHeader, CardTitle};
@@ -53,6 +52,75 @@ const PATIENCE: usize = 10;
 /// Held-out gain in nats that counts as improvement rather than noise.
 const MIN_GAIN: f32 = 0.004;
 
+const CONFIG_FIELDS: [(&str, u64, u64); 7] = [
+    ("Blocks", 1, 8),
+    ("Model width", 8, 512),
+    ("Attention heads", 1, 16),
+    ("Feed-forward width", 8, 2048),
+    ("Context tokens", 8, 512),
+    ("Batch size", 1, 128),
+    ("Training tokens", 1, 1_000_000_000),
+];
+
+#[derive(Clone)]
+struct ConfigDraft([String; 7]);
+
+impl From<TrainingConfig> for ConfigDraft {
+    fn from(c: TrainingConfig) -> Self {
+        Self(
+            [
+                c.model.blocks as u64,
+                c.model.dim as u64,
+                c.model.heads as u64,
+                c.model.mlp as u64,
+                c.model.context as u64,
+                c.model.batch as u64,
+                c.token_budget,
+            ]
+            .map(|value| value.to_string()),
+        )
+    }
+}
+
+impl ConfigDraft {
+    fn parse(&self, vocab: usize) -> Result<TrainingConfig, String> {
+        let mut values = [0u64; 7];
+        for (index, value) in self.0.iter().enumerate() {
+            values[index] = value
+                .parse::<u64>()
+                .ok()
+                .filter(|n| (CONFIG_FIELDS[index].1..=CONFIG_FIELDS[index].2).contains(n))
+                .ok_or_else(|| {
+                    format!(
+                        "{} must be a whole number between {} and {}.",
+                        CONFIG_FIELDS[index].0, CONFIG_FIELDS[index].1, CONFIG_FIELDS[index].2
+                    )
+                })?;
+        }
+        let config = TrainingConfig {
+            model: ModelConfig {
+                blocks: values[0] as usize,
+                dim: values[1] as usize,
+                heads: values[2] as usize,
+                mlp: values[3] as usize,
+                context: values[4] as usize,
+                batch: values[5] as usize,
+            },
+            token_budget: values[6],
+        };
+        config.validate(vocab)?;
+        Ok(config)
+    }
+}
+
+/// Keep controls locked until a paused/cancelled GPU operation actually ends.
+struct Busy(Signal<bool>);
+impl Drop for Busy {
+    fn drop(&mut self) {
+        self.0.set(false);
+    }
+}
+
 /// A model taken out of its cell for the duration of one run.
 ///
 /// Parking it again on drop is what makes cancellation harmless: whether the
@@ -67,11 +135,11 @@ struct Parked {
 impl Parked {
     /// Drive out the model built for `seed`, discarding one built for any
     /// other seed — that is what Reset does.
-    fn take(garage: &Rc<RefCell<Option<(u32, Lm)>>>, seed: u32) -> Self {
+    fn take(garage: &Rc<RefCell<Option<(u32, Lm)>>>, seed: u32, config: ModelConfig) -> Self {
         let model = garage
             .borrow_mut()
             .take()
-            .filter(|(built, _)| *built == seed)
+            .filter(|(built, model)| *built == seed && model.config() == config)
             .map(|(_, model)| model);
         Self {
             garage: garage.clone(),
@@ -107,13 +175,21 @@ struct Cost {
 impl Cost {
     /// Milliseconds of training per optimizer step.
     fn ms_per_step(&self) -> f32 {
-        if self.steps == 0 { 0.0 } else { self.train / self.steps as f32 }
+        if self.steps == 0 {
+            0.0
+        } else {
+            self.train / self.steps as f32
+        }
     }
 
     /// Share of wall time not spent training.
     fn overhead(&self) -> f32 {
         let total = self.train + self.eval + self.sample;
-        if total <= 0.0 { 0.0 } else { (self.eval + self.sample) / total }
+        if total <= 0.0 {
+            0.0
+        } else {
+            (self.eval + self.sample) / total
+        }
     }
 
     /// GPU dispatches per optimizer step.
@@ -135,6 +211,7 @@ struct Insight {
     maps: Vec<Vec<Vec<f32>>>,
     /// Real positions in the window; the rest are left padding.
     filled: usize,
+    window: usize,
     /// Largest logit gap between the model and the lens the maps come from.
     disagreement: f32,
     /// The next-character distribution at the end of `context`.
@@ -157,16 +234,37 @@ pub fn Train() -> Element {
     let mut rate = use_signal(|| 0.0f32);
     let mut cost = use_signal(Cost::default);
     let mut running = use_signal(|| false);
+    let mut busy = use_signal(|| false);
+    let mut configuration = use_signal(TrainingConfig::default);
+    let mut draft = use_signal(|| ConfigDraft::from(TrainingConfig::default()));
     let mut status = use_signal(String::new);
     let mut run_id = use_signal(|| 0usize);
     let mut seed = use_signal(|| 0x51ed_c0deu32);
-    let mut early_stop = use_signal(|| true);
+    let mut early_stop = use_signal(|| false);
     let mut insight = use_signal(|| None::<Insight>);
     // What the next turn of the loop should do besides train.
     let mut want_inspect = use_signal(|| false);
     let mut want_write = use_signal(|| false);
 
     let garage: Rc<RefCell<Option<(u32, Lm)>>> = use_hook(|| Rc::new(RefCell::new(None)));
+
+    let reset = use_callback({
+        let garage = garage.clone();
+        move |next: TrainingConfig| {
+            garage.borrow_mut().take();
+            configuration.set(next);
+            draft.set(ConfigDraft::from(next));
+            seed.set(seed() ^ 0x9e37_79b9);
+            history.write().clear();
+            cost.set(Cost::default());
+            stats.set(None);
+            evaluation.set(None);
+            insight.set(None);
+            sample.set(String::new());
+            rate.set(0.0);
+            status.set("Ready — the next run starts with fresh weights.".into());
+        }
+    });
 
     let _training = use_resource({
         let garage = garage.clone();
@@ -182,12 +280,20 @@ pub fn Train() -> Element {
                 // parked again by `Parked::drop`, so no borrow is ever live
                 // across an await — including the one where this future is
                 // cancelled out from under us.
+                busy.set(true);
+                let _busy = Busy(busy);
+                let setup = *configuration.peek();
                 let wanted = *seed.peek();
-                let mut parked = Parked::take(&garage, wanted);
+                let mut parked = Parked::take(&garage, wanted, setup.model);
                 if parked.model.is_none() {
                     status.set("Requesting an adapter and compiling kernels…".into());
-                    match Lm::new(corpus.vocab_size(), wanted).await {
+                    match Lm::new(corpus.vocab_size(), wanted, setup.model).await {
                         Ok(mut built) => {
+                            if let Err(error) = built.set_training_steps(setup.steps()) {
+                                status.set(error.to_string());
+                                running.set(false);
+                                return;
+                            }
                             if let Err(error) = built.compile_training(Default::default()).await {
                                 status.set(error.to_string());
                                 running.set(false);
@@ -207,28 +313,37 @@ pub fn Train() -> Element {
                 };
 
                 // The loop owns the model, so it is also what answers a
-                // one-off request: both buttons bump the same `run_id`, so
-                // they work whether or not training is going.
+                // one-off observation request while training is paused.
                 if *want_write.peek() {
                     want_write.set(false);
                     status.set("Writing…".into());
                     let seeded = corpus.encode_all(&prompt.peek().clone());
                     let hot = *temperature.peek();
                     match model.generate(&corpus, &seeded, FULL_CHARS, hot).await {
-                        Ok(text) => sample.set(text),
-                        Err(error) => status.set(error.to_string()),
+                        Ok(text) => {
+                            sample.set(text);
+                            status.set(String::new());
+                        }
+                        Err(error) => {
+                            status.set(error.to_string());
+                            return;
+                        }
                     }
-                    status.set(String::new());
                 }
                 if *want_inspect.peek() {
                     want_inspect.set(false);
                     status.set("Reading the model…".into());
                     let text = prompt.peek().clone();
                     match look_inside(model, &corpus, &text, *temperature.peek()).await {
-                        Ok(found) => insight.set(Some(found)),
-                        Err(error) => status.set(error.to_string()),
+                        Ok(found) => {
+                            insight.set(Some(found));
+                            status.set(String::new());
+                        }
+                        Err(error) => {
+                            status.set(error.to_string());
+                            return;
+                        }
                     }
-                    status.set(String::new());
                 }
 
                 // `peek` throughout: reading these reactively would re-run the
@@ -243,9 +358,16 @@ pub fn Train() -> Element {
                 }
                 status.set("Training".into());
                 while *running.peek() {
+                    let remaining = setup.steps().saturating_sub(model.step_count());
+                    if remaining == 0 {
+                        status.set("Complete — training token budget reached.".into());
+                        break;
+                    }
                     let before = model.step_count();
                     let at = Instant::now();
-                    let outcome = model.train(&corpus, STEPS_PER_SYNC).await;
+                    let outcome = model
+                        .train(&corpus, remaining.min(STEPS_PER_SYNC as u64) as usize)
+                        .await;
                     {
                         let mut c = cost.write();
                         c.train += at.elapsed().as_secs_f32() * 1000.0;
@@ -266,7 +388,7 @@ pub fn Train() -> Element {
                     // the loss alone — no update root is asked for, so
                     // measuring cannot train.
                     since_eval += 1;
-                    if since_eval >= SYNCS_PER_EVAL {
+                    if since_eval >= SYNCS_PER_EVAL || model.step_count() == setup.steps() {
                         since_eval = 0;
                         let at = Instant::now();
                         let scored = model.evaluate(&corpus, EVAL_BATCHES).await;
@@ -308,7 +430,10 @@ pub fn Train() -> Element {
                     // sync — otherwise the demo would spend its time writing
                     // instead of learning.
                     since_sample += 1;
-                    if since_sample >= SYNCS_PER_SAMPLE {
+                    if since_sample >= SYNCS_PER_SAMPLE
+                        && *running.peek()
+                        && model.step_count() < setup.steps()
+                    {
                         since_sample = 0;
                         let seeded = corpus.encode_all(&prompt.peek().clone());
                         let hot = *temperature.peek();
@@ -345,9 +470,13 @@ pub fn Train() -> Element {
         move || corpus.excerpt(560)
     });
     let alphabet: Vec<char> = corpus.alphabet().to_vec();
-    let parameters = Thousands(parameter_count_for(vocab) as u64);
+    let setup = configuration();
+    let parsed = draft.read().parse(vocab);
+    let pending = parsed.as_ref().is_ok_and(|next| *next != setup);
+    let parameters = Thousands(setup.model.parameters(vocab) as u64);
     let step = stats.read().map_or(0, |s| s.step);
-    let tokens_seen = step * TOKENS as u64;
+    let tokens_seen = step * setup.model.tokens() as u64;
+    let complete = step >= setup.steps();
 
     rsx! {
         div { class: "lm-page",
@@ -360,39 +489,91 @@ pub fn Train() -> Element {
                     "fusor graph, built once and re-run every step."
                 }
                 div { class: "lm-hero-facts",
-                    Fact { value: "{BLOCKS}", label: "blocks" }
-                    Fact { value: "{HEADS}", label: "heads" }
-                    Fact { value: "{CONTEXT}", label: "context" }
+                    Fact { value: "{setup.model.blocks}", label: "blocks" }
+                    Fact { value: "{setup.model.heads}", label: "heads" }
+                    Fact { value: "{setup.model.context}", label: "context" }
                     Fact { value: "{vocab}", label: "characters" }
+                }
+            }
+
+            Card { class: "lm-card",
+                CardHeader {
+                    CardTitle { "Architecture & training" }
+                    CardDescription { "Choose the shape, then start a fresh run. One token is one character." }
+                }
+                CardContent {
+                    div { class: "lm-config-presets",
+                        Button {
+                            variant: ButtonVariant::Outline, size: ButtonSize::Sm, disabled: busy(),
+                            onclick: move |_| draft.set(ConfigDraft::from(TrainingConfig {
+                                model: ModelConfig::TINY, ..TrainingConfig::default()
+                            })),
+                            "Tiny · 64 context"
+                        }
+                        Button {
+                            variant: ButtonVariant::Outline, size: ButtonSize::Sm, disabled: busy(),
+                            onclick: move |_| draft.set(ConfigDraft::from(TrainingConfig::default())),
+                            "Longer context · 128"
+                        }
+                    }
+                    fieldset { class: "lm-config-fields", disabled: busy(),
+                        legend { class: "sr-only", "Model and training configuration" }
+                        for (index, (label, min, max)) in CONFIG_FIELDS.iter().enumerate() {
+                            label { class: "lm-field",
+                                span { "{label}" }
+                                input {
+                                    r#type: "number", min: "{min}", max: "{max}", step: "1",
+                                    value: "{draft.read().0[index]}",
+                                    oninput: move |event| draft.write().0[index] = event.value(),
+                                }
+                            }
+                        }
+                    }
+                    if let Ok(next) = parsed.as_ref() {
+                        div { class: "lm-config-summary",
+                            span { "{Thousands(next.model.parameters(vocab) as u64)} parameters" }
+                            span { "{Thousands(next.model.tokens() as u64)} tokens / step" }
+                            span { "{Thousands(next.steps())} steps / run" }
+                        }
+                    } else if let Err(error) = parsed.as_ref() {
+                        p { class: "lm-config-error", role: "alert", "{error}" }
+                    }
+                    div { class: "lm-row",
+                        Button {
+                            variant: ButtonVariant::Outline, disabled: busy() || !pending,
+                            onclick: move |_| {
+                                let next = draft.read().parse(vocab);
+                                if let Ok(next) = next { reset.call(next); }
+                            },
+                            if step > 0 { "Apply & reset model" } else { "Apply configuration" }
+                        }
+                        span { class: "lm-hint",
+                            if busy() { "Pause training before changing the architecture." }
+                            else if pending { "Apply these settings to create a fresh model." }
+                            else { "Settings applied. Training finishes at the token budget, rounded up to a full step." }
+                        }
+                    }
                 }
             }
 
             section { class: "lm-controls",
                 Button {
                     variant: if running() { ButtonVariant::Secondary } else { ButtonVariant::Primary },
+                    disabled: !running() && (busy() || complete || pending || parsed.is_err()),
                     onclick: move |_| {
                         let next = !running();
                         running.set(next);
                         if next {
+                            busy.set(true);
                             run_id += 1;
                         }
                     },
-                    if running() { "Pause" } else if step > 0 { "Resume" } else { "Start training" }
+                    if running() { "Pause" } else if complete { "Training complete" } else if step > 0 { "Resume" } else { "Start training" }
                 }
                 Button {
                     variant: ButtonVariant::Outline,
-                    disabled: running(),
-                    onclick: move |_| {
-                        seed.set(seed() ^ 0x9e37_79b9);
-                        history.write().clear();
-                        cost.set(Cost::default());
-                        stats.set(None);
-                        evaluation.set(None);
-                        insight.set(None);
-                        sample.set(String::new());
-                        rate.set(0.0);
-                        status.set("Reset — the weights are noise again.".into());
-                    },
+                    disabled: busy(),
+                    onclick: move |_| reset.call(configuration()),
                     "Reset"
                 }
                 label { class: "lm-toggle",
@@ -421,6 +602,10 @@ pub fn Train() -> Element {
                         }
                     }
                     CardContent {
+                        div { class: "lm-budget",
+                            span { "{Thousands(tokens_seen)} / {Thousands(setup.steps() * setup.model.tokens() as u64)} tokens" }
+                            progress { value: "{step}", max: "{setup.steps()}", aria_label: "Training token budget" }
+                        }
                         LossCurve { points: history() }
                         div { class: "lm-metrics",
                             Metric {
@@ -430,6 +615,10 @@ pub fn Train() -> Element {
                             Metric {
                                 value: format!("{:.0}/s", rate()),
                                 label: "step rate",
+                            }
+                            Metric {
+                                value: format!("{}/s", Thousands((rate() * setup.model.tokens() as f32) as u64)),
+                                label: "token rate",
                             }
                             Metric {
                                 value: stats.read().map_or("—".into(), |s| format!("{:.3}", s.loss)),
@@ -453,7 +642,7 @@ pub fn Train() -> Element {
                             }
                             Metric {
                                 value: format!("{}", Thousands(tokens_seen)),
-                                label: "characters seen",
+                                label: "tokens trained",
                             }
                             Metric {
                                 value: stats.read().map_or("—".into(), |s| format!("{:.1e}", s.rate)),
@@ -531,7 +720,9 @@ pub fn Train() -> Element {
                             Button {
                                 variant: ButtonVariant::Outline,
                                 size: ButtonSize::Sm,
+                                disabled: busy(),
                                 onclick: move |_| {
+                                    busy.set(true);
                                     want_write.set(true);
                                     run_id += 1;
                                 },
@@ -550,7 +741,7 @@ pub fn Train() -> Element {
                     CardTitle { "What it is learning from" }
                     CardDescription {
                         "A {Thousands(corpus.len() as u64)} character slice of TinyStories, "
-                        "embedded in the page. The last tenth is held out."
+                        "embedded in the page. About 90% trains the model; the remaining stories are held out."
                     }
                 }
                 CardContent {
@@ -577,7 +768,9 @@ pub fn Train() -> Element {
                         Button {
                             variant: ButtonVariant::Outline,
                             size: ButtonSize::Sm,
+                            disabled: busy(),
                             onclick: move |_| {
+                                busy.set(true);
                                 want_inspect.set(true);
                                 run_id += 1;
                             },
@@ -681,7 +874,7 @@ fn Inside(insight: Insight, alphabet: Vec<char>) -> Element {
                 for (head, map) in heads.iter().enumerate() {
                     div { class: "lm-head",
                         span { class: "lm-head-label", "block {block} · head {head}" }
-                        AttentionMap { map: map.clone(), filled: insight.filled }
+                        AttentionMap { map: map.clone(), filled: insight.filled, context: insight.window }
                     }
                 }
             }
@@ -719,13 +912,13 @@ fn Inside(insight: Insight, alphabet: Vec<char>) -> Element {
 /// `CONTEXT x CONTEXT` is fifty thousand cells, which the browser lays out
 /// every time the panel opens.
 #[component]
-fn AttentionMap(map: Vec<f32>, filled: usize) -> Element {
-    let n = filled.clamp(1, CONTEXT);
+fn AttentionMap(map: Vec<f32>, filled: usize, context: usize) -> Element {
+    let n = filled.clamp(1, context);
     // The window is filled from the left, so the live block is the top-left
     // `n x n` corner; the rest is padding nobody should read.
     let peak = (0..n)
         .flat_map(|q| (0..=q).map(move |k| (q, k)))
-        .map(|(q, k)| map[q * CONTEXT + k])
+        .map(|(q, k)| map[q * context + k])
         .fold(1e-6f32, f32::max);
     let mut pixels = Vec::with_capacity(n * n);
     for q in 0..n {
@@ -735,7 +928,7 @@ fn AttentionMap(map: Vec<f32>, filled: usize) -> Element {
             } else {
                 // Gamma below one so the long tail of small probabilities is
                 // visible at all; attention is usually one bright cell.
-                let a = (map[q * CONTEXT + k] / peak).clamp(0.0, 1.0).powf(0.55);
+                let a = (map[q * context + k] / peak).clamp(0.0, 1.0).powf(0.55);
                 [
                     (16.0 + a * 48.0) as u8,
                     (19.0 + a * 165.0) as u8,
@@ -847,12 +1040,17 @@ async fn look_inside(
     let Attention {
         maps,
         filled,
+        context: window,
         disagreement,
     } = model.attention(&tokens).await?;
     let next = model.next_char(&tokens, temperature).await?;
     let similarity = model.embedding_similarity().await?;
     Ok(Insight {
-        context: text.to_string(),
+        context: tokens
+            .iter()
+            .map(|id| corpus.decode(*id as usize))
+            .collect(),
+        window,
         maps,
         filled,
         disagreement,

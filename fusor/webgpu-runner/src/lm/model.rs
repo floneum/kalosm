@@ -31,22 +31,7 @@ use fusor::{Device, Dtype, Result, Tensor};
 use super::corpus::{Corpus, Split};
 use super::rng::Rng;
 
-/// Characters of context. Also the generator's window: a longer story is
-/// written by sliding this over its own output.
-pub const CONTEXT: usize = 64;
-/// Residual width.
-const DIM: usize = 96;
-/// Attention heads, and the width each one gets.
-pub const HEADS: usize = 4;
-const HEAD_DIM: usize = DIM / HEADS;
-/// The feed-forward hidden width.
-const MLP: usize = 192;
-/// Transformer blocks.
-pub const BLOCKS: usize = 3;
-/// Windows per step.
-const BATCH: usize = 16;
-/// Tokens the loss is averaged over, and what one step consumes.
-pub const TOKENS: usize = BATCH * CONTEXT;
+use super::config::ModelConfig;
 
 /// Peak step size, reached at the end of warmup, then cosine-decayed.
 pub const LEARNING_RATE: f32 = 3e-3;
@@ -133,15 +118,15 @@ struct Block {
 struct Single {
     /// An observation program snapshots parameters at this optimizer step.
     compiled: Option<(u64, fusor::program::TrainingProgram)>,
-    /// `[1, CONTEXT]` token ids, right-aligned by the caller.
+    /// `[1, context]` token ids, left-aligned by the caller.
     tokens: Tensor<2, u32>,
-    /// `[1, CONTEXT, vocab]`, through the same fused attention the training
+    /// `[1, context, vocab]`, through the same fused attention the training
     /// graph uses.
     logits: Tensor<3, f32>,
     /// The same logits through an unfused, explicitly-masked softmax — the
     /// path the attention maps come out of.
     lens_logits: Tensor<3, f32>,
-    /// `[HEADS, CONTEXT, CONTEXT]` attention probabilities per block.
+    /// `[heads, context, context]` attention probabilities per block.
     attention: Vec<Tensor<3, f32>>,
     /// Everything to invalidate when the parameters move.
     chain: Vec<Dyn>,
@@ -153,6 +138,8 @@ pub struct Lm {
     published_step: Option<u64>,
     device: Device,
     vocab: usize,
+    config: ModelConfig,
+    schedule: (u64, u64),
 
     tokens: Tensor<2, u32>,
     labels: Tensor<1, f32>,
@@ -180,19 +167,6 @@ pub struct Lm {
     pub floor_rate: f32,
 }
 
-/// What [`Lm::new`] will allocate, without a device.
-///
-/// The page states the model's size before anything has been built, and a
-/// number quoted there that the model does not actually have is a lie the
-/// reader has no way to catch — so the two are checked against each other in
-/// the tests below.
-pub fn parameter_count_for(vocab: usize) -> usize {
-    let embeddings = vocab * DIM + CONTEXT * DIM;
-    let attention = DIM + 4 * DIM * DIM;
-    let feed_forward = DIM + DIM * MLP + MLP * DIM;
-    embeddings + BLOCKS * (attention + feed_forward) + DIM + DIM * vocab
-}
-
 /// `n` normal-ish samples at `std`, from a uniform: a xorshift and a scale,
 /// rather than a Box-Muller that would change nothing a 250k-parameter model
 /// can feel. The `sqrt(3)` makes the uniform's standard deviation `std`.
@@ -201,15 +175,46 @@ fn init(rng: &mut Rng, n: usize, std: f32) -> Vec<f32> {
 }
 
 impl Lm {
+    pub fn config(&self) -> ModelConfig {
+        self.config
+    }
+
+    /// Set the schedule for this run before its first optimizer step.
+    pub fn set_training_steps(&mut self, steps: u64) -> Result<()> {
+        if self.step != 0 || steps == 0 {
+            return Err(fusor::Error::Plan(
+                "Set a positive training budget before training starts.".into(),
+            ));
+        }
+        self.schedule = ((steps / 10).clamp(1, WARMUP), steps.max(2));
+        Ok(())
+    }
+
+    fn validate_corpus(&self, corpus: &Corpus) -> Result<()> {
+        if corpus.vocab_size() != self.vocab
+            || corpus.split_len(Split::Train) <= self.config.context
+            || corpus.split_len(Split::Test) <= self.config.context
+        {
+            return Err(fusor::Error::Shape("The corpus must match the vocabulary and contain a full context plus target in each split.".into()));
+        }
+        Ok(())
+    }
+
     /// Build the device, the parameters and the step graph.
-    pub async fn new(vocab: usize, seed: u32) -> Result<Self> {
+    pub async fn new(vocab: usize, seed: u32, config: ModelConfig) -> Result<Self> {
+        config.validate(vocab).map_err(fusor::Error::Shape)?;
         let device = Device::gpu().await?;
         let mut rng = Rng::new(seed);
 
         // Every leaf here is an *external* leaf — `Tensor::zeros` would mint a
         // constant, and neither `set_elements` nor `adopt_buffer` accepts one.
-        let tokens = Tensor::<2, u32>::from_slice(&device, [BATCH, CONTEXT], &[0u32; TOKENS]);
-        let labels = Tensor::<1, f32>::from_slice(&device, [TOKENS], &[0.0; TOKENS]);
+        let tokens = Tensor::<2, u32>::from_slice(
+            &device,
+            [config.batch, config.context],
+            &vec![0u32; config.tokens()],
+        );
+        let labels =
+            Tensor::<1, f32>::from_slice(&device, [config.tokens()], &vec![0.0; config.tokens()]);
         let alpha = Tensor::<1, f32>::from_slice(&device, [1], &[0.0]);
 
         let weight = |rng: &mut Rng, inn: usize, out: usize, std: f32| {
@@ -218,34 +223,34 @@ impl Lm {
         let ones = |n: usize| Tensor::<1, f32>::from_slice(&device, [n], &vec![1.0; n]);
         // A residual projection is summed into the stream once per block, so
         // its share of the variance is divided by how many such sums there are.
-        let residual = INIT_STD / ((2 * BLOCKS) as f32).sqrt();
+        let residual = INIT_STD / ((2 * config.blocks) as f32).sqrt();
 
         let embed = Tensor::<2, f32>::from_slice(
             &device,
-            [vocab, DIM],
-            &init(&mut rng, vocab * DIM, INIT_STD),
+            [vocab, config.dim],
+            &init(&mut rng, vocab * config.dim, INIT_STD),
         );
         // Learned, not sinusoidal: at 64 positions the table is 6k parameters
         // and the demo gets to show a position embedding that means something.
         let positions = Tensor::<2, f32>::from_slice(
             &device,
-            [CONTEXT, DIM],
-            &init(&mut rng, CONTEXT * DIM, INIT_STD / 2.0),
+            [config.context, config.dim],
+            &init(&mut rng, config.context * config.dim, INIT_STD / 2.0),
         );
-        let blocks: Vec<Block> = (0..BLOCKS)
+        let blocks: Vec<Block> = (0..config.blocks)
             .map(|_| Block {
-                attn_norm: ones(DIM),
-                q: weight(&mut rng, DIM, DIM, INIT_STD),
-                k: weight(&mut rng, DIM, DIM, INIT_STD),
-                v: weight(&mut rng, DIM, DIM, INIT_STD),
-                proj: weight(&mut rng, DIM, DIM, residual),
-                mlp_norm: ones(DIM),
-                up: weight(&mut rng, DIM, MLP, INIT_STD),
-                down: weight(&mut rng, MLP, DIM, residual),
+                attn_norm: ones(config.dim),
+                q: weight(&mut rng, config.dim, config.dim, INIT_STD),
+                k: weight(&mut rng, config.dim, config.dim, INIT_STD),
+                v: weight(&mut rng, config.dim, config.dim, INIT_STD),
+                proj: weight(&mut rng, config.dim, config.dim, residual),
+                mlp_norm: ones(config.dim),
+                up: weight(&mut rng, config.dim, config.mlp, INIT_STD),
+                down: weight(&mut rng, config.mlp, config.dim, residual),
             })
             .collect();
-        let final_norm = ones(DIM);
-        let head = weight(&mut rng, DIM, vocab, INIT_STD);
+        let final_norm = ones(config.dim);
+        let head = weight(&mut rng, config.dim, vocab, INIT_STD);
 
         let mut chain = Vec::new();
         let hidden = forward(
@@ -254,21 +259,22 @@ impl Lm {
             &positions,
             &blocks,
             &final_norm,
-            BATCH,
+            config.batch,
+            config,
             &mut chain,
         );
         let logits: Tensor<3, f32> = Linear::new(head.clone(), None).forward(&hidden);
         chain.push(logits.as_dyn().clone());
-        let flat = logits.reshape([TOKENS, vocab]);
+        let flat = logits.reshape([config.tokens(), vocab]);
         chain.push(flat.as_dyn().clone());
 
         // Cross-entropy against a one-hot the *device* builds: uploading a
-        // dense `[TOKENS, vocab]` target every step would be a quarter of a
+        // dense `[config.tokens(), vocab]` target every step would be a quarter of a
         // megabyte of host traffic for what is one comparison in a kernel.
         let ids = Tensor::<1, f32>::arange(&device, 0.0, vocab as f64);
         let onehot = ids
             .reshape([1, vocab])
-            .sub_::<2, 2, _>(&labels.reshape([TOKENS, 1]))
+            .sub_::<2, 2, _>(&labels.reshape([config.tokens(), 1]))
             .abs()
             .lte_scalar(0.5);
         let shifted = flat.sub_::<2, 2, _>(&flat.max_keepdim(1usize));
@@ -278,7 +284,7 @@ impl Lm {
             .sum::<1>(1usize)
             .sum::<0>(0usize)
             .neg()
-            .div_scalar(TOKENS as f32);
+            .div_scalar(config.tokens() as f32);
 
         // Next-character accuracy, scored where the logits already are. The
         // true character's logit against the row's best: reading a
@@ -291,7 +297,7 @@ impl Lm {
             .add_scalar(1e-6)
             .gte_scalar(0.0)
             .sum::<0>(0usize)
-            .div_scalar(TOKENS as f32);
+            .div_scalar(config.tokens() as f32);
         // One value to read rather than two: a second readback costs another
         // trip through the browser's event loop for four bytes.
         let scored = fusor::stack::<0, 1, f32, _>([loss.clone(), hits], 0);
@@ -351,6 +357,8 @@ impl Lm {
             published_step: None,
             device,
             vocab,
+            config,
+            schedule: (WARMUP, WARMUP + DECAY),
             tokens,
             labels,
             alpha,
@@ -445,6 +453,7 @@ impl Lm {
     /// the next step's leaves adopt without waiting on the GPU, so a run is one
     /// host sync rather than one per step.
     pub async fn train(&mut self, corpus: &Corpus, steps: usize) -> Result<StepStats> {
+        self.validate_corpus(corpus)?;
         let mut rate = 0.0;
         for _ in 0..steps.max(1) {
             rate = self.dispatch(corpus).await?;
@@ -472,8 +481,8 @@ impl Lm {
         let t = self.step.min(i32::MAX as u64) as i32;
         let rate = cosine_decay(
             self.step,
-            WARMUP,
-            WARMUP + DECAY,
+            self.schedule.0,
+            self.schedule.1,
             self.learning_rate,
             self.floor_rate,
         );
@@ -518,6 +527,7 @@ impl Lm {
     /// held-out number measured through a second implementation would be
     /// measuring the second implementation.
     pub async fn evaluate(&mut self, corpus: &Corpus, batches: usize) -> Result<Evaluation> {
+        self.validate_corpus(corpus)?;
         self.publish_parameters()?;
         // Use the selected executor for observations as well as updates. This
         // program has no feedback, so held-out inputs cannot train the model.
@@ -572,14 +582,14 @@ impl Lm {
 
     /// A batch of windows and their next-character targets.
     fn draw(&mut self, corpus: &Corpus, split: Split) -> (Vec<u32>, Vec<f32>) {
-        let mut tokens = vec![0u32; TOKENS];
-        let mut labels = vec![0.0f32; TOKENS];
-        for row in 0..BATCH {
-            let window = corpus.window(split, self.rng.below(corpus.len()), CONTEXT);
-            for position in 0..CONTEXT {
-                let at = row * CONTEXT + position;
-                tokens[at] = u32::from(window[position.min(window.len() - 1)]);
-                labels[at] = f32::from(window[(position + 1).min(window.len() - 1)]);
+        let mut tokens = vec![0u32; self.config.tokens()];
+        let mut labels = vec![0.0f32; self.config.tokens()];
+        for row in 0..self.config.batch {
+            let window = corpus.window(split, self.rng.below(corpus.len()), self.config.context);
+            for position in 0..self.config.context {
+                let at = row * self.config.context + position;
+                tokens[at] = u32::from(window[position]);
+                labels[at] = f32::from(window[position + 1]);
             }
         }
         (tokens, labels)
@@ -588,9 +598,9 @@ impl Lm {
     /// The next-character distribution after `context`, at `temperature`.
     ///
     /// `context` is the tail of what has been written so far; only its last
-    /// [`CONTEXT`] characters reach the model.
+    /// `config.context` characters reach the model.
     pub async fn next_char(&mut self, context: &[u8], temperature: f32) -> Result<Vec<f32>> {
-        let (row, filled) = window_of(context);
+        let (row, filled) = window_of(context, self.config.context);
         self.single_forward(&row).await?;
         let single = self.expect_single()?;
         let logits = single.logits.to_vec_f32_async().await?;
@@ -626,17 +636,17 @@ impl Lm {
 
     /// Attention probabilities for `context`, block by block and head by head.
     ///
-    /// Returns `[BLOCKS][HEADS][CONTEXT * CONTEXT]` row-major probabilities
-    /// and how many of the positions are real rather than left padding.
+    /// Returns `[self.config.blocks][self.config.heads][self.config.context * self.config.context]` row-major probabilities
+    /// and how many of the positions are real rather than right padding.
     pub async fn attention(&mut self, context: &[u8]) -> Result<Attention> {
-        let (row, filled) = window_of(context);
+        let (row, filled) = window_of(context, self.config.context);
         self.single_forward(&row).await?;
         let single = self.expect_single()?;
-        let mut maps = Vec::with_capacity(BLOCKS);
+        let mut maps = Vec::with_capacity(self.config.blocks);
         for block in &single.attention {
             let flat = block.to_vec_f32_async().await?;
             maps.push(
-                flat.chunks_exact(CONTEXT * CONTEXT)
+                flat.chunks_exact(self.config.context * self.config.context)
                     .map(<[f32]>::to_vec)
                     .collect::<Vec<_>>(),
             );
@@ -653,6 +663,7 @@ impl Lm {
             .fold(0.0f32, f32::max);
         Ok(Attention {
             maps,
+            context: self.config.context,
             filled,
             disagreement,
         })
@@ -670,7 +681,7 @@ impl Lm {
         let v = self.vocab;
         let norms: Vec<f32> = (0..v)
             .map(|i| {
-                rows[i * DIM..(i + 1) * DIM]
+                rows[i * self.config.dim..(i + 1) * self.config.dim]
                     .iter()
                     .map(|x| x * x)
                     .sum::<f32>()
@@ -681,9 +692,9 @@ impl Lm {
         let mut out = vec![0.0f32; v * v];
         for i in 0..v {
             for j in 0..v {
-                let dot: f32 = rows[i * DIM..(i + 1) * DIM]
+                let dot: f32 = rows[i * self.config.dim..(i + 1) * self.config.dim]
                     .iter()
-                    .zip(&rows[j * DIM..(j + 1) * DIM])
+                    .zip(&rows[j * self.config.dim..(j + 1) * self.config.dim])
                     .map(|(a, b)| a * b)
                     .sum();
                 out[i * v + j] = dot / (norms[i] * norms[j]);
@@ -737,7 +748,11 @@ impl Lm {
     /// The batch-of-one graph: the model's own forward, plus an unfused
     /// attention beside it that the maps are read out of.
     fn build_single(&self) -> Result<Single> {
-        let tokens = Tensor::<2, u32>::from_slice(&self.device, [1, CONTEXT], &[0u32; CONTEXT]);
+        let tokens = Tensor::<2, u32>::from_slice(
+            &self.device,
+            [1, self.config.context],
+            &vec![0u32; self.config.context],
+        );
         let mut chain = Vec::new();
         let hidden = forward(
             &tokens,
@@ -746,6 +761,7 @@ impl Lm {
             &self.blocks,
             &self.final_norm,
             1,
+            self.config,
             &mut chain,
         );
         let logits: Tensor<3, f32> = Linear::new(self.head.clone(), None).forward(&hidden);
@@ -754,27 +770,36 @@ impl Lm {
         // The lens. `attention` is one fused op with no probability tensor to
         // read, so the maps come from the same arithmetic spelled out: scaled
         // scores, an additive causal mask, a softmax.
-        let mut causal = vec![0.0f32; CONTEXT * CONTEXT];
-        for query in 0..CONTEXT {
-            for key in (query + 1)..CONTEXT {
-                causal[query * CONTEXT + key] = -MASK_FLOOR;
+        let mut causal = vec![0.0f32; self.config.context * self.config.context];
+        for query in 0..self.config.context {
+            for key in (query + 1)..self.config.context {
+                causal[query * self.config.context + key] = -MASK_FLOOR;
             }
         }
-        let mask = Tensor::<2, f32>::from_slice(&self.device, [CONTEXT, CONTEXT], &causal);
-        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let mask = Tensor::<2, f32>::from_slice(
+            &self.device,
+            [self.config.context, self.config.context],
+            &causal,
+        );
+        let scale = 1.0 / (self.config.head_dim() as f32).sqrt();
 
         let embedded: Tensor<3, f32> = Embedding::new(self.embed.clone()).forward(&tokens);
         let mut x = embedded.add_::<2, 3, _>(&self.positions);
         chain.push(x.as_dyn().clone());
-        let mut attention = Vec::with_capacity(BLOCKS);
+        let mut attention = Vec::with_capacity(self.config.blocks);
         for block in &self.blocks {
             let h = x.rms_norm(&block.attn_norm, 1e-5);
             chain.push(h.as_dyn().clone());
-            let flat = h.reshape([CONTEXT, DIM]);
+            let flat = h.reshape([self.config.context, self.config.dim]);
             let heads = |w: &Tensor<2, f32>| -> Tensor<4, f32> {
                 let projected: Tensor<2, f32> = Linear::new(w.clone(), None).forward(&flat);
                 projected
-                    .reshape([1, CONTEXT, HEADS, HEAD_DIM])
+                    .reshape([
+                        1,
+                        self.config.context,
+                        self.config.heads,
+                        self.config.head_dim(),
+                    ])
                     .permute([0, 2, 1, 3])
             };
             let (q, k, v) = (heads(&block.q), heads(&block.k), heads(&block.v));
@@ -784,14 +809,19 @@ impl Lm {
                 .add_::<2, 4, _>(&mask)
                 .softmax(3usize);
             chain.push(probabilities.as_dyn().clone());
-            let merged = probabilities
-                .matmul(&v)
-                .permute([0, 2, 1, 3])
-                .reshape([1, CONTEXT, DIM]);
-            attention.push(probabilities.reshape([HEADS, CONTEXT, CONTEXT]));
+            let merged = probabilities.matmul(&v).permute([0, 2, 1, 3]).reshape([
+                1,
+                self.config.context,
+                self.config.dim,
+            ]);
+            attention.push(probabilities.reshape([
+                self.config.heads,
+                self.config.context,
+                self.config.context,
+            ]));
             x = x.add(&Linear::new(block.proj.clone(), None).forward(&merged));
             chain.push(x.as_dyn().clone());
-            x = block.feed_forward(&x, 1, &mut chain);
+            x = block.feed_forward(&x, 1, self.config, &mut chain);
         }
         let normed = x.rms_norm(&self.final_norm, 1e-5);
         chain.push(normed.as_dyn().clone());
@@ -834,39 +864,46 @@ impl Block {
         &self,
         x: &Tensor<3, f32>,
         rows: usize,
+        config: ModelConfig,
         chain: &mut Vec<Dyn>,
     ) -> Tensor<3, f32> {
         let h = x
             .rms_norm(&self.mlp_norm, 1e-5)
-            .reshape([rows * CONTEXT, DIM]);
+            .reshape([rows * config.context, config.dim]);
         chain.push(h.as_dyn().clone());
         let up: Tensor<2, f32> = Linear::new(self.up.clone(), None).forward(&h);
         chain.push(up.as_dyn().clone());
         let down: Tensor<2, f32> = Linear::new(self.down.clone(), None).forward(&up.gelu());
-        let out = x.add(&down.reshape([rows, CONTEXT, DIM]));
+        let out = x.add(&down.reshape([rows, config.context, config.dim]));
         chain.push(out.as_dyn().clone());
         out
     }
 
     /// Pre-norm multi-head causal attention, added back into the stream.
-    fn attend(&self, x: &Tensor<3, f32>, rows: usize, chain: &mut Vec<Dyn>) -> Tensor<3, f32> {
+    fn attend(
+        &self,
+        x: &Tensor<3, f32>,
+        rows: usize,
+        config: ModelConfig,
+        chain: &mut Vec<Dyn>,
+    ) -> Tensor<3, f32> {
         let h = x
             .rms_norm(&self.attn_norm, 1e-5)
-            .reshape([rows * CONTEXT, DIM]);
+            .reshape([rows * config.context, config.dim]);
         chain.push(h.as_dyn().clone());
         let heads = |w: &Tensor<2, f32>| -> Tensor<4, f32> {
             let projected: Tensor<2, f32> = Linear::new(w.clone(), None).forward(&h);
             projected
-                .reshape([rows, CONTEXT, HEADS, HEAD_DIM])
+                .reshape([rows, config.context, config.heads, config.head_dim()])
                 .permute([0, 2, 1, 3])
         };
         let merged = heads(&self.q)
             .attention(&heads(&self.k), &heads(&self.v), MaskKind::Causal, None)
             .permute([0, 2, 1, 3])
-            .reshape([rows * CONTEXT, DIM]);
+            .reshape([rows * config.context, config.dim]);
         chain.push(merged.as_dyn().clone());
         let projected: Tensor<2, f32> = Linear::new(self.proj.clone(), None).forward(&merged);
-        let out = x.add(&projected.reshape([rows, CONTEXT, DIM]));
+        let out = x.add(&projected.reshape([rows, config.context, config.dim]));
         chain.push(out.as_dyn().clone());
         out
     }
@@ -880,14 +917,15 @@ fn forward(
     blocks: &[Block],
     final_norm: &Tensor<1, f32>,
     rows: usize,
+    config: ModelConfig,
     chain: &mut Vec<Dyn>,
 ) -> Tensor<3, f32> {
     let embedded: Tensor<3, f32> = Embedding::new(embed.clone()).forward(tokens);
     let mut x = embedded.add_::<2, 3, _>(positions);
     chain.push(x.as_dyn().clone());
     for block in blocks {
-        x = block.attend(&x, rows, chain);
-        x = block.feed_forward(&x, rows, chain);
+        x = block.attend(&x, rows, config, chain);
+        x = block.feed_forward(&x, rows, config, chain);
     }
     let normed = x.rms_norm(final_norm, 1e-5);
     chain.push(normed.as_dyn().clone());
@@ -896,27 +934,28 @@ fn forward(
 
 /// What the attention panel draws.
 pub struct Attention {
-    /// `[BLOCKS][HEADS]` maps of `CONTEXT * CONTEXT` probabilities.
+    /// `[blocks][heads]` maps of `context * context` probabilities.
     pub maps: Vec<Vec<Vec<f32>>>,
-    /// How many of the `CONTEXT` positions carry real characters; the rest
-    /// are left padding the reader should not be shown.
+    /// How many of the `context` positions carry real characters; the rest
+    /// are right padding the reader should not be shown.
     pub filled: usize,
+    pub context: usize,
     /// The largest gap between the model's own logits and the lens's, on the
     /// position the panel is about. A picture of the model is only a picture
     /// of the model while this is small.
     pub disagreement: f32,
 }
 
-/// The last [`CONTEXT`] characters of `context`, laid into a window from the
+/// The last configured window of characters of `context`, laid into a window from the
 /// left, and how many of them are real.
 ///
 /// The trailing slots stay zero. Nothing reads them: the caller takes the
 /// last *real* position, and a causal mask means that position attends to
 /// nothing after itself.
-fn window_of(context: &[u8]) -> (Vec<u32>, usize) {
-    let take = context.len().clamp(1, CONTEXT);
+fn window_of(context: &[u8], size: usize) -> (Vec<u32>, usize) {
+    let take = context.len().clamp(1, size);
     let from = context.len().saturating_sub(take);
-    let mut row = vec![0u32; CONTEXT];
+    let mut row = vec![0u32; size];
     for (slot, token) in row.iter_mut().zip(&context[from..]) {
         *slot = u32::from(*token);
     }
@@ -953,61 +992,124 @@ mod tests {
     #[test]
     fn compiled_training_matches_reference_state_and_observations() {
         pollster::block_on(async {
-            let corpus = Corpus::load();
-            let mut reference = Lm::new(corpus.vocab_size(), 0x51ed_c0de).await.unwrap();
-            let mut compiled = Lm::new(corpus.vocab_size(), 0x51ed_c0de).await.unwrap();
-            compiled.compile_training(Default::default()).await.unwrap();
-            for _ in 0..3 {
-                let a = reference.train(&corpus, 8).await.unwrap();
-                let b = compiled.train(&corpus, 8).await.unwrap();
-                assert!((a.loss - b.loss).abs() < 2e-4, "{} vs {}", a.loss, b.loss);
-            }
-            let state: Vec<_> = compiled
-                .slots
-                .iter()
-                .flat_map(|s| [s.value.clone(), s.m.clone(), s.v.clone()])
-                .collect();
-            compiled.compiled.as_ref().unwrap().export(&state).unwrap();
-            let expected: Vec<_> = reference
-                .slots
-                .iter()
-                .flat_map(|s| [s.value.clone(), s.m.clone(), s.v.clone()])
-                .collect();
-            for (index, (a, b)) in expected.iter().zip(&state).enumerate() {
-                let a = a.to_bytes_async().await.unwrap();
-                let b = b.to_bytes_async().await.unwrap();
-                for (a, b) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
-                    let a = f32::from_le_bytes(a.try_into().unwrap());
-                    let b = f32::from_le_bytes(b.try_into().unwrap());
+            for config in [
+                ModelConfig::TINY,
+                ModelConfig::default(),
+                ModelConfig {
+                    blocks: 2,
+                    dim: 42,
+                    heads: 3,
+                    mlp: 75,
+                    context: 19,
+                    batch: 3,
+                },
+            ] {
+                eprintln!("checking {config:?}");
+                let corpus = if config == ModelConfig::TINY {
+                    Corpus::benchmark()
+                } else {
+                    Corpus::load()
+                };
+                let mut reference = Lm::new(corpus.vocab_size(), 0x51ed_c0de, config)
+                    .await
+                    .unwrap();
+                let mut compiled = Lm::new(corpus.vocab_size(), 0x51ed_c0de, config)
+                    .await
+                    .unwrap();
+                compiled.compile_training(Default::default()).await.unwrap();
+                let allocated: usize = compiled
+                    .slots
+                    .iter()
+                    .map(|s| s.value.elem_count().unwrap() as usize)
+                    .sum();
+                assert_eq!(allocated, config.parameters(corpus.vocab_size()));
+                for _ in 0..3 {
+                    let a = reference.train(&corpus, 8).await.unwrap();
+                    let b = compiled.train(&corpus, 8).await.unwrap();
+                    assert!((a.loss - b.loss).abs() < 2e-4, "{} vs {}", a.loss, b.loss);
+                }
+                let state: Vec<_> = compiled
+                    .slots
+                    .iter()
+                    .flat_map(|s| [s.value.clone(), s.m.clone(), s.v.clone()])
+                    .collect();
+                compiled.compiled.as_ref().unwrap().export(&state).unwrap();
+                let expected: Vec<_> = reference
+                    .slots
+                    .iter()
+                    .flat_map(|s| [s.value.clone(), s.m.clone(), s.v.clone()])
+                    .collect();
+                for (index, (a, b)) in expected.iter().zip(&state).enumerate() {
+                    let a = a.to_bytes_async().await.unwrap();
+                    let b = b.to_bytes_async().await.unwrap();
+                    for (a, b) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
+                        let a = f32::from_le_bytes(a.try_into().unwrap());
+                        let b = f32::from_le_bytes(b.try_into().unwrap());
+                        assert!(
+                            (a - b).abs() <= 2e-5 + 1e-3 * a.abs(),
+                            "state {index}: {a} vs {b}"
+                        );
+                    }
+                }
+                let a = reference.evaluate(&corpus, 1).await.unwrap();
+                let b = compiled.evaluate(&corpus, 1).await.unwrap();
+                assert!((a.loss - b.loss).abs() < 2e-4);
+                assert!((a.accuracy - b.accuracy).abs() < 1e-4);
+                let a = reference.next_char(&[0, 1, 2, 3], 1.).await.unwrap();
+                let b = compiled.next_char(&[0, 1, 2, 3], 1.).await.unwrap();
+                for (a, b) in a.iter().zip(b) {
+                    assert!((a - b).abs() < 2e-4);
+                }
+                let probe =
+                    corpus.encode_all("Once upon a time, there was a little girl named Lily.");
+                let lens = compiled.attention(&probe).await.unwrap();
+                assert_eq!(lens.context, config.context);
+                assert_eq!(lens.filled, config.context.min(probe.len()));
+                assert_eq!(lens.maps.len(), config.blocks);
+                assert!(lens.disagreement < 1e-2, "{}", lens.disagreement);
+                for heads in &lens.maps {
+                    assert_eq!(heads.len(), config.heads);
+                    for map in heads {
+                        assert_eq!(map.len(), config.context * config.context);
+                        for q in 0..lens.filled {
+                            let row = &map[q * config.context..(q + 1) * config.context];
+                            assert!((row.iter().sum::<f32>() - 1.).abs() < 1e-4);
+                            assert!(row[q + 1..].iter().all(|p| p.abs() < 1e-6));
+                        }
+                    }
+                }
+                assert_eq!(
+                    compiled
+                        .generate(&corpus, &probe, 4, 0.8)
+                        .await
+                        .unwrap()
+                        .chars()
+                        .count(),
+                    4
+                );
+                assert_eq!(
+                    compiled.embedding_similarity().await.unwrap().len(),
+                    corpus.vocab_size().pow(2)
+                );
+                if config == ModelConfig::TINY {
+                    let trained = compiled.train(&corpus, 376).await.unwrap();
                     assert!(
-                        (a - b).abs() <= 2e-5 + 1e-3 * a.abs(),
-                        "state {index}: {a} vs {b}"
+                        trained.loss.is_finite() && trained.loss < 2.5,
+                        "loss after 400 steps: {}",
+                        trained.loss
                     );
                 }
             }
-            let a = reference.evaluate(&corpus, 1).await.unwrap();
-            let b = compiled.evaluate(&corpus, 1).await.unwrap();
-            assert!((a.loss - b.loss).abs() < 2e-4);
-            assert!((a.accuracy - b.accuracy).abs() < 1e-4);
-            let a = reference.next_char(&[0, 1, 2, 3], 1.).await.unwrap();
-            let b = compiled.next_char(&[0, 1, 2, 3], 1.).await.unwrap();
-            for (a, b) in a.iter().zip(b) {
-                assert!((a - b).abs() < 2e-4);
-            }
-            let trained = compiled.train(&corpus, 376).await.unwrap();
-            assert!(
-                trained.loss.is_finite() && trained.loss < 2.5,
-                "loss after 400 steps: {}",
-                trained.loss
-            );
         });
     }
 
     #[test]
     #[ignore]
     fn slab_oracle() {
-        let corpus = Corpus::load();
-        let Ok(mut model) = pollster::block_on(Lm::new(corpus.vocab_size(), 0x51ed_c0de)) else {
+        let corpus = Corpus::benchmark();
+        let Ok(mut model) =
+            pollster::block_on(Lm::new(corpus.vocab_size(), 0x51ed_c0de, ModelConfig::TINY))
+        else {
             return;
         };
         let steps = std::env::var("ORACLE_STEPS")
@@ -1021,8 +1123,10 @@ mod tests {
 
     #[test]
     fn the_model_learns_and_the_lens_agrees_with_it() {
-        let corpus = Corpus::load();
-        let Ok(mut model) = pollster::block_on(Lm::new(corpus.vocab_size(), 0x51ed_c0de)) else {
+        let corpus = Corpus::benchmark();
+        let Ok(mut model) =
+            pollster::block_on(Lm::new(corpus.vocab_size(), 0x51ed_c0de, ModelConfig::TINY))
+        else {
             // No adapter (CI without a GPU): there is nothing to check.
             return;
         };
@@ -1076,8 +1180,8 @@ mod tests {
         for (block, heads) in read.maps.iter().enumerate() {
             for (head, map) in heads.iter().enumerate() {
                 for query in 0..read.filled {
-                    let leak: f32 = ((query + 1)..CONTEXT)
-                        .map(|k| map[query * CONTEXT + k])
+                    let leak: f32 = ((query + 1)..model.config.context)
+                        .map(|k| map[query * model.config.context + k])
                         .sum();
                     assert!(
                         leak < 1e-5,
@@ -1098,8 +1202,9 @@ mod tests {
     /// arithmetic that quotes it has to match what gets allocated.
     #[test]
     fn the_quoted_parameter_count_is_the_real_one() {
-        let corpus = Corpus::load();
-        let Ok(model) = pollster::block_on(Lm::new(corpus.vocab_size(), 1)) else {
+        let corpus = Corpus::benchmark();
+        let Ok(model) = pollster::block_on(Lm::new(corpus.vocab_size(), 1, ModelConfig::TINY))
+        else {
             return;
         };
         let allocated: usize = model
@@ -1107,7 +1212,7 @@ mod tests {
             .iter()
             .map(|s| s.value.elem_count().unwrap_or(0) as usize)
             .sum();
-        assert_eq!(allocated, parameter_count_for(corpus.vocab_size()));
+        assert_eq!(allocated, model.config.parameters(corpus.vocab_size()));
     }
 }
 
@@ -1120,8 +1225,10 @@ mod bench {
     #[test]
     #[ignore]
     fn step_rate() {
-        let corpus = Corpus::load();
-        let Ok(mut model) = pollster::block_on(Lm::new(corpus.vocab_size(), 0x51ed_c0de)) else {
+        let corpus = Corpus::benchmark();
+        let Ok(mut model) =
+            pollster::block_on(Lm::new(corpus.vocab_size(), 0x51ed_c0de, ModelConfig::TINY))
+        else {
             return;
         };
         // Warm the kernels and the tuner before timing anything.
@@ -1138,7 +1245,7 @@ mod bench {
             best = best.max(rate);
             println!(
                 "{run:>4} steps in {seconds:6.3}s = {rate:6.1} steps/s, {:>9.0} chars/s",
-                run as f32 * TOKENS as f32 / seconds,
+                run as f32 * ModelConfig::TINY.tokens() as f32 / seconds,
             );
         }
         println!("best: {best:6.1} steps/s");
