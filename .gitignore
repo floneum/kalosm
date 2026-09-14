@@ -17,6 +17,8 @@ tokenizer.json
 *.cpp
 !prototypes/phase-token-prototype/examples/bench_ggml_qmatmul.cpp
 *.wgsl
+!fusor/vendor/naga-browser/src/back/wgsl/polyfill/**/*.wgsl
+!fusor/vendor/wgpu/src/util/blit.wgsl
 out.txt
 todo.md
 rust-analyzer

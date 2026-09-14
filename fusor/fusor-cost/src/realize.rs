@@ -16,7 +16,9 @@ use fusor_ir::ir::Op;
 use fusor_ir::ir::kernel::{
     ArenaPlanner, MemoryLevel, ScalarElement, Tile, TileDecl, TileLayout, Tiles,
 };
-use fusor_ir::ir::launch::{Effect, FoldStrat, IndexSpace, Launch, SchedPoint, ScheduleDomain};
+use fusor_ir::ir::launch::{
+    Effect, FoldStrat, IndexSpace, Launch, SchedPoint, ScheduleDomain,
+};
 use fusor_ir::ir::logical::{LeafKind, Logical};
 use fusor_ir::shape::Dim;
 use smallvec::SmallVec;
@@ -143,6 +145,13 @@ pub struct Component {
     pub work: Work,
     pub resident_lanes: u64,
     pub wg_bytes: u64,
+    pub line_bytes: u64,
+    pub coop_steps: u64,
+    pub lane_steps: u64,
+    /// Slab members that live in workgroup memory: read by nothing outside
+    /// the slab, and within the budget the device leaves after the fold
+    /// scratch. No buffer, no binding, no traffic.
+    pub private: Vec<Id>,
     pub grid: [u32; 3],
     pub block: u32,
 }
@@ -185,6 +194,9 @@ impl Realized {
                 work: c.work,
                 resident_lanes: c.resident_lanes,
                 wg_bytes: c.wg_bytes,
+                line_bytes: c.line_bytes,
+                coop_steps: c.coop_steps,
+                lane_steps: c.lane_steps,
                 grid: c.grid,
             })
             .collect()
@@ -307,6 +319,7 @@ pub fn realize_with(
                 graph,
                 extraction,
                 &consumers,
+                &consumer_nodes,
                 &launch_of,
                 &resolved_roots,
                 members,
@@ -352,6 +365,11 @@ pub fn forced_boundary(
     if leaf_role(graph, producer) != LeafRole::NotLeaf {
         return true;
     }
+    // A slab's members run as its stages, materialized or not: that is the
+    // one edge a buffer does not cut.
+    if slab_stage(graph, consumer, producer).is_some() {
+        return false;
+    }
     if extraction.is_materialized(producer) || roots.contains(&producer) {
         return true;
     }
@@ -359,6 +377,15 @@ pub fn forced_boundary(
         return true;
     }
     structural_boundary(graph, producer, consumer)
+}
+
+/// `Some(is_last)` when `producer` is a member of the slab `consumer`.
+pub fn slab_stage(graph: &EGraph, consumer: Id, producer: Id) -> Option<bool> {
+    let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) = &graph.node(consumer).op else {
+        return None;
+    };
+    let pos = members.iter().position(|m| *m == producer)?;
+    Some(pos + 1 == members.len())
 }
 
 /// The half of [`forced_boundary`] that `M` cannot argue with: a merged wave,
@@ -389,6 +416,11 @@ pub fn structural_boundary(graph: &EGraph, producer: Id, consumer: Id) -> bool {
 /// price an inlined producer; the seed, the repair and the `FLIP` frontier
 /// refuse to ship one.
 pub fn needs_own_buffer(graph: &EGraph, producer: Id, consumer: Id) -> bool {
+    // Every stage but the last lands in its own buffer, where the stages
+    // after it read it; the last stage lands in the slab's.
+    if let Some(last) = slab_stage(graph, consumer, producer) {
+        return !last;
+    }
     structural_boundary(graph, producer, consumer) || !absorbs(graph, consumer, producer)
 }
 
@@ -443,6 +475,10 @@ pub fn index_space(graph: &EGraph, id: Id) -> IndexSpace {
             | Launch::Scatter { space, .. },
         ) => space.clone(),
         Op::Launch(Launch::Contract { batch, m, n, .. }) => IndexSpace::new([*batch, *m, *n]),
+        Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) => members
+            .last()
+            .map(|m| index_space(graph, *m))
+            .unwrap_or_default(),
         _ => IndexSpace {
             dims: graph.facts(id).shape.clone(),
         },
@@ -565,6 +601,129 @@ pub fn tiles_for(
     Tiles { decls }
 }
 
+/// Bytes a cache line holds on every device this targets; the amplification
+/// is a ratio against it, so the exact figure matters less than having one.
+const LINE_BYTES: u64 = 128;
+
+/// How many times its useful bytes a fold's operand read moves through the
+/// memory pipe at `lane_group` lanes per row. A subgroup's lanes cover
+/// `contig` consecutive elements per load — the lane group's share of a row
+/// when the reduced axis is innermost, the adjacent rows the subgroup serves
+/// otherwise — and each such run costs whole lines.
+pub fn fold_line_amplification(
+    dims: &[u64],
+    axis: usize,
+    lane_group: u32,
+    caps: &Caps,
+    elem_bytes: u64,
+) -> u64 {
+    let Some(&k) = dims.get(axis) else {
+        return 1;
+    };
+    let inner: u64 = dims[axis + 1..].iter().product::<u64>().max(1);
+    let sg = u64::from(caps.subgroup_width().max(1));
+    let lg = u64::from(lane_group.max(1)).min(sg);
+    let line_elems = (LINE_BYTES / elem_bytes.max(1)).max(1);
+    let contig = if inner == 1 {
+        lg.min(k.max(1))
+    } else {
+        (sg / lg).min(inner)
+    }
+    .max(1);
+    let runs = sg / contig.min(sg);
+    let lines = runs.max(1) * contig.div_ceil(line_elems);
+    (lines * line_elems / sg).clamp(1, line_elems)
+}
+
+
+/// The longest dependent chain one workgroup of `root` runs at `theta`: for
+/// a tiled contraction the k steps of one tile (split-K divides them), for
+/// a fold the iterations of one lane over the reduced axis, for a slab the
+/// sum over its stages. What no occupancy shortens.
+pub fn serial_steps(
+    graph: &EGraph,
+    root: Id,
+    theta: Option<SchedPoint>,
+    block: u32,
+    caps: &Caps,
+) -> (u64, u64) {
+    match &graph.node(root).op {
+        Op::Launch(Launch::Slab { slabs, members, .. }) => {
+            let slabs = u64::from((*slabs).max(1));
+            let mut steps = 0u64;
+            for m in members.iter() {
+                match &graph.node(*m).op {
+                    Op::Launch(Launch::Fold { space, axis, .. }) => {
+                        let Some(total) = space.iterations() else { continue };
+                        let k = space.dims.get(*axis as usize).and_then(|d| d.as_const()).unwrap_or(1).max(1);
+                        let rows = (total / k) / slabs;
+                        let lpr = fusor_ir::ir::launch::slab_lanes_per_row(block, rows, k);
+                        let groups = u64::from(block / lpr.max(1)).max(1);
+                        steps += rows.div_ceil(groups).max(1) * k.div_ceil(u64::from(lpr));
+                    }
+                    Op::Launch(Launch::Map { space, .. }) => {
+                        let Some(total) = space.iterations() else { continue };
+                        steps += (total / slabs).div_ceil(u64::from(block)).max(1);
+                    }
+                    _ => {}
+                }
+            }
+            (0, steps)
+        }
+        op => node_serial_steps(op, theta, caps),
+    }
+}
+
+/// [`serial_steps`] for one launch node from its own op: a contraction's k
+/// steps at `theta`, a fold's iterations per lane.
+pub fn node_serial_steps(op: &Op, theta: Option<SchedPoint>, caps: &Caps) -> (u64, u64) {
+    match op {
+        Op::Launch(Launch::Contract { k, .. }) => {
+            let k = k.as_const().unwrap_or(1).max(1);
+            // A step is one fragment depth of k, whatever `bk` stages at
+            // once: a deeper tile runs its fragments back to back, so the
+            // chain is as long either way.
+            let depth = u64::from(fusor_ir::ir::launch::CoopGeom::COOP_DIM.max(1));
+            // Every family walks k in dependent steps; a GEMV lane's dot
+            // and a subgroup's fragment chain are the same length in
+            // depths. The floor separates split from unsplit, and tiled
+            // from scalar folds — not one family from another.
+            match theta {
+                // One subgroup multiplies its `(bm / rg) x (bn / cg)` block a
+                // fragment at a time, every depth: that chain is the step
+                // count. `16x16` on one subgroup and `32x32` on four are the
+                // same chain; what separates them is traffic.
+                // A depth step is a staged load and a barrier; `16x16` on
+                // one subgroup (four multiplies per depth) measured the same
+                // as on four (one each), so the multiplies are not the step.
+                Some(SchedPoint::Coop { splits, .. }) => {
+                    (k.div_ceil(depth).div_ceil(u64::from(splits.max(1))), 0)
+                }
+                // A scalar-tiled lane walks every k with its register tile's
+                // FMAs and staged loads: measured 8-10x a fragment chain on
+                // the same shape (281 us against 33 us at 1024x96x96).
+                Some(SchedPoint::Sgemm(_)) => (0, k.saturating_mul(4)),
+                Some(SchedPoint::Sgemv(_)) => (k.div_ceil(depth) * 4, 0),
+                _ => (0, k),
+            }
+        }
+        Op::Launch(Launch::Fold { space, axis, .. }) => {
+            let k = space.dims.get(*axis as usize).and_then(|d| d.as_const()).unwrap_or(1);
+            (0, k.div_ceil(u64::from(fold_lane_group(theta, caps).max(1))))
+        }
+        // The dense scatter walks every update once per output lane, each
+        // step a dependent index load.
+        Op::Launch(Launch::Scatter { ops, .. }) => {
+            let updates = ops
+                .get(1)
+                .map(|o| o.layout.shape().iter().map(|d| d.as_const().unwrap_or(1)).product::<u64>())
+                .unwrap_or(1);
+            (0, updates.max(1))
+        }
+        _ => (0, 0),
+    }
+}
+
 /// The lane group a fold lowers at under `theta`. A point that is not a fold
 /// strategy — a `Point`, or a geometry inherited from a contraction domain —
 /// takes the emitters' default, which is `emitted_block(1)`.
@@ -634,16 +793,27 @@ pub fn geometry(theta: Option<SchedPoint>, space: &IndexSpace, caps: &Caps) -> G
                 .saturating_mul(n.div_ceil(u64::from(p.cols.max(1))))
                 .max(1),
         },
+        // What `lower_fold` actually launches: a block of
+        // `emitted_block(lane_group)` lanes carrying `block / lane_group`
+        // output rows each. Reporting `block = lane_group` instead said a
+        // one-lane fold was 1024 workgroups of one thread when it is four of
+        // 256, which priced the least parallel strategy as the most.
         Some(SchedPoint::Fold(strat)) => {
-            let lanes = match strat {
-                FoldStrat::Subgroup => width,
+            let (block, lane_group) = match strat {
+                FoldStrat::Subgroup => (
+                    width.min(caps.limits.max_compute_invocations_per_workgroup.max(1)),
+                    width,
+                ),
                 FoldStrat::WgTree { lane_group } | FoldStrat::LoopThenTree { lane_group, .. } => {
-                    lane_group.max(1)
+                    let lg = lane_group.max(1);
+                    (fusor_ir::ir::launch::emitted_block(lg, caps), lg)
                 }
             };
+            let rows = (total / n.max(1)).max(1);
+            let per_group = u64::from((block / lane_group.max(1)).max(1));
             Geometry {
-                block: lanes.max(1),
-                workgroups: (total / n.max(1)).max(1),
+                block: block.max(1),
+                workgroups: rows.div_ceil(per_group).max(1),
             }
         }
         Some(SchedPoint::Map(t)) => {
@@ -745,11 +915,21 @@ fn walk(
                 OPEN => return Err(WalkFail::Cycle(v)),
                 _ => {
                     state[v.index()] = OPEN;
+                    // A slab names its members by id — they are the spellings
+                    // its lowering reads — and its last member shares its
+                    // class, so selecting them would walk back into the slab.
+                    let by_id = matches!(graph.node(v).op, Op::Launch(Launch::Slab { .. } | Launch::Group { .. }));
                     let kids: SmallVec<[Id; 4]> = graph
                         .node(v)
                         .children
                         .iter()
-                        .map(|c| select(graph, extraction, *c))
+                        .map(|c| {
+                            if by_id {
+                                Ok(*c)
+                            } else {
+                                select(graph, extraction, *c)
+                            }
+                        })
                         .collect::<Result<_>>()
                         .map_err(WalkFail::Other)?;
                     stack.push(Frame::Exit(v));
@@ -859,7 +1039,100 @@ fn cut(
         groups[idx as usize].push(*v);
         launch_of.insert(*v, idx);
     }
-    (launch_of, groups)
+
+    // Groups came out in the order their *first* node appears, which is not
+    // a dependency order: a composite whose first member reads nothing may
+    // have a later member that reads a launch appearing after that first
+    // node. Order the groups as a DAG instead, earliest-first among the
+    // ready ones so the order stays deterministic.
+    let n = groups.len();
+    let mut deps: Vec<Vec<usize>> = vec![Vec::new(); n];
+    let mut indegree = vec![0usize; n];
+    for (g, members) in groups.iter().enumerate() {
+        let mut seen: SmallVec<[usize; 8]> = SmallVec::new();
+        for v in members {
+            for c in operands.get(*v).map(|o| o.as_slice()).unwrap_or(&[]) {
+                let Some(d) = launch_of.copied(*c) else {
+                    continue;
+                };
+                let d = d as usize;
+                if d == g || seen.contains(&d) {
+                    continue;
+                }
+                seen.push(d);
+                deps[d].push(g);
+                indegree[g] += 1;
+            }
+        }
+    }
+    let mut ready: std::collections::BinaryHeap<std::cmp::Reverse<usize>> = (0..n)
+        .filter(|g| indegree[*g] == 0)
+        .map(std::cmp::Reverse)
+        .collect();
+    let mut sorted: Vec<usize> = Vec::with_capacity(n);
+    while let Some(std::cmp::Reverse(g)) = ready.pop() {
+        sorted.push(g);
+        for &h in &deps[g] {
+            indegree[h] -= 1;
+            if indegree[h] == 0 {
+                ready.push(std::cmp::Reverse(h));
+            }
+        }
+    }
+    if sorted.len() != n {
+        // A cycle between launches: leave the appearance order, which the
+        // walk already proved acyclic node by node, so the fault surfaces
+        // in verification rather than here.
+        if std::env::var_os("FUSOR_SLAB_LOG").is_some() {
+            let stuck: Vec<usize> = (0..n).filter(|g| indegree[*g] > 0).collect();
+            for g in stuck.iter().take(6) {
+                let roots: Vec<Id> = groups[*g].iter().copied().take(4).collect();
+                let waits: Vec<usize> = (0..n).filter(|d| deps[*d].contains(g) && indegree[*d] > 0).collect();
+                eprintln!("LAUNCH CYCLE group {g} members {roots:?} waits on {waits:?}");
+                for v in &groups[*g] {
+                    for c in operands.get(*v).map(|o| o.as_slice()).unwrap_or(&[]) {
+                        if let Some(d) = launch_of.copied(*c)
+                            && waits.contains(&(d as usize))
+                        {
+                            let show = |i: Id| {
+                                format!("{:?}", graph.node(i).op).chars().take(90).collect::<String>()
+                            };
+                            let in_slab = groups[*g].iter().any(|m| matches!(graph.node(*m).op, Op::Launch(Launch::Slab { .. })));
+                            let raw: Vec<String> = graph
+                                .node(*v)
+                                .children
+                                .iter()
+                                .map(|x| format!("{x}:c{}", graph.class_of(*x).0.index()))
+                                .collect();
+                            eprintln!(
+                                "    {v} [{}] reads {c} (class {}) [{}] of group {d}; slab group {in_slab}; raw children {raw:?}; sigma {:?}",
+                                show(*v),
+                                graph.class_of(*c).0.index(),
+                                show(*c),
+                                extraction.selected(graph.class_of(*c))
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        return (launch_of, groups);
+    }
+    let mut renumber = vec![0u32; n];
+    for (new, old) in sorted.iter().enumerate() {
+        renumber[*old] = new as u32;
+    }
+    let mut reordered: Vec<Vec<Id>> = Vec::with_capacity(n);
+    for old in &sorted {
+        reordered.push(std::mem::take(&mut groups[*old]));
+    }
+    for members in &reordered {
+        for v in members {
+            let old = launch_of.copied(*v).unwrap_or(0);
+            launch_of.insert(*v, renumber[old as usize]);
+        }
+    }
+    (launch_of, reordered)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -867,6 +1140,7 @@ fn build_component(
     graph: &EGraph,
     extraction: &Extraction,
     consumers: &IdMap<u32>,
+    consumer_nodes: &IdMap<SmallVec<[Id; 4]>>,
     launch_of: &IdMap<u32>,
     roots: &[Id],
     members: Vec<Id>,
@@ -878,6 +1152,33 @@ fn build_component(
         .first()
         .and_then(|m| launch_of.copied(*m))
         .unwrap_or(0);
+    if std::env::var_os("FUSOR_SLAB_LOG").is_some()
+        && let Some(slab) = members
+            .iter()
+            .find(|m| matches!(graph.node(**m).op, Op::Launch(Launch::Slab { .. })))
+    {
+        let Op::Launch(Launch::Slab { members: sm, .. }) = &graph.node(*slab).op else {
+            unreachable!()
+        };
+        let extra: Vec<Id> = members
+            .iter()
+            .copied()
+            .filter(|m| m != slab && !sm.contains(m))
+            .collect();
+        if !extra.is_empty() {
+            let kinds: Vec<String> = extra
+                .iter()
+                .map(|e| {
+                    format!(
+                        "{e}:{:?}:mat={}",
+                        graph.node(*e).op.tag(),
+                        extraction.is_materialized(*e)
+                    )
+                })
+                .collect();
+            eprintln!("COMPONENT slab {slab} has {} extra nodes: {kinds:?}", extra.len());
+        }
+    }
 
     // The component's output is the last member that lands in a buffer.
     let root = members
@@ -912,8 +1213,13 @@ fn build_component(
     let mut ext: Vec<(Id, u64, u32)> = Vec::new();
     for m in &members {
         let iters = iterations_of(&index_space(graph, *m));
+        let by_id = matches!(graph.node(*m).op, Op::Launch(Launch::Slab { .. } | Launch::Group { .. }));
         for c in graph.node(*m).children.iter() {
-            let c = select(graph, extraction, *c)?;
+            let c = if by_id {
+                *c
+            } else {
+                select(graph, extraction, *c)?
+            };
             if launch_of.copied(c) == Some(own) {
                 continue;
             }
@@ -933,10 +1239,172 @@ fn build_component(
 
     let theta = extraction.theta.get(&root).copied();
     let space = index_space(graph, root);
-    let geom = geometry(theta, &space, caps);
+    // A group's members each take their own workgroups at their own block;
+    // the dispatch is their sum at the widest block.
+    let group_geoms: Vec<(Id, Geometry)> = match &graph.node(root).op {
+        Op::Launch(Launch::Group { members: gm, .. }) => gm
+            .iter()
+            .map(|m| (*m, member_geometry(graph, extraction, *m, caps)))
+            .collect(),
+        _ => Vec::new(),
+    };
+    let geom = match &graph.node(root).op {
+        Op::Launch(Launch::Group { .. }) => Geometry {
+            block: group_geoms.iter().map(|(_, g)| g.block).max().unwrap_or(1),
+            workgroups: group_geoms
+                .iter()
+                .map(|(_, g)| {
+                    let d = distribute_workgroups(g.workgroups, caps.limits.max_compute_workgroups_per_dimension);
+                    u64::from(d[0]) * u64::from(d[1]) * u64::from(d[2])
+                })
+                .sum::<u64>()
+                .max(1),
+        },
+        // One workgroup per slab, at the block the widest stage's share of
+        // one slab asks for — the emitter's own arithmetic.
+        Op::Launch(Launch::Slab { slabs, members, .. }) => {
+            let widest = members
+                .iter()
+                .filter_map(|m| index_space(graph, *m).iterations())
+                .map(|n| n / u64::from((*slabs).max(1)))
+                .max()
+                .unwrap_or(1);
+            Geometry {
+                block: fusor_ir::ir::launch::slab_block(widest, caps),
+                workgroups: u64::from(*slabs).max(1),
+            }
+        }
+        _ => geometry(theta, &space, caps),
+    };
     let lanes = fold_footprint(graph, root).map(|(l, _)| l);
     let tiles = tiles_for(theta, scalar_element(graph.facts(root).dtype), lanes, caps);
-    let wg_bytes = arena.workgroup_bytes(&tiles, caps)? as u64;
+    let mut wg_bytes = arena.workgroup_bytes(&tiles, caps)? as u64;
+
+    // Uncoalesced fold reads: every operand walked at the fold's iteration
+    // space pays the line amplification of its lane group. A slab pays it
+    // per fold stage at that stage's lanes per row.
+    let mut line_bytes = 0u64;
+    let amp_of = |m: Id, lane_group: u32| -> (u64, u64) {
+        let Op::Launch(Launch::Fold { space, axis, .. }) = &graph.node(m).op else {
+            return (1, 0);
+        };
+        let dims: Vec<u64> = space.dims.iter().filter_map(|d| d.as_const()).collect();
+        if dims.len() != space.rank() {
+            return (1, 0);
+        }
+        let elem = graph.facts(m).dtype.byte_size().max(1) as u64;
+        (
+            fold_line_amplification(&dims, *axis as usize, lane_group, caps, elem),
+            dims.iter().product(),
+        )
+    };
+    let stage_amp: Vec<(Id, u64, u64)> = match &graph.node(root).op {
+        Op::Launch(Launch::Fold { .. }) => vec![{
+            let (a, n) = amp_of(root, fold_lane_group(theta, caps));
+            (root, a, n)
+        }],
+        Op::Launch(Launch::Slab { slabs, members: sm, .. }) => sm
+            .iter()
+            .filter_map(|m| {
+                let Op::Launch(Launch::Fold { space, axis, .. }) = &graph.node(*m).op else {
+                    return None;
+                };
+                let total = space.iterations()?;
+                let k = space.dims.get(*axis as usize)?.as_const()?.max(1);
+                let rows = (total / k) / u64::from((*slabs).max(1));
+                let lpr = fusor_ir::ir::launch::slab_lanes_per_row(geom.block, rows, k);
+                let (a, n) = amp_of(*m, lpr);
+                Some((*m, a, n))
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    // A tiled contraction pulls each operand once per tile on the other
+    // side: `M*N*K*(1/bn + 1/bm)` elements through the memory pipe, of which
+    // `M*K + K*N` are the operands themselves.
+    if let Op::Launch(Launch::Contract { m, n, k, batch, .. }) = &graph.node(root).op
+        && let Some((bm, bn)) = match theta {
+            Some(SchedPoint::Coop { geom, .. }) => Some((u64::from(geom.bm), u64::from(geom.bn))),
+            Some(SchedPoint::Sgemm(p)) => Some((u64::from(p.bm), u64::from(p.bn))),
+            _ => None,
+        }
+    {
+        let (m, n, k, batch) = (
+            m.as_const().unwrap_or(1).max(1),
+            n.as_const().unwrap_or(1).max(1),
+            k.as_const().unwrap_or(1).max(1),
+            batch.as_const().unwrap_or(1).max(1),
+        );
+        let elem = graph.facts(root).dtype.byte_size().max(1) as u64;
+        let pulled = batch * k * (m * n.div_ceil(bn.max(1)) + n * m.div_ceil(bm.max(1)));
+        let useful = batch * k * (m + n);
+        line_bytes = line_bytes.saturating_add(pulled.saturating_sub(useful).saturating_mul(elem));
+    }
+
+    if !stage_amp.is_empty() {
+        for m in &members {
+            let by_id = matches!(graph.node(*m).op, Op::Launch(Launch::Slab { .. } | Launch::Group { .. }));
+            // The fold whose iteration space walks this member's operands:
+            // the member itself when it is a stage, else the root.
+            let (amp, total) = stage_amp
+                .iter()
+                .find(|(s, _, _)| s == m)
+                .or_else(|| stage_amp.first())
+                .map_or((1, 0), |(_, a, n)| (*a, *n));
+            if amp <= 1 {
+                continue;
+            }
+            for c in graph.node(*m).children.iter() {
+                let c = if by_id { *c } else { select(graph, extraction, *c)? };
+                let facts = graph.facts(c);
+                if launch_of.copied(c) == Some(own) || elements_of(facts) != total {
+                    continue;
+                }
+                line_bytes = line_bytes.saturating_add(bytes_of(facts).saturating_mul(amp - 1));
+            }
+        }
+    }
+
+    let (coop_steps, lane_steps) = if group_geoms.is_empty() {
+        serial_steps(graph, root, theta, geom.block, caps)
+    } else {
+        // Members run side by side: the chain is the longest of theirs.
+        group_geoms
+            .iter()
+            .map(|(m, g)| serial_steps(graph, *m, extraction.theta.get(m).copied(), g.block, caps))
+            .fold((0, 0), |a, b| (a.0.max(b.0), a.1.max(b.1)))
+    };
+
+    // A slab's middle members nothing outside reads live in workgroup memory
+    // as far as it fits; the rest, and anything read outside, in buffers.
+    let mut private: Vec<Id> = Vec::new();
+    // A group's member slabs keep their own privates; the group itself has
+    // none.
+    let slab_roots: Vec<Id> = match &graph.node(root).op {
+        Op::Launch(Launch::Slab { .. }) => vec![root],
+        Op::Launch(Launch::Group { members: gm, .. }) => gm
+            .iter()
+            .copied()
+            .filter(|m| matches!(graph.node(*m).op, Op::Launch(Launch::Slab { .. })))
+            .collect(),
+        _ => Vec::new(),
+    };
+    for slab in slab_roots {
+        let Op::Launch(Launch::Slab { members: sm, .. }) = &graph.node(slab).op else { continue };
+        let inside: rustc_hash::FxHashSet<ClassId> = sm.iter().map(|m| graph.class_of(*m)).collect();
+        let shared = |m: Id| {
+            consumer_nodes.get(m).is_some_and(|cs| {
+                cs.iter()
+                    .any(|c| c != &slab && c != &root && !inside.contains(&graph.class_of(*c)))
+            })
+        };
+        let (p, used) = slab_layout(graph, slab, caps, roots, &shared)?;
+        for m in &p {
+            writes = writes.saturating_sub(bytes_of(graph.facts(*m)));
+        }
+        wg_bytes = wg_bytes.max(used);
+        private.extend(p);
+    }
 
     Ok(Component {
         root,
@@ -947,12 +1415,36 @@ fn build_component(
         work,
         resident_lanes: geom.workgroups.saturating_mul(geom.block as u64),
         wg_bytes,
+        line_bytes,
+        coop_steps,
+        lane_steps,
+        private,
         grid: distribute_workgroups(
             geom.workgroups,
             caps.limits.max_compute_workgroups_per_dimension,
         ),
         block: geom.block,
     })
+}
+
+/// The geometry one node launches at on its own: a slab's, or its schedule
+/// point's over its index space.
+fn member_geometry(graph: &EGraph, extraction: &Extraction, m: Id, caps: &Caps) -> Geometry {
+    match &graph.node(m).op {
+        Op::Launch(Launch::Slab { slabs, members, .. }) => {
+            let widest = members
+                .iter()
+                .filter_map(|s| index_space(graph, *s).iterations())
+                .map(|n| n / u64::from((*slabs).max(1)))
+                .max()
+                .unwrap_or(1);
+            Geometry {
+                block: fusor_ir::ir::launch::slab_block(widest, caps),
+                workgroups: u64::from(*slabs).max(1),
+            }
+        }
+        _ => geometry(extraction.theta.get(&m).copied(), &index_space(graph, m), caps),
+    }
 }
 
 /// True when a class has exactly one member, in which case selection is
@@ -983,6 +1475,11 @@ pub fn is_runnable(graph: &EGraph, id: Id) -> bool {
 /// denote "compute X by computing X". A rule bug must degrade the plan, never
 /// make a class unextractable.
 pub fn is_self_referential(graph: &EGraph, id: Id) -> bool {
+    // A slab's last member is in the slab's own class by construction, and is
+    // read by id rather than selected; that is not a cycle.
+    if matches!(graph.node(id).op, Op::Launch(Launch::Slab { .. } | Launch::Group { .. })) {
+        return false;
+    }
     let class = graph.class_of(id);
     graph
         .node(id)
@@ -1010,6 +1507,14 @@ pub fn fold_footprint(graph: &EGraph, id: Id) -> Option<(u64, u64)> {
 /// inherited strategies were admitted at one accumulator lane and the
 /// promoted nest holds `lanes` of them.
 pub fn point_is_legal(graph: &EGraph, id: Id, theta: SchedPoint, caps: &Caps) -> bool {
+    // A split point needs a combine dispatch the targets do not run; the
+    // `SPLIT_K` rule spells the same split as a batched contraction and a
+    // fold, which every target runs.
+    if let SchedPoint::Coop { splits, .. } = theta
+        && splits > 1
+    {
+        return false;
+    }
     let Some((lanes, acc_bytes)) = fold_footprint(graph, id) else {
         return true;
     };
@@ -1033,10 +1538,215 @@ pub fn point_is_legal(graph: &EGraph, id: Id, theta: SchedPoint, caps: &Caps) ->
 /// expensive: a lowering refusal is a hard assert, so selecting one mints a
 /// crash rather than a slow plan.
 pub fn has_legal_point(graph: &EGraph, id: Id, caps: &Caps) -> bool {
+    if matches!(graph.node(id).op, Op::Launch(Launch::Slab { .. })) && !slab_bindings_fit(graph, id, caps)
+    {
+        return false;
+    }
+    if matches!(graph.node(id).op, Op::Launch(Launch::Group { .. })) && !group_bindings_fit(graph, id, caps) {
+        return false;
+    }
     let Some(domain) = domain_of(graph, id) else {
         return true;
     };
     domain.iter().any(|p| point_is_legal(graph, id, p, caps))
+}
+
+/// Whether group `id` can bind: each member's own buffers and the distinct
+/// outside inputs, a member slab's stages as its layout says. Memoized
+/// like [`slab_bindings_fit`].
+pub fn group_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
+    thread_local! {
+        static MEMO: std::cell::RefCell<rustc_hash::FxHashMap<(u64, Id), (usize, bool)>> =
+            std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+    }
+    let key = (graph.arena_id(), id);
+    if let Some((len, fit)) = MEMO.with(|m| m.borrow().get(&key).copied())
+        && len == graph.len()
+    {
+        return fit;
+    }
+    let fit = group_bindings_fit_uncached(graph, id, caps);
+    MEMO.with(|m| m.borrow_mut().insert(key, (graph.len(), fit)));
+    fit
+}
+
+fn group_bindings_fit_uncached(graph: &EGraph, id: Id, caps: &Caps) -> bool {
+    if let Op::Launch(Launch::Group { members, .. }) = &graph.node(id).op {
+        let mut inputs: rustc_hash::FxHashSet<ClassId> = rustc_hash::FxHashSet::default();
+        let mut outs = 0usize;
+        for m in members.iter() {
+            match &graph.node(*m).op {
+                Op::Launch(Launch::Slab { members: sm, .. }) => {
+                    if !slab_bindings_fit(graph, *m, caps) {
+                        return false;
+                    }
+                    let own: rustc_hash::FxHashSet<ClassId> = sm.iter().map(|s| graph.class_of(*s)).collect();
+                    for s in sm.iter() {
+                        for c in graph.node(*s).children.iter() {
+                            let class = graph.class_of(*c);
+                            if !own.contains(&class) {
+                                inputs.insert(class);
+                            }
+                        }
+                    }
+                    let shared = |x: Id| graph.any_reader(graph.class_of(x), |r| !own.contains(&graph.class_of(r)));
+                    let Ok((private, _)) = slab_layout(graph, *m, caps, graph.roots(), &shared) else {
+                        return false;
+                    };
+                    outs += sm.len() - private.len();
+                }
+                _ => {
+                    outs += 1;
+                    for c in graph.node(*m).children.iter() {
+                        inputs.insert(graph.class_of(*c));
+                    }
+                }
+            }
+        }
+        let own: rustc_hash::FxHashSet<ClassId> = members.iter().map(|m| graph.class_of(*m)).collect();
+        let root_classes: rustc_hash::FxHashSet<ClassId> = graph.roots().iter().map(|r| graph.class_of(*r)).collect();
+        let inputs = inputs
+            .iter()
+            .filter(|c| !own.contains(c) && own_buffer(graph, **c, &root_classes))
+            .count();
+        let _ = outs;
+        let outs = members.iter().filter(|m| root_classes.contains(&graph.class_of(**m))).count();
+        if 2 + outs + inputs > caps.limits.max_storage_buffers_per_shader_stage as usize {
+            return false;
+        }
+    }
+    true
+}
+
+/// Whether slab `id` can bind, with every middle member nothing outside the
+/// slab reads kept in workgroup memory as far as it fits. The readers index
+/// says what is read outside; `build_component` decides the same layout
+/// from the realized consumers, which read no more than that.
+pub fn slab_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
+    let Op::Launch(Launch::Slab { members, .. }) = &graph.node(id).op else {
+        return true;
+    };
+    // Readers only grow with the graph, so the answer is a function of
+    // `(graph, node, graph.len())`; the extractor asks per class per move.
+    thread_local! {
+        static MEMO: std::cell::RefCell<rustc_hash::FxHashMap<(u64, Id), (usize, bool)>> =
+            std::cell::RefCell::new(rustc_hash::FxHashMap::default());
+    }
+    let key = (graph.arena_id(), id);
+    if let Some((len, fit)) = MEMO.with(|m| m.borrow().get(&key).copied())
+        && len == graph.len()
+    {
+        return fit;
+    }
+    let classes: rustc_hash::FxHashSet<ClassId> =
+        members.iter().map(|m| graph.class_of(*m)).collect();
+    let shared = |m: Id| {
+        graph.any_reader(graph.class_of(m), |r| !classes.contains(&graph.class_of(r)))
+    };
+    // The graph's roots are every value a caller may read back: a root
+    // member lands in a buffer whichever roots this extraction has.
+    let fit = slab_layout(graph, id, caps, graph.roots(), &shared).is_ok();
+    MEMO.with(|m| m.borrow_mut().insert(key, (graph.len(), fit)));
+    fit
+}
+
+/// Whether a class binds its own storage buffer: an external leaf, or a
+/// root the caller reads back. Every other value is packed into the step
+/// arena, which a launch binds once.
+pub fn own_buffer(graph: &EGraph, class: ClassId, roots: &rustc_hash::FxHashSet<ClassId>) -> bool {
+    roots.contains(&class) || graph.members(class).iter().any(|m| leaf_role(graph, *m) == LeafRole::External)
+}
+
+/// A slab's workgroup memory and bindings: the widest fold stage's scratch,
+/// then as many middle members as fit — smallest share first, of those
+/// `shared` says nothing outside reads and that are not roots — and the
+/// storage buffers left over: the uniform block, the output, every distinct
+/// outside class read, and every middle member still in a buffer. `Err`
+/// when those exceed the device's bindings.
+pub fn slab_layout(
+    graph: &EGraph,
+    root: Id,
+    caps: &Caps,
+    roots: &[Id],
+    shared: &dyn Fn(Id) -> bool,
+) -> Result<(Vec<Id>, u64)> {
+    let Op::Launch(Launch::Slab { slabs, members: sm, .. }) = &graph.node(root).op else {
+        return Ok((Vec::new(), 0));
+    };
+    let slabs = u64::from((*slabs).max(1));
+    let widest = sm
+        .iter()
+        .filter_map(|m| index_space(graph, *m).iterations())
+        .map(|n| n / slabs)
+        .max()
+        .unwrap_or(1);
+    let block = u64::from(fusor_ir::ir::launch::slab_block(widest, caps));
+    let limit = u64::from(caps.limits.max_compute_workgroup_storage_size);
+    let scratch = sm
+        .iter()
+        .filter_map(|m| fold_footprint(graph, *m))
+        .map(|(lanes, acc)| lanes.saturating_mul(acc).saturating_mul(block))
+        .max()
+        .unwrap_or(0);
+    let mut used = scratch;
+    let middle = &sm[..sm.len().saturating_sub(1)];
+    let root_classes: rustc_hash::FxHashSet<ClassId> =
+        roots.iter().map(|r| graph.class_of(*r)).collect();
+    let mut unshared: Vec<(u64, Id)> = middle
+        .iter()
+        .filter(|m| !root_classes.contains(&graph.class_of(**m)) && !shared(**m))
+        .map(|m| (bytes_of(graph.facts(*m)) / slabs, *m))
+        .collect();
+    unshared.sort_unstable();
+    let mut private: Vec<Id> = Vec::new();
+    // `FUSOR_NO_PRIVATE`: every member in a buffer, for bisecting.
+    if std::env::var_os("FUSOR_NO_PRIVATE").is_some() {
+        unshared.clear();
+    }
+    for (share, m) in unshared {
+        if used.saturating_add(share) > limit {
+            continue;
+        }
+        used += share;
+        private.push(m);
+    }
+    // Stage order, so the lowering declares tiles in the order it runs.
+    private.sort_unstable_by_key(|m| sm.iter().position(|x| x == m));
+
+    let classes: rustc_hash::FxHashSet<ClassId> = sm.iter().map(|m| graph.class_of(*m)).collect();
+    let mut inputs: rustc_hash::FxHashSet<ClassId> = rustc_hash::FxHashSet::default();
+    for m in sm.iter() {
+        for c in graph.node(*m).children.iter() {
+            let class = graph.class_of(*c);
+            if !classes.contains(&class) && leaf_role(graph, *c) != LeafRole::Free {
+                inputs.insert(class);
+            }
+        }
+    }
+    // The uniform block, the step arena, the output when the caller reads
+    // it back, and every input or buffered middle member that is a leaf or
+    // a root: everything else lives in the arena binding.
+    let owns = |c: ClassId| own_buffer(graph, c, &root_classes);
+    let bound = 2
+        + inputs.iter().filter(|c| owns(**c)).count()
+        + middle.iter().filter(|m| !private.contains(m) && owns(graph.class_of(**m))).count()
+        + usize::from(owns(graph.class_of(root)));
+    let limit_bufs = caps.limits.max_storage_buffers_per_shader_stage as usize;
+    if bound > limit_bufs && std::env::var_os("FUSOR_SLAB_LOG").is_some() {
+        eprintln!(
+            "LAYOUT slab {root}: {bound} bindings > {limit_bufs}: {} inputs, {} middle, {} private, wg {used}/{limit}",
+            inputs.len(),
+            middle.len(),
+            private.len()
+        );
+    }
+    if bound > limit_bufs {
+        return Err(Error::Plan(format!(
+            "slab {root} binds {bound} storage buffers over the {limit_bufs}-buffer limit: \
+             its middle members do not fit workgroup memory"
+        )));
+    }
+    Ok((private, used))
 }
 
 pub fn selectable(graph: &EGraph, class: ClassId, caps: &Caps) -> Vec<Id> {

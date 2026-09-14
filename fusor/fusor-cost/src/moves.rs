@@ -152,6 +152,10 @@ pub(crate) fn candidates(
     let mut out: SmallVec<[Candidate; 8]> = SmallVec::new();
     match mv {
         Move::Reselect(class) => {
+            // A member of a selected slab is that slab's to select.
+            if slab_pinned(graph, extraction, class) {
+                return out;
+            }
             let current = extraction.sigma.get(&class).copied();
             // Only runnable members: the verifier rejects the un-lowered
             // `Logical` node.
@@ -207,6 +211,7 @@ pub(crate) fn apply(graph: &EGraph, extraction: &mut Extraction, c: Candidate) -
                 return None;
             }
             let node_was_materialized = extraction.is_materialized(node);
+            crate::extract::sigma_debug(class, node, "move select");
             extraction.sigma.insert(class, node);
             // `M` is keyed by node, but the decision it records belongs to the
             // class: a value that had to land in a buffer still has to,
@@ -258,6 +263,7 @@ pub(crate) fn undo(extraction: &mut Extraction, undo: Undo) {
             node_was_materialized,
         } => {
             set_materialized(extraction, node, node_was_materialized);
+            crate::extract::sigma_debug(class, was, "move undo");
             extraction.sigma.insert(class, was);
         }
         Undo::Flip {
@@ -303,10 +309,28 @@ pub(crate) fn is_pinned(graph: &EGraph, roots: &[Id], id: Id) -> bool {
     if roots.contains(&id) {
         return true;
     }
+    // A slab is the buffer its consumers read; inlined, its stages would run
+    // once per consumer.
+    if matches!(graph.node(id).op, Op::Launch(Launch::Slab { .. } | Launch::Group { .. })) {
+        return true;
+    }
     if realize::leaf_role(graph, id) != realize::LeafRole::NotLeaf {
         return true;
     }
     graph.semantics().effect(&graph.node(id).op) != Effect::Pure
+}
+
+/// Whether `class` is a middle member's class of some selected slab.
+pub(crate) fn slab_pinned(graph: &EGraph, extraction: &Extraction, class: ClassId) -> bool {
+    extraction.sigma.values().any(|sel| {
+        let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) = &graph.node(*sel).op else {
+            return false;
+        };
+        let n = members.len();
+        members[..n.saturating_sub(1)]
+            .iter()
+            .any(|m| graph.class_of(*m) == class)
+    })
 }
 
 /// Everything a schedule score depends on besides the point itself: the
@@ -370,7 +394,7 @@ fn operand_layouts(op: &Op) -> SmallVec<[Layout; 4]> {
             Launch::Contract { a, b, .. } => {
                 out.extend(a.ops.iter().chain(b.ops.iter()).map(|o| o.layout.clone()))
             }
-            Launch::Region { .. } => {}
+            Launch::Region { .. } | Launch::Slab { .. } | Launch::Group { .. } => {}
         }
     }
     out

@@ -183,6 +183,36 @@ fn doubled(f: &crate::facts::ValueFacts) -> crate::facts::ValueFacts {
 fn check_composite_domain(cx: &VerifyCtx<'_>, op: &Launch) -> Result<()> {
     let sched = match op {
         Launch::Region { sched, .. } => sched,
+        // A slab has one geometry, a workgroup per slab, and nothing to
+        // enumerate.
+        Launch::Slab { sched, slabs, members } => {
+            if *slabs < 2 || members.len() < 2 {
+                return Err(Error::Legality(format!(
+                    "a Slab needs at least two slabs and two members, got {slabs} and {}",
+                    members.len()
+                )));
+            }
+            if *sched != ScheduleDomain::Point {
+                return Err(Error::Legality(format!(
+                    "a Slab's schedule domain is Point; got {sched:?}"
+                )));
+            }
+            return Ok(());
+        }
+        Launch::Group { sched, members } => {
+            if members.len() < 2 {
+                return Err(Error::Legality(format!(
+                    "a Group needs at least two members, got {}",
+                    members.len()
+                )));
+            }
+            if *sched != ScheduleDomain::Point {
+                return Err(Error::Legality(format!(
+                    "a Group's schedule domain is Point; got {sched:?}"
+                )));
+            }
+            return Ok(());
+        }
         _ => return Ok(()),
     };
     let want = ScheduleDomain::Map(crate::ir::launch::MapDomain::linear_over(
@@ -785,7 +815,7 @@ fn operands_of(op: &Launch) -> Vec<Operand> {
         | Launch::Scatter { ops, .. }
         | Launch::Ext { ops, .. } => ops.clone(),
         Launch::Contract { a, b, .. } => a.ops.iter().chain(b.ops.iter()).cloned().collect(),
-        Launch::Region { .. } => Vec::new(),
+        Launch::Region { .. } | Launch::Slab { .. } | Launch::Group { .. } => Vec::new(),
     }
 }
 

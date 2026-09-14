@@ -327,12 +327,17 @@ pub(crate) fn create_storage_globals(em: &mut Emitter<'_>) -> Result<(), EmitErr
 /// is therefore always emittable, just larger.
 pub(crate) fn create_workgroup_globals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
     let tiles = em.analysis.tiles.clone();
-    let placements: FxHashMap<usize, (u32, u32)> = em
-        .plan
-        .placements
-        .iter()
-        .map(|p| (key(&p.tile), (p.byte_offset, p.byte_len)))
-        .collect();
+    // `FUSOR_NO_TILE_ALIAS` gives every tile its own allocation: the
+    // bisection aid for a suspected aliasing miscompile.
+    let placements: FxHashMap<usize, (u32, u32)> = if std::env::var_os("FUSOR_NO_TILE_ALIAS").is_some() {
+        FxHashMap::default()
+    } else {
+        em.plan
+            .placements
+            .iter()
+            .map(|p| (key(&p.tile), (p.byte_offset, p.byte_len)))
+            .collect()
+    };
 
     match em.plan.mode {
         ArenaMode::ByteArena if !placements.is_empty() => {

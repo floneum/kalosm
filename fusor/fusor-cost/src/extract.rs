@@ -132,10 +132,9 @@ impl LocalSearch {
             theta: FxHashMap::default(),
         };
         for class in classes {
-            ex.sigma.insert(
-                *class,
-                argmin_member(graph, lb, launches, *class, &self.caps),
-            );
+            let pick = argmin_member(graph, lb, launches, *class, &self.caps, cost.facts().launch_ps);
+            sigma_debug(*class, pick, "seed");
+            ex.sigma.insert(*class, pick);
         }
         seed_theta(graph, &mut ex, cost);
 
@@ -153,7 +152,15 @@ impl LocalSearch {
         {
             Ok(probe) => probe,
             Err(first) => {
-                if !break_selection_cycles(graph, roots, &mut ex, lb, launches, &self.caps)? {
+                if !break_selection_cycles(
+                    graph,
+                    roots,
+                    &mut ex,
+                    lb,
+                    launches,
+                    &self.caps,
+                    cost.facts().launch_ps,
+                )? {
                     // Not a cycle. `first` is the real diagnosis.
                     return Err(first);
                 }
@@ -273,6 +280,24 @@ impl LocalSearch {
                 cap,
             )?
         {}
+
+        // A root's update chain is one of many the step ends in; a slab
+        // batching several roots is cheaper by their dispatches, which no
+        // per-class bound can see (it prices the other roots' whole chains
+        // into this one). Tried at plan cost, largest batch first.
+        if std::env::var_os("FUSOR_BATCH_ROOTS").is_some() {
+            batch_roots_over(
+                graph,
+                roots,
+                cost,
+                self.arena.as_ref(),
+                &mut ex,
+                &mut realized,
+                &mut best_cost,
+                &mut cache,
+                &self.caps,
+            )?;
+        }
 
         let descend = |ex: &mut Extraction,
                        realized: &mut Realized,
@@ -410,7 +435,7 @@ impl LocalSearch {
 
         let plan = derive_plan(graph, &ex, &realized, cost.facts(), best_cost)?;
         // Before verification: a rejected plan is the one worth reading.
-        probe_dump(graph, &plan, &ex, &realized, &self.caps);
+        probe_dump(graph, &plan, &ex, &realized, &self.caps, cost);
         crate::verify_plan::verify_plan_with(
             graph,
             &plan,
@@ -904,10 +929,18 @@ fn co_select_over(
 
 // Dumps every launch of every extracted plan when `FUSOR_DUMP_PLAN` is set,
 // so a launch count can be attributed to specific nodes.
-fn probe_dump(graph: &EGraph, plan: &Plan, _ex: &Extraction, realized: &Realized, caps: &Caps) {
+fn probe_dump(
+    graph: &EGraph,
+    plan: &Plan,
+    _ex: &Extraction,
+    realized: &Realized,
+    caps: &Caps,
+    cost: &dyn CostModel,
+) {
     if std::env::var_os("FUSOR_DUMP_PLAN").is_none() {
         return;
     }
+    let priced = realized.launches(_ex);
     eprintln!(
         "PLAN nodes={} classes={} launches={} buffers={}",
         graph.len(),
@@ -918,8 +951,22 @@ fn probe_dump(graph: &EGraph, plan: &Plan, _ex: &Extraction, realized: &Realized
     for (i, l) in plan.launches.iter().enumerate() {
         let n = graph.node(l.root);
         let facts = graph.facts(l.root);
+        let priced_line = priced
+            .iter()
+            .find(|p| p.root == l.root)
+            .map(|p| {
+                format!(
+                    "cost_us={:.1} reads={:?} writes={} line_bytes={} lanes={}",
+                    cost.launch_cost(p).0 as f64 / 1e6,
+                    p.reads,
+                    p.writes,
+                    p.line_bytes,
+                    p.resident_lanes
+                )
+            })
+            .unwrap_or_default();
         eprintln!(
-            "  L{i}: root={:?} class={} op={} shape={:?} members={} grid={:?} block={}",
+            "  L{i}: root={:?} class={} op={} shape={:?} members={} grid={:?} block={} {priced_line}",
             l.root,
             graph.class_of(l.root).0.index(),
             op_tag(&n.op),
@@ -962,6 +1009,8 @@ fn probe_dump(graph: &EGraph, plan: &Plan, _ex: &Extraction, realized: &Realized
                 Op::Launch(fusor_ir::ir::launch::Launch::Gather { .. }) => "Gather",
                 Op::Launch(fusor_ir::ir::launch::Launch::Scatter { .. }) => "Scatter",
                 Op::Launch(fusor_ir::ir::launch::Launch::Region { .. }) => "Region",
+                Op::Launch(fusor_ir::ir::launch::Launch::Slab { .. }) => "Slab",
+                Op::Launch(fusor_ir::ir::launch::Launch::Group { .. }) => "Group",
                 Op::Launch(fusor_ir::ir::launch::Launch::Ext { .. }) => "Ext",
                 Op::Logical(_) => "Logical",
                 Op::Union(_, _) => "Union",
@@ -1098,32 +1147,129 @@ fn break_selection_cycles(
     lb: &[Picoseconds],
     launches: &[u32],
     caps: &Caps,
+    launch_ps: u64,
 ) -> Result<bool> {
     let mut banned: FxHashMap<ClassId, FxHashSet<Id>> = FxHashMap::default();
     let mut repaired = false;
+    let mut seen_cycles = 0usize;
     while let Some(v) = realize::selection_cycle(graph, ex, roots) {
         let class = graph.class_of(v);
+        if std::env::var_os("FUSOR_CYCLE_LOG").is_some() {
+            seen_cycles += 1;
+            let show = |i: Id| format!("{:?}", graph.node(i).op).chars().take(120).collect::<String>();
+            let kids: Vec<String> = graph
+                .node(v)
+                .children
+                .iter()
+                .map(|c| {
+                    let cc = graph.class_of(*c);
+                    format!("{c}:c{}->{:?}", cc.0.index(), ex.sigma.get(&cc))
+                })
+                .collect();
+            eprintln!("CYCLE {seen_cycles} at {v} (class {}) {}\n   kids {kids:?}", class.0.index(), show(v));
+            // The path back to `v` under the current selection.
+            let mut stack: Vec<(Id, Vec<Id>)> = vec![(v, vec![v])];
+            let mut seen: FxHashSet<Id> = FxHashSet::default();
+            let mut found: Option<Vec<Id>> = None;
+            while let Some((x, path)) = stack.pop() {
+                let by_id = matches!(graph.node(x).op, Op::Launch(Launch::Slab { .. } | Launch::Group { .. }));
+                for c in graph.node(x).children.iter() {
+                    let n = if by_id { *c } else { ex.selected(graph.class_of(*c)).unwrap_or(*c) };
+                    if n == v {
+                        let mut p = path.clone();
+                        p.push(n);
+                        found = Some(p);
+                        break;
+                    }
+                    if seen.insert(n) {
+                        let mut p = path.clone();
+                        p.push(n);
+                        stack.push((n, p));
+                    }
+                }
+                if found.is_some() {
+                    break;
+                }
+            }
+            if let Some(path) = found {
+                for n in path {
+                    eprintln!("     {n} (class {}) {}", graph.class_of(n).0.index(), show(n));
+                }
+            }
+            if seen_cycles > 8 {
+                panic!("FUSOR_CYCLE_LOG: stopping after {seen_cycles} cycles");
+            }
+        }
         let out = banned.entry(class).or_default();
         out.insert(v);
-        let Some(next) =
-            crate::lower_bound::argmin_member_excluding(graph, lb, launches, class, caps, out)
-        else {
-            return Err(Error::Plan(format!(
-                "selection is cyclic through {v} and class {} has no acyclic member: \
-                 every candidate names a class that names it back",
-                class.0
-            )));
+        let next = crate::lower_bound::argmin_member_excluding(
+            graph,
+            lb,
+            launches,
+            class,
+            caps,
+            launch_ps,
+            out,
+        );
+        let (class, next) = match next {
+            Some(next) => (class, next),
+            None => {
+                // Every spelling of this class closes the cycle: it runs
+                // through a group somewhere on the path, whose bundling of
+                // independent launches is what made the order circular.
+                // Re-select that group's class without it.
+                let Some((gclass, group)) = cycle_group(graph, ex, v) else {
+                    return Err(Error::Plan(format!(
+                        "selection is cyclic through {v} and class {} has no acyclic member: \
+                         every candidate names a class that names it back",
+                        class.0
+                    )));
+                };
+                let out = banned.entry(gclass).or_default();
+                out.insert(group);
+                let Some(next) = crate::lower_bound::argmin_member_excluding(
+                    graph, lb, launches, gclass, caps, launch_ps, out,
+                ) else {
+                    return Err(Error::Plan(format!(
+                        "selection is cyclic through {v}; group {group} in class {} has no replacement",
+                        gclass.0
+                    )));
+                };
+                (gclass, next)
+            }
         };
+        sigma_debug(class, next, "break_selection_cycles");
         ex.sigma.insert(class, next);
         repaired = true;
     }
     Ok(repaired)
 }
 
+/// A selected group on the selection cycle through `v`, with its class:
+/// the walk from `v` back to itself under the current selection, stopping
+/// at the first group met.
+fn cycle_group(graph: &EGraph, ex: &Extraction, v: Id) -> Option<(ClassId, Id)> {
+    let mut stack: Vec<Id> = vec![v];
+    let mut seen: FxHashSet<Id> = FxHashSet::default();
+    while let Some(x) = stack.pop() {
+        let by_id = matches!(graph.node(x).op, Op::Launch(Launch::Slab { .. } | Launch::Group { .. }));
+        for c in graph.node(x).children.iter() {
+            let n = if by_id { *c } else { ex.selected(graph.class_of(*c)).unwrap_or(*c) };
+            if matches!(graph.node(n).op, Op::Launch(Launch::Group { .. })) {
+                return Some((graph.class_of(n), n));
+            }
+            if seen.insert(n) {
+                stack.push(n);
+            }
+        }
+    }
+    None
+}
+
 fn seed_theta(graph: &EGraph, ex: &mut Extraction, cost: &dyn CostModel) -> bool {
     let mut trail = RepairTrail::default();
     seed_theta_trailed(graph, ex, cost, &mut trail);
-    !trail.theta.is_empty()
+    !trail.is_empty()
 }
 
 /// [`seed_theta`], recording every entry it wrote and the value it replaced.
@@ -1146,7 +1292,7 @@ fn seed_theta_trailed(
         if matches!(domain, ScheduleDomain::Point) {
             let prev = ex.theta.insert(id, fusor_ir::ir::launch::SchedPoint::Point);
             if prev != Some(fusor_ir::ir::launch::SchedPoint::Point) {
-                trail.theta.push((id, prev));
+                trail.push_theta(id, prev);
             }
             continue;
         }
@@ -1184,7 +1330,7 @@ fn seed_theta_trailed(
         if let Some((_, _, theta)) = best {
             let prev = ex.theta.insert(id, theta);
             if prev != Some(theta) {
-                trail.theta.push((id, prev));
+                trail.push_theta(id, prev);
             }
         }
     }
@@ -1223,6 +1369,125 @@ fn repair(graph: &EGraph, ex: &mut Extraction, realized: &Realized, cost: &dyn C
     changed | seed_theta(graph, ex, cost)
 }
 
+/// `FUSOR_SIGMA_DEBUG=<class id>`: prints every selection change of that
+/// class with the site that made it.
+pub(crate) fn sigma_debug(class: ClassId, node: Id, site: &str) {
+    thread_local! { static WANT: Option<u32> = std::env::var("FUSOR_SIGMA_DEBUG").ok().and_then(|v| v.parse().ok()); }
+    if WANT.with(|w| *w == Some(class.0.index() as u32)) {
+        eprintln!("[sigma] class {} <- {node} ({site})", class.0.index());
+    }
+}
+
+/// For every root class selecting a plain stage, the slab spellings of
+/// that class in decreasing member count, kept when the plan gets cheaper.
+#[allow(clippy::too_many_arguments)]
+fn batch_roots_over(
+    graph: &EGraph,
+    roots: &[Id],
+    cost: &dyn CostModel,
+    arena: &dyn ArenaPlanner,
+    ex: &mut Extraction,
+    realized: &mut Realized,
+    best_cost: &mut Picoseconds,
+    cache: &mut NodeCache,
+    _caps: &Caps,
+) -> Result<()> {
+    let mut classes: Vec<ClassId> = roots.iter().map(|r| graph.class_of(*r)).collect();
+    classes.sort_unstable();
+    classes.dedup();
+    let log = std::env::var_os("FUSOR_SLAB_LOG").is_some();
+    for class in classes {
+        let Some(cur) = ex.sigma.get(&class).copied() else { continue };
+        // Already batched, or a member of a batch kept for another root.
+        if matches!(graph.node(cur).op, Op::Launch(Launch::Slab { .. }))
+            || moves::slab_pinned(graph, ex, class)
+        {
+            if log {
+                eprintln!(
+                    "BATCH class {} skipped: cur {:?} pinned {}",
+                    class.0.index(),
+                    graph.node(cur).op.tag(),
+                    moves::slab_pinned(graph, ex, class)
+                );
+            }
+            continue;
+        }
+        if log {
+            let all: Vec<Id> = graph
+                .members(class)
+                .into_iter()
+                .filter(|m| matches!(graph.node(*m).op, Op::Launch(Launch::Slab { .. })))
+                .collect();
+            let blocked: Vec<Id> = all
+                .iter()
+                .copied()
+                .filter(|m| match &graph.node(*m).op {
+                    Op::Launch(Launch::Slab { members, .. }) => {
+                        members.iter().any(|x| moves::slab_pinned(graph, ex, graph.class_of(*x)))
+                    }
+                    _ => false,
+                })
+                .collect();
+            eprintln!(
+                "BATCH class {} ({:?}): {} slab spellings, {} blocked by pinned members",
+                class.0.index(),
+                graph.node(cur).op.tag(),
+                all.len(),
+                blocked.len()
+            );
+        }
+        // Two selected slabs may not share a member, so a batch reaching
+        // into one already kept is not offered. Every slab spelling is
+        // tried, not only what `selectable` admits: its binding check reads
+        // the graph's readers, which count spellings the plan never runs,
+        // and the realizer below is the exact judge.
+        let mut slabs: Vec<(usize, Id)> = graph
+            .members(class)
+            .into_iter()
+            .filter_map(|m| match &graph.node(m).op {
+                Op::Launch(Launch::Slab { members, .. })
+                    if !members.iter().any(|x| moves::slab_pinned(graph, ex, graph.class_of(*x))) =>
+                {
+                    Some((members.len(), m))
+                }
+                _ => None,
+            })
+            .collect();
+        slabs.sort_unstable_by_key(|(n, id)| (std::cmp::Reverse(*n), *id));
+        for (n, slab) in slabs {
+            let Some(undo) = moves::apply(graph, ex, crate::moves::Candidate::Select { class, node: slab })
+            else {
+                continue;
+            };
+            match price(graph, roots, ex, cost, arena, cache) {
+                Ok((r, c, _)) if c < *best_cost => {
+                    if log {
+                        eprintln!("BATCH class {} slab {slab} ({n} members): {} -> {} us KEPT", class.0.index(), best_cost.0 / 1_000_000, c.0 / 1_000_000);
+                    }
+                    *best_cost = c;
+                    *realized = r;
+                    break;
+                }
+                Ok((_, c, trail)) => {
+                    if log {
+                        eprintln!("BATCH class {} slab {slab} ({n} members): {} -> {} us rejected", class.0.index(), best_cost.0 / 1_000_000, c.0 / 1_000_000);
+                    }
+                    unrepair(ex, trail);
+                    moves::undo(ex, undo);
+                }
+                Err(trail) => {
+                    if log {
+                        eprintln!("BATCH class {} slab {slab} ({n} members): did not realize", class.0.index());
+                    }
+                    unrepair(ex, trail);
+                    moves::undo(ex, undo);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Realize, [`repair_trailed`], re-realize. See [`LocalSearch::price`].
 /// A priced extraction, or — when repair could not converge — the trail of
 /// what was tried. The trail travels in `Err` by design: it is the whole
@@ -1239,20 +1504,27 @@ fn price(
     arena: &dyn ArenaPlanner,
     cache: &mut NodeCache,
 ) -> PriceResult {
-    let first = realize::realize_with(graph, roots, ex, cost, arena, cache)
+    // A repair changes what the roots reach — a pinned slab's members are
+    // selected where other spellings were — and the new DAG can expose
+    // obligations the old one did not: a slab reachable only now, a value
+    // at a boundary only now. So realize and repair to a fixpoint.
+    const ROUNDS: usize = 6;
+    let mut realized = realize::realize_with(graph, roots, ex, cost, arena, cache)
         .map_err(|_| RepairTrail::default())?;
-    let trail = repair_trailed(graph, ex, &first, cost);
-    if trail.is_empty() {
-        let c = realize::exact_cost(&first, ex, cost);
-        return Ok((first, c, trail));
-    }
-    match realize::realize_with(graph, roots, ex, cost, arena, cache) {
-        Ok(second) => {
-            let c = realize::exact_cost(&second, ex, cost);
-            Ok((second, c, trail))
+    let mut trail = RepairTrail::default();
+    for _ in 0..ROUNDS {
+        let round = repair_trailed(graph, ex, &realized, cost);
+        if round.is_empty() {
+            break;
         }
-        Err(_) => Err(trail),
+        trail.extend(round);
+        realized = match realize::realize_with(graph, roots, ex, cost, arena, cache) {
+            Ok(r) => r,
+            Err(_) => return Err(trail),
+        };
     }
+    let c = realize::exact_cost(&realized, ex, cost);
+    Ok((realized, c, trail))
 }
 
 /// Everything [`repair_trailed`] added to a state, in the order it added it.
@@ -1261,39 +1533,77 @@ fn price(
 /// well as the move itself.
 #[derive(Clone, Debug, Default)]
 struct RepairTrail {
-    /// Nodes newly inserted into `m`. Only nodes that were absent before, so
-    /// reverting is an unconditional clear.
-    m: SmallVec<[Id; 8]>,
-    /// `theta` entries written, each with the value it replaced.
-    theta: SmallVec<[(Id, Option<fusor_ir::ir::launch::SchedPoint>); 8]>,
+    /// Every change a repair made, in the order it made it; undone in
+    /// reverse, so a node materialized in one round and cleared in the next
+    /// ends where it began.
+    entries: SmallVec<[Repair; 16]>,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum Repair {
+    /// Newly inserted into `m`.
+    Materialized(Id),
+    /// Newly removed from `m`: a slab's last member, which its slab writes.
+    Inlined(Id),
+    /// A `theta` entry written, with the value it replaced.
+    Theta(Id, Option<fusor_ir::ir::launch::SchedPoint>),
+    /// A `sigma` entry written, with the value it replaced: a selected slab
+    /// pins its members as their classes' selections.
+    Sigma(ClassId, Option<Id>),
 }
 
 impl RepairTrail {
     fn is_empty(&self) -> bool {
-        self.m.is_empty() && self.theta.is_empty()
+        self.entries.is_empty()
+    }
+    fn extend(&mut self, other: RepairTrail) {
+        self.entries.extend(other.entries);
+    }
+    fn push_m(&mut self, id: Id) {
+        self.entries.push(Repair::Materialized(id));
+    }
+    fn push_unm(&mut self, id: Id) {
+        self.entries.push(Repair::Inlined(id));
+    }
+    fn push_theta(&mut self, id: Id, prev: Option<fusor_ir::ir::launch::SchedPoint>) {
+        self.entries.push(Repair::Theta(id, prev));
+    }
+    fn push_sigma(&mut self, class: ClassId, prev: Option<Id>) {
+        self.entries.push(Repair::Sigma(class, prev));
     }
 }
 
-/// Undo a [`RepairTrail`], newest entry first.
 fn unrepair(ex: &mut Extraction, trail: RepairTrail) {
-    for (id, prev) in trail.theta.into_iter().rev() {
-        match prev {
-            Some(p) => {
+    for entry in trail.entries.into_iter().rev() {
+        match entry {
+            Repair::Materialized(id) => {
+                if ex.m.len() > id.index() {
+                    ex.m.remove(id.index());
+                }
+            }
+            Repair::Inlined(id) => {
+                if ex.m.len() <= id.index() {
+                    ex.m.grow(id.index() + 1);
+                }
+                ex.m.insert(id.index());
+            }
+            Repair::Theta(id, Some(p)) => {
                 ex.theta.insert(id, p);
             }
-            None => {
+            Repair::Theta(id, None) => {
                 ex.theta.remove(&id);
             }
-        }
-    }
-    for id in trail.m.into_iter().rev() {
-        if ex.m.len() > id.index() {
-            ex.m.remove(id.index());
+            Repair::Sigma(class, Some(p)) => {
+                sigma_debug(class, p, "unrepair");
+                ex.sigma.insert(class, p);
+            }
+            Repair::Sigma(class, None) => {
+                ex.sigma.remove(&class);
+            }
         }
     }
 }
 
-/// [`repair`], recording what it changed so the caller can revert it.
 fn repair_trailed(
     graph: &EGraph,
     ex: &mut Extraction,
@@ -1315,15 +1625,169 @@ fn repair_trailed(
             materialize_trailed(graph, ex, *v, &mut trail);
         }
     }
+    pin_slabs_trailed(graph, ex, realized, &mut trail);
     seed_theta_trailed(graph, ex, cost, &mut trail);
     trail
+}
+
+/// A selected slab or group is materialized, every member but its last is
+/// its class's selection and materialized — the stages after it read that
+/// buffer, and so does anything outside — and its last member is not,
+/// because the composite's own buffer is where that value lands. A member
+/// that is itself a slab is pinned the same way, through the composite.
+fn pin_slabs_trailed(
+    graph: &EGraph,
+    ex: &mut Extraction,
+    realized: &Realized,
+    trail: &mut RepairTrail,
+) {
+    use fusor_ir::ir::launch::Launch as L;
+    fn members_of(graph: &EGraph, id: Id) -> Option<&smallvec::SmallVec<[Id; 8]>> {
+        match &graph.node(id).op {
+            Op::Launch(L::Slab { members, .. } | L::Group { members, .. }) => Some(members),
+            _ => None,
+        }
+    }
+    /// Every node a composite runs: its members and, for member
+    /// composites, theirs.
+    fn flat_members(graph: &EGraph, id: Id) -> Vec<Id> {
+        let mut out = Vec::new();
+        let mut stack = vec![id];
+        while let Some(x) = stack.pop() {
+            if let Some(ms) = members_of(graph, x) {
+                for m in ms.iter() {
+                    out.push(*m);
+                    stack.push(*m);
+                }
+            }
+        }
+        out
+    }
+    // Realized composites only: `sigma` also holds selections for classes
+    // nothing reaches any more, and a pin from one of those would reach
+    // into live classes. Groups first, then larger slabs: pinning a
+    // composite's middle member as its class's selection deselects any
+    // smaller slab that ended there.
+    // A group holds the roots before its head, so groups go latest head
+    // first: each pins the window before it, and the next unpinned head's
+    // group is the window before that.
+    let root_of = |id: Id| -> u32 {
+        let class = graph.class_of(id);
+        graph
+            .roots()
+            .iter()
+            .filter(|r| graph.class_of(**r) == class)
+            .map(|r| r.0)
+            .min()
+            .unwrap_or(u32::MAX)
+    };
+    let mut slabs: Vec<(bool, u32, usize, Id)> = realized
+        .order
+        .iter()
+        .filter_map(|id| members_of(graph, *id).map(|m| {
+            let group = matches!(graph.node(*id).op, Op::Launch(L::Group { .. }));
+            (!group, if group { u32::MAX - root_of(*id) } else { 0 }, m.len(), *id)
+        }))
+        .collect();
+    slabs.sort_unstable_by_key(|(slab, head, n, id)| (*slab, *head, std::cmp::Reverse(*n), *id));
+    slabs.dedup();
+
+    // Pin `id` and, recursively, its member composites. `via` is the
+    // composite `id` ends, whose buffer is `id`'s value.
+    fn pin(
+        graph: &EGraph,
+        ex: &mut Extraction,
+        trail: &mut RepairTrail,
+        owned: &mut rustc_hash::FxHashMap<ClassId, Id>,
+        id: Id,
+        via: Option<Id>,
+    ) {
+        let Some(members) = members_of(graph, id) else { return };
+        owned.extend(members.iter().map(|m| (graph.class_of(*m), id)));
+        if via.is_none() {
+            materialize_trailed(graph, ex, id, trail);
+        }
+        let Some((last, middle)) = members.split_last() else { return };
+        for m in middle {
+            let class = graph.class_of(*m);
+            let was = ex.sigma.get(&class).copied();
+            if was != Some(*m) {
+                sigma_debug(class, *m, "pin_slabs member");
+                ex.sigma.insert(class, *m);
+                trail.push_sigma(class, was);
+            }
+            materialize_trailed(graph, ex, *m, trail);
+            if members_of(graph, *m).is_some() {
+                pin(graph, ex, trail, owned, *m, None);
+            }
+        }
+        if ex.is_materialized(*last) {
+            ex.m.set(last.index(), false);
+            trail.push_unm(*last);
+        }
+        if members_of(graph, *last).is_some() {
+            pin(graph, ex, trail, owned, *last, Some(id));
+        }
+    }
+
+    // Two realized composites may not share a member class: each would run
+    // its stage, and the realizer would cut both into one launch. The first
+    // keeps it; the other takes its longest spelling sharing nothing, else
+    // its last member's own launch.
+    let mut owned: rustc_hash::FxHashMap<ClassId, Id> = rustc_hash::FxHashMap::default();
+    for (_, _, _, id) in slabs {
+        let Some(members) = members_of(graph, id) else { continue };
+        let class = graph.class_of(id);
+        if ex.sigma.get(&class).copied() != Some(id) {
+            continue;
+        }
+        // Already pinned through a composite that contains it.
+        if owned.contains_key(&class) {
+            continue;
+        }
+        let flat = flat_members(graph, id);
+        if let Some(m) = flat.iter().find(|m| owned.contains_key(&graph.class_of(**m))) {
+            let alt = graph
+                .members(class)
+                .into_iter()
+                .filter(|a| *a != id)
+                .filter_map(|a| {
+                    members_of(graph, a)
+                        .filter(|_| flat_members(graph, a).iter().all(|x| !owned.contains_key(&graph.class_of(*x))))
+                        .map(|ms| (ms.len(), a))
+                })
+                .max_by_key(|(n, a)| (*n, std::cmp::Reverse(*a)))
+                .map(|(_, a)| a);
+            if std::env::var_os("FUSOR_SLAB_LOG").is_some() {
+                let owner = owned[&graph.class_of(*m)];
+                let show: String = format!("{:?}", graph.node(*m).op).chars().take(160).collect();
+                eprintln!(
+                    "PIN fallback: {id:?} ({} members) overlaps at {m:?} with {owner:?} ({} members), class {} -> {alt:?}\n    {m:?} = {show}",
+                    members.len(),
+                    members_of(graph, owner).map_or(0, |x| x.len()),
+                    class.0.index()
+                );
+            }
+            let next = alt.or_else(|| members.last().copied());
+            if let Some(next) = next {
+                sigma_debug(class, next, "pin_slabs overlap fallback");
+                ex.sigma.insert(class, next);
+                trail.push_sigma(class, Some(id));
+                if members_of(graph, next).is_some() {
+                    pin(graph, ex, trail, &mut owned, next, None);
+                }
+            }
+            continue;
+        }
+        pin(graph, ex, trail, &mut owned, id, None);
+    }
 }
 
 fn materialize_trailed(graph: &EGraph, ex: &mut Extraction, id: Id, trail: &mut RepairTrail) {
     let before = ex.is_materialized(id);
     materialize(graph, ex, id);
     if !before && ex.is_materialized(id) {
-        trail.m.push(id);
+        trail.push_m(id);
     }
 }
 
@@ -1658,6 +2122,11 @@ fn body_digest(op: &Op) -> u64 {
             }
         }
         Op::Launch(Launch::Region { live_outs, .. }) => live_outs.hash(&mut h),
+        Op::Launch(Launch::Slab { slabs, members, .. }) => {
+            slabs.hash(&mut h);
+            members.hash(&mut h);
+        }
+        Op::Launch(Launch::Group { members, .. }) => members.hash(&mut h),
         Op::Launch(Launch::Ext { .. }) | Op::Logical(_) | Op::Union(..) => {}
     }
     h.finish()

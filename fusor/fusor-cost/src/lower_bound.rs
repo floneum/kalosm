@@ -10,7 +10,7 @@ use fusor_ir::device::Caps;
 use fusor_ir::egraph::{ClassId, EGraph, Id};
 use fusor_ir::facts::ValueFacts;
 use fusor_ir::ir::Op;
-use fusor_ir::ir::launch::ScheduleDomain;
+use fusor_ir::ir::launch::{Launch, ScheduleDomain};
 use fusor_ir::ir::logical::Logical;
 use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
@@ -90,7 +90,7 @@ fn lower_bound_over(graph: &EGraph, cost: &dyn CostModel, ids: &[Id]) -> Vec<Pic
     for pass in 0..MAX_PASSES {
         let mut changed = 0usize;
         for id in &order {
-            let next = combine(graph, *id, &math, &lb);
+            let next = combine(graph, *id, &math, &lb, cost.facts().launch_ps);
             if next != lb[id.index()] {
                 lb[id.index()] = next;
                 changed += 1;
@@ -163,6 +163,17 @@ fn postorder(graph: &EGraph, ids: &[Id]) -> Vec<Id> {
                     push(*a, &mut stack);
                     push(*b, &mut stack);
                 }
+                // A composite names its members by id, and its last member
+                // shares its class: through the class that edge is a cycle
+                // and the member's bound would be read before it is made.
+                Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) => {
+                    for m in members.iter() {
+                        push(*m, &mut stack);
+                        // A member's class too: a group prices each member
+                        // against its class's best.
+                        push(graph.class_of(*m).0, &mut stack);
+                    }
+                }
                 _ => {
                     for child in node.children.iter() {
                         push(graph.class_of(*child).0, &mut stack);
@@ -182,16 +193,17 @@ fn postorder(graph: &EGraph, ids: &[Id]) -> Vec<Id> {
 /// they replace on math, so an unrestricted `min_by_key` would return the
 /// un-lowered original every time. See [`crate::realize::selectable`].
 ///
-/// The launch bound is the tie-break because the relaxation erases exactly
-/// the launch and traffic a fusion deletes, so fused and unfused spellings
-/// tie on picoseconds; ranking ties by fewest launches adopts the merged
-/// spelling where doing so is free.
+/// The relaxation erases exactly the launch and traffic a fusion deletes,
+/// so fused and unfused spellings tie on picoseconds; each launch the chain
+/// keeps is priced at the device's dispatch cost, which is what a fusion
+/// saves.
 pub(crate) fn argmin_member(
     graph: &EGraph,
     lb: &[Picoseconds],
     launches: &[u32],
     class: ClassId,
     caps: &Caps,
+    launch_ps: u64,
 ) -> Id {
     if crate::realize::is_singleton(graph, class) {
         return class.0;
@@ -202,17 +214,43 @@ pub(crate) fn argmin_member(
         && want == class.0.index().to_string()
     {
         for m in crate::realize::selectable(graph, class, caps) {
+            let show: String = format!("{:?}", graph.node(m).op)
+                .replace("ScalarExpr(ScalarNode { kind: ", "")
+                .chars()
+                .take(220)
+                .collect();
+            let excess: Vec<String> = match &graph.node(m).op {
+                Op::Launch(Launch::Group { members, .. }) => members
+                    .iter()
+                    .map(|x| {
+                        let c = graph.class_of(*x);
+                        format!(
+                            "{x}:c{}:+{}us:best={:?}",
+                            c.0.index(),
+                            lb[x.index()].0.saturating_sub(lb[c.0.index()].0) / 1_000_000,
+                            argmin_member_excluding(graph, lb, launches, c, caps, launch_ps, &Default::default())
+                        )
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
             eprintln!(
-                "[seed] class {} member {m:?} lb={} launches={} op={:?}",
+                "[seed] class {} member {m:?} lb={} launches={} excess={excess:?} op={show}",
                 class.0.index(),
                 lb[m.index()].0,
                 launches[m.index()],
-                std::mem::discriminant(&graph.node(m).op),
             );
         }
     }
-    argmin_member_excluding(graph, lb, launches, class, caps, &Default::default())
-        .unwrap_or(class.0)
+    let chosen =
+        argmin_member_excluding(graph, lb, launches, class, caps, launch_ps, &Default::default())
+            .unwrap_or(class.0);
+    if let Ok(want) = std::env::var("FUSOR_SEED_DEBUG")
+        && want == class.0.index().to_string()
+    {
+        eprintln!("[seed] class {} chose {chosen:?}", class.0.index());
+    }
+    chosen
 }
 
 /// [`argmin_member`] over the members `banned` does not name. Returns `None`
@@ -224,12 +262,16 @@ pub(crate) fn argmin_member_excluding(
     launches: &[u32],
     class: ClassId,
     caps: &Caps,
+    launch_ps: u64,
     banned: &rustc_hash::FxHashSet<Id>,
 ) -> Option<Id> {
     crate::realize::selectable(graph, class, caps)
         .into_iter()
         .filter(|m| !banned.contains(m))
-        .min_by_key(|m| (lb[m.index()], launches[m.index()], *m))
+        .min_by_key(|m| {
+            let _ = launch_ps;
+            (lb[m.index()], launches[m.index()], *m)
+        })
 }
 
 /// The launch-count analogue of [`lower_bound_scoped`]: per node, the fewest
@@ -269,6 +311,26 @@ fn launch_combine(graph: &EGraph, id: Id, l: &[u32]) -> u32 {
     match &node.op {
         Op::Union(a, b) => l[a.index()].min(l[b.index()]),
         Op::Logical(Logical::Leaf(_)) => 0,
+        // One dispatch for every stage, plus whatever feeds the stages from
+        // outside.
+        Op::Launch(Launch::Slab { members, .. }) => {
+            let mut total = 1u32;
+            for class in slab_inputs(graph, members) {
+                total = total.saturating_add(l[class.0.index()]);
+            }
+            total
+        }
+        // The last member's chain, less the dispatches the other members
+        // would have been.
+        Op::Launch(Launch::Group { members, .. }) => {
+            let last = members.last().copied().unwrap_or(id);
+            let mut total = l[last.index()].saturating_sub(members.len().saturating_sub(1) as u32);
+            for m in &members[..members.len().saturating_sub(1)] {
+                let excess = l[m.index()].saturating_sub(l[graph.class_of(*m).0.index()]);
+                total = total.saturating_add(excess);
+            }
+            total
+        }
         _ => {
             let mut seen: SmallVec<[ClassId; 4]> = SmallVec::new();
             let mut total = 1u32;
@@ -285,16 +347,75 @@ fn launch_combine(graph: &EGraph, id: Id, l: &[u32]) -> u32 {
     }
 }
 
-fn combine(graph: &EGraph, id: Id, math: &[Picoseconds], lb: &[Picoseconds]) -> Picoseconds {
+/// A launch node's bound is its math, its own dispatch, and its children's
+/// bounds; a slab's is one dispatch, its stages' math, and its inputs'
+/// bounds. The dispatch is in the bound itself so a spelling that fuses
+/// launches away is cheaper by that much in one number — a separate launch
+/// count, relaxed on its own, credits a fold over split partials with the
+/// unsplit contraction's single dispatch.
+fn combine(
+    graph: &EGraph,
+    id: Id,
+    math: &[Picoseconds],
+    lb: &[Picoseconds],
+    launch_ps: u64,
+) -> Picoseconds {
     let node = graph.node(id);
     match &node.op {
         Op::Union(a, b) => lb[a.index()].min(lb[b.index()]),
         Op::Logical(Logical::Leaf(_)) => Picoseconds(0),
+        // The stages' own math, once each, plus the bound of what feeds them
+        // from outside. Summing the members' bounds would count every
+        // stage's producers once per stage that reads them.
+        Op::Launch(Launch::Slab { members, .. }) => {
+            let mut total = math[id.index()] + Picoseconds(launch_ps);
+            for m in members {
+                total += math[m.index()];
+            }
+            for class in slab_inputs(graph, members) {
+                total += lb[class.0.index()];
+            }
+            // A middle member that is a root of the graph — an optimizer
+            // state, say — would be its own dispatch otherwise; the slab
+            // computes it on the way. The bound is for the plan, and the
+            // plan pays that dispatch nowhere else.
+            let roots: SmallVec<[ClassId; 8]> = graph.roots().iter().map(|r| graph.class_of(*r)).collect();
+            let saved = members[..members.len().saturating_sub(1)]
+                .iter()
+                .filter(|m| roots.contains(&graph.class_of(**m)))
+                .count() as u64;
+            Picoseconds(total.0.saturating_sub(saved.saturating_mul(launch_ps)))
+        }
+        // Every member but the last is computed anyway — each is a root or
+        // another launch's input — so the group ties its last member's own
+        // spelling and wins on the launch count. Crediting the dispatches
+        // here would flow into every reader's bound.
+        // A member spelled worse than its class's best costs the group the
+        // difference: groups minted before the fused spellings existed
+        // carry the plain ones.
+        // Each other member is computed anyway — a root, or another
+        // launch's input — and the group is its dispatch cheaper. The
+        // credit reaches a root's readers as a uniform shift, which moves
+        // no choice of theirs.
+        Op::Launch(Launch::Group { members, .. }) => {
+            let last = members.last().copied().unwrap_or(id);
+            let mut total = lb[last.index()];
+            for m in &members[..members.len().saturating_sub(1)] {
+                let excess = lb[m.index()].0.saturating_sub(lb[graph.class_of(*m).0.index()].0);
+                total = Picoseconds(total.0.saturating_add(excess));
+            }
+            let saved = members.len().saturating_sub(1) as u64;
+            Picoseconds(total.0.saturating_sub(saved.saturating_mul(launch_ps)))
+        }
         _ => {
             // Deduplicate children by class: a node reading the same class
             // twice contributes once, which is what makes sharing free.
             let mut seen: SmallVec<[ClassId; 4]> = SmallVec::new();
-            let mut total = math[id.index()];
+            // A logical node is computed by some launch too; without its
+            // dispatch every class's bound would run through its logical
+            // spelling and no fusion would ever look cheaper than none.
+            let dispatch = launch_ps;
+            let mut total = math[id.index()] + Picoseconds(dispatch);
             for child in node.children.iter() {
                 let class = graph.class_of(*child);
                 if seen.contains(&class) {
@@ -306,6 +427,21 @@ fn combine(graph: &EGraph, id: Id, math: &[Picoseconds], lb: &[Picoseconds]) -> 
             total
         }
     }
+}
+
+/// The classes a slab reads that none of its members produce, each once.
+fn slab_inputs(graph: &EGraph, members: &[Id]) -> Vec<ClassId> {
+    let own: SmallVec<[ClassId; 8]> = members.iter().map(|m| graph.class_of(*m)).collect();
+    let mut out: Vec<ClassId> = Vec::new();
+    for m in members {
+        for child in graph.node(*m).children.iter() {
+            let class = graph.class_of(*child);
+            if !own.contains(&class) && !out.contains(&class) {
+                out.push(class);
+            }
+        }
+    }
+    out
 }
 
 fn node_math_table(graph: &EGraph, cost: &dyn CostModel, ids: &[Id]) -> Vec<Picoseconds> {
@@ -341,6 +477,14 @@ fn node_math_table(graph: &EGraph, cost: &dyn CostModel, ids: &[Id]) -> Vec<Pico
             }
         };
     }
+    if let Ok(want) = std::env::var("FUSOR_SEED_DEBUG") {
+        for id in ids {
+            if want == graph.class_of(*id).0.index().to_string() {
+                let show: String = format!("{:?}", graph.node(*id).op).chars().take(120).collect();
+                eprintln!("[math] class {want} node {id} math={} budget_left={budget} {show}", out[id.index()].0);
+            }
+        }
+    }
     out
 }
 
@@ -374,9 +518,23 @@ fn best_math(graph: &EGraph, cost: &dyn CostModel, id: Id, budget: &mut usize) -
             let mut seen: SmallVec<[(u8, u32, u32); 12]> = SmallVec::new();
             let mut best: Option<Picoseconds> = None;
             for theta in domain.iter() {
+                // A promoted fold inherits its pre-promotion domain, most of
+                // which its carrier's footprint rules out; the floor is over
+                // the points that can lower.
+                if !crate::realize::point_is_legal(graph, id, theta, &cost.facts().caps) {
+                    continue;
+                }
                 let key = match theta {
-                    fusor_ir::ir::launch::SchedPoint::Coop { geom, .. } => (1u8, geom.bm, geom.bn),
-                    fusor_ir::ir::launch::SchedPoint::Sgemm(p) => (2u8, p.bm, p.bn),
+                    // The k-step floor moves with `bk` and the split count,
+                    // so those are part of the key.
+                    fusor_ir::ir::launch::SchedPoint::Coop { geom, splits, .. } => {
+                        (1u8, geom.bm * 1024 + geom.bn, geom.bk * 1024 + splits)
+                    }
+                    fusor_ir::ir::launch::SchedPoint::Sgemm(p) => (2u8, p.bm * 1024 + p.bn, p.bk),
+                    // A fold's floor moves with its lane group.
+                    fusor_ir::ir::launch::SchedPoint::Fold(s) => {
+                        (3u8, s.lane_group(cost.facts().caps.subgroup_width()), 0)
+                    }
                     _ => (0u8, 0, 0),
                 };
                 if seen.contains(&key) {

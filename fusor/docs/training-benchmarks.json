@@ -1,0 +1,488 @@
+{
+  "hardware": "Apple M2 Max, Metal",
+  "dtype": "f32",
+  "date": "2026-09-13",
+  "note": "Same initial weights and data. Transformer compare: 17 warmup steps per executor, five alternating-order 32-step windows, no concurrent GPU workloads. Report fastest warmed windows and retain all timings, including Session stalls. MLP: 128-step windows, first window excluded. Repeated runs can use driver shader caches. Browser results are recorded below and in browser-performance.json.",
+  "runs": {
+    "transformer_alternating_32": [
+      "parameters=240480 tokens/step=1024 plan=Some(ProgramStats { stages: 324, kernels: 99, workgroups: 64, arena_bytes: 35690896, dedicated_bytes: 87486360, state_bytes: 2885760 })",
+      "round=0 mode=baseline ms/step=4.462 dispatches/step=216 loss=2.5142379",
+      "round=0 mode=fused ms/step=1.850 dispatches/step=99 loss=2.5142379",
+      "round=1 mode=fused ms/step=1.894 dispatches/step=99 loss=2.3119307",
+      "round=1 mode=baseline ms/step=4.541 dispatches/step=216 loss=2.3119304",
+      "round=2 mode=baseline ms/step=8.007 dispatches/step=216 loss=2.338251",
+      "round=2 mode=fused ms/step=1.849 dispatches/step=99 loss=2.338251",
+      "round=3 mode=fused ms/step=1.928 dispatches/step=99 loss=2.2370622",
+      "round=3 mode=baseline ms/step=3.759 dispatches/step=216 loss=2.237063",
+      "round=4 mode=baseline ms/step=7.834 dispatches/step=216 loss=2.2243052",
+      "round=4 mode=fused ms/step=1.990 dispatches/step=99 loss=2.2243028",
+      "held_out baseline_loss=2.1768246 fused_loss=2.176824 baseline_accuracy=0.35839844 fused_accuracy=0.35839844",
+      "best baseline_ms=3.759 fused_ms=1.849 speedup=2.034x"
+    ],
+    "transformer_original_repro_64": [
+      "mode=baseline parameters=240480 tokens/step=1024 setup_ms=15412.984 first_loss=4.1970463 plan=None",
+      "round=0 ms/step=4.602 dispatches/step=216 loss=2.3119304",
+      "round=1 ms/step=5.868 dispatches/step=216 loss=2.237063",
+      "round=2 ms/step=6.087 dispatches/step=216 loss=2.1797485",
+      "held_out_loss=2.2139335 accuracy=0.33007813",
+      "",
+      "mode=fused parameters=240480 tokens/step=1024 setup_ms=255.010 first_loss=4.1970463 plan=Some(ProgramStats { stages: 324, kernels: 99, workgroups: 64, arena_bytes: 35690896, dedicated_bytes: 87486360, state_bytes: 2885760 })",
+      "round=0 ms/step=1.875 dispatches/step=99 loss=2.3119307",
+      "round=1 ms/step=1.889 dispatches/step=99 loss=2.2370622",
+      "round=2 ms/step=1.914 dispatches/step=99 loss=2.17975",
+      "held_out_loss=2.2139297 accuracy=0.33007813",
+      "",
+      "fused/baseline=0.407"
+    ],
+    "mlp_baseline": [
+      "round=0 us/step=998.187 dispatches/step=8 loss=0.00009745726",
+      "round=1 us/step=219.249 dispatches/step=8 loss=0.000047086738",
+      "round=2 us/step=221.695 dispatches/step=8 loss=0.000033120967",
+      "round=3 us/step=222.144 dispatches/step=8 loss=0.000025951002"
+    ],
+    "mlp_fused": [
+      "round=0 us/step=97.101 dispatches/step=1 loss=0.000097457276",
+      "round=1 us/step=63.013 dispatches/step=1 loss=0.000047086753",
+      "round=2 us/step=37.588 dispatches/step=1 loss=0.00003312099",
+      "round=3 us/step=38.032 dispatches/step=1 loss=0.000025951002"
+    ]
+  },
+  "previous_implementation": {
+    "mlp_baseline": [
+      "round=0 us/step=1147.438 dispatches/step=8 loss=0.00009745726",
+      "round=1 us/step=233.770 dispatches/step=8 loss=0.000047086738",
+      "round=2 us/step=223.932 dispatches/step=8 loss=0.000033120967",
+      "round=3 us/step=233.841 dispatches/step=8 loss=0.000025951002"
+    ],
+    "mlp_fused": [
+      "round=0 us/step=59.524 dispatches/step=1 loss=0.000097457276",
+      "round=1 us/step=42.273 dispatches/step=1 loss=0.000047086753",
+      "round=2 us/step=41.157 dispatches/step=1 loss=0.00003312099",
+      "round=3 us/step=41.106 dispatches/step=1 loss=0.000025951002"
+    ],
+    "transformer_baseline": [
+      "mode=baseline parameters=240480 tokens/step=1024 setup_ms=15716.541 first_loss=4.1970463 plan=None",
+      "round=0 ms/step=3.338 dispatches/step=216 loss=2.5142379",
+      "round=1 ms/step=3.276 dispatches/step=216 loss=2.3119302",
+      "round=2 ms/step=4.072 dispatches/step=216 loss=2.3382516",
+      "held_out_loss=2.2806659 accuracy=0.3125"
+    ],
+    "transformer_fused": [
+      "mode=fused parameters=240480 tokens/step=1024 setup_ms=345.217 first_loss=4.197049 plan=Some(ProgramStats { stages: 306, kernels: 99, workgroups: 64, arena_bytes: 37118356, dedicated_bytes: 82177944, state_bytes: 2885760 })",
+      "round=0 ms/step=5.147 dispatches/step=99 loss=2.514236",
+      "round=1 ms/step=5.228 dispatches/step=99 loss=2.3119302",
+      "round=2 ms/step=5.257 dispatches/step=99 loss=2.3382504",
+      "held_out_loss=2.2806659 accuracy=0.3125"
+    ],
+    "transformer_single": [
+      "mode=single parameters=240480 tokens/step=1024 setup_ms=4868.429 first_loss=4.197049 plan=Some(ProgramStats { stages: 306, kernels: 1, workgroups: 1, arena_bytes: 35551636, dedicated_bytes: 82177944, state_bytes: 2885760 })",
+      "round=0 ms/step=98.710 dispatches/step=1 loss=2.514236",
+      "round=1 ms/step=98.362 dispatches/step=1 loss=2.3119302",
+      "round=2 ms/step=98.112 dispatches/step=1 loss=2.3382504",
+      "held_out_loss=2.2806659 accuracy=0.3125"
+    ]
+  },
+  "validation": [
+    "13 GPU integration tests passed (native and forced portable cases)",
+    "Full transformer: all parameters and Adam moments compared after 24 steps; evaluation and generation parity; 400 compiled training steps",
+    "GPU compiler index proof and cancellation tests passed",
+    "WASM browser application build passed"
+  ],
+  "discarded_experiments": [
+    "Wider matrix tiles: isolated GEMM gains did not transfer to the full model",
+    "Subgroup and direct-global matrix variants: slower full-model training",
+    "Matrix epilogues: 93 rather than 99 dispatches, no measured full-model throughput gain",
+    "Subgroup streaming scatter: no measured full-model throughput gain"
+  ],
+  "browser_release_smoke": {
+    "steps": 320,
+    "training_ms_per_step": 6.7,
+    "held_out_loss": 1.933,
+    "held_out_accuracy": 0.41,
+    "training_dispatches_per_step": 99,
+    "note": "Local headless Chrome on Metal, portable WebGPU program. UI training-time metric excludes held-out scoring and text generation. Smoke measurement, not a native-equivalent benchmark. Compiled observations avoid the older browser Session scoring path.",
+    "browser": "Chrome 152.0.7977.83",
+    "adapter": "apple, metal-3"
+  },
+  "browser_acceleration": {
+    "browser": "Chrome 152.0.7977.83, headless, --enable-unsafe-webgpu --use-angle=metal",
+    "adapter": "Apple M2 Max, apple/metal-3, subgroupMinSize = subgroupMaxSize = 32",
+    "model": "240480 parameters, f32, 1024 characters per optimizer step",
+    "method": "Release checkTraining export: same seed, 17 warmup steps, five windows of 32 steps. Includes uploads, submission, loss readback; excludes graph compilation, evaluation, sampling and rendering. Modes tested sequentially on otherwise idle GPU. Performance is diagnostic, not a CI threshold.",
+    "median_ms": {
+      "portable": 5.465625,
+      "subgroups": 4.921875,
+      "accelerated": 4.28125,
+      "no-matrix": 4.909375,
+      "no-subgroups": 5.471875,
+      "no-config": 4.95,
+      "ranged-width": 5.01875,
+      "reject-matrix": 4.90625
+    },
+    "results": [
+      {
+        "case": "portable",
+        "mode": "portable",
+        "first_loss": 4.197046,
+        "ms_per_step": [
+          5.434375,
+          5.43125,
+          5.546875,
+          5.475,
+          5.465625
+        ],
+        "losses": [
+          2.5142379,
+          2.3119304,
+          2.338251,
+          2.2370625,
+          2.2243035
+        ],
+        "held_out_loss": 2.176824,
+        "accuracy": 0.35839844,
+        "subgroups": false,
+        "matrices": "Portable",
+        "fallback": false,
+        "dispatches": 99,
+        "audit": {
+          "requests": [
+            [
+              "shader-f16",
+              "subgroups",
+              "chromium-experimental-subgroup-matrix"
+            ],
+            [
+              "shader-f16",
+              "subgroups",
+              "chromium-experimental-subgroup-matrix"
+            ]
+          ],
+          "matrix": 19,
+          "subgroup": 16,
+          "errors": []
+        }
+      },
+      {
+        "case": "subgroups",
+        "mode": "subgroups",
+        "first_loss": 4.1970463,
+        "ms_per_step": [
+          4.8843749999999995,
+          4.9906250000000005,
+          4.9156249999999995,
+          4.921875,
+          4.934375
+        ],
+        "losses": [
+          2.5142379,
+          2.3119307,
+          2.3382514,
+          2.237062,
+          2.2243023
+        ],
+        "held_out_loss": 2.1768239,
+        "accuracy": 0.35839844,
+        "subgroups": true,
+        "matrices": "Portable",
+        "fallback": false,
+        "dispatches": 99,
+        "audit": {
+          "requests": [
+            [
+              "shader-f16",
+              "subgroups",
+              "chromium-experimental-subgroup-matrix"
+            ],
+            [
+              "shader-f16",
+              "subgroups",
+              "chromium-experimental-subgroup-matrix"
+            ]
+          ],
+          "matrix": 19,
+          "subgroup": 48,
+          "errors": []
+        }
+      },
+      {
+        "case": "accelerated",
+        "mode": "accelerated",
+        "first_loss": 4.1970463,
+        "ms_per_step": [
+          4.275,
+          4.36875,
+          4.315625,
+          4.28125,
+          4.271875
+        ],
+        "losses": [
+          2.5142379,
+          2.3119307,
+          2.3382514,
+          2.237062,
+          2.2243023
+        ],
+        "held_out_loss": 2.1768239,
+        "accuracy": 0.35839844,
+        "subgroups": true,
+        "matrices": "Browser",
+        "fallback": false,
+        "dispatches": 99,
+        "audit": {
+          "requests": [
+            [
+              "shader-f16",
+              "subgroups",
+              "chromium-experimental-subgroup-matrix"
+            ],
+            [
+              "shader-f16",
+              "subgroups",
+              "chromium-experimental-subgroup-matrix"
+            ]
+          ],
+          "matrix": 63,
+          "subgroup": 48,
+          "errors": []
+        }
+      },
+      {
+        "case": "no-matrix",
+        "mode": "accelerated",
+        "first_loss": 4.1970463,
+        "ms_per_step": [
+          4.909375,
+          4.89375,
+          5.01875,
+          4.8812500000000005,
+          4.909375
+        ],
+        "losses": [
+          2.5142379,
+          2.3119307,
+          2.3382514,
+          2.237062,
+          2.2243023
+        ],
+        "held_out_loss": 2.1768239,
+        "accuracy": 0.35839844,
+        "subgroups": true,
+        "matrices": "Portable",
+        "fallback": false,
+        "dispatches": 99,
+        "audit": {
+          "requests": [
+            [
+              "shader-f16",
+              "subgroups"
+            ],
+            [
+              "shader-f16",
+              "subgroups"
+            ]
+          ],
+          "matrix": 0,
+          "subgroup": 48,
+          "errors": []
+        }
+      },
+      {
+        "case": "no-subgroups",
+        "mode": "accelerated",
+        "first_loss": 4.197046,
+        "ms_per_step": [
+          5.434375,
+          5.446875,
+          5.55,
+          5.5,
+          5.471875
+        ],
+        "losses": [
+          2.5142379,
+          2.3119304,
+          2.338251,
+          2.2370625,
+          2.2243035
+        ],
+        "held_out_loss": 2.176824,
+        "accuracy": 0.35839844,
+        "subgroups": false,
+        "matrices": "Portable",
+        "fallback": false,
+        "dispatches": 99,
+        "audit": {
+          "requests": [
+            [
+              "shader-f16"
+            ],
+            [
+              "shader-f16"
+            ]
+          ],
+          "matrix": 0,
+          "subgroup": 0,
+          "errors": []
+        }
+      },
+      {
+        "case": "no-config",
+        "mode": "accelerated",
+        "first_loss": 4.1970463,
+        "ms_per_step": [
+          4.953125,
+          4.95,
+          4.9312499999999995,
+          4.909375,
+          5.034375
+        ],
+        "losses": [
+          2.5142379,
+          2.3119307,
+          2.3382514,
+          2.237062,
+          2.2243023
+        ],
+        "held_out_loss": 2.1768239,
+        "accuracy": 0.35839844,
+        "subgroups": true,
+        "matrices": "Portable",
+        "fallback": false,
+        "dispatches": 99,
+        "audit": {
+          "requests": [
+            [
+              "shader-f16",
+              "subgroups",
+              "chromium-experimental-subgroup-matrix"
+            ],
+            [
+              "shader-f16",
+              "subgroups",
+              "chromium-experimental-subgroup-matrix"
+            ]
+          ],
+          "matrix": 0,
+          "subgroup": 48,
+          "errors": []
+        }
+      },
+      {
+        "case": "ranged-width",
+        "mode": "accelerated",
+        "first_loss": 4.1970463,
+        "ms_per_step": [
+          5.01875,
+          5.012499999999999,
+          5.040625,
+          5.01875,
+          5.134375
+        ],
+        "losses": [
+          2.5142379,
+          2.3119307,
+          2.3382514,
+          2.237062,
+          2.2243023
+        ],
+        "held_out_loss": 2.1768239,
+        "accuracy": 0.35839844,
+        "subgroups": true,
+        "matrices": "Portable",
+        "fallback": false,
+        "dispatches": 99,
+        "audit": {
+          "requests": [
+            [
+              "shader-f16",
+              "subgroups",
+              "chromium-experimental-subgroup-matrix"
+            ],
+            [
+              "shader-f16",
+              "subgroups",
+              "chromium-experimental-subgroup-matrix"
+            ]
+          ],
+          "matrix": 0,
+          "subgroup": 46,
+          "errors": []
+        }
+      },
+      {
+        "case": "reject-matrix",
+        "mode": "accelerated",
+        "first_loss": 4.1970463,
+        "ms_per_step": [
+          4.890625,
+          4.9156249999999995,
+          4.90625,
+          4.90625,
+          5.025
+        ],
+        "losses": [
+          2.5142379,
+          2.3119307,
+          2.3382514,
+          2.237062,
+          2.2243023
+        ],
+        "held_out_loss": 2.1768239,
+        "accuracy": 0.35839844,
+        "subgroups": true,
+        "matrices": "Portable",
+        "fallback": true,
+        "dispatches": 99,
+        "audit": {
+          "requests": [
+            [
+              "shader-f16",
+              "subgroups",
+              "chromium-experimental-subgroup-matrix"
+            ],
+            [
+              "shader-f16",
+              "subgroups",
+              "chromium-experimental-subgroup-matrix"
+            ]
+          ],
+          "matrix": 5,
+          "subgroup": 51,
+          "errors": []
+        }
+      }
+    ],
+    "native_accelerated_ms": [
+      1.869,
+      1.886,
+      1.882
+    ],
+    "validation": [
+      "Every matrix element and row sum checked against host arithmetic for 37x17x35, 17x257x19 and 544x33x256 contractions in all eight cases",
+      "Ordinary Session subgroup reduction checked against a host oracle in each case",
+      "Training and held-out losses agree across cases within 0.0002",
+      "All 13 native GPU integration tests pass, expanded to portable/subgroup-only/matrix modes",
+      "Full native transformer: parameters and Adam state parity at 24 steps, observations parity, and 400 training steps pass"
+    ],
+    "normal_release_smoke": {
+      "steps": 392,
+      "training_ms_per_step": 4.7,
+      "held_out_loss": 1.788,
+      "audit": {
+        "requests": [
+          [
+            "shader-f16",
+            "subgroups",
+            "chromium-experimental-subgroup-matrix"
+          ]
+        ],
+        "shaders": {
+          "matrix": 245,
+          "subgroup": 140,
+          "portable": 86
+        },
+        "errors": []
+      },
+      "note": "Normal release build without training-checks exports. UI timing includes initial training warmup but excludes evaluation and generation; this final smoke used an already warm driver cache, so it is not the controlled before/after benchmark."
+    }
+  }
+}

@@ -51,6 +51,8 @@ fn seed_facts(caps: &Caps) -> DeviceFacts {
     // ~3 GHz x lanes x 2 (fma) per core.
     let fma = 3_000 * lanes * 2 * threads;
     DeviceFacts {
+        coop_step_ps: 0,
+        lane_step_ps: 0,
         // The generic CPU runner lowers, binds, and dispatches each selected
         // launch. BERT's one-workgroup maps measure in the 10--20 us range,
         // so pricing them as a 1 us function call causes the extractor to

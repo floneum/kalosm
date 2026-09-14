@@ -332,6 +332,9 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
         // their *facts*, so this row is the shape-varying floor every member
         // pays to land its output; `fusor-cost` sums the exact rows on the
         // realized DAG, where it has the member nodes ([`sum_work`]).
+        // The members are launch nodes of their own and carry their work; the
+        // node that sequences them adds none.
+        Launch::Slab { .. } | Launch::Group { .. } => Work::default(),
         Launch::Region { .. } => ins.iter().fold(Work::default(), |acc, f| {
             acc.add(Work {
                 index_ops: elements(f),
@@ -386,9 +389,24 @@ pub fn epilogue_work(expr: &ScalarExpr, iterations: u64) -> Work {
     }
 }
 
+/// Index-op equivalents of one scalar load from cache: the load/store port
+/// issues at a fraction of the ALU rate and the value is not there for the
+/// next instruction. Tiled contractions stage their loads and do not pay
+/// this per MAC; a map or a fold does, once per operand per iteration.
+const LOAD_INDEX_OPS: u64 = 4;
+
+/// Index-op equivalents of one integer divide or modulo: a u32 division is
+/// a multi-instruction sequence, not an ALU slot.
+const DIVMOD_INDEX_OPS: u64 = 8;
+
 fn operand_index_ops(ops: &[crate::ir::launch::Operand], iterations: u64) -> u64 {
     ops.iter().fold(0u64, |acc, o| {
-        acc.saturating_add(iterations.saturating_mul(o.access.index_ops()))
+        let per = o
+            .access
+            .index_ops()
+            .saturating_mul(DIVMOD_INDEX_OPS)
+            .saturating_add(LOAD_INDEX_OPS);
+        acc.saturating_add(iterations.saturating_mul(per))
     })
 }
 

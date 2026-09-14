@@ -51,7 +51,15 @@ const fn cpu_mac_table(fma_f32: u64) -> [[u64; RateDtype::COUNT]; 3] {
 /// Not a `const fn`: [`DeviceFacts`] owns a [`Caps`], which owns a `String`.
 pub fn seed_facts_gpu(caps: &Caps) -> DeviceFacts {
     DeviceFacts {
-        launch_ps: 1_000_000,
+        // A k=1024 weight gradient on 36 workgroups of one `16x16` subgroup
+        // measured 70-230 us: 128 depths of four fragment multiplies, about
+        // 0.2 us each, nothing to hide them behind. Per-lane loops are a
+        // load and an accumulate per step.
+        coop_step_ps: 450_000,
+        lane_step_ps: 150_000,
+        // What one dispatch costs in a pass on Metal, measured as the gap a
+        // step of tiny kernels leaves between GPU spans.
+        launch_ps: 10_000_000,
         dram_bytes_per_us: 379_500,
         llc_bytes: 8 << 20,
         wg_bytes_per_us: 700_000,
@@ -79,6 +87,8 @@ pub fn seed_facts_gpu(caps: &Caps) -> DeviceFacts {
 pub fn seed_facts_cpu(caps: &Caps) -> DeviceFacts {
     let threads = u64::from(caps.threads.max(1));
     DeviceFacts {
+        coop_step_ps: 0,
+        lane_step_ps: 0,
         launch_ps: 0,
         dram_bytes_per_us: 40_000,
         llc_bytes: 16 << 20,

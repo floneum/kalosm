@@ -103,6 +103,13 @@ pub struct DeviceFacts {
     /// Cost of waking the CPU worker pool for one parallel region.
     /// Replaces `PARALLEL_THRESHOLD = 16_777_216`.
     pub thread_wake_ps: u64,
+    /// One dependent step of a tiled contraction's k loop — a staged load,
+    /// a barrier and a fragment multiply — as latency a workgroup cannot
+    /// hide from itself. A launch is at least its longest chain of these.
+    pub coop_step_ps: u64,
+    /// One dependent step of a per-lane loop — a load and an accumulate —
+    /// the same way.
+    pub lane_step_ps: u64,
     pub caps: Caps,
 }
 
@@ -134,6 +141,14 @@ pub struct LaunchPlan<'a> {
     pub work: Work,
     pub resident_lanes: u64,
     pub wg_bytes: u64,
+    /// Cache-line traffic beyond the useful bytes: a read whose adjacent
+    /// lanes are not adjacent in memory pulls a whole line per element.
+    pub line_bytes: u64,
+    /// The longest dependent chain one workgroup runs: k steps of a tiled
+    /// contraction, and per-lane loop iterations, priced at the device's
+    /// step latencies. Occupancy cannot shorten it.
+    pub coop_steps: u64,
+    pub lane_steps: u64,
     pub grid: [u32; 3],
 }
 

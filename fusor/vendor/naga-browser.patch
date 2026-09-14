@@ -1,0 +1,225 @@
+--- a/src/common/wgsl/types.rs
++++ b/src/common/wgsl/types.rs
+@@ -23,6 +23,11 @@
+ /// [`write_type_inner`]: TypeContext::write_type_inner
+ /// [`type_name`]: TypeContext::type_name
+ pub trait TypeContext {
++    /// Emit Dawn's experimental subgroup-matrix types instead of Naga's native dialect.
++    fn browser_subgroup_matrix(&self) -> bool {
++        false
++    }
++
+     /// Return the [`Type`] referred to by `handle`.
+     ///
+     /// [`Type`]: crate::Type
+@@ -323,6 +328,21 @@
+             scalar,
+             role,
+         } => {
++            if ctx.browser_subgroup_matrix() {
++                let role = match role {
++                    crate::CooperativeRole::A => "left",
++                    crate::CooperativeRole::B => "right",
++                    crate::CooperativeRole::C => "result",
++                };
++                write!(
++                    out,
++                    "subgroup_matrix_{role}<{}, {}, {}>",
++                    scalar.try_to_wgsl().unwrap_or_default(),
++                    columns as u32,
++                    rows as u32
++                )?;
++                return Ok(());
++            }
+             write!(
+                 out,
+                 "coop_mat{}x{}<{},{}>",
+--- a/src/back/wgsl/writer.rs
++++ b/src/back/wgsl/writer.rs
+@@ -75,6 +75,9 @@
+     pub struct WriterFlags: u32 {
+         /// Always annotate the type information instead of inferring.
+         const EXPLICIT_TYPES = 0x1;
++        /// Use Dawn's experimental subgroup-matrix WGSL dialect. The caller
++        /// must request chromium-experimental-subgroup-matrix and subgroups.
++        const BROWSER_SUBGROUP_MATRIX = 0x2;
+     }
+ }
+ 
+@@ -364,6 +367,23 @@
+             }
+         }
+ 
++        // Matrix expression types may be inferred and never enter module.types.
++        // A load/MMA-only shader still needs the dialect's enable declaration.
++        needed.cooperative_matrix |= module
++            .functions
++            .iter()
++            .map(|(_, f)| f)
++            .chain(module.entry_points.iter().map(|ep| &ep.function))
++            .any(|f| {
++                f.expressions.iter().any(|(_, e)| {
++                    matches!(
++                        e,
++                        crate::Expression::CooperativeLoad { .. }
++                            | crate::Expression::CooperativeMultiplyAdd { .. }
++                    )
++                })
++            });
++
+         for ep in &module.entry_points {
+             if let Some(res) = ep.function.result.as_ref().and_then(|a| a.binding.as_ref()) {
+                 check_binding(res, &mut needed);
+@@ -443,7 +463,14 @@
+             any_written = true;
+         }
+         if needed.cooperative_matrix {
+-            writeln!(self.out, "enable wgpu_cooperative_matrix;")?;
++            if self.flags.contains(WriterFlags::BROWSER_SUBGROUP_MATRIX) {
++                writeln!(
++                    self.out,
++                    "enable chromium_experimental_subgroup_matrix;\nenable subgroups;"
++                )?;
++            } else {
++                writeln!(self.out, "enable wgpu_cooperative_matrix;")?;
++            }
+             any_written = true;
+         }
+         if needed.ray_tracing_pipeline {
+@@ -665,6 +692,7 @@
+         let type_context = WriterTypeContext {
+             module,
+             names: &self.names,
++            browser_subgroup_matrix: self.flags.contains(WriterFlags::BROWSER_SUBGROUP_MATRIX),
+         };
+         type_context.write_type(ty, &mut self.out)?;
+ 
+@@ -682,9 +710,35 @@
+         let type_context = WriterTypeContext {
+             module,
+             names: &self.names,
++            browser_subgroup_matrix: self.flags.contains(WriterFlags::BROWSER_SUBGROUP_MATRIX),
+         };
+         type_context.write_type_resolution(resolution, &mut self.out)?;
+ 
++        Ok(())
++    }
++
++    fn write_matrix_address(
++        &mut self,
++        module: &Module,
++        pointer: Handle<crate::Expression>,
++        func_ctx: &back::FunctionCtx<'_>,
++    ) -> BackendResult {
++        match func_ctx.expressions[pointer] {
++            crate::Expression::Access { base, index } => {
++                self.write_expr(module, base, func_ctx)?;
++                write!(self.out, ", ")?;
++                self.write_expr(module, index, func_ctx)?;
++            }
++            crate::Expression::AccessIndex { base, index } => {
++                self.write_expr(module, base, func_ctx)?;
++                write!(self.out, ", {index}u")?;
++            }
++            _ => {
++                return Err(Error::Custom(
++                    "browser matrix memory must address an array element".into(),
++                ))
++            }
++        }
+         Ok(())
+     }
+ 
+@@ -1167,6 +1221,16 @@
+                 writeln!(self.out, ");")?;
+             }
+             Statement::CooperativeStore { target, ref data } => {
++                if self.flags.contains(WriterFlags::BROWSER_SUBGROUP_MATRIX) {
++                    write!(self.out, "{level}subgroupMatrixStore(")?;
++                    self.write_matrix_address(module, data.pointer, func_ctx)?;
++                    write!(self.out, ", ")?;
++                    self.write_expr(module, target, func_ctx)?;
++                    write!(self.out, ", {}, ", data.row_major)?;
++                    self.write_expr(module, data.stride, func_ctx)?;
++                    writeln!(self.out, ");")?;
++                    return Ok(());
++                }
+                 let suffix = if data.row_major { "T" } else { "" };
+                 write!(self.out, "{level}coopStore{suffix}(")?;
+                 self.write_expr(module, target, func_ctx)?;
+@@ -1400,7 +1464,14 @@
+             }
+             Expression::ZeroValue(ty) => {
+                 self.write_type(module, ty)?;
+-                write!(self.out, "()")?;
++                match module.types[ty].inner {
++                    TypeInner::CooperativeMatrix { scalar, .. }
++                        if self.flags.contains(WriterFlags::BROWSER_SUBGROUP_MATRIX) =>
++                    {
++                        write!(self.out, "({}(0))", scalar.try_to_wgsl().unwrap())?;
++                    }
++                    _ => write!(self.out, "()")?,
++                }
+             }
+             Expression::Compose { ty, ref components } => {
+                 self.write_type(module, ty)?;
+@@ -1929,6 +2000,25 @@
+                     .inner_with(&module.types)
+                     .scalar()
+                     .unwrap();
++                if self.flags.contains(WriterFlags::BROWSER_SUBGROUP_MATRIX) {
++                    let role = match role {
++                        crate::CooperativeRole::A => "left",
++                        crate::CooperativeRole::B => "right",
++                        crate::CooperativeRole::C => "result",
++                    };
++                    write!(
++                        self.out,
++                        "subgroupMatrixLoad<subgroup_matrix_{role}<{}, {}, {}>>(",
++                        scalar.try_to_wgsl().unwrap(),
++                        columns as u32,
++                        rows as u32
++                    )?;
++                    self.write_matrix_address(module, data.pointer, func_ctx)?;
++                    write!(self.out, ", {}, ", data.row_major)?;
++                    self.write_expr(module, data.stride, func_ctx)?;
++                    write!(self.out, ")")?;
++                    return Ok(());
++                }
+                 write!(
+                     self.out,
+                     "coopLoad{suffix}<coop_mat{}x{}<{},{:?}>>(",
+@@ -1943,7 +2033,15 @@
+                 write!(self.out, ")")?;
+             }
+             Expression::CooperativeMultiplyAdd { a, b, c } => {
+-                write!(self.out, "coopMultiplyAdd(")?;
++                write!(
++                    self.out,
++                    "{}(",
++                    if self.flags.contains(WriterFlags::BROWSER_SUBGROUP_MATRIX) {
++                        "subgroupMatrixMultiplyAccumulate"
++                    } else {
++                        "coopMultiplyAdd"
++                    }
++                )?;
+                 self.write_expr(module, a, func_ctx)?;
+                 write!(self.out, ", ")?;
+                 self.write_expr(module, b, func_ctx)?;
+@@ -2078,11 +2176,16 @@
+ }
+ 
+ struct WriterTypeContext<'m> {
++    browser_subgroup_matrix: bool,
+     module: &'m Module,
+     names: &'m crate::FastHashMap<NameKey, String>,
+ }
+ 
+ impl TypeContext for WriterTypeContext<'_> {
++    fn browser_subgroup_matrix(&self) -> bool {
++        self.browser_subgroup_matrix
++    }
++
+     fn lookup_type(&self, handle: Handle<crate::Type>) -> &crate::Type {
+         &self.module.types[handle]
+     }

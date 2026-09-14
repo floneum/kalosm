@@ -58,6 +58,7 @@ pub struct GpuDevice {
     limits_used: wgpu::Limits,
     features: wgpu::Features,
     adapter_info: wgpu::AdapterInfo,
+    matrix_fallback: Option<String>,
     lost: LostFlag,
 }
 
@@ -115,6 +116,9 @@ impl GpuDevice {
     pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
         &self.adapter_info
     }
+    pub(crate) fn matrix_fallback(&self) -> Option<&str> {
+        self.matrix_fallback.as_deref()
+    }
     /// Set once the driver reports the device lost; see [`LostFlag`].
     pub fn lost(&self) -> &LostFlag {
         &self.lost
@@ -138,6 +142,15 @@ pub(crate) async fn request_device(opts: &DeviceOptions) -> Result<GpuDevice> {
     // 256 MiB. Take the adapter's capacity; the workgroup/occupancy limits
     // stay at the baseline so plan legality means the same thing everywhere.
     limits.max_buffer_size = limits.max_buffer_size.max(adapter_limits.max_buffer_size);
+    // Bindings per stage bound how many values one kernel can read and
+    // write, which is what caps a slab's stage count; the baseline eight is
+    // a quarter of what Metal and D3D12 give.
+    // One slot short of the adapter's count: wgpu binds its buffer-sizes
+    // table in the same argument table, and Metal loses the device with
+    // an out-of-memory report when a kernel fills all 31.
+    limits.max_storage_buffers_per_shader_stage = limits
+        .max_storage_buffers_per_shader_stage
+        .max(adapter_limits.max_storage_buffers_per_shader_stage.saturating_sub(1));
     limits.max_storage_buffer_binding_size = limits
         .max_storage_buffer_binding_size
         .max(adapter_limits.max_storage_buffer_binding_size);
@@ -190,6 +203,10 @@ pub(crate) async fn request_device(opts: &DeviceOptions) -> Result<GpuDevice> {
         &coop_props,
         DeviceKind::Gpu,
     );
+    #[cfg(target_arch = "wasm32")]
+    let (caps, matrix_fallback) = probe_browser_matrices(&device, caps).await?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let matrix_fallback = None;
     // Rates are calibrated (or loaded from the on-disk cache) by fusor-cost;
     // capabilities are always re-probed, so a stale capability set cannot
     // outlive a driver update.
@@ -204,8 +221,68 @@ pub(crate) async fn request_device(opts: &DeviceOptions) -> Result<GpuDevice> {
         limits_used: limits,
         features: granted,
         adapter_info,
+        matrix_fallback,
         lost,
     })
+}
+
+/// The experimental dialect can change independently of the advertised feature.
+/// Probe once, before Session's synchronous compiler admits matrix candidates.
+/// Use the same Naga serialization path as real kernels, including typed stores.
+#[cfg(target_arch = "wasm32")]
+async fn probe_browser_matrices(
+    device: &wgpu::Device,
+    mut caps: Caps,
+) -> Result<(Caps, Option<String>)> {
+    let mut fallback = None;
+    if !caps.subgroups.is_some_and(|w| w.min == 32 && w.max == 32) {
+        return Ok((caps, fallback));
+    }
+    let mut supported = smallvec::SmallVec::new();
+    for kind in &caps.coop {
+        let scalar = if kind.operand == fusor_ir::dtype::Dtype::F16 {
+            "f16"
+        } else {
+            "f32"
+        };
+        let enable = if scalar == "f16" { "enable f16;" } else { "" };
+        let source = format!(r#"
+enable wgpu_cooperative_matrix;
+{enable}
+var<workgroup> tile: array<{scalar},64>;
+@group(0) @binding(0) var<storage,read_write> output: array<{scalar}>;
+@compute @workgroup_size(32)
+fn main() {{
+    let a = coopLoad<coop_mat8x8<{scalar},A>>(&tile[0],8u);
+    let b = coopLoad<coop_mat8x8<{scalar},B>>(&tile[0],8u);
+    let c = coopLoad<coop_mat8x8<{scalar},C>>(&tile[0],8u);
+    let result = coopMultiplyAdd(a,b,c);
+    coopStore(result,&output[0],8u);
+}}
+"#);
+        let module = naga::front::wgsl::parse_str(&source)
+            .map_err(|e| Error::Plan(e.emit_to_string(&source)))?;
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fusor browser matrix capability probe"),
+            source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
+        });
+        let _pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fusor browser matrix capability probe"),
+            layout: None,
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        if let Some(error) = scope.pop().await {
+            fallback = Some(format!("browser {scalar} matrix probe: {error}"));
+        } else {
+            supported.push(*kind);
+        }
+    }
+    caps.coop = supported;
+    Ok((caps, fallback))
 }
 
 /// Rank adapters: discrete, then integrated, then

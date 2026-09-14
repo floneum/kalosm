@@ -101,6 +101,34 @@ pub enum Launch {
         sched: ScheduleDomain,
     },
 
+    /// A pipeline of launches run by one dispatch: `members`, in dependency
+    /// order, each computed stage by stage inside one workgroup per slab.
+    ///
+    /// Every member keeps its leading axis independent: workgroup `s` computes
+    /// slab `s` of every stage and reads only slab `s` of every earlier one,
+    /// so a barrier between stages is the whole synchronization. Members other
+    /// than the last are materialized in their own buffers, where later
+    /// stages and consumers outside the slab read them; the last member's
+    /// value is this node's, and this node sits in its class.
+    ///
+    /// The children are the members themselves, by id: a member is a concrete
+    /// spelling the lowering reads, not a class it selects from.
+    Slab {
+        slabs: u32,
+        members: SmallVec<[Id; 8]>,
+        sched: ScheduleDomain,
+    },
+
+    /// Independent launches run by one dispatch: each member owns a
+    /// contiguous range of the grid's workgroups and runs its own kernel
+    /// body there, storing into its own buffer. No member reads another;
+    /// the dispatch count is all a group saves. The last member's value is
+    /// this node's. Children are the members by id, as for a slab.
+    Group {
+        members: SmallVec<[Id; 8]>,
+        sched: ScheduleDomain,
+    },
+
     /// The one open extension point.
     Ext {
         def: OpDefId,
@@ -117,6 +145,8 @@ impl Launch {
             Self::Gather { .. } => OpTag::LaunchGather,
             Self::Scatter { .. } => OpTag::LaunchScatter,
             Self::Region { .. } => OpTag::LaunchRegion,
+            Self::Slab { .. } => OpTag::LaunchSlab,
+            Self::Group { .. } => OpTag::LaunchGroup,
             Self::Ext { .. } => OpTag::Ext,
         }
     }
@@ -156,7 +186,9 @@ impl Launch {
             | Self::Contract { sched, .. }
             | Self::Gather { sched, .. }
             | Self::Scatter { sched, .. }
-            | Self::Region { sched, .. } => Some(sched),
+            | Self::Region { sched, .. }
+            | Self::Slab { sched, .. }
+            | Self::Group { sched, .. } => Some(sched),
             Self::Ext { .. } => None,
         }
     }
@@ -797,6 +829,27 @@ pub fn emitted_block(lane_group: u32, caps: &crate::device::Caps) -> u32 {
         .max(DEFAULT_BLOCK.min(caps.limits.max_compute_invocations_per_workgroup))
         .min(caps.limits.max_compute_invocations_per_workgroup.max(1))
         .max(1)
+}
+
+/// The block a slab lowers at: enough lanes for the widest stage's share of
+/// one slab, a power of two so a fold stage can split them evenly across
+/// its rows, between one subgroup and the default block. `per_slab` is the
+/// most iterations any stage runs for one slab. `realize` geometry and the
+/// GPU emitter both take their block from here.
+pub fn slab_block(per_slab: u64, caps: &crate::device::Caps) -> u32 {
+    let top = emitted_block(1, caps);
+    let floor = caps.subgroup_width().clamp(1, top);
+    u32::try_from(per_slab.max(1).next_power_of_two())
+        .unwrap_or(u32::MAX)
+        .clamp(floor, top)
+}
+
+/// Lanes a slab's fold stage gives each output row: the block split over
+/// the slab's rows, never wider than the reduced axis rounds up to.
+pub fn slab_lanes_per_row(block: u32, rows_per_slab: u64, k: u64) -> u32 {
+    let rows = u32::try_from(rows_per_slab.max(1).next_power_of_two()).unwrap_or(u32::MAX);
+    let k = u32::try_from(k.max(1).next_power_of_two()).unwrap_or(u32::MAX);
+    (block / rows.min(block)).min(k).max(1)
 }
 
 /// Workgroup bytes one fold strategy's cross-lane close needs, for a carrier

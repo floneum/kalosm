@@ -1,0 +1,484 @@
+{
+  "date": "2026-09-13",
+  "hardware": "Apple M2 Max",
+  "browser": "Chrome 152.0.7977.83, Metal, fixed 32-wide subgroups, 8x8 f32 matrix configuration",
+  "protocol": {
+    "training": "Same 240480-parameter transformer, f32, 1024 tokens per step. 17 warmup steps then five windows of 32. GPU workloads run sequentially. Excludes initialization, evaluation, generation and rendering.",
+    "general": "Release benchmark harness, median of nine warmed calibrated windows; same compute/readback definition before and after. Baseline captured from the full Fusor/Burn UI sweep. After values from the Fusor-only diagnostic export before the independent indexing change. Both use the default size-optimized WASM profile. Final values were also verified with the full Fusor/Burn release UI sweep."
+  },
+  "training_before_ms": [
+    4.3,
+    4.29375,
+    4.3,
+    4.53125,
+    4.2875
+  ],
+  "training_before_gpu_pass_median_ms": 4.2607055,
+  "training_before_profiled_webgpu_api_ms_per_step": 0.0836,
+  "training_after": [
+    {
+      "case": "portable",
+      "mode": "portable",
+      "first_loss": 4.197046,
+      "ms_per_step": [
+        4.190625,
+        4.14375,
+        4.165625,
+        4.109375,
+        4.103125
+      ],
+      "losses": [
+        2.5142379,
+        2.3119304,
+        2.338251,
+        2.2370625,
+        2.2243035
+      ],
+      "held_out_loss": 2.176824,
+      "accuracy": 0.35839844,
+      "subgroups": false,
+      "matrices": "Portable",
+      "fallback": false,
+      "dispatches": 99,
+      "audit": {
+        "requests": [
+          [
+            "shader-f16",
+            "subgroups",
+            "chromium-experimental-subgroup-matrix"
+          ],
+          [
+            "shader-f16",
+            "subgroups",
+            "chromium-experimental-subgroup-matrix"
+          ]
+        ],
+        "matrix": 24,
+        "generalMatrix": 1,
+        "subgroup": 19,
+        "errors": []
+      }
+    },
+    {
+      "case": "subgroups",
+      "mode": "subgroups",
+      "first_loss": 4.1970463,
+      "ms_per_step": [
+        3.5531249999999996,
+        3.575,
+        3.628125,
+        3.6125,
+        3.590625
+      ],
+      "losses": [
+        2.5142379,
+        2.3119307,
+        2.3382514,
+        2.237062,
+        2.2243023
+      ],
+      "held_out_loss": 2.1768239,
+      "accuracy": 0.35839844,
+      "subgroups": true,
+      "matrices": "Portable",
+      "fallback": false,
+      "dispatches": 99,
+      "audit": {
+        "requests": [
+          [
+            "shader-f16",
+            "subgroups",
+            "chromium-experimental-subgroup-matrix"
+          ],
+          [
+            "shader-f16",
+            "subgroups",
+            "chromium-experimental-subgroup-matrix"
+          ]
+        ],
+        "matrix": 24,
+        "generalMatrix": 1,
+        "subgroup": 52,
+        "errors": []
+      }
+    },
+    {
+      "case": "accelerated",
+      "mode": "accelerated",
+      "first_loss": 4.1970463,
+      "ms_per_step": [
+        3.221875,
+        3.265625,
+        3.3125,
+        3.31875,
+        3.26875
+      ],
+      "losses": [
+        2.5142379,
+        2.3119307,
+        2.3382514,
+        2.237062,
+        2.2243023
+      ],
+      "held_out_loss": 2.1768239,
+      "accuracy": 0.35839844,
+      "subgroups": true,
+      "matrices": "Browser",
+      "fallback": false,
+      "dispatches": 99,
+      "audit": {
+        "requests": [
+          [
+            "shader-f16",
+            "subgroups",
+            "chromium-experimental-subgroup-matrix"
+          ],
+          [
+            "shader-f16",
+            "subgroups",
+            "chromium-experimental-subgroup-matrix"
+          ]
+        ],
+        "matrix": 69,
+        "generalMatrix": 1,
+        "subgroup": 52,
+        "errors": []
+      }
+    },
+    {
+      "case": "no-matrix",
+      "mode": "accelerated",
+      "first_loss": 4.1970463,
+      "ms_per_step": [
+        3.609375,
+        3.596875,
+        3.609375,
+        3.6125,
+        3.5374999999999996
+      ],
+      "losses": [
+        2.5142379,
+        2.3119307,
+        2.3382514,
+        2.237062,
+        2.2243023
+      ],
+      "held_out_loss": 2.1768239,
+      "accuracy": 0.35839844,
+      "subgroups": true,
+      "matrices": "Portable",
+      "fallback": false,
+      "dispatches": 99,
+      "audit": {
+        "requests": [
+          [
+            "shader-f16",
+            "subgroups"
+          ],
+          [
+            "shader-f16",
+            "subgroups"
+          ]
+        ],
+        "matrix": 0,
+        "generalMatrix": 0,
+        "subgroup": 52,
+        "errors": []
+      }
+    },
+    {
+      "case": "no-subgroups",
+      "mode": "accelerated",
+      "first_loss": 4.197046,
+      "ms_per_step": [
+        4.1625000000000005,
+        4.125,
+        4.134375,
+        4.1125,
+        4.18125
+      ],
+      "losses": [
+        2.5142379,
+        2.3119304,
+        2.338251,
+        2.2370625,
+        2.2243035
+      ],
+      "held_out_loss": 2.176824,
+      "accuracy": 0.35839844,
+      "subgroups": false,
+      "matrices": "Portable",
+      "fallback": false,
+      "dispatches": 99,
+      "audit": {
+        "requests": [
+          [
+            "shader-f16"
+          ],
+          [
+            "shader-f16"
+          ]
+        ],
+        "matrix": 0,
+        "generalMatrix": 0,
+        "subgroup": 0,
+        "errors": []
+      }
+    },
+    {
+      "case": "no-config",
+      "mode": "accelerated",
+      "first_loss": 4.1970463,
+      "ms_per_step": [
+        3.609375,
+        3.559375,
+        3.56875,
+        3.6375,
+        3.634375
+      ],
+      "losses": [
+        2.5142379,
+        2.3119307,
+        2.3382514,
+        2.237062,
+        2.2243023
+      ],
+      "held_out_loss": 2.1768239,
+      "accuracy": 0.35839844,
+      "subgroups": true,
+      "matrices": "Portable",
+      "fallback": false,
+      "dispatches": 99,
+      "audit": {
+        "requests": [
+          [
+            "shader-f16",
+            "subgroups",
+            "chromium-experimental-subgroup-matrix"
+          ],
+          [
+            "shader-f16",
+            "subgroups",
+            "chromium-experimental-subgroup-matrix"
+          ]
+        ],
+        "matrix": 0,
+        "generalMatrix": 0,
+        "subgroup": 52,
+        "errors": []
+      }
+    },
+    {
+      "case": "ranged-width",
+      "mode": "accelerated",
+      "first_loss": 4.1970463,
+      "ms_per_step": [
+        3.7,
+        3.759375,
+        3.690625,
+        3.8,
+        3.7
+      ],
+      "losses": [
+        2.5142379,
+        2.3119307,
+        2.3382514,
+        2.237062,
+        2.2243023
+      ],
+      "held_out_loss": 2.1768239,
+      "accuracy": 0.35839844,
+      "subgroups": true,
+      "matrices": "Portable",
+      "fallback": false,
+      "dispatches": 99,
+      "audit": {
+        "requests": [
+          [
+            "shader-f16",
+            "subgroups",
+            "chromium-experimental-subgroup-matrix"
+          ],
+          [
+            "shader-f16",
+            "subgroups",
+            "chromium-experimental-subgroup-matrix"
+          ]
+        ],
+        "matrix": 0,
+        "generalMatrix": 0,
+        "subgroup": 47,
+        "errors": []
+      }
+    },
+    {
+      "case": "reject-matrix",
+      "mode": "accelerated",
+      "first_loss": 4.1970463,
+      "ms_per_step": [
+        3.64375,
+        3.56875,
+        3.715625,
+        3.575,
+        3.571875
+      ],
+      "losses": [
+        2.5142379,
+        2.3119307,
+        2.3382514,
+        2.237062,
+        2.2243023
+      ],
+      "held_out_loss": 2.1768239,
+      "accuracy": 0.35839844,
+      "subgroups": true,
+      "matrices": "Portable",
+      "fallback": true,
+      "dispatches": 99,
+      "audit": {
+        "requests": [
+          [
+            "shader-f16",
+            "subgroups",
+            "chromium-experimental-subgroup-matrix"
+          ],
+          [
+            "shader-f16",
+            "subgroups",
+            "chromium-experimental-subgroup-matrix"
+          ]
+        ],
+        "matrix": 4,
+        "generalMatrix": 0,
+        "subgroup": 52,
+        "errors": []
+      }
+    }
+  ],
+  "native_alternating_before_after": [
+    "before",
+    "mode=fused parameters=240480 tokens/step=1024 setup_ms=307.046 first_loss=4.1970463 plan=Some(ProgramStats { stages: 324, kernels: 99, workgroups: 64, arena_bytes: 35690896, dedicated_bytes: 87486360, state_bytes: 2885760 })",
+    "round=0 ms/step=1.957 dispatches/step=99 loss=2.5142379",
+    "round=1 ms/step=1.953 dispatches/step=99 loss=2.3119307",
+    "round=2 ms/step=2.011 dispatches/step=99 loss=2.338251",
+    "held_out_loss=2.2806659 accuracy=0.3125",
+    "",
+    "after",
+    "mode=fused parameters=240480 tokens/step=1024 setup_ms=287.503 first_loss=4.1970463 plan=Some(ProgramStats { stages: 324, kernels: 99, workgroups: 64, arena_bytes: 35690896, dedicated_bytes: 87486360, state_bytes: 2885760 })",
+    "round=0 ms/step=1.985 dispatches/step=99 loss=2.5142379",
+    "round=1 ms/step=2.041 dispatches/step=99 loss=2.3119307",
+    "round=2 ms/step=2.002 dispatches/step=99 loss=2.338251",
+    "held_out_loss=2.2806659 accuracy=0.3125",
+    "",
+    "after",
+    "mode=fused parameters=240480 tokens/step=1024 setup_ms=299.010 first_loss=4.1970463 plan=Some(ProgramStats { stages: 324, kernels: 99, workgroups: 64, arena_bytes: 35690896, dedicated_bytes: 87486360, state_bytes: 2885760 })",
+    "round=0 ms/step=1.944 dispatches/step=99 loss=2.5142379",
+    "round=1 ms/step=1.957 dispatches/step=99 loss=2.3119307",
+    "round=2 ms/step=1.992 dispatches/step=99 loss=2.338251",
+    "held_out_loss=2.2806659 accuracy=0.3125",
+    "",
+    "before",
+    "mode=fused parameters=240480 tokens/step=1024 setup_ms=296.998 first_loss=4.1970463 plan=Some(ProgramStats { stages: 324, kernels: 99, workgroups: 64, arena_bytes: 35690896, dedicated_bytes: 87486360, state_bytes: 2885760 })",
+    "round=0 ms/step=1.944 dispatches/step=99 loss=2.5142379",
+    "round=1 ms/step=2.002 dispatches/step=99 loss=2.3119307",
+    "round=2 ms/step=1.991 dispatches/step=99 loss=2.338251",
+    "held_out_loss=2.2806659 accuracy=0.3125"
+  ],
+  "general_before_median_ms": {
+    "webgpu::elementwise_add_square": 0.08,
+    "webgpu::elementwise_mul_rank4": 0.039,
+    "webgpu::unary_trig_chain": 0.038,
+    "webgpu::activation_gelu": 0.037,
+    "webgpu::broadcast_add": 0.039,
+    "webgpu::transpose_then_elementwise": 0.034,
+    "webgpu::reduction_sum_last_dim": 0.034,
+    "webgpu::reduction_max_middle_axis": 0.032,
+    "webgpu::softmax_last_dim": 0.073,
+    "webgpu::softmax_middle_axis": 0.165,
+    "webgpu::layer_norm_last_dim": 0.486,
+    "webgpu::rms_norm_fused": 0.1,
+    "webgpu::dense_matmul_square": 0.633,
+    "webgpu::dense_batched_matmul": 0.107,
+    "webgpu::conv1d_small": 0.47,
+    "webgpu::q8_0_qgemv": 0.087,
+    "webgpu::q4k_qgemv": 0.076,
+    "webgpu::q4k_paired_silu": 0.079,
+    "webgpu::attention_small": 0.467,
+    "webgpu::attention_causal_small": 0.467,
+    "webgpu::rope_fused_decode": 0.099
+  },
+  "general_after_matrix_support_median_ms": {
+    "webgpu::elementwise_add_square": 0.04,
+    "webgpu::elementwise_mul_rank4": 0.033203125,
+    "webgpu::unary_trig_chain": 0.03587443946188341,
+    "webgpu::activation_gelu": 0.03497757847533632,
+    "webgpu::broadcast_add": 0.032,
+    "webgpu::transpose_then_elementwise": 0.0304,
+    "webgpu::reduction_sum_last_dim": 0.03183856502242153,
+    "webgpu::reduction_max_middle_axis": 0.033203125,
+    "webgpu::softmax_last_dim": 0.07014925373134329,
+    "webgpu::softmax_middle_axis": 0.14800000000000002,
+    "webgpu::layer_norm_last_dim": 0.49393939393939384,
+    "webgpu::rms_norm_fused": 0.09576271186440677,
+    "webgpu::dense_matmul_square": 0.10149253731343283,
+    "webgpu::dense_batched_matmul": 0.03441558441558441,
+    "webgpu::conv1d_small": 0.4717948717948718,
+    "webgpu::q8_0_qgemv": 0.08985507246376812,
+    "webgpu::q4k_qgemv": 0.07922077922077923,
+    "webgpu::q4k_paired_silu": 0.08051948051948052,
+    "webgpu::attention_small": 0.12857142857142856,
+    "webgpu::attention_causal_small": 0.12173913043478261,
+    "webgpu::rope_fused_decode": 0.09160839160839161
+  },
+  "validation": {
+    "browser_modes": 8,
+    "native_program_cases": 14,
+    "normalization_cases": 17,
+    "attention_rope_cases": 26,
+    "known_failure": "matmul::q_mat_mul_rank1: expected -0.625, got 0 at sampled shape [8,1], seed 84249719. Reproduces with matrix extension masked off; outstanding outside this change.",
+    "native_model_tests": {
+      "passed": 3,
+      "ignored_benchmark_oracles": 2
+    },
+    "dense_matrix_cases": 7
+  },
+  "discarded_experiments": {
+    "larger_K_tiles": "K32 ~4.4 ms and K64 ~5.44 ms; K128 exceeded requested workgroup storage.",
+    "per_job_pipeline_specialization": "~4.7 ms; more dispatches and no training improvement.",
+    "static_arena_and_subgroup_clamp": "~4.3 ms, no material benefit.",
+    "opt_level_3_wasm": "No material steady-state benefit; bundle grew from 11.8 to 27.8 MB.",
+    "composite_cache": "No material browser improvement; removed."
+  },
+  "general_final_ui_median_ms": {
+    "webgpu::elementwise_add_square": 0.042,
+    "webgpu::elementwise_mul_rank4": 0.033,
+    "webgpu::unary_trig_chain": 0.037,
+    "webgpu::activation_gelu": 0.036,
+    "webgpu::broadcast_add": 0.037,
+    "webgpu::transpose_then_elementwise": 0.035,
+    "webgpu::reduction_sum_last_dim": 0.036,
+    "webgpu::reduction_max_middle_axis": 0.033,
+    "webgpu::softmax_last_dim": 0.072,
+    "webgpu::softmax_middle_axis": 0.148,
+    "webgpu::layer_norm_last_dim": 0.494,
+    "webgpu::rms_norm_fused": 0.097,
+    "webgpu::dense_matmul_square": 0.103,
+    "webgpu::dense_batched_matmul": 0.035,
+    "webgpu::conv1d_small": 0.469,
+    "webgpu::q8_0_qgemv": 0.088,
+    "webgpu::q4k_qgemv": 0.076,
+    "webgpu::q4k_paired_silu": 0.078,
+    "webgpu::attention_small": 0.129,
+    "webgpu::attention_causal_small": 0.123,
+    "webgpu::rope_fused_decode": 0.101
+  },
+  "release_ui_smoke": {
+    "steps": 488,
+    "training_ms_per_step": 3.4,
+    "overall_steps_per_second": 217,
+    "held_out_loss": 1.785,
+    "accuracy": 0.47,
+    "not_training_fraction": 0.29,
+    "note": "Normal release app, no diagnostic exports. Start and pause controls exercised. Includes periodic scoring and generated samples outside the training timer."
+  }
+}

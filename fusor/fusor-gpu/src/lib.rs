@@ -16,6 +16,7 @@ mod caps;
 mod device;
 mod emit;
 pub mod executable;
+pub mod program;
 pub mod launch;
 mod lower;
 mod plan_cache;

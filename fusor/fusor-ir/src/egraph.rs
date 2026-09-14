@@ -106,12 +106,21 @@ pub struct EGraph {
     /// when a node is appended, so the arena length is an exact validity
     /// stamp.
     class_ids_memo: (usize, FxHashMap<ClassId, Arc<[Id]>>),
+    /// Per node, the nodes that read it as a child, by the id they wrote.
+    /// Nodes never move, so the index is append-only with `nodes`.
+    readers: Vec<SmallVec<[Id; 4]>>,
+    /// The classes reading each class, computed at a node count and valid
+    /// until the next node: a rule application asks about the same chain's
+    /// members many times while it mints nothing.
+    reader_classes_memo: std::sync::Mutex<(usize, FxHashMap<ClassId, Arc<FxHashSet<ClassId>>>)>,
 }
 
 impl EGraph {
     pub fn new(sem: Arc<dyn Semantics>) -> Self {
         Self {
             nodes: Vec::new(),
+            readers: Vec::new(),
+            reader_classes_memo: std::sync::Mutex::new((usize::MAX, FxHashMap::default())),
             facts: Vec::new(),
             memo: Arc::new(FxHashMap::default()),
             parent: Vec::new(),
@@ -258,11 +267,16 @@ impl EGraph {
             Op::Union(a, _) => self.nodes[a.index()].level,
             other => other.level().expect("non-union ops carry a level"),
         };
+        self.index_readers_to(next.index());
+        for c in &children {
+            self.readers[c.index()].push(next);
+        }
         self.nodes.push(Node {
             op,
             level,
             children,
         });
+        self.readers.push(SmallVec::new());
         self.facts.push(facts);
         self.parent.push(None);
         // Copy-on-write: a no-op clone unless a `SaturationDelta` still holds
@@ -308,6 +322,76 @@ impl EGraph {
     /// `union(defn, sugar)` produced, so the `Tensor` the user reads back is
     /// the spine node. Anything keyed on "this value" rather than "this
     /// candidate" has to use this.
+    /// Brings the readers index up to `len` nodes: every node added by a
+    /// path other than [`Self::add`] — a replayed delta — is indexed here.
+    fn index_readers_to(&mut self, len: usize) {
+        while self.readers.len() < len {
+            let id = Id(self.readers.len() as u32);
+            self.readers.push(SmallVec::new());
+            for c in self.nodes[id.index()].children.clone().iter() {
+                self.readers[c.index()].push(id);
+            }
+        }
+    }
+
+    /// Every non-`Union` node that reads any id of `class`, deduplicated.
+    /// The `Union` spine is not a reader: it is the class itself.
+    pub fn readers(&self, class: ClassId) -> Vec<Id> {
+        let mut out: Vec<Id> = Vec::new();
+        let mut seen: FxHashSet<Id> = FxHashSet::default();
+        self.for_each_reader(class, |r| {
+            if seen.insert(r) {
+                out.push(r);
+            }
+            false
+        });
+        out
+    }
+
+    /// Whether some non-`Union` reader of `class` satisfies `pred`; stops
+    /// at the first.
+    pub fn any_reader(&self, class: ClassId, mut pred: impl FnMut(Id) -> bool) -> bool {
+        self.for_each_reader(class, |r| pred(r))
+    }
+
+    /// The classes whose nodes read `class`, memoized at the current node
+    /// count.
+    pub fn reader_classes(&self, class: ClassId) -> Arc<FxHashSet<ClassId>> {
+        let mut memo = self.reader_classes_memo.lock().unwrap_or_else(|e| e.into_inner());
+        if memo.0 != self.nodes.len() {
+            *memo = (self.nodes.len(), FxHashMap::default());
+        }
+        if let Some(hit) = memo.1.get(&class) {
+            return Arc::clone(hit);
+        }
+        let mut out: FxHashSet<ClassId> = FxHashSet::default();
+        self.for_each_reader(class, |r| {
+            out.insert(self.class_of(r));
+            false
+        });
+        let out = Arc::new(out);
+        memo.1.insert(class, Arc::clone(&out));
+        out
+    }
+
+    /// Visits the readers of `class` until `f` answers true.
+    fn for_each_reader(&self, class: ClassId, mut f: impl FnMut(Id) -> bool) -> bool {
+        for id in self.class_ids(class) {
+            let Some(readers) = self.readers.get(id.index()) else {
+                continue;
+            };
+            for r in readers {
+                if r.index() < self.nodes.len()
+                    && !matches!(self.nodes[r.index()].op, Op::Union(..))
+                    && f(*r)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn class_ids(&self, class: ClassId) -> Vec<Id> {
         let mut out = Vec::new();
         // The spine is a DAG; a set membership test keeps this linear.
@@ -447,6 +531,7 @@ impl EGraph {
         }
         self.nodes.extend_from_slice(&delta.nodes[pre.len..]);
         self.facts.extend_from_slice(&delta.facts[pre.len..]);
+        self.index_readers_to(self.nodes.len());
         self.memo = Arc::clone(&delta.memo);
         self.parent.clone_from(&delta.parent);
         self.defns.clone_from(&delta.defns);
@@ -492,6 +577,40 @@ pub struct Builder<'a> {
 impl<'a> Builder<'a> {
     pub fn caps(&self) -> &Caps {
         self.caps
+    }
+    /// The class `id` belongs to.
+    pub fn class_of(&self, id: Id) -> ClassId {
+        self.graph.class_of(id)
+    }
+    /// Every node in `id`'s class. A rule that composes launches needs the
+    /// launch spelling of a value it was handed by its logical id.
+    pub fn class_members(&self, id: Id) -> Vec<Id> {
+        self.graph.members(self.graph.class_of(id))
+    }
+    /// Whether some node outside `classes` reads `id`'s class.
+    /// Every id `id`'s class holds, spine included.
+    pub fn class_ids(&self, id: Id) -> Vec<Id> {
+        self.graph.class_ids(self.graph.class_of(id))
+    }
+    /// The graph's roots: every value a caller reads back.
+    pub fn roots(&self) -> &[Id] {
+        self.graph.roots()
+    }
+    pub fn len(&self) -> usize {
+        self.graph.len()
+    }
+    pub fn arena_id(&self) -> u64 {
+        self.graph.arena_id()
+    }
+    /// Every node reading `id`'s class.
+    pub fn readers_of(&self, id: Id) -> Vec<Id> {
+        self.graph.readers(self.graph.class_of(id))
+    }
+    pub fn read_outside(&self, id: Id, classes: &FxHashSet<ClassId>) -> bool {
+        self.graph
+            .reader_classes(self.graph.class_of(id))
+            .iter()
+            .any(|c| !classes.contains(c))
     }
     pub fn node(&self, id: Id) -> &Node {
         self.graph.node(id)

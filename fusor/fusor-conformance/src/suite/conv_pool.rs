@@ -43,6 +43,17 @@ const GROUPED_CONV_SPEC: &[FuzzDim] = &[
     FuzzDim::Range(3, 8),
     FuzzDim::Range(1, 3),
 ];
+// `[batch, in_ch, h, w, out_ch, kernel, stride]`. The kernel starts at 2 and
+// the stride is clamped below it, so every run of this case overlaps.
+const OVERLAP_GRAD_SPEC: &[FuzzDim] = &[
+    FuzzDim::Range(1, 2),
+    FuzzDim::Range(1, 3),
+    FuzzDim::Range(3, 9),
+    FuzzDim::Range(3, 9),
+    FuzzDim::Range(1, 3),
+    FuzzDim::Range(2, 4),
+    FuzzDim::Range(1, 3),
+];
 // The length is `window * positions`, so the non-overlapping pool always
 // tiles it exactly.
 const POOL_SPEC: &[FuzzDim] = &[
@@ -71,6 +82,12 @@ pub fn cases() -> Cases {
         "grouped_conv",
         GROUPED_CONV_SPEC,
         grouped_conv,
+    ));
+    cases.push_case(fuzz_case(
+        "conv_pool",
+        "conv2d_overlapping_input_gradient",
+        OVERLAP_GRAD_SPEC,
+        conv2d_overlapping_input_gradient,
     ));
     cases.push_case(fuzz_case(
         "conv_pool",
@@ -285,6 +302,105 @@ async fn conv2d_strided(session: &Session, shape: &[u64], seed: u32) -> CaseResu
         Dtype::F32,
         &read(&y).await?,
         &expected,
+    )
+    .await?;
+    Ok(())
+}
+
+/// The overlapping branch of the `Window` adjoint: `stride < kernel`, so a
+/// source element feeds several windows and the adjoint has to add their
+/// gradients together.
+///
+/// Every other conv and pool case here tiles exactly and takes the pure-view
+/// branch, so without this one nothing in the suite reaches the overlap-add
+/// at all — which is how it went unmeasured long enough to become the whole
+/// cost of a convolutional training step.
+///
+/// `d(sum y)/dx` needs no finite differences: it is exactly the sum of the
+/// weights of every window covering that source position, independent of `x`.
+async fn conv2d_overlapping_input_gradient(
+    session: &Session,
+    shape: &[u64],
+    seed: u32,
+) -> CaseResult {
+    let [batch, in_ch, h, w_ext, out_ch, kernel, stride_pick] = [
+        shape[0] as usize,
+        shape[1] as usize,
+        shape[2] as usize,
+        shape[3] as usize,
+        shape[4] as usize,
+        shape[5] as usize,
+        shape[6] as usize,
+    ];
+    // Overlap is the point of the case, so the stride never reaches the
+    // kernel; `pad` is the "same"-ish padding a real network uses.
+    let stride = stride_pick.clamp(1, kernel - 1);
+    let pad = kernel / 2;
+
+    let x_data = Domain::Wide.sample(seed, batch * in_ch * h * w_ext);
+    let w_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, out_ch * in_ch * kernel * kernel);
+
+    let graph = graph_of(session);
+    let x = upload(
+        graph.handle(),
+        &dims(&[batch as u64, in_ch as u64, h as u64, w_ext as u64]),
+        &x_data,
+    )?;
+    let w = upload(
+        graph.handle(),
+        &dims(&[out_ch as u64, in_ch as u64, kernel as u64, kernel as u64]),
+        &w_data,
+    )?;
+    let y = conv(
+        &x,
+        &w,
+        None,
+        &[stride as u32, stride as u32],
+        &[pad as u32, pad as u32],
+        &[1, 1],
+    )
+    .map_err(|e| -> CaseError { e.to_string().into() })?;
+
+    let out_h = (h + 2 * pad - kernel) / stride + 1;
+    let out_w = (w_ext + 2 * pad - kernel) / stride + 1;
+    let mut want = vec![0.0f32; batch * in_ch * h * w_ext];
+    for b in 0..batch {
+        for oc in 0..out_ch {
+            for oh in 0..out_h {
+                for ow in 0..out_w {
+                    for ic in 0..in_ch {
+                        for kh in 0..kernel {
+                            for kw in 0..kernel {
+                                let ih = (oh * stride + kh) as isize - pad as isize;
+                                let iw = (ow * stride + kw) as isize - pad as isize;
+                                if ih < 0 || iw < 0 || ih >= h as isize || iw >= w_ext as isize {
+                                    continue;
+                                }
+                                want[((b * in_ch + ic) * h + ih as usize) * w_ext + iw as usize] +=
+                                    w_data[((oc * in_ch + ic) * kernel + kh) * kernel + kw];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let got = gradient_of(&graph, &y, &x).await?;
+    if got.len() != want.len() {
+        return Err(format!(
+            "the input gradient has {} elements, want {}: it must land in the input's own shape",
+            got.len(),
+            want.len()
+        )
+        .into());
+    }
+    expect_values(
+        session,
+        &[batch as u64, in_ch as u64, h as u64, w_ext as u64],
+        Dtype::F32,
+        &got,
+        &want,
     )
     .await?;
     Ok(())

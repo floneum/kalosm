@@ -89,6 +89,11 @@ fn side(
             if crate::lower::const_operand(cx, operand.src).is_some() {
                 return None;
             }
+            // A GEMM call reads from the buffer's start; an offset layout —
+            // a slot of a multi-slot fold, a window — goes to the JIT.
+            if super::resolved_layout(cx, &operand.layout).ok()?.0 != 0 {
+                return None;
+            }
             let strides = collapsed_strides(cx, &operand.layout, groups)?;
             Some((binds.of(operand.src).ok()?, strides))
         })
@@ -194,7 +199,25 @@ fn lower_jit(
     })
 }
 
-type JitSide = Vec<(OperandSrc, [u32; 3])>;
+/// One operand's source and how its `(batch, row, col)` coordinates reach
+/// an element: three collapsed strides when each axis group is one dense
+/// run, else the layout's own axes, decomposed per group — a permuted head
+/// split, a broadcast, a merged axis, an offset slot are all just strides.
+struct JitOperand {
+    src: OperandSrc,
+    offset: u32,
+    addressing: Addressing,
+}
+
+enum Addressing {
+    Collapsed([u32; 3]),
+    Axes {
+        extents: Vec<u32>,
+        strides: Vec<u32>,
+    },
+}
+
+type JitSide = Vec<JitOperand>;
 
 fn jit_side(
     cx: &LowerCtx<'_>,
@@ -205,15 +228,88 @@ fn jit_side(
     side.ops
         .iter()
         .map(|operand| {
-            let strides = collapsed_strides(cx, &operand.layout, groups).ok_or_else(|| {
-                Error::Legality(format!(
-                    "CPU JIT contraction cannot collapse layout {:?}",
-                    operand.layout
-                ))
-            })?;
-            Ok((super::operand_src(cx, binds, operand.src)?, strides))
+            let (offset, extents, strides) = super::resolved_layout(cx, &operand.layout)?;
+            let addressing = match collapse_resolved(&extents, &strides, groups) {
+                Some(c) => Addressing::Collapsed(c),
+                None => {
+                    // The axes must partition into the groups, whatever
+                    // their strides.
+                    if group_axes(&extents, groups).is_none() {
+                        return Err(Error::Legality(format!(
+                            "CPU JIT contraction cannot partition layout {:?} into its groups",
+                            operand.layout
+                        )));
+                    }
+                    Addressing::Axes { extents, strides }
+                }
+            };
+            Ok(JitOperand {
+                src: super::operand_src(cx, binds, operand.src)?,
+                offset,
+                addressing,
+            })
         })
         .collect()
+}
+
+/// The axis range each group covers, row-major with the last axis fastest.
+fn group_axes(extents: &[u32], groups: [u32; 3]) -> Option<[(usize, usize); 3]> {
+    let mut out = [(0, 0); 3];
+    let mut axis = 0;
+    for (group, wanted) in groups.into_iter().map(|v| v.max(1)).enumerate() {
+        let start = axis;
+        let mut product = 1u64;
+        while product < u64::from(wanted) && axis < extents.len() {
+            product = product.saturating_mul(u64::from(extents[axis].max(1)));
+            axis += 1;
+        }
+        if product != u64::from(wanted) {
+            return None;
+        }
+        out[group] = (start, axis);
+    }
+    (axis == extents.len()).then_some(out)
+}
+
+/// `offset + Σ coord * stride`, the group coordinates decomposed over the
+/// layout's axes.
+fn axes_index(
+    extents: &[u32],
+    strides: &[u32],
+    groups: [u32; 3],
+    indices: [&TileExpr; 3],
+    offset: u32,
+) -> TileExpr {
+    let ranges = group_axes(extents, groups).unwrap_or([(0, 0); 3]);
+    let mut terms: Vec<TileExpr> = Vec::new();
+    if offset != 0 {
+        terms.push(lit_u32(offset));
+    }
+    for (group, (start, end)) in ranges.into_iter().enumerate() {
+        let mut rest = indices[group].clone();
+        for i in (start..end).rev() {
+            let extent = extents[i].max(1);
+            let coord = if i == start {
+                rest.clone()
+            } else {
+                bin(BinOp::Rem, rest.clone(), lit_u32(extent), u32_ty())
+            };
+            if strides[i] != 0 {
+                terms.push(if strides[i] == 1 {
+                    coord
+                } else {
+                    bin(BinOp::Mul, coord, lit_u32(strides[i]), u32_ty())
+                });
+            }
+            if i != start {
+                rest = bin(BinOp::Div, rest, lit_u32(extent), u32_ty());
+            }
+        }
+    }
+    terms
+        .into_iter()
+        .reduce(|l, r| bin(BinOp::Add, l, r, u32_ty()))
+        .unwrap_or_else(|| lit_u32(0))
 }
 
 fn side_value(
@@ -227,7 +323,22 @@ fn side_value(
 ) -> Result<TileExpr> {
     let args = sources
         .iter()
-        .map(|(source, strides)| source.at(strided_index(indices, *strides), mask.clone()))
+        .map(|o| {
+            let index = match &o.addressing {
+                Addressing::Collapsed(strides) => {
+                    let base = strided_index(indices, *strides);
+                    if o.offset == 0 {
+                        base
+                    } else {
+                        bin(BinOp::Add, lit_u32(o.offset), base, u32_ty())
+                    }
+                }
+                Addressing::Axes { extents, strides } => {
+                    axes_index(extents, strides, groups, indices, o.offset)
+                }
+            };
+            o.src.at(index, mask.clone())
+        })
         .collect::<Vec<_>>();
     let coords = side_coords(cx, side, groups, indices).ok_or_else(|| {
         Error::Legality("CPU JIT contraction cannot state side coordinates".into())

@@ -14,7 +14,7 @@ use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
     Accumulator, Addr, Builtin, CoopMatrixRole, CoopSrc, ElementType, KernelIr, ReduceKind,
     ScalarElement, Source, Stmt, StorageView, Tile, TileBinaryOp, TileCompareOp, TileExpr,
-    TileReduceOp, WorkgroupAxis, cooperative_store_layout_supported,
+    TileReduceOp, cooperative_store_layout_supported,
 };
 use fusor_ir::ir::launch::{
     ContractSide, CoopGeom, Family, Launch, SchedPoint, SgemmParams, SgemvParams,
@@ -249,7 +249,7 @@ pub(crate) fn lower_coop(
     let want_rows = shape.batch.saturating_mul(m_padded).max(1);
     let out_view = StorageView {
         buffer: ctx.buffer(out)?,
-        offset: 0,
+        offset: ctx.offset_of(out),
         layout: fusor_ir::ir::kernel::TileLayout::contiguous(
             fusor_ir::ir::kernel::MemoryLevel::Storage,
             &[want_rows, n_padded],
@@ -607,19 +607,7 @@ pub(crate) fn lower_coop(
 /// stores the same values. The clamp is emitted only when the grid
 /// over-covers.
 fn workgroup_index(ctx: &mut Ctx<'_>, grid: [u32; 3], groups: u32) -> TileExpr {
-    let gx = ctx.b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
-    let gy = ctx.b.builtin(Builtin::ProgramId(WorkgroupAxis::Y));
-    let gz = ctx.b.builtin(Builtin::ProgramId(WorkgroupAxis::Z));
-    // Linearization constants from `@builtin(num_workgroups)`, never baked:
-    // a baked grid puts the dispatch size into the body and recompiles the
-    // pipeline whenever a symbolic extent moves the grid.
-    let x_e = ctx.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::X));
-    let y_only = ctx.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::Y));
-    let xy_e = ctx.b.mul(x_e.clone(), y_only);
-    let y_off = ctx.b.mul(gy, x_e);
-    let z_off = ctx.b.mul(gz, xy_e);
-    let id = ctx.b.add(gx, y_off);
-    let id = ctx.b.add(id, z_off);
+    let id = ctx.linear_workgroup();
     let covered = u64::from(grid[0]) * u64::from(grid[1]) * u64::from(grid[2]);
     if covered > u64::from(groups) {
         let last = ctx.b.u32(groups.saturating_sub(1));

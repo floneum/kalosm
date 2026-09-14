@@ -9,8 +9,11 @@
 //! shape family.
 
 use crate::realize::{self, Component, Realized};
+use rustc_hash::{FxHashMap, FxHashSet};
 use fusor_ir::Result;
+use fusor_ir::error::Error;
 use fusor_ir::cost::DeviceFacts;
+use fusor_ir::dtype::{Dtype, Persistence};
 use fusor_ir::egraph::{EGraph, Id};
 use fusor_ir::extract::{BindKind, BindingPlan, BufferPlan, Dispatch, Extraction, Plan, PlanHash};
 use fusor_ir::facts::ValueFacts;
@@ -44,7 +47,20 @@ pub fn derive_plan(
     symbols.extend(scalar_symbols.iter().copied());
 
     let mut launches = Vec::with_capacity(realized.components.len());
+    let private: FxHashSet<Id> = realized
+        .components
+        .iter()
+        .flat_map(|c| c.private.iter().copied())
+        .collect();
     for c in &realized.components {
+        // A slab member kept in workgroup memory is read by nothing outside
+        // that slab; a launch binding one would read a buffer nothing wrote.
+        if let Some(r) = c.external.iter().find(|r| private.contains(r)) {
+            return Err(Error::Plan(format!(
+                "launch {} reads {r}, a slab member kept in workgroup memory",
+                c.root
+            )));
+        }
         launches.push(Dispatch {
             root: c.root,
             members: c.members.iter().copied().collect(),
@@ -54,16 +70,130 @@ pub fn derive_plan(
         });
     }
 
-    let hash = plan_hash(graph, extraction, &launches, &symbols, facts);
+    let mut buffers = buffers;
+    let arena_bytes = if facts.caps.kind == fusor_ir::device::DeviceKind::Gpu {
+        pack_arena(&mut buffers, &mut launches, realized)
+    } else {
+        0
+    };
+    let hash = plan_hash(graph, extraction, &launches, &buffers, &symbols, facts);
     Ok(Plan {
         extraction: extraction.clone(),
         launches,
         buffers,
+        arena_bytes,
         symbols,
         scalar_symbols,
         hash,
         cost,
     })
+}
+
+/// Interval-color the step-local intermediates into one arena: each is
+/// live from the first launch binding it to the last, and two whose ranges
+/// are disjoint take the same bytes. A launch then binds the arena once per
+/// dtype instead of once per value, which is what the device's binding
+/// limit counts. Returns the arena's size.
+fn pack_arena(buffers: &mut [BufferPlan], launches: &mut [Dispatch], realized: &Realized) -> u64 {
+    const ALIGN: u64 = 256;
+    let mut first: FxHashMap<Id, usize> = FxHashMap::default();
+    let mut last: FxHashMap<Id, usize> = FxHashMap::default();
+    for (ix, l) in launches.iter().enumerate() {
+        for b in &l.bindings {
+            first.entry(b.value).or_insert(ix);
+            last.insert(b.value, ix);
+        }
+    }
+    // Candidates: step-local, constant extent, not read back by the caller.
+    let mut items: Vec<(usize, usize, u64, usize)> = Vec::new();
+    for (i, b) in buffers.iter().enumerate() {
+        if b.persistence != Persistence::Step || realized.is_root(b.value) {
+            continue;
+        }
+        let Some(elements) = b.elements.as_const() else { continue };
+        let (Some(s), Some(e)) = (first.get(&b.value), last.get(&b.value)) else { continue };
+        let bytes = elements.saturating_mul(b.dtype.byte_size()).max(4).div_ceil(ALIGN) * ALIGN;
+        items.push((*s, *e, bytes, i));
+    }
+    if items.is_empty() {
+        return 0;
+    }
+    items.sort_unstable_by_key(|(s, e, bytes, i)| (*s, *e, std::cmp::Reverse(*bytes), *i));
+    // Best-fit over a free list, releasing blocks whose ranges have ended.
+    let mut free: Vec<(u64, u64)> = Vec::new(); // (offset, bytes)
+    let mut live: Vec<(usize, u64, u64)> = Vec::new(); // (end, offset, bytes)
+    let mut top = 0u64;
+    for (s, e, bytes, i) in items {
+        let mut j = 0;
+        while j < live.len() {
+            if live[j].0 < s {
+                let (_, off, len) = live.swap_remove(j);
+                free.push((off, len));
+            } else {
+                j += 1;
+            }
+        }
+        // Coalesce adjacent free blocks.
+        free.sort_unstable();
+        let mut merged: Vec<(u64, u64)> = Vec::new();
+        for (off, len) in free.drain(..) {
+            match merged.last_mut() {
+                Some((o, l)) if *o + *l == off => *l += len,
+                _ => merged.push((off, len)),
+            }
+        }
+        free = merged;
+        let fit = free
+            .iter()
+            .enumerate()
+            .filter(|(_, (_, len))| *len >= bytes)
+            .min_by_key(|(_, (_, len))| *len)
+            .map(|(k, _)| k);
+        let offset = match fit {
+            Some(k) => {
+                let (off, len) = free[k];
+                if len == bytes {
+                    free.remove(k);
+                } else {
+                    free[k] = (off + bytes, len - bytes);
+                }
+                off
+            }
+            None => {
+                let off = top;
+                top += bytes;
+                off
+            }
+        };
+        live.push((e, offset, bytes));
+        buffers[i].arena = Some(offset);
+    }
+    let in_arena: FxHashMap<Id, Dtype> = buffers
+        .iter()
+        .filter(|b| b.arena.is_some())
+        .map(|b| (b.value, b.dtype))
+        .collect();
+    // One binding per dtype per launch for the arena values, renumbered.
+    for l in launches.iter_mut() {
+        let mut out: Vec<BindingPlan> = Vec::with_capacity(l.bindings.len());
+        let mut slot_of_dtype: FxHashMap<Dtype, u32> = FxHashMap::default();
+        let mut next = 1u32;
+        for b in &l.bindings {
+            if let Some(dtype) = in_arena.get(&b.value) {
+                let binding = *slot_of_dtype.entry(*dtype).or_insert_with(|| {
+                    let n = next;
+                    next += 1;
+                    n
+                });
+                out.push(BindingPlan { binding, value: b.value, kind: BindKind::ReadWrite, arena: true });
+            } else {
+                out.push(BindingPlan { binding: next, value: b.value, kind: b.kind, arena: false });
+                next += 1;
+            }
+        }
+        l.bindings = out;
+    }
+    top
 }
 
 /// One [`BufferPlan`] per node in `m ∪ roots`, in realized order. Leaves are
@@ -74,12 +204,17 @@ pub fn derive_buffers(
     extraction: &Extraction,
     realized: &Realized,
 ) -> Result<Vec<BufferPlan>> {
+    let private: FxHashSet<Id> = realized
+        .components
+        .iter()
+        .flat_map(|c| c.private.iter().copied())
+        .collect();
     let mut out = Vec::new();
     for id in &realized.order {
         if realize::leaf_role(graph, *id) != realize::LeafRole::NotLeaf {
             continue;
         }
-        if !extraction.is_materialized(*id) && !realized.is_root(*id) {
+        if !extraction.is_materialized(*id) && !realized.is_root(*id) || private.contains(id) {
             continue;
         }
         let facts = graph.facts(*id);
@@ -91,6 +226,7 @@ pub fn derive_buffers(
             layout,
             dtype: facts.dtype,
             persistence: facts.persistence,
+            arena: None,
         });
     }
     Ok(out)
@@ -109,7 +245,9 @@ pub fn derive_bindings(
         .members
         .iter()
         .copied()
-        .filter(|m| extraction.is_materialized(*m) || realized.is_root(*m))
+        .filter(|m| {
+            (extraction.is_materialized(*m) || realized.is_root(*m)) && !component.private.contains(m)
+        })
         .collect();
     writes.sort_unstable();
     writes.dedup();
@@ -128,6 +266,7 @@ pub fn derive_bindings(
             binding,
             value,
             kind: BindKind::Read,
+            arena: false,
         });
         binding += 1;
     }
@@ -140,6 +279,7 @@ pub fn derive_bindings(
             binding,
             value,
             kind,
+            arena: false,
         });
         binding += 1;
     }
@@ -315,6 +455,7 @@ pub fn plan_hash(
     graph: &EGraph,
     extraction: &Extraction,
     launches: &[Dispatch],
+    buffers: &[BufferPlan],
     symbols: &[SymId],
     facts: &DeviceFacts,
 ) -> PlanHash {
@@ -322,6 +463,12 @@ pub fn plan_hash(
     let sm = SymMap::new(symbols);
     for (seed, h) in lanes.iter_mut().enumerate() {
         h.write_u64(seed as u64);
+        for b in buffers {
+            if let Some(off) = b.arena {
+                h.write_u32(b.value.0);
+                h.write_u64(off);
+            }
+        }
         for launch in launches {
             h.write_u32(launch.root.0);
             h.write_u32(launch.grid[0]);
@@ -809,6 +956,17 @@ fn hash_l1<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &Launch) {
             }
             live_outs.hash(h);
         }
+        Launch::Slab { slabs, members, .. } => {
+            h.write_u32(*slabs);
+            for m in members {
+                h.write_u32(m.0);
+            }
+        }
+        Launch::Group { members, .. } => {
+            for m in members {
+                h.write_u32(m.0);
+            }
+        }
         Launch::Ext { def, ops, attrs } => {
             def.hash(h);
             hash_operands(h, sm, ops);
@@ -927,7 +1085,7 @@ fn collect_op(op: &Op, dims: &mut Vec<SymId>, scalars: &mut Vec<SymId>) {
                 collect_ops(ops, dims);
             }
             Launch::Ext { ops, .. } => collect_ops(ops, dims),
-            Launch::Region { .. } => {}
+            Launch::Region { .. } | Launch::Slab { .. } | Launch::Group { .. } => {}
         },
     }
 }

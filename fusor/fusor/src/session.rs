@@ -753,7 +753,7 @@ impl Session {
             // resolve of this key replays.
             let missed = self.inner.replay.get(key).is_none();
             let graph_ref: &EGraph = &g;
-            let (plan, _unchanged) = self.inner.replay.get_or_extract(key, || {
+            let (plan, _unchanged) = self.inner.replay.get_or_extract(key, graph_ref, || {
                 self.inner.extractor.extract(
                     graph_ref,
                     &roots,
@@ -984,7 +984,7 @@ impl Session {
                     [x, y] => g.union(*x, *y)?,
                     _ => id,
                 }
-            } else if !is_root && !is_leaf && bound.contains(&id) {
+            } else if !is_root && !is_leaf && bound.contains(&id) && dense_bound(graph, id) {
                 if resolve_profile() {
                     eprintln!("[profile]   cutting {id} ({:?})", node.op.tag());
                 }
@@ -3069,6 +3069,21 @@ impl Gather {
 /// `None` when the shapes do not factor this way — the caller turns that
 /// into an error rather than a dense read, because reading a padded buffer
 /// densely returns padding as data.
+/// Whether `id`'s bound device buffer holds its value densely.
+///
+/// A `Coop` output is padded to whole blocks, and the padding lives in the
+/// layout the buffer was bound with. An external leaf carries no
+/// `BufferPlan`, so `repad_index` has nothing to correct a read of it with
+/// and would take the padding for data; such a value is recomputed rather
+/// than cut at.
+fn dense_bound(graph: &GraphRef, id: Id) -> bool {
+    let Some(layout) = graph.device_layout(id) else {
+        return true;
+    };
+    layout.offset().known_eq(Dim::Const(0))
+        && layout.strides() == &fusor_ir::shape::Layout::row_major_strides(layout.shape())[..]
+}
+
 fn restate_layout(
     layout: &fusor_ir::shape::Layout,
     shape: &[Dim],
@@ -3281,6 +3296,48 @@ mod tests {
             1,
             "a replay hit must not extract and record another plan"
         );
+    }
+
+    /// A `Coop` contraction pads its output to whole blocks, and a view of
+    /// that output is served by cutting the graph at the bound buffer. The
+    /// cut mints an external leaf, which carries no `BufferPlan` for
+    /// `repad_index` to correct the read with, so the view must not be cut
+    /// there — it read the padding as data.
+    #[test]
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    fn a_view_of_a_padded_contraction_reads_the_value_not_its_padding() {
+        let Ok(backend) = Backend::gpu_blocking() else {
+            return;
+        };
+        let session = Session::new(backend).unwrap();
+        let graph = Graph::new(&session);
+        let h = graph.handle();
+        // `n = 130` is not a multiple of any block width, so every geometry
+        // the extractor can pick pads it; the extents are large enough that
+        // it picks a cooperative one.
+        const T: u64 = 512;
+        const K: u64 = 512;
+        const N: u64 = 130;
+        let xs: Vec<f32> = (0..T * K).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
+        let ws: Vec<f32> = (0..N * K).map(|i| ((i * 53 % 97) as f32 - 48.0) / 48.0).collect();
+        let x = Tensor::from_elements(h, &[Dim::Const(T), Dim::Const(K)], &xs).unwrap();
+        let w = Tensor::from_elements(h, &[Dim::Const(N), Dim::Const(K)], &ws).unwrap();
+        let y = x.matmul_t(&w).unwrap();
+        let flat = y
+            .reshape_dims(&[Dim::Const(1), Dim::Const(T), Dim::Const(N)])
+            .unwrap();
+
+        let full = h.read_back(y.id).unwrap();
+        let full = bytemuck::cast_slice::<u8, f32>(&full).to_vec();
+        let view = h.read_back(flat.id).unwrap();
+        let view = bytemuck::cast_slice::<u8, f32>(&view).to_vec();
+        assert_eq!(full.len(), view.len());
+        let worst = full
+            .iter()
+            .zip(&view)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert!(worst < 1e-4, "a view of the contraction differs by {worst}");
     }
 
     /// A model step rebuilt with a longer cache every call (a `cat` onto a

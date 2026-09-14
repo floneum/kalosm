@@ -28,7 +28,7 @@ use fusor_ir::ir::kernel::ArenaPlanner;
 use fusor_ir::ir::launch::{Effect, Launch, SchedPoint, ScheduleDomain};
 use fusor_ir::ir::{OpDefId, OpDefRegistry};
 use fusor_ir::shape::Dim;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Clauses 1, 3, 4, 5 and the root half of 6 — everything derivable from the
 /// graph and the plan alone.
@@ -37,8 +37,132 @@ pub(crate) fn verify_plan(graph: &EGraph, plan: &Plan) -> Result<()> {
     check_operands(graph, plan)?;
     check_operand_spaces(graph, plan)?;
     check_buffers(graph, plan)?;
+    check_launch_order(graph, plan)?;
     check_effect_pinning(graph, plan)?;
     check_roots(graph, plan)?;
+    check_slabs(graph, plan)?;
+    Ok(())
+}
+
+/// A selected slab is one launch with all of its members: materialized
+/// itself, every member but the last selected in its class and materialized,
+/// the last member's class selecting the slab, and every member in the
+/// slab's dispatch. Anything else is a stage computed twice or never.
+pub(crate) fn check_slabs(graph: &EGraph, plan: &Plan) -> Result<()> {
+    let launch_of = launch_index(plan);
+    let mut realized: Vec<Id> = plan
+        .launches
+        .iter()
+        .flat_map(|l| l.members.iter().copied())
+        .filter(|id| matches!(graph.node(*id).op, Op::Launch(Launch::Slab { .. } | Launch::Group { .. })))
+        .collect();
+    realized.sort_unstable();
+    realized.dedup();
+    // A member slab's class selects the group it ends: the group's buffer is
+    // where that value lands.
+    let group_last: FxHashSet<Id> = plan
+        .launches
+        .iter()
+        .flat_map(|l| l.members.iter().copied())
+        .filter_map(|id| match &graph.node(id).op {
+            Op::Launch(Launch::Group { members, .. }) => members.last().copied(),
+            _ => None,
+        })
+        .collect();
+    // A group's launch holds every member composite's nodes; the count is
+    // checked on the group, and a member slab is checked for the rest.
+    let grouped: FxHashSet<Id> = plan
+        .launches
+        .iter()
+        .flat_map(|l| l.members.iter().copied())
+        .filter_map(|id| match &graph.node(id).op {
+            Op::Launch(Launch::Group { members, .. }) => Some(members.iter().copied()),
+            _ => None,
+        })
+        .flatten()
+        .collect();
+    for id in realized {
+        let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) = &graph.node(id).op else {
+            continue;
+        };
+        if group_last.contains(&id) {
+            continue;
+        }
+        let expected = match &graph.node(id).op {
+            Op::Launch(Launch::Group { .. }) => members
+                .iter()
+                .map(|m| match &graph.node(*m).op {
+                    Op::Launch(Launch::Slab { members: sm, .. }) => sm.len() + 1,
+                    _ => 1,
+                })
+                .sum::<usize>() + 1,
+            _ => members.len() + 1,
+        };
+        if !plan.extraction.is_materialized(id) {
+            return Err(Error::Plan(format!("slab {id} is inlined")));
+        }
+        let own = launch_of.get(&id).copied();
+        let Some((last, middle)) = members.split_last() else {
+            return Err(Error::Plan(format!("slab {id} has no members")));
+        };
+        if plan.extraction.selected(graph.class_of(*last)) != Some(id) {
+            return Err(Error::Plan(format!(
+                "slab {id}'s last member {last} is selected past the slab"
+            )));
+        }
+        if plan.extraction.is_materialized(*last) {
+            return Err(Error::Plan(format!(
+                "slab {id}'s last member {last} is materialized beside the slab's own buffer"
+            )));
+        }
+        if let Some(ix) = own
+            && !grouped.contains(&id)
+            && plan.launches[ix].members.len() != expected
+        {
+            let foreign: Vec<Id> = plan.launches[ix]
+                .members
+                .iter()
+                .copied()
+                .filter(|m| *m != id && !members.contains(m))
+                .collect();
+            return Err(Error::Plan(format!(
+                "slab {id}'s launch has {} nodes for {} members: foreign {foreign:?}",
+                plan.launches[ix].members.len(),
+                members.len()
+            )));
+        }
+        for m in members.iter() {
+            if launch_of.get(m).copied() != own {
+                let class = graph.class_of(*m);
+                return Err(Error::Plan(format!(
+                    "slab {id}'s member {m} is not in the slab's launch: member launch {:?}, \
+                     slab launch {own:?}, member materialized {}, class {} selects {:?}, \
+                     op {:?}",
+                    launch_of.get(m),
+                    plan.extraction.is_materialized(*m),
+                    class.0,
+                    plan.extraction.selected(class),
+                    graph.node(*m).op.tag(),
+                )));
+            }
+        }
+        for m in middle {
+            if plan.extraction.selected(graph.class_of(*m)) != Some(*m) {
+                let class = graph.class_of(*m);
+                return Err(Error::Plan(format!(
+                    "slab {id} ({:?}) member {m} ({:?}) is not its class {}'s selection {:?} ({:?})",
+                    graph.node(id).op.tag(),
+                    graph.node(*m).op.tag(),
+                    class.0.index(),
+                    plan.extraction.selected(class),
+                    plan.extraction.selected(class).map(|s| graph.node(s).op.tag()),
+                )));
+            }
+            if !plan.extraction.is_materialized(*m) {
+                return Err(Error::Plan(format!("slab {id}'s member {m} is inlined")));
+            }
+        }
+    }
     Ok(())
 }
 
@@ -121,7 +245,11 @@ pub(crate) fn verify_plan_with(
 pub(crate) fn check_bind_groups(plan: &Plan, caps: &Caps) -> Result<()> {
     let limit = caps.limits.max_storage_buffers_per_shader_stage as usize;
     for (i, launch) in plan.launches.iter().enumerate() {
-        let needed = launch.bindings.len() + 1;
+        // Arena values share a binding: count distinct slots.
+        let mut slots: Vec<u32> = launch.bindings.iter().map(|b| b.binding).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let needed = slots.len() + 1;
         if needed > limit {
             return Err(Error::Plan(format!(
                 "launch {i} (root {}) binds {} storage buffers — {} operands plus the \
@@ -399,4 +527,31 @@ fn launch_index(plan: &Plan) -> FxHashMap<Id, usize> {
         }
     }
     out
+}
+
+/// Every value a launch reads is written by an earlier launch or comes from
+/// outside the plan: a launch order the realizer could not sort — a cycle
+/// between launches — would otherwise run and read what nothing wrote yet.
+pub(crate) fn check_launch_order(graph: &EGraph, plan: &Plan) -> Result<()> {
+    let mut written: rustc_hash::FxHashSet<Id> = rustc_hash::FxHashSet::default();
+    for (i, l) in plan.launches.iter().enumerate() {
+        for b in &l.bindings {
+            if matches!(b.kind, fusor_ir::extract::BindKind::Read)
+                && realize::leaf_role(graph, b.value) == realize::LeafRole::NotLeaf
+                && !written.contains(&b.value)
+            {
+                return Err(Error::Plan(format!(
+                    "launch {i} (root {}) reads {} before any launch writes it: the launches \
+                     have a dependency cycle",
+                    l.root, b.value
+                )));
+            }
+        }
+        for b in &l.bindings {
+            if !matches!(b.kind, fusor_ir::extract::BindKind::Read) {
+                written.insert(b.value);
+            }
+        }
+    }
+    Ok(())
 }

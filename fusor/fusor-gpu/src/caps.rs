@@ -101,9 +101,8 @@ pub(crate) fn widen_limits(
 /// The wgpu features to request, given what the adapter supports. Each is
 /// optional and independently fallback-covered.
 ///
-/// `TIMESTAMP_QUERY` is requested whenever available: profiling is read
-/// through [`Caps::timestamp_query`], and a device that never resolves a query
-/// set pays nothing for holding the feature bit.
+/// Native `TIMESTAMP_QUERY` supports the synchronous tuner. Browser timing
+/// remains disabled until that tuner can resolve queries asynchronously.
 pub(crate) fn requested_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     let available = adapter.features();
     let mut wanted = wgpu::Features::empty();
@@ -112,9 +111,7 @@ pub(crate) fn requested_features(adapter: &wgpu::Adapter) -> wgpu::Features {
             wanted |= f;
         }
     };
-    // wasm32 never requests SUBGROUP: the browser's WebGPU surface does not
-    // expose it, and the `WgTree` fold is the working fallback.
-    #[cfg(not(target_arch = "wasm32"))]
+    // Subgroups are optional on both native and browser adapters.
     want(wgpu::Features::SUBGROUP);
     want(wgpu::Features::SHADER_F16);
     want(wgpu::Features::PIPELINE_CACHE);
@@ -131,8 +128,7 @@ pub(crate) fn requested_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     }
     // Cooperative matrices are experimental: requesting the bit additionally
     // needs `unsafe ExperimentalFeatures::enabled()` on the descriptor, which
-    // `device::request_device` supplies. wasm32 requests neither.
-    #[cfg(not(target_arch = "wasm32"))]
+    // `device::request_device` supplies. The web backend maps Dawn's extension.
     want(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
     // The second experimental bit, EXPERIMENTAL_WORKGROUP_MEMORY_ALIAS, exists
     // only on the wgpu fork; released wgpu 29 does not define it. The

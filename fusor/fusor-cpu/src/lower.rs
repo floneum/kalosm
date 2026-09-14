@@ -62,7 +62,11 @@ pub(crate) fn lower(
         Launch::Gather { .. } | Launch::Scatter { .. } => {
             gather_scatter::lower(caps, node, theta, cx)
         }
-        Launch::Region { members, .. } => compose(caps, members, theta, cx, "cpu_region"),
+        Launch::Region { members, .. } => compose(caps, members, theta, cx, "cpu_region", false),
+        // Members are read by id: the last one shares the slab's class, and
+        // selecting it would lower the slab again.
+        Launch::Slab { members, .. } => compose(caps, members, theta, cx, "cpu_slab", true),
+        Launch::Group { members, .. } => compose(caps, members, theta, cx, "cpu_group", true),
         Launch::Ext { def, .. } => ext::lower(*def, node, theta),
     }
 }
@@ -81,6 +85,7 @@ fn compose(
     theta: SchedPoint,
     cx: &LowerCtx<'_>,
     name: &'static str,
+    by_id: bool,
 ) -> Result<KernelIr> {
     if members.is_empty() {
         return Err(Error::Legality(
@@ -104,7 +109,7 @@ fn compose(
     let binds = Binds::build(cx)?;
     let mut kernels = Vec::with_capacity(members.len());
     for m in members {
-        let selected = cx.selected(*m);
+        let selected = if by_id { *m } else { cx.selected(*m) };
         let node = cx.graph.node(selected);
         // Each member is scheduled at its own point, not the composite's.
         let member_theta = cx

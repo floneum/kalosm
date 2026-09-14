@@ -6,6 +6,9 @@
 //! Rule order carries no semantics; the fixed order below exists only for
 //! reproducibility.
 
+pub mod absorb_view;
+pub mod group;
+pub mod scatter_fold;
 pub mod algebra;
 pub mod fusion;
 pub mod layout;
@@ -13,7 +16,9 @@ pub mod lower_floor;
 pub mod promote;
 pub mod rebase;
 pub mod sink;
+pub mod slab;
 pub mod specialize;
+pub mod split_k;
 pub mod tuple;
 
 use crate::dtype::Dtype;
@@ -47,6 +52,8 @@ pub static CORE_RULES: &[Rule] = &[
     fusion::MAP_INTO_MAP,
     fusion::FOLD_POST_EPILOGUE,
     fusion::FORM_KREGION,
+    slab::FORM_SLAB_MAP,
+    slab::FORM_SLAB_FOLD,
     // Launch fold algebra — the carrier laws. `HOIST` and `RETARGET` are two
     // entries sharing one dependence query: the driver's fired set is per
     // `(RuleId, Id)`, so one merged rule could fire at most once per node
@@ -77,6 +84,14 @@ pub static CORE_RULES: &[Rule] = &[
     lower_floor::LOWER_PROJECT,
     // shape specialization
     specialize::SPECIALIZE_DIM,
+    split_k::SPLIT_K,
+    absorb_view::ABSORB_VIEW_INTO_CONTRACT,
+    absorb_view::ABSORB_BROADCAST_INTO_MAP,
+    absorb_view::ABSORB_BROADCAST_INTO_FOLD,
+    group::FORM_GROUP_MAP,
+    group::FORM_GROUP_FOLD,
+    group::FORM_GROUP_SLAB,
+    scatter_fold::SCATTER_ADD_AS_FOLD,
 ];
 
 /// Look a core rule up by the name its `rule!` declaration stringified.

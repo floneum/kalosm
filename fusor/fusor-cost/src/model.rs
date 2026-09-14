@@ -164,7 +164,12 @@ impl Roofline {
             den,
         );
 
-        let dram = terms::dram_ps(f, launch.reads, launch.writes);
+        // Bandwidth is not free of parallelism: a launch resident on a
+        // fraction of the device cannot keep DRAM busy, and the shortfall
+        // that throttles issue throttles the memory pipe too. Without it a
+        // reduction is priced on bytes alone, so every lane group reads the
+        // same total and occupancy never enters the comparison.
+        let dram = terms::scaled(terms::dram_ps(f, launch.reads, launch.writes, launch.line_bytes), num, den);
         // One split's padded output; `(splits + 1)` then counts reading
         // every partial and writing the result.
         let combine = terms::combine_ps(
@@ -173,7 +178,14 @@ impl Roofline {
             launch.writes / u64::from(sched.splits.max(1)),
         );
 
-        Picoseconds(f.launch_ps) + dram.max(issue) + drain + combine
+        // What one workgroup cannot finish faster than: its dependent chain.
+        let serial = Picoseconds(
+            launch
+                .coop_steps
+                .saturating_mul(f.coop_step_ps)
+                .saturating_add(launch.lane_steps.saturating_mul(f.lane_step_ps)),
+        );
+        Picoseconds(f.launch_ps) + dram.max(issue).max(serial) + drain + combine
     }
 }
 
@@ -189,6 +201,40 @@ fn unit_and_dtype(
     match theta {
         Some(SchedPoint::Coop { .. }) => (MacUnit::Coop, dtype),
         _ => (MacUnit::Fma, dtype),
+    }
+}
+
+impl Roofline {
+    /// Line traffic beyond the useful bytes a fold moves at `theta`'s lane
+    /// group, over the operands it walks at its own iteration space.
+    fn fold_line_floor(&self, node: &Node, ins: &[ValueFacts], theta: Option<SchedPoint>) -> Picoseconds {
+        let fusor_ir::ir::Op::Launch(fusor_ir::ir::launch::Launch::Fold { space, axis, .. }) = &node.op
+        else {
+            return Picoseconds(0);
+        };
+        let Some(total) = space.iterations() else {
+            return Picoseconds(0);
+        };
+        let dims: Vec<u64> = space.dims.iter().filter_map(|d| d.as_const()).collect();
+        let caps = &self.facts.caps;
+        let lane_group = match theta {
+            Some(SchedPoint::Fold(s)) => s.lane_group(caps.subgroup_width()),
+            // The emitters' default at a bare point: the subgroup collective
+            // where there is one, the full block otherwise.
+            _ if caps.subgroups.is_some() => caps.subgroup_width(),
+            _ => fusor_ir::ir::launch::emitted_block(1, caps),
+        };
+        let mut extra = 0u64;
+        for f in ins {
+            let elems = f.shape.iter().try_fold(1u64, |a, d| d.as_const().map(|d| a * d));
+            if elems != Some(total) {
+                continue;
+            }
+            let elem = f.dtype.byte_size().max(1) as u64;
+            let amp = crate::realize::fold_line_amplification(&dims, *axis as usize, lane_group, caps, elem);
+            extra = extra.saturating_add(total.saturating_mul(elem).saturating_mul(amp - 1));
+        }
+        terms::dram_ps(&self.facts, &[], 0, extra)
     }
 }
 
@@ -246,11 +292,24 @@ impl CostModel for Roofline {
         }
         // Zero traffic, no occupancy scaling. The admissible lower bound is
         // built from this, and either addition would break admissibility.
-        terms::math_ps(&self.facts, work, unit, dtype)
+        // The one memory term that is a floor of the node itself: a fold's
+        // line amplification at this point, which every plan through the
+        // point pays whatever it inlines around it.
+        let t = terms::math_ps(&self.facts, work, unit, dtype) + self.fold_line_floor(node, ins, theta);
+        // A workgroup's dependent chain is a floor of the node at this point
+        // too: nothing around it shortens the k loop.
+        if std::env::var_os("FUSOR_NO_SEED_FLOOR").is_some() {
+            return t;
+        }
+        let (coop, lane) = crate::realize::node_serial_steps(&node.op, theta, &self.facts.caps);
+        let serial = coop
+            .saturating_mul(self.facts.coop_step_ps)
+            .saturating_add(lane.saturating_mul(self.facts.lane_step_ps));
+        t.max(Picoseconds(serial))
     }
 
     fn traffic(&self, bytes: u64, rereads: u32) -> Picoseconds {
-        terms::dram_ps(&self.facts, &[(bytes, rereads)], 0)
+        terms::dram_ps(&self.facts, &[(bytes, rereads)], 0, 0)
     }
 
     fn compile_amortized(&self, plan: PlanHash, expected_reuse: u32) -> Picoseconds {

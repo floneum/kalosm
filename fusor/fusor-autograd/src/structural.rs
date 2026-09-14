@@ -238,6 +238,9 @@ pub(crate) fn window_adjoint(
     if let Some(dx) = window_view_adjoint(tape, specs, &xshape, grad)? {
         return Ok(smallvec::smallvec![Some(dx)]);
     }
+    if let Some(dx) = window_overlap_adjoint(tape, specs, &xshape, grad)? {
+        return Ok(smallvec::smallvec![Some(dx)]);
+    }
 
     // Overlap-add. `IndexOf` over the position axis and the trailing window
     // axis reconstruct the source coordinate; duplicates accumulate.
@@ -265,6 +268,81 @@ pub(crate) fn window_adjoint(
     let dtype = tape.dtype_of(x);
     let dx = scatter_back(tape, grad, idx_expr, &xshape, dtype)?;
     Ok(smallvec::smallvec![Some(dx)])
+}
+
+/// The overlapping branch: one `Scatter{Add}` per windowed axis.
+///
+/// [`scatter_back`] flattens to a single axis of `numel` bins, and
+/// `scatter_dense` costs `O(bins x updates)` — 18 816 x 42 336 for a 3x3
+/// stride-2 conv over a `[24, 1, 30, 30]` batch, 74 ms in one dispatch. A
+/// `Window` spec touches one axis and the overlap-add is separable, so per
+/// axis the bins stay that axis's extent and the updates `positions *
+/// window`: 30 x 42 twice.
+fn window_overlap_adjoint(
+    tape: &mut dyn Tape,
+    specs: &[SlidingWindow],
+    xshape: &[Dim],
+    grad: Val,
+) -> Result<Option<Val>> {
+    let rank = xshape.len();
+    let dtype = tape.dtype_of(grad);
+    let mut cur = grad;
+    for i in (0..specs.len()).rev() {
+        let w = specs[i];
+        let a = w.axis as usize;
+        let (window, step) = (u64::from(w.window), u64::from(w.step));
+        let Some(extent) = xshape.get(a).and_then(|d| d.as_const()) else {
+            return Ok(None);
+        };
+        if window == 0 || step == 0 {
+            return Ok(None);
+        }
+        let shape = tape.shape_of(cur);
+        let last = shape.len() - 1;
+        debug_assert_eq!(last, rank + i);
+        let Some(positions) = shape.get(a).and_then(|d| d.as_const()) else {
+            return Ok(None);
+        };
+
+        // Move the trailing window axis next to its position axis. Identical
+        // to the tiling case: the two axes have to be adjacent before they
+        // can be read as one update axis.
+        let mut perm: Vec<u32> = Vec::with_capacity(shape.len());
+        perm.extend((0..=a).map(|j| j as u32));
+        perm.push(last as u32);
+        perm.extend((a + 1..last).map(|j| j as u32));
+        let permuted = tape.permute(cur, &perm)?;
+
+        // `(position, window) -> position * window + offset`. A logical
+        // reshape, not the tiling case's merge-restride: at `step != window`
+        // the position axis strides by `step` and the pair is not one run.
+        let pshape = tape.shape_of(permuted);
+        let mut updates_shape: Dims = SmallVec::with_capacity(pshape.len() - 1);
+        updates_shape.extend(pshape[..a].iter().copied());
+        updates_shape.push(Dim::Const(positions.saturating_mul(window)));
+        updates_shape.extend(pshape[a + 2..].iter().copied());
+        let updates = tape.reshape(permuted, &updates_shape)?;
+
+        let idx = window_index(tape, positions.saturating_mul(window), window, step)?;
+        let mut base_shape = updates_shape;
+        base_shape[a] = Dim::Const(extent);
+        let base = tape.zeros_shaped(dtype, &base_shape)?;
+        cur = tape.scatter_add(a as u32, base, idx, updates)?;
+    }
+    Ok(Some(cur))
+}
+
+/// `idx[u] = (u / window) * step + u % window`, as a rank-1 `Map` of
+/// `IndexOf`. The destination of update `u`, on device and in one pass —
+/// there is no host loop and no uploaded index buffer.
+fn window_index(tape: &mut dyn Tape, len: u64, window: u64, step: u64) -> Result<Val> {
+    let carrier = tape.zeros_shaped(Dtype::U32, &[Dim::Const(len)])?;
+    let u = ScalarExpr::index_of(0);
+    let w = ScalarExpr::lit(fusor_ir::dtype::Splat::U32(window as u32));
+    let position = ScalarExpr::bin(BinOp::Div, u.clone(), w.clone());
+    let offset = ScalarExpr::bin(BinOp::Rem, u, w);
+    let expr = ScalarExpr::bin(BinOp::Add, u32_mul(position, step), offset);
+    tape.map(expr, &[carrier])
 }
 
 /// The `is_mask` branch: a chain of pure views, or `None` when the geometry

@@ -38,6 +38,8 @@ pub mod graph;
 pub mod layers;
 pub(crate) mod ops;
 pub mod optim;
+#[cfg(feature = "gpu")]
+pub mod program;
 pub mod quantized;
 pub mod sampling;
 pub mod session;

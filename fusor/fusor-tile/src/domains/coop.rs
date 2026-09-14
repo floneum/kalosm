@@ -134,11 +134,11 @@ fn generate_geoms(operand: Dtype, cx: &DomainCtx<'_>) -> SmallVec<[CoopGeom; 16]
     let max_bytes = caps.limits.max_compute_workgroup_storage_size;
     let stage = stage_element(operand);
 
-    // `FUSOR_PIN_COOP="bm,bn,bk"` restricts the domain to one geometry, for
-    // measurement. Ordinary runs never set it.
-    let pin: Option<(u32, u32, u32)> = std::env::var("FUSOR_PIN_COOP").ok().and_then(|v| {
+    // `FUSOR_PIN_COOP="bm,bn,bk[,subgroups[,n_passes]]"` restricts the domain
+    // to one geometry, for measurement. Ordinary runs never set it.
+    let pin: Option<Vec<u32>> = std::env::var("FUSOR_PIN_COOP").ok().and_then(|v| {
         let p: Vec<u32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-        (p.len() == 3).then(|| (p[0], p[1], p[2]))
+        (p.len() >= 3).then_some(p)
     });
     let mut out: SmallVec<[CoopGeom; 16]> = SmallVec::new();
     for bm in BM_CHOICES {
@@ -153,8 +153,12 @@ fn generate_geoms(operand: Dtype, cx: &DomainCtx<'_>) -> SmallVec<[CoopGeom; 16]
                                 .planner
                                 .workgroup_bytes(&coop_tiles(geom, stage), caps)
                                 .is_ok_and(|bytes| bytes <= max_bytes)
-                            && pin.is_none_or(|(pm, pn, pk)| {
-                                geom.bm == pm && geom.bn == pn && geom.bk == pk
+                            && pin.as_ref().is_none_or(|p| {
+                                geom.bm == p[0]
+                                    && geom.bn == p[1]
+                                    && geom.bk == p[2]
+                                    && p.get(3).is_none_or(|sg| geom.subgroups == *sg)
+                                    && p.get(4).is_none_or(|np| geom.n_passes == *np)
                             })
                         {
                             out.push(geom);

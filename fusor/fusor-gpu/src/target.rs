@@ -432,8 +432,15 @@ impl GpuTarget {
         // is allocated on top of them.
         let mut resolved: FxHashMap<Id, Buf> = binds.buffers.clone();
         let mut pending: FxHashMap<Id, (u64, Persistence)> = FxHashMap::default();
+        // The step arena: every packed intermediate lives in it for the
+        // whole resolve.
+        let arena_buf = if plan.arena_bytes > 0 {
+            Some(self.pool.alloc(plan.arena_bytes, Persistence::Step)?)
+        } else {
+            None
+        };
         for buffer in &plan.buffers {
-            if resolved.contains_key(&buffer.value) {
+            if resolved.contains_key(&buffer.value) || buffer.arena.is_some() {
                 continue;
             }
             // `BufferPlan::elements` is the derived placeholder whenever any
@@ -557,8 +564,12 @@ impl GpuTarget {
             worker();
             #[cfg(not(target_arch = "wasm32"))]
             std::thread::scope(|scope| {
-                let threads = std::thread::available_parallelism()
-                    .map(|n| n.get())
+                // `FUSOR_COMPILE_THREADS` caps the parallel compiles, for
+                // telling one shader's compiler blow-up from their sum.
+                let threads = std::env::var("FUSOR_COMPILE_THREADS")
+                    .ok()
+                    .and_then(|v| v.parse::<usize>().ok())
+                    .or_else(|| std::thread::available_parallelism().map(|n| n.get()).ok())
                     .unwrap_or(1)
                     .min(len);
                 for _ in 0..threads {
@@ -613,6 +624,8 @@ impl GpuTarget {
         // that dispatch alone.
         let focus_plan_ix = self.launcher.take_tuning_focus();
         let mut records = Vec::with_capacity(total);
+        // Plan launch index and grid per live dispatch, for `TSPAN`.
+        let mut dispatch_launch: Vec<(usize, [u32; 3])> = Vec::new();
         for item in &mut work {
             let artifact = item
                 .artifact
@@ -628,7 +641,20 @@ impl GpuTarget {
             ordered.sort_by_key(|b| b.binding);
             let mut buffers = Vec::with_capacity(ordered.len() + 1);
             buffers.push(uniform_buf.clone());
+            let mut last_binding: Option<u32> = None;
             for b in &ordered {
+                // Arena values share a binding: bound once.
+                if last_binding == Some(b.binding) {
+                    continue;
+                }
+                last_binding = Some(b.binding);
+                if b.arena {
+                    let arena = arena_buf
+                        .clone()
+                        .ok_or_else(|| Error::Plan("launch binds the arena, which the plan never sized".into()))?;
+                    buffers.push(arena);
+                    continue;
+                }
                 let buf = match resolved.get(&b.value) {
                     Some(buf) => buf.clone(),
                     None => {
@@ -666,6 +692,9 @@ impl GpuTarget {
             // buffers, and a pool handle kept past this point would pin
             // every intermediate for the whole resolve.
             drop(buffers);
+            if !item.grid.contains(&0) {
+                dispatch_launch.push((item.launch_ix, item.grid));
+            }
             records.push(CommandRecord::Dispatch {
                 name: gpu.name,
                 pipeline: gpu.pipeline.clone(),
@@ -677,7 +706,8 @@ impl GpuTarget {
             // buffer alive, and dispatches execute in encoding order, so a
             // later launch may reuse it.
             for b in &ordered {
-                if last_use.get(&b.value) == Some(&item.launch_ix)
+                if !b.arena
+                    && last_use.get(&b.value) == Some(&item.launch_ix)
                     && !binds.buffers.contains_key(&b.value)
                     && plan
                         .buffers
@@ -729,6 +759,12 @@ impl GpuTarget {
                 self.launcher.timestamp_query_set(focus_pairs.len()),
                 TimingMode::Sparse(&focus_live),
             )
+        } else if std::env::var_os("FUSOR_TIME_PLAN").is_some() {
+            // The whole plan's GPU span as `TPLAN <us>`: the number the
+            // step rate is made of, free of host and clock-state noise
+            // between two plans measured back to back.
+            self.launcher.set_tuning(true);
+            (self.launcher.timestamp_query_set(1), TimingMode::Whole)
         } else if let Some(start) = std::env::var("FUSOR_TIME_RANGE")
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
@@ -766,6 +802,9 @@ impl GpuTarget {
             }
         }
         self.pool.recycle(uniform_buf);
+        if let Some(arena) = arena_buf {
+            self.pool.recycle(arena);
+        }
         self.pool.repoison_free_buffers();
         if gap {
             let end = start.elapsed();
@@ -817,6 +856,13 @@ impl GpuTarget {
                 }
                 return Ok(());
             }
+            if matches!(mode, TimingMode::Whole) {
+                let samples = self.launcher.read_timestamps(&self.pool, set, 1)?;
+                if let Some(us) = samples.first() {
+                    eprintln!("TPLAN {us:.1} n={total}");
+                }
+                return Ok(());
+            }
             if let TimingMode::Range { start, n } = mode {
                 let samples = self.launcher.read_timestamps(&self.pool, set, n)?;
                 let names: Vec<&'static str> = work
@@ -829,11 +875,15 @@ impl GpuTarget {
                             .unwrap_or("?")
                     })
                     .collect();
+                // `TSPAN <live index> <kernel> <us> L<plan launch> grid=[x,y,z]`:
+                // the plan index is what a plan dump names, the live index is
+                // what the encoder counted.
                 for (j, us) in samples.iter().enumerate() {
                     let ix = start + j;
+                    let (lix, grid) = dispatch_launch.get(ix).copied().unwrap_or((usize::MAX, [0; 3]));
                     eprintln!(
-                        "TSPAN {ix} {} {us:.1}",
-                        names.get(ix).copied().unwrap_or("?")
+                        "TSPAN {ix} {} {us:.1} L{lix} grid={grid:?}",
+                        names.get(lix).copied().unwrap_or("?")
                     );
                 }
                 return Ok(());
@@ -1255,6 +1305,10 @@ impl GpuTarget {
             )
         };
         self.launcher.note_pipeline_compile();
+        let trace = std::env::var_os("FUSOR_TRACE_DISPATCH").is_some();
+        if trace {
+            eprintln!("[compile] start {name} bindings={}", entries.len());
+        }
         let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
             label: Some(name),
             layout: Some(&pipeline_layout),
@@ -1263,6 +1317,9 @@ impl GpuTarget {
             compilation_options: wgpu::PipelineCompilationOptions::default(),
             cache: None,
         });
+        if trace {
+            eprintln!("[compile] done {name}");
+        }
         static NEXT_ARTIFACT_ID: std::sync::atomic::AtomicU64 =
             std::sync::atomic::AtomicU64::new(0);
         Ok(Artifact::new(GpuArtifact {
@@ -1357,6 +1414,14 @@ impl GpuTarget {
             self.cache.memory_len(),
             pool.live_bytes >> 20,
             pool.created,
+        );
+        use std::sync::atomic::Ordering::Relaxed;
+        eprintln!(
+            "[upload-stats] uniform_kib={} init_kib={} copy_kib={} poison_kib={}",
+            crate::pool::UPLOAD_UNIFORM.load(Relaxed) >> 10,
+            crate::pool::UPLOAD_INIT.load(Relaxed) >> 10,
+            crate::pool::COPY_BYTES.load(Relaxed) >> 10,
+            crate::pool::POISON_BYTES.load(Relaxed) >> 10,
         );
     }
 }

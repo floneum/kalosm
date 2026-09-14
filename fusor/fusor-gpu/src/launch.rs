@@ -48,7 +48,10 @@ fn scopeguard<F: FnMut()>(f: F) -> ScopeGuard<F> {
 /// Consecutive dispatches share a pass; past the threshold the pass is
 /// chunked, never dropped to a pass per dispatch — a Metal pass boundary
 /// costs on the order of a small kernel.
-pub const fn dispatches_per_pass(total: usize) -> usize {
+pub fn dispatches_per_pass(total: usize) -> usize {
+    if let Some(n) = std::env::var("FUSOR_PASS_SIZE").ok().and_then(|v| v.parse().ok()) {
+        return n;
+    }
     if total >= PASS_CHUNK_THRESHOLD {
         PASS_CHUNK
     } else {
@@ -247,6 +250,10 @@ pub enum TimingMode<'a> {
     /// `[start, start+n)` own slot pairs `(2(i-start), 2(i-start)+1)`, so a
     /// plan too large for a full query set can be timed in two halves.
     Range { start: usize, n: usize },
+    /// One pair around the whole submission: slot 0 at the first pass's
+    /// start, slot 1 at every pass's end (the last write stands). The
+    /// plan's GPU span, dispatch gaps included, with no pass splitting.
+    Whole,
 }
 
 impl TimingMode<'_> {
@@ -332,6 +339,31 @@ struct BindGroupEntry {
 /// reason [`crate::target::ARTIFACT_CAPACITY`] is: a plan larger than the
 /// cache evicts its own entries every resolve and never hits.
 const BIND_GROUP_CAPACITY: usize = 16_384;
+
+/// Unmaps a staging buffer if the readback awaiting it is dropped.
+///
+/// `Buffer::unmap` cancels an outstanding map, so the buffer goes back to the
+/// pool in a state the next caller can map.
+struct MapGuard<'a> {
+    staging: Option<&'a Buf>,
+}
+
+impl MapGuard<'_> {
+    /// The map resolved; there is nothing to cancel.
+    fn disarm(mut self) {
+        self.staging = None;
+    }
+}
+
+impl Drop for MapGuard<'_> {
+    fn drop(&mut self) {
+        if let Some(staging) = self.staging.take()
+            && let Some(gpu) = staging.downcast_ref::<GpuBuffer>()
+        {
+            gpu.buffer.unmap();
+        }
+    }
+}
 
 impl Launcher {
     pub fn new(
@@ -492,6 +524,7 @@ impl Launcher {
                 gpu.size
             )));
         }
+        crate::pool::UPLOAD_UNIFORM.fetch_add(bytes.len() as u64, std::sync::atomic::Ordering::Relaxed);
         self.queue.write_buffer(&gpu.buffer, 0, &bytes);
         Ok(())
     }
@@ -648,10 +681,18 @@ impl Launcher {
                 dispatches_in_chunk += 1;
             }
             if dispatches_in_chunk >= per_submit {
+                // Wall time per traced submit; `Instant` does not exist on
+                // wasm, and tracing is a native diagnostic.
+                #[cfg(not(target_arch = "wasm32"))]
+                let started = trace.then(std::time::Instant::now);
                 let (ix, submitted) =
                     self.encode_one_submit(&chunk, timestamps, mode, dispatch_ix, total)?;
                 if trace {
                     let poll = self.device.poll(wgpu::PollType::wait_indefinitely());
+                    #[cfg(not(target_arch = "wasm32"))]
+                    let __us = started.map_or(0, |t| t.elapsed().as_micros());
+                    #[cfg(target_arch = "wasm32")]
+                    let __us = 0u128;
                     let state = match (
                         &poll,
                         self.lost.reason(),
@@ -666,7 +707,7 @@ impl Launcher {
                         (Ok(_), None, None) => "ok".to_string(),
                     };
                     if let CommandRecord::Dispatch { name, grid, .. } = record {
-                        eprintln!("[trace] dispatch {name} grid={grid:?} -> {state}");
+                        eprintln!("[trace] dispatch {name} grid={grid:?} -> {state} {__us}us");
                     }
                 }
                 dispatch_ix = ix;
@@ -723,7 +764,7 @@ impl Launcher {
                 TimingMode::Range { start, n } if ix >= start && ix < start + n => {
                     u32::try_from((ix - start) * 2).ok()
                 }
-                TimingMode::Range { .. } => None,
+                TimingMode::Range { .. } | TimingMode::Whole => None,
             }
         };
         // A pass writes exactly one boundary pair, so without in-pass writes
@@ -804,13 +845,21 @@ impl Launcher {
                             matches!(mode, TimingMode::All | TimingMode::Range { .. })
                                 || (mode.isolates(dispatch_ix) && run_end - run_start == 1)
                         });
-                    let writes = pass_slot.and_then(|q| {
+                    let writes = if matches!(mode, TimingMode::Whole) {
                         timestamps.map(|set| wgpu::ComputePassTimestampWrites {
                             query_set: set,
-                            beginning_of_pass_write_index: Some(q),
-                            end_of_pass_write_index: Some(q + 1),
+                            beginning_of_pass_write_index: (dispatch_ix == 0).then_some(0),
+                            end_of_pass_write_index: Some(1),
                         })
-                    });
+                    } else {
+                        pass_slot.and_then(|q| {
+                            timestamps.map(|set| wgpu::ComputePassTimestampWrites {
+                                query_set: set,
+                                beginning_of_pass_write_index: Some(q),
+                                end_of_pass_write_index: Some(q + 1),
+                            })
+                        })
+                    };
                     let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
                         label: Some("fusor resolve"),
                         timestamp_writes: writes,
@@ -974,6 +1023,7 @@ impl Launcher {
     /// copy reads what the dispatches that produced `src` wrote.
     pub fn copy_buffer(&self, src: &Buf, dst: &Buf, bytes: u64) -> Result<()> {
         self.lost.check()?;
+        crate::pool::COPY_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
         let record = CommandRecord::CopyBuffer {
             src: src.clone(),
             src_offset: 0,
@@ -1016,11 +1066,19 @@ impl Launcher {
             state("copy");
         }
         let done = self.begin_map(staging)?;
+        // A dropped future must not leave the map outstanding: the staging
+        // buffer returns to the pool, and a mapped one panics the next
+        // readback that draws it.
+        let pending = MapGuard {
+            staging: Some(staging),
+        };
         // Natively this drives the map to completion; on the web the device
         // is polled by the browser and this returns at once.
         self.poll_wait()?;
         state("map");
-        done.await
+        let mapped = done.await;
+        pending.disarm();
+        mapped
             .map_err(|_| {
                 // wgpu drops the callback unfired when it rejects the map
                 // outright, which on a lost device it does without a word.
@@ -1037,6 +1095,8 @@ impl Launcher {
 
     /// Issue the map of the whole staging buffer; the returned signal
     /// completes when the callback runs.
+    ///
+    /// See [`MapGuard`] for what happens if nobody waits for it.
     fn begin_map(&self, staging: &Buf) -> Result<MapDone> {
         let gpu = staging
             .downcast_ref::<GpuBuffer>()
@@ -1251,4 +1311,46 @@ fn launcher_fields_are_send_sync() {
     assert::<Mutex<Option<Vec<f64>>>>();
     assert::<Mutex<Option<usize>>>();
     assert::<Mutex<lru::LruCache<BindGroupKey, BindGroupEntry>>>();
+}
+
+#[cfg(test)]
+mod cancel_tests {
+    /// `unmap` must cancel a map that has not resolved yet.
+    ///
+    /// This is the premise [`MapGuard`] rests on. It cannot be tested through
+    /// a readback, because natively `poll_wait` drives the map to completion
+    /// before anything awaits it — which is exactly why a cancelled readback
+    /// leaving a pooled buffer mapped only ever showed up in a browser, as a
+    /// panic inside wgpu on the *next* readback.
+    #[test]
+    fn unmap_cancels_a_pending_map() {
+        let instance = wgpu::Instance::default();
+        let Some(adapter) =
+            pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions::default()))
+                .ok()
+        else {
+            eprintln!("no adapter; skipping");
+            return;
+        };
+        let Ok((device, _queue)) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+        else {
+            eprintln!("no device; skipping");
+            return;
+        };
+        let buffer = device.create_buffer(&wgpu::BufferDescriptor {
+            label: None,
+            size: 256,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+
+        // Map, abandon it the way a dropped future does, and map again. Before
+        // the guard this second map is the panic the browser reported.
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        buffer.unmap();
+        buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        buffer.unmap();
+    }
 }

@@ -12,7 +12,9 @@
 pub(crate) mod contract;
 pub(crate) mod gather_scatter;
 pub(crate) mod map_fold;
+pub(crate) mod group;
 pub(crate) mod region;
+pub(crate) mod slab;
 
 use fusor_cost::realize::distribute_workgroups;
 use fusor_ir::Result;
@@ -861,7 +863,15 @@ pub(crate) struct Ctx<'a> {
     pub buffers: Vec<Buffer>,
     /// `Plan` value -> index into [`Self::buffers`].
     slot_of: FxHashMap<Id, usize>,
-    pack: std::sync::Arc<UniformPack>,
+    /// Element offset of each arena value within the arena binding.
+    arena_offset: FxHashMap<Id, u32>,
+    pub(crate) pack: std::sync::Arc<UniformPack>,
+    /// A group member's linear workgroup index within its own range, in
+    /// place of the dispatch's builtins.
+    pub workgroup: Option<TileExpr>,
+    /// The fewest lanes a member may lower at: a group runs every member at
+    /// its widest member's block.
+    pub block_floor: u32,
 }
 
 impl<'a> Ctx<'a> {
@@ -880,6 +890,17 @@ impl<'a> Ctx<'a> {
         // same launch mints the same ids, so the pipeline cache's body-hash
         // dedup actually hits.
         fusor_ir::ir::kernel::reset_decl_ids();
+        Self::with_pack_in(caps, cx, binding, pack)
+    }
+
+    /// [`Self::with_pack`] without restarting decl numbering: a group
+    /// member's decls must not collide with its siblings'.
+    pub(crate) fn with_pack_in(
+        caps: &'a Caps,
+        cx: &'a LowerCtx<'a>,
+        binding: DimBinding,
+        pack: std::sync::Arc<UniformPack>,
+    ) -> Result<Self> {
         let uniform_words = (pack.byte_len() / 4).max(1) as u32;
         let mut buffers: Vec<Buffer> = vec![Arc::new(BufferDecl {
             binding: UNIFORM_BINDING,
@@ -892,8 +913,42 @@ impl<'a> Ctx<'a> {
         ordered.sort_by_key(|b| b.binding);
 
         let mut slot_of = FxHashMap::default();
-        for (position, plan_binding) in ordered.iter().enumerate() {
+        let mut arena_offset: FxHashMap<Id, u32> = FxHashMap::default();
+        let mut last_binding: Option<u32> = None;
+        for plan_binding in ordered.iter() {
             let (layout, dtype) = bound_layout(cx, plan_binding.value);
+            let class = cx.graph.class_of(plan_binding.value);
+            // Arena values of one dtype share a binding: one decl, spanning
+            // the arena, and each value at its own element offset.
+            if plan_binding.arena {
+                let bytes = cx
+                    .plan
+                    .buffers
+                    .iter()
+                    .find(|b| b.value == plan_binding.value)
+                    .and_then(|b| b.arena)
+                    .ok_or_else(|| Error::Plan(format!("arena value {} has no offset", plan_binding.value)))?;
+                let elem = dtype.byte_size().max(1);
+                let off = u32::try_from(bytes / elem)
+                    .map_err(|_| Error::Plan("arena offset exceeds a u32".into()))?;
+                if last_binding != Some(plan_binding.binding) {
+                    let extent = u32::try_from(cx.plan.arena_bytes / elem)
+                        .map_err(|_| Error::Plan("arena element count exceeds a u32".into()))?;
+                    buffers.push(Arc::new(BufferDecl {
+                        binding: plan_binding.binding,
+                        element: ElementType::Scalar(scalar_element(dtype)),
+                        layout: TileLayout::contiguous(MemoryLevel::Storage, &[extent.max(1)]),
+                        access: BufferAccess::ReadWrite,
+                    }));
+                    last_binding = Some(plan_binding.binding);
+                }
+                for member in cx.graph.class_ids(class) {
+                    slot_of.insert(member, buffers.len() - 1);
+                    arena_offset.insert(member, off);
+                }
+                continue;
+            }
+            last_binding = Some(plan_binding.binding);
             let elements = decl_elements(&layout);
             // A quantized buffer holds blocks, not elements: it binds as the
             // `u32` word stream the decode program addresses.
@@ -914,12 +969,11 @@ impl<'a> Ctx<'a> {
             // selected one: an `Operand::src` names whichever id the rule
             // author wrote, and they all denote the same buffer. `class_ids`
             // includes the `Union` spine, which macro ops hand their callers.
-            let class = cx.graph.class_of(plan_binding.value);
             for member in cx.graph.class_ids(class) {
                 slot_of.insert(member, buffers.len());
             }
             buffers.push(Arc::new(BufferDecl {
-                binding: 1 + position as u32,
+                binding: plan_binding.binding,
                 element: ElementType::Scalar(scalar_element(dtype)),
                 layout: TileLayout::contiguous(MemoryLevel::Storage, &[extent.max(1)]),
                 access,
@@ -933,11 +987,47 @@ impl<'a> Ctx<'a> {
             binding,
             buffers,
             slot_of,
+            arena_offset,
             pack,
+            workgroup: None,
+            block_floor: 0,
         })
     }
 
+    /// Element offset of a value inside its binding: its arena slot, or 0.
+    pub(crate) fn offset_of(&self, value: Id) -> u32 {
+        self.arena_offset.get(&value).copied().unwrap_or(0)
+    }
+
+    /// This workgroup's linear index against the dispatch grid — or, for a
+    /// group member, within the member's own range.
+    pub(crate) fn linear_workgroup(&mut self) -> TileExpr {
+        use fusor_ir::ir::kernel::WorkgroupAxis;
+        if let Some(w) = &self.workgroup {
+            return w.clone();
+        }
+        let gx = self.b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
+        let gy = self.b.builtin(Builtin::ProgramId(WorkgroupAxis::Y));
+        let gz = self.b.builtin(Builtin::ProgramId(WorkgroupAxis::Z));
+        // group = gx + gy*X + gz*X*Y, exactly as the grid fold laid it out —
+        // with X and Y read from `@builtin(num_workgroups)`, never baked, so
+        // the extents never enter the body.
+        let x_e = self.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::X));
+        let y_e = self.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::Y));
+        let xy_e = self.b.mul(x_e.clone(), y_e);
+        let yx = self.b.mul(gy, x_e);
+        let zxy = self.b.mul(gz, xy_e);
+        let group = self.b.add(gx, yx);
+        self.b.add(group, zxy)
+    }
+
     /// The bound buffer for a plan value.
+    /// Whether this launch binds a buffer for `value`. A slab member kept in
+    /// workgroup memory has none.
+    pub(crate) fn has_buffer(&self, value: Id) -> bool {
+        self.slot_of.contains_key(&value)
+    }
+
     pub(crate) fn buffer(&self, value: Id) -> Result<Buffer> {
         let slot = self
             .slot_of
@@ -963,7 +1053,7 @@ impl<'a> Ctx<'a> {
         let layout = buffer.layout.clone();
         Ok(fusor_ir::ir::kernel::StorageView {
             buffer,
-            offset: 0,
+            offset: self.offset_of(value),
             layout,
         })
     }
@@ -980,7 +1070,7 @@ impl<'a> Ctx<'a> {
         let buffer = self.buffer(operand.src)?;
         Ok(fusor_ir::ir::kernel::StorageView {
             buffer,
-            offset: view.offset,
+            offset: view.offset + self.offset_of(operand.src),
             layout: view.layout,
         })
     }
@@ -1213,23 +1303,10 @@ impl<'a> Ctx<'a> {
     /// the tail of the output untouched — silently, for any launch over the
     /// per-dimension limit.
     pub(crate) fn global_index(&mut self, block: u32, grid: [u32; 3]) -> TileExpr {
-        use fusor_ir::ir::kernel::WorkgroupAxis;
         let lane = self.b.builtin(Builtin::Lane);
-        let gx = self.b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
-        let gy = self.b.builtin(Builtin::ProgramId(WorkgroupAxis::Y));
-        let gz = self.b.builtin(Builtin::ProgramId(WorkgroupAxis::Z));
-        // group = gx + gy*X + gz*X*Y, exactly as the grid fold laid it out —
-        // with X and Y read from `@builtin(num_workgroups)`, never baked, so
-        // the extents never enter the body. `grid` still names the dispatch
-        // this lowering derived.
+        // `grid` still names the dispatch this lowering derived.
         let _ = grid;
-        let x_e = self.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::X));
-        let y_e = self.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::Y));
-        let xy_e = self.b.mul(x_e.clone(), y_e);
-        let yx = self.b.mul(gy, x_e);
-        let zxy = self.b.mul(gz, xy_e);
-        let group = self.b.add(gx, yx);
-        let group = self.b.add(group, zxy);
+        let group = self.linear_workgroup();
         let block_e = self.b.u32(block);
         let base = self.b.mul(group, block_e);
         self.b.add(base, lane)
@@ -1693,7 +1770,7 @@ impl<'a> Ctx<'a> {
             let view = fusor_ir::ir::kernel::QuantizedView {
                 data: fusor_ir::ir::kernel::StorageView {
                     buffer,
-                    offset: 0,
+                    offset: self.offset_of(operand.src),
                     layout,
                 },
                 fmt,
@@ -1711,7 +1788,7 @@ impl<'a> Ctx<'a> {
         let layout = buffer.layout.clone();
         let view = fusor_ir::ir::kernel::StorageView {
             buffer,
-            offset: 0,
+            offset: self.offset_of(operand.src),
             layout,
         };
         // The buffer's extent is not the shape product: padding lives in the
@@ -1830,7 +1907,49 @@ pub(crate) fn lower_node(
         Launch::Gather { .. } => gather_scatter::lower_kgather(ctx, op, theta).map(|k| vec![k]),
         Launch::Scatter { .. } => gather_scatter::lower_kscatter(ctx, op, theta),
         Launch::Region { .. } => region::lower_kregion(ctx, op, theta).map(|k| vec![k]),
+        Launch::Slab { .. } => slab::lower_kslab(ctx, op, theta).map(|k| vec![k]),
+        Launch::Group { .. } => group::lower_kgroup(ctx, op, theta).map(|k| vec![k]),
         Launch::Ext { def, .. } => ext::lower(*def, node, theta).map(|k| vec![k]),
+    }
+}
+
+/// [`lower_node`] for one member of a group: decl numbering continues from
+/// the siblings', the workgroup index is `workgroup`, and the body runs at
+/// no fewer than `block_floor` lanes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lower_member(
+    caps: &Caps,
+    node: &Node,
+    theta: SchedPoint,
+    cx: &LowerCtx<'_>,
+    binding: DimBinding,
+    pack: std::sync::Arc<UniformPack>,
+    workgroup: TileExpr,
+    block_floor: u32,
+    buffers: &[Buffer],
+) -> Result<KernelIr> {
+    let Op::Launch(op) = &node.op else {
+        return Err(Error::Plan("a group member is not a Launch node".into()));
+    };
+    let mut ctx = Ctx::with_pack_in(caps, cx, binding, pack)?;
+    // One buffer table for the whole kernel: a member's own decls would
+    // bind the same slots a second time.
+    ctx.buffers = buffers.to_vec();
+    ctx.workgroup = Some(workgroup);
+    ctx.block_floor = block_floor;
+    match op {
+        Launch::Map { .. } => map_fold::lower_kmap(ctx, op, theta),
+        Launch::Fold { .. } => map_fold::lower_kfold(ctx, op, theta),
+        Launch::Slab { .. } => slab::lower_kslab(ctx, op, theta),
+        Launch::Gather { .. } => gather_scatter::lower_kgather(ctx, op, theta),
+        Launch::Contract { family, .. } => {
+            let mut k = contract::lower_contract(ctx, op, *family, theta)?;
+            if k.len() != 1 {
+                return Err(Error::Plan("a group member lowers to one kernel".into()));
+            }
+            Ok(k.remove(0))
+        }
+        other => Err(Error::Plan(format!("a {:?} cannot be a group member", other.tag()))),
     }
 }
 

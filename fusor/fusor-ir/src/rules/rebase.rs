@@ -1455,11 +1455,12 @@ fn mint_retarget(
 
         let body_view = slot_view(b, joint_id, &free, lanes, 1, body_lanes, body_axis)?;
         let ref_view = slot_view(b, joint_id, &free, lanes, 0, 1, None)?;
-        let hit = b.union(id, body_view).ok()?;
-        // The second union stops extraction running the reference pass a
-        // second time.
-        b.union(reference.id, ref_view).ok()?;
-        return Some(hit);
+        // Only the reader is redirected. Equating the reference with slot 0
+        // as well would save its pass, but it is unsound: it made a softmax
+        // whose max is read by more than the sum it feeds compute a wrong
+        // result whenever the input was materialized rather than fused.
+        let _ = ref_view;
+        return b.union(id, body_view).ok();
     }
     None
 }

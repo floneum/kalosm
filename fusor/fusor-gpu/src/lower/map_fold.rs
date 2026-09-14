@@ -46,7 +46,7 @@ pub(crate) fn lower_kmap(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Re
     let out = ctx.output()?;
     let out_view = ctx.linear_view(out)?;
     let out_elem = out_view.buffer.element;
-    let block = emitted_block(1, ctx.caps);
+    let block = emitted_block(1, ctx.caps).max(ctx.block_floor);
     let limits = ctx.caps.limits;
 
     let mut body_stmts: Vec<Stmt> = Vec::new();
@@ -277,6 +277,7 @@ pub(crate) fn lower_kfold(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> R
             (emitted_block(lg, ctx.caps), lg)
         }
     };
+    let block = block.max(ctx.block_floor);
     let limits = ctx.caps.limits;
 
     // One row per output element; the fold axis is consumed by the lanes.
@@ -551,7 +552,7 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resu
         SchedPoint::Fold(FoldStrat::Subgroup) => ctx.caps.subgroup_width().max(1),
         _ => max_block,
     };
-    let block = lane_group.max(max_block);
+    let block = lane_group.max(max_block).max(ctx.block_floor);
 
     // Output rows are `space` minus the reduced axis and every promoted axis:
     // a promoted extent lives in the carrier's lanes, not in the write map.
@@ -812,7 +813,7 @@ fn single_slot_reduce_op(c: &Carrier) -> Result<TileReduceOp> {
 
 /// A carrier identity as a tile literal. The infinities go through the
 /// builder's own spellings so the emitted text is unchanged.
-fn identity_expr(ctx: &mut Ctx<'_>, s: Splat, elem: ScalarElement) -> TileExpr {
+pub(crate) fn identity_expr(ctx: &mut Ctx<'_>, s: Splat, elem: ScalarElement) -> TileExpr {
     let f = match s {
         Splat::F32(v) => v,
         Splat::F16(b) => half::f16::from_bits(b).to_f32(),

@@ -117,8 +117,13 @@ pub(crate) fn effective_read_bytes(llc_bytes: u64, bytes: u64, rereads: u32) -> 
 /// `reads` is one `(bytes, rereads)` pair per *distinct* operand, so a value
 /// two consumers share is counted once and its reread factor carries the
 /// sharing.
-pub(crate) fn dram_ps(facts: &DeviceFacts, reads: &[(u64, u32)], writes: u64) -> Picoseconds {
-    let mut total = u128::from(writes);
+pub(crate) fn dram_ps(
+    facts: &DeviceFacts,
+    reads: &[(u64, u32)],
+    writes: u64,
+    line_bytes: u64,
+) -> Picoseconds {
+    let mut total = u128::from(writes) + u128::from(line_bytes);
     for &(bytes, rereads) in reads {
         total += effective_read_bytes(facts.llc_bytes, bytes, rereads);
     }

@@ -68,9 +68,15 @@ impl Default for ExtractBudget {
     /// buffer where dense finds a 40-element one, so both searches must stay
     /// truncated until the causal side can reach the two-slot carrier.
     fn default() -> Self {
+        // `FUSOR_MOVE_WORK` overrides the visit budget, for measuring what
+        // a longer search buys on a given graph.
+        let max_move_work = std::env::var("FUSOR_MOVE_WORK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90_000);
         Self {
             moves_per_chain: 64,
-            max_move_work: 90_000,
+            max_move_work,
         }
     }
 }
@@ -107,6 +113,9 @@ pub struct BindingPlan {
     pub binding: u32,
     pub value: Id,
     pub kind: BindKind,
+    /// The value lives in the plan's step arena: every arena value of one
+    /// dtype in a launch shares one binding, at its own offset.
+    pub arena: bool,
 }
 
 /// One buffer the plan allocates. Allocation is derived from the plan:
@@ -119,6 +128,9 @@ pub struct BufferPlan {
     pub elements: Dim,
     pub dtype: crate::dtype::Dtype,
     pub persistence: crate::dtype::Persistence,
+    /// Byte offset in the step arena, for a step-local intermediate whose
+    /// live range was packed there; `None` allocates its own buffer.
+    pub arena: Option<u64>,
 }
 
 /// One dispatch in the extracted plan. `grid` is after the 3-D fold against
@@ -139,6 +151,9 @@ pub struct Plan {
     pub extraction: Extraction,
     pub launches: Vec<Dispatch>,
     pub buffers: Vec<BufferPlan>,
+    /// Bytes of the step arena: intermediates with disjoint live ranges
+    /// share it, interval-colored at derivation.
+    pub arena_bytes: u64,
     pub symbols: Vec<crate::shape::SymId>,
     /// The subset of `symbols` that are runtime scalars (`Leaf::Uniform`),
     /// carried as `f32` words. Every other symbol is an extent, offset or
