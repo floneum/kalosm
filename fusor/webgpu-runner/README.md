@@ -12,11 +12,14 @@ up to 40 steps, then the learning rate decays from 0.003 to 0.0003 across the ru
 Optional early stopping uses held-out loss; it is off by default. Token counts
 include repeated sampling of training windows, not unique corpus coverage.
 
-The embedded [TinyStories slice](assets/TinyStories.md) contains 7,999,444 character
+The [TinyStories slice](assets/TinyStories.md) contains 7,999,444 character
 tokens across 9,804 complete stories, about 25 times the previous corpus. A split
-between stories near 90% reserves the tail for evaluation. The browser needs no
-dataset download after loading the application. The corpus adds about 7.7 MB of
-uncompressed text to the application compared with the previous slice.
+between stories near 90% reserves the tail for evaluation. The first visit downloads it
+separately from an immutable snapshot; SHA-256-verified bytes are cached locally.
+It is neither tracked in the current source tree nor embedded in Wasm. A cached
+copy works without corpus network access; an initial download failure shows a
+retry control. Native examples use curl and a filesystem cache (override the
+system temporary directory with `FUSOR_CORPUS_CACHE`).
 
 `ModelConfig` is shared by training, generation, parameter counts and attention
 inspection. Validation runs before device creation: widths must divide evenly
@@ -26,7 +29,7 @@ guarantee allocation on every adapter; actual GPU allocation/compilation errors
 are reported by the page.
 
 The Tiny preset retains the old architecture. Compiler benchmarks also use the
-original 65-character vocabulary and corpus via `Corpus::benchmark()`, so their
+original 65-character vocabulary and corpus via `Corpus::benchmark().await`, so their
 240,480-parameter workload, loss oracles and timing comparisons stay unchanged.
 The browser Tiny preset uses the expanded corpus and its 74-character vocabulary.
 
@@ -48,6 +51,7 @@ Chrome executable in `CHROME`, run from this directory:
 
 ```sh
 node tests/configuration.cjs
+node tests/corpus-cache.cjs
 ```
 
 This drives the production UI: invalid configurations, a custom architecture,

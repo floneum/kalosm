@@ -1,16 +1,11 @@
-//! The training text: a slice of TinyStories, embedded in the binary.
-//!
-//! Embedded rather than fetched, for the same reason the doodle demo embedded
-//! MNIST: a demo that needs a working network and a cooperative CORS policy
-//! before it can show anything fails in front of people.
-//!
-//! TinyStories is short children's stories written with a small vocabulary,
-//! which is what makes a quarter-million-parameter model worth watching: the
-//! grammar it has to learn is simple enough to actually learn in a minute.
+//! Verified, cached training data, loaded independently of the application.
 
-static TEXT: &str = include_str!("../../assets/tinystories.txt");
+const SNAPSHOT: &str = "https://raw.githubusercontent.com/floneum/kalosm/117a8a095a5371f5cc78a6b9050ad0eaf89ef314/fusor/webgpu-runner/assets";
+const TRAIN_HASH: &str = "4b26bc79469080b97a984fd79d3e61ebd5c3b86f7b9cf79fbc463a349b6cc7e2";
+const BENCHMARK_HASH: &str = "87b2de1e357184eee2de1cfa116ac7d41a202cf84ef89068cd86867e905e10e7";
 
 /// The corpus as token ids, plus the character each id denotes.
+#[derive(PartialEq)]
 pub struct Corpus {
     /// Every character of the text, as a vocabulary index.
     tokens: Vec<u8>,
@@ -24,25 +19,20 @@ pub struct Corpus {
 }
 
 impl Corpus {
-    /// Tokenize the embedded text.
-    ///
-    /// The vocabulary is the set of characters that actually occur, sorted —
-    /// derived from the text rather than declared beside it, so the two can
-    /// never disagree.
-    pub fn load() -> Self {
-        // Split between complete stories, so the held-out tail never contains
-        // the ending of a story whose beginning trained the model.
-        let split = TEXT[..TEXT.len() * 9 / 10]
+    /// Download once, or reuse the verified local copy on subsequent visits.
+    pub async fn load() -> Result<Self, String> {
+        let text = fetch("tinystories.txt", 7_999_444, TRAIN_HASH).await?;
+        let split = text[..text.len() * 9 / 10]
             .rfind("\n\n\n")
-            .expect("story boundary");
-        Self::from_text(TEXT, split)
+            .ok_or("Training text has no story boundary")?;
+        Ok(Self::from_text(&text, split))
     }
 
-    /// Freeze both data and sampling for the original performance oracles.
-    #[allow(dead_code)] // Retained by native examples and opt-in browser checks only.
-    pub fn benchmark() -> Self {
-        let text = include_str!("../../assets/tinystories-benchmark.txt");
-        Self::from_text(text, ((text.len() as f32) * 0.9) as usize)
+    /// Preserve the original benchmark's exact bytes, vocabulary and sampling.
+    #[allow(dead_code)]
+    pub async fn benchmark() -> Result<Self, String> {
+        let text = fetch("tinystories-benchmark.txt", 319_868, BENCHMARK_HASH).await?;
+        Ok(Self::from_text(&text, ((text.len() as f32) * 0.9) as usize))
     }
 
     fn from_text(text: &str, split: usize) -> Self {
@@ -144,17 +134,93 @@ impl Corpus {
     }
 }
 
-#[cfg(test)]
+#[cfg(target_arch = "wasm32")]
+async fn fetch(file: &str, size: usize, hash: &str) -> Result<String, String> {
+    use wasm_bindgen::prelude::*;
+    #[wasm_bindgen(module = "/src/lm/corpus-cache.js")]
+    extern "C" {
+        #[wasm_bindgen(catch, js_name = loadCorpus)]
+        async fn load_corpus(url: &str, size: u32, hash: &str) -> Result<JsValue, JsValue>;
+    }
+    load_corpus(&format!("{SNAPSHOT}/{file}"), size as u32, hash)
+        .await
+        .map_err(|error| {
+            error
+                .as_string()
+                .unwrap_or_else(|| "Corpus download failed".into())
+        })?
+        .as_string()
+        .ok_or_else(|| "Corpus response was not text".into())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn verified(bytes: &[u8], size: usize, hash: &str) -> bool {
+    use sha2::{Digest, Sha256};
+    bytes.len() == size && format!("{:x}", Sha256::digest(bytes)) == hash
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+async fn fetch(file: &str, size: usize, hash: &str) -> Result<String, String> {
+    use std::{fs, process::Command};
+    let cache = std::env::var_os("FUSOR_CORPUS_CACHE")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::env::temp_dir().join("fusor-corpus-v1"));
+    let path = cache.join(format!("{hash}.txt"));
+    if let Ok(bytes) = fs::read(&path) {
+        if verified(&bytes, size, hash) {
+            return String::from_utf8(bytes).map_err(|e| e.to_string());
+        }
+    }
+    let output = Command::new("curl")
+        .args([
+            "--fail",
+            "--silent",
+            "--show-error",
+            "--location",
+            "--connect-timeout",
+            "15",
+            "--max-time",
+            "120",
+            "--max-filesize",
+            &size.to_string(),
+            &format!("{SNAPSHOT}/{file}"),
+        ])
+        .output()
+        .map_err(|e| format!("Could not download corpus with curl: {e}"))?;
+    if !output.status.success() || !verified(&output.stdout, size, hash) {
+        return Err(format!(
+            "Corpus download failed or had incorrect contents: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let text = String::from_utf8(output.stdout).map_err(|e| e.to_string())?;
+    if fs::create_dir_all(&cache).is_ok() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let temporary = cache.join(format!("{hash}-{}-{nonce}.tmp", std::process::id()));
+        if fs::write(&temporary, &text).is_ok() {
+            let _ = fs::rename(&temporary, &path);
+        }
+        let _ = fs::remove_file(&temporary);
+    }
+    Ok(text)
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
 
     #[test]
     fn expanded_data_round_trips_and_windows_stay_in_their_split() {
-        let corpus = Corpus::load();
+        let corpus = pollster::block_on(Corpus::load()).unwrap();
         assert!(corpus.len() > 7_900_000);
-        assert_eq!(corpus.len(), TEXT.len());
-        assert_eq!(corpus.excerpt(corpus.len()), TEXT);
-        assert!(TEXT[corpus.split..].starts_with("\n\n\n"));
+        assert_eq!(corpus.len(), 7_999_444);
+        assert_eq!(corpus.split, 7_199_486);
+        let text = corpus.excerpt(corpus.len());
+        assert!(text[corpus.split..].starts_with("\n\n\n"));
+        assert!(verified(text.as_bytes(), 7_999_444, TRAIN_HASH));
         for split in [Split::Train, Split::Test] {
             for at in [0, corpus.len() - 1, usize::MAX] {
                 let window = corpus.window(split, at, 512);

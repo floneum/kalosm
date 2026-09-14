@@ -1,11 +1,11 @@
-# Embedded TinyStories data
+# TinyStories corpus snapshots
 
 Source: [Ronen Eldan and Yuanzhi Li's TinyStories dataset](https://huggingface.co/datasets/roneneldan/TinyStories),
 revision `f54c09fd23315a6f9c86f9dc80f725de7d8f9c64`, `TinyStoriesV2-GPT4-train.txt`.
 The dataset is distributed under [CDLA-Sharing 1.0](TinyStories-LICENSE.txt).
-The data files in this directory retain that license; the software's license is separate.
+The corpus snapshots retain that license; the software's license is separate.
 
-`tinystories.txt` is a modified, normalized slice: 9,804 complete unique stories,
+The downloaded `tinystories.txt` snapshot is a modified, normalized slice: 9,804 complete unique stories,
 7,999,444 ASCII character tokens. Preparation maps typographic punctuation to ASCII,
 decomposes accents, discards remaining non-ASCII characters, trims lines and removes
 blank lines within stories. Three newlines separate stories. The final partial story
@@ -19,7 +19,7 @@ Reproduce from `fusor/webgpu-runner`:
 curl --fail --location --range 0-8499999 \
   https://huggingface.co/datasets/roneneldan/TinyStories/resolve/f54c09fd23315a6f9c86f9dc80f725de7d8f9c64/TinyStoriesV2-GPT4-train.txt \
   -o /tmp/tinystories-source.txt
-python3 scripts/prepare-corpus.py /tmp/tinystories-source.txt
+python3 scripts/prepare-corpus.py /tmp/tinystories-source.txt /tmp/tinystories-prepared.txt
 ```
 
 The script checks the source byte range's SHA-256. The prepared file's SHA-256 is
@@ -30,3 +30,14 @@ including its historical normalization and split, for unchanged compiler perform
 and numerical regression comparisons. Its precise upstream byte offset was not
 recorded. It is used by the native `train_small` example and optional browser training
 checks; production training uses the expanded file.
+
+The runtime fetches both prepared snapshots from the immutable `117a8a095`
+commit of this repository, verifies their length and SHA-256, then caches them.
+The files are no longer in the current source tree or embedded in Wasm. Existing
+Git history is retained; that historical commit is the snapshot host, not a
+runtime dependency on the current branch contents. The preprocessing script can
+reproduce the larger snapshot from the original upstream data independently.
+
+Browsers use Cache Storage; native tests/examples use `FUSOR_CORPUS_CACHE`, or
+`fusor-corpus-v1` under the system temporary directory. First use requires network
+access. A valid cached corpus can be loaded offline; corrupt entries are replaced.

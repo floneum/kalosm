@@ -25,7 +25,9 @@ fn main() -> fusor::Result<()> {
                     .into(),
             ));
         }
-        let corpus = corpus::Corpus::benchmark();
+        let corpus = corpus::Corpus::benchmark()
+            .await
+            .map_err(fusor::Error::Plan)?;
         if mode == "compare" {
             return compare(&corpus, steps).await;
         }

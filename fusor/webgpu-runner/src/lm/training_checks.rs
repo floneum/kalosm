@@ -12,7 +12,7 @@ pub async fn check_training(mode: &str, steps: u32) -> std::result::Result<Strin
                 "expected portable/subgroups/accelerated and 1..=512 steps".into(),
             ));
         }
-        let corpus = Corpus::benchmark();
+        let corpus = Corpus::benchmark().await.map_err(fusor::Error::Plan)?;
         let mut model = Lm::new(corpus.vocab_size(), 0x51ed_c0de, ModelConfig::TINY).await?;
         model
             .compile_training(fusor::program::ProgramOptions {

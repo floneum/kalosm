@@ -25,7 +25,7 @@ for story in raw.decode("utf-8", errors="ignore").split("<|endoftext|>")[:-1]:
     stories.append(story)
     size += len(story) + 3
 text = "\n\n\n".join(stories) + "\n"
-destination = pathlib.Path(__file__).resolve().parents[1] / "assets/tinystories.txt"
+destination = pathlib.Path(sys.argv[2]) if len(sys.argv) > 2 else pathlib.Path("/tmp/tinystories-prepared.txt")
 destination.write_text(text, encoding="ascii")
 print(f"{len(stories)} stories; {len(text):,} character tokens; {len(set(text))} characters in vocabulary")
 print(f"sha256 {hashlib.sha256(text.encode()).hexdigest()}")

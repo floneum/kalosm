@@ -185,8 +185,8 @@ with portable matrix kernels; `acceleration_fallback()` retains the reason.
 Missing features, missing configurations, and unknown subgroup widths fall back
 before shader creation. Ordinary Session kernels use the same advertised matrix instructions through
 the shared Naga WGSL writer. Device initialization probes supported matrix kinds
-before admitting them to either executor. The small vendored backend change and
-its upstream source are documented in `../vendor/README.md`.
+before admitting them to either executor. The small dependency patch and its pinned fork revision are documented in
+`browser-dependencies.md`.
 
 The opt-in browser checks exercise the actual model without the UI's scoring and
 sampling overhead:

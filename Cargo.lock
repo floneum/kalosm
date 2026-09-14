@@ -4640,6 +4640,7 @@ dependencies = [
 [[package]]
 name = "naga"
 version = "29.0.3"
+source = "git+https://github.com/ealmloff/wgpu?rev=24a7d3577213fc147637fe7fb20e0e845a74df8a#24a7d3577213fc147637fe7fb20e0e845a74df8a"
 dependencies = [
  "arrayvec",
  "bit-set 0.9.1",
@@ -8786,6 +8787,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 [[package]]
 name = "wgpu"
 version = "29.0.4"
+source = "git+https://github.com/ealmloff/wgpu?rev=24a7d3577213fc147637fe7fb20e0e845a74df8a#24a7d3577213fc147637fe7fb20e0e845a74df8a"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.0",

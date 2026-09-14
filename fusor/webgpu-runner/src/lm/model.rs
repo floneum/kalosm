@@ -1006,9 +1006,9 @@ mod tests {
             ] {
                 eprintln!("checking {config:?}");
                 let corpus = if config == ModelConfig::TINY {
-                    Corpus::benchmark()
+                    Corpus::benchmark().await.unwrap()
                 } else {
-                    Corpus::load()
+                    Corpus::load().await.unwrap()
                 };
                 let mut reference = Lm::new(corpus.vocab_size(), 0x51ed_c0de, config)
                     .await
@@ -1106,7 +1106,7 @@ mod tests {
     #[test]
     #[ignore]
     fn slab_oracle() {
-        let corpus = Corpus::benchmark();
+        let corpus = pollster::block_on(Corpus::benchmark()).unwrap();
         let Ok(mut model) =
             pollster::block_on(Lm::new(corpus.vocab_size(), 0x51ed_c0de, ModelConfig::TINY))
         else {
@@ -1123,7 +1123,7 @@ mod tests {
 
     #[test]
     fn the_model_learns_and_the_lens_agrees_with_it() {
-        let corpus = Corpus::benchmark();
+        let corpus = pollster::block_on(Corpus::benchmark()).unwrap();
         let Ok(mut model) =
             pollster::block_on(Lm::new(corpus.vocab_size(), 0x51ed_c0de, ModelConfig::TINY))
         else {
@@ -1202,7 +1202,7 @@ mod tests {
     /// arithmetic that quotes it has to match what gets allocated.
     #[test]
     fn the_quoted_parameter_count_is_the_real_one() {
-        let corpus = Corpus::benchmark();
+        let corpus = pollster::block_on(Corpus::benchmark()).unwrap();
         let Ok(model) = pollster::block_on(Lm::new(corpus.vocab_size(), 1, ModelConfig::TINY))
         else {
             return;
@@ -1225,7 +1225,7 @@ mod bench {
     #[test]
     #[ignore]
     fn step_rate() {
-        let corpus = Corpus::benchmark();
+        let corpus = pollster::block_on(Corpus::benchmark()).unwrap();
         let Ok(mut model) =
             pollster::block_on(Lm::new(corpus.vocab_size(), 0x51ed_c0de, ModelConfig::TINY))
         else {

@@ -46,3 +46,6 @@ required-features = ["gpu"]
 # device is driven by the browser's event loop, so everything is awaited.
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 pollster.workspace = true
+
+[dev-dependencies]
+sha2 = "0.10"

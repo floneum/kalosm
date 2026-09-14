@@ -222,7 +222,29 @@ struct Insight {
 
 #[component]
 pub fn Train() -> Element {
-    let corpus = use_hook(|| Rc::new(Corpus::load()));
+    let mut data = use_resource(|| async { Corpus::load().await.map(Rc::new) });
+    match data.read().as_ref() {
+        Some(Ok(corpus)) => rsx! { Training { corpus: corpus.clone() } },
+        Some(Err(error)) => rsx! {
+            Card { class: "lm-card",
+                CardHeader { CardTitle { "Training text unavailable" } }
+                CardContent {
+                    p { role: "alert", "{error}" }
+                    Button { onclick: move |_| data.restart(), "Retry download" }
+                }
+            }
+        },
+        None => rsx! {
+            Card { class: "lm-card",
+                CardHeader { CardTitle { "Loading training text…" } }
+                CardContent { p { role: "status", "The first visit downloads 8 MB of stories. A verified copy is cached for later visits." } }
+            }
+        },
+    }
+}
+
+#[component]
+fn Training(corpus: Rc<Corpus>) -> Element {
     let vocab = corpus.vocab_size();
 
     let mut prompt = use_signal(|| DEFAULT_PROMPT.to_string());
@@ -741,7 +763,7 @@ pub fn Train() -> Element {
                     CardTitle { "What it is learning from" }
                     CardDescription {
                         "A {Thousands(corpus.len() as u64)} character slice of TinyStories, "
-                        "embedded in the page. About 90% trains the model; the remaining stories are held out."
+                        "downloaded once and cached on this device. About 90% trains the model; the remaining stories are held out."
                     }
                 }
                 CardContent {

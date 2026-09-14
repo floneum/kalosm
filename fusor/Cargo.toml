@@ -10,15 +10,14 @@ members = [
     "fusor-cpu",
     "fusor",
     "fusor-conformance",
-    "fusor-storage-prototype",
 ]
 # The browser runner is built by `dx` in its own directory and pulls burn; it
 # is its own workspace so `--workspace` commands here never compile it.
-exclude = ["webgpu-runner", "vendor/wgpu", "vendor/naga-browser"]
+exclude = ["webgpu-runner"]
 
 # Fusor is a standalone workspace, deliberately excluded from the repository
 # root workspace so it owns its compiler dependencies, test matrix, and
-# lockfile. The repository root repeats the vendored naga patch when it builds
+# lockfile. The repository root repeats the pinned dependency patches when it builds
 # model crates that depend on Fusor.
 
 [workspace.package]
@@ -64,11 +63,11 @@ naga = "29"
 
 # Use Naga from the ealmloff/wgpu fork. It includes the
 # `CooperativeLoad` correctness fix in `bake_ref_count`, so a simdgroup load
-# referenced once cannot sink past the barrier that ordered it. The vendored
-# copy adds browser matrix serialization; see vendor/README.md.
+# referenced once cannot sink past the barrier that ordered it. This revision
+# also supplies browser matrix serialization; see docs/browser-dependencies.md.
 [patch.crates-io]
-wgpu = { path = "vendor/wgpu" }
-naga = { path = "vendor/naga-browser" }
+wgpu = { git = "https://github.com/ealmloff/wgpu", rev = "24a7d3577213fc147637fe7fb20e0e845a74df8a" }
+naga = { git = "https://github.com/ealmloff/wgpu", rev = "24a7d3577213fc147637fe7fb20e0e845a74df8a" }
 
 # CI builds: the conformance sweep runs the planner and every raced kernel
 # body on the host, and unoptimized planner code is most of its wall time.
