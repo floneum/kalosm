@@ -228,7 +228,15 @@ pub(crate) fn argmin_member(
                             "{x}:c{}:+{}us:best={:?}",
                             c.0.index(),
                             lb[x.index()].0.saturating_sub(lb[c.0.index()].0) / 1_000_000,
-                            argmin_member_excluding(graph, lb, launches, c, caps, launch_ps, &Default::default())
+                            argmin_member_excluding(
+                                graph,
+                                lb,
+                                launches,
+                                c,
+                                caps,
+                                launch_ps,
+                                &Default::default()
+                            )
                         )
                     })
                     .collect(),
@@ -242,9 +250,16 @@ pub(crate) fn argmin_member(
             );
         }
     }
-    let chosen =
-        argmin_member_excluding(graph, lb, launches, class, caps, launch_ps, &Default::default())
-            .unwrap_or(class.0);
+    let chosen = argmin_member_excluding(
+        graph,
+        lb,
+        launches,
+        class,
+        caps,
+        launch_ps,
+        &Default::default(),
+    )
+    .unwrap_or(class.0);
     if let Ok(want) = std::env::var("FUSOR_SEED_DEBUG")
         && want == class.0.index().to_string()
     {
@@ -379,7 +394,8 @@ fn combine(
             // state, say — would be its own dispatch otherwise; the slab
             // computes it on the way. The bound is for the plan, and the
             // plan pays that dispatch nowhere else.
-            let roots: SmallVec<[ClassId; 8]> = graph.roots().iter().map(|r| graph.class_of(*r)).collect();
+            let roots: SmallVec<[ClassId; 8]> =
+                graph.roots().iter().map(|r| graph.class_of(*r)).collect();
             let saved = members[..members.len().saturating_sub(1)]
                 .iter()
                 .filter(|m| roots.contains(&graph.class_of(**m)))
@@ -401,7 +417,9 @@ fn combine(
             let last = members.last().copied().unwrap_or(id);
             let mut total = lb[last.index()];
             for m in &members[..members.len().saturating_sub(1)] {
-                let excess = lb[m.index()].0.saturating_sub(lb[graph.class_of(*m).0.index()].0);
+                let excess = lb[m.index()]
+                    .0
+                    .saturating_sub(lb[graph.class_of(*m).0.index()].0);
                 total = Picoseconds(total.0.saturating_add(excess));
             }
             let saved = members.len().saturating_sub(1) as u64;
@@ -480,8 +498,14 @@ fn node_math_table(graph: &EGraph, cost: &dyn CostModel, ids: &[Id]) -> Vec<Pico
     if let Ok(want) = std::env::var("FUSOR_SEED_DEBUG") {
         for id in ids {
             if want == graph.class_of(*id).0.index().to_string() {
-                let show: String = format!("{:?}", graph.node(*id).op).chars().take(120).collect();
-                eprintln!("[math] class {want} node {id} math={} budget_left={budget} {show}", out[id.index()].0);
+                let show: String = format!("{:?}", graph.node(*id).op)
+                    .chars()
+                    .take(120)
+                    .collect();
+                eprintln!(
+                    "[math] class {want} node {id} math={} budget_left={budget} {show}",
+                    out[id.index()].0
+                );
             }
         }
     }

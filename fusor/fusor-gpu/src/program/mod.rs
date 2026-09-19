@@ -13,6 +13,6 @@ mod regions;
 mod run;
 mod workloads;
 
+pub use features::{MatrixInstructions, ProgramAcceleration};
 pub use plan::{Input, Plan, ProgramOptions, ProgramStats, Uniform};
 pub use run::Program;
-pub use features::{MatrixInstructions, ProgramAcceleration};

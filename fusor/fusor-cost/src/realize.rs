@@ -16,9 +16,7 @@ use fusor_ir::ir::Op;
 use fusor_ir::ir::kernel::{
     ArenaPlanner, MemoryLevel, ScalarElement, Tile, TileDecl, TileLayout, Tiles,
 };
-use fusor_ir::ir::launch::{
-    Effect, FoldStrat, IndexSpace, Launch, SchedPoint, ScheduleDomain,
-};
+use fusor_ir::ir::launch::{Effect, FoldStrat, IndexSpace, Launch, SchedPoint, ScheduleDomain};
 use fusor_ir::ir::logical::{LeafKind, Logical};
 use fusor_ir::shape::Dim;
 use smallvec::SmallVec;
@@ -381,7 +379,9 @@ pub fn forced_boundary(
 
 /// `Some(is_last)` when `producer` is a member of the slab `consumer`.
 pub fn slab_stage(graph: &EGraph, consumer: Id, producer: Id) -> Option<bool> {
-    let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) = &graph.node(consumer).op else {
+    let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) =
+        &graph.node(consumer).op
+    else {
         return None;
     };
     let pos = members.iter().position(|m| *m == producer)?;
@@ -635,7 +635,6 @@ pub fn fold_line_amplification(
     (lines * line_elems / sg).clamp(1, line_elems)
 }
 
-
 /// The longest dependent chain one workgroup of `root` runs at `theta`: for
 /// a tiled contraction the k steps of one tile (split-K divides them), for
 /// a fold the iterations of one lane over the reduced axis, for a slab the
@@ -654,15 +653,24 @@ pub fn serial_steps(
             for m in members.iter() {
                 match &graph.node(*m).op {
                     Op::Launch(Launch::Fold { space, axis, .. }) => {
-                        let Some(total) = space.iterations() else { continue };
-                        let k = space.dims.get(*axis as usize).and_then(|d| d.as_const()).unwrap_or(1).max(1);
+                        let Some(total) = space.iterations() else {
+                            continue;
+                        };
+                        let k = space
+                            .dims
+                            .get(*axis as usize)
+                            .and_then(|d| d.as_const())
+                            .unwrap_or(1)
+                            .max(1);
                         let rows = (total / k) / slabs;
                         let lpr = fusor_ir::ir::launch::slab_lanes_per_row(block, rows, k);
                         let groups = u64::from(block / lpr.max(1)).max(1);
                         steps += rows.div_ceil(groups).max(1) * k.div_ceil(u64::from(lpr));
                     }
                     Op::Launch(Launch::Map { space, .. }) => {
-                        let Some(total) = space.iterations() else { continue };
+                        let Some(total) = space.iterations() else {
+                            continue;
+                        };
                         steps += (total / slabs).div_ceil(u64::from(block)).max(1);
                     }
                     _ => {}
@@ -708,15 +716,28 @@ pub fn node_serial_steps(op: &Op, theta: Option<SchedPoint>, caps: &Caps) -> (u6
             }
         }
         Op::Launch(Launch::Fold { space, axis, .. }) => {
-            let k = space.dims.get(*axis as usize).and_then(|d| d.as_const()).unwrap_or(1);
-            (0, k.div_ceil(u64::from(fold_lane_group(theta, caps).max(1))))
+            let k = space
+                .dims
+                .get(*axis as usize)
+                .and_then(|d| d.as_const())
+                .unwrap_or(1);
+            (
+                0,
+                k.div_ceil(u64::from(fold_lane_group(theta, caps).max(1))),
+            )
         }
         // The dense scatter walks every update once per output lane, each
         // step a dependent index load.
         Op::Launch(Launch::Scatter { ops, .. }) => {
             let updates = ops
                 .get(1)
-                .map(|o| o.layout.shape().iter().map(|d| d.as_const().unwrap_or(1)).product::<u64>())
+                .map(|o| {
+                    o.layout
+                        .shape()
+                        .iter()
+                        .map(|d| d.as_const().unwrap_or(1))
+                        .product::<u64>()
+                })
                 .unwrap_or(1);
             (0, updates.max(1))
         }
@@ -918,7 +939,10 @@ fn walk(
                     // A slab names its members by id — they are the spellings
                     // its lowering reads — and its last member shares its
                     // class, so selecting them would walk back into the slab.
-                    let by_id = matches!(graph.node(v).op, Op::Launch(Launch::Slab { .. } | Launch::Group { .. }));
+                    let by_id = matches!(
+                        graph.node(v).op,
+                        Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
+                    );
                     let kids: SmallVec<[Id; 4]> = graph
                         .node(v)
                         .children
@@ -1087,7 +1111,9 @@ fn cut(
             let stuck: Vec<usize> = (0..n).filter(|g| indegree[*g] > 0).collect();
             for g in stuck.iter().take(6) {
                 let roots: Vec<Id> = groups[*g].iter().copied().take(4).collect();
-                let waits: Vec<usize> = (0..n).filter(|d| deps[*d].contains(g) && indegree[*d] > 0).collect();
+                let waits: Vec<usize> = (0..n)
+                    .filter(|d| deps[*d].contains(g) && indegree[*d] > 0)
+                    .collect();
                 eprintln!("LAUNCH CYCLE group {g} members {roots:?} waits on {waits:?}");
                 for v in &groups[*g] {
                     for c in operands.get(*v).map(|o| o.as_slice()).unwrap_or(&[]) {
@@ -1095,9 +1121,14 @@ fn cut(
                             && waits.contains(&(d as usize))
                         {
                             let show = |i: Id| {
-                                format!("{:?}", graph.node(i).op).chars().take(90).collect::<String>()
+                                format!("{:?}", graph.node(i).op)
+                                    .chars()
+                                    .take(90)
+                                    .collect::<String>()
                             };
-                            let in_slab = groups[*g].iter().any(|m| matches!(graph.node(*m).op, Op::Launch(Launch::Slab { .. })));
+                            let in_slab = groups[*g].iter().any(|m| {
+                                matches!(graph.node(*m).op, Op::Launch(Launch::Slab { .. }))
+                            });
                             let raw: Vec<String> = graph
                                 .node(*v)
                                 .children
@@ -1176,7 +1207,10 @@ fn build_component(
                     )
                 })
                 .collect();
-            eprintln!("COMPONENT slab {slab} has {} extra nodes: {kinds:?}", extra.len());
+            eprintln!(
+                "COMPONENT slab {slab} has {} extra nodes: {kinds:?}",
+                extra.len()
+            );
         }
     }
 
@@ -1213,7 +1247,10 @@ fn build_component(
     let mut ext: Vec<(Id, u64, u32)> = Vec::new();
     for m in &members {
         let iters = iterations_of(&index_space(graph, *m));
-        let by_id = matches!(graph.node(*m).op, Op::Launch(Launch::Slab { .. } | Launch::Group { .. }));
+        let by_id = matches!(
+            graph.node(*m).op,
+            Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
+        );
         for c in graph.node(*m).children.iter() {
             let c = if by_id {
                 *c
@@ -1254,7 +1291,10 @@ fn build_component(
             workgroups: group_geoms
                 .iter()
                 .map(|(_, g)| {
-                    let d = distribute_workgroups(g.workgroups, caps.limits.max_compute_workgroups_per_dimension);
+                    let d = distribute_workgroups(
+                        g.workgroups,
+                        caps.limits.max_compute_workgroups_per_dimension,
+                    );
                     u64::from(d[0]) * u64::from(d[1]) * u64::from(d[2])
                 })
                 .sum::<u64>()
@@ -1292,7 +1332,7 @@ fn build_component(
         if dims.len() != space.rank() {
             return (1, 0);
         }
-        let elem = graph.facts(m).dtype.byte_size().max(1) as u64;
+        let elem = graph.facts(m).dtype.byte_size().max(1);
         (
             fold_line_amplification(&dims, *axis as usize, lane_group, caps, elem),
             dims.iter().product(),
@@ -1303,7 +1343,9 @@ fn build_component(
             let (a, n) = amp_of(root, fold_lane_group(theta, caps));
             (root, a, n)
         }],
-        Op::Launch(Launch::Slab { slabs, members: sm, .. }) => sm
+        Op::Launch(Launch::Slab {
+            slabs, members: sm, ..
+        }) => sm
             .iter()
             .filter_map(|m| {
                 let Op::Launch(Launch::Fold { space, axis, .. }) = &graph.node(*m).op else {
@@ -1335,7 +1377,7 @@ fn build_component(
             k.as_const().unwrap_or(1).max(1),
             batch.as_const().unwrap_or(1).max(1),
         );
-        let elem = graph.facts(root).dtype.byte_size().max(1) as u64;
+        let elem = graph.facts(root).dtype.byte_size().max(1);
         let pulled = batch * k * (m * n.div_ceil(bn.max(1)) + n * m.div_ceil(bm.max(1)));
         let useful = batch * k * (m + n);
         line_bytes = line_bytes.saturating_add(pulled.saturating_sub(useful).saturating_mul(elem));
@@ -1343,7 +1385,10 @@ fn build_component(
 
     if !stage_amp.is_empty() {
         for m in &members {
-            let by_id = matches!(graph.node(*m).op, Op::Launch(Launch::Slab { .. } | Launch::Group { .. }));
+            let by_id = matches!(
+                graph.node(*m).op,
+                Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
+            );
             // The fold whose iteration space walks this member's operands:
             // the member itself when it is a stage, else the root.
             let (amp, total) = stage_amp
@@ -1355,7 +1400,11 @@ fn build_component(
                 continue;
             }
             for c in graph.node(*m).children.iter() {
-                let c = if by_id { *c } else { select(graph, extraction, *c)? };
+                let c = if by_id {
+                    *c
+                } else {
+                    select(graph, extraction, *c)?
+                };
                 let facts = graph.facts(c);
                 if launch_of.copied(c) == Some(own) || elements_of(facts) != total {
                     continue;
@@ -1390,8 +1439,11 @@ fn build_component(
         _ => Vec::new(),
     };
     for slab in slab_roots {
-        let Op::Launch(Launch::Slab { members: sm, .. }) = &graph.node(slab).op else { continue };
-        let inside: rustc_hash::FxHashSet<ClassId> = sm.iter().map(|m| graph.class_of(*m)).collect();
+        let Op::Launch(Launch::Slab { members: sm, .. }) = &graph.node(slab).op else {
+            continue;
+        };
+        let inside: rustc_hash::FxHashSet<ClassId> =
+            sm.iter().map(|m| graph.class_of(*m)).collect();
         let shared = |m: Id| {
             consumer_nodes.get(m).is_some_and(|cs| {
                 cs.iter()
@@ -1443,7 +1495,11 @@ fn member_geometry(graph: &EGraph, extraction: &Extraction, m: Id, caps: &Caps) 
                 workgroups: u64::from(*slabs).max(1),
             }
         }
-        _ => geometry(extraction.theta.get(&m).copied(), &index_space(graph, m), caps),
+        _ => geometry(
+            extraction.theta.get(&m).copied(),
+            &index_space(graph, m),
+            caps,
+        ),
     }
 }
 
@@ -1477,7 +1533,10 @@ pub fn is_runnable(graph: &EGraph, id: Id) -> bool {
 pub fn is_self_referential(graph: &EGraph, id: Id) -> bool {
     // A slab's last member is in the slab's own class by construction, and is
     // read by id rather than selected; that is not a cycle.
-    if matches!(graph.node(id).op, Op::Launch(Launch::Slab { .. } | Launch::Group { .. })) {
+    if matches!(
+        graph.node(id).op,
+        Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
+    ) {
         return false;
     }
     let class = graph.class_of(id);
@@ -1538,11 +1597,14 @@ pub fn point_is_legal(graph: &EGraph, id: Id, theta: SchedPoint, caps: &Caps) ->
 /// expensive: a lowering refusal is a hard assert, so selecting one mints a
 /// crash rather than a slow plan.
 pub fn has_legal_point(graph: &EGraph, id: Id, caps: &Caps) -> bool {
-    if matches!(graph.node(id).op, Op::Launch(Launch::Slab { .. })) && !slab_bindings_fit(graph, id, caps)
+    if matches!(graph.node(id).op, Op::Launch(Launch::Slab { .. }))
+        && !slab_bindings_fit(graph, id, caps)
     {
         return false;
     }
-    if matches!(graph.node(id).op, Op::Launch(Launch::Group { .. })) && !group_bindings_fit(graph, id, caps) {
+    if matches!(graph.node(id).op, Op::Launch(Launch::Group { .. }))
+        && !group_bindings_fit(graph, id, caps)
+    {
         return false;
     }
     let Some(domain) = domain_of(graph, id) else {
@@ -1580,7 +1642,8 @@ fn group_bindings_fit_uncached(graph: &EGraph, id: Id, caps: &Caps) -> bool {
                     if !slab_bindings_fit(graph, *m, caps) {
                         return false;
                     }
-                    let own: rustc_hash::FxHashSet<ClassId> = sm.iter().map(|s| graph.class_of(*s)).collect();
+                    let own: rustc_hash::FxHashSet<ClassId> =
+                        sm.iter().map(|s| graph.class_of(*s)).collect();
                     for s in sm.iter() {
                         for c in graph.node(*s).children.iter() {
                             let class = graph.class_of(*c);
@@ -1589,8 +1652,11 @@ fn group_bindings_fit_uncached(graph: &EGraph, id: Id, caps: &Caps) -> bool {
                             }
                         }
                     }
-                    let shared = |x: Id| graph.any_reader(graph.class_of(x), |r| !own.contains(&graph.class_of(r)));
-                    let Ok((private, _)) = slab_layout(graph, *m, caps, graph.roots(), &shared) else {
+                    let shared = |x: Id| {
+                        graph.any_reader(graph.class_of(x), |r| !own.contains(&graph.class_of(r)))
+                    };
+                    let Ok((private, _)) = slab_layout(graph, *m, caps, graph.roots(), &shared)
+                    else {
                         return false;
                     };
                     outs += sm.len() - private.len();
@@ -1603,14 +1669,19 @@ fn group_bindings_fit_uncached(graph: &EGraph, id: Id, caps: &Caps) -> bool {
                 }
             }
         }
-        let own: rustc_hash::FxHashSet<ClassId> = members.iter().map(|m| graph.class_of(*m)).collect();
-        let root_classes: rustc_hash::FxHashSet<ClassId> = graph.roots().iter().map(|r| graph.class_of(*r)).collect();
+        let own: rustc_hash::FxHashSet<ClassId> =
+            members.iter().map(|m| graph.class_of(*m)).collect();
+        let root_classes: rustc_hash::FxHashSet<ClassId> =
+            graph.roots().iter().map(|r| graph.class_of(*r)).collect();
         let inputs = inputs
             .iter()
             .filter(|c| !own.contains(c) && own_buffer(graph, **c, &root_classes))
             .count();
         let _ = outs;
-        let outs = members.iter().filter(|m| root_classes.contains(&graph.class_of(**m))).count();
+        let outs = members
+            .iter()
+            .filter(|m| root_classes.contains(&graph.class_of(**m)))
+            .count();
         if 2 + outs + inputs > caps.limits.max_storage_buffers_per_shader_stage as usize {
             return false;
         }
@@ -1640,9 +1711,8 @@ pub fn slab_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
     }
     let classes: rustc_hash::FxHashSet<ClassId> =
         members.iter().map(|m| graph.class_of(*m)).collect();
-    let shared = |m: Id| {
-        graph.any_reader(graph.class_of(m), |r| !classes.contains(&graph.class_of(r)))
-    };
+    let shared =
+        |m: Id| graph.any_reader(graph.class_of(m), |r| !classes.contains(&graph.class_of(r)));
     // The graph's roots are every value a caller may read back: a root
     // member lands in a buffer whichever roots this extraction has.
     let fit = slab_layout(graph, id, caps, graph.roots(), &shared).is_ok();
@@ -1654,7 +1724,11 @@ pub fn slab_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
 /// root the caller reads back. Every other value is packed into the step
 /// arena, which a launch binds once.
 pub fn own_buffer(graph: &EGraph, class: ClassId, roots: &rustc_hash::FxHashSet<ClassId>) -> bool {
-    roots.contains(&class) || graph.members(class).iter().any(|m| leaf_role(graph, *m) == LeafRole::External)
+    roots.contains(&class)
+        || graph
+            .members(class)
+            .iter()
+            .any(|m| leaf_role(graph, *m) == LeafRole::External)
 }
 
 /// A slab's workgroup memory and bindings: the widest fold stage's scratch,
@@ -1670,7 +1744,10 @@ pub fn slab_layout(
     roots: &[Id],
     shared: &dyn Fn(Id) -> bool,
 ) -> Result<(Vec<Id>, u64)> {
-    let Op::Launch(Launch::Slab { slabs, members: sm, .. }) = &graph.node(root).op else {
+    let Op::Launch(Launch::Slab {
+        slabs, members: sm, ..
+    }) = &graph.node(root).op
+    else {
         return Ok((Vec::new(), 0));
     };
     let slabs = u64::from((*slabs).max(1));
@@ -1729,7 +1806,10 @@ pub fn slab_layout(
     let owns = |c: ClassId| own_buffer(graph, c, &root_classes);
     let bound = 2
         + inputs.iter().filter(|c| owns(**c)).count()
-        + middle.iter().filter(|m| !private.contains(m) && owns(graph.class_of(**m))).count()
+        + middle
+            .iter()
+            .filter(|m| !private.contains(m) && owns(graph.class_of(**m)))
+            .count()
         + usize::from(owns(graph.class_of(root)));
     let limit_bufs = caps.limits.max_storage_buffers_per_shader_stage as usize;
     if bound > limit_bufs && std::env::var_os("FUSOR_SLAB_LOG").is_some() {

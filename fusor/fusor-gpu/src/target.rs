@@ -649,9 +649,9 @@ impl GpuTarget {
                 }
                 last_binding = Some(b.binding);
                 if b.arena {
-                    let arena = arena_buf
-                        .clone()
-                        .ok_or_else(|| Error::Plan("launch binds the arena, which the plan never sized".into()))?;
+                    let arena = arena_buf.clone().ok_or_else(|| {
+                        Error::Plan("launch binds the arena, which the plan never sized".into())
+                    })?;
                     buffers.push(arena);
                     continue;
                 }
@@ -880,7 +880,10 @@ impl GpuTarget {
                 // what the encoder counted.
                 for (j, us) in samples.iter().enumerate() {
                     let ix = start + j;
-                    let (lix, grid) = dispatch_launch.get(ix).copied().unwrap_or((usize::MAX, [0; 3]));
+                    let (lix, grid) = dispatch_launch
+                        .get(ix)
+                        .copied()
+                        .unwrap_or((usize::MAX, [0; 3]));
                     eprintln!(
                         "TSPAN {ix} {} {us:.1} L{lix} grid={grid:?}",
                         names.get(lix).copied().unwrap_or("?")

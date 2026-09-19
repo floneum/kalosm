@@ -4,7 +4,7 @@
 
 use fusor::{Dtype, Session};
 
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fuzz_case};
+use crate::harness::{Case, CaseError, CaseResult, Cases, FuzzDim, dims, fuzz_case};
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
 
 // Gradients here are analytic (all-ones seed row/column sums), not finite
@@ -93,6 +93,48 @@ pub fn cases() -> Cases {
         QMATMUL_RANK1_SPEC,
         async move |s: &Session, sh: &[u64], seed: u32| quantized_matmul(s, 1, sh, seed).await,
     ));
+    for (name, dtype, batch) in [
+        ("q_mat_mul_rank1_gradient", Dtype::F32, 1),
+        ("q_mat_mul_rank1_gradient_f16", Dtype::F16, 1),
+        ("q_mat_mul_gradient_f16", Dtype::F16, 16),
+    ] {
+        cases.push_case(Case::new("matmul", name, async move |session: &Session| {
+            use fusor_ir::dtype::{QFmt, QLayout};
+            if dtype == Dtype::F16 && !session.caps().f16 {
+                return Err(crate::harness::skip("device has no f16 support"));
+            }
+            let graph = graph_of(session);
+            let mut block = [1u8; 34];
+            block[..2].copy_from_slice(&half::f16::ONE.to_le_bytes());
+            for (i, q) in block[2..].iter_mut().enumerate() {
+                *q = (i as i8 - 16) as u8;
+            }
+            let weight = fusor::QMatrix::from_raw_bytes(
+                &graph,
+                QFmt::Q8_0,
+                QLayout::Native,
+                [fusor::Dim::Const(8), fusor::Dim::Const(32)],
+                &block.repeat(8),
+            )?;
+            let shape = if batch == 1 {
+                vec![32]
+            } else {
+                vec![batch, 32]
+            };
+            let input = upload(
+                graph.handle(),
+                &dims(&shape),
+                &vec![0.; batch as usize * 32],
+            )?
+            .cast(dtype)?;
+            let output = weight.q_mat_mul(&input)?;
+            let gradient = gradient_of(&graph, &output, &input).await?;
+            let expected: Vec<f32> = (0..batch * 32)
+                .map(|i| 8. * ((i % 32) as f32 - 16.))
+                .collect();
+            expect_values(session, &shape, dtype, &gradient, &expected).await
+        }));
+    }
     // Split-K at the extents the trainer and this suite actually use. The
     // shipped `extent.at_least(4096)` gate refuses every one of them, so
     // whether the reduction runs split or unsplit is a schedule decision

@@ -168,7 +168,12 @@ fn through_copy(b: &Builder<'_>, o: &Operand, broadcast_only: bool) -> Option<Op
                 None => format!("{m}:{:?}", b.node(*m).op.tag()),
             })
             .collect();
-        eprintln!("ABSORB {} (class {}) read as {}: {kinds:?}", o.src, b.class_of(o.src).0.index(), access_name(&o.access));
+        eprintln!(
+            "ABSORB {} (class {}) read as {}: {kinds:?}",
+            o.src,
+            b.class_of(o.src).0.index(),
+            access_name(&o.access)
+        );
     }
     for m in b.class_members(o.src) {
         let Some(view) = map_view(b, m) else { continue };
@@ -188,19 +193,33 @@ fn through_copy(b: &Builder<'_>, o: &Operand, broadcast_only: bool) -> Option<Op
         let out_shape = b.facts_of(o.src).shape.clone();
         if view.space.dims.as_slice() != out_shape.as_slice() {
             if log {
-                eprintln!("ABSORB {}: copy {m} space {:?} vs shape {:?}", o.src, view.space.dims, out_shape);
+                eprintln!(
+                    "ABSORB {}: copy {m} space {:?} vs shape {:?}",
+                    o.src, view.space.dims, out_shape
+                );
             }
             continue;
         }
         if log {
             eprintln!(
                 "ABSORB {}: copy {m} src layout {:?}/{:?} contiguous {} ; o layout {:?}/{:?} contiguous {}",
-                o.src, src.layout.shape(), src.layout.strides(), src.layout.is_contiguous(),
-                o.layout.shape(), o.layout.strides(), o.layout.is_contiguous()
+                o.src,
+                src.layout.shape(),
+                src.layout.strides(),
+                src.layout.is_contiguous(),
+                o.layout.shape(),
+                o.layout.strides(),
+                o.layout.is_contiguous()
             );
         }
-        let out_elems: Option<u64> = out_shape.iter().try_fold(1u64, |a, d| d.as_const().map(|d| a * d));
-        let src_elems: Option<u64> = src.layout.shape().iter().try_fold(1u64, |a, d| d.as_const().map(|d| a * d));
+        let out_elems: Option<u64> = out_shape
+            .iter()
+            .try_fold(1u64, |a, d| d.as_const().map(|d| a * d));
+        let src_elems: Option<u64> = src
+            .layout
+            .shape()
+            .iter()
+            .try_fold(1u64, |a, d| d.as_const().map(|d| a * d));
         if src.layout.is_contiguous() && out_elems.is_some() && out_elems == src_elems {
             return Some(Operand {
                 src: src.src,
@@ -228,7 +247,12 @@ fn through_copy(b: &Builder<'_>, o: &Operand, broadcast_only: bool) -> Option<Op
         if log {
             eprintln!(
                 "ABSORB {}: no composition: o {:?}/{:?} over copy shape {:?}, copy reads {:?}/{:?}",
-                o.src, o.layout.shape(), o.layout.strides(), out_shape, src.layout.shape(), src.layout.strides()
+                o.src,
+                o.layout.shape(),
+                o.layout.strides(),
+                out_shape,
+                src.layout.shape(),
+                src.layout.strides()
             );
         }
     }
@@ -265,8 +289,8 @@ fn permute_through(outer: &Layout, shape: &[Dim], inner: &Layout) -> Option<Layo
         if have != want {
             return None;
         }
-        for axis in k..=j {
-            dims.push(shape[axis]);
+        for (axis, dim) in shape.iter().enumerate().take(j + 1).skip(k) {
+            dims.push(*dim);
             strides.push(inner.strides()[axis]);
         }
     }

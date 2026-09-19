@@ -311,7 +311,10 @@ pub(crate) fn is_pinned(graph: &EGraph, roots: &[Id], id: Id) -> bool {
     }
     // A slab is the buffer its consumers read; inlined, its stages would run
     // once per consumer.
-    if matches!(graph.node(id).op, Op::Launch(Launch::Slab { .. } | Launch::Group { .. })) {
+    if matches!(
+        graph.node(id).op,
+        Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
+    ) {
         return true;
     }
     if realize::leaf_role(graph, id) != realize::LeafRole::NotLeaf {
@@ -323,7 +326,9 @@ pub(crate) fn is_pinned(graph: &EGraph, roots: &[Id], id: Id) -> bool {
 /// Whether `class` is a middle member's class of some selected slab.
 pub(crate) fn slab_pinned(graph: &EGraph, extraction: &Extraction, class: ClassId) -> bool {
     extraction.sigma.values().any(|sel| {
-        let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) = &graph.node(*sel).op else {
+        let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) =
+            &graph.node(*sel).op
+        else {
             return false;
         };
         let n = members.len();

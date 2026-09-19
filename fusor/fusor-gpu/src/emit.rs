@@ -10,6 +10,7 @@ pub(crate) mod expr;
 pub(crate) mod quantized;
 pub(crate) mod reduce;
 pub(crate) mod stmt;
+mod storage;
 pub(crate) mod types;
 
 use fusor_ir::device::Caps;
@@ -154,6 +155,7 @@ impl Analysis {
         // Cooperative lowering addresses fragments per subgroup, so it needs a
         // subgroup id whether or not the body asked for one.
         a.subgroup_id |= a.uses_coop;
+        a.subgroup_lane |= a.uses_coop;
         a
     }
 
@@ -516,6 +518,8 @@ pub(crate) struct Emitter<'a> {
     pub(crate) fn_locals: naga::Arena<naga::LocalVariable>,
     /// Buffer decl key -> storage global.
     pub(crate) buffer_globals: FxHashMap<usize, naga::Handle<naga::GlobalVariable>>,
+    /// Physical storage element, which can differ from a typed buffer view.
+    pub(crate) buffer_elements: FxHashMap<usize, ElementType>,
     /// Tile decl key -> how that tile is backed in workgroup memory.
     pub(crate) tile_backing: FxHashMap<usize, types::TileBacking>,
     /// Private tiles and program locals.
@@ -612,6 +616,7 @@ impl<'a> Emitter<'a> {
             exprs: naga::Arena::new(),
             fn_locals: naga::Arena::new(),
             buffer_globals: FxHashMap::default(),
+            buffer_elements: FxHashMap::default(),
             tile_backing: FxHashMap::default(),
             local_handles: FxHashMap::default(),
             scratch: FxHashMap::default(),

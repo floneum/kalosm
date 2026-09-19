@@ -141,9 +141,9 @@ fn infer_launch_inner(
             if members.len() < 2 {
                 return Err(Error::Shape("a Slab needs at least two members".into()));
             }
-            let facts = ins.last().ok_or_else(|| {
-                Error::Shape("a Slab's last member has no inferred facts".into())
-            })?;
+            let facts = ins
+                .last()
+                .ok_or_else(|| Error::Shape("a Slab's last member has no inferred facts".into()))?;
             let mut out = facts.clone();
             out.outs = 1;
             Ok(out)

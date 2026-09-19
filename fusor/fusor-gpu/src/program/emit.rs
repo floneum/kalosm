@@ -21,7 +21,7 @@ fn lit(x: Splat) -> Result<String> {
     // Browser WGSL rejects constant evaluation that produces infinity or NaN,
     // including a constant bitcast. Reduction identities need their exact bits;
     // a function parameter makes the conversion a runtime expression instead.
-    if x.dtype() == Dtype::F32 && !f32::from_bits(x.bits() as u32).is_finite() {
+    if x.dtype() == Dtype::F32 && !f32::from_bits(x.bits()).is_finite() {
         return Ok(format!("f32_bits({}u)", x.bits()));
     }
     Ok(format!("bitcast<{}>({}u)", ty(x.dtype())?, x.bits()))
@@ -336,9 +336,7 @@ pub(crate) fn shader(
             read_deps(p, *output, &mut used_maps, &mut used_reads);
         }
     }
-    let mut out = format!(
-        "@group(0) @binding(0) var<storage,read_write> arena: array<u32>;\nvar<workgroup> tile_a:array<f32,512>;\nvar<workgroup> tile_b:array<f32,256>;\nvar<workgroup> reduce_scratch:array<u32,256>;\nvar<private> owner:u32;\nfn f32_bits(bits:u32)->f32{{return bitcast<f32>(bits);}}\n"
-    );
+    let mut out = "@group(0) @binding(0) var<storage,read_write> arena: array<u32>;\nvar<workgroup> tile_a:array<f32,512>;\nvar<workgroup> tile_b:array<f32,256>;\nvar<workgroup> reduce_scratch:array<u32,256>;\nvar<private> owner:u32;\nfn f32_bits(bits:u32)->f32{return bitcast<f32>(bits);}\n".to_string();
     if cooperative {
         out.insert_str(
             0,
@@ -442,40 +440,18 @@ pub(crate) fn shader(
                 bucketed_scatter(&mut out, p, *id, groups)?;
                 continue;
             }
-            if let Logical::Contract {
-                spec,
-                a,
-                b,
-                acc,
-                outs,
-            } = &v.op
-            {
-                if *acc != Dtype::F32 || *outs != 1 {
-                    return Err(Error::Dtype(
-                        "fixed contractions require one f32 output".into(),
-                    ));
-                }
-                contraction(
-                    &mut out,
-                    p,
-                    *id,
-                    spec,
-                    *a,
-                    *b,
-                    groups,
-                    acceleration.matrices,
-                    tiled,
-                )?;
+            if matches!(&v.op, Logical::Contract { .. }) {
+                contraction(&mut out, p, *id, groups, acceleration.matrices, tiled)?;
                 continue;
             }
             if let Logical::Fold {
                 axis, ins, carrier, ..
             } = &v.op
+                && carrier.associative
+                && p.value(ins[0]).shape[*axis as usize] >= 32
             {
-                if carrier.associative && p.value(ins[0]).shape[*axis as usize] >= 32 {
-                    reduction(&mut out, p, *id, groups, acceleration.subgroups)?;
-                    continue;
-                }
+                reduction(&mut out, p, *id, groups, acceleration.subgroups)?;
+                continue;
             }
             let share = n.div_ceil(groups);
             writeln!(
@@ -611,9 +587,6 @@ fn contraction(
     out: &mut String,
     p: &Plan,
     id: Id,
-    spec: &fusor_ir::ir::logical::EinSpec,
-    a: Id,
-    b: Id,
     groups: u32,
     matrices: super::MatrixInstructions,
     tiled: bool,
@@ -621,9 +594,25 @@ fn contraction(
     let cooperative = matrices != super::MatrixInstructions::Portable;
     let browser = matrices == super::MatrixInstructions::Browser;
     use fusor_ir::ir::logical::Label;
+    let v = p.value(id);
+    let Logical::Contract {
+        spec,
+        a,
+        b,
+        acc,
+        outs,
+    } = &v.op
+    else {
+        return Err(Error::Plan("expected a contraction stage".into()));
+    };
+    if *acc != Dtype::F32 || *outs != 1 {
+        return Err(Error::Dtype(
+            "fixed contractions require one f32 output".into(),
+        ));
+    }
+    let (a, b) = (*a, *b);
     let av = p.value(a);
     let bv = p.value(b);
-    let v = p.value(id);
     let mut dims = std::collections::BTreeMap::new();
     for (labels, value) in [(&spec.a, av), (&spec.b, bv)] {
         for (label, dim) in labels.iter().zip(&value.shape) {

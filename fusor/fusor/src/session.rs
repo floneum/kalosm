@@ -3318,8 +3318,12 @@ mod tests {
         const T: u64 = 512;
         const K: u64 = 512;
         const N: u64 = 130;
-        let xs: Vec<f32> = (0..T * K).map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0).collect();
-        let ws: Vec<f32> = (0..N * K).map(|i| ((i * 53 % 97) as f32 - 48.0) / 48.0).collect();
+        let xs: Vec<f32> = (0..T * K)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0)
+            .collect();
+        let ws: Vec<f32> = (0..N * K)
+            .map(|i| ((i * 53 % 97) as f32 - 48.0) / 48.0)
+            .collect();
         let x = Tensor::from_elements(h, &[Dim::Const(T), Dim::Const(K)], &xs).unwrap();
         let w = Tensor::from_elements(h, &[Dim::Const(N), Dim::Const(K)], &ws).unwrap();
         let y = x.matmul_t(&w).unwrap();

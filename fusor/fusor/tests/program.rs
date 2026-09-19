@@ -62,8 +62,8 @@ fn long_queue_and_observation_preserve_state() {
     let state = Tensor::<1, f32>::from_slice(&device, [1], &[0.]);
     let next = state.as_dyn().add_scalar(1f32).unwrap();
     let mut program = pollster::block_on(TrainingProgram::compile(
-        &[next.clone()],
-        &[(state.as_dyn().clone(), next)],
+        std::slice::from_ref(&next),
+        &[(state.as_dyn().clone(), next.clone())],
     ))
     .unwrap();
     pollster::block_on(async {
@@ -122,7 +122,7 @@ fn long_parameter_gradient_uses_each_matrix_tile_once() {
             [(false, false), (false, true), (true, true)]
         {
             let mut program = pollster::block_on(TrainingProgram::compile_with_options(
-                &[update.clone()],
+                std::slice::from_ref(&update),
                 &[],
                 ProgramOptions {
                     workgroups: Some(64),
@@ -472,7 +472,7 @@ fn indexed_reductions_preserve_order_outer_axes_and_changing_indices() {
             [(false, false), (false, true), (true, true)]
         {
             let mut p = pollster::block_on(TrainingProgram::compile_with_options(
-                &[result.clone()],
+                std::slice::from_ref(&result),
                 &[],
                 ProgramOptions {
                     workgroups: Some(3),
@@ -543,7 +543,7 @@ fn indexed_reductions_preserve_signed_integer_bits() {
         [(false, false), (false, true), (true, true)]
     {
         let mut p = pollster::block_on(TrainingProgram::compile_with_options(
-            &[result.clone()],
+            std::slice::from_ref(&result),
             &[],
             ProgramOptions {
                 workgroups: Some(3),
@@ -639,7 +639,7 @@ fn composed_view_addresses_keep_gather_bounds_before_simplification() {
     let output = selected.add_scalar(0.25f32).unwrap();
     for workgroups in [1, 3] {
         let mut p = pollster::block_on(TrainingProgram::compile_with_options(
-            &[output.clone()],
+            std::slice::from_ref(&output),
             &[],
             ProgramOptions {
                 workgroups: Some(workgroups),
@@ -687,7 +687,7 @@ fn matrix_coordinates_cover_multiple_axes_and_permuted_outputs() {
         .unwrap();
     for matrix_acceleration in [false, true] {
         let mut program = pollster::block_on(TrainingProgram::compile_with_options(
-            &[product.clone()],
+            std::slice::from_ref(&product),
             &[],
             ProgramOptions {
                 matrix_acceleration,

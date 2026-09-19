@@ -259,7 +259,6 @@ impl Lm {
             &positions,
             &blocks,
             &final_norm,
-            config.batch,
             config,
             &mut chain,
         );
@@ -760,7 +759,6 @@ impl Lm {
             &self.positions,
             &self.blocks,
             &self.final_norm,
-            1,
             self.config,
             &mut chain,
         );
@@ -916,10 +914,10 @@ fn forward(
     positions: &Tensor<2, f32>,
     blocks: &[Block],
     final_norm: &Tensor<1, f32>,
-    rows: usize,
     config: ModelConfig,
     chain: &mut Vec<Dyn>,
 ) -> Tensor<3, f32> {
+    let rows = tokens.shape()[0];
     let embedded: Tensor<3, f32> = Embedding::new(embed.clone()).forward(tokens);
     let mut x = embedded.add_::<2, 3, _>(positions);
     chain.push(x.as_dyn().clone());

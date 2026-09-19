@@ -166,10 +166,10 @@ async fn fetch(file: &str, size: usize, hash: &str) -> Result<String, String> {
         .map(std::path::PathBuf::from)
         .unwrap_or_else(|| std::env::temp_dir().join("fusor-corpus-v1"));
     let path = cache.join(format!("{hash}.txt"));
-    if let Ok(bytes) = fs::read(&path) {
-        if verified(&bytes, size, hash) {
-            return String::from_utf8(bytes).map_err(|e| e.to_string());
-        }
+    if let Ok(bytes) = fs::read(&path)
+        && verified(&bytes, size, hash)
+    {
+        return String::from_utf8(bytes).map_err(|e| e.to_string());
     }
     let output = Command::new("curl")
         .args([

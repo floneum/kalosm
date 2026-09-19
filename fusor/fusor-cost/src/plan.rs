@@ -9,12 +9,11 @@
 //! shape family.
 
 use crate::realize::{self, Component, Realized};
-use rustc_hash::{FxHashMap, FxHashSet};
 use fusor_ir::Result;
-use fusor_ir::error::Error;
 use fusor_ir::cost::DeviceFacts;
-use fusor_ir::dtype::{Dtype, Persistence};
+use fusor_ir::dtype::Persistence;
 use fusor_ir::egraph::{EGraph, Id};
+use fusor_ir::error::Error;
 use fusor_ir::extract::{BindKind, BindingPlan, BufferPlan, Dispatch, Extraction, Plan, PlanHash};
 use fusor_ir::facts::ValueFacts;
 use fusor_ir::ir::Op;
@@ -23,6 +22,7 @@ use fusor_ir::ir::logical::{LeafKind, Logical};
 use fusor_ir::scalar::{ScalarExpr, ScalarKind};
 use fusor_ir::shape::{Dim, Dims, Layout, SymId};
 use rustc_hash::FxHasher;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 
@@ -91,9 +91,8 @@ pub fn derive_plan(
 
 /// Interval-color the step-local intermediates into one arena: each is
 /// live from the first launch binding it to the last, and two whose ranges
-/// are disjoint take the same bytes. A launch then binds the arena once per
-/// dtype instead of once per value, which is what the device's binding
-/// limit counts. Returns the arena's size.
+/// are disjoint take the same bytes. A launch binds the arena once; typed
+/// views reinterpret values through that binding. Returns the arena's size.
 fn pack_arena(buffers: &mut [BufferPlan], launches: &mut [Dispatch], realized: &Realized) -> u64 {
     const ALIGN: u64 = 256;
     let mut first: FxHashMap<Id, usize> = FxHashMap::default();
@@ -110,9 +109,17 @@ fn pack_arena(buffers: &mut [BufferPlan], launches: &mut [Dispatch], realized: &
         if b.persistence != Persistence::Step || realized.is_root(b.value) {
             continue;
         }
-        let Some(elements) = b.elements.as_const() else { continue };
-        let (Some(s), Some(e)) = (first.get(&b.value), last.get(&b.value)) else { continue };
-        let bytes = elements.saturating_mul(b.dtype.byte_size()).max(4).div_ceil(ALIGN) * ALIGN;
+        let Some(elements) = b.elements.as_const() else {
+            continue;
+        };
+        let (Some(s), Some(e)) = (first.get(&b.value), last.get(&b.value)) else {
+            continue;
+        };
+        let bytes = elements
+            .saturating_mul(b.dtype.byte_size())
+            .max(4)
+            .div_ceil(ALIGN)
+            * ALIGN;
         items.push((*s, *e, bytes, i));
     }
     if items.is_empty() {
@@ -168,26 +175,37 @@ fn pack_arena(buffers: &mut [BufferPlan], launches: &mut [Dispatch], realized: &
         live.push((e, offset, bytes));
         buffers[i].arena = Some(offset);
     }
-    let in_arena: FxHashMap<Id, Dtype> = buffers
+    let in_arena: FxHashSet<Id> = buffers
         .iter()
         .filter(|b| b.arena.is_some())
-        .map(|b| (b.value, b.dtype))
+        .map(|b| b.value)
         .collect();
-    // One binding per dtype per launch for the arena values, renumbered.
+    // One binding per physical buffer. Multiple writable bindings spanning
+    // the same arena are invalid in WebGPU, even for different element types.
     for l in launches.iter_mut() {
         let mut out: Vec<BindingPlan> = Vec::with_capacity(l.bindings.len());
-        let mut slot_of_dtype: FxHashMap<Dtype, u32> = FxHashMap::default();
+        let mut arena_binding = None;
         let mut next = 1u32;
         for b in &l.bindings {
-            if let Some(dtype) = in_arena.get(&b.value) {
-                let binding = *slot_of_dtype.entry(*dtype).or_insert_with(|| {
+            if in_arena.contains(&b.value) {
+                let binding = *arena_binding.get_or_insert_with(|| {
                     let n = next;
                     next += 1;
                     n
                 });
-                out.push(BindingPlan { binding, value: b.value, kind: BindKind::ReadWrite, arena: true });
+                out.push(BindingPlan {
+                    binding,
+                    value: b.value,
+                    kind: BindKind::ReadWrite,
+                    arena: true,
+                });
             } else {
-                out.push(BindingPlan { binding: next, value: b.value, kind: b.kind, arena: false });
+                out.push(BindingPlan {
+                    binding: next,
+                    value: b.value,
+                    kind: b.kind,
+                    arena: false,
+                });
                 next += 1;
             }
         }
@@ -246,7 +264,8 @@ pub fn derive_bindings(
         .iter()
         .copied()
         .filter(|m| {
-            (extraction.is_materialized(*m) || realized.is_root(*m)) && !component.private.contains(m)
+            (extraction.is_materialized(*m) || realized.is_root(*m))
+                && !component.private.contains(m)
         })
         .collect();
     writes.sort_unstable();

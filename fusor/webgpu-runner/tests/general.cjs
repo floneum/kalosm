@@ -44,7 +44,7 @@ const { chromium } = require('playwright');
     }, rowMode);
     await page.goto(process.env.FUSOR_URL || 'http://127.0.0.1:8900/#/train', { waitUntil: 'networkidle' });
     const filters = process.argv.slice(2);
-    for (const filter of filters.length ? filters : ['matmul::matmul', 'matmul::mat_mul_rank', 'mat_mul_transposed_rhs', 'wide_n_columns', 'qkv_projection_triple', 'normalization', 'attention_rope']) {
+    for (const filter of filters.length ? filters : ['matmul', 'normalization', 'attention_rope']) {
       console.log(await page.evaluate(async filter => {
         const script = [...document.scripts].find(s => s.type === 'module' && s.src.includes('fusor-webgpu-runner'));
         const module = await import(script.src);

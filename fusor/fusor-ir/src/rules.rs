@@ -7,14 +7,14 @@
 //! reproducibility.
 
 pub mod absorb_view;
-pub mod group;
-pub mod scatter_fold;
 pub mod algebra;
 pub mod fusion;
+pub mod group;
 pub mod layout;
 pub mod lower_floor;
 pub mod promote;
 pub mod rebase;
+pub mod scatter_fold;
 pub mod sink;
 pub mod slab;
 pub mod specialize;

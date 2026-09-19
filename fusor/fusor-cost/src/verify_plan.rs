@@ -54,7 +54,12 @@ pub(crate) fn check_slabs(graph: &EGraph, plan: &Plan) -> Result<()> {
         .launches
         .iter()
         .flat_map(|l| l.members.iter().copied())
-        .filter(|id| matches!(graph.node(*id).op, Op::Launch(Launch::Slab { .. } | Launch::Group { .. })))
+        .filter(|id| {
+            matches!(
+                graph.node(*id).op,
+                Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
+            )
+        })
         .collect();
     realized.sort_unstable();
     realized.dedup();
@@ -82,20 +87,25 @@ pub(crate) fn check_slabs(graph: &EGraph, plan: &Plan) -> Result<()> {
         .flatten()
         .collect();
     for id in realized {
-        let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) = &graph.node(id).op else {
+        let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) =
+            &graph.node(id).op
+        else {
             continue;
         };
         if group_last.contains(&id) {
             continue;
         }
         let expected = match &graph.node(id).op {
-            Op::Launch(Launch::Group { .. }) => members
-                .iter()
-                .map(|m| match &graph.node(*m).op {
-                    Op::Launch(Launch::Slab { members: sm, .. }) => sm.len() + 1,
-                    _ => 1,
-                })
-                .sum::<usize>() + 1,
+            Op::Launch(Launch::Group { .. }) => {
+                members
+                    .iter()
+                    .map(|m| match &graph.node(*m).op {
+                        Op::Launch(Launch::Slab { members: sm, .. }) => sm.len() + 1,
+                        _ => 1,
+                    })
+                    .sum::<usize>()
+                    + 1
+            }
             _ => members.len() + 1,
         };
         if !plan.extraction.is_materialized(id) {
@@ -155,7 +165,9 @@ pub(crate) fn check_slabs(graph: &EGraph, plan: &Plan) -> Result<()> {
                     graph.node(*m).op.tag(),
                     class.0.index(),
                     plan.extraction.selected(class),
-                    plan.extraction.selected(class).map(|s| graph.node(s).op.tag()),
+                    plan.extraction
+                        .selected(class)
+                        .map(|s| graph.node(s).op.tag()),
                 )));
             }
             if !plan.extraction.is_materialized(*m) {
@@ -513,7 +525,19 @@ pub(crate) fn check_extensions(
 }
 
 fn selected(plan: &Plan) -> Vec<Id> {
-    let mut out: Vec<Id> = plan.extraction.sigma.values().copied().collect();
+    // Sigma retains choices for abandoned paths so autotuning can explore
+    // them later. Validate the executable DAG, including composite members
+    // and external bindings, rather than those unreachable candidates.
+    let mut out: Vec<Id> = plan
+        .launches
+        .iter()
+        .flat_map(|l| {
+            l.members
+                .iter()
+                .copied()
+                .chain(l.bindings.iter().map(|b| b.value))
+        })
+        .collect();
     out.sort_unstable();
     out.dedup();
     out

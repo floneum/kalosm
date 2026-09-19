@@ -113,8 +113,8 @@ pub struct BindingPlan {
     pub binding: u32,
     pub value: Id,
     pub kind: BindKind,
-    /// The value lives in the plan's step arena: every arena value of one
-    /// dtype in a launch shares one binding, at its own offset.
+    /// The value lives in the plan's step arena: all arena values in a
+    /// launch share one binding, with typed views at their own offsets.
     pub arena: bool,
 }
 

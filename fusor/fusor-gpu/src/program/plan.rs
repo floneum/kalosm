@@ -248,16 +248,14 @@ impl Plan {
             if let Logical::Fold {
                 axis, ins, carrier, ..
             } = &op
-            {
-                if ins.is_empty()
+                && (ins.is_empty()
                     || *axis as usize >= values[by_id[&ins[0]]].shape.len()
                     || carrier.width() != 1
-                    || carrier.lanes() != Some(1)
-                {
-                    return Err(Error::Plan(
-                        "program reductions require a valid axis and scalar carrier".into(),
-                    ));
-                }
+                    || carrier.lanes() != Some(1))
+            {
+                return Err(Error::Plan(
+                    "program reductions require a valid axis and scalar carrier".into(),
+                ));
             }
             by_id.insert(id, values.len());
             by_id.insert(selected, values.len());

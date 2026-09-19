@@ -53,7 +53,9 @@ pub fn form_slab(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Op
 }
 
 thread_local! { static LAST_REASON: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") }; }
-fn why(r: &'static str) { LAST_REASON.with(|c| c.set(r)); }
+fn why(r: &'static str) {
+    LAST_REASON.with(|c| c.set(r));
+}
 
 fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
     why("ok");
@@ -71,7 +73,9 @@ fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
     }
     // `FUSOR_SLAB_HEAD_MAX=<id>`: only heads up to that id form slabs, for
     // bisecting a wrong plan down to one slab.
-    if let Some(max) = std::env::var("FUSOR_SLAB_HEAD_MAX").ok().and_then(|v| v.parse::<u32>().ok())
+    if let Some(max) = std::env::var("FUSOR_SLAB_HEAD_MAX")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
         && id.0 > max
     {
         why("disabled");
@@ -80,7 +84,10 @@ fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
     let Op::Launch(op) = &node.op else {
         return None;
     };
-    let Some((_, ops)) = stage_parts(op) else { why("not a stage"); return None; };
+    let Some((_, ops)) = stage_parts(op) else {
+        why("not a stage");
+        return None;
+    };
     if is_contraction(b, id) {
         why("not a stage");
         return None;
@@ -129,7 +136,7 @@ fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
             .filter(|r| b.class_of(*r) == b.class_of(id))
             .min()
             .unwrap_or(id);
-        for r in b.roots().iter().copied().collect::<Vec<_>>() {
+        for r in b.roots().to_vec() {
             let class = b.class_of(r);
             if r >= head_root || !seen_root.insert(class) {
                 continue;
@@ -149,17 +156,31 @@ fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
                         .filter(|m| matches!(&b.node(*m).op, Op::Launch(op) if stage_parts(op).is_some()))
                         .map(|m| format!("{m}:{:?}", stage_rank(b, m)))
                         .collect();
-                    eprintln!("  ROOTPICK {id}: root class {} -> {m} from {ranks:?}", class.0.index());
+                    eprintln!(
+                        "  ROOTPICK {id}: root class {} -> {m} from {ranks:?}",
+                        class.0.index()
+                    );
                 }
                 members.push(m);
             }
         }
     }
-    let trace = std::env::var("FUSOR_SLAB_TRACE").ok().and_then(|v| v.parse::<u32>().ok()) == Some(id.0);
+    let trace = std::env::var("FUSOR_SLAB_TRACE")
+        .ok()
+        .and_then(|v| v.parse::<u32>().ok())
+        == Some(id.0);
     if trace {
         let ops_s: Vec<String> = ops
             .iter()
-            .map(|o| format!("{}:c{}:varies={}:prod={:?}", o.src, b.class_of(o.src).0.index(), varies(o, op), producer_stage(b, o.src)))
+            .map(|o| {
+                format!(
+                    "{}:c{}:varies={}:prod={:?}",
+                    o.src,
+                    b.class_of(o.src).0.index(),
+                    varies(o, op),
+                    producer_stage(b, o.src)
+                )
+            })
             .collect();
         eprintln!("TRACE {id}: ops {ops_s:?} members {members:?}");
         // Each member's own operands: where a chain stops and why.
@@ -169,8 +190,12 @@ fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
             if !seen_m.insert(m) {
                 continue;
             }
-            let Op::Launch(mop) = &b.node(m).op else { continue };
-            let Some((_, mops)) = stage_parts(mop) else { continue };
+            let Op::Launch(mop) = &b.node(m).op else {
+                continue;
+            };
+            let Some((_, mops)) = stage_parts(mop) else {
+                continue;
+            };
             for o in mops {
                 let c = b.class_of(o.src);
                 let kinds: Vec<String> = b
@@ -220,7 +245,9 @@ fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
                     continue;
                 }
                 if let Op::Launch(Launch::Slab { members: ms, .. }) = &b.node(r).op
-                    && ms.last().is_some_and(|l| root_classes_all.contains(&b.class_of(*l)))
+                    && ms
+                        .last()
+                        .is_some_and(|l| root_classes_all.contains(&b.class_of(*l)))
                     && ms.contains(&m)
                     && !ms.iter().any(|x| b.class_of(*x) == b.class_of(id))
                 {
@@ -315,7 +342,10 @@ fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
     // nothing reads it — and goes last whatever position the closure's
     // additions took.
     let rest: Vec<Id> = members.iter().copied().filter(|m| *m != id).collect();
-    let Some(mut members) = order_members(b, rest) else { why("cycle"); return None; };
+    let Some(mut members) = order_members(b, rest) else {
+        why("cycle");
+        return None;
+    };
     members.push(id);
     if trace {
         eprintln!("TRACE {id}: closed {members:?}");
@@ -362,7 +392,10 @@ fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
         }
         let Some(slabs) = coarsen(g, widest, b.caps()) else {
             if std::env::var_os("FUSOR_SLAB_LOG").is_some() {
-                eprintln!("  NOSLAB {id} cut {cut}: gcd {g} widest {widest} finests {:?}", &finests[cut..]);
+                eprintln!(
+                    "  NOSLAB {id} cut {cut}: gcd {g} widest {widest} finests {:?}",
+                    &finests[cut..]
+                );
             }
             continue;
         };
@@ -389,13 +422,18 @@ fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
         // step arena's one binding.
         let owns = |c: &ClassId| {
             root_classes.contains(c)
-                || b.class_members(c.0)
-                    .iter()
-                    .any(|m| matches!(b.node(*m).op, Op::Logical(crate::ir::logical::Logical::Leaf(_))))
+                || b.class_members(c.0).iter().any(|m| {
+                    matches!(
+                        b.node(*m).op,
+                        Op::Logical(crate::ir::logical::Logical::Leaf(_))
+                    )
+                })
         };
         let inputs = inputs.iter().filter(|c| owns(c)).count();
         if trace {
-            eprintln!("TRACE {id}: cut {cut} slabs {slabs} inputs {inputs} root_members {root_members}");
+            eprintln!(
+                "TRACE {id}: cut {cut} slabs {slabs} inputs {inputs} root_members {root_members}"
+            );
         }
         if 3 + inputs + root_members > budget {
             reason = "over the binding budget";
@@ -443,7 +481,12 @@ fn stage(op: &Launch) -> Option<Stage<'_>> {
     match op {
         Launch::Map { space, ops, .. } => {
             space.iterations()?;
-            Some(Stage { space, start: 0, end_max: space.rank(), ops })
+            Some(Stage {
+                space,
+                start: 0,
+                end_max: space.rank(),
+                ops,
+            })
         }
         Launch::Fold {
             space,
@@ -465,11 +508,20 @@ fn stage(op: &Launch) -> Option<Stage<'_>> {
             }
             space.iterations()?;
             let axis = *axis as usize;
-            let (start, end_max) = if axis == 0 { (1, space.rank()) } else { (0, axis) };
+            let (start, end_max) = if axis == 0 {
+                (1, space.rank())
+            } else {
+                (0, axis)
+            };
             if start >= end_max {
                 return None;
             }
-            Some(Stage { space, start, end_max, ops })
+            Some(Stage {
+                space,
+                start,
+                end_max,
+                ops,
+            })
         }
         _ => None,
     }
@@ -485,9 +537,10 @@ fn varies(o: &Operand, op: &Launch) -> bool {
     let Some(map) = o.address_map() else {
         return true;
     };
-    map.terms.iter().enumerate().any(|(i, t)| {
-        t.stride != 0 && (u64::from(t.divisor) < total || map.needs_modulo(i, total))
-    })
+    map.terms
+        .iter()
+        .enumerate()
+        .any(|(i, t)| t.stride != 0 && (u64::from(t.divisor) < total || map.needs_modulo(i, total)))
 }
 
 /// Whether `id`'s class also has a `Contract` spelling: the value is a
@@ -514,7 +567,13 @@ pub(crate) fn small_fold(b: &Builder<'_>, id: Id) -> bool {
     match &b.node(id).op {
         // One operand summed as it is: a contraction spelled as a fold
         // multiplies two.
-        Op::Launch(Launch::Fold { space, axis, ops, carrier, .. }) => {
+        Op::Launch(Launch::Fold {
+            space,
+            axis,
+            ops,
+            carrier,
+            ..
+        }) => {
             ops.len() == 1
                 && carrier.lift.len() == 1
                 && matches!(carrier.lift[0].kind(), crate::scalar::ScalarKind::Arg(0))
@@ -543,9 +602,11 @@ pub(crate) fn stage_rank(b: &Builder<'_>, m: Id) -> (isize, usize, u64, isize) {
     // Among sums of split-K partials, the most split: the contraction
     // feeding it runs with the most workgroups.
     let splits = match op {
-        Launch::Fold { space, axis, .. } if small_fold(b, m) => {
-            space.dims.get(*axis as usize).and_then(|d| d.as_const()).unwrap_or(0)
-        }
+        Launch::Fold { space, axis, .. } if small_fold(b, m) => space
+            .dims
+            .get(*axis as usize)
+            .and_then(|d| d.as_const())
+            .unwrap_or(0),
         _ => 0,
     };
     (-copies, ops.len(), splits, -(m.0 as isize))
@@ -605,10 +666,11 @@ fn producer_stage(b: &Builder<'_>, src: Id) -> Option<Id> {
                     best_slab = Some((members.len(), m));
                 }
             }
-            Op::Launch(op) if stage_parts(op).is_some() => {
-                if stage.is_none_or(|s| stage_rank(b, m) > stage_rank(b, s)) {
-                    stage = Some(m);
-                }
+            Op::Launch(op)
+                if stage_parts(op).is_some()
+                    && stage.is_none_or(|s| stage_rank(b, m) > stage_rank(b, s)) =>
+            {
+                stage = Some(m);
             }
             _ => {}
         }
@@ -685,7 +747,12 @@ fn finest(b: &Builder<'_>, m: Id, classes: &FxHashSet<ClassId>) -> Option<u64> {
         return None;
     };
     let st = stage(op)?;
-    let dims: Vec<u64> = st.space.dims.iter().map(|d| d.as_const()).collect::<Option<_>>()?;
+    let dims: Vec<u64> = st
+        .space
+        .dims
+        .iter()
+        .map(|d| d.as_const())
+        .collect::<Option<_>>()?;
     (st.start + 1..=st.end_max)
         .rev()
         .find(|end| slab_local(b, m, &dims, st.start, *end, classes))
@@ -704,7 +771,11 @@ fn coarsen(g: u64, widest: u64, caps: &crate::device::Caps) -> Option<u64> {
         .unwrap_or(1);
     // A chain too small to fill `MIN_SLABS` blocks is a few workgroups
     // whichever way it is cut; one dispatch for it beats several.
-    let floor = if widest < MIN_SLABS * block { 1 } else { MIN_SLABS };
+    let floor = if widest < MIN_SLABS * block {
+        1
+    } else {
+        MIN_SLABS
+    };
     (slabs >= floor).then_some(slabs)
 }
 
@@ -833,7 +904,11 @@ fn address_span(
     let mut lead: u64 = 0;
     let mut rest: u64 = u64::from(map.offset);
     for (i, t) in map.terms.iter().enumerate() {
-        let (d, n, s) = (u64::from(t.divisor), u64::from(t.modulus), u64::from(t.stride));
+        let (d, n, s) = (
+            u64::from(t.divisor),
+            u64::from(t.modulus),
+            u64::from(t.stride),
+        );
         if d == 0 || n == 0 {
             return Err("a degenerate term");
         }
@@ -845,7 +920,10 @@ fn address_span(
             // Wholly above the slab prefix: bounded, and paid whatever the
             // slab.
             let span = if wraps { n - 1 } else { (total - 1) / d };
-            rest = span.checked_mul(s).and_then(|v| rest.checked_add(v)).ok_or(OVERFLOW)?;
+            rest = span
+                .checked_mul(s)
+                .and_then(|v| rest.checked_add(v))
+                .ok_or(OVERFLOW)?;
             continue;
         }
         if !inner.is_multiple_of(d) {
@@ -855,7 +933,10 @@ fn address_span(
         if wraps {
             // `(c_above * q * leading + c * q + r / d) % n`.
             if q.is_multiple_of(n) {
-                rest = (n - 1).checked_mul(s).and_then(|v| rest.checked_add(v)).ok_or(OVERFLOW)?;
+                rest = (n - 1)
+                    .checked_mul(s)
+                    .and_then(|v| rest.checked_add(v))
+                    .ok_or(OVERFLOW)?;
                 continue;
             }
             if !n.is_multiple_of(q) {
@@ -881,8 +962,14 @@ fn address_span(
                 .and_then(|v| rest.checked_add(v))
                 .ok_or(OVERFLOW)?;
         }
-        lead = q.checked_mul(s).and_then(|v| lead.checked_add(v)).ok_or(OVERFLOW)?;
-        rest = (q - 1).checked_mul(s).and_then(|v| rest.checked_add(v)).ok_or(OVERFLOW)?;
+        lead = q
+            .checked_mul(s)
+            .and_then(|v| lead.checked_add(v))
+            .ok_or(OVERFLOW)?;
+        rest = (q - 1)
+            .checked_mul(s)
+            .and_then(|v| rest.checked_add(v))
+            .ok_or(OVERFLOW)?;
     }
     Ok((lead, rest))
 }
@@ -927,7 +1014,12 @@ impl Deps {
     }
 
     /// Whether the value at `start` is computed from any class in `classes`.
-    pub(crate) fn depends(&mut self, b: &Builder<'_>, start: Id, classes: &FxHashSet<ClassId>) -> bool {
+    pub(crate) fn depends(
+        &mut self,
+        b: &Builder<'_>,
+        start: Id,
+        classes: &FxHashSet<ClassId>,
+    ) -> bool {
         let floor = self.floor;
         let mut stack: Vec<(Id, bool)> = vec![(start, false)];
         while let Some((x, expanded)) = stack.pop() {

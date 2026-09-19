@@ -16,15 +16,15 @@
 
 use fusor_ir::Result;
 use fusor_ir::dtype::NumericContract;
+use fusor_ir::egraph::ClassId;
 use fusor_ir::error::Error;
 use fusor_ir::ir::Op;
 use fusor_ir::ir::kernel::{
     Accumulator, Addr, ElementType, KernelIr, ScalarElement, Stmt, StorageView, TileBinaryOp,
     TileCompareOp, TileExpr,
 };
-use fusor_ir::ir::launch::{IndexSpace, Launch, SchedPoint, slab_block, slab_lanes_per_row};
 use fusor_ir::ir::kernel::{MergeBody, ReduceKind, Tile};
-use fusor_ir::egraph::ClassId;
+use fusor_ir::ir::launch::{IndexSpace, Launch, SchedPoint, slab_block, slab_lanes_per_row};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
@@ -61,7 +61,14 @@ impl Dst {
 }
 
 /// `value` at member-space index `at`, under `live`.
-fn store(ctx: &mut Ctx<'_>, lanes: &Lanes, dst: &Dst, at: TileExpr, value: TileExpr, live: TileExpr) -> Stmt {
+fn store(
+    ctx: &mut Ctx<'_>,
+    lanes: &Lanes,
+    dst: &Dst,
+    at: TileExpr,
+    value: TileExpr,
+    live: TileExpr,
+) -> Stmt {
     match dst {
         Dst::Buffer(view) => Stmt::Store {
             dst: view.clone(),
@@ -111,7 +118,9 @@ pub(crate) fn lower_kslab(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> R
         return Err(Error::Plan("lower_kslab on a non-Slab node".into()));
     };
     if theta != SchedPoint::Point {
-        return Err(Error::Plan(format!("a Slab lowers at Point, not {theta:?}")));
+        return Err(Error::Plan(format!(
+            "a Slab lowers at Point, not {theta:?}"
+        )));
     }
     let Some(last) = members.last().copied() else {
         return Err(Error::Plan("a Slab has no members".into()));
@@ -133,9 +142,12 @@ pub(crate) fn lower_kslab(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> R
 
     let global = ctx.global_index(block, grid);
     let block_e = ctx.b.u32(block);
-    let slab = ctx
-        .b
-        .binary(TileBinaryOp::Div, global.clone(), block_e.clone(), NumericContract::RELAXED);
+    let slab = ctx.b.binary(
+        TileBinaryOp::Div,
+        global.clone(),
+        block_e.clone(),
+        NumericContract::RELAXED,
+    );
     let lane = ctx
         .b
         .binary(TileBinaryOp::Rem, global, block_e, NumericContract::RELAXED);
@@ -168,9 +180,11 @@ pub(crate) fn lower_kslab(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> R
                 .try_fold(1u64, |a, d| d.as_const().map(|d| a * d))
                 .ok_or_else(|| Error::Plan("a slab stage needs constant extents".into()))?;
             let share = per_slab(elements, *slabs)?;
-            let tile = ctx
-                .b
-                .tile("slab_member", ElementType::Scalar(scalar_element(facts.dtype)), &[share]);
+            let tile = ctx.b.tile(
+                "slab_member",
+                ElementType::Scalar(scalar_element(facts.dtype)),
+                &[share],
+            );
             lanes
                 .private
                 .insert(ctx.cx.graph.class_of(m), (tile.clone(), share));
@@ -190,7 +204,11 @@ pub(crate) fn lower_kslab(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> R
             }
         }
         if m != last {
-            body.push(if to_tile { Stmt::Barrier } else { Stmt::StorageBarrier });
+            body.push(if to_tile {
+                Stmt::Barrier
+            } else {
+                Stmt::StorageBarrier
+            });
         }
     }
     Ok(ctx.finish("kslab", grid, block, body))
@@ -208,12 +226,7 @@ fn per_slab(count: u64, slabs: u32) -> Result<u32> {
 }
 
 /// `slab * per + it * block + lane`, and whether that lane is live.
-fn strided(
-    ctx: &mut Ctx<'_>,
-    lanes: &Lanes,
-    it: &TileExpr,
-    per: u32,
-) -> (TileExpr, TileExpr) {
+fn strided(ctx: &mut Ctx<'_>, lanes: &Lanes, it: &TileExpr, per: u32) -> (TileExpr, TileExpr) {
     let block_e = ctx.b.u32(lanes.block);
     let step = ctx.b.mul(it.clone(), block_e);
     let within = ctx.b.add(step, lanes.lane.clone());
@@ -236,7 +249,10 @@ fn map_stage(
     lanes: &Lanes,
 ) -> Result<()> {
     let Launch::Map {
-        space, body: expr, ops, ..
+        space,
+        body: expr,
+        ops,
+        ..
     } = stage
     else {
         return Err(Error::Plan("map_stage on a non-Map".into()));

@@ -51,6 +51,8 @@ pub struct NodeKey {
     pub children: Children,
 }
 
+type ReaderClasses = FxHashMap<ClassId, Arc<FxHashSet<ClassId>>>;
+
 /// The e-graph: one node arena, one memo, one facts table, no union-find.
 pub struct EGraph {
     nodes: Vec<Node>,
@@ -112,7 +114,7 @@ pub struct EGraph {
     /// The classes reading each class, computed at a node count and valid
     /// until the next node: a rule application asks about the same chain's
     /// members many times while it mints nothing.
-    reader_classes_memo: std::sync::Mutex<(usize, FxHashMap<ClassId, Arc<FxHashSet<ClassId>>>)>,
+    reader_classes_memo: std::sync::Mutex<(usize, ReaderClasses)>,
 }
 
 impl EGraph {
@@ -350,14 +352,17 @@ impl EGraph {
 
     /// Whether some non-`Union` reader of `class` satisfies `pred`; stops
     /// at the first.
-    pub fn any_reader(&self, class: ClassId, mut pred: impl FnMut(Id) -> bool) -> bool {
-        self.for_each_reader(class, |r| pred(r))
+    pub fn any_reader(&self, class: ClassId, pred: impl FnMut(Id) -> bool) -> bool {
+        self.for_each_reader(class, pred)
     }
 
     /// The classes whose nodes read `class`, memoized at the current node
     /// count.
     pub fn reader_classes(&self, class: ClassId) -> Arc<FxHashSet<ClassId>> {
-        let mut memo = self.reader_classes_memo.lock().unwrap_or_else(|e| e.into_inner());
+        let mut memo = self
+            .reader_classes_memo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if memo.0 != self.nodes.len() {
             *memo = (self.nodes.len(), FxHashMap::default());
         }
@@ -598,6 +603,9 @@ impl<'a> Builder<'a> {
     }
     pub fn len(&self) -> usize {
         self.graph.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.graph.is_empty()
     }
     pub fn arena_id(&self) -> u64 {
         self.graph.arena_id()

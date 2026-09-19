@@ -11,8 +11,8 @@
 
 pub(crate) mod contract;
 pub(crate) mod gather_scatter;
-pub(crate) mod map_fold;
 pub(crate) mod group;
+pub(crate) mod map_fold;
 pub(crate) mod region;
 pub(crate) mod slab;
 
@@ -914,12 +914,12 @@ impl<'a> Ctx<'a> {
 
         let mut slot_of = FxHashMap::default();
         let mut arena_offset: FxHashMap<Id, u32> = FxHashMap::default();
-        let mut last_binding: Option<u32> = None;
+        let mut arena_views = FxHashMap::default();
         for plan_binding in ordered.iter() {
             let (layout, dtype) = bound_layout(cx, plan_binding.value);
             let class = cx.graph.class_of(plan_binding.value);
-            // Arena values of one dtype share a binding: one decl, spanning
-            // the arena, and each value at its own element offset.
+            // Typed views share one physical arena binding. The emitter
+            // declares it once and reinterprets mixed types at each access.
             if plan_binding.arena {
                 let bytes = cx
                     .plan
@@ -927,11 +927,15 @@ impl<'a> Ctx<'a> {
                     .iter()
                     .find(|b| b.value == plan_binding.value)
                     .and_then(|b| b.arena)
-                    .ok_or_else(|| Error::Plan(format!("arena value {} has no offset", plan_binding.value)))?;
+                    .ok_or_else(|| {
+                        Error::Plan(format!("arena value {} has no offset", plan_binding.value))
+                    })?;
                 let elem = dtype.byte_size().max(1);
                 let off = u32::try_from(bytes / elem)
                     .map_err(|_| Error::Plan("arena offset exceeds a u32".into()))?;
-                if last_binding != Some(plan_binding.binding) {
+                let slot = if let Some(slot) = arena_views.get(&dtype) {
+                    *slot
+                } else {
                     let extent = u32::try_from(cx.plan.arena_bytes / elem)
                         .map_err(|_| Error::Plan("arena element count exceeds a u32".into()))?;
                     buffers.push(Arc::new(BufferDecl {
@@ -940,15 +944,16 @@ impl<'a> Ctx<'a> {
                         layout: TileLayout::contiguous(MemoryLevel::Storage, &[extent.max(1)]),
                         access: BufferAccess::ReadWrite,
                     }));
-                    last_binding = Some(plan_binding.binding);
-                }
+                    let slot = buffers.len() - 1;
+                    arena_views.insert(dtype, slot);
+                    slot
+                };
                 for member in cx.graph.class_ids(class) {
-                    slot_of.insert(member, buffers.len() - 1);
+                    slot_of.insert(member, slot);
                     arena_offset.insert(member, off);
                 }
                 continue;
             }
-            last_binding = Some(plan_binding.binding);
             let elements = decl_elements(&layout);
             // A quantized buffer holds blocks, not elements: it binds as the
             // `u32` word stream the decode program addresses.
@@ -1949,7 +1954,10 @@ pub(crate) fn lower_member(
             }
             Ok(k.remove(0))
         }
-        other => Err(Error::Plan(format!("a {:?} cannot be a group member", other.tag()))),
+        other => Err(Error::Plan(format!(
+            "a {:?} cannot be a group member",
+            other.tag()
+        ))),
     }
 }
 

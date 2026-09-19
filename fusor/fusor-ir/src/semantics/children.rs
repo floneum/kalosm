@@ -46,8 +46,6 @@ pub fn children_launch(op: &Launch) -> Children {
         Launch::Contract { a, b, .. } => a.ops.iter().chain(b.ops.iter()).map(|o| o.src).collect(),
         Launch::Region { members, .. }
         | Launch::Slab { members, .. }
-        | Launch::Group { members, .. } => {
-            members.iter().copied().collect()
-        }
+        | Launch::Group { members, .. } => members.iter().copied().collect(),
     }
 }

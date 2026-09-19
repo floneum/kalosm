@@ -148,9 +148,11 @@ pub(crate) async fn request_device(opts: &DeviceOptions) -> Result<GpuDevice> {
     // One slot short of the adapter's count: wgpu binds its buffer-sizes
     // table in the same argument table, and Metal loses the device with
     // an out-of-memory report when a kernel fills all 31.
-    limits.max_storage_buffers_per_shader_stage = limits
-        .max_storage_buffers_per_shader_stage
-        .max(adapter_limits.max_storage_buffers_per_shader_stage.saturating_sub(1));
+    limits.max_storage_buffers_per_shader_stage = limits.max_storage_buffers_per_shader_stage.max(
+        adapter_limits
+            .max_storage_buffers_per_shader_stage
+            .saturating_sub(1),
+    );
     limits.max_storage_buffer_binding_size = limits
         .max_storage_buffer_binding_size
         .max(adapter_limits.max_storage_buffer_binding_size);
@@ -246,7 +248,8 @@ async fn probe_browser_matrices(
             "f32"
         };
         let enable = if scalar == "f16" { "enable f16;" } else { "" };
-        let source = format!(r#"
+        let source = format!(
+            r#"
 enable wgpu_cooperative_matrix;
 {enable}
 var<workgroup> tile: array<{scalar},64>;
@@ -259,7 +262,8 @@ fn main() {{
     let result = coopMultiplyAdd(a,b,c);
     coopStore(result,&output[0],8u);
 }}
-"#);
+"#
+        );
         let module = naga::front::wgsl::parse_str(&source)
             .map_err(|e| Error::Plan(e.emit_to_string(&source)))?;
         let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);

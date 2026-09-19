@@ -68,13 +68,16 @@ pub fn split_k(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Opti
     let a_k = k_axis(a.primary().layout.shape(), batch_c, mc, kc, false);
     let b_k = k_axis(rhs.primary().layout.shape(), batch_c, nc, kc, true);
     if log {
-        eprintln!("  axes a={:?} b={:?}", a_k.as_ref().map(|k| (k.axis, k.batch_axes)), b_k.as_ref().map(|k| (k.axis, k.batch_axes)));
+        eprintln!(
+            "  axes a={:?} b={:?}",
+            a_k.as_ref().map(|k| (k.axis, k.batch_axes)),
+            b_k.as_ref().map(|k| (k.axis, k.batch_axes))
+        );
     }
     let (a_k, b_k) = (a_k?, b_k?);
     // An `Alias` or a `Pack` reads the operand's own layout; a gather or an
     // unflatten carries its own map, which the chunk stride cannot thread.
-    if a
-        .ops
+    if a.ops
         .iter()
         .chain(rhs.ops.iter())
         .any(|o| !matches!(o.access, AccessPlan::Alias | AccessPlan::Pack { .. }))
@@ -87,51 +90,53 @@ pub fn split_k(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Opti
             continue;
         }
         let chunk = Dim::Const(kc / s);
-        let side = |side: &ContractSide, k_axis: usize, batch_axes: usize| -> Option<ContractSide> {
-            let ops: Option<SmallVec<[Operand; 2]>> = side
-                .ops
-                .iter()
-                .map(|o| {
-                    let layout = &o.layout;
-                    let shape = layout.shape();
-                    let strides = layout.strides();
-                    let k_stride = strides[k_axis];
-                    let mut new_shape: SmallVec<[Dim; 6]> = SmallVec::new();
-                    let mut new_strides: SmallVec<[Dim; 6]> = SmallVec::new();
-                    for (i, (d, st)) in shape.iter().zip(strides).enumerate() {
-                        if i == batch_axes {
+        let side =
+            |side: &ContractSide, k_axis: usize, batch_axes: usize| -> Option<ContractSide> {
+                let ops: Option<SmallVec<[Operand; 2]>> = side
+                    .ops
+                    .iter()
+                    .map(|o| {
+                        let layout = &o.layout;
+                        let shape = layout.shape();
+                        let strides = layout.strides();
+                        let k_stride = strides[k_axis];
+                        let mut new_shape: SmallVec<[Dim; 6]> = SmallVec::new();
+                        let mut new_strides: SmallVec<[Dim; 6]> = SmallVec::new();
+                        for (i, (d, st)) in shape.iter().zip(strides).enumerate() {
+                            if i == batch_axes {
+                                new_shape.push(Dim::Const(s));
+                                new_strides.push(k_stride * chunk);
+                            }
+                            if i == k_axis {
+                                new_shape.push(chunk);
+                            } else {
+                                new_shape.push(*d);
+                            }
+                            new_strides.push(*st);
+                        }
+                        if batch_axes == shape.len() {
                             new_shape.push(Dim::Const(s));
                             new_strides.push(k_stride * chunk);
                         }
-                        if i == k_axis {
-                            new_shape.push(chunk);
-                        } else {
-                            new_shape.push(*d);
-                        }
-                        new_strides.push(*st);
-                    }
-                    if batch_axes == shape.len() {
-                        new_shape.push(Dim::Const(s));
-                        new_strides.push(k_stride * chunk);
-                    }
-                    let access = match &o.access {
-                        AccessPlan::Pack { .. } => AccessPlan::Pack {
-                            into: Layout::contiguous(&new_shape),
-                        },
-                        _ => AccessPlan::Alias,
-                    };
-                    Some(Operand {
-                        src: o.src,
-                        layout: Layout::from_parts(layout.offset(), &new_shape, &new_strides).ok()?,
-                        access,
+                        let access = match &o.access {
+                            AccessPlan::Pack { .. } => AccessPlan::Pack {
+                                into: Layout::contiguous(&new_shape),
+                            },
+                            _ => AccessPlan::Alias,
+                        };
+                        Some(Operand {
+                            src: o.src,
+                            layout: Layout::from_parts(layout.offset(), &new_shape, &new_strides)
+                                .ok()?,
+                            access,
+                        })
                     })
+                    .collect();
+                Some(ContractSide {
+                    pre: side.pre.clone(),
+                    ops: ops?,
                 })
-                .collect();
-            Some(ContractSide {
-                pre: side.pre.clone(),
-                ops: ops?,
-            })
-        };
+            };
         let a2 = side(a, a_k.axis, a_k.batch_axes)?;
         let b2 = side(rhs, b_k.axis, b_k.batch_axes)?;
         let partials = b
@@ -208,13 +213,19 @@ fn k_axis(shape: &[Dim], batch: u64, x: u64, k: u64, k_first: bool) -> Option<KA
             return None;
         }
         let rest: u64 = consts[i + 1..].iter().product();
-        (rest == x).then_some(KAxis { axis: i, batch_axes })
+        (rest == x).then_some(KAxis {
+            axis: i,
+            batch_axes,
+        })
     } else {
         let last = consts.len().checked_sub(1)?;
         if consts[last] != k || last < i {
             return None;
         }
         let mid: u64 = consts[i..last].iter().product();
-        (mid == x).then_some(KAxis { axis: last, batch_axes })
+        (mid == x).then_some(KAxis {
+            axis: last,
+            batch_axes,
+        })
     }
 }

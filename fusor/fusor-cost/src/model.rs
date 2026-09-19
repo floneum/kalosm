@@ -169,7 +169,11 @@ impl Roofline {
         // that throttles issue throttles the memory pipe too. Without it a
         // reduction is priced on bytes alone, so every lane group reads the
         // same total and occupancy never enters the comparison.
-        let dram = terms::scaled(terms::dram_ps(f, launch.reads, launch.writes, launch.line_bytes), num, den);
+        let dram = terms::scaled(
+            terms::dram_ps(f, launch.reads, launch.writes, launch.line_bytes),
+            num,
+            den,
+        );
         // One split's padded output; `(splits + 1)` then counts reading
         // every partial and writing the result.
         let combine = terms::combine_ps(
@@ -207,8 +211,14 @@ fn unit_and_dtype(
 impl Roofline {
     /// Line traffic beyond the useful bytes a fold moves at `theta`'s lane
     /// group, over the operands it walks at its own iteration space.
-    fn fold_line_floor(&self, node: &Node, ins: &[ValueFacts], theta: Option<SchedPoint>) -> Picoseconds {
-        let fusor_ir::ir::Op::Launch(fusor_ir::ir::launch::Launch::Fold { space, axis, .. }) = &node.op
+    fn fold_line_floor(
+        &self,
+        node: &Node,
+        ins: &[ValueFacts],
+        theta: Option<SchedPoint>,
+    ) -> Picoseconds {
+        let fusor_ir::ir::Op::Launch(fusor_ir::ir::launch::Launch::Fold { space, axis, .. }) =
+            &node.op
         else {
             return Picoseconds(0);
         };
@@ -226,12 +236,21 @@ impl Roofline {
         };
         let mut extra = 0u64;
         for f in ins {
-            let elems = f.shape.iter().try_fold(1u64, |a, d| d.as_const().map(|d| a * d));
+            let elems = f
+                .shape
+                .iter()
+                .try_fold(1u64, |a, d| d.as_const().map(|d| a * d));
             if elems != Some(total) {
                 continue;
             }
-            let elem = f.dtype.byte_size().max(1) as u64;
-            let amp = crate::realize::fold_line_amplification(&dims, *axis as usize, lane_group, caps, elem);
+            let elem = f.dtype.byte_size().max(1);
+            let amp = crate::realize::fold_line_amplification(
+                &dims,
+                *axis as usize,
+                lane_group,
+                caps,
+                elem,
+            );
             extra = extra.saturating_add(total.saturating_mul(elem).saturating_mul(amp - 1));
         }
         terms::dram_ps(&self.facts, &[], 0, extra)
@@ -295,7 +314,8 @@ impl CostModel for Roofline {
         // The one memory term that is a floor of the node itself: a fold's
         // line amplification at this point, which every plan through the
         // point pays whatever it inlines around it.
-        let t = terms::math_ps(&self.facts, work, unit, dtype) + self.fold_line_floor(node, ins, theta);
+        let t =
+            terms::math_ps(&self.facts, work, unit, dtype) + self.fold_line_floor(node, ins, theta);
         // A workgroup's dependent chain is a floor of the node at this point
         // too: nothing around it shortens the k loop.
         if std::env::var_os("FUSOR_NO_SEED_FLOOR").is_some() {

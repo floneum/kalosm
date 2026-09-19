@@ -185,7 +185,11 @@ fn check_composite_domain(cx: &VerifyCtx<'_>, op: &Launch) -> Result<()> {
         Launch::Region { sched, .. } => sched,
         // A slab has one geometry, a workgroup per slab, and nothing to
         // enumerate.
-        Launch::Slab { sched, slabs, members } => {
+        Launch::Slab {
+            sched,
+            slabs,
+            members,
+        } => {
             if *slabs < 2 || members.len() < 2 {
                 return Err(Error::Legality(format!(
                     "a Slab needs at least two slabs and two members, got {slabs} and {}",

@@ -13,9 +13,27 @@ use crate::rules::slab::{Deps, copy_operands, is_contraction, stage_rank};
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
-rule!(FORM_GROUP_MAP, level = Level::Launch, head = OpTag::LaunchMap, tag = RuleTag::Additive, apply = form_group);
-rule!(FORM_GROUP_FOLD, level = Level::Launch, head = OpTag::LaunchFold, tag = RuleTag::Additive, apply = form_group);
-rule!(FORM_GROUP_SLAB, level = Level::Launch, head = OpTag::LaunchSlab, tag = RuleTag::Additive, apply = form_group);
+rule!(
+    FORM_GROUP_MAP,
+    level = Level::Launch,
+    head = OpTag::LaunchMap,
+    tag = RuleTag::Additive,
+    apply = form_group
+);
+rule!(
+    FORM_GROUP_FOLD,
+    level = Level::Launch,
+    head = OpTag::LaunchFold,
+    tag = RuleTag::Additive,
+    apply = form_group
+);
+rule!(
+    FORM_GROUP_SLAB,
+    level = Level::Launch,
+    head = OpTag::LaunchSlab,
+    tag = RuleTag::Additive,
+    apply = form_group
+);
 
 /// A member whose block the group lowering can set: a map, a fold, or a
 /// slab of those. A tiled contraction fixes its own lane count.
@@ -38,7 +56,9 @@ fn slab_copies(b: &Builder<'_>, members: &[Id]) -> isize {
     members
         .iter()
         .map(|m| match &b.node(*m).op {
-            Op::Launch(Launch::Map { ops, .. } | Launch::Fold { ops, .. }) => copy_operands(b, ops) as isize,
+            Op::Launch(Launch::Map { ops, .. } | Launch::Fold { ops, .. }) => {
+                copy_operands(b, ops) as isize
+            }
             _ => 0,
         })
         .sum()
@@ -75,7 +95,11 @@ fn best_spelling(b: &Builder<'_>, class: ClassId) -> Option<Id> {
             .class_members(class.0)
             .into_iter()
             .filter_map(|m| match &b.node(m).op {
-                Op::Launch(Launch::Slab { members, .. }) => Some(format!("{m}:c{}:n{}", slab_copies(b, members), members.len())),
+                Op::Launch(Launch::Slab { members, .. }) => Some(format!(
+                    "{m}:c{}:n{}",
+                    slab_copies(b, members),
+                    members.len()
+                )),
                 _ => None,
             })
             .collect();
@@ -98,15 +122,23 @@ fn covers(b: &Builder<'_>, m: Id, out: &mut FxHashSet<ClassId>) {
 /// caller reads back. Everything else shares the step arena's binding.
 fn own_buffer(b: &Builder<'_>, class: ClassId, roots: &FxHashSet<ClassId>) -> bool {
     roots.contains(&class)
-        || b.class_members(class.0)
-            .iter()
-            .any(|m| matches!(b.node(*m).op, Op::Logical(crate::ir::logical::Logical::Leaf(_))))
+        || b.class_members(class.0).iter().any(|m| {
+            matches!(
+                b.node(*m).op,
+                Op::Logical(crate::ir::logical::Logical::Leaf(_))
+            )
+        })
 }
 
 /// Bindings a member needs beyond the uniform block and the arena: its
 /// output and every slab stage a root reads back, and its outside inputs
 /// that own a buffer.
-fn bindings(b: &Builder<'_>, m: Id, roots: &FxHashSet<ClassId>, inputs: &mut FxHashSet<ClassId>) -> usize {
+fn bindings(
+    b: &Builder<'_>,
+    m: Id,
+    roots: &FxHashSet<ClassId>,
+    inputs: &mut FxHashSet<ClassId>,
+) -> usize {
     let mut out = usize::from(roots.contains(&b.class_of(m)));
     match &b.node(m).op {
         Op::Launch(Launch::Slab { members, .. }) => {
@@ -149,17 +181,24 @@ fn covered_class(b: &Builder<'_>, head: Id, class: ClassId) -> bool {
 /// heads fire, so a firing scans only its own shape.
 fn siblings(b: &Builder<'_>, id: Id) -> Vec<Id> {
     use std::cell::RefCell;
+    type Siblings = rustc_hash::FxHashMap<(OpTag, Vec<crate::shape::Dim>), Vec<Id>>;
     thread_local! {
-        static SEEN: RefCell<(u64, rustc_hash::FxHashMap<(OpTag, Vec<crate::shape::Dim>), Vec<Id>>)> =
+        static SEEN: RefCell<(u64, Siblings)> =
             RefCell::new((0, rustc_hash::FxHashMap::default()));
     }
     const MAX_SIBLINGS: usize = 24;
-    let Op::Launch(op) = &b.node(id).op else { return Vec::new() };
+    let Op::Launch(op) = &b.node(id).op else {
+        return Vec::new();
+    };
     let (tag, space) = match op {
         Launch::Map { space, .. } | Launch::Fold { space, .. } => (op.tag(), space.dims.to_vec()),
         Launch::Slab { members, .. } => {
-            let Some(last) = members.last() else { return Vec::new() };
-            let Op::Launch(lop) = &b.node(*last).op else { return Vec::new() };
+            let Some(last) = members.last() else {
+                return Vec::new();
+            };
+            let Op::Launch(lop) = &b.node(*last).op else {
+                return Vec::new();
+            };
             (op.tag(), lop.iter_space().dims.to_vec())
         }
         _ => return Vec::new(),
@@ -199,7 +238,9 @@ fn siblings(b: &Builder<'_>, id: Id) -> Vec<Id> {
 }
 
 pub fn form_group(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    if b.caps().kind != crate::device::DeviceKind::Gpu || std::env::var_os("FUSOR_NO_GROUP").is_some() {
+    if b.caps().kind != crate::device::DeviceKind::Gpu
+        || std::env::var_os("FUSOR_NO_GROUP").is_some()
+    {
         return None;
     }
     let Op::Launch(_) = &node.op else { return None };
@@ -209,7 +250,11 @@ pub fn form_group(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> O
     let class = b.class_of(id);
     let roots: Vec<Id> = b.roots().to_vec();
     let root_classes: FxHashSet<ClassId> = roots.iter().map(|r| b.class_of(*r)).collect();
-    let head_root = roots.iter().copied().filter(|r| b.class_of(*r) == class).min();
+    let head_root = roots
+        .iter()
+        .copied()
+        .filter(|r| b.class_of(*r) == class)
+        .min();
 
     // Candidates: for a root, every earlier root's best spelling; for
     // anything else, the earlier launches of the same kind over the same
@@ -222,7 +267,9 @@ pub fn form_group(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> O
             .filter(|r| *r < head_root)
             .filter_map(|r| {
                 let rc = b.class_of(r);
-                (!covered_class(b, id, rc)).then(|| best_spelling(b, rc)).flatten()
+                (!covered_class(b, id, rc))
+                    .then(|| best_spelling(b, rc))
+                    .flatten()
             })
             .collect(),
         // Same-shaped independent siblings (`siblings`) measured a net
@@ -252,7 +299,11 @@ pub fn form_group(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> O
             continue;
         }
         back.reset_classes(b, &own);
-        if members.iter().chain(std::iter::once(&id)).any(|m| back.depends(b, *m, &own)) {
+        if members
+            .iter()
+            .chain(std::iter::once(&id))
+            .any(|m| back.depends(b, *m, &own))
+        {
             continue;
         }
         covered.extend(own);
@@ -278,7 +329,10 @@ pub fn form_group(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> O
         let own: FxHashSet<ClassId> = tail.iter().map(|m| b.class_of(*m)).collect();
         let inputs = inputs.iter().filter(|c| !own.contains(c)).count();
         if std::env::var_os("FUSOR_GROUP_LOG").is_some() {
-            eprintln!("GROUP {id}: cut {cut} tail {} outs {outs} inputs {inputs} budget {budget}", tail.len());
+            eprintln!(
+                "GROUP {id}: cut {cut} tail {} outs {outs} inputs {inputs} budget {budget}",
+                tail.len()
+            );
         }
         if 2 + outs + inputs <= budget {
             chosen = Some(tail.to_vec());

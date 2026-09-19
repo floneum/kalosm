@@ -47,7 +47,7 @@ impl TrainingProgram {
         let limits = target.device().device().limits();
         let max_bytes = limits
             .max_buffer_size
-            .min(u64::from(limits.max_storage_buffer_binding_size));
+            .min(limits.max_storage_buffer_binding_size);
         let ids = roots.iter().map(Dyn::id).collect::<Vec<_>>();
         let state = feedback
             .iter()

@@ -41,14 +41,20 @@ pub fn scatter_as_fold(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>)
     {
         return None;
     }
-    let Op::Launch(Launch::Scatter { axis, combine, ops, .. }) = &node.op else {
+    let Op::Launch(Launch::Scatter {
+        axis, combine, ops, ..
+    }) = &node.op
+    else {
         return None;
     };
     if *combine != ScatterCombine::Add || ops.len() != 3 {
         return None;
     }
     let (base, idx, upd) = (&ops[0], &ops[1], &ops[2]);
-    if !ops.iter().all(|o| matches!(o.access, AccessPlan::Alias) && o.layout.is_contiguous()) {
+    if !ops
+        .iter()
+        .all(|o| matches!(o.access, AccessPlan::Alias) && o.layout.is_contiguous())
+    {
         return None;
     }
     let a = *axis as usize;
@@ -85,7 +91,11 @@ pub fn scatter_as_fold(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>)
     s_base.push(0);
     let mut s_idx = vec![0u64; rank];
     s_idx.push(1);
-    let operand = |src: Id, layout: Layout| Operand { src, layout, access: AccessPlan::Alias };
+    let operand = |src: Id, layout: Layout| Operand {
+        src,
+        layout,
+        access: AccessPlan::Alias,
+    };
     let ops = vec![
         operand(upd.src, layout(s_upd)?),
         operand(idx.src, layout(s_idx)?),
@@ -97,7 +107,11 @@ pub fn scatter_as_fold(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>)
         ScalarExpr::cast(Dtype::U32, ScalarExpr::arg(1, idx_dtype)),
         ScalarExpr::index_of(a as u32),
     );
-    let first = ScalarExpr::cmp(CmpOp::Eq, ScalarExpr::index_of(rank as u32), ScalarExpr::lit(Splat::U32(0)));
+    let first = ScalarExpr::cmp(
+        CmpOp::Eq,
+        ScalarExpr::index_of(rank as u32),
+        ScalarExpr::lit(Splat::U32(0)),
+    );
     let lift = ScalarExpr::bin(
         BinOp::Add,
         ScalarExpr::select(hit, ScalarExpr::arg(0, dtype), zero.clone()),

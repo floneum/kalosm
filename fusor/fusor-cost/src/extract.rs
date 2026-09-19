@@ -132,7 +132,14 @@ impl LocalSearch {
             theta: FxHashMap::default(),
         };
         for class in classes {
-            let pick = argmin_member(graph, lb, launches, *class, &self.caps, cost.facts().launch_ps);
+            let pick = argmin_member(
+                graph,
+                lb,
+                launches,
+                *class,
+                &self.caps,
+                cost.facts().launch_ps,
+            );
             sigma_debug(*class, pick, "seed");
             ex.sigma.insert(*class, pick);
         }
@@ -1156,7 +1163,12 @@ fn break_selection_cycles(
         let class = graph.class_of(v);
         if std::env::var_os("FUSOR_CYCLE_LOG").is_some() {
             seen_cycles += 1;
-            let show = |i: Id| format!("{:?}", graph.node(i).op).chars().take(120).collect::<String>();
+            let show = |i: Id| {
+                format!("{:?}", graph.node(i).op)
+                    .chars()
+                    .take(120)
+                    .collect::<String>()
+            };
             let kids: Vec<String> = graph
                 .node(v)
                 .children
@@ -1166,15 +1178,26 @@ fn break_selection_cycles(
                     format!("{c}:c{}->{:?}", cc.0.index(), ex.sigma.get(&cc))
                 })
                 .collect();
-            eprintln!("CYCLE {seen_cycles} at {v} (class {}) {}\n   kids {kids:?}", class.0.index(), show(v));
+            eprintln!(
+                "CYCLE {seen_cycles} at {v} (class {}) {}\n   kids {kids:?}",
+                class.0.index(),
+                show(v)
+            );
             // The path back to `v` under the current selection.
             let mut stack: Vec<(Id, Vec<Id>)> = vec![(v, vec![v])];
             let mut seen: FxHashSet<Id> = FxHashSet::default();
             let mut found: Option<Vec<Id>> = None;
             while let Some((x, path)) = stack.pop() {
-                let by_id = matches!(graph.node(x).op, Op::Launch(Launch::Slab { .. } | Launch::Group { .. }));
+                let by_id = matches!(
+                    graph.node(x).op,
+                    Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
+                );
                 for c in graph.node(x).children.iter() {
-                    let n = if by_id { *c } else { ex.selected(graph.class_of(*c)).unwrap_or(*c) };
+                    let n = if by_id {
+                        *c
+                    } else {
+                        ex.selected(graph.class_of(*c)).unwrap_or(*c)
+                    };
                     if n == v {
                         let mut p = path.clone();
                         p.push(n);
@@ -1193,7 +1216,11 @@ fn break_selection_cycles(
             }
             if let Some(path) = found {
                 for n in path {
-                    eprintln!("     {n} (class {}) {}", graph.class_of(n).0.index(), show(n));
+                    eprintln!(
+                        "     {n} (class {}) {}",
+                        graph.class_of(n).0.index(),
+                        show(n)
+                    );
                 }
             }
             if seen_cycles > 8 {
@@ -1203,13 +1230,7 @@ fn break_selection_cycles(
         let out = banned.entry(class).or_default();
         out.insert(v);
         let next = crate::lower_bound::argmin_member_excluding(
-            graph,
-            lb,
-            launches,
-            class,
-            caps,
-            launch_ps,
-            out,
+            graph, lb, launches, class, caps, launch_ps, out,
         );
         let (class, next) = match next {
             Some(next) => (class, next),
@@ -1252,9 +1273,16 @@ fn cycle_group(graph: &EGraph, ex: &Extraction, v: Id) -> Option<(ClassId, Id)> 
     let mut stack: Vec<Id> = vec![v];
     let mut seen: FxHashSet<Id> = FxHashSet::default();
     while let Some(x) = stack.pop() {
-        let by_id = matches!(graph.node(x).op, Op::Launch(Launch::Slab { .. } | Launch::Group { .. }));
+        let by_id = matches!(
+            graph.node(x).op,
+            Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
+        );
         for c in graph.node(x).children.iter() {
-            let n = if by_id { *c } else { ex.selected(graph.class_of(*c)).unwrap_or(*c) };
+            let n = if by_id {
+                *c
+            } else {
+                ex.selected(graph.class_of(*c)).unwrap_or(*c)
+            };
             if matches!(graph.node(n).op, Op::Launch(Launch::Group { .. })) {
                 return Some((graph.class_of(n), n));
             }
@@ -1397,7 +1425,9 @@ fn batch_roots_over(
     classes.dedup();
     let log = std::env::var_os("FUSOR_SLAB_LOG").is_some();
     for class in classes {
-        let Some(cur) = ex.sigma.get(&class).copied() else { continue };
+        let Some(cur) = ex.sigma.get(&class).copied() else {
+            continue;
+        };
         // Already batched, or a member of a batch kept for another root.
         if matches!(graph.node(cur).op, Op::Launch(Launch::Slab { .. }))
             || moves::slab_pinned(graph, ex, class)
@@ -1422,9 +1452,9 @@ fn batch_roots_over(
                 .iter()
                 .copied()
                 .filter(|m| match &graph.node(*m).op {
-                    Op::Launch(Launch::Slab { members, .. }) => {
-                        members.iter().any(|x| moves::slab_pinned(graph, ex, graph.class_of(*x)))
-                    }
+                    Op::Launch(Launch::Slab { members, .. }) => members
+                        .iter()
+                        .any(|x| moves::slab_pinned(graph, ex, graph.class_of(*x))),
                     _ => false,
                 })
                 .collect();
@@ -1446,7 +1476,9 @@ fn batch_roots_over(
             .into_iter()
             .filter_map(|m| match &graph.node(m).op {
                 Op::Launch(Launch::Slab { members, .. })
-                    if !members.iter().any(|x| moves::slab_pinned(graph, ex, graph.class_of(*x))) =>
+                    if !members
+                        .iter()
+                        .any(|x| moves::slab_pinned(graph, ex, graph.class_of(*x))) =>
                 {
                     Some((members.len(), m))
                 }
@@ -1455,14 +1487,22 @@ fn batch_roots_over(
             .collect();
         slabs.sort_unstable_by_key(|(n, id)| (std::cmp::Reverse(*n), *id));
         for (n, slab) in slabs {
-            let Some(undo) = moves::apply(graph, ex, crate::moves::Candidate::Select { class, node: slab })
-            else {
+            let Some(undo) = moves::apply(
+                graph,
+                ex,
+                crate::moves::Candidate::Select { class, node: slab },
+            ) else {
                 continue;
             };
             match price(graph, roots, ex, cost, arena, cache) {
                 Ok((r, c, _)) if c < *best_cost => {
                     if log {
-                        eprintln!("BATCH class {} slab {slab} ({n} members): {} -> {} us KEPT", class.0.index(), best_cost.0 / 1_000_000, c.0 / 1_000_000);
+                        eprintln!(
+                            "BATCH class {} slab {slab} ({n} members): {} -> {} us KEPT",
+                            class.0.index(),
+                            best_cost.0 / 1_000_000,
+                            c.0 / 1_000_000
+                        );
                     }
                     *best_cost = c;
                     *realized = r;
@@ -1470,14 +1510,22 @@ fn batch_roots_over(
                 }
                 Ok((_, c, trail)) => {
                     if log {
-                        eprintln!("BATCH class {} slab {slab} ({n} members): {} -> {} us rejected", class.0.index(), best_cost.0 / 1_000_000, c.0 / 1_000_000);
+                        eprintln!(
+                            "BATCH class {} slab {slab} ({n} members): {} -> {} us rejected",
+                            class.0.index(),
+                            best_cost.0 / 1_000_000,
+                            c.0 / 1_000_000
+                        );
                     }
                     unrepair(ex, trail);
                     moves::undo(ex, undo);
                 }
                 Err(trail) => {
                     if log {
-                        eprintln!("BATCH class {} slab {slab} ({n} members): did not realize", class.0.index());
+                        eprintln!(
+                            "BATCH class {} slab {slab} ({n} members): did not realize",
+                            class.0.index()
+                        );
                     }
                     unrepair(ex, trail);
                     moves::undo(ex, undo);
@@ -1684,10 +1732,17 @@ fn pin_slabs_trailed(
     let mut slabs: Vec<(bool, u32, usize, Id)> = realized
         .order
         .iter()
-        .filter_map(|id| members_of(graph, *id).map(|m| {
-            let group = matches!(graph.node(*id).op, Op::Launch(L::Group { .. }));
-            (!group, if group { u32::MAX - root_of(*id) } else { 0 }, m.len(), *id)
-        }))
+        .filter_map(|id| {
+            members_of(graph, *id).map(|m| {
+                let group = matches!(graph.node(*id).op, Op::Launch(L::Group { .. }));
+                (
+                    !group,
+                    if group { u32::MAX - root_of(*id) } else { 0 },
+                    m.len(),
+                    *id,
+                )
+            })
+        })
         .collect();
     slabs.sort_unstable_by_key(|(slab, head, n, id)| (*slab, *head, std::cmp::Reverse(*n), *id));
     slabs.dedup();
@@ -1702,12 +1757,16 @@ fn pin_slabs_trailed(
         id: Id,
         via: Option<Id>,
     ) {
-        let Some(members) = members_of(graph, id) else { return };
+        let Some(members) = members_of(graph, id) else {
+            return;
+        };
         owned.extend(members.iter().map(|m| (graph.class_of(*m), id)));
         if via.is_none() {
             materialize_trailed(graph, ex, id, trail);
         }
-        let Some((last, middle)) = members.split_last() else { return };
+        let Some((last, middle)) = members.split_last() else {
+            return;
+        };
         for m in middle {
             let class = graph.class_of(*m);
             let was = ex.sigma.get(&class).copied();
@@ -1736,7 +1795,9 @@ fn pin_slabs_trailed(
     // its last member's own launch.
     let mut owned: rustc_hash::FxHashMap<ClassId, Id> = rustc_hash::FxHashMap::default();
     for (_, _, _, id) in slabs {
-        let Some(members) = members_of(graph, id) else { continue };
+        let Some(members) = members_of(graph, id) else {
+            continue;
+        };
         let class = graph.class_of(id);
         if ex.sigma.get(&class).copied() != Some(id) {
             continue;
@@ -1746,21 +1807,31 @@ fn pin_slabs_trailed(
             continue;
         }
         let flat = flat_members(graph, id);
-        if let Some(m) = flat.iter().find(|m| owned.contains_key(&graph.class_of(**m))) {
+        if let Some(m) = flat
+            .iter()
+            .find(|m| owned.contains_key(&graph.class_of(**m)))
+        {
             let alt = graph
                 .members(class)
                 .into_iter()
                 .filter(|a| *a != id)
                 .filter_map(|a| {
                     members_of(graph, a)
-                        .filter(|_| flat_members(graph, a).iter().all(|x| !owned.contains_key(&graph.class_of(*x))))
+                        .filter(|_| {
+                            flat_members(graph, a)
+                                .iter()
+                                .all(|x| !owned.contains_key(&graph.class_of(*x)))
+                        })
                         .map(|ms| (ms.len(), a))
                 })
                 .max_by_key(|(n, a)| (*n, std::cmp::Reverse(*a)))
                 .map(|(_, a)| a);
             if std::env::var_os("FUSOR_SLAB_LOG").is_some() {
                 let owner = owned[&graph.class_of(*m)];
-                let show: String = format!("{:?}", graph.node(*m).op).chars().take(160).collect();
+                let show: String = format!("{:?}", graph.node(*m).op)
+                    .chars()
+                    .take(160)
+                    .collect();
                 eprintln!(
                     "PIN fallback: {id:?} ({} members) overlaps at {m:?} with {owner:?} ({} members), class {} -> {alt:?}\n    {m:?} = {show}",
                     members.len(),

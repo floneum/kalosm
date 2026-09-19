@@ -165,8 +165,9 @@ impl TileLayout {
 }
 
 /// A storage buffer declaration. `binding` is the one externally meaningful
-/// name; read-only-ness is what the derived bind group reads back out of
-/// the emitted module.
+/// name; declarations with the same binding are typed views of one buffer.
+/// Read-only-ness is what the derived bind group reads back out of the
+/// emitted module.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BufferDecl {
     pub binding: u32,

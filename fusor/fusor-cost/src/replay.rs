@@ -373,7 +373,10 @@ mod tests {
     #[test]
     fn merged_classes_cannot_be_rekeyed() {
         let merged = |_: Id| ClassId(Id(9));
-        assert_eq!(recanonicalize_sigma(&sigma(&[(1, 1), (2, 2)]), merged), Some(None));
+        assert_eq!(
+            recanonicalize_sigma(&sigma(&[(1, 1), (2, 2)]), merged),
+            Some(None)
+        );
     }
 
     /// Two keys that merged onto the *same* member are not a conflict: one

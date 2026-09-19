@@ -253,10 +253,13 @@ promote its family to a generic symbolic plan, then non-square/tail matrices and
 long-K reductions. Browser normalization and dense-matrix conformance can also
 be run with `node tests/general.cjs` using the same opt-in build and environment
 as `tests/training.cjs`. Arbitrary conformance filters can be supplied as arguments.
-A broader sweep found an existing `matmul::q_mat_mul_rank1` browser failure
-(expected -0.625, got 0 at sampled shape [8,1]); it reproduces with matrix support
-masked off and remains an outstanding issue. This is not a claim that the entire
-browser conformance suite passes.
+The `matmul::q_mat_mul_rank1` browser failure (expected -0.625, got 0 at
+sampled shape [8,1]) came from binding the same writable arena more than once
+for different dtypes. WebGPU rejected the dispatch for overlapping writable
+bindings. Each dispatch now binds the arena once. Mixed scalar views load and
+store through u32 words; packed f16 stores preserve the neighboring half with
+compare-exchange. Homogeneous bindings keep their native element type. Fixed
+f32/f16 gradient regressions and the original rank-1 case pass in the browser.
 
 Larger K tiles, per-job pipeline specialization, a static arena extent, an
 additional subgroup-index clamp, composite-expression caching, and a speed-first
