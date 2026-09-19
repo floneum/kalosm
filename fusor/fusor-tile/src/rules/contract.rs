@@ -16,7 +16,7 @@ use fusor_ir::ir::logical::{EinSpec, Label, Logical};
 use fusor_ir::ir::{Level, Node, Op, OpTag};
 use fusor_ir::rule;
 use fusor_ir::scalar::{ScalarExpr, ScalarKind};
-use fusor_ir::shape::{Dim, Layout, SymId};
+use fusor_ir::shape::{Dim, Layout, OPAQUE_SYM};
 use smallvec::SmallVec;
 
 use crate::domains::{
@@ -73,30 +73,8 @@ pub struct Mnk {
     pub batch: Dim,
 }
 
-/// An extent that could not be folded to a constant because two or more
-/// symbolic labels multiply into it. Mirrors `Layout::row_major_strides`,
-/// which reaches for the same opaque symbol for the same reason.
-const OPAQUE: Dim = Dim::Sym(SymId(u32::MAX));
-
 fn dim_product(dims: &[Dim]) -> Dim {
-    let mut acc: u64 = 1;
-    let mut symbolic: Option<Dim> = None;
-    for d in dims {
-        match d {
-            Dim::Const(v) => acc = acc.saturating_mul(*v),
-            Dim::Sym(_) => {
-                if symbolic.is_some() {
-                    return OPAQUE;
-                }
-                symbolic = Some(*d);
-            }
-        }
-    }
-    match symbolic {
-        None => Dim::Const(acc),
-        Some(s) if acc == 1 => s,
-        Some(_) => OPAQUE,
-    }
+    dims.iter().copied().fold(Dim::ONE, |a, b| a * b)
 }
 
 fn extent(labels: &[Label], shape: &[Dim], want: Label) -> Option<Dim> {
@@ -297,6 +275,9 @@ fn lower_family(
     let a_op = permuted_alias(a_id, fa, &spec.a, &want_a)?;
     let b_op = permuted_alias(b_id, fb, &spec.b, &want_b)?;
     let mnk = contract_mnk(spec, fa, fb);
+    if [mnk.m, mnk.n, mnk.k, mnk.batch].contains(&Dim::Sym(OPAQUE_SYM)) {
+        return None;
+    }
     let cx = DomainCtx::new(f.caps(), default_planner());
 
     let sched = match family {
@@ -324,6 +305,7 @@ fn lower_family(
     };
 
     let op = Launch::Contract {
+        output: IndexSpace::new(f.own().shape.iter().copied()),
         m: mnk.m,
         n: mnk.n,
         k: mnk.k,
@@ -336,25 +318,6 @@ fn lower_family(
         sched,
     };
     let new = b.add_launch(op).ok()?;
-    // The kernel's batch/m/n coordinates flatten label groups. Restore the
-    // logical output axes before union: the kernel and its view are distinct
-    // values, and only the view has the contraction's original type.
-    let new = if b.facts_of(new).shape != f.own().shape {
-        let shape = &f.own().shape;
-        b.add_launch(Launch::Map {
-            space: IndexSpace::new(shape.iter().copied()),
-            body: identity(acc),
-            ops: vec![Operand {
-                src: new,
-                layout: Layout::contiguous(shape),
-                access: AccessPlan::Alias,
-            }],
-            sched: ScheduleDomain::Point,
-        })
-        .ok()?
-    } else {
-        new
-    };
     b.union(id, new).ok()?;
     Some(new)
 }
@@ -427,9 +390,7 @@ pub fn unfuse_coop_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<
         return None;
     };
     let Launch::Contract {
-        m,
-        n,
-        batch,
+        output,
         family: Family::Coop,
         a,
         b: rhs,
@@ -448,22 +409,21 @@ pub fn unfuse_coop_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<
         return None;
     }
 
-    let (post, m, n, batch, acc) = (post.clone(), *m, *n, *batch, *acc);
+    let (post, output, acc) = (post.clone(), output.clone(), *acc);
     let mut inner_op = l1.clone();
     if let Launch::Contract { post: p, .. } = &mut inner_op {
         *p = identity(acc);
     }
     let inner = b.add_launch(inner_op).ok()?;
 
-    let shape = [batch, m, n];
     let cx = DomainCtx::new(f.caps(), default_planner());
     let inner_facts = b.facts_of(inner).clone();
     let outer = b
         .add_launch(Launch::Map {
-            space: IndexSpace::new(shape),
+            space: output.clone(),
             body: post,
             ops: vec![alias(inner, &inner_facts)],
-            sched: ScheduleDomain::Map(map_domain(&shape, &[AccessPlan::Alias], &cx)),
+            sched: ScheduleDomain::Map(map_domain(&output.dims, &[AccessPlan::Alias], &cx)),
         })
         .ok()?;
     b.union(id, outer).ok()?;

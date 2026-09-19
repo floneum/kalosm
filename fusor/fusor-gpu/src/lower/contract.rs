@@ -180,49 +180,13 @@ pub(crate) fn lower_coop(
     let a_rows = shape.batch.saturating_mul(shape.m).max(1);
     let b_rows = shape.batch.saturating_mul(shape.k).max(1);
 
-    // The output. `plan::buffer_layout_for` pads `m` to `bm` and `n` to `bn`
-    // at this schedule point so the whole-block cooperative store needs no
-    // per-element mask — the store is subgroup-collective and cannot take
-    // one. Padding lives in the strides, never in the shape. If the plan did
-    // not deliver that padding the block store would run off the buffer, so
-    // the strides are verified here: offset 0, and walking axes right to
-    // left, `n` strides 1, `m` strides `n_padded`, and every batch axis
-    // strides whole padded `m_padded * n_padded` blocks.
+    // Allocation maps logical output axes onto whole padded matrix tiles.
+    // Cooperative stores use their flattened physical matrix coordinates.
     let out = ctx.output()?;
-    let out_layout = ctx.plan_layout(out)?.clone();
     let tiles_m = shape.m.max(1).div_ceil(geom.bm.max(1)).max(1);
     let tiles_n = shape.n.max(1).div_ceil(geom.bn.max(1)).max(1);
     let m_padded = tiles_m.saturating_mul(geom.bm);
     let n_padded = tiles_n.saturating_mul(geom.bn);
-    let rank = out_layout.rank();
-    if rank < 2 || !out_layout.offset().known_eq(Dim::Const(0)) {
-        return Err(Error::Plan(format!(
-            "coop needs a rank >= 2, offset-0 output layout; the plan laid out \
-             rank {rank} at offset {}",
-            out_layout.offset()
-        )));
-    }
-    let mut expected = 1u64;
-    for axis in (0..rank).rev() {
-        let got = ctx.binding.require(out_layout.strides()[axis])?;
-        if got != expected {
-            return Err(Error::Plan(format!(
-                "coop needs its output padded to whole {}x{} blocks in the strides: \
-                 axis {axis} strides {got} where {expected} was required",
-                geom.bm, geom.bn
-            )));
-        }
-        // The next axis out strides one whole run of this one: its padded
-        // extent for `n` and `m`, its logical extent for the batch axes,
-        // which are never padded.
-        expected = expected.saturating_mul(if axis == rank - 1 {
-            u64::from(n_padded.max(1))
-        } else if axis == rank - 2 {
-            u64::from(m_padded.max(1))
-        } else {
-            ctx.binding.require(out_layout.shape()[axis])?.max(1)
-        });
-    }
     let want_rows = shape.batch.saturating_mul(m_padded).max(1);
     let out_view = StorageView {
         buffer: ctx.buffer(out)?,
@@ -794,6 +758,45 @@ fn source_element(src: &Source) -> ScalarElement {
     }
 }
 
+fn load_staged(
+    ctx: &mut Ctx<'_>,
+    sources: &[StagedSource],
+    row: &TileExpr,
+    col: &TileExpr,
+    mask: &TileExpr,
+) -> Result<Vec<TileExpr>> {
+    sources
+        .iter()
+        .map(|source| match source {
+            StagedSource::Const(lit) => Ok(lit.clone()),
+            StagedSource::Mem(source) => {
+                let fill = ctx.b.zero(source_element(source));
+                Ok(ctx.b.load(
+                    source.clone(),
+                    Addr::Rc2 {
+                        row: row.clone(),
+                        col: col.clone(),
+                    },
+                    mask.clone(),
+                    fill,
+                ))
+            }
+            StagedSource::Indexed {
+                operand,
+                rows,
+                cols,
+            } => {
+                let width = ctx.b.u32(*cols);
+                let base = ctx.b.mul(row.clone(), width);
+                let flat = ctx.b.add(base, col.clone());
+                let value = ctx.load_mapped(operand, flat, u64::from(*rows) * u64::from(*cols))?;
+                let fill = ctx.zero_of(value.element());
+                Ok(ctx.b.select(mask.clone(), value, fill))
+            }
+        })
+        .collect()
+}
+
 #[allow(clippy::too_many_arguments)]
 fn stage_operand_tile(
     ctx: &mut Ctx<'_>,
@@ -858,26 +861,7 @@ fn stage_operand_tile(
         // Each out-of-range fill takes its own source's element type, not the
         // staging tile's: a decode reads `u32` words and only becomes `elem`
         // after `pre` has run.
-        let mut raws: Vec<TileExpr> = Vec::with_capacity(srcs.len());
-        for src in srcs {
-            let src = match src {
-                StagedSource::Const(lit) => {
-                    raws.push(lit.clone());
-                    continue;
-                }
-                StagedSource::Mem(s) => s,
-            };
-            let src_fill = ctx.b.zero(source_element(src));
-            raws.push(ctx.b.load(
-                src.clone(),
-                Addr::Rc2 {
-                    row: row.clone(),
-                    col: col.clone(),
-                },
-                active.clone(),
-                src_fill,
-            ));
-        }
+        let raws = load_staged(ctx, srcs, &row, &col, &active)?;
         let coord_exprs = match coords {
             Some(c) => c.at(ctx, &row, &col),
             None => Vec::new(),
@@ -1101,26 +1085,7 @@ fn contract_rows(
 
     let k_index = ctx.b.local(ElementType::Scalar(ScalarElement::U32));
     let kk = ctx.b.load_local(k_index.clone());
-    let mut avs = Vec::with_capacity(a_sources.len());
-    for src in &a_sources {
-        let src = match src {
-            StagedSource::Const(lit) => {
-                avs.push(lit.clone());
-                continue;
-            }
-            StagedSource::Mem(s) => s,
-        };
-        let fill = ctx.b.zero(source_element(src));
-        avs.push(ctx.b.load(
-            src.clone(),
-            Addr::Rc2 {
-                row: row.clone(),
-                col: kk.clone(),
-            },
-            live.clone(),
-            fill,
-        ));
-    }
+    let avs = load_staged(&mut ctx, &a_sources, &row, &kk, &live)?;
     let a_coord_exprs = match &a_coords {
         Some(c) => c.at(&mut ctx, &row, &kk),
         None => Vec::new(),
@@ -1139,26 +1104,7 @@ fn contract_rows(
         let n_bound = ctx.b.u32(n);
         let in_n = ctx.b.compare(TileCompareOp::Lt, col.clone(), n_bound);
         let ok = ctx.b.and(live.clone(), in_n);
-        let mut bvs = Vec::with_capacity(b_sources.len());
-        for src in &b_sources {
-            let src = match src {
-                StagedSource::Const(lit) => {
-                    bvs.push(lit.clone());
-                    continue;
-                }
-                StagedSource::Mem(s) => s,
-            };
-            let fill = ctx.b.zero(source_element(src));
-            bvs.push(ctx.b.load(
-                src.clone(),
-                Addr::Rc2 {
-                    row: b_row.clone(),
-                    col: col.clone(),
-                },
-                ok.clone(),
-                fill,
-            ));
-        }
+        let bvs = load_staged(&mut ctx, &b_sources, &b_row, &col, &ok)?;
         let b_coord_exprs = match &b_coords {
             Some(c) => c.at(&mut ctx, &b_row, &col),
             None => Vec::new(),
@@ -1233,24 +1179,8 @@ pub(crate) fn lower_sgemv(mut ctx: Ctx<'_>, op: &Launch, p: SgemvParams) -> Resu
     // coordinates through `contract_stage_source`.
     let a_rows = shape.batch.saturating_mul(shape.m).max(1);
     let b_rows = shape.batch.saturating_mul(shape.k).max(1);
-    let stage = |ctx: &mut Ctx<'_>,
-                 side: &ContractSide,
-                 rows: u32,
-                 cols: u32|
-     -> Result<Vec<StagedSource>> {
-        side.ops
-            .iter()
-            .map(|o| {
-                if let Some(lit) = ctx.const_operand(o.src) {
-                    return Ok(StagedSource::Const(lit));
-                }
-                let view = ctx.contract_operand_view(o, rows, cols)?;
-                Ok(StagedSource::Mem(ctx.contract_stage_source(o, &view)?))
-            })
-            .collect()
-    };
-    let a_views = stage(&mut ctx, a, a_rows, shape.k.max(1))?;
-    let b_views = stage(&mut ctx, b, b_rows, shape.n.max(1))?;
+    let a_views = ctx.contract_side_sources(a, a_rows, shape.k.max(1))?;
+    let b_views = ctx.contract_side_sources(b, b_rows, shape.n.max(1))?;
     let a_coords = SideCoords::for_side(
         &ctx,
         a,
@@ -1352,47 +1282,9 @@ pub(crate) fn lower_sgemv(mut ctx: Ctx<'_>, op: &Launch, p: SgemvParams) -> Resu
             } else {
                 ctx.b.bool(true)
             };
-            let mut avs = Vec::with_capacity(a_views.len());
-            for src in &a_views {
-                let src = match src {
-                    StagedSource::Const(lit) => {
-                        avs.push(lit.clone());
-                        continue;
-                    }
-                    StagedSource::Mem(s) => s,
-                };
-                let fill = ctx.b.zero(source_element(src));
-                avs.push(ctx.b.load(
-                    src.clone(),
-                    Addr::Rc2 {
-                        row: row.clone(),
-                        col: k.clone(),
-                    },
-                    mask.clone(),
-                    fill,
-                ));
-            }
-            let mut bvs = Vec::with_capacity(b_views.len());
-            for src in &b_views {
-                let src = match src {
-                    StagedSource::Const(lit) => {
-                        bvs.push(lit.clone());
-                        continue;
-                    }
-                    StagedSource::Mem(s) => s,
-                };
-                let fill = ctx.b.zero(source_element(src));
-                let b_row = ctx.b.add(b_row_base.clone(), k.clone());
-                bvs.push(ctx.b.load(
-                    src.clone(),
-                    Addr::Rc2 {
-                        row: b_row,
-                        col: col.clone(),
-                    },
-                    mask.clone(),
-                    fill,
-                ));
-            }
+            let avs = load_staged(ctx, &a_views, &row, &k, &mask)?;
+            let b_row = ctx.b.add(b_row_base.clone(), k.clone());
+            let bvs = load_staged(ctx, &b_views, &b_row, &col, &mask)?;
             let a_coord_exprs = match &a_coords {
                 Some(c) => c.at(ctx, &row, &k),
                 None => Vec::new(),
@@ -1725,26 +1617,7 @@ fn lower_sgemv_subgroup_cols(
             } else {
                 ctx.b.bool(true)
             };
-            let mut avs = Vec::with_capacity(a_views.len());
-            for src in a_views {
-                let src = match src {
-                    StagedSource::Const(lit) => {
-                        avs.push(lit.clone());
-                        continue;
-                    }
-                    StagedSource::Mem(s) => s,
-                };
-                let fill = ctx.b.zero(source_element(src));
-                avs.push(ctx.b.load(
-                    src.clone(),
-                    Addr::Rc2 {
-                        row: row.clone(),
-                        col: k.clone(),
-                    },
-                    mask.clone(),
-                    fill,
-                ));
-            }
+            let avs = load_staged(ctx, a_views, &row, &k, &mask)?;
             let a_coord_exprs = match a_coords {
                 Some(c) => c.at(ctx, &row, &k),
                 None => Vec::new(),
@@ -1770,27 +1643,8 @@ fn lower_sgemv_subgroup_cols(
                 } else {
                     ctx.b.and(mask.clone(), col_ok.clone())
                 };
-                let mut bvs = Vec::with_capacity(b_views.len());
-                for src in b_views {
-                    let src = match src {
-                        StagedSource::Const(lit) => {
-                            bvs.push(lit.clone());
-                            continue;
-                        }
-                        StagedSource::Mem(s) => s,
-                    };
-                    let fill = ctx.b.zero(source_element(src));
-                    let b_row = ctx.b.add(b_row_base.clone(), k.clone());
-                    bvs.push(ctx.b.load(
-                        src.clone(),
-                        Addr::Rc2 {
-                            row: b_row,
-                            col: col.clone(),
-                        },
-                        load_mask.clone(),
-                        fill,
-                    ));
-                }
+                let b_row = ctx.b.add(b_row_base.clone(), k.clone());
+                let bvs = load_staged(ctx, b_views, &b_row, col, &load_mask)?;
                 let b_coord_exprs = match b_coords {
                     Some(c) => {
                         let b_row = ctx.b.add(b_row_base.clone(), k.clone());

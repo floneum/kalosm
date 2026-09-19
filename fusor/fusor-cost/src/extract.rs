@@ -113,8 +113,7 @@ impl LocalSearch {
             .map(|(ex, _)| ex)
     }
 
-    /// The seed plus the DAG it denotes. The probe realization is reused
-    /// when `m_0` turned out to add nothing.
+    /// Construct the seed's required buffers before partitioning its launches.
     #[allow(clippy::too_many_arguments)]
     fn seed_realized(
         &self,
@@ -143,68 +142,30 @@ impl LocalSearch {
             sigma_debug(*class, pick, "seed");
             ex.sigma.insert(*class, pick);
         }
-        seed_theta(graph, &mut ex, cost);
-
-        // Consumer counts and index spaces are independent of `m`.
-        pin_inplace(graph, &mut ex);
-        for r in roots {
-            let sel = realize::select(graph, &ex, *r)?;
-            materialize(graph, &mut ex, sel);
-        }
-        // The per-class `argmin_member` above chooses each class without
-        // knowing what any other class chose, so the selection can carry a
-        // cycle even though the graph is acyclic. The walk `realize_with`
-        // performs detects it; only a failed probe pays for the diagnosis.
-        let probe = match realize::realize_with(graph, roots, &ex, cost, self.arena.as_ref(), cache)
-        {
-            Ok(probe) => probe,
-            Err(first) => {
-                if !break_selection_cycles(
-                    graph,
-                    roots,
-                    &mut ex,
-                    lb,
-                    launches,
-                    &self.caps,
-                    cost.facts().launch_ps,
-                )? {
-                    // Not a cycle. `first` is the real diagnosis.
-                    return Err(first);
+        loop {
+            let attempt = pin_selection(graph, roots, &mut ex, &mut RepairTrail::default())
+                .and_then(|()| {
+                    seed_theta(graph, &mut ex, cost);
+                    ex.m = realize::seed_materializations(graph, &ex, roots)?;
+                    realize::realize_with(graph, roots, &ex, cost, self.arena.as_ref(), cache)
+                });
+            match attempt {
+                Ok(realized) => return Ok((ex, realized)),
+                Err(error) => {
+                    if !break_selection_cycles(
+                        graph,
+                        roots,
+                        &mut ex,
+                        lb,
+                        launches,
+                        &self.caps,
+                        cost.facts().launch_ps,
+                    )? {
+                        return Err(error);
+                    }
                 }
-                seed_theta(graph, &mut ex, cost);
-                pin_inplace(graph, &mut ex);
-                for r in roots {
-                    let sel = realize::select(graph, &ex, *r)?;
-                    materialize(graph, &mut ex, sel);
-                }
-                realize::realize_with(graph, roots, &ex, cost, self.arena.as_ref(), cache)?
-            }
-        };
-        let mut grew = false;
-        for v in &probe.order {
-            if realize::leaf_role(graph, *v) != realize::LeafRole::NotLeaf {
-                continue;
-            }
-            if ex.is_materialized(*v) {
-                continue;
-            }
-            if probe.consumers.copied(*v).unwrap_or(0) > 1 {
-                materialize(graph, &mut ex, *v);
-                grew = true;
-                continue;
-            }
-            // A producer across any structural cut has to land in a buffer
-            // or its consumer reads what nothing wrote.
-            if moves::at_structural_boundary(graph, &probe, *v) {
-                materialize(graph, &mut ex, *v);
-                grew = true;
             }
         }
-        if !grew {
-            return Ok((ex, probe));
-        }
-        let realized = realize::realize_with(graph, roots, &ex, cost, self.arena.as_ref(), cache)?;
-        Ok((ex, realized))
     }
 
     /// The full run, with an explicit [`ShapeStats`] so a caller driving many
@@ -232,7 +193,8 @@ impl LocalSearch {
         let (mut realized, mut best_cost) =
             match self.price(graph, roots, &mut ex, cost, &mut cache) {
                 Ok((r, c, _)) => (r, c),
-                Err(_) => {
+                Err(trail) => {
+                    unrepair(&mut ex, trail);
                     let c = realize::exact_cost(&seeded, &ex, cost);
                     (seeded, c)
                 }
@@ -383,13 +345,16 @@ impl LocalSearch {
                 )?
             {}
 
-            // The winner is the live state — up to the invariants a sequence
-            // of independent moves does not preserve on its own.
-            if repair(graph, ex, realized, cost) {
-                *realized =
-                    realize::realize_with(graph, roots, ex, cost, self.arena.as_ref(), cache)?;
-                *best_cost = realize::exact_cost(realized, ex, cost);
-                best.push(*best_cost);
+            let trail = repair_trailed(graph, ex, realized, cost);
+            if !trail.is_empty() {
+                match realize::realize_with(graph, roots, ex, cost, self.arena.as_ref(), cache) {
+                    Ok(next) => {
+                        *realized = next;
+                        *best_cost = realize::exact_cost(realized, ex, cost);
+                        best.push(*best_cost);
+                    }
+                    Err(_) => unrepair(ex, trail),
+                }
             }
             Ok(())
         };
@@ -458,7 +423,7 @@ impl LocalSearch {
         Ok((plan, trace))
     }
 
-    /// Realize, [`repair`], re-realize: the cost of the plan this state
+    /// Realize, [`repair_trailed`], re-realize: the cost of the plan this state
     /// denotes, which is the only number an accept test may compare.
     ///
     /// A move can put a producer across a structural cut; the buffer that
@@ -494,10 +459,20 @@ impl LocalSearch {
         cost: &dyn CostModel,
         cache: &mut NodeCache,
     ) -> Result<Plan> {
-        let (realized, exact, _) = self
-            .price(graph, roots, ex, cost, cache)
-            .map_err(|_| Error::Plan("autotune candidate does not realize".into()))?;
-        let plan = derive_plan(graph, ex, &realized, cost.facts(), exact)?;
+        let (realized, exact, trail) = match self.price(graph, roots, ex, cost, cache) {
+            Ok(priced) => priced,
+            Err(trail) => {
+                unrepair(ex, trail);
+                return Err(Error::Plan("autotune candidate does not realize".into()));
+            }
+        };
+        let plan = match derive_plan(graph, ex, &realized, cost.facts(), exact) {
+            Ok(plan) => plan,
+            Err(error) => {
+                unrepair(ex, trail);
+                return Err(error);
+            }
+        };
         // Conformance checks the plan independently of the constructor.
         #[cfg(feature = "compiler-tests")]
         crate::verify_plan::verify_plan_with(
@@ -1171,24 +1146,6 @@ fn materialize(graph: &EGraph, ex: &mut Extraction, id: Id) {
     ex.m.insert(id.index());
 }
 
-fn pin_inplace(graph: &EGraph, ex: &mut Extraction) {
-    let mut selected: Vec<Id> = ex.sigma.values().copied().collect();
-    selected.sort_unstable();
-    for id in selected {
-        if graph.semantics().effect(&graph.node(id).op) != Effect::Pure {
-            materialize(graph, ex, id);
-        }
-    }
-}
-
-/// The frontier-first point of every selected schedule domain: the cheapest
-/// by `node_math`, ties by domain index. The full domain stays reachable
-/// through `RESCHEDULE`; this only picks where the search starts.
-///
-/// Fill-only: a point `RESCHEDULE` already chose is kept, so this is safe to
-/// re-run after the search. A `theta` that is *not* a member of its node's
-/// domain is replaced — that only happens when the node was never scheduled,
-/// because every `RESCHEDULE` candidate comes out of the domain itself.
 /// Re-select, class by class, until the seeded selection is acyclic.
 ///
 /// The seed picks each class's member independently, so two picks can name
@@ -1353,7 +1310,7 @@ fn seed_theta(graph: &EGraph, ex: &mut Extraction, cost: &dyn CostModel) -> bool
     !trail.is_empty()
 }
 
-/// [`seed_theta`], recording every entry it wrote and the value it replaced.
+/// Fill missing schedules and record them for rollback.
 fn seed_theta_trailed(
     graph: &EGraph,
     ex: &mut Extraction,
@@ -1378,21 +1335,17 @@ fn seed_theta_trailed(
     let mut selected: Vec<Id> = scheduled.into_iter().collect();
     selected.sort_unstable();
     for id in selected {
+        if ex.theta.contains_key(&id) {
+            continue;
+        }
         let node = graph.node(id);
         let Op::Launch(l1) = &node.op else { continue };
         let Some(domain) = l1.schedule() else {
             continue;
         };
         if matches!(domain, ScheduleDomain::Point) {
-            let prev = ex.theta.insert(id, fusor_ir::ir::launch::SchedPoint::Point);
-            if prev != Some(fusor_ir::ir::launch::SchedPoint::Point) {
-                trail.push_theta(id, prev);
-            }
-            continue;
-        }
-        if let Some(current) = ex.theta.get(&id).copied()
-            && domain.iter().any(|p| p == current)
-        {
+            ex.theta.insert(id, SchedPoint::Point);
+            trail.push_theta(id, None);
             continue;
         }
         let ins: SmallVec<[ValueFacts; 4]> = node
@@ -1401,53 +1354,14 @@ fn seed_theta_trailed(
             .map(|c| graph.facts(*c).clone())
             .collect();
         let out = graph.facts(id);
-        let mut best: Option<(Picoseconds, usize, _)> = None;
-        for (i, theta) in domain.iter().enumerate() {
-            let s = cost.node_math(node, &ins, out, Some(theta));
-            if best.as_ref().is_none_or(|(b, _, _)| s < *b) {
-                best = Some((s, i, theta));
-            }
-        }
-        if let Some((_, _, theta)) = best {
-            let prev = ex.theta.insert(id, theta);
-            if prev != Some(theta) {
-                trail.push_theta(id, prev);
-            }
+        if let Some(theta) = domain
+            .iter()
+            .min_by_key(|theta| cost.node_math(node, &ins, out, Some(*theta)))
+        {
+            ex.theta.insert(id, theta);
+            trail.push_theta(id, None);
         }
     }
-}
-
-/// Re-establish, on the search winner, every invariant a plan needs that a
-/// sequence of independent moves does not preserve: a root and an in-place
-/// node land in a buffer, a producer cut from a consumer by structure lands
-/// in a buffer, and every selected schedule domain has a point in it. These
-/// are `verify_plan`'s clauses 3, 5 and 6.
-///
-/// One pass is a fixpoint: `order`, `consumers` and every index space are
-/// functions of `sigma` alone, so materializing a node can never create a new
-/// obligation.
-///
-/// Returns whether anything changed, in which case the caller re-realizes and
-/// re-prices.
-fn repair(graph: &EGraph, ex: &mut Extraction, realized: &Realized, cost: &dyn CostModel) -> bool {
-    let mut changed = false;
-    for r in &realized.roots {
-        if !ex.is_materialized(*r) {
-            materialize(graph, ex, *r);
-            changed |= ex.is_materialized(*r);
-        }
-    }
-    for v in &realized.order {
-        if realize::leaf_role(graph, *v) != realize::LeafRole::NotLeaf || ex.is_materialized(*v) {
-            continue;
-        }
-        let in_place = graph.semantics().effect(&graph.node(*v).op) != Effect::Pure;
-        if in_place || moves::at_structural_boundary(graph, realized, *v) {
-            materialize(graph, ex, *v);
-            changed |= ex.is_materialized(*v);
-        }
-    }
-    changed | seed_theta(graph, ex, cost)
 }
 
 /// `FUSOR_SIGMA_DEBUG=<class id>`: prints every selection change of that
@@ -1608,9 +1522,15 @@ fn price(
     // Reselecting slab members can expose further materialization boundaries.
     // Repeat realization and repair until the extraction stabilizes.
     const ROUNDS: usize = 6;
-    let mut realized = realize::realize_with(graph, roots, ex, cost, arena, cache)
-        .map_err(|_| RepairTrail::default())?;
     let mut trail = RepairTrail::default();
+    if pin_selection(graph, roots, ex, &mut trail).is_err() {
+        return Err(trail);
+    }
+    seed_theta_trailed(graph, ex, cost, &mut trail);
+    let mut realized = match realize::realize_with(graph, roots, ex, cost, arena, cache) {
+        Ok(realized) => realized,
+        Err(_) => return Err(trail),
+    };
     for _ in 0..ROUNDS {
         let round = repair_trailed(graph, ex, &realized, cost);
         if round.is_empty() {
@@ -1724,9 +1644,28 @@ fn repair_trailed(
             materialize_trailed(graph, ex, *v, &mut trail);
         }
     }
-    pin_slabs_trailed(graph, ex, realized, &mut trail);
+    pin_slabs_trailed(graph, ex, &realized.order, &mut trail);
     seed_theta_trailed(graph, ex, cost, &mut trail);
     trail
+}
+
+fn pin_selection(
+    graph: &EGraph,
+    roots: &[Id],
+    ex: &mut Extraction,
+    trail: &mut RepairTrail,
+) -> Result<()> {
+    loop {
+        let before = trail.entries.len();
+        let order = realize::selected_order(graph, ex, roots)?;
+        pin_slabs_trailed(graph, ex, &order, trail);
+        if !trail.entries[before..]
+            .iter()
+            .any(|entry| matches!(entry, Repair::Sigma(..)))
+        {
+            return Ok(());
+        }
+    }
 }
 
 /// A selected slab or group is materialized, every member but its last is
@@ -1734,12 +1673,7 @@ fn repair_trailed(
 /// buffer, and so does anything outside — and its last member is not,
 /// because the composite's own buffer is where that value lands. A member
 /// that is itself a slab is pinned the same way, through the composite.
-fn pin_slabs_trailed(
-    graph: &EGraph,
-    ex: &mut Extraction,
-    realized: &Realized,
-    trail: &mut RepairTrail,
-) {
+fn pin_slabs_trailed(graph: &EGraph, ex: &mut Extraction, order: &[Id], trail: &mut RepairTrail) {
     use fusor_ir::ir::launch::Launch as L;
     fn members_of(graph: &EGraph, id: Id) -> Option<&smallvec::SmallVec<[Id; 8]>> {
         match &graph.node(id).op {
@@ -1780,8 +1714,7 @@ fn pin_slabs_trailed(
             .min()
             .unwrap_or(u32::MAX)
     };
-    let mut slabs: Vec<(bool, u32, usize, Id)> = realized
-        .order
+    let mut slabs: Vec<(bool, u32, usize, Id)> = order
         .iter()
         .filter_map(|id| {
             members_of(graph, *id).map(|m| {
@@ -2019,11 +1952,19 @@ pub fn launch_work(graph: &EGraph, base: &Plan, launch_ix: usize) -> u64 {
             Op::Launch(Launch::Map { space, .. }) | Op::Launch(Launch::Fold { space, .. }) => {
                 space.dims = space.dims.iter().map(|d| graph.hinted(*d)).collect();
             }
-            Op::Launch(Launch::Contract { m, n, k, batch, .. }) => {
+            Op::Launch(Launch::Contract {
+                m,
+                n,
+                k,
+                batch,
+                output,
+                ..
+            }) => {
                 *m = graph.hinted(*m);
                 *n = graph.hinted(*n);
                 *k = graph.hinted(*k);
                 *batch = graph.hinted(*batch);
+                output.dims = output.dims.iter().map(|d| graph.hinted(*d)).collect();
             }
             _ => {}
         }
@@ -2191,6 +2132,7 @@ fn body_digest(op: &Op) -> u64 {
             n,
             k,
             batch,
+            output,
             family,
             post,
             acc,
@@ -2198,7 +2140,7 @@ fn body_digest(op: &Op) -> u64 {
             b,
             ..
         }) => {
-            (m, n, k, batch, family, acc).hash(&mut h);
+            (m, n, k, batch, output, family, acc).hash(&mut h);
             for e in [&a.pre, &b.pre, post] {
                 e.structural_hash().hash(&mut h);
             }

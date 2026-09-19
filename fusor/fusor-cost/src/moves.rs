@@ -16,10 +16,8 @@ use fusor_ir::extract::{ExtractBudget, Extraction, Move};
 use fusor_ir::facts::ValueFacts;
 use fusor_ir::ir::Op;
 use fusor_ir::ir::launch::{Effect, Launch, SchedPoint, ScheduleDomain};
-use fusor_ir::shape::Layout;
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use std::hash::{Hash, Hasher};
 
 /// One concrete state change a [`Move`] can produce. A `Move` names the
 /// dimension; a `Candidate` names the value.
@@ -52,12 +50,10 @@ pub(crate) enum Undo {
     },
 }
 
-/// Memo for the `RESCHEDULE` frontier: the per-point score and the sorted
-/// order, both keyed on `(node, context_hash)`.
+/// Schedule ordering for one search with a fixed graph and cost model.
 #[derive(Default)]
 pub(crate) struct SchedCache {
-    order: FxHashMap<(Id, u64), Vec<SchedPoint>>,
-    score: FxHashMap<(Id, SchedPoint, u64), Picoseconds>,
+    order: FxHashMap<Id, Vec<SchedPoint>>,
 }
 
 impl SchedCache {
@@ -71,10 +67,9 @@ impl SchedCache {
         &mut self,
         graph: &EGraph,
         id: Id,
-        context: u64,
         cost: &dyn CostModel,
     ) -> &[SchedPoint] {
-        if !self.order.contains_key(&(id, context)) {
+        self.order.entry(id).or_insert_with(|| {
             let node = graph.node(id);
             let ins: SmallVec<[ValueFacts; 4]> = node
                 .children
@@ -91,21 +86,13 @@ impl SchedCache {
                 Some(d) => d
                     .iter()
                     .enumerate()
-                    .map(|(i, theta)| {
-                        let s = cost.node_math(node, &ins, out, Some(theta));
-                        self.score.insert((id, theta, context), s);
-                        (s, i, theta)
-                    })
+                    .map(|(i, theta)| (cost.node_math(node, &ins, out, Some(theta)), i, theta))
                     .collect(),
             };
             // Ties break by domain index, so the order is total and stable.
             points.sort_by_key(|(s, i, _)| (*s, *i));
-            self.order.insert(
-                (id, context),
-                points.into_iter().map(|(_, _, t)| t).collect(),
-            );
-        }
-        &self.order[&(id, context)]
+            points.into_iter().map(|(_, _, t)| t).collect()
+        })
     }
 }
 
@@ -182,8 +169,7 @@ pub(crate) fn candidates(
         }
         Move::Reschedule(node) => {
             let current = extraction.theta.get(&node).copied();
-            let context = context_hash(graph, realized, node);
-            for theta in cache.ordered(graph, node, context, cost) {
+            for theta in cache.ordered(graph, node, cost) {
                 if Some(*theta) != current {
                     out.push(Candidate::Schedule {
                         node,
@@ -330,73 +316,6 @@ pub(crate) fn slab_pinned(graph: &EGraph, extraction: &Extraction, class: ClassI
             .iter()
             .any(|m| graph.class_of(*m) == class)
     })
-}
-
-/// Everything a schedule score depends on besides the point itself: the
-/// epilogue signature, operand layouts and the consumer demand set. Two
-/// occurrences of the same node in different surroundings therefore do not
-/// share a memo entry.
-pub(crate) fn context_hash(graph: &EGraph, realized: &Realized, node: Id) -> u64 {
-    let mut h = FxHasher::default();
-    let n = graph.node(node);
-
-    match &n.op {
-        Op::Launch(Launch::Contract { a, b, post, .. }) => {
-            h.write_u64(a.pre.structural_hash());
-            h.write_u64(b.pre.structural_hash());
-            h.write_u64(post.structural_hash());
-        }
-        Op::Launch(Launch::Fold { carrier, post, .. }) => {
-            for l in &carrier.lift {
-                h.write_u64(l.structural_hash());
-            }
-            for m in &carrier.merge {
-                h.write_u64(m.structural_hash());
-            }
-            for p in post {
-                h.write_u64(p.structural_hash());
-            }
-        }
-        Op::Launch(Launch::Map { body, .. }) => h.write_u64(body.structural_hash()),
-        _ => h.write_u64(0),
-    }
-
-    for layout in operand_layouts(&n.op) {
-        layout.hash(&mut h);
-    }
-
-    let mut demand: Vec<u32> = realized
-        .consumer_nodes
-        .get(node)
-        .map(|c| c.as_slice())
-        .unwrap_or(&[])
-        .iter()
-        .map(|consumer| graph.class_of(*consumer).0.0)
-        .collect();
-    demand.sort_unstable();
-    demand.dedup();
-    for c in demand {
-        h.write_u32(c);
-    }
-    h.finish()
-}
-
-fn operand_layouts(op: &Op) -> SmallVec<[Layout; 4]> {
-    let mut out: SmallVec<[Layout; 4]> = SmallVec::new();
-    if let Op::Launch(l1) = op {
-        match l1 {
-            Launch::Map { ops, .. }
-            | Launch::Fold { ops, .. }
-            | Launch::Gather { ops, .. }
-            | Launch::Scatter { ops, .. }
-            | Launch::Ext { ops, .. } => out.extend(ops.iter().map(|o| o.layout.clone())),
-            Launch::Contract { a, b, .. } => {
-                out.extend(a.ops.iter().chain(b.ops.iter()).map(|o| o.layout.clone()))
-            }
-            Launch::Region { .. } | Launch::Slab { .. } | Launch::Group { .. } => {}
-        }
-    }
-    out
 }
 
 fn domain(graph: &EGraph, id: Id) -> Option<&ScheduleDomain> {

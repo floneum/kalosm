@@ -41,12 +41,16 @@ use crate::uniforms::UniformPack;
 /// Binding index of the always-present uniform block.
 pub(crate) const UNIFORM_BINDING: u32 = 0;
 
-/// One staged input of a contraction side: a memory source, or a `Const`
-/// leaf already folded to its literal.
+/// A contraction input, with general indexing for non-affine padded views.
 #[derive(Clone)]
 pub(crate) enum StagedSource {
     Mem(Source),
     Const(TileExpr),
+    Indexed {
+        operand: Box<Operand>,
+        rows: u32,
+        cols: u32,
+    },
 }
 pub(crate) fn bound_layout(cx: &LowerCtx<'_>, value: Id) -> (Layout, Dtype) {
     let value = cx.selected(value);
@@ -1041,13 +1045,6 @@ impl<'a> Ctx<'a> {
         Ok(self.buffers[*slot].clone())
     }
 
-    /// The `BufferPlan` layout for a value. **Never re-derived** where the
-    /// plan has one — that is the padded stride set the extractor committed
-    /// to. See [`bound_layout`] for the leaf case.
-    pub(crate) fn plan_layout(&self, value: Id) -> Result<Layout> {
-        Ok(bound_layout(self.cx, value).0)
-    }
-
     pub(crate) fn plan_dtype(&self, value: Id) -> Result<Dtype> {
         Ok(bound_layout(self.cx, value).1)
     }
@@ -1069,115 +1066,71 @@ impl<'a> Ctx<'a> {
         &self,
         operand: &Operand,
         row_dims: usize,
-    ) -> Result<fusor_ir::ir::kernel::StorageView> {
-        let layout = self.repad_operand_layout(operand)?;
+    ) -> Result<Option<fusor_ir::ir::kernel::StorageView>> {
+        let Some(layout) = self.repad_operand_layout(operand)? else {
+            return Ok(None);
+        };
         let view = flatten_matrix_layout_split(&layout, row_dims, &self.binding)?;
         let buffer = self.buffer(operand.src)?;
-        Ok(fusor_ir::ir::kernel::StorageView {
+        Ok(Some(fusor_ir::ir::kernel::StorageView {
             buffer,
             offset: view.offset + self.offset_of(operand.src),
             layout: view.layout,
-        })
+        }))
     }
 
-    /// An operand's layout restated over the producer's *plan* buffer.
-    ///
-    /// The operand's strides address the producer's logical dense element
-    /// space; the buffer holds whatever the plan laid out, and those differ
-    /// exactly when the producer's schedule point padded it. This is
-    /// [`Ctx::repad_index`]'s statement for the contraction path, which loads
-    /// through strided views rather than a flat index: every operand axis
-    /// must walk exactly one producer axis — its stride is that axis's dense
-    /// row-major stride — and the restatement substitutes the padded stride
-    /// for the dense one, axis for axis. A transposed or batch-permuted edge
-    /// (`permuted_alias`, an absorbed producer) satisfies that by
-    /// construction; an operand whose stride is no producer axis's own is an
-    /// error, never a silent dense read.
-    fn repad_operand_layout(&self, operand: &Operand) -> Result<Layout> {
+    /// Restate an affine operand over its producer's padded allocation. An
+    /// axis spanning padding needs the general logical-index mapping instead.
+    fn repad_operand_layout(&self, operand: &Operand) -> Result<Option<Layout>> {
         let selected = self.cx.selected(operand.src);
         let Some(plan) = self.cx.plan.buffers.iter().find(|b| b.value == selected) else {
-            return Ok(operand.layout.clone());
+            return Ok(Some(operand.layout.clone()));
         };
-        let logical = self.cx.graph.facts(selected).shape.clone();
-        if plan.layout.rank() != logical.len() || logical.is_empty() {
-            return Ok(operand.layout.clone());
+        let logical = &self.cx.graph.facts(selected).shape;
+        let dense = Layout::row_major_strides(logical);
+        if plan.layout == Layout::contiguous(logical) || logical.is_empty() {
+            return Ok(Some(operand.layout.clone()));
         }
-        let dense = Layout::row_major_strides(&logical);
-        let unpadded = plan.layout.offset().known_eq(Dim::Const(0))
-            && plan
-                .layout
-                .shape()
-                .iter()
-                .zip(&logical)
-                .all(|(p, l)| p.known_eq(*l))
-            && plan
-                .layout
-                .strides()
-                .iter()
-                .zip(&dense)
-                .all(|(s, w)| s.known_eq(*w));
-        if unpadded {
-            return Ok(operand.layout.clone());
+        if !plan.layout.offset().known_eq(Dim::Const(0))
+            || !operand.layout.offset().known_eq(Dim::Const(0))
+        {
+            return Ok(None);
         }
-        if !plan.layout.offset().known_eq(Dim::Const(0)) {
-            return Err(Error::Plan(format!(
-                "operand {} reads a buffer at offset {}; the contraction path \
-                 cannot restate an offset layout",
-                operand.src,
-                plan.layout.offset()
-            )));
-        }
-        // The operand may be a *reshaped* spelling of the producer — a
-        // `[2, 2, 3, 4]` read of a `[4, 3, 4]` contract — so an operand axis
-        // walks `k` steps of one producer axis rather than exactly one: its
-        // stride is `k * dense[i]`, and it stays inside that axis
-        // (`k * (ext - 1) < logical[i]`). Substituting `k * padded[i]`
-        // restates it, because a within-axis walk scales linearly with the
-        // axis's own stride whatever the padding did to the axes outside it.
-        let padded = plan.layout.strides();
-        let remap = |ext: Dim, s: Dim| -> Result<Dim> {
-            // Unobservable axes keep whatever they said.
-            if ext.known_eq(Dim::Const(1)) || s.known_eq(Dim::Const(0)) {
-                return Ok(s);
+        let mut strides = Vec::with_capacity(operand.layout.rank());
+        for (&extent, &stride) in operand.layout.shape().iter().zip(operand.layout.strides()) {
+            if extent.as_const().is_some_and(|e| e <= 1) || stride.known_eq(Dim::Const(0)) {
+                strides.push(stride);
+                continue;
             }
-            let (Some(sv), Some(ev)) = (s.as_const(), ext.as_const()) else {
-                return Err(Error::Plan(format!(
-                    "operand {} reads a padded buffer through symbolic stride {s}",
-                    operand.src
-                )));
-            };
-            for (i, d) in dense.iter().enumerate() {
-                let (Some(dv), Some(lv)) = (d.as_const(), logical[i].as_const()) else {
+            let mut mapped = None;
+            for (axis, &dense_stride) in dense.iter().enumerate() {
+                if stride.known_eq(dense_stride) && extent.known_eq(logical[axis]) {
+                    mapped = Some(plan.layout.strides()[axis]);
+                    break;
+                }
+                let (Some(stride), Some(extent), Some(dense_stride), Some(logical_extent)) = (
+                    stride.as_const(),
+                    extent.as_const(),
+                    dense_stride.as_const(),
+                    logical[axis].as_const(),
+                ) else {
                     continue;
                 };
-                if dv == 0 || sv % dv != 0 {
+                if dense_stride == 0 || stride % dense_stride != 0 {
                     continue;
                 }
-                let k = sv / dv;
-                if k >= 1 && k.saturating_mul(ev - 1) < lv {
-                    let pv = padded[i].as_const().ok_or_else(|| {
-                        Error::Plan(format!(
-                            "operand {} reads a buffer with symbolic padded stride",
-                            operand.src
-                        ))
-                    })?;
-                    return Ok(Dim::Const(k * pv));
+                let step = stride / dense_stride;
+                if step >= 1 && step.saturating_mul(extent - 1) < logical_extent {
+                    mapped = Some(Dim::Const(step) * plan.layout.strides()[axis]);
+                    break;
                 }
             }
-            Err(Error::Plan(format!(
-                "operand {} reads a padded buffer through stride {s}, which walks \
-                 no single axis of the producer's dense layout {dense:?}",
-                operand.src
-            )))
-        };
-        let strides: Vec<Dim> = operand
-            .layout
-            .shape()
-            .iter()
-            .zip(operand.layout.strides())
-            .map(|(ext, s)| remap(*ext, *s))
-            .collect::<Result<_>>()?;
-        Layout::from_parts(operand.layout.offset(), operand.layout.shape(), &strides)
+            let Some(mapped) = mapped else {
+                return Ok(None);
+            };
+            strides.push(mapped);
+        }
+        Layout::from_parts(operand.layout.offset(), operand.layout.shape(), &strides).map(Some)
     }
 
     /// The [`Source`] a contraction stages one operand from.
@@ -1228,8 +1181,14 @@ impl<'a> Ctx<'a> {
                 if let Some(lit) = self.const_operand(o.src) {
                     return Ok(StagedSource::Const(lit));
                 }
-                let view = self.contract_operand_view(o, rows, cols)?;
-                Ok(StagedSource::Mem(self.contract_stage_source(o, &view)?))
+                match self.contract_operand_view(o, rows, cols)? {
+                    Some(view) => Ok(StagedSource::Mem(self.contract_stage_source(o, &view)?)),
+                    None => Ok(StagedSource::Indexed {
+                        operand: Box::new(o.clone()),
+                        rows,
+                        cols,
+                    }),
+                }
             })
             .collect()
     }
@@ -1239,7 +1198,7 @@ impl<'a> Ctx<'a> {
         operand: &Operand,
         rows: u32,
         cols: u32,
-    ) -> Result<fusor_ir::ir::kernel::StorageView> {
+    ) -> Result<Option<fusor_ir::ir::kernel::StorageView>> {
         let split = matrix_split_for(
             &operand.layout,
             &self.binding,
@@ -1666,60 +1625,34 @@ impl<'a> Ctx<'a> {
         if unpadded {
             return Ok(index);
         }
-        // Every extent has to be decidable to state the delinearize; when one
-        // is not, the previous dense address is still what the rest of the
-        // launch agreed on, so leave it alone rather than mint a wrong one.
-        let Ok(extents) = logical
-            .iter()
-            .map(|d| self.binding.require(*d))
-            .collect::<Result<Vec<u64>>>()
-        else {
-            return Ok(index);
+        let offset = plan.layout.offset();
+        let mut acc = if offset.known_eq(Dim::Const(0)) {
+            None
+        } else {
+            Some(self.dim_expr(offset)?)
         };
-        let Ok(logical_strides) = dense
-            .iter()
-            .map(|d| self.binding.require(*d))
-            .collect::<Result<Vec<u64>>>()
-        else {
-            return Ok(index);
-        };
-        let Ok(padded_strides) = strides
-            .iter()
-            .map(|d| self.binding.require(*d))
-            .collect::<Result<Vec<u64>>>()
-        else {
-            return Ok(index);
-        };
-        let offset = self.binding.require(plan.layout.offset())?;
-
-        let mut acc: Option<TileExpr> = (offset != 0).then(|| {
-            let o = u32::try_from(offset).unwrap_or(u32::MAX);
-            self.b.u32(o)
-        });
         for axis in 0..logical.len() {
-            let extent = extents[axis];
-            let stride = padded_strides[axis];
-            if extent <= 1 || stride == 0 {
+            let extent = logical[axis];
+            let stride = strides[axis];
+            if extent.as_const().is_some_and(|e| e <= 1) || stride.known_eq(Dim::Const(0)) {
                 continue;
             }
             let mut e = index.clone();
-            let div = logical_strides[axis];
-            if div > 1 {
-                let d = self.b.u32(u32::try_from(div).unwrap_or(u32::MAX));
+            let div = dense[axis];
+            if !div.known_eq(Dim::Const(1)) {
+                let d = self.dim_expr(div)?;
                 e = self
                     .b
                     .binary(TileBinaryOp::Div, e, d, NumericContract::RELAXED);
             }
-            // The most significant axis needs no `%`: `flat` is already below
-            // its bound for every live lane, and an overhang lane is masked.
             if axis > 0 {
-                let m = self.b.u32(u32::try_from(extent).unwrap_or(u32::MAX));
+                let m = self.dim_expr(extent)?;
                 e = self
                     .b
                     .binary(TileBinaryOp::Rem, e, m, NumericContract::RELAXED);
             }
-            if stride != 1 {
-                let s = self.b.u32(u32::try_from(stride).unwrap_or(u32::MAX));
+            if !stride.known_eq(Dim::Const(1)) {
+                let s = self.dim_expr(stride)?;
                 e = self.b.mul(e, s);
             }
             acc = Some(match acc {

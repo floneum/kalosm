@@ -53,6 +53,7 @@ impl ProgramAcceleration {
     pub(crate) fn cooperative(self) -> bool {
         self.matrices != MatrixInstructions::Portable
     }
+    #[cfg(any(not(target_arch = "wasm32"), test, feature = "compiler-tests"))]
     pub(crate) fn native_validation(self) -> Self {
         Self {
             matrices: if self.cooperative() {

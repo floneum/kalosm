@@ -147,6 +147,12 @@ pub fn cases() -> Cases {
             async move |s: &Session, sh: &[u64], seed: u32| split_k(s, k, sh, seed).await,
         ));
     }
+    cases.push_case(Case::new("matmul", "split_k_multi_axis", async |s| {
+        multi_axis(s, false).await
+    }));
+    cases.push_case(Case::new("matmul", "grouped_reshape_chain", async |s| {
+        multi_axis(s, true).await
+    }));
     cases.push_case(fuzz_case("matmul", "wide_n_columns", WIDE_N_SPEC, wide_n));
     cases.push_case(fuzz_case(
         "matmul",
@@ -311,6 +317,44 @@ fn host_matmul(a: &[f32], b: &[f32], batch: usize, m: usize, k: usize, n: usize)
         }
     }
     out
+}
+
+async fn multi_axis(session: &Session, chain: bool) -> CaseResult {
+    use fusor_ir::ir::logical::{EinSpec, Label};
+    let graph = graph_of(session);
+    let a_data: Vec<_> = (0..2 * 12 * 256)
+        .map(|i| ((i % 17) as f32 - 8.) * 0.125)
+        .collect();
+    let b_data: Vec<_> = (0..2 * 256 * 30)
+        .map(|i| ((i % 13) as f32 - 6.) * 0.125)
+        .collect();
+    let a = upload(graph.handle(), &dims(&[2, 1, 3, 4, 256]), &a_data)?;
+    let b = upload(graph.handle(), &dims(&[2, 1, 256, 5, 6]), &b_data)?;
+    let out = a.contract(
+        &b,
+        EinSpec {
+            a: [0, 1, 2, 3, 6].map(Label).into_iter().collect(),
+            b: [0, 1, 6, 4, 5].map(Label).into_iter().collect(),
+            out: [0, 1, 2, 3, 4, 5].map(Label).into_iter().collect(),
+        },
+        Dtype::F32,
+    )?;
+    let expected = host_matmul(&a_data, &b_data, 2, 12, 256, 30);
+    if chain {
+        let c_data: Vec<_> = (0..30 * 7).map(|i| ((i % 7) as f32 - 3.) * 0.125).collect();
+        let c = upload(graph.handle(), &dims(&[30, 7]), &c_data)?;
+        let out = out.reshape_dims(&dims(&[24, 30]))?.matmul(&c)?;
+        let expected = host_matmul(&expected, &c_data, 1, 24, 30, 7);
+        return expect_values(session, &[24, 7], Dtype::F32, &read(&out).await?, &expected).await;
+    }
+    expect_values(
+        session,
+        &[2, 1, 3, 4, 5, 6],
+        Dtype::F32,
+        &read(&out).await?,
+        &expected,
+    )
+    .await
 }
 
 /// One contraction at an arbitrary batch prefix (`shape` is

@@ -24,7 +24,9 @@ use fusor_ir::ir::kernel::{
     TileCompareOp, TileExpr,
 };
 use fusor_ir::ir::kernel::{MergeBody, ReduceKind, Tile};
-use fusor_ir::ir::launch::{IndexSpace, Launch, SchedPoint, slab_block, slab_lanes_per_row};
+use fusor_ir::ir::launch::{
+    IndexSpace, Launch, SchedPoint, slab_block, slab_lanes_per_row, slab_subgroup_width,
+};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
@@ -295,22 +297,13 @@ fn fold_stage(
     slabs: u32,
     lanes: &mut Lanes,
 ) -> Result<()> {
-    use fusor_ir::ir::kernel::{Builtin, fast_reduce_op};
-    let subgroup = ctx
-        .caps
-        .subgroups
-        .filter(|s| s.is_fixed())
-        .map(|s| s.assumed())
-        .filter(|width| *width > 0);
-    if let (
-        Some(width),
-        Launch::Fold {
-            space,
-            axis,
-            carrier,
-            ..
-        },
-    ) = (subgroup, stage)
+    use fusor_ir::ir::kernel::Builtin;
+    if let Launch::Fold {
+        space,
+        axis,
+        carrier,
+        ..
+    } = stage
     {
         let dims = constant_dims(space)?;
         let k = *dims.get(*axis as usize).ok_or_else(|| {
@@ -318,9 +311,7 @@ fn fold_stage(
         })?;
         let rows = dims.iter().product::<u64>() / k.max(1);
         let per = per_slab(rows, slabs)?;
-        if fast_reduce_op(carrier).is_some()
-            && lanes.block.is_multiple_of(width)
-            && slab_lanes_per_row(lanes.block, u64::from(per), k) >= width
+        if let Some(width) = slab_subgroup_width(lanes.block, u64::from(per), k, carrier, ctx.caps)
         {
             // Local invocation indices have no specified subgroup mapping.
             // Assign rows using actual subgroup IDs and lanes. Only use this

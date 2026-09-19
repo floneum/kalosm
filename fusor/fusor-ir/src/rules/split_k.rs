@@ -7,7 +7,7 @@
 //! axis. Both spellings stay live; cost decides.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
-use crate::ir::launch::{AccessPlan, ContractSide, IndexSpace, Launch, Operand, ScheduleDomain};
+use crate::ir::launch::{AccessPlan, ContractSide, Launch, Operand, ScheduleDomain};
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
 use crate::rules::ident_expr;
@@ -31,6 +31,7 @@ const SPLITS: [u64; 4] = [4, 8, 16, 32];
 
 pub fn split_k(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     let Op::Launch(Launch::Contract {
+        output,
         m,
         n,
         k,
@@ -46,10 +47,24 @@ pub fn split_k(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Opti
         return None;
     };
     let kc = k.as_const()?;
-    if kc < MIN_K || std::env::var_os("FUSOR_NO_SPLIT_K").is_some() {
+    // Splitting changes operand coordinates, including the reduced-axis origin.
+    if kc < MIN_K
+        || a.pre.reads_index_of()
+        || rhs.pre.reads_index_of()
+        || std::env::var_os("FUSOR_NO_SPLIT_K").is_some()
+    {
         return None;
     }
     let (mc, nc, batch_c) = (m.as_const()?, n.as_const()?, batch.as_const()?);
+    let mut batch_axes = 0;
+    let mut batch_elements = 1u64;
+    while batch_elements < batch_c {
+        batch_elements = batch_elements.checked_mul(output.dims.get(batch_axes)?.as_const()?)?;
+        batch_axes += 1;
+    }
+    if batch_elements != batch_c {
+        return None;
+    }
     let log = std::env::var_os("FUSOR_SPLIT_LOG").is_some();
     if log {
         eprintln!(
@@ -139,8 +154,11 @@ pub fn split_k(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Opti
             };
         let a2 = side(a, a_k.axis, a_k.batch_axes)?;
         let b2 = side(rhs, b_k.axis, b_k.batch_axes)?;
+        let mut partial_output = output.clone();
+        partial_output.dims.insert(batch_axes, Dim::Const(s));
         let partials = b
             .add_launch(Launch::Contract {
+                output: partial_output.clone(),
                 m: *m,
                 n: *n,
                 k: chunk,
@@ -153,24 +171,10 @@ pub fn split_k(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Opti
                 sched: sched.clone(),
             })
             .ok()?;
-        // The partials land as `[batch * s, m, n]`; the sum walks them as
-        // `[batch, s, m, n]` (or `[s, m, n]` without a batch), so the fold's
-        // output is the contraction's own shape.
-        let mut space: SmallVec<[Dim; 6]> = SmallVec::new();
-        let axis = if batch_c == 1 {
-            space.push(Dim::Const(s));
-            0u32
-        } else {
-            space.push(*batch);
-            space.push(Dim::Const(s));
-            1u32
-        };
-        space.push(*m);
-        space.push(*n);
         let sum = b
             .add_launch(Launch::Fold {
-                space: IndexSpace::new(space.iter().copied()),
-                axis,
+                space: partial_output.clone(),
+                axis: batch_axes as u32,
                 vec_axes: SmallVec::new(),
                 carrier: crate::carrier::Carrier::binop(
                     BinOp::Add,
@@ -180,7 +184,10 @@ pub fn split_k(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Opti
                 .with_lift([ident_expr(*acc)]),
                 acc: *acc,
                 post: smallvec::smallvec![post.clone()],
-                ops: vec![crate::rules::alias_operand_of(partials, &space)],
+                ops: vec![crate::rules::alias_operand_of(
+                    partials,
+                    &partial_output.dims,
+                )],
                 sched: ScheduleDomain::Point,
             })
             .ok()?;
@@ -209,6 +216,9 @@ fn k_axis(shape: &[Dim], batch: u64, x: u64, k: u64, k_first: bool) -> Option<KA
     }
     let batch_axes = i;
     if k_first {
+        while consts.get(i) == Some(&1) {
+            i += 1;
+        }
         if consts.get(i) != Some(&k) {
             return None;
         }

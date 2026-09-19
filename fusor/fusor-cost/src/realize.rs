@@ -16,7 +16,10 @@ use fusor_ir::ir::Op;
 use fusor_ir::ir::kernel::{
     ArenaPlanner, MemoryLevel, ScalarElement, Tile, TileDecl, TileLayout, Tiles,
 };
-use fusor_ir::ir::launch::{Effect, FoldStrat, IndexSpace, Launch, SchedPoint, ScheduleDomain};
+use fusor_ir::ir::launch::{
+    Effect, FoldStrat, IndexSpace, Launch, SchedPoint, ScheduleDomain, slab_lanes_per_row,
+    slab_subgroup_width,
+};
 use fusor_ir::ir::logical::{LeafKind, Logical};
 use fusor_ir::shape::Dim;
 use smallvec::SmallVec;
@@ -309,7 +312,8 @@ pub fn realize_with(
     let (order, operands) = walk(graph, extraction, &resolved_roots).map_err(Error::from)?;
     let (consumers, consumer_nodes) =
         count_consumers(graph.len(), &order, &operands, &resolved_roots);
-    let (launch_of, groups) = cut(graph, extraction, &order, &operands, &resolved_roots);
+    let (launch_of, groups) =
+        cut(graph, extraction, &order, &operands, &resolved_roots).map_err(Error::from)?;
     let components = groups
         .into_iter()
         .map(|members| {
@@ -474,7 +478,7 @@ pub fn index_space(graph: &EGraph, id: Id) -> IndexSpace {
             | Launch::Gather { space, .. }
             | Launch::Scatter { space, .. },
         ) => space.clone(),
-        Op::Launch(Launch::Contract { batch, m, n, .. }) => IndexSpace::new([*batch, *m, *n]),
+        Op::Launch(Launch::Contract { output, .. }) => output.clone(),
         Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) => members
             .last()
             .map(|m| index_space(graph, *m))
@@ -652,7 +656,12 @@ pub fn serial_steps(
             let mut steps = 0u64;
             for m in members.iter() {
                 match &graph.node(*m).op {
-                    Op::Launch(Launch::Fold { space, axis, .. }) => {
+                    Op::Launch(Launch::Fold {
+                        space,
+                        axis,
+                        carrier,
+                        ..
+                    }) => {
                         let Some(total) = space.iterations() else {
                             continue;
                         };
@@ -663,7 +672,8 @@ pub fn serial_steps(
                             .unwrap_or(1)
                             .max(1);
                         let rows = (total / k) / slabs;
-                        let lpr = fusor_ir::ir::launch::slab_lanes_per_row(block, rows, k);
+                        let lpr = slab_subgroup_width(block, rows, k, carrier, caps)
+                            .unwrap_or_else(|| slab_lanes_per_row(block, rows, k));
                         let groups = u64::from(block / lpr.max(1)).max(1);
                         steps += rows.div_ceil(groups).max(1) * k.div_ceil(u64::from(lpr));
                     }
@@ -870,7 +880,7 @@ enum Frame {
 
 type Operands = IdMap<SmallVec<[Id; 4]>>;
 
-/// Why [`walk`] could not order the selected DAG.
+/// Why the selected nodes or their launch components cannot be ordered.
 ///
 /// `Cycle` is repairable: it names a class whose selected member closes a
 /// loop, and [`crate::extract`] re-selects that one class.
@@ -882,9 +892,7 @@ enum WalkFail {
 impl From<WalkFail> for Error {
     fn from(f: WalkFail) -> Self {
         match f {
-            WalkFail::Cycle(v) => Error::Plan(format!(
-                "selection is cyclic through {v}: a class member selected above its own consumer"
-            )),
+            WalkFail::Cycle(v) => Error::Plan(format!("selection is cyclic through {v}")),
             WalkFail::Other(e) => e,
         }
     }
@@ -896,17 +904,73 @@ impl From<WalkFail> for Error {
 /// replaces an operand id by its class's selected member, which may have a
 /// larger id than the consumer that reached it. Two classes can form a cycle
 /// in which neither member names its own class, so [`is_self_referential`]
-/// (the depth-1 case) sees nothing.
+/// (the depth-1 case) sees nothing. Composite ownership can also turn an
+/// acyclic node order into cyclic launch dependencies.
 pub fn selection_cycle(graph: &EGraph, extraction: &Extraction, roots: &[Id]) -> Option<Id> {
     let resolved = roots
         .iter()
         .map(|r| select(graph, extraction, *r))
         .collect::<Result<Vec<_>>>()
         .ok()?;
-    match walk(graph, extraction, &resolved) {
+    let attempt = walk(graph, extraction, &resolved).and_then(|(order, operands)| {
+        let mut seed = extraction.clone();
+        seed.m = materializations(graph, &resolved, &order, &operands);
+        cut(graph, &seed, &order, &operands, &resolved)
+    });
+    match attempt {
         Err(WalkFail::Cycle(v)) => Some(v),
         _ => None,
     }
+}
+
+pub(crate) fn seed_materializations(
+    graph: &EGraph,
+    extraction: &Extraction,
+    roots: &[Id],
+) -> Result<fixedbitset::FixedBitSet> {
+    let roots = roots
+        .iter()
+        .map(|r| select(graph, extraction, *r))
+        .collect::<Result<Vec<_>>>()?;
+    let (order, operands) = walk(graph, extraction, &roots).map_err(Error::from)?;
+    Ok(materializations(graph, &roots, &order, &operands))
+}
+
+pub(crate) fn selected_order(
+    graph: &EGraph,
+    extraction: &Extraction,
+    roots: &[Id],
+) -> Result<Vec<Id>> {
+    let roots = roots
+        .iter()
+        .map(|r| select(graph, extraction, *r))
+        .collect::<Result<Vec<_>>>()?;
+    walk(graph, extraction, &roots)
+        .map(|(order, _)| order)
+        .map_err(Error::from)
+}
+
+fn materializations(
+    graph: &EGraph,
+    roots: &[Id],
+    order: &[Id],
+    operands: &Operands,
+) -> fixedbitset::FixedBitSet {
+    let (consumers, readers) = count_consumers(graph.len(), order, operands, roots);
+    let mut materialized = fixedbitset::FixedBitSet::with_capacity(graph.len());
+    for &id in order {
+        if leaf_role(graph, id) == LeafRole::NotLeaf
+            && (roots.contains(&id)
+                || graph.semantics().effect(&graph.node(id).op) != Effect::Pure
+                || consumers.copied(id).unwrap_or(0) > 1
+                || readers
+                    .get(id)
+                    .is_some_and(|cs| cs.iter().any(|c| needs_own_buffer(graph, id, *c))))
+        {
+            materialized.insert(id.index());
+        }
+    }
+    materialized
 }
 
 fn walk(
@@ -1020,7 +1084,7 @@ fn cut(
     order: &[Id],
     operands: &Operands,
     roots: &[Id],
-) -> (IdMap<u32>, Vec<Vec<Id>>) {
+) -> std::result::Result<(IdMap<u32>, Vec<Vec<Id>>), WalkFail> {
     let mut pos: IdMap<usize> = IdMap::with_len(graph.len());
     for (i, v) in order.iter().enumerate() {
         pos.insert(*v, i);
@@ -1098,50 +1162,30 @@ fn cut(
         }
     }
     if sorted.len() != n {
-        // A cycle between launches: leave the appearance order, which the
-        // walk already proved acyclic node by node, so the fault surfaces
-        // in verification rather than here.
-        if std::env::var_os("FUSOR_SLAB_LOG").is_some() {
-            let stuck: Vec<usize> = (0..n).filter(|g| indegree[*g] > 0).collect();
-            for g in stuck.iter().take(6) {
-                let roots: Vec<Id> = groups[*g].iter().copied().take(4).collect();
-                let waits: Vec<usize> = (0..n)
-                    .filter(|d| deps[*d].contains(g) && indegree[*d] > 0)
-                    .collect();
-                eprintln!("LAUNCH CYCLE group {g} members {roots:?} waits on {waits:?}");
-                for v in &groups[*g] {
-                    for c in operands.get(*v).map(|o| o.as_slice()).unwrap_or(&[]) {
-                        if let Some(d) = launch_of.copied(*c)
-                            && waits.contains(&(d as usize))
+        let mut cycle = Vec::new();
+        let mut g = (0..n).find(|g| indegree[*g] > 0).unwrap();
+        loop {
+            if let Some(start) = cycle.iter().position(|previous| *previous == g) {
+                for &g in &cycle[start..] {
+                    for &id in &groups[g] {
+                        if matches!(
+                            graph.node(id).op,
+                            Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
+                        ) && extraction.selected(graph.class_of(id)) == Some(id)
                         {
-                            let show = |i: Id| {
-                                format!("{:?}", graph.node(i).op)
-                                    .chars()
-                                    .take(90)
-                                    .collect::<String>()
-                            };
-                            let in_slab = groups[*g].iter().any(|m| {
-                                matches!(graph.node(*m).op, Op::Launch(Launch::Slab { .. }))
-                            });
-                            let raw: Vec<String> = graph
-                                .node(*v)
-                                .children
-                                .iter()
-                                .map(|x| format!("{x}:c{}", graph.class_of(*x).0.index()))
-                                .collect();
-                            eprintln!(
-                                "    {v} [{}] reads {c} (class {}) [{}] of group {d}; slab group {in_slab}; raw children {raw:?}; sigma {:?}",
-                                show(*v),
-                                graph.class_of(*c).0.index(),
-                                show(*c),
-                                extraction.selected(graph.class_of(*c))
-                            );
+                            return Err(WalkFail::Cycle(id));
                         }
                     }
                 }
+                return Err(WalkFail::Other(Error::Plan(
+                    "selected fusion creates cyclic launch dependencies".into(),
+                )));
             }
+            cycle.push(g);
+            g = (0..n)
+                .find(|d| indegree[*d] > 0 && deps[*d].contains(&g))
+                .unwrap();
         }
-        return (launch_of, groups);
     }
     let mut renumber = vec![0u32; n];
     for (new, old) in sorted.iter().enumerate() {
@@ -1157,7 +1201,7 @@ fn cut(
             launch_of.insert(*v, renumber[old as usize]);
         }
     }
-    (launch_of, reordered)
+    Ok((launch_of, reordered))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1342,13 +1386,20 @@ fn build_component(
         }) => sm
             .iter()
             .filter_map(|m| {
-                let Op::Launch(Launch::Fold { space, axis, .. }) = &graph.node(*m).op else {
+                let Op::Launch(Launch::Fold {
+                    space,
+                    axis,
+                    carrier,
+                    ..
+                }) = &graph.node(*m).op
+                else {
                     return None;
                 };
                 let total = space.iterations()?;
                 let k = space.dims.get(*axis as usize)?.as_const()?.max(1);
                 let rows = (total / k) / u64::from((*slabs).max(1));
-                let lpr = fusor_ir::ir::launch::slab_lanes_per_row(geom.block, rows, k);
+                let lpr = slab_subgroup_width(geom.block, rows, k, carrier, caps)
+                    .unwrap_or_else(|| slab_lanes_per_row(geom.block, rows, k));
                 let (a, n) = amp_of(*m, lpr);
                 Some((*m, a, n))
             })

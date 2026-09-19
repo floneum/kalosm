@@ -7,6 +7,7 @@ use fusor_ir::{
         Op,
         logical::{LeafKind, Logical},
     },
+    semantics::children::children_logical,
     shape::SymId,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -84,6 +85,27 @@ impl Value {
                 self.op,
                 Logical::Restride { .. } | Logical::Leaf(LeafKind::Const { .. })
             )
+    }
+}
+
+pub(super) fn visit_sources(
+    values: &[Value],
+    by_id: &FxHashMap<Id, usize>,
+    id: Id,
+    visit: &mut impl FnMut(&Value),
+) {
+    let value = &values[by_id[&id]];
+    match value.op {
+        Logical::Restride { x, .. } => visit_sources(values, by_id, x, visit),
+        Logical::Leaf(LeafKind::Const { .. }) => {}
+        _ => {
+            visit(value);
+            if value.forwarded {
+                for dep in children_logical(&value.op) {
+                    visit_sources(values, by_id, dep, visit);
+                }
+            }
+        }
     }
 }
 
@@ -201,7 +223,7 @@ impl Plan {
                     "a program value exceeds the device buffer budget".into(),
                 ));
             }
-            for dep in dependencies(&op) {
+            for dep in children_logical(&op) {
                 visit(g, dep, values, by_id, visiting, max_bytes)?;
             }
             if let Logical::Restride { x, specs, .. } = &op {
@@ -369,7 +391,7 @@ impl Plan {
             if matches!(v.op, Logical::Restride { .. }) {
                 continue;
             }
-            for dep in dependencies(&v.op) {
+            for dep in children_logical(&v.op) {
                 *uses.entry(view_base(&values, &by_id, dep)).or_default() += 1;
             }
         }
@@ -452,27 +474,15 @@ impl Plan {
             first.insert(*id, times[id]);
             last.insert(*id, times[id]);
         }
-        fn bases(id: Id, values: &[Value], map: &FxHashMap<Id, usize>, out: &mut Vec<Id>) {
-            match values[map[&id]].op {
-                Logical::Restride { x, .. } => bases(x, values, map, out),
-                Logical::Leaf(LeafKind::Const { .. }) => {}
-                _ if values[map[&id]].forwarded => {
-                    for dep in dependencies(&values[map[&id]].op) {
-                        bases(dep, values, map, out);
-                    }
-                }
-                _ => out.push(values[map[&id]].id),
-            }
-        }
         for id in &stages {
-            let mut reads = vec![];
-            for dep in dependencies(&values[by_id[id]].op) {
-                bases(dep, &values, &by_id, &mut reads);
-            }
-            for dep in reads {
-                last.entry(dep)
-                    .and_modify(|n| *n = (*n).max(times[id]))
-                    .or_insert(times[id]);
+            for dep in children_logical(&values[by_id[id]].op) {
+                visit_sources(&values, &by_id, dep, &mut |v| {
+                    if v.materialized() {
+                        last.entry(v.id)
+                            .and_modify(|n| *n = (*n).max(times[id]))
+                            .or_insert(times[id]);
+                    }
+                });
             }
         }
         let end = stages.len() + 2;
@@ -481,11 +491,11 @@ impl Plan {
             .copied()
             .chain(feedback.iter().flat_map(|(a, b)| [*a, *b]))
         {
-            let mut reads = vec![];
-            bases(id, &values, &by_id, &mut reads);
-            for id in reads {
-                last.insert(id, end);
-            }
+            visit_sources(&values, &by_id, id, &mut |v| {
+                if v.materialized() {
+                    last.insert(v.id, end);
+                }
+            });
         }
         // Inputs survive across steps, including those not updated by feedback.
         for v in &values {
@@ -706,18 +716,5 @@ impl Plan {
             ));
         }
         Ok(value)
-    }
-}
-pub(crate) fn dependencies(op: &Logical) -> Vec<Id> {
-    match op {
-        Logical::Leaf(_) => vec![],
-        Logical::Map { ins, .. } | Logical::Fold { ins, .. } => ins.to_vec(),
-        Logical::Restride { x, .. }
-        | Logical::Project { x, .. }
-        | Logical::Window { x, .. }
-        | Logical::Dequant { x, .. } => vec![*x],
-        Logical::Contract { a, b, .. } => vec![*a, *b],
-        Logical::Gather { x, idx, .. } => vec![*x, *idx],
-        Logical::Scatter { base, idx, upd, .. } => vec![*base, *idx, *upd],
     }
 }

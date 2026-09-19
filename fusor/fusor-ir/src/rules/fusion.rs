@@ -628,6 +628,7 @@ pub fn map_into_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
 /// producer can be absorbed without inventing a third edge.
 pub fn map_into_contract(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Launch(Launch::Contract {
+        output,
         m,
         n,
         k,
@@ -664,6 +665,7 @@ pub fn map_into_contract(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>
     }
     let fused = b
         .add_launch(Launch::Contract {
+            output: output.clone(),
             m: *m,
             n: *n,
             k: *k,

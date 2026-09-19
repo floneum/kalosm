@@ -58,6 +58,8 @@ pub enum Launch {
     /// independent of operand dtype, which is what makes
     /// `contract{acc: F32}(F16, F16) -> F16` one node.
     Contract {
+        /// Logical output axes; matrix dimensions flatten adjacent axis groups.
+        output: IndexSpace,
         m: Dim,
         n: Dim,
         k: Dim,
@@ -841,6 +843,22 @@ pub fn slab_lanes_per_row(block: u32, rows_per_slab: u64, k: u64) -> u32 {
     let rows = u32::try_from(rows_per_slab.max(1).next_power_of_two()).unwrap_or(u32::MAX);
     let k = u32::try_from(k.max(1).next_power_of_two()).unwrap_or(u32::MAX);
     (block / rows.min(block)).min(k).max(1)
+}
+
+/// Subgroup width used by a slab fold when the workgroup has full subgroups.
+pub fn slab_subgroup_width(
+    block: u32,
+    rows_per_slab: u64,
+    k: u64,
+    carrier: &Carrier,
+    caps: &crate::device::Caps,
+) -> Option<u32> {
+    let width = caps.subgroups.filter(|s| s.is_fixed())?.assumed();
+    (width > 0
+        && super::kernel::fast_reduce_op(carrier).is_some()
+        && block.is_multiple_of(width)
+        && slab_lanes_per_row(block, rows_per_slab, k) >= width)
+        .then_some(width)
 }
 
 /// Workgroup bytes one fold strategy's cross-lane close needs, for a carrier

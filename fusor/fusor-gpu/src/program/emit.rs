@@ -1,4 +1,4 @@
-use super::plan::{BLOCK, Plan};
+use super::plan::{BLOCK, Plan, visit_sources};
 use fusor_ir::{
     Result,
     dtype::{Dtype, RoundMode, Splat},
@@ -6,6 +6,7 @@ use fusor_ir::{
     error::Error,
     ir::logical::{LeafKind, Logical, ScatterCombine},
     scalar::{BinOp, CmpOp, ScalarExpr, ScalarKind, UnOp},
+    semantics::children::children_logical,
 };
 use std::fmt::Write;
 
@@ -233,30 +234,14 @@ fn load_expr(
     variables: &[&str],
     bounds: &super::index::Bounds,
 ) -> Result<String> {
-    use super::index::Expr;
     let v = p.value(id);
     match &v.op {
         Logical::Leaf(LeafKind::Const { value, .. }) => lit(*value),
         Logical::Restride { specs, x, .. } => {
             let source = p.value(*x);
-            let mapped = Expr::sum(
-                specs
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| s.multiplier != 0)
-                    .map(|(axis, s)| {
-                        Expr::sum([
-                            index
-                                .clone()
-                                .div(stride(&v.shape, axis) as usize)
-                                .modulo(v.shape[axis] as usize)
-                                .scale(s.multiplier as usize),
-                            Expr::Const(s.offset.as_const().unwrap()),
-                        ])
-                        .scale(stride(&source.shape, s.input_dim as usize) as usize)
-                    }),
-            )
-            .simplify(bounds);
+            let mapped = index
+                .restride(&v.shape, &source.shape, specs)
+                .simplify(bounds);
             load_expr(p, *x, mapped, variables, bounds)
         }
         Logical::Map { ins, .. } if v.forwarded => {
@@ -302,39 +287,29 @@ pub(crate) fn shader(
     let stages: Vec<_> = jobs.iter().flat_map(|j| j.stages.iter().copied()).collect();
     let commit =
         (p.stats().workgroups == 1 && region + 1 == p.regions.len()) || region == p.regions.len();
-    let mut used_maps = rustc_hash::FxHashSet::default();
+    let mut used_maps: rustc_hash::FxHashSet<_> = stages
+        .iter()
+        .copied()
+        .filter(|id| matches!(p.value(*id).op, Logical::Map { .. }))
+        .collect();
     let mut used_reads = rustc_hash::FxHashSet::default();
-    fn read_deps(
-        p: &Plan,
-        id: Id,
-        maps: &mut rustc_hash::FxHashSet<Id>,
-        reads: &mut rustc_hash::FxHashSet<Id>,
-    ) {
-        let v = p.value(id);
-        if v.forwarded {
-            maps.insert(v.id);
-            for dep in super::plan::dependencies(&v.op) {
-                read_deps(p, dep, maps, reads);
+    for id in stages
+        .iter()
+        .flat_map(|id| children_logical(&p.value(*id).op))
+        .chain(
+            p.feedback
+                .iter()
+                .filter(|_| commit)
+                .map(|(_, output)| *output),
+        )
+    {
+        visit_sources(&p.values, &p.by_id, id, &mut |v| {
+            if v.forwarded {
+                used_maps.insert(v.id);
+            } else {
+                used_reads.insert(v.id);
             }
-        } else if let Logical::Restride { x, .. } = v.op {
-            read_deps(p, x, maps, reads);
-        } else if v.materialized() {
-            reads.insert(v.id);
-        }
-    }
-    for id in &stages {
-        let v = p.value(*id);
-        if matches!(v.op, Logical::Map { .. }) {
-            used_maps.insert(v.id);
-        }
-        for dep in super::plan::dependencies(&v.op) {
-            read_deps(p, dep, &mut used_maps, &mut used_reads);
-        }
-    }
-    if commit {
-        for (_, output) in &p.feedback {
-            read_deps(p, *output, &mut used_maps, &mut used_reads);
-        }
+        });
     }
     let mut out = "@group(0) @binding(0) var<storage,read_write> arena: array<u32>;\nvar<workgroup> tile_a:array<f32,512>;\nvar<workgroup> tile_b:array<f32,256>;\nvar<workgroup> reduce_scratch:array<u32,256>;\nvar<private> owner:u32;\nfn f32_bits(bits:u32)->f32{return bitcast<f32>(bits);}\n".to_string();
     if cooperative {
@@ -674,8 +649,7 @@ fn contraction(
                 (3, &ks, red.iter().position(|l| l == label).unwrap())
             };
             Expr::var(var)
-                .div(stride(dims, i) as usize)
-                .modulo(dims[i] as usize)
+                .coordinate(dims, i)
                 .scale(stride(shape, axis) as usize)
         }))
         .simplify(&bounds)

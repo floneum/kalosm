@@ -86,34 +86,32 @@ impl Program {
         raw: &GpuBuffer,
         acceleration: super::ProgramAcceleration,
     ) -> Result<Vec<(wgpu::ComputePipeline, wgpu::BindGroup)>> {
-        #[cfg(any(test, feature = "compiler-tests"))]
-        let cooperative = acceleration.cooperative();
         let mut kernels = vec![];
-        for (region, _source) in plan
-            .shaders_with(acceleration.native_validation())?
-            .into_iter()
-            .enumerate()
-        {
+        for region in 0..plan.stats().kernels {
             #[cfg(any(not(target_arch = "wasm32"), test, feature = "compiler-tests"))]
-            let module = naga::front::wgsl::parse_str(&_source)
-                .map_err(|e| Error::Plan(e.emit_to_string(&_source)))?;
-            #[cfg(any(test, feature = "compiler-tests"))]
-            naga::valid::Validator::new(
-                naga::valid::ValidationFlags::all(),
-                if cooperative {
-                    naga::valid::Capabilities::COOPERATIVE_MATRIX
-                        | naga::valid::Capabilities::SUBGROUP
-                } else if acceleration.subgroups {
-                    naga::valid::Capabilities::SUBGROUP
-                } else {
-                    naga::valid::Capabilities::empty()
-                },
-            )
-            .validate(&module)
-            .map_err(|e| Error::Plan(e.emit_to_string(&_source)))?;
+            let _module = {
+                let source = super::emit::shader(plan, region, acceleration.native_validation())?;
+                let module = naga::front::wgsl::parse_str(&source)
+                    .map_err(|e| Error::Plan(e.emit_to_string(&source)))?;
+                #[cfg(any(test, feature = "compiler-tests"))]
+                naga::valid::Validator::new(
+                    naga::valid::ValidationFlags::all(),
+                    if acceleration.cooperative() {
+                        naga::valid::Capabilities::COOPERATIVE_MATRIX
+                            | naga::valid::Capabilities::SUBGROUP
+                    } else if acceleration.subgroups {
+                        naga::valid::Capabilities::SUBGROUP
+                    } else {
+                        naga::valid::Capabilities::empty()
+                    },
+                )
+                .validate(&module)
+                .map_err(|e| Error::Plan(e.emit_to_string(&source)))?;
+                module
+            };
             #[cfg(target_arch = "wasm32")]
             let shader_source = {
-                let mut source = super::emit::shader(&plan, region, acceleration)?;
+                let mut source = super::emit::shader(plan, region, acceleration)?;
                 // Naga recognizes subgroup operations without the enable line;
                 // browser WGSL requires it explicitly.
                 if acceleration.subgroups {
@@ -122,10 +120,7 @@ impl Program {
                 wgpu::ShaderSource::Wgsl(std::borrow::Cow::Owned(source))
             };
             #[cfg(not(target_arch = "wasm32"))]
-            let shader_source = {
-                let _ = region;
-                wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module))
-            };
+            let shader_source = wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(_module));
             let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
             // SAFETY: emission contains only statically counted loops, and plan
             // admission excludes overflow of every counter (including its final
@@ -185,49 +180,40 @@ impl Program {
     pub fn uniforms(&mut self, values: &[(fusor_ir::shape::SymId, f32)]) -> Result<()> {
         self.target.device().lost().check()?;
         let values: rustc_hash::FxHashMap<_, _> = values.iter().copied().collect();
+        let encode = |sym, dtype| {
+            let value = values
+                .get(&sym)
+                .ok_or_else(|| Error::Plan(format!("unbound program uniform {sym:?}")))?;
+            let word = match dtype {
+                fusor_ir::dtype::Dtype::F32 => value.to_bits(),
+                fusor_ir::dtype::Dtype::I32 => (*value as i32) as u32,
+                fusor_ir::dtype::Dtype::U32 => *value as u32,
+                _ => return Err(Error::Dtype("unsupported program uniform type".into())),
+            };
+            Ok(word.to_le_bytes())
+        };
         let leaves = self
             .plan
             .inputs()
             .iter()
-            .filter_map(|input| input.uniform.map(|sym| (input.id, input.dtype, sym)))
-            .map(|(id, dtype, sym)| {
-                let value = values
-                    .get(&sym)
-                    .ok_or_else(|| Error::Plan(format!("unbound program uniform {sym:?}")))?;
-                let word = match dtype {
-                    fusor_ir::dtype::Dtype::F32 => value.to_bits(),
-                    fusor_ir::dtype::Dtype::I32 => (*value as i32) as u32,
-                    fusor_ir::dtype::Dtype::U32 => *value as u32,
-                    _ => return Err(Error::Dtype("unsupported program uniform type".into())),
-                };
-                Ok((id, word.to_le_bytes()))
-            })
+            .filter_map(|input| input.uniform.map(|sym| (input, sym)))
+            .map(|(input, sym)| Ok((input, encode(sym, input.dtype)?)))
             .collect::<Result<Vec<_>>>()?;
         let mut bytes = Vec::with_capacity(self.plan.uniforms.len() * 4);
         for uniform in &self.plan.uniforms {
-            let value = values
-                .get(&uniform.sym)
-                .ok_or_else(|| Error::Plan(format!("unbound program uniform {:?}", uniform.sym)))?;
-            let word = match uniform.dtype {
-                fusor_ir::dtype::Dtype::F32 => value.to_bits(),
-                fusor_ir::dtype::Dtype::U32 => *value as u32,
-                fusor_ir::dtype::Dtype::I32 => (*value as i32) as u32,
-                _ => return Err(Error::Dtype("unsupported program uniform type".into())),
-            };
-            bytes.extend_from_slice(&word.to_le_bytes());
+            bytes.extend_from_slice(&encode(uniform.sym, uniform.dtype)?);
         }
+        let queue = self.target.device().queue();
+        let arena = &self.arena.downcast_ref::<GpuBuffer>().unwrap().buffer;
         if bytes != self.uniform_bytes {
             if let Some(first) = self.plan.uniforms.first() {
-                self.target.device().queue().write_buffer(
-                    &self.arena.downcast_ref::<GpuBuffer>().unwrap().buffer,
-                    u64::from(first.offset) * 4,
-                    &bytes,
-                );
+                queue.write_buffer(arena, u64::from(first.offset) * 4, &bytes);
             }
             self.uniform_bytes = bytes;
         }
-        for (id, bytes) in leaves {
-            self.write(id, &bytes)?;
+        for (input, bytes) in leaves {
+            queue.write_buffer(arena, u64::from(input.offset) * 4, &bytes);
+            self.initialized.insert(input.id);
         }
         Ok(())
     }

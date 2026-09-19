@@ -91,6 +91,32 @@ impl Expr {
     pub(super) fn scale(self, n: usize) -> Self {
         Self::weighted([(self, n as u64)])
     }
+    pub(super) fn coordinate(self, shape: &[u32], axis: usize) -> Self {
+        self.div(shape[axis + 1..].iter().product::<u32>() as usize)
+            .modulo(shape[axis] as usize)
+    }
+    pub(super) fn restride(
+        self,
+        shape: &[u32],
+        source: &[u32],
+        specs: &[fusor_ir::shape::StrideSpec],
+    ) -> Self {
+        Self::sum(
+            specs
+                .iter()
+                .enumerate()
+                .filter(|(_, s)| s.multiplier != 0)
+                .map(|(axis, s)| {
+                    Self::sum([
+                        self.clone()
+                            .coordinate(shape, axis)
+                            .scale(s.multiplier as usize),
+                        Self::Const(s.offset.as_const().unwrap()),
+                    ])
+                    .scale(source[s.input_dim as usize + 1..].iter().product::<u32>() as usize)
+                }),
+        )
+    }
     pub(super) fn div(self, n: usize) -> Self {
         assert!(n > 0);
         let n = n as u64;

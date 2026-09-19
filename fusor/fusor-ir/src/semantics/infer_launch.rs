@@ -6,7 +6,7 @@ use crate::error::{Error, Result};
 use crate::facts::ValueFacts;
 use crate::ir::OpDefRegistry;
 use crate::ir::launch::Launch;
-use crate::shape::{Dim, Dims};
+use crate::shape::Dims;
 
 /// Infer the result facts of a Launch node from its operands' facts.
 ///
@@ -82,11 +82,13 @@ fn infer_launch_inner(
             })
         }
 
-        // A quantized contraction has no batch axis: its weight side is a
-        // single `[n, k]` matrix.
-        Launch::Contract {
-            m, n, batch, post, ..
-        } => Ok(contract_facts(*m, *n, *batch, post, ins)),
+        Launch::Contract { output, post, .. } => Ok(ValueFacts {
+            dtype: post.dtype(),
+            shape: output.dims.clone(),
+            numeric: meet(ins),
+            persistence: Persistence::Step,
+            outs: 1,
+        }),
         // `QuantizedRows` reads the quantized leaf but *decodes* every
         // element it gathers, so its value is float-typed and step-lived —
         // inheriting the leaf's `Q(fmt)` dtype is exactly the double-decode
@@ -179,30 +181,6 @@ fn infer_launch_inner(
                 .ok_or_else(|| Error::Shape(format!("no OpDef registered as {def:?}")))?;
             (d.infer)(ins)
         }
-    }
-}
-
-/// `[batch, m, n]`, dropping a unit batch so a plain `[m, n]` matmul does not
-/// grow a leading axis nothing reads.
-fn contract_facts(
-    m: Dim,
-    n: Dim,
-    batch: Dim,
-    post: &crate::scalar::ScalarExpr,
-    ins: &[ValueFacts],
-) -> ValueFacts {
-    let mut shape: Dims = Dims::new();
-    if !batch.known_eq(Dim::Const(1)) {
-        shape.push(batch);
-    }
-    shape.push(m);
-    shape.push(n);
-    ValueFacts {
-        dtype: post.dtype(),
-        shape,
-        numeric: meet(ins),
-        persistence: Persistence::Step,
-        outs: 1,
     }
 }
 

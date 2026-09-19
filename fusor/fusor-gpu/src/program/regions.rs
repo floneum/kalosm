@@ -4,11 +4,12 @@
 //! scheduling never introduces a cross-workgroup barrier inside a kernel.
 use super::{
     index::{Bounds, Expr, GROUP, LOCAL},
-    plan::{Value, dependencies},
+    plan::Value,
 };
 use fusor_ir::{
     egraph::Id,
     ir::logical::{LeafKind, Logical},
+    semantics::children::children_logical,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -30,11 +31,6 @@ impl Region {
     }
 }
 
-fn coord(at: Expr, shape: &[u32], axis: usize) -> Expr {
-    at.div(shape[axis + 1..].iter().product::<u32>() as usize)
-        .modulo(shape[axis] as usize)
-}
-
 fn reads(
     id: Id,
     at: Expr,
@@ -47,23 +43,7 @@ fn reads(
         Logical::Leaf(LeafKind::Const { .. }) => (),
         Logical::Restride { x, specs, .. } => {
             let source = &values[map[x]];
-            let index = Expr::sum(
-                specs
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, s)| s.multiplier != 0)
-                    .map(|(axis, s)| {
-                        Expr::sum([
-                            coord(at.clone(), &v.shape, axis).scale(s.multiplier as usize),
-                            Expr::Const(s.offset.as_const().unwrap()),
-                        ])
-                        .scale(
-                            source.shape[s.input_dim as usize + 1..]
-                                .iter()
-                                .product::<u32>() as usize,
-                        )
-                    }),
-            );
+            let index = at.restride(&v.shape, &source.shape, specs);
             reads(*x, index, values, map, out);
         }
         Logical::Map { ins, .. } if v.forwarded => {
@@ -107,7 +87,7 @@ fn recipes(
         Logical::Contract { spec, a, b, .. } => {
             let mut labels = std::collections::BTreeMap::new();
             for (i, label) in spec.out.iter().enumerate() {
-                labels.insert(*label, coord(at.clone(), &v.shape, i));
+                labels.insert(*label, at.clone().coordinate(&v.shape, i));
             }
             let mut next = 0;
             for (dep, axes) in [(*a, &spec.a), (*b, &spec.b)] {
@@ -147,7 +127,7 @@ fn recipes(
         // Data dependent scatter is deliberately a cut unless its inputs are
         // already global. Full input ranges are a sound over-approximation.
         _ => {
-            for (var, dep) in dependencies(&v.op).into_iter().enumerate() {
+            for (var, dep) in children_logical(&v.op).into_iter().enumerate() {
                 bounds.insert(var, u64::from(values[map[&dep]].len() - 1));
                 read(dep, Expr::var(var));
             }

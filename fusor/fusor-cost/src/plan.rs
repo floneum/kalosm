@@ -25,10 +25,7 @@ use rustc_hash::FxHasher;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::hash::{Hash, Hasher};
 
-/// `SymId(u32::MAX)` is the crate-wide "symbolic, not statically known"
-/// sentinel — `Layout::row_major_strides` already mints it for a stride past
-/// a symbolic axis. A `BufferPlan::elements` of this value means the runtime
-/// derives the extent from `layout` plus the bound symbols.
+/// An opaque allocation size, derived at runtime from the bound layout.
 pub const UNKNOWN_SYM: SymId = SymId(u32::MAX);
 
 /// Everything derived from one realized extraction: buffers, launches,
@@ -41,7 +38,18 @@ pub fn derive_plan(
     cost: fusor_ir::cost::Picoseconds,
 ) -> Result<Plan> {
     let buffers = derive_buffers(graph, extraction, realized)?;
-    let (dims, scalar_symbols) = classified_symbols_of(graph, realized);
+    let (mut dims, scalar_symbols) = classified_symbols_of(graph, realized);
+    for buffer in &buffers {
+        collect_layout(
+            &Layout::contiguous(&graph.facts(buffer.value).shape),
+            &mut dims,
+        );
+        collect_layout(&buffer.layout, &mut dims);
+        collect_dims(&[buffer.elements], &mut dims);
+    }
+    dims.retain(|s| *s != UNKNOWN_SYM);
+    dims.sort_unstable();
+    dims.dedup();
     let mut symbols = dims;
     symbols.extend(scalar_symbols.iter().copied());
 
@@ -236,7 +244,7 @@ pub fn derive_buffers(
         }
         let facts = graph.facts(*id);
         let theta = extraction.theta.get(id).copied();
-        let (layout, elements) = buffer_layout_for(facts, theta)?;
+        let (layout, elements) = buffer_layout_for(facts, &graph.node(*id).op, theta)?;
         out.push(BufferPlan {
             value: *id,
             elements,
@@ -304,89 +312,56 @@ pub fn derive_bindings(
     Ok(out)
 }
 
-/// The layout one materialized value needs under one schedule point, plus
-/// the buffer's allocation extent in elements.
-///
-/// **Padding lives in the strides, never in the shape.** The returned
-/// layout's shape is always the value's logical shape; a `Coop` point pads
-/// `m` to a multiple of `geom.bm` and `n` to `geom.bn` *in the strides*
-/// (row-major over the padded extents). A rank-2 padded matrix loses
-/// `m_pad` from `(shape, strides)` alone, which is why the padded element
-/// count is returned alongside — allocation cannot rederive it.
-///
-/// - default: `Layout::contiguous(shape)`, elements = product(shape);
-/// - `Coop { geom, .. }`: logical shape over padded row-major strides;
-///   elements = `product(padded)`;
-/// - `Sgemm` / `Sgemv` / `Fold` / `Map` / `Point`: contiguous.
-///
-/// Elements is `Dim::Sym(UNKNOWN_SYM)` when a symbolic extent keeps the
-/// count from being a constant; the runtime then derives it from the layout
-/// (`shape[0] * strides[0]` for these row-major layouts), never from the
-/// shape product, which undercounts a padded buffer.
-///
-/// `Sgemm` pads nothing. Padding exists so a kernel may write a whole block
-/// without a bounds test, and only the cooperative store does that: the SGEMM
-/// body masks every store with `row < batch * m && col < n`. Padding here
-/// acts on the output's last two axes, which are the `m` and `n` axes only
-/// when each occupies exactly one — a contraction with `n = 1` has none, so
-/// padding it would pad batch axes instead.
-pub fn buffer_layout_for(facts: &ValueFacts, theta: Option<SchedPoint>) -> Result<(Layout, Dim)> {
+/// Logical strides and allocation extent for a selected node. Cooperative
+/// stores pad matrix groups, while retaining each group's logical axes.
+pub fn buffer_layout_for(
+    facts: &ValueFacts,
+    op: &Op,
+    theta: Option<SchedPoint>,
+) -> Result<(Layout, Dim)> {
     let shape = &facts.shape;
-    let (bm, bn) = match theta {
-        Some(SchedPoint::Coop { geom, .. }) => (geom.bm, geom.bn),
-        _ => {
-            let l = Layout::contiguous(shape);
-            let e = layout_elements(shape);
-            return Ok((l, e));
-        }
+    let (Op::Launch(Launch::Contract { m, n, batch, .. }), Some(SchedPoint::Coop { geom, .. })) =
+        (op, theta)
+    else {
+        return Ok((Layout::contiguous(shape), layout_elements(shape)));
     };
-    if shape.len() < 2 {
-        let l = Layout::contiguous(shape);
-        let e = layout_elements(shape);
-        return Ok((l, e));
-    }
-
-    let mut padded: Dims = shape.clone();
-    let last = padded.len() - 1;
-    padded[last - 1] = pad_to(padded[last - 1], bm);
-    padded[last] = pad_to(padded[last], bn);
-
-    let strides = Layout::row_major_strides(&padded);
-    // Stride placeholders resolve from the logical shape, so padded strides
-    // require concrete extents.
-    if padded != *shape
-        && strides
-            .iter()
-            .any(|s| matches!(s, Dim::Sym(x) if *x == UNKNOWN_SYM))
-    {
-        return Err(fusor_ir::Error::Plan(format!(
-            "a padded layout over {shape:?} needs a derived stride, which would \
-             resolve from the logical shape and lose the padding"
-        )));
-    }
-    let padded_elements = {
-        let mut acc: Option<u64> = Some(1);
-        for d in &padded {
-            acc = match (acc, d.as_const()) {
-                (Some(a), Some(v)) => Some(a.saturating_mul(v)),
-                _ => None,
-            };
-        }
-        match acc {
-            Some(v) => Dim::Const(v),
-            None => Dim::Sym(UNKNOWN_SYM),
-        }
+    let constant = |dim: Dim| {
+        dim.as_const()
+            .ok_or_else(|| Error::Plan("cooperative matrix groups require concrete extents".into()))
     };
-
-    let l = Layout::from_parts(Dim::Const(0), shape, &strides)?;
-    Ok((l, padded_elements))
-}
-
-const fn pad_to(d: Dim, multiple: u32) -> Dim {
-    match (d.as_const(), multiple) {
-        (Some(v), m) if m > 1 => Dim::Const(v.div_ceil(m as u64) * m as u64),
-        _ => d,
+    let (m, n) = (constant(*m)?, constant(*n)?);
+    let m_padded = m.max(1).div_ceil(u64::from(geom.bm)) * u64::from(geom.bm);
+    let n_padded = n.max(1).div_ceil(u64::from(geom.bn)) * u64::from(geom.bn);
+    let elements = *batch * Dim::Const(m_padded) * Dim::Const(n_padded);
+    if m == 0 || n == 0 {
+        return Ok((Layout::contiguous(shape), elements));
     }
+    let mut strides: Dims = shape.clone();
+    let mut axis = shape.len();
+    for (extent, stride) in [(n, 1), (m, n_padded)] {
+        let mut covered = 1;
+        while covered < extent {
+            axis = axis.checked_sub(1).ok_or_else(|| {
+                Error::Plan("matrix group exceeds its logical output rank".into())
+            })?;
+            strides[axis] = Dim::Const(stride * covered);
+            covered *= constant(shape[axis])?;
+        }
+        if covered != extent {
+            return Err(Error::Plan(
+                "matrix group cuts through a logical output axis".into(),
+            ));
+        }
+    }
+    let mut stride = Dim::Const(m_padded * n_padded);
+    for axis in (0..axis).rev() {
+        strides[axis] = stride;
+        stride = stride * shape[axis];
+    }
+    Ok((
+        Layout::from_parts(Dim::Const(0), shape, &strides)?,
+        elements,
+    ))
 }
 
 fn layout_elements(shape: &[Dim]) -> Dim {
@@ -451,10 +426,10 @@ pub fn plan_hash(
     for (seed, h) in lanes.iter_mut().enumerate() {
         h.write_u64(seed as u64);
         for b in buffers {
-            if let Some(off) = b.arena {
-                h.write_u32(b.value.0);
-                h.write_u64(off);
-            }
+            h.write_u32(b.value.0);
+            hash_layout(h, &sm, &b.layout);
+            hash_dim(h, &sm, b.elements);
+            b.arena.hash(h);
         }
         for launch in launches {
             h.write_u32(launch.root.0);
@@ -880,6 +855,7 @@ fn hash_l1<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &Launch) {
             hash_operands(h, sm, ops);
         }
         Launch::Contract {
+            output,
             m,
             n,
             k,
@@ -891,6 +867,7 @@ fn hash_l1<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &Launch) {
             b,
             ..
         } => {
+            hash_space(h, sm, output);
             hash_dim(h, sm, *m);
             hash_dim(h, sm, *n);
             hash_dim(h, sm, *k);
@@ -1051,6 +1028,7 @@ fn collect_op(op: &Op, dims: &mut Vec<SymId>, scalars: &mut Vec<SymId>) {
                 collect_ops(ops, dims);
             }
             Launch::Contract {
+                output,
                 m,
                 n,
                 k,
@@ -1060,6 +1038,7 @@ fn collect_op(op: &Op, dims: &mut Vec<SymId>, scalars: &mut Vec<SymId>) {
                 b,
                 ..
             } => {
+                collect_dims(&output.dims, dims);
                 collect_dims(&[*m, *n, *k, *batch], dims);
                 collect_scalar(&a.pre, scalars);
                 collect_scalar(&b.pre, scalars);

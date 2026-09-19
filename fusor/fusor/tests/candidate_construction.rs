@@ -205,23 +205,231 @@ fn promotion_constructs_a_domain_for_the_promoted_carrier() {
 
 #[test]
 fn contraction_alternatives_preserve_the_logical_output_shape() {
+    use fusor_ir::device::{CoopKind, SubgroupWidths};
+    use fusor_ir::ir::launch::Launch;
+    use fusor_ir::scalar::{BinOp, ScalarExpr};
     let mut caps = caps();
     caps.kind = DeviceKind::Gpu;
     caps.limits = Limits::default();
-    let mut graph = EGraph::new(fusor_ir::CoreSemantics::new(Arc::new(
-        fusor_tile::Planner::new(),
-    )));
-    let mut leaf = |name, shape: [u64; 4]| {
+    caps.subgroups = Some(SubgroupWidths { min: 32, max: 32 });
+    caps.coop.push(CoopKind {
+        operand: Dtype::F32,
+        acc: Dtype::F32,
+        m: 8,
+        n: 8,
+        k: 8,
+    });
+    for (batch, m, n) in [
+        (&[2, 3][..], &[4][..], &[6][..]),
+        (&[1, 1][..], &[4][..], &[6][..]),
+        (&[2, 1][..], &[3, 4][..], &[5, 6][..]),
+    ] {
+        let mut graph = EGraph::new(fusor_ir::CoreSemantics::new(Arc::new(
+            fusor_tile::Planner::new(),
+        )));
+        let mut leaf = |name, shape: Vec<u64>| {
+            graph
+                .add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
+                    name: BufferId(name),
+                    dtype: Dtype::F32,
+                    shape: shape.into_iter().map(Dim::Const).collect(),
+                })))
+                .unwrap()
+        };
+        let a = leaf(0, batch.iter().chain(m).copied().chain([256]).collect());
+        let b = leaf(
+            1,
+            batch
+                .iter()
+                .copied()
+                .chain([256])
+                .chain(n.iter().copied())
+                .collect(),
+        );
+        let batch_end = batch.len() as u8;
+        let m_end = batch_end + m.len() as u8;
+        let n_end = m_end + n.len() as u8;
+        let id = graph
+            .add(Op::Logical(Logical::Contract {
+                spec: EinSpec {
+                    a: (0..m_end).chain([n_end]).map(Label).collect(),
+                    b: (0..batch_end)
+                        .chain([n_end])
+                        .chain(m_end..n_end)
+                        .map(Label)
+                        .collect(),
+                    out: (0..n_end).map(Label).collect(),
+                },
+                a,
+                b,
+                acc: Dtype::F32,
+                outs: 1,
+            }))
+            .unwrap();
+        let node = graph.node(id).clone();
+        let facts = graph.facts_view(id, &caps);
+        let shape = facts.own().shape.clone();
+        for rule in [
+            fusor_tile::rules::contract::lower_generic,
+            fusor_tile::rules::contract::lower_sgemm,
+            fusor_tile::rules::contract::lower_sgemv,
+            fusor_tile::rules::contract::lower_coop,
+        ] {
+            let variant = rule(&mut graph.builder(&caps), id, &node, &facts).unwrap();
+            assert_eq!(graph.facts(variant).shape, shape);
+            let variant_node = graph.node(variant).clone();
+            if matches!(variant_node.op, Op::Launch(Launch::Contract { .. })) {
+                let facts = graph.facts_view(variant, &caps);
+                let split = fusor_ir::rules::split_k::split_k(
+                    &mut graph.builder(&caps),
+                    variant,
+                    &variant_node,
+                    &facts,
+                )
+                .unwrap();
+                assert_eq!(graph.facts(split).shape, shape);
+                for left in [true, false] {
+                    let mut indexed = variant_node.op.clone();
+                    let Op::Launch(Launch::Contract { a, b, .. }) = &mut indexed else {
+                        unreachable!()
+                    };
+                    let side = if left { a } else { b };
+                    side.pre = ScalarExpr::bin(
+                        BinOp::Add,
+                        side.pre.clone(),
+                        ScalarExpr::cast(
+                            Dtype::F32,
+                            ScalarExpr::index_of((side.primary().layout.rank() - 1) as u32),
+                        ),
+                    );
+                    let indexed = graph.add(indexed).unwrap();
+                    let node = graph.node(indexed).clone();
+                    let facts = graph.facts_view(indexed, &caps);
+                    let before = graph.len();
+                    assert!(
+                        fusor_ir::rules::split_k::split_k(
+                            &mut graph.builder(&caps),
+                            indexed,
+                            &node,
+                            &facts,
+                        )
+                        .is_none()
+                    );
+                    assert_eq!(graph.len(), before);
+                }
+            }
+        }
+        assert_graph_invariants(&graph, &caps);
+    }
+}
+
+#[test]
+fn symbolic_contraction_groups_keep_their_bound_extents() {
+    use fusor_ir::ir::launch::Launch;
+    use fusor_ir::shape::SymId;
+    let s = Dim::Sym(SymId(0));
+    let t = Dim::Sym(SymId(1));
+    let mut caps = caps();
+    caps.kind = DeviceKind::Gpu;
+    caps.limits = Limits::default();
+    for (rows, expected) in [
+        (vec![s], 5),
+        (vec![s, Dim::ONE], 5),
+        (vec![s, Dim::Const(2)], 10),
+        (vec![Dim::Const(2), s], 10),
+        (vec![s, t], 15),
+    ] {
+        let mut graph = EGraph::new(fusor_ir::CoreSemantics::new(Arc::new(
+            fusor_tile::Planner::new(),
+        )));
+        let mut leaf = |name, shape: Vec<Dim>| {
+            graph
+                .add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
+                    name: BufferId(name),
+                    dtype: Dtype::F32,
+                    shape: shape.into_iter().collect(),
+                })))
+                .unwrap()
+        };
+        let a = leaf(0, rows.iter().copied().chain([Dim::Const(8)]).collect());
+        let b = leaf(1, vec![Dim::Const(8), Dim::Const(4)]);
+        let k = rows.len() as u8;
+        let id = graph
+            .add(Op::Logical(Logical::Contract {
+                spec: EinSpec {
+                    a: (0..=k).map(Label).collect(),
+                    b: [Label(k), Label(k + 1)].into_iter().collect(),
+                    out: (0..k).chain([k + 1]).map(Label).collect(),
+                },
+                a,
+                b,
+                acc: Dtype::F32,
+                outs: 1,
+            }))
+            .unwrap();
+        let node = graph.node(id).clone();
+        let facts = graph.facts_view(id, &caps);
+        let variant =
+            fusor_tile::rules::contract::lower_sgemm(&mut graph.builder(&caps), id, &node, &facts)
+                .unwrap();
+        let node = graph.node(variant).clone();
+        let Op::Launch(Launch::Contract { m, .. }) = &node.op else {
+            unreachable!()
+        };
+        assert_eq!(
+            m.evaluate(&mut |sym| [5, 3].get(sym.0 as usize).copied()),
+            Some(expected)
+        );
+        assert_eq!(graph.facts(variant).shape, facts.own().shape);
+        let facts = graph.facts_view(variant, &caps);
+        let before = graph.len();
+        assert!(
+            fusor_ir::rules::specialize::specialize_dim(
+                &mut graph.builder(&caps),
+                variant,
+                &node,
+                &facts,
+            )
+            .is_none()
+        );
+        assert_eq!(graph.len(), before);
+    }
+}
+
+#[test]
+fn grouped_padding_symbols_reach_the_uniform_plan() {
+    use fusor_cost::{Roofline, extract::LocalSearch, realize::NodeCache};
+    use fusor_ir::device::{CoopKind, SubgroupWidths};
+    use fusor_ir::extract::Extraction;
+    use fusor_ir::ir::launch::Launch;
+    use fusor_ir::shape::SymId;
+    let mut caps = caps();
+    caps.kind = DeviceKind::Gpu;
+    caps.limits = Limits::default();
+    caps.subgroups = Some(SubgroupWidths { min: 32, max: 32 });
+    caps.coop.push(CoopKind {
+        operand: Dtype::F32,
+        acc: Dtype::F32,
+        m: 8,
+        n: 8,
+        k: 8,
+    });
+    let planner = Arc::new(fusor_tile::Planner::new());
+    let mut graph = EGraph::new(fusor_ir::CoreSemantics::new(planner.clone()));
+    let batch = Dim::Sym(SymId(0));
+    let mut leaf = |name, m, n| {
         graph
             .add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
                 name: BufferId(name),
                 dtype: Dtype::F32,
-                shape: shape.map(Dim::Const).into_iter().collect(),
+                shape: [Dim::Const(2), batch, Dim::Const(m), Dim::Const(n)]
+                    .into_iter()
+                    .collect(),
             })))
             .unwrap()
     };
-    let a = leaf(0, [2, 3, 4, 5]);
-    let b = leaf(1, [2, 3, 5, 6]);
+    let a = leaf(0, 3, 8);
+    let b = leaf(1, 8, 5);
     let id = graph
         .add(Op::Logical(Logical::Contract {
             spec: EinSpec {
@@ -237,16 +445,75 @@ fn contraction_alternatives_preserve_the_logical_output_shape() {
         .unwrap();
     let node = graph.node(id).clone();
     let facts = graph.facts_view(id, &caps);
-    let shape = facts.own().shape.clone();
-    for rule in [
-        fusor_tile::rules::contract::lower_generic,
-        fusor_tile::rules::contract::lower_sgemm,
-        fusor_tile::rules::contract::lower_sgemv,
-    ] {
-        let variant = rule(&mut graph.builder(&caps), id, &node, &facts).unwrap();
-        assert_eq!(graph.facts(variant).shape, shape);
-        assert_graph_invariants(&graph, &caps);
+    let variant =
+        fusor_tile::rules::contract::lower_coop(&mut graph.builder(&caps), id, &node, &facts)
+            .unwrap();
+    let Op::Launch(Launch::Contract { sched, .. }) = &graph.node(variant).op else {
+        unreachable!()
+    };
+    let mut extraction = Extraction::default();
+    for node in [a, b, variant] {
+        extraction.sigma.insert(graph.class_of(node), node);
     }
+    extraction.m.grow(graph.len());
+    extraction.m.insert(variant.index());
+    extraction.theta.insert(variant, sched.point(0).unwrap());
+    let facts = fusor_cost::facts::seed_facts(&caps);
+    let plan = LocalSearch::new(planner, caps)
+        .replan(
+            &graph,
+            &[variant],
+            &mut extraction,
+            &Roofline::new(facts.clone()),
+            &mut NodeCache::new(graph.len()),
+        )
+        .unwrap();
+    let buffer = plan
+        .buffers
+        .iter()
+        .find(|buffer| buffer.value == variant)
+        .unwrap();
+    let Dim::Sym(stride) = buffer.layout.strides()[0] else {
+        panic!("batch stride must depend on its symbolic inner extent")
+    };
+    assert!(
+        plan.symbols.contains(&stride),
+        "the padded batch stride needs a uniform slot"
+    );
+    let dense = fusor_ir::shape::Layout::contiguous(&graph.facts(variant).shape);
+    let Dim::Sym(logical_stride) = dense.strides()[0] else {
+        unreachable!()
+    };
+    assert!(
+        plan.symbols.contains(&logical_stride),
+        "repadding needs the logical batch stride too"
+    );
+    for extent in [3, 5] {
+        let bind = &mut |symbol| (symbol == SymId(0)).then_some(extent);
+        let inner_stride = buffer.layout.strides()[1].evaluate(bind).unwrap();
+        assert_eq!(Dim::Sym(stride).evaluate(bind), Some(extent * inner_stride));
+        assert_eq!(
+            buffer.elements.evaluate(bind),
+            Some(2 * extent * inner_stride)
+        );
+    }
+    let mut buffers = plan.buffers.clone();
+    buffers
+        .iter_mut()
+        .find(|buffer| buffer.value == variant)
+        .unwrap()
+        .layout = dense;
+    assert_ne!(
+        plan.hash,
+        fusor_cost::plan::plan_hash(
+            &graph,
+            &plan.extraction,
+            &plan.launches,
+            &buffers,
+            &plan.symbols,
+            &facts,
+        )
+    );
 }
 
 fn assert_graph_invariants(graph: &EGraph, caps: &Caps) {
@@ -256,6 +523,19 @@ fn assert_graph_invariants(graph: &EGraph, caps: &Caps) {
     for index in 0..graph.len() {
         let id = Id(index as u32);
         let node = graph.node(id);
+        if let Op::Launch(fusor_ir::ir::launch::Launch::Contract {
+            output,
+            m,
+            n,
+            batch,
+            ..
+        }) = &node.op
+        {
+            assert_eq!(
+                output.iterations(),
+                Some(m.as_const().unwrap() * n.as_const().unwrap() * batch.as_const().unwrap())
+            );
+        }
         let operands: Vec<_> = node
             .children
             .iter()

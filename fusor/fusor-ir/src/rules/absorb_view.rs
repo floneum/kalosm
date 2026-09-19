@@ -86,6 +86,7 @@ pub fn absorb_view(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> 
         return None;
     }
     let Op::Launch(Launch::Contract {
+        output,
         m,
         n,
         k,
@@ -125,6 +126,7 @@ pub fn absorb_view(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> 
     }
     let absorbed = b
         .add_launch(Launch::Contract {
+            output: output.clone(),
             m: *m,
             n: *n,
             k: *k,
