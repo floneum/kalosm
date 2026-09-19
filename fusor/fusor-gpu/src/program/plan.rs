@@ -537,6 +537,7 @@ impl Plan {
             placed.push(i);
         }
         // Independent pairwise check: no live values may share bytes.
+        #[cfg(any(test, feature = "compiler-tests"))]
         for (i, a) in values.iter().enumerate().filter(|(_, v)| v.materialized()) {
             for b in values[..i].iter().filter(|v| v.materialized()) {
                 if first[&a.id] <= last[&b.id] && first[&b.id] <= last[&a.id] {

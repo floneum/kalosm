@@ -811,11 +811,8 @@ pub fn geometry(theta: Option<SchedPoint>, space: &IndexSpace, caps: &Caps) -> G
                 .saturating_mul(n.div_ceil(u64::from(p.cols.max(1))))
                 .max(1),
         },
-        // What `lower_fold` actually launches: a block of
-        // `emitted_block(lane_group)` lanes carrying `block / lane_group`
-        // output rows each. Reporting `block = lane_group` instead said a
-        // one-lane fold was 1024 workgroups of one thread when it is four of
-        // 256, which priced the least parallel strategy as the most.
+        // A fold workgroup has `emitted_block(lane_group)` lanes and computes
+        // `block / lane_group` output rows.
         Some(SchedPoint::Fold(strat)) => {
             let (block, lane_group) = match strat {
                 FoldStrat::Subgroup => (

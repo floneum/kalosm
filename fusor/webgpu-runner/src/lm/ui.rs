@@ -15,28 +15,17 @@ use crate::components::badge::{Badge, BadgeVariant};
 use crate::components::button::{Button, ButtonSize, ButtonVariant};
 use crate::components::card::{Card, CardContent, CardDescription, CardHeader, CardTitle};
 
-/// Points the loss curve draws. The history itself is never truncated — a
-/// curve whose beginning has scrolled off cannot show what training did,
-/// which is the only thing it is for. Longer runs are decimated at render.
+/// Maximum plotted points; the full loss history is retained.
 const CURVE_POINTS: usize = 320;
-/// Optimizer steps queued between host syncs.
-///
-/// A readback completes on the browser's event loop, so one per step caps
-/// training at the frame rate no matter how little work the GPU has.
+/// Optimizer steps queued between host readbacks.
 const STEPS_PER_SYNC: usize = 8;
 /// Syncs between held-out evaluations.
 const SYNCS_PER_EVAL: usize = 8;
-/// Held-out batches averaged per evaluation. Each is one readback, and in a
-/// browser a readback completes on the event loop — so this is frames, not
-/// arithmetic.
+/// Held-out batches averaged per evaluation.
 const EVAL_BATCHES: usize = 2;
 /// Syncs between re-samples of the live continuation.
 const SYNCS_PER_SAMPLE: usize = 24;
-/// Characters the live sample writes while training runs. Short on purpose:
-/// generation is sequential, so every character is its own dispatch and
-/// readback — a frame each in a browser — and a long sample starves the
-/// optimizer for a second at a time. The Write button is where a long one
-/// belongs.
+/// Characters generated between training intervals.
 const LIVE_CHARS: usize = 48;
 /// Characters the Write button produces.
 const FULL_CHARS: usize = 400;
@@ -44,22 +33,19 @@ const FULL_CHARS: usize = 400;
 const DEFAULT_PROMPT: &str = "Once upon a time, there was a little girl named";
 /// Sampling temperature the demo opens at.
 const DEFAULT_TEMPERATURE: f32 = 0.8;
-/// Evaluations without a new best held-out loss before training stops.
-///
-/// Patience rather than a target: a target you never reach never stops, and
-/// "it stopped getting better" is the honest reason to halt.
+/// Evaluations without improvement before early stopping.
 const PATIENCE: usize = 10;
 /// Held-out gain in nats that counts as improvement rather than noise.
 const MIN_GAIN: f32 = 0.004;
 
-const CONFIG_FIELDS: [(&str, u64, u64); 7] = [
-    ("Blocks", 1, 8),
-    ("Model width", 8, 512),
-    ("Attention heads", 1, 16),
-    ("Feed-forward width", 8, 2048),
-    ("Context tokens", 8, 512),
-    ("Batch size", 1, 128),
-    ("Training tokens", 1, 1_000_000_000),
+const CONFIG_FIELDS: [&str; 7] = [
+    "Blocks",
+    "Model width",
+    "Attention heads",
+    "Feed-forward width",
+    "Context tokens",
+    "Batch size",
+    "Training tokens",
 ];
 
 #[derive(Clone)]
@@ -89,22 +75,27 @@ impl ConfigDraft {
             values[index] = value
                 .parse::<u64>()
                 .ok()
-                .filter(|n| (CONFIG_FIELDS[index].1..=CONFIG_FIELDS[index].2).contains(n))
+                .filter(|n| *n > 0)
                 .ok_or_else(|| {
-                    format!(
-                        "{} must be a whole number between {} and {}.",
-                        CONFIG_FIELDS[index].0, CONFIG_FIELDS[index].1, CONFIG_FIELDS[index].2
-                    )
+                    format!("{} must be a positive whole number.", CONFIG_FIELDS[index])
                 })?;
         }
+        let dimension = |index: usize| {
+            usize::try_from(values[index]).map_err(|_| {
+                format!(
+                    "{} exceeds this platform's address space.",
+                    CONFIG_FIELDS[index]
+                )
+            })
+        };
         let config = TrainingConfig {
             model: ModelConfig {
-                blocks: values[0] as usize,
-                dim: values[1] as usize,
-                heads: values[2] as usize,
-                mlp: values[3] as usize,
-                context: values[4] as usize,
-                batch: values[5] as usize,
+                blocks: dimension(0)?,
+                dim: dimension(1)?,
+                heads: dimension(2)?,
+                mlp: dimension(3)?,
+                context: dimension(4)?,
+                batch: dimension(5)?,
             },
             token_budget: values[6],
         };
@@ -121,11 +112,7 @@ impl Drop for Busy {
     }
 }
 
-/// A model taken out of its cell for the duration of one run.
-///
-/// Parking it again on drop is what makes cancellation harmless: whether the
-/// run ends normally or the route re-renders the resource away mid-step, the
-/// weights and the compiled kernels are back in the cell for the next click.
+/// Returns the model to its cell when a run finishes or is cancelled.
 struct Parked {
     garage: Rc<RefCell<Option<(u32, Lm)>>>,
     seed: u32,
@@ -157,11 +144,7 @@ impl Drop for Parked {
     }
 }
 
-/// Where the loop's wall time goes, and what it costs in dispatches.
-///
-/// A demo about a compiler should say what it is spending. Training, held-out
-/// scoring and writing a sample are three different costs, and lumping them
-/// into one "steps per second" hides which one a change actually moved.
+/// Wall time by operation, plus optimizer steps and dispatch counts.
 #[derive(Clone, Copy, Default, PartialEq)]
 struct Cost {
     train: f32,
@@ -406,9 +389,6 @@ fn Training(corpus: Rc<Corpus>) -> Element {
                         }
                     }
 
-                    // Held-out text is scored by the same graph resolved for
-                    // the loss alone — no update root is asked for, so
-                    // measuring cannot train.
                     since_eval += 1;
                     if since_eval >= SYNCS_PER_EVAL || model.step_count() == setup.steps() {
                         since_eval = 0;
@@ -420,10 +400,6 @@ fn Training(corpus: Rc<Corpus>) -> Element {
                                 if let Some(last) = history.write().last_mut() {
                                     last.2 = Some(scored.loss);
                                 }
-                                // Stop on the held-out loss, never on the
-                                // training loss, which keeps falling long
-                                // after the model stops learning anything
-                                // transferable.
                                 if *early_stop.peek() {
                                     if scored.loss < best - MIN_GAIN {
                                         best = scored.loss;
@@ -447,10 +423,6 @@ fn Training(corpus: Rc<Corpus>) -> Element {
                         }
                     }
 
-                    // The live continuation costs one dispatch per character,
-                    // so it is re-sampled every so often rather than every
-                    // sync — otherwise the demo would spend its time writing
-                    // instead of learning.
                     since_sample += 1;
                     if since_sample >= SYNCS_PER_SAMPLE
                         && *running.peek()
@@ -540,11 +512,11 @@ fn Training(corpus: Rc<Corpus>) -> Element {
                     }
                     fieldset { class: "lm-config-fields", disabled: busy(),
                         legend { class: "sr-only", "Model and training configuration" }
-                        for (index, (label, min, max)) in CONFIG_FIELDS.iter().enumerate() {
+                        for (index, label) in CONFIG_FIELDS.iter().enumerate() {
                             label { class: "lm-field",
                                 span { "{label}" }
                                 input {
-                                    r#type: "number", min: "{min}", max: "{max}", step: "1",
+                                    r#type: "number", min: "1", step: "1",
                                     value: "{draft.read().0[index]}",
                                     oninput: move |event| draft.write().0[index] = event.value(),
                                 }
@@ -928,11 +900,7 @@ fn Inside(insight: Insight, alphabet: Vec<char>) -> Element {
     }
 }
 
-/// One head's attention, as an image cropped to the real positions.
-///
-/// An `<img>` rather than a grid of elements: twelve heads at
-/// `CONTEXT x CONTEXT` is fifty thousand cells, which the browser lays out
-/// every time the panel opens.
+/// Attention for one head, cropped to the prompt length.
 #[component]
 fn AttentionMap(map: Vec<f32>, filled: usize, context: usize) -> Element {
     let n = filled.clamp(1, context);
@@ -965,11 +933,7 @@ fn AttentionMap(map: Vec<f32>, filled: usize, context: usize) -> Element {
     }
 }
 
-/// The loss history as two SVG polylines.
-///
-/// Every point since the run began is kept; only the drawing is decimated,
-/// and by taking the **worst** loss in each bucket rather than the first, so
-/// a spike survives being summarized.
+/// Plot the maximum loss in each bucket so decimation preserves spikes.
 #[component]
 fn LossCurve(points: Vec<(u64, f32, Option<f32>)>) -> Element {
     const WIDTH: f32 = 320.0;

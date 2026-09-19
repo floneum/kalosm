@@ -533,11 +533,7 @@ pub fn cases() -> Cases {
             attention_backward(s, dense_dims(shape), seed).await
         },
     ));
-    // Pinned, not fuzzed. Canonicalizing the `d_rhs` adjoint's output order
-    // used to zero `dk` on the GPU at exactly this shape while the CPU stayed
-    // correct, and that kept every weight gradient on the generic fold
-    // instead of a matmul. A shape the fuzzer only sometimes draws is not
-    // cover for the one shape known to have broken.
+    // Exercise the canonical output order of the key-gradient contraction.
     cases.push(
         "attention_rope",
         "attention_backward_at_1_2_3_5_4",

@@ -1,8 +1,4 @@
-//! One xorshift32, shared by the weight initializer, the batch sampler and
-//! the character sampler.
-//!
-//! Everything here wants the same thing: cheap, seeded, reproducible noise
-//! that runs in wasm without a dependency. Nothing here wants entropy.
+//! Seeded xorshift32 for weight initialization, batch selection and sampling.
 
 /// xorshift32.
 #[derive(Clone)]

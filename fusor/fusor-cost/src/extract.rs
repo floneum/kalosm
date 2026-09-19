@@ -1360,9 +1360,23 @@ fn seed_theta_trailed(
     cost: &dyn CostModel,
     trail: &mut RepairTrail,
 ) {
-    let mut selected: Vec<Id> = ex.sigma.values().copied().collect();
+    let mut scheduled: FxHashSet<Id> = ex.sigma.values().copied().collect();
+    let mut pending: Vec<Id> = scheduled.iter().copied().collect();
+    // Composites execute their members by id. Their final member shares the
+    // composite's class and therefore has no separate sigma entry.
+    while let Some(id) = pending.pop() {
+        if let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) =
+            &graph.node(id).op
+        {
+            for member in members {
+                if scheduled.insert(*member) {
+                    pending.push(*member);
+                }
+            }
+        }
+    }
+    let mut selected: Vec<Id> = scheduled.into_iter().collect();
     selected.sort_unstable();
-    selected.dedup();
     for id in selected {
         let node = graph.node(id);
         let Op::Launch(l1) = &node.op else { continue };
@@ -1591,10 +1605,8 @@ fn price(
     arena: &dyn ArenaPlanner,
     cache: &mut NodeCache,
 ) -> PriceResult {
-    // A repair changes what the roots reach — a pinned slab's members are
-    // selected where other spellings were — and the new DAG can expose
-    // obligations the old one did not: a slab reachable only now, a value
-    // at a boundary only now. So realize and repair to a fixpoint.
+    // Reselecting slab members can expose further materialization boundaries.
+    // Repeat realization and repair until the extraction stabilizes.
     const ROUNDS: usize = 6;
     let mut realized = realize::realize_with(graph, roots, ex, cost, arena, cache)
         .map_err(|_| RepairTrail::default())?;

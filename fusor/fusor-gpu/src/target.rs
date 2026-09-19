@@ -387,7 +387,7 @@ impl GpuTarget {
         // - `p1`/`probe`/`build`/`bind`/`enc`/`tail`/`tot` the phases below,
         //   in order; `cold` is how many launches the warm probe missed and
         //   `build` therefore had to lower.
-        // - `lowus`/`compus`/`verus`/`vern` CPU microseconds this resolve
+        // - `lowus`/`compus` CPU microseconds this resolve
         //   spent lowering and in the Metal compiler — summed across the build cohort,
         //   so they exceed `build` whenever the workers overlap.
         // - `chunkwait`/`pollus` how long the host was blocked on the GPU

@@ -352,12 +352,8 @@ pub fn buffer_layout_for(facts: &ValueFacts, theta: Option<SchedPoint>) -> Resul
     padded[last] = pad_to(padded[last], bn);
 
     let strides = Layout::row_major_strides(&padded);
-    // A `row_major_strides` placeholder is resolved at dispatch from the
-    // *shape* — which is now logical — so a placeholder in a padded stride
-    // set would silently resolve to the unpadded product. That combination
-    // (a symbolic batch axis to the right of another batch axis, under a
-    // padding point) cannot be stated under this convention; fail loudly
-    // rather than under-address.
+    // Stride placeholders resolve from the logical shape, so padded strides
+    // require concrete extents.
     if padded != *shape
         && strides
             .iter()

@@ -71,8 +71,8 @@ not the model name or parameter count.
 
 The arena uses largest-first placement with lifetime interference checks.
 Within parallel execution, lifetimes extend to region boundaries because
-workgroups advance independently. A separate pairwise check rejects overlapping
-live allocations. Inputs and retained outputs stay live, and feedback waits
+workgroups advance independently. Compiler tests independently check for
+overlapping live allocations. Inputs and retained outputs stay live, and feedback waits
 until every old-state read has completed. Scheduling and packing are heuristics;
 dispatch count alone is not the optimization objective.
 
@@ -83,201 +83,64 @@ budget violations return errors. The program has one storage binding and uses
 256 lanes per workgroup. Storage bounds checks remain enabled; statically
 bounded loops omit redundant runtime loop counters.
 
-## Initial measurements
+## Browser acceleration
 
-Apple M2 Max, Metal, f32. These are end-to-end queued training timings with
-readback at batch boundaries, using identical initial weights and data between
-modes. The MLP uses fixed inputs. The transformer draws new batches and updates
-Adam's learning-rate input every step. Warmup is excluded from step timings.
+Device creation requests advertised subgroups and probes supported f32 8×8
+matrix configurations. `TrainingProgram::acceleration()` reports the selected
+instructions; `acceleration_fallback()` explains a matrix fallback. Matrix kernels
+require fixed 32-lane subgroups. Ordinary subgroup reductions use the runtime
+width, with a shared-memory fallback when subgroup slots are not fully occupied.
+The pinned backend fork is documented in [browser-dependencies.md](browser-dependencies.md).
 
-| Workload | Executor | Dispatches/step | Warm step time |
-| --- | --- | ---: | ---: |
-| MLP: 1,280 parameters, batch 4 | Session | 8 | 219–222 µs |
-| Same MLP | TrainingProgram | 1 | 38–63 µs |
-| Transformer: 240,480 parameters, batch 16, context 64 | Session | 216 | 3.76 ms best; 4.46–8.01 ms other windows |
-| Same transformer | Parallel TrainingProgram | 99 | 1.85–1.99 ms |
+Ordinary Session dispatches bind each physical arena once. Mixed scalar views
+load and store through u32 words; packed f16 stores preserve the neighboring half
+with compare-exchange. Homogeneous bindings use their native element type.
 
-The alternating transformer comparison uses five 32-step windows per executor
-after 17 warmup steps, checks losses after every window, and asserts that the
-program's fastest warmed window beats Session's. Best-to-best speedup is 2.03×
-in this run. Earlier Session measurements reached 3.28 ms; against that faster
-historical baseline, the current 1.85 ms is about 1.8× faster. The previous fused
-implementation took 5.15–5.26 ms, making the current version about 2.8× faster.
-All window timings are retained; slow reference windows do not inflate the
-reported best-to-best speedup. The MLP's best warmed windows improve by 5.8×.
+## Tests and benchmarks
 
-After the alternating run, held-out losses were 2.1768246 (Session) and 2.176824
-(program), with identical accuracy 0.35839844. The original 64-step-window
-regression also passes. The transformer arena occupies 35,690,896 bytes, versus
-87,486,360 bytes for dedicated allocations. The earlier forced single-workgroup
-transformer measurement was roughly 98 ms; its matrix workloads benefit from
-parallel execution. The small MLP remains one kernel.
+GPU tests compare outputs with host arithmetic and cover simultaneous state
+feedback, retained snapshots, changing inputs, tail tiles, reduction boundaries,
+indexing, mixed-type storage, and scratch reuse. The transformer test compares
+all parameters and Adam moments with Session after 24 steps, checks evaluation
+and generation, and trains the compiled model through 400 steps.
 
-Wider matrix tiles and matrix epilogues were measured and discarded: faster
-isolated GEMMs or fewer dispatches did not improve the actual training step.
-
-See [the recorded output](training-benchmarks.json). Reproduce from `fusor/`:
+Run from `fusor/`:
 
 ```sh
-cargo run --release -p fusor --example train_mlp -- baseline
+cargo test --release -p fusor --features compiler-tests --test program
+cargo test --release -p fusor --example train_small
+cargo run --release -p fusor-conformance
 cargo run --release -p fusor --example train_mlp -- fused
 cargo run --release -p fusor --example train_small -- compare 32
-cargo run --release -p fusor --example train_small -- baseline 32
-cargo run --release -p fusor --example train_small -- fused 32
-cargo run --release -p fusor --example train_small -- single 32
-cargo run --release -p fusor --example train_small -- portable 32
 ```
 
-## Validation and rollout
+The training examples support `baseline` and `fused` execution. `train_small`
+also supports `single`, `subgroups`, and `portable`. Queued step measurements
+include input updates and a readback per window; they exclude initialization,
+evaluation, generation, and UI rendering. Recorded protocols and measurements
+are in [training-benchmarks.json](training-benchmarks.json) and
+[browser-performance.json](browser-performance.json).
 
-The GPU regressions cover changing inputs, independent host SGD and matrix
-oracles, tail tiles, required global-reduction boundaries, simultaneous swaps,
-strided outputs, long gradient contractions, uniform updates, bounded replay,
-independent observation snapshots, packed independent jobs, dense repeated
-indices, signed integer scatters, and chained-view gather bounds. The full
-transformer test compares every parameter and Adam moment against Session after 24 steps, checks evaluation and
-generation, and trains the compiled model through 400 steps.
-
-The MLP benchmark also exposed and now covers an existing grouped-launch bug:
-subgroup reductions did not honor the enclosing group's lane count. Maps and
-folds now honor the common block size, and group ranges are assigned from the
-resulting grids. The existing reduction suite passes all 52 CPU/GPU cases with
-no skips.
-
-```sh
-cargo test --release -p fusor --test program
-cargo test --release -p fusor --lib changing_expression_and_integer_leaf_uniforms
-cargo test --release -p fusor-gpu --lib
-cargo test --release -p fusor --example train_small compiled_training_matches_reference
-cargo run --release -p fusor-conformance -- reductions
-cargo check --target wasm32-unknown-unknown --manifest-path webgpu-runner/Cargo.toml
-```
-
-The release browser app has also run in local Chrome on Metal: 320 steps,
-6.7 ms per training step, held-out loss 1.933, accuracy 41%, and 99 training
-dispatches per step. This UI metric excludes scoring and generation overhead;
-it is a smoke measurement, not the same benchmark as the native timings above.
-Browser WGSL requires nonfinite reduction identities to be constructed at runtime.
-Held-out scoring and generation now use compiled observation programs without
-feedback, avoiding the older browser Session path that returned zero scores.
-Other browsers and GPU vendors still need device testing.
-
-Serve the release app from `webgpu-runner/` with a Dioxus 0.7 CLI:
+Serve the release app from `webgpu-runner/` using Dioxus CLI 0.7:
 
 ```sh
 dx serve --platform web --release --port 8900
 ```
 
-Open `http://localhost:8900/#/train`.
+Open `http://localhost:8900/#/train`. See the [runner README](../webgpu-runner/README.md)
+for configuration, corpus caching, and UI tests.
 
-### Browser acceleration
-
-Device creation requests subgroups whenever advertised. The browser capability
-bridge also reads the actual subgroup widths and f32 8×8 matrix configurations;
-fixed programs emit Dawn's matrix dialect directly. Subgroup reductions remain
-available without matrices and use the runtime subgroup size. Stable indexed
-reductions and matrix tiling currently specialize for fixed 32-wide subgroups.
-No f16 conversion is introduced.
-
-`TrainingProgram::acceleration()` reports the selected instructions. An
-advertised experimental matrix extension that fails pipeline validation retries
-with portable matrix kernels; `acceleration_fallback()` retains the reason.
-Missing features, missing configurations, and unknown subgroup widths fall back
-before shader creation. Ordinary Session kernels use the same advertised matrix instructions through
-the shared Naga WGSL writer. Device initialization probes supported matrix kinds
-before admitting them to either executor. The small dependency patch and its pinned fork revision are documented in
-`browser-dependencies.md`.
-
-The opt-in browser checks exercise the actual model without the UI's scoring and
-sampling overhead:
+Browser compiler tests require a separate build with `--features training-checks`.
+With Playwright available on `NODE_PATH` and a WebGPU-capable browser in `CHROME`:
 
 ```sh
-# Use Dioxus CLI 0.7.x for this application.
-cd fusor/webgpu-runner
-dx serve --release --features training-checks --port 8900 --open false --watch false
-# In another shell, with Playwright installed / available through NODE_PATH:
-CHROME="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" node tests/training.cjs
-```
-
-These exports are omitted unless `training-checks` is enabled. The test launches
-its own browser and verifies actual feature requests and emitted shader paths.
-It covers portable, subgroup-only, accelerated, no-matrix, no-subgroups,
-no-configuration, ranged-width and rejected-matrix cases. Each mode checks
-non-square and tail matrices, long-K splitting, retained matrix outputs, row
-reductions and ordinary Session subgroup emission against host arithmetic, then
-compares training and held-out losses. A shader rejection is injected only in
-the isolated test browser.
-
-On the M2 Max / Chrome 152 release benchmark, median warmed training falls from
-5.47 ms/step for portable shaders to 4.92 ms with subgroup collectives and
-4.28 ms with f32 matrix instructions as well. Native remains 1.88 ms/step.
-These are five windows of 32 steps after 17 warmup steps; initialization,
-held-out scoring, text generation and rendering are excluded. Full measurements
-and feature audits are in `training-benchmarks.json`.
-
-
-### Browser performance follow-up
-
-Matrix coordinates now stay symbolic through all views, allowing the compiler to
-remove divisions and remainders that earlier WGSL emission hid from the index
-simplifier. The same model, f32 precision, optimizer and 99 dispatches are retained.
-In alternating M2 Max / Chrome 152 release runs, median training step time falls
-from about **3.00 to 2.37 ms**. The native comparison falls from about **1.83 to
-1.63 ms**. These are warm step timings, excluding initialization, held-out scoring,
-generation and rendering. The 1 ms browser target has not been reached.
-
-GPU timestamps measured **2.33 ms** inside the optimized training pass, against
-about 2.36 ms wall time. Earlier timestamps were 4.26 ms before both indexing
-changes. Most of the remaining training time is still GPU execution. The release UI now
-updates elapsed training time and its step count together, fixing an inflated
-per-step average between the separate half-second throughput updates.
-
-Fused normalization now assigns rows through actual subgroup IDs and lane IDs.
-A runtime occupancy check selects a subgroup collective only when all subgroup
-slots are populated; otherwise the existing workgroup tree runs. The collective
-is evaluated before the leader-only output store, including private intermediate
-tiles. This avoids assuming a relationship between local invocation indices and
-subgroup membership that [WGSL does not guarantee](https://www.w3.org/TR/WGSL/#subgroups).
-Multi-slot carriers retain their existing merge tree.
-
-Layer normalization's GPU pass improves from **0.231 to 0.215 ms**. A full browser
-sweep measured its wall time at 0.489 → 0.453 ms and causal attention at 0.122 →
-0.110 ms. Isolated normalization wall timings were noisy and did not show a
-consistent gain; host overhead remains a limitation for these general cases.
-Dense matrix and convolution timings stay approximately unchanged at 0.10 and
-0.47 ms respectively. All windows and these limitations are retained in the
-`symbolic_address_follow_up` record in [browser-performance.json](browser-performance.json).
-
-The checks include an aligned ordinary Session matrix before changing shapes
-promote its family to a generic symbolic plan, then non-square/tail matrices and
-long-K reductions. Browser normalization and dense-matrix conformance can also
-be run with `node tests/general.cjs` using the same opt-in build and environment
-as `tests/training.cjs`. Arbitrary conformance filters can be supplied as arguments.
-The `matmul::q_mat_mul_rank1` browser failure (expected -0.625, got 0 at
-sampled shape [8,1]) came from binding the same writable arena more than once
-for different dtypes. WebGPU rejected the dispatch for overlapping writable
-bindings. Each dispatch now binds the arena once. Mixed scalar views load and
-store through u32 words; packed f16 stores preserve the neighboring half with
-compare-exchange. Homogeneous bindings keep their native element type. Fixed
-f32/f16 gradient regressions and the original rank-1 case pass in the browser.
-
-Larger K tiles, per-job pipeline specialization, a static arena extent, an
-additional subgroup-index clamp, composite-expression caching, and a speed-first
-WASM release profile were measured and discarded. The profile change more than
-doubled the WASM download (11.8 to 27.8 MB) without a useful steady-state gain.
-
-The latest checks pass 82 browser conformance cases and all eight training modes,
-15 native program/slab GPU tests, and three model tests including full parameter
-and Adam-state parity and 400-step training. The normalization oracle includes
-the benchmark's 128 × 512 shape. Its 18 cases also pass under two test-only shader
-mutations: local lane numbers permuted across subgroups, and the occupancy guard
-forced onto its tree fallback. Reproduce those additional checks with:
-
-```sh
+node tests/training.cjs
+node tests/general.cjs matmul normalization attention_rope
 FUSOR_ROW_MODE=permuted-lanes node tests/general.cjs normalization
 FUSOR_ROW_MODE=partial-subgroups node tests/general.cjs normalization
-cargo test --release --manifest-path ../Cargo.toml -p fusor --test slab
 ```
 
-Direct storage matrix loads were also measured and discarded; they did not
-improve training. No shader rewriting is used in the production compiler.
+The training harness checks portable, subgroup-only, and matrix execution,
+including absent capabilities and shader rejection. The normalization harness
+can permute local lanes across subgroups or force the occupancy fallback.
+Diagnostic exports are absent from production builds.

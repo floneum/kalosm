@@ -28,7 +28,7 @@ impl Corpus {
         Ok(Self::from_text(&text, split))
     }
 
-    /// Preserve the original benchmark's exact bytes, vocabulary and sampling.
+    /// Load the fixed corpus used by compiler benchmarks.
     #[allow(dead_code)]
     pub async fn benchmark() -> Result<Self, String> {
         let text = fetch("tinystories-benchmark.txt", 319_868, BENCHMARK_HASH).await?;

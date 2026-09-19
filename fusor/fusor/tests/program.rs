@@ -3,8 +3,10 @@ use fusor::{Device, Tensor, program::TrainingProgram};
 
 fn floats(bytes: Vec<u8>) -> Vec<f32> {
     bytes
-        .chunks_exact(4)
-        .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|x| f32::from_le_bytes(*x))
         .collect()
 }
 
@@ -323,8 +325,10 @@ fn fused_training_updates_state_and_uses_changing_inputs() {
         );
         let bytes = pollster::block_on(program.read(weight.as_dyn())).unwrap();
         let got: Vec<_> = bytes
-            .chunks_exact(4)
-            .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|x| f32::from_le_bytes(*x))
             .collect();
         for (a, b) in got.iter().zip(w) {
             assert!((a - b).abs() < 1e-5, "{a} vs {b}");
@@ -444,9 +448,9 @@ fn collective_reductions_cover_strides_tails_and_integer_bits() {
                 }
             }
             let got = pollster::block_on(p.read(integer_sum.as_dyn())).unwrap();
-            for (row, word) in got.chunks_exact(4).enumerate() {
+            for (row, word) in got.as_chunks::<4>().0.iter().enumerate() {
                 assert_eq!(
-                    i32::from_le_bytes(word.try_into().unwrap()),
+                    i32::from_le_bytes(*word),
                     ints[row * 257..(row + 1) * 257].iter().sum::<i32>()
                 );
             }
@@ -555,9 +559,9 @@ fn indexed_reductions_preserve_signed_integer_bits() {
         .unwrap();
         p.run().unwrap();
         let bytes = pollster::block_on(p.read(&result)).unwrap();
-        for (i, word) in bytes.chunks_exact(4).enumerate() {
+        for (i, word) in bytes.as_chunks::<4>().0.iter().enumerate() {
             assert_eq!(
-                i32::from_le_bytes(word.try_into().unwrap()),
+                i32::from_le_bytes(*word),
                 if i / 33 == 64 { -7 - 3 * 171 } else { -7 }
             );
         }

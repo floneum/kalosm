@@ -1,16 +1,14 @@
-//! Small grids as `data:` images.
-//!
-//! An attention map is `CONTEXT x CONTEXT` cells and there are
-//! `BLOCKS * HEADS` of them, so drawing one `<div>` per cell is fifty
-//! thousand elements the browser lays out every time the panel opens. One
-//! `<img>` each costs twelve.
-//!
-//! BMP rather than PNG because it needs no compressor: a header, then rows of
-//! BGR bottom-up padded to four bytes. The image is scaled up by CSS with
-//! `image-rendering: pixelated`, so a 64-pixel bitmap draws as crisp cells.
+//! Encode attention and embedding grids as BMP data URIs.
+//! Rows are bottom-up BGR pixels padded to four bytes.
 
 /// A `width x height` grid of `(r, g, b)` as a `data:image/bmp;base64` URI.
 pub fn data_uri(pixels: &[[u8; 3]], width: usize, height: usize) -> String {
+    let mut uri = String::from("data:image/bmp;base64,");
+    base64_into(&encode_bmp(pixels, width, height), &mut uri);
+    uri
+}
+
+fn encode_bmp(pixels: &[[u8; 3]], width: usize, height: usize) -> Vec<u8> {
     debug_assert_eq!(pixels.len(), width * height);
     let stride = (width * 3).next_multiple_of(4);
     let pixel_bytes = stride * height;
@@ -38,12 +36,10 @@ pub fn data_uri(pixels: &[[u8; 3]], width: usize, height: usize) -> String {
         for [r, g, b] in row {
             bmp.extend_from_slice(&[*b, *g, *r]);
         }
-        bmp.resize(bmp.len().next_multiple_of(4), 0);
+        bmp.resize(54 + (height - y) * stride, 0);
     }
 
-    let mut uri = String::from("data:image/bmp;base64,");
-    base64_into(&bmp, &mut uri);
-    uri
+    bmp
 }
 
 const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
@@ -75,6 +71,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn bmp_rows_are_bottom_up_bgr_with_row_padding() {
+        let pixels = [
+            [255, 0, 0],
+            [0, 255, 0],
+            [0, 0, 255],
+            [1, 2, 3],
+            [4, 5, 6],
+            [7, 8, 9],
+        ];
+        let bmp = encode_bmp(&pixels, 3, 2);
+        assert_eq!(
+            &bmp[54..],
+            &[
+                3, 2, 1, 6, 5, 4, 9, 8, 7, 0, 0, 0, 0, 0, 255, 0, 255, 0, 255, 0, 0, 0, 0, 0,
+            ]
+        );
+        assert_eq!(
+            u32::from_le_bytes(bmp[2..6].try_into().unwrap()) as usize,
+            bmp.len()
+        );
+    }
+
+    #[test]
     fn base64_matches_the_rfc_test_vectors() {
         let mut out = String::new();
         base64_into(b"", &mut out);
@@ -91,17 +110,5 @@ mod tests {
             base64_into(input, &mut out);
             assert_eq!(out, expected, "base64 of {input:?}");
         }
-    }
-
-    /// The header a decoder reads: the magic, the declared file size, and the
-    /// pixel offset, over a grid whose rows need padding.
-    #[test]
-    fn a_bmp_declares_the_bytes_it_carries() {
-        let pixels = vec![[1u8, 2, 3]; 3 * 2];
-        let uri = data_uri(&pixels, 3, 2);
-        assert!(uri.starts_with("data:image/bmp;base64,"));
-        // 3 pixels is 9 bytes, padded to 12; two rows is 24; plus 54 header.
-        let payload = &uri["data:image/bmp;base64,".len()..];
-        assert_eq!(payload.len(), (54 + 24usize).div_ceil(3) * 4);
     }
 }

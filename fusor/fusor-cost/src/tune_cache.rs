@@ -397,7 +397,7 @@ mod tests {
     }
 
     #[test]
-    fn timing_cache_round_trip_and_old_verdicts_are_discarded() {
+    fn persisted_timings_require_a_matching_format() {
         let path =
             std::env::temp_dir().join(format!("fusor-timing-test-{}.json", std::process::id()));
         let cache = TuneCache {
@@ -412,7 +412,10 @@ mod tests {
         assert_eq!(restored.window_min("launch", "a"), Some(40));
         assert_eq!(restored.observations("launch", "a"), 2);
         assert_eq!(restored.combo("plan"), Some(vec![Some("a".into())]));
-        std::fs::write(&path, r#"{"format":6,"records":[{"launch":"launch","variant":"a","window":null}],"combos":[{"plan":"plan","picks":["a"],"score":0}]}"#).unwrap();
+        let mut disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        disk["format"] = (FORMAT + 1).into();
+        std::fs::write(&path, serde_json::to_string(&disk).unwrap()).unwrap();
         let obsolete = at_path(&path);
         assert!(obsolete.is_empty());
         assert_eq!(obsolete.combo("plan"), None);

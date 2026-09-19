@@ -42,13 +42,23 @@ const { chromium } = require('playwright');
     assert.match(await page.getByRole('alert').innerText(), /divisible/);
     assert(await button('Start training').isDisabled());
     await field('Attention heads').fill('0');
-    assert.match(await page.getByRole('alert').innerText(), /between/);
+    assert.match(await page.getByRole('alert').innerText(), /positive whole number/);
     await field('Attention heads').fill('4');
     await field('Batch size').fill('128');
     await field('Context tokens').fill('512');
-    assert.match(await page.getByRole('alert').innerText(), /memory/);
+    assert.equal(await page.getByRole('alert').count(), 0);
+    // Accept a large configuration without allocating its model.
+    for (const [name, value] of [
+      ['Batch size', 1], ['Blocks', 24], ['Model width', 768], ['Attention heads', 32],
+      ['Feed-forward width', 4096], ['Context tokens', 1024], ['Context tokens', 8],
+      ['Batch size', 256], ['Training tokens', 2000000000],
+    ]) {
+      await field(name).fill(String(value));
+      assert.equal(await field(name).getAttribute('max'), null);
+      assert.equal(await page.getByRole('alert').count(), 0);
+    }
     for (const [name, value] of Object.entries({
-      'Blocks': 2, 'Model width': 42, 'Attention heads': 3,
+      'Blocks': 9, 'Model width': 42, 'Attention heads': 3,
       'Feed-forward width': 75, 'Context tokens': 19, 'Batch size': 3, 'Training tokens': 500,
     })) await field(name).fill(String(value));
     await button('Apply configuration').click();
@@ -61,8 +71,8 @@ const { chromium } = require('playwright');
     assert(Number.isFinite(Number(await metric('train loss'))));
     await button('Read the model').click();
     await idle();
-    assert.equal(await page.locator('.lm-map').count(), 6);
-    assert.deepEqual(await page.locator('.lm-map').evaluateAll(imgs => imgs.map(i => i.naturalWidth)), [19, 19, 19, 19, 19, 19]);
+    assert.equal(await page.locator('.lm-map').count(), 27);
+    assert.deepEqual(await page.locator('.lm-map').evaluateAll(imgs => imgs.map(i => i.naturalWidth)), Array(27).fill(19));
     await button('Write 400 characters').click();
     await idle();
     assert.equal((await page.locator('.lm-sample > span').last().innerText()).length, 400);

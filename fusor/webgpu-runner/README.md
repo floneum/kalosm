@@ -13,7 +13,7 @@ Optional early stopping uses held-out loss; it is off by default. Token counts
 include repeated sampling of training windows, not unique corpus coverage.
 
 The [TinyStories slice](assets/TinyStories.md) contains 7,999,444 character
-tokens across 9,804 complete stories, about 25 times the previous corpus. A split
+tokens across 9,804 complete stories. A split
 between stories near 90% reserves the tail for evaluation. The first visit downloads it
 separately from an immutable snapshot; SHA-256-verified bytes are cached locally.
 It is neither tracked in the current source tree nor embedded in Wasm. A cached
@@ -22,16 +22,13 @@ retry control. Native examples use curl and a filesystem cache (override the
 system temporary directory with `FUSOR_CORPUS_CACHE`).
 
 `ModelConfig` is shared by training, generation, parameter counts and attention
-inspection. Validation runs before device creation: widths must divide evenly
-among heads, dimensions must be in range, and the combination must fit a
-conservative 256 MiB working-memory estimate. This admission limit does not
-guarantee allocation on every adapter; actual GPU allocation/compilation errors
-are reported by the page.
+inspection. Dimensions must be positive, width must divide evenly among heads,
+and tensor sizes must be representable on the host. The backend enforces the
+device's buffer limits; allocation and compilation errors are reported by the page.
 
-The Tiny preset retains the old architecture. Compiler benchmarks also use the
-original 65-character vocabulary and corpus via `Corpus::benchmark().await`, so their
-240,480-parameter workload, loss oracles and timing comparisons stay unchanged.
-The browser Tiny preset uses the expanded corpus and its 74-character vocabulary.
+The Tiny preset uses a 64-token context. Compiler benchmarks use the fixed
+65-character corpus from `Corpus::benchmark().await`, yielding 240,480 parameters.
+The browser uses the 74-character training corpus.
 
 ## Validation
 
@@ -42,7 +39,7 @@ cargo test --offline --release -p fusor --example train_small -- --test-threads=
 ```
 
 The model checks compare all parameters and Adam moments with the reference
-executor for the original shape, the new default, and an irregular custom shape.
+executor for the benchmark preset, the default, and an irregular custom shape.
 They also check held-out evaluation, generation, embedding similarity and causal
 attention maps.
 
@@ -65,7 +62,7 @@ capability checks in `tests/training.cjs` require `--features training-checks`.
 Measured on an Apple M2 Max in Chrome 152, the default full UI run completed in
 72.1 seconds including model compilation, periodic evaluation and sampling, plus
 one pause/resume. Training averaged 5.6 ms per step, ending at 0.912 held-out loss
-and 72% next-character accuracy. This is a different workload from the original
+and 72% next-character accuracy. This is a different workload from the
 tiny compiler benchmark: twice the tokens per step, twice the context and a
 larger vocabulary. These are single-device measurements, not portable targets.
 

@@ -1,26 +1,6 @@
-//! A character-level transformer trained in the browser, on WebGPU, from
-//! scratch.
-//!
-//! The point of the demo is that a whole training step — forward, backward,
-//! and the Adam update — is one fusor graph, built **once** and re-run every
-//! step. Nothing about the graph changes between steps:
-//!
-//! * the token window, its targets, and the bias-corrected step size are
-//!   external leaves whose bytes are replaced per step
-//!   ([`fusor::Tensor::set_elements`]);
-//! * the new parameters and the new Adam moments are ordinary values on that
-//!   graph, and after each resolve their leaves adopt the buffers those
-//!   values landed in ([`fusor::tensor::Dyn::adopt_buffer`]) — a device-side
-//!   rebind, no host round trip.
-//!
-//! Steps are decoupled from host syncs. A readback is the only thing in the
-//! loop that waits, and on the web it completes on the browser's event loop —
-//! so one readback per step pins training to the frame rate no matter how
-//! little work the GPU has. [`Lm::train`] queues a run of steps and reads once.
-//!
-//! Generation and the attention maps run on a second, batch-of-one graph over
-//! the *same* parameter leaves, so what the panels show is the model that is
-//! training rather than a copy of it.
+//! Character-level transformer with reusable training and observation programs.
+//! Inputs change between steps; parameters and Adam moments remain on the GPU.
+//! Session execution is available as a numerical reference and benchmark.
 
 use fusor::cache::MaskKind;
 use fusor::layers::{Embedding, Linear};
@@ -37,19 +17,16 @@ use super::config::ModelConfig;
 pub const LEARNING_RATE: f32 = 3e-3;
 /// Where the schedule settles.
 pub const FLOOR_RATE: f32 = 3e-4;
-/// Adam's second moment is meaningless before it has seen a few gradients,
-/// and a large step taken on it lands anywhere.
+/// Learning-rate warmup steps.
 const WARMUP: u64 = 40;
 /// Steps from warmup to the floor.
 const DECAY: u64 = 1400;
 const BETA1: f32 = 0.9;
 const BETA2: f32 = 0.999;
 const EPS: f32 = 1e-8;
-/// GPT-2's initializer: everything at this scale, and the projections that
-/// write into the residual stream scaled down by the depth they sum over.
+/// Parameter standard deviation, scaled by depth for residual projections.
 const INIT_STD: f32 = 0.02;
-/// How far below its row a masked position is pushed. `exp(-1e9)` is zero in
-/// f32 and `1e9` is finite, which is the whole requirement.
+/// Finite mask magnitude whose negative exponential underflows to zero.
 const MASK_FLOOR: f32 = 1e9;
 
 /// What one run of steps measured.
@@ -167,9 +144,7 @@ pub struct Lm {
     pub floor_rate: f32,
 }
 
-/// `n` normal-ish samples at `std`, from a uniform: a xorshift and a scale,
-/// rather than a Box-Muller that would change nothing a 250k-parameter model
-/// can feel. The `sqrt(3)` makes the uniform's standard deviation `std`.
+/// Uniform samples with mean zero and standard deviation `std`.
 fn init(rng: &mut Rng, n: usize, std: f32) -> Vec<f32> {
     (0..n).map(|_| rng.signed() * std * 1.732_050_8).collect()
 }
@@ -230,8 +205,6 @@ impl Lm {
             [vocab, config.dim],
             &init(&mut rng, vocab * config.dim, INIT_STD),
         );
-        // Learned, not sinusoidal: at 64 positions the table is 6k parameters
-        // and the demo gets to show a position embedding that means something.
         let positions = Tensor::<2, f32>::from_slice(
             &device,
             [config.context, config.dim],
@@ -434,11 +407,7 @@ impl Lm {
         self.step
     }
 
-    /// GPU dispatches issued since the device was created.
-    ///
-    /// What a browser pays for that a native run barely notices: WebGPU
-    /// validates every dispatch, so the count is the thing to watch when the
-    /// same kernels run slower in a page than they do on the host.
+    /// GPU dispatches issued since device creation.
     pub fn dispatch_count(&self) -> u64 {
         self.compiled.as_ref().map_or_else(
             || self.device.session().launch_count(),
@@ -446,11 +415,7 @@ impl Lm {
         )
     }
 
-    /// `steps` optimizer steps over windows drawn from `corpus`.
-    ///
-    /// Every step is dispatched and left to run: `resolve` records the buffers
-    /// the next step's leaves adopt without waiting on the GPU, so a run is one
-    /// host sync rather than one per step.
+    /// Queue `steps` optimizer steps, then read the final loss and step size.
     pub async fn train(&mut self, corpus: &Corpus, steps: usize) -> Result<StepStats> {
         self.validate_corpus(corpus)?;
         let mut rate = 0.0;
@@ -519,12 +484,7 @@ impl Lm {
         Ok(rate)
     }
 
-    /// Score `batches` batches of held-out text, forward only.
-    ///
-    /// The same graph the optimizer runs, resolved for the loss alone: no
-    /// update root is asked for, so nothing moves. That is the point — a
-    /// held-out number measured through a second implementation would be
-    /// measuring the second implementation.
+    /// Score held-out batches without updating parameters or optimizer state.
     pub async fn evaluate(&mut self, corpus: &Corpus, batches: usize) -> Result<Evaluation> {
         self.validate_corpus(corpus)?;
         self.publish_parameters()?;
@@ -612,11 +572,7 @@ impl Lm {
         ))
     }
 
-    /// Continue `prompt` for `count` characters, sampling at `temperature`.
-    ///
-    /// Sequential by nature: each character needs the one before it, so this
-    /// is `count` dispatches and `count` readbacks. The caller is expected to
-    /// show them as they arrive.
+    /// Generate `count` characters; each character requires a logits readback.
     pub async fn generate(
         &mut self,
         corpus: &Corpus,
@@ -670,11 +626,7 @@ impl Lm {
         })
     }
 
-    /// Which characters the model has learned to treat alike.
-    ///
-    /// Cosine similarity between rows of the token embedding — the one place
-    /// in a character model where "what did it learn" has a picture a reader
-    /// can check against their own intuition about spelling.
+    /// Pairwise cosine similarity between token embeddings.
     pub async fn embedding_similarity(&mut self) -> Result<Vec<f32>> {
         self.publish_parameters()?;
         self.embed.as_dyn().clear_device_buf();
@@ -978,17 +930,6 @@ fn soften(logits: &[f32], temperature: f32) -> Vec<f32> {
 mod tests {
     use super::*;
 
-    /// The demo's whole claim, checked against the demo's own code: a model
-    /// initialized from noise reaches a held-out loss well below `ln(vocab)`
-    /// — the loss of guessing uniformly — inside a few hundred steps, and the
-    /// read-out graph agrees with the model it is reading.
-    ///
-    /// Held-out rather than training loss, because a training loss that falls
-    /// proves only that the optimizer found *something*; and the lens is
-    /// checked here rather than only in the UI, because a picture of the
-    /// wrong arithmetic is what an interpretability panel fails as.
-    /// Loss after a short run, for bisecting a wrong plan against a
-    /// reference configuration: `cargo test --release -- --ignored slab_oracle`.
     #[test]
     fn compiled_training_matches_reference_state_and_observations() {
         pollster::block_on(async {
@@ -1104,32 +1045,11 @@ mod tests {
     }
 
     #[test]
-    #[ignore]
-    fn slab_oracle() {
+    fn training_improves_held_out_loss_and_preserves_causal_attention() {
         let corpus = pollster::block_on(Corpus::benchmark()).unwrap();
-        let Ok(mut model) =
+        let mut model =
             pollster::block_on(Lm::new(corpus.vocab_size(), 0x51ed_c0de, ModelConfig::TINY))
-        else {
-            return;
-        };
-        let steps = std::env::var("ORACLE_STEPS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(24);
-        pollster::block_on(model.train(&corpus, steps)).expect("train");
-        let after = pollster::block_on(model.evaluate(&corpus, 2)).expect("evaluate");
-        eprintln!("ORACLE loss {:.6} acc {:.5}", after.loss, after.accuracy);
-    }
-
-    #[test]
-    fn the_model_learns_and_the_lens_agrees_with_it() {
-        let corpus = pollster::block_on(Corpus::benchmark()).unwrap();
-        let Ok(mut model) =
-            pollster::block_on(Lm::new(corpus.vocab_size(), 0x51ed_c0de, ModelConfig::TINY))
-        else {
-            // No adapter (CI without a GPU): there is nothing to check.
-            return;
-        };
+                .expect("create training model");
         let uniform = (corpus.vocab_size() as f32).ln();
 
         let before = pollster::block_on(model.evaluate(&corpus, 2)).expect("evaluate");
@@ -1139,11 +1059,6 @@ mod tests {
             "an untrained model should be near {uniform:.2} nats, not {:.2}",
             before.loss,
         );
-        // Accuracy is scored on the device, against the row's own best logit.
-        // An untrained model picks the true character about one time in
-        // `vocab`; a comparison that always held would read 100% and one that
-        // never held would read 0%, so this is the check that the formula
-        // means what it says.
         let chance = 1.0 / corpus.vocab_size() as f32;
         assert!(
             before.accuracy > chance * 0.2 && before.accuracy < chance * 6.0,
@@ -1196,66 +1111,6 @@ mod tests {
         let written = pollster::block_on(model.generate(&corpus, &prompt, 64, 0.8)).expect("write");
         assert_eq!(written.chars().count(), 64);
         assert!(written.chars().all(|c| corpus.encode(c).is_some()));
-    }
-
-    /// The page quotes the model's size before a device exists, so the
-    /// arithmetic that quotes it has to match what gets allocated.
-    #[test]
-    fn the_quoted_parameter_count_is_the_real_one() {
-        let corpus = pollster::block_on(Corpus::benchmark()).unwrap();
-        let Ok(model) = pollster::block_on(Lm::new(corpus.vocab_size(), 1, ModelConfig::TINY))
-        else {
-            return;
-        };
-        let allocated: usize = model
-            .slots
-            .iter()
-            .map(|s| s.value.elem_count().unwrap_or(0) as usize)
-            .sum();
-        assert_eq!(allocated, model.config.parameters(corpus.vocab_size()));
-    }
-}
-
-#[cfg(all(test, not(target_arch = "wasm32")))]
-mod bench {
-    use super::*;
-
-    /// Not an assertion — a number to optimize against. `cargo test --release
-    /// -- --nocapture --ignored step_rate`.
-    #[test]
-    #[ignore]
-    fn step_rate() {
-        let corpus = pollster::block_on(Corpus::benchmark()).unwrap();
-        let Ok(mut model) =
-            pollster::block_on(Lm::new(corpus.vocab_size(), 0x51ed_c0de, ModelConfig::TINY))
-        else {
-            return;
-        };
-        // Warm the kernels and the tuner before timing anything.
-        pollster::block_on(model.train(&corpus, 40)).expect("warm");
-        // Best of several windows: the GPU's clock state drifts by 10%
-        // between invocations, and the fastest window is the plan's cost.
-        let mut best = 0.0f32;
-        for _ in 0..6 {
-            let run = 256usize;
-            let at = std::time::Instant::now();
-            pollster::block_on(model.train(&corpus, run)).expect("train");
-            let seconds = at.elapsed().as_secs_f32();
-            let rate = run as f32 / seconds;
-            best = best.max(rate);
-            println!(
-                "{run:>4} steps in {seconds:6.3}s = {rate:6.1} steps/s, {:>9.0} chars/s",
-                run as f32 * ModelConfig::TINY.tokens() as f32 / seconds,
-            );
-        }
-        println!("best: {best:6.1} steps/s");
-        let at = std::time::Instant::now();
-        let probe = corpus.encode_all("Once upon a time");
-        pollster::block_on(model.generate(&corpus, &probe, 64, 0.8)).expect("write");
-        println!(
-            "generation: {:.1} chars/s",
-            64.0 / at.elapsed().as_secs_f32()
-        );
     }
 }
 

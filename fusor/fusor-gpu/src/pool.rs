@@ -19,19 +19,7 @@ use rustc_hash::FxHashMap;
 
 use crate::target::GpuConfig;
 
-/// Idle buffers a bucket retains beyond its own working set.
-///
-/// The real bound is the working set: a bucket keeps as many idle buffers as
-/// that size has ever had in use at once, because a loop that needed `n` of a
-/// size once will need `n` again next step. This is the floor under that, for
-/// a bucket whose peak is still tiny.
-///
-/// It used to be the *only* retention rule, at 4 native and 1 on wasm. A
-/// training step holds dozens of same-shaped intermediates at once, so the
-/// pool destroyed and re-created about fifty buffers every step — and a fresh
-/// buffer has a fresh address, which misses the bind-group cache too. That is
-/// cheap on Metal and expensive in a browser, where both calls are validated
-/// JS.
+/// Minimum idle buffers retained per size class, below its observed peak usage.
 pub const FREE_PER_BUCKET: usize = 4;
 
 /// Usage set for a tensor buffer.
@@ -62,11 +50,7 @@ pub struct BufferPoolCounters {
     pub cap_retries: u64,
 }
 
-/// One size class's buffers, and how many of them were ever in use at once.
-///
-/// `peak` is the working set this size has demonstrated. Retaining that many
-/// idle buffers is what makes a steady-state loop stop allocating: it asks for
-/// the same shapes every step, and they are already there.
+/// Buffers and peak concurrent usage for one size class.
 #[derive(Debug, Default)]
 struct Bucket {
     bufs: Vec<Buf>,
@@ -100,9 +84,7 @@ pub struct GpuBuffer {
 pub struct BufferPool {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    /// Free-list buckets by size and usage. A plain map: a bounded cache
-    /// evicted whole buckets once a run used more sizes than its capacity,
-    /// dropping their tracking while `live_bytes` kept counting them.
+    /// Buckets retain all live buffers so `live_bytes` accounts for every allocation.
     free: Mutex<FxHashMap<PoolKey, Bucket>>,
     counters: Mutex<BufferPoolCounters>,
     ceiling_bytes: Mutex<u64>,

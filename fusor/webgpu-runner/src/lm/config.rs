@@ -20,7 +20,7 @@ impl Default for ModelConfig {
 }
 
 impl ModelConfig {
-    /// The original shape, retained for comparable compiler benchmarks.
+    /// The 64-token benchmark preset.
     pub const TINY: Self = Self {
         blocks: 3,
         dim: 96,
@@ -38,40 +38,75 @@ impl ModelConfig {
     }
 
     pub fn parameters(self, vocab: usize) -> usize {
-        let embeddings = vocab * self.dim + self.context * self.dim;
-        let attention = self.dim + 4 * self.dim * self.dim;
-        let feed_forward = self.dim + 2 * self.dim * self.mlp;
-        embeddings + self.blocks * (attention + feed_forward) + self.dim + self.dim * vocab
+        self.checked_parameters(vocab)
+            .expect("model configuration must be checked before counting parameters")
+    }
+
+    fn checked_parameters(self, vocab: usize) -> Option<usize> {
+        let embeddings = vocab.checked_add(self.context)?.checked_mul(self.dim)?;
+        let attention = self
+            .dim
+            .checked_mul(self.dim)?
+            .checked_mul(4)?
+            .checked_add(self.dim)?;
+        let feed_forward = self
+            .dim
+            .checked_mul(self.mlp)?
+            .checked_mul(2)?
+            .checked_add(self.dim)?;
+        embeddings
+            .checked_add(
+                self.blocks
+                    .checked_mul(attention.checked_add(feed_forward)?)?,
+            )?
+            .checked_add(self.dim)?
+            .checked_add(self.dim.checked_mul(vocab)?)
     }
 
     pub fn validate(self, vocab: usize) -> Result<(), String> {
-        for (name, value, min, max) in [
-            ("Blocks", self.blocks, 1, 8),
-            ("Model width", self.dim, 8, 512),
-            ("Attention heads", self.heads, 1, 16),
-            ("Feed-forward width", self.mlp, 8, 2048),
-            ("Context", self.context, 8, 512),
-            ("Batch size", self.batch, 1, 128),
-            ("Vocabulary", vocab, 2, 128),
+        for (name, value) in [
+            ("Blocks", self.blocks),
+            ("Model width", self.dim),
+            ("Attention heads", self.heads),
+            ("Feed-forward width", self.mlp),
+            ("Context", self.context),
+            ("Batch size", self.batch),
         ] {
-            if !(min..=max).contains(&value) {
-                return Err(format!("{name} must be between {min} and {max}."));
+            if value == 0 {
+                return Err(format!("{name} must be a positive whole number."));
             }
+        }
+        // The corpus encodes ASCII characters, independently of model size.
+        if !(2..=128).contains(&vocab) {
+            return Err("The character vocabulary must contain between 2 and 128 symbols.".into());
         }
         if !self.dim.is_multiple_of(self.heads) {
             return Err("Model width must be divisible by attention heads.".into());
         }
-        // A conservative admission budget, not a promise about device memory.
-        // Account for parameters, Adam, gradients and retained activations;
-        // attention grows quadratically with context. Check dimensions first
-        // so even hostile integer inputs cannot overflow this arithmetic.
-        let working_bytes = 4
-            * (12 * self.parameters(vocab) as u64
-                + self.blocks as u64
-                    * self.tokens() as u64
-                    * (16 * self.dim + 4 * self.mlp + 6 * self.heads * self.context) as u64);
-        if working_bytes > 256 * 1024 * 1024 {
-            return Err("This combination exceeds the browser's 256 MiB working-memory budget. Reduce batch size, context or width.".into());
+        self.checked_parameters(vocab)
+            .ok_or("The parameter count exceeds this platform's address space.")?;
+        // Every tensor must fit a host allocation; the backend enforces device limits.
+        for (name, shape) in [
+            ("Embedding", &[vocab, self.dim][..]),
+            ("Position", &[self.context, self.dim][..]),
+            ("Attention projection", &[self.dim, self.dim][..]),
+            ("Feed-forward projection", &[self.dim, self.mlp][..]),
+            ("Hidden", &[self.batch, self.context, self.dim][..]),
+            ("Feed-forward", &[self.batch, self.context, self.mlp][..]),
+            (
+                "Attention",
+                &[self.batch, self.heads, self.context, self.context][..],
+            ),
+            ("Logits", &[self.batch, self.context, vocab][..]),
+        ] {
+            let bytes = shape
+                .iter()
+                .try_fold(size_of::<f32>(), |n, d| n.checked_mul(*d));
+            if bytes.is_none_or(|n| n > isize::MAX as usize) {
+                return Err(format!(
+                    "The {name} tensor exceeds this platform's address space."
+                ));
+            }
         }
         Ok(())
     }
@@ -100,9 +135,12 @@ impl TrainingConfig {
 
     pub fn validate(self, vocab: usize) -> Result<(), String> {
         self.model.validate(vocab)?;
-        if !(1..=1_000_000_000).contains(&self.token_budget) {
-            return Err("Training tokens must be between 1 and 1,000,000,000.".into());
+        if self.token_budget == 0 {
+            return Err("Training tokens must be a positive whole number.".into());
         }
+        self.steps()
+            .checked_mul(self.model.tokens() as u64)
+            .ok_or("The token budget rounded to complete batches exceeds the token counter.")?;
         Ok(())
     }
 }
@@ -112,7 +150,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn reject_invalid_and_excessive_shapes_before_allocating() {
+    fn reject_invalid_and_unrepresentable_shapes_before_allocating() {
         for bad in [
             ModelConfig {
                 heads: 0,
@@ -124,11 +162,12 @@ mod tests {
             },
             ModelConfig {
                 dim: usize::MAX,
+                heads: 1,
                 ..ModelConfig::TINY
             },
             ModelConfig {
-                context: 512,
-                batch: 128,
+                context: usize::MAX / 4,
+                batch: 8,
                 ..ModelConfig::TINY
             },
         ] {
@@ -143,11 +182,13 @@ mod tests {
             .validate(65)
             .is_err()
         );
-        let run = TrainingConfig {
-            token_budget: 2049,
-            ..Default::default()
-        };
-        assert_eq!(run.steps(), 2);
-        assert_eq!(ModelConfig::TINY.parameters(65), 240_480);
+        assert!(
+            TrainingConfig {
+                token_budget: u64::MAX,
+                ..Default::default()
+            }
+            .validate(96)
+            .is_err()
+        );
     }
 }
