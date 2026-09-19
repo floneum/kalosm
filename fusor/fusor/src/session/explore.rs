@@ -15,7 +15,7 @@
 //! changed launches are timed together and their sum is judged against the
 //! sum of the incumbent's per-launch windows at its changed launches.
 //!
-//! Every arm is a `verify_plan`-checked plan over members of the same
+//! Every arm is a plan constructed over equivalent members of the same
 //! e-classes, so selection is pure performance. A substitution is safe on an
 //! impure plan (the decode step's KV append): the arm runs once, instead of
 //! the incumbent, so the plan's one write happens exactly once either way.

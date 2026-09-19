@@ -553,8 +553,10 @@ impl Lm {
                 program.run_async().await?;
                 let bytes = program.read(self.scored.as_dyn()).await?;
                 let read: Vec<_> = bytes
-                    .chunks_exact(4)
-                    .map(|x| f32::from_le_bytes(x.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|x| f32::from_le_bytes(*x))
                     .collect();
                 loss += read[0];
                 accuracy += read[1];
@@ -1040,9 +1042,9 @@ mod tests {
                 for (index, (a, b)) in expected.iter().zip(&state).enumerate() {
                     let a = a.to_bytes_async().await.unwrap();
                     let b = b.to_bytes_async().await.unwrap();
-                    for (a, b) in a.chunks_exact(4).zip(b.chunks_exact(4)) {
-                        let a = f32::from_le_bytes(a.try_into().unwrap());
-                        let b = f32::from_le_bytes(b.try_into().unwrap());
+                    for (a, b) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0.iter()) {
+                        let a = f32::from_le_bytes(*a);
+                        let b = f32::from_le_bytes(*b);
                         assert!(
                             (a - b).abs() <= 2e-5 + 1e-3 * a.abs(),
                             "state {index}: {a} vs {b}"

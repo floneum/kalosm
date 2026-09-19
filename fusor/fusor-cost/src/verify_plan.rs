@@ -323,7 +323,7 @@ pub(crate) fn check_schedules(
                     format!(
                         "{m:?} {} legal={} domain={:?}",
                         crate::extract::op_tag(&graph.node(*m).op),
-                        realize::has_legal_point(graph, *m, caps),
+                        realize::composite_bindings_fit(graph, *m, caps),
                         realize::domain_of(graph, *m).map(|d| d.len())
                     )
                 })
@@ -425,13 +425,7 @@ pub(crate) fn check_operands(graph: &EGraph, plan: &Plan) -> Result<()> {
 pub(crate) fn check_buffers(graph: &EGraph, plan: &Plan) -> Result<()> {
     for b in &plan.buffers {
         let value_rank = graph.facts(b.value).rank();
-        // A split-K scratch buffer carries one extra leading axis, one slice
-        // per partial; every other buffer matches its value exactly.
-        let extra = match plan.extraction.theta.get(&b.value) {
-            Some(SchedPoint::Coop { splits, .. }) if *splits > 1 => 1,
-            _ => 0,
-        };
-        if b.layout.rank() != value_rank + extra {
+        if b.layout.rank() != value_rank {
             return Err(Error::Plan(format!(
                 "buffer for {} has rank {} but its value has rank {value_rank}",
                 b.value,

@@ -184,12 +184,6 @@ pub(crate) fn candidates(
             let current = extraction.theta.get(&node).copied();
             let context = context_hash(graph, realized, node);
             for theta in cache.ordered(graph, node, context, cost) {
-                // A point whose footprint is over the device cap hard-asserts
-                // in lowering. `has_legal_point` passes as soon as one point
-                // fits, so each point must be checked here as well.
-                if !realize::point_is_legal(graph, node, *theta, &cost.facts().caps) {
-                    continue;
-                }
                 if Some(*theta) != current {
                     out.push(Candidate::Schedule {
                         node,

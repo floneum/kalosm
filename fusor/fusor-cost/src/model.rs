@@ -2,13 +2,13 @@
 //!
 //! Per launch:
 //! `launch_ps + max(dram_ps, occupancy * (math_ps + wg_ps)) + occupancy *
-//! drain_ps + combine_ps`.
+//! drain_ps_ps`.
 //!
 //! T1 and T2 are **summed** inside the `max` because they contend for the
 //! same per-core issue and load/store slots; DRAM overlaps them; the combine
 //! dispatch sits behind its own barrier and adds.
 //!
-//! One scalar. Precision is a verifier property (`NumericContract`), not a
+//! One scalar. Precision is a construction invariant (`NumericContract`), not a
 //! cost term, because a time-only model eliminates f32 everywhere.
 
 use crate::terms;
@@ -24,8 +24,8 @@ use rustc_hash::{FxHashSet, FxHasher};
 use std::hash::{Hash, Hasher};
 
 /// The one cost model. `score_fs` maps onto its terms one for one:
-/// T1 -> math, T2 -> wg, T3 -> drain, T4 -> the `max`, T5 -> the combine
-/// launch.
+/// T1 -> math, T2 -> wg, T3 -> drain, T4 -> the `max`. Split-K combine
+/// work is an ordinary reduction launch in the graph.
 pub struct Roofline {
     facts: DeviceFacts,
     stats: RwLock<ShapeStats>,
@@ -38,7 +38,6 @@ struct Sched {
     unit: MacUnit,
     /// 1 loses the load/MMA overlap the threadgroup rate was fitted on.
     staging: u8,
-    splits: u32,
     /// Emitting subgroups per workgroup — the epilogue drain is per element
     /// *and* per subgroup.
     subgroups: u32,
@@ -49,7 +48,6 @@ impl Default for Sched {
         Self {
             unit: MacUnit::Fma,
             staging: 2,
-            splits: 1,
             subgroups: 1,
         }
     }
@@ -58,14 +56,9 @@ impl Default for Sched {
 impl Sched {
     fn of(theta: Option<SchedPoint>) -> Self {
         match theta {
-            Some(SchedPoint::Coop {
-                geom,
-                splits,
-                staging,
-            }) => Self {
+            Some(SchedPoint::Coop { geom, staging }) => Self {
                 unit: MacUnit::Coop,
                 staging,
-                splits,
                 subgroups: (geom.rg * geom.cg).max(1),
             },
             Some(SchedPoint::Sgemm(p)) => Self {
@@ -174,14 +167,6 @@ impl Roofline {
             num,
             den,
         );
-        // One split's padded output; `(splits + 1)` then counts reading
-        // every partial and writing the result.
-        let combine = terms::combine_ps(
-            f,
-            sched.splits,
-            launch.writes / u64::from(sched.splits.max(1)),
-        );
-
         // What one workgroup cannot finish faster than: its dependent chain.
         let serial = Picoseconds(
             launch
@@ -189,7 +174,7 @@ impl Roofline {
                 .saturating_mul(f.coop_step_ps)
                 .saturating_add(launch.lane_steps.saturating_mul(f.lane_step_ps)),
         );
-        Picoseconds(f.launch_ps) + dram.max(issue).max(serial) + drain + combine
+        Picoseconds(f.launch_ps) + dram.max(issue).max(serial) + drain
     }
 }
 

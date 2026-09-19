@@ -573,7 +573,8 @@ impl ScheduleDomain {
             Self::Map(d) => d.tilings.len(),
         }
     }
-    /// True when no legal point exists — the node is unselectable.
+    /// True when no supported point exists. Constructors must not attach an
+    /// empty domain to a graph node.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -596,11 +597,7 @@ impl ScheduleDomain {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SchedPoint {
     Point,
-    Coop {
-        geom: CoopGeom,
-        splits: u32,
-        staging: u8,
-    },
+    Coop { geom: CoopGeom, staging: u8 },
     Sgemm(SgemmParams),
     Sgemv(SgemvParams),
     Fold(FoldStrat),
@@ -675,37 +672,31 @@ impl CoopGeom {
     }
 }
 
-/// The complete legal cooperative schedule space of one contraction.
-/// `geoms` is filtered by lane limits and the exact
-/// `ArenaPlan::total_bytes`; `splits` is never-split plus every divisor of
-/// the K loop leaving two iterations per workgroup; `staging` is 1 or 2.
+/// One supported geometry and staging depth. These axes are coupled by the
+/// workgroup memory limit, so a domain contains pairs, not their cross product.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CoopSchedule {
+    pub geom: CoopGeom,
+    pub staging: u8,
+}
+
+/// The supported cooperative schedules of one contraction. Split-K is a
+/// graph rewrite with an explicit combine, never a single-kernel schedule.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct CoopDomain {
-    pub geoms: SmallVec<[CoopGeom; 16]>,
-    pub splits: SmallVec<[u32; 8]>,
-    pub staging: SmallVec<[u8; 2]>,
+    pub schedules: SmallVec<[CoopSchedule; 16]>,
 }
 
 impl CoopDomain {
     pub fn len(&self) -> usize {
-        self.geoms.len() * self.splits.len() * self.staging.len()
+        self.schedules.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.schedules.is_empty()
     }
     pub fn point(&self, index: usize) -> Option<SchedPoint> {
-        let ns = self.splits.len();
-        let nd = self.staging.len();
-        if ns == 0 || nd == 0 {
-            return None;
-        }
-        let geom = *self.geoms.get(index / (ns * nd))?;
-        let rem = index % (ns * nd);
-        Some(SchedPoint::Coop {
-            geom,
-            splits: self.splits[rem / nd],
-            staging: self.staging[rem % nd],
-        })
+        let CoopSchedule { geom, staging } = *self.schedules.get(index)?;
+        Some(SchedPoint::Coop { geom, staging })
     }
 }
 
@@ -899,6 +890,40 @@ pub struct FoldDomain {
     pub strategies: SmallVec<[FoldStrat; 8]>,
 }
 
+impl ScheduleDomain {
+    /// Construct schedules for a fold with a new carrier. Promotion changes
+    /// scratch requirements, so it cannot copy the old domain verbatim.
+    pub fn with_fold_carrier(
+        &self,
+        lanes: u64,
+        acc_bytes: u64,
+        caps: &crate::device::Caps,
+    ) -> Option<Self> {
+        let fits = |s: &FoldStrat| {
+            fold_scratch_bytes(s, lanes, acc_bytes, caps.subgroup_width(), caps)
+                <= u64::from(caps.limits.max_compute_workgroup_storage_size)
+        };
+        let strategies = match self {
+            Self::Fold(domain) => domain.strategies.iter().copied().filter(fits).collect(),
+            Self::Point => {
+                let default = FoldStrat::WgTree {
+                    lane_group: emitted_block(1, caps),
+                };
+                if fits(&default) {
+                    return Some(Self::Point);
+                }
+                // A row per lane reduces privately and needs no scratch.
+                smallvec::smallvec![FoldStrat::WgTree { lane_group: 1 }]
+            }
+            _ => return None,
+        };
+        if strategies.is_empty() {
+            return None;
+        }
+        Some(Self::Fold(FoldDomain { strategies }))
+    }
+}
+
 /// Elementwise register-reuse tiling. `vector` is the SIMD width on the CPU
 /// backend and 1 on GPU.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -983,5 +1008,32 @@ impl WindowAdjoint {
             window,
             is_mask: window.is_non_overlapping(),
         }
+    }
+}
+
+/// Scratch budget for a cooperative schedule. Operand tiles are stacked by
+/// depth, exactly as lowering declares them. Reserve the output staging tile
+/// too: storage packing may require a scalar copy of the accumulator.
+pub fn coop_tiles(
+    geom: CoopGeom,
+    elem: super::kernel::ScalarElement,
+    staging: u8,
+) -> super::kernel::Tiles {
+    use super::kernel::{ElementType, MemoryLevel, ScalarElement, TileDecl, TileLayout, Tiles};
+    let depth = u32::from(staging);
+    let bn_pass = geom.bn / geom.n_passes;
+    let tile = |name, elem, shape: &[u32]| {
+        std::sync::Arc::new(TileDecl::new(
+            ElementType::Scalar(elem),
+            TileLayout::contiguous(MemoryLevel::Workgroup, shape),
+            name,
+        ))
+    };
+    Tiles {
+        decls: smallvec::smallvec![
+            tile("coop_a", elem, &[depth * geom.bm, geom.bk]),
+            tile("coop_b", elem, &[depth * geom.bk, bn_pass]),
+            tile("coop_acc", ScalarElement::F32, &[geom.bm, bn_pass]),
+        ],
     }
 }

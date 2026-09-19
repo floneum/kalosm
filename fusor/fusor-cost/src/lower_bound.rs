@@ -542,17 +542,11 @@ fn best_math(graph: &EGraph, cost: &dyn CostModel, id: Id, budget: &mut usize) -
             let mut seen: SmallVec<[(u8, u32, u32); 12]> = SmallVec::new();
             let mut best: Option<Picoseconds> = None;
             for theta in domain.iter() {
-                // A promoted fold inherits its pre-promotion domain, most of
-                // which its carrier's footprint rules out; the floor is over
-                // the points that can lower.
-                if !crate::realize::point_is_legal(graph, id, theta, &cost.facts().caps) {
-                    continue;
-                }
                 let key = match theta {
                     // The k-step floor moves with `bk` and the split count,
                     // so those are part of the key.
-                    fusor_ir::ir::launch::SchedPoint::Coop { geom, splits, .. } => {
-                        (1u8, geom.bm * 1024 + geom.bn, geom.bk * 1024 + splits)
+                    fusor_ir::ir::launch::SchedPoint::Coop { geom, .. } => {
+                        (1u8, geom.bm * 1024 + geom.bn, geom.bk)
                     }
                     fusor_ir::ir::launch::SchedPoint::Sgemm(p) => (2u8, p.bm * 1024 + p.bn, p.bk),
                     // A fold's floor moves with its lane group.

@@ -450,7 +450,7 @@ pub fn fuzz_case(
         let sweep_run = case_seed(name, 0) % runs();
         for run in 0..runs() {
             if sweep {
-                fusor::session::set_verify_members(run == sweep_run);
+                set_member_sweep(run == sweep_run);
             }
             let seed = case_seed(name, run);
             let shape = sample_shape(&mut Rng::new(seed), spec);
@@ -469,12 +469,12 @@ pub fn fuzz_case(
                 })
                 .inspect_err(|_| {
                     if sweep {
-                        fusor::session::set_verify_members(true);
+                        set_member_sweep(true);
                     }
                 })?;
         }
         if sweep {
-            fusor::session::set_verify_members(true);
+            set_member_sweep(true);
         }
         Ok(())
     })
@@ -482,9 +482,20 @@ pub fn fuzz_case(
 
 /// Whether this process was asked to sweep class members at all, read once:
 /// the flag itself is toggled per run, so it cannot be the source of truth.
+#[cfg(feature = "compiler-tests")]
 fn sweeping_members() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
     *ON.get_or_init(fusor::session::verify_members)
+}
+
+#[cfg(not(feature = "compiler-tests"))]
+fn sweeping_members() -> bool {
+    false
+}
+
+fn set_member_sweep(_on: bool) {
+    #[cfg(feature = "compiler-tests")]
+    fusor::session::set_verify_members(_on);
 }
 
 /// Element count of a fully constant shape. Panics on a symbolic extent: a

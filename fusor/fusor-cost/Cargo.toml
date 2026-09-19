@@ -17,3 +17,7 @@ fixedbitset.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[features]
+# Instrumentation for the compiler conformance harness only.
+compiler-tests = ["fusor-ir/compiler-tests"]

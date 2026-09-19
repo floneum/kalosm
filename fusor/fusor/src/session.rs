@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use web_time::Instant;
 
-use fusor_cost::tune_cache::Verdict;
 use fusor_cost::{LocalSearch, ReplayMemo, Roofline};
 #[cfg(feature = "cpu")]
 use fusor_cpu::CpuTarget;
@@ -16,7 +15,9 @@ use fusor_gpu::GpuTarget;
 use fusor_ir::CORE_RULES;
 use fusor_ir::cost::CostModel;
 use fusor_ir::device::Caps;
-use fusor_ir::dtype::{Dtype, Persistence};
+#[cfg(feature = "compiler-tests")]
+use fusor_ir::dtype::Dtype;
+use fusor_ir::dtype::Persistence;
 use fusor_ir::egraph::{ClassId, EGraph, Id, Rule, Saturate, SaturationBudget, SaturationDelta};
 use fusor_ir::extract::{ExtractBudget, Extractor, Plan, ReplayKey};
 use fusor_ir::ir::launch::Effect;
@@ -57,43 +58,15 @@ const TUNE_RUNS: usize = 4;
 /// and on the whole plan only when one does not.
 const TUNE_MARGIN: f64 = 0.08;
 
-/// Class members the tune race has caught computing wrong values, process
-/// wide. Every entry is a live miscompile: a member of some e-class whose
-/// value disagrees with its siblings'. The conformance harness races every
-/// class member (`FUSOR_VERIFY_MEMBERS`) and fails the run when this is
-/// nonzero.
-static WRONG_MEMBERS: AtomicU64 = AtomicU64::new(0);
-
-/// Number of live member-verification failures observed by this process.
-pub fn wrong_member_count() -> u64 {
-    WRONG_MEMBERS.load(Ordering::Relaxed)
-}
-
-/// Whether the tune race sweeps every class member of every launch instead
-/// of only the candidates worth timing.
-///
-/// Starts from `FUSOR_VERIFY_MEMBERS` and is settable from there on, because
-/// the sweep is a per-kernel correctness pass and a suite that reruns a case
-/// at several shapes does not need to pay for it at every one. It is by far
-/// the most expensive thing a resolve can do: one small sampling case races
-/// about 470 candidates under it.
-static VERIFY_MEMBERS: std::sync::OnceLock<std::sync::atomic::AtomicBool> =
-    std::sync::OnceLock::new();
-
-fn verify_members_flag() -> &'static std::sync::atomic::AtomicBool {
-    VERIFY_MEMBERS.get_or_init(|| {
-        std::sync::atomic::AtomicBool::new(std::env::var_os("FUSOR_VERIFY_MEMBERS").is_some())
-    })
-}
-
-/// Whether the member sweep is currently on. See [`set_verify_members`].
-pub fn verify_members() -> bool {
-    verify_members_flag().load(Ordering::Relaxed)
-}
-
-/// Turn the member sweep on or off for the resolves that follow.
-pub fn set_verify_members(on: bool) {
-    verify_members_flag().store(on, Ordering::Relaxed);
+#[cfg(feature = "compiler-tests")]
+mod testing;
+#[cfg(feature = "compiler-tests")]
+use testing::{agrees, first_mismatch};
+#[cfg(feature = "compiler-tests")]
+pub use testing::{set_verify_members, verify_members, wrong_member_count};
+#[cfg(all(not(feature = "compiler-tests"), feature = "gpu"))]
+fn verify_members() -> bool {
+    false
 }
 
 /// Proof that the holder owns a graph's `resolve_lock`.
@@ -168,10 +141,10 @@ impl Backend {
 
     /// Release the kernels only losing race candidates used; see
     /// `GpuTarget::release_candidates`. The CPU keeps nothing per candidate.
-    pub(crate) fn release_candidates(&self, arena: u64, candidates: &[Arc<Plan>], keep: &Plan) {
+    pub(crate) fn release_candidates(&self, _arena: u64, _candidates: &[Arc<Plan>], _keep: &Plan) {
         match self {
             #[cfg(feature = "gpu")]
-            Self::Gpu(t) => t.release_candidates(arena, candidates, keep),
+            Self::Gpu(t) => t.release_candidates(_arena, _candidates, _keep),
             #[allow(unreachable_patterns)]
             _ => {}
         }
@@ -179,10 +152,10 @@ impl Backend {
 
     /// Release every kernel compiled for graph `arena`; called when the
     /// graph is dropped. See `GpuTarget::release_arena`.
-    pub(crate) fn release_arena(&self, arena: u64) {
+    pub(crate) fn release_arena(&self, _arena: u64) {
         match self {
             #[cfg(feature = "gpu")]
-            Self::Gpu(t) => t.release_arena(arena),
+            Self::Gpu(t) => t.release_arena(_arena),
             #[allow(unreachable_patterns)]
             _ => {}
         }
@@ -761,19 +734,11 @@ impl Session {
                     ExtractBudget::default(),
                 )
             })?;
-            let __t_verify = Instant::now();
-            // `verify_plan` is a pure function of `(key, plan)`, so the same
-            // verdict is not re-derived every dispatch. A plan reaching
-            // Kernel for the first time is always verified, and an entry
-            // replaced by a tuning winner is verified on its own hash.
-            if !self.inner.replay.is_verified(key, plan.hash) {
-                self.inner.extractor.verify_plan(graph_ref, &plan)?;
-                self.inner.replay.mark_verified(key, plan.hash);
-            }
-            let __verify_us = __t_verify.elapsed().as_micros();
+            #[cfg(feature = "compiler-tests")]
+            self.inner.extractor.verify_plan(graph_ref, &plan)?;
             if resolve_profile() {
                 eprintln!(
-                    "[profile] saturate{} {} us ({} -> {} nodes), extract+verify {} us (verify {__verify_us}), replay {}",
+                    "[profile] saturate{} {} us ({} -> {} nodes), extract {} us, replay {}",
                     if __skipped {
                         " (skipped)"
                     } else if __replayed {
@@ -801,7 +766,7 @@ impl Session {
 
         // Online tuning: on a replay hit, occasionally substitute one legal
         // arm for the incumbent and let this production dispatch's own GPU
-        // spans feed the tuner's windows. Every arm is a verify_plan-checked
+        // spans feed the tuner's windows. Every arm is a constructed
         // member plan.
         #[cfg(feature = "gpu")]
         let explored = if !missed && self.inner.device.is_gpu() {
@@ -1230,6 +1195,7 @@ impl Session {
         // `FUSOR_VERIFY_FAMILIES`: also plan this member concretely and
         // compare every output byte-for-byte. A twin computing something
         // its member does not is a compiler bug in symbolic lowering.
+        #[cfg(feature = "compiler-tests")]
         if verify_families() {
             let mut from_twin = Vec::with_capacity(values.len());
             for value in values {
@@ -1878,21 +1844,17 @@ impl Session {
 
     fn autotune(
         &self,
-        guard: &ResolveGuard<'_>,
+        _guard: &ResolveGuard<'_>,
         graph: &GraphRef,
         roots: &[Id],
         base: Arc<Plan>,
         values: &[Tensor],
     ) -> Result<Arc<Plan>> {
-        // Member verification: race every candidate of every launch so each
-        // gets value-checked, but adopt none — a plan that changes under
-        // measurement would make suite dispatch counts nondeterministic.
-        let verify_members = verify_members();
-        let min_macs = if verify_members {
-            0
-        } else {
-            autotune_min_macs()
-        };
+        #[cfg(feature = "compiler-tests")]
+        if verify_members() {
+            return self.check_members(_guard, graph, roots, base, values);
+        }
+        let min_macs = autotune_min_macs();
         let log = std::env::var_os("FUSOR_AUTOTUNE_LOG").is_some();
 
         // Timing a plan re-runs it, and an in-place node makes a re-run
@@ -1957,24 +1919,15 @@ impl Session {
         // times), and re-running it in every process would put that on
         // every first transcription or embedding. Production sampling keeps
         // exploring from there. The member sweep must measure everything.
-        if !verify_members
-            && let Some(picks) = self.inner.tune.combo(&plan_sig)
+        if let Some(picks) = self.inner.tune.combo(&plan_sig)
             && let Some(plan) = self.apply_combo(graph, roots, &base, &picks, min_macs, log)?
         {
             return Ok(plan);
         }
 
-        // A member sweep is a correctness pass, not a benchmark: its timings
-        // are discarded below, so one execution covers each candidate. Normal
-        // autotuning keeps the repeated samples and per-dispatch timestamps it
-        // needs for stable comparisons.
-        let repetitions = if verify_members { 1 } else { TUNE_RUNS };
         #[cfg(feature = "gpu")]
-        let _clock = (!verify_members).then(|| TuningClock::new(&self.inner.device));
-
-        let Some(reference) = self.timed_run(guard, graph, &base, values, repetitions)? else {
-            return Ok(base);
-        };
+        let _clock = TuningClock::new(&self.inner.device);
+        let reference = self.timed_run(graph, &base, values, TUNE_RUNS)?;
         // What this pass actually adopts, per launch, so the combination can
         // be recorded rather than reassembled from per-launch minima that
         // were never measured together.
@@ -2034,9 +1987,6 @@ impl Session {
                     .map(|l| fusor_cost::extract::launch_signature(&g, l))
             };
             let variants: Vec<(String, Plan)> = match &sig {
-                // The member sweep is a coverage tool: every candidate must be
-                // built and value-checked, so the cache must not narrow it.
-                Some(_) if verify_members => variants,
                 Some(sig) => {
                     // Each candidate travels with the cost model's prior for
                     // the plan it denotes: on a cold signature the cache races
@@ -2046,8 +1996,8 @@ impl Session {
                         .map(|(n, p)| (n.clone(), p.cost.0))
                         .collect();
                     // The cache orders and prunes; it never replaces the race.
-                    // Every candidate it hands back is still built, timed and
-                    // value-checked, and a recorded combination is
+                    // Every candidate it hands back is still built and timed;
+                    // a recorded combination is
                     // authoritative only once every candidate for the launch
                     // has been measured.
                     let (run, skipped) = self.inner.tune.plan_candidates(sig, &names);
@@ -2071,39 +2021,8 @@ impl Session {
             for (label, candidate) in variants {
                 let candidate = Arc::new(candidate);
                 raced.push(Arc::clone(&candidate));
-                let sample = match self.timed_run(guard, graph, &candidate, values, repetitions) {
-                    Ok(Some(sample)) => sample,
-                    // A candidate this device cannot build or read is not a
-                    // wrong answer; it is skipped. A candidate that took the
-                    // device down is a different matter: nothing after it
-                    // can run, and the name of the kernel is the whole
-                    // diagnosis.
-                    outcome => {
-                        if let Some(reason) = self.inner.device.device_lost() {
-                            let detail = match outcome {
-                                Err(e) => format!(" ({e})"),
-                                Ok(None) => String::new(),
-                                Ok(Some(_)) => unreachable!(),
-                            };
-                            return Err(Error::Device(format!(
-                                "the device was lost while racing candidate `{label}` of \
-                                 launch {ix}: {reason}{detail}"
-                            )));
-                        }
-                        continue;
-                    }
-                };
+                let sample = self.timed_run(graph, &candidate, values, TUNE_RUNS)?;
                 let sample_ns = plan_ns(&sample);
-                // A different tile is a different reduction order, so bit
-                // equality is the wrong test — but a wrong kernel is off by
-                // orders of magnitude. This runs before the cache write: a
-                // whole-plan disagreement is this variant's.
-                let ok = reference.bytes.len() == sample.bytes.len()
-                    && reference
-                        .bytes
-                        .iter()
-                        .zip(&sample.bytes)
-                        .all(|((dt, a), (_, b))| agrees(*dt, a, b));
                 // `replan` rebuilds the whole plan from a one-node edit, so a
                 // per-launch quantity may be attributed to index `ix` only
                 // when every other launch is untouched. Equal roots are not
@@ -2113,96 +2032,21 @@ impl Session {
                 // work onto its neighbour.
                 let aligned = plans_align(&candidate, &best, ix);
                 if let Some(sig) = &sig {
-                    // `sig` names one launch, so only a property of that
-                    // launch may be filed under it: its own kernel span,
-                    // hence the `aligned` filter. A wrong answer needs no
-                    // such guard — it is not a timing property.
-                    let verdict = if !ok {
-                        WRONG_MEMBERS.fetch_add(1, Ordering::Relaxed);
-                        let detail = reference
-                            .bytes
-                            .iter()
-                            .zip(&sample.bytes)
-                            .enumerate()
-                            .find_map(|(o, ((dt, a), (_, b)))| {
-                                (*dt == Dtype::F32)
-                                    .then(|| first_mismatch(a, b).map(|m| (o, m)))
-                                    .flatten()
-                            });
-                        let detail = detail.map_or_else(String::new, |(o, (i, p, q, w))| {
-                            format!(" (out {o} elem {i}: incumbent {p} vs {q}, worst |d| {w})")
-                        });
-                        // A tiny output is worth printing whole: the wrong
-                        // pattern (a column, a row tail, a stripe) names the
-                        // bug faster than any single element.
-                        if let Some(((_, a), (_, b))) =
-                            reference.bytes.first().zip(sample.bytes.first())
-                            && a.len() <= 128
-                            && a.len() % 4 == 0
-                        {
-                            let f = |s: &[u8]| {
-                                s.as_chunks::<4>()
-                                    .0
-                                    .iter()
-                                    .map(|c| f32::from_le_bytes(*c))
-                                    .map(|v| format!("{v:.3}"))
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            };
-                            eprintln!("[tune]   incumbent: {}", f(a));
-                            eprintln!("[tune]   candidate: {}", f(b));
-                        }
-                        eprintln!(
-                            "[tune] MISCOMPILE: candidate `{label}` of launch {ix} computes \
-                             different values from the incumbent plan{detail}"
-                        );
-                        // Two members of one e-class disagreeing on bytes is
-                        // a violated compiler invariant. In production the
-                        // resolve fails loudly; only the CI member sweep
-                        // (`FUSOR_VERIFY_MEMBERS`) records and continues,
-                        // so one run can enumerate every such bug.
-                        if !verify_members {
-                            return Err(Error::Plan(format!(
-                                "internal compiler error: class member `{label}` of launch \
-                                 {ix} computes different values from its siblings; every \
-                                 member of a class must compute the same value. This is a \
-                                 compiler bug — reduce and fix the kernel or rule, do not \
-                                 route around it."
-                            )));
-                        }
-                        Some(Verdict::Wrong)
-                    } else {
-                        match launch_ns(&sample, ix).filter(|_| aligned) {
-                            // Absolute nanoseconds are comparable across
-                            // processes because `launch_signature` pins family,
-                            // dtype and shape, and the file is keyed by device.
-                            Some(ns) => Some(Verdict::Ran(ns)),
-                            // No device timer at all: keep the ppm-of-base
-                            // ratio, the best a host clock supports. A GPU that
-                            // *can* time kernels but did not time this plan
-                            // records nothing, rather than mixing two units in
-                            // one device's file.
-                            None if self.inner.device.is_cpu() => {
-                                Some(Verdict::Ran(ratio_ppm(sample_ns, base_ns)))
-                            }
-                            None => None,
-                        }
-                    };
-                    // The member sweep's spans are measured under contention
-                    // at sizes production never tunes. A `Wrong` verdict is a
-                    // property of the kernel and is kept; a `Ran` time is a
-                    // property of the sweep and is dropped.
-                    let keep = !verify_members || matches!(verdict, Some(Verdict::Wrong));
-                    if let Some(verdict) = verdict.filter(|_| keep) {
-                        self.inner.tune.record(sig, &label, verdict);
+                    let measurement = launch_ns(&sample, ix).filter(|_| aligned).or_else(|| {
+                        self.inner
+                            .device
+                            .is_cpu()
+                            .then(|| ratio_ppm(sample_ns, base_ns))
+                    });
+                    if let Some(ns) = measurement {
+                        self.inner.tune.observe(sig, &label, ns);
                     }
                 }
                 if log {
                     eprintln!(
-                        "[tune]   L{ix} {sample_ns:.0} ns  (own {} ns, {} ns wall)  {label}{}{}",
+                        "[tune]   L{ix} {sample_ns:.0} ns  (own {} ns, {} ns wall)  {label}{}",
                         launch_ns(&sample, ix).map_or_else(|| "-".to_string(), |ns| ns.to_string()),
                         sample.nanos,
-                        if ok { "" } else { "  REJECTED: wrong values" },
                         if aligned {
                             ""
                         } else {
@@ -2225,7 +2069,7 @@ impl Session {
                     // clock always had.
                     _ => sample_ns < best_ns * (1.0 - TUNE_MARGIN),
                 };
-                if ok && improved && !verify_members {
+                if improved {
                     best_ns = sample_ns;
                     // The adopted candidate is the new incumbent, so its
                     // profile serves every later launch's comparison.
@@ -2243,9 +2087,7 @@ impl Session {
         // launch, so it stays a ratio against this pass's own base, which is
         // what makes it comparable across runs.
         let combo_score = ratio_ppm(best_ns, base_ns);
-        if !verify_members {
-            self.inner.tune.record_combo(&plan_sig, picks, combo_score);
-        }
+        self.inner.tune.record_combo(&plan_sig, picks, combo_score);
         // One write per tuning pass, atomic, and a no-op when nothing new was
         // measured — a fully-learned shape costs zero IO.
         self.inner.tune.save();
@@ -2302,7 +2144,8 @@ impl Session {
             best = Arc::new(plan);
             applied += 1;
         }
-        if applied > 0 {
+        #[cfg(feature = "compiler-tests")]
+        {
             let g = graph.state().egraph.lock();
             self.inner.extractor.verify_plan(&g, &best)?;
         }
@@ -2315,16 +2158,15 @@ impl Session {
         Ok(Some(best))
     }
 
-    /// Run `plan` `repetitions` times, keep the fastest, and read every
-    /// requested value back. `None` when nothing was readable.
+    /// Run `plan` repeatedly and retain timings. No output readback or
+    /// correctness decisions belong to the performance selector.
     fn timed_run(
         &self,
-        guard: &ResolveGuard<'_>,
         graph: &GraphRef,
         plan: &Plan,
         values: &[Tensor],
         repetitions: usize,
-    ) -> Result<Option<TuneSample>> {
+    ) -> Result<TuneSample> {
         let mut nanos = u64::MAX;
         let mut gpu_us: Option<Vec<f64>> = None;
         for _ in 0..repetitions {
@@ -2345,18 +2187,7 @@ impl Session {
                 });
             }
         }
-        let mut bytes = Vec::with_capacity(values.len());
-        for v in values {
-            match self.read_bytes_locked(guard, graph, v.id) {
-                Ok(b) => bytes.push((graph.facts(v.id).dtype, b)),
-                Err(_) => return Ok(None),
-            }
-        }
-        Ok(Some(TuneSample {
-            nanos,
-            gpu_us,
-            bytes,
-        }))
+        Ok(TuneSample { nanos, gpu_us })
     }
 
     /// The device buffer of an external leaf, uploading it on first use.
@@ -2406,6 +2237,7 @@ pub(crate) fn autotune_min_macs() -> u64 {
 /// path and an env lookup per call is a per-resolve allocation.
 /// Whether `FUSOR_VERIFY_FAMILIES` is set: every shape-family hit is
 /// cross-checked against a concrete plan of the same member.
+#[cfg(feature = "compiler-tests")]
 fn verify_families() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FUSOR_VERIFY_FAMILIES").is_some())
@@ -2731,7 +2563,7 @@ impl SaturationMemo {
     }
 }
 
-/// One candidate's measurement and the values it produced, together.
+/// One candidate's timing measurements.
 struct TuneSample {
     /// Wall clock around the whole `run`, in nanoseconds. Includes buffer
     /// allocation, binding, the plan-cache lookup, submission and the poll
@@ -2741,7 +2573,6 @@ struct TuneSample {
     /// could time them. This is the number a tuning decision wants: it excludes
     /// every host cost above and is a property of one launch.
     gpu_us: Option<Vec<f64>>,
-    bytes: Vec<(Dtype, Vec<u8>)>,
 }
 
 /// Whether `candidate` differs from `incumbent` at exactly launch `ix`, so a
@@ -2948,52 +2779,6 @@ impl Drop for TuningClock<'_> {
             let _ = t.launcher().take_last_profile();
         }
     }
-}
-
-/// The first disagreeing f32 element and the worst one, for the MISCOMPILE
-/// report: `(first_index, expected, got, worst_abs_diff)`.
-fn first_mismatch(a: &[u8], b: &[u8]) -> Option<(usize, f32, f32, f32)> {
-    let f = |s: &[u8]| {
-        s.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect::<Vec<f32>>()
-    };
-    let (x, y) = (f(a), f(b));
-    let scale = x.iter().fold(1.0f32, |m, v| m.max(v.abs()));
-    let mut first = None;
-    let mut worst = 0.0f32;
-    for (i, (p, q)) in x.iter().zip(&y).enumerate() {
-        let d = (p - q).abs();
-        if d > 1e-3 * scale && first.is_none() {
-            first = Some((i, *p, *q));
-        }
-        worst = worst.max(d);
-    }
-    first.map(|(i, p, q)| (i, p, q, worst))
-}
-
-fn agrees(dtype: Dtype, a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    if a == b {
-        return true;
-    }
-    if dtype != Dtype::F32 {
-        return false;
-    }
-    let f = |s: &[u8]| {
-        s.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect::<Vec<f32>>()
-    };
-    let (x, y) = (f(a), f(b));
-    let scale = x.iter().fold(1.0f32, |m, v| m.max(v.abs()));
-    x.iter().zip(&y).all(|(p, q)| (p - q).abs() <= 1e-3 * scale)
 }
 
 /// One element's little-endian bytes, in the splat's own dtype.

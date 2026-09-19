@@ -23,7 +23,6 @@ use fusor_ir::scalar::{ScalarExpr, ScalarKind};
 use fusor_ir::shape::{Dim, Dims, Layout, SymId};
 use rustc_hash::FxHasher;
 use rustc_hash::{FxHashMap, FxHashSet};
-use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 
 /// `SymId(u32::MAX)` is the crate-wide "symbolic, not statically known"
@@ -316,10 +315,8 @@ pub fn derive_bindings(
 /// count is returned alongside — allocation cannot rederive it.
 ///
 /// - default: `Layout::contiguous(shape)`, elements = product(shape);
-/// - `Coop { geom, splits, .. }`: logical shape over padded row-major
-///   strides, and when `splits > 1` a prepended axis of extent `splits`
-///   whose stride is one whole padded output — the split-K scratch slice;
-///   elements = `splits * product(padded)`;
+/// - `Coop { geom, .. }`: logical shape over padded row-major strides;
+///   elements = `product(padded)`;
 /// - `Sgemm` / `Sgemv` / `Fold` / `Map` / `Point`: contiguous.
 ///
 /// Elements is `Dim::Sym(UNKNOWN_SYM)` when a symbolic extent keeps the
@@ -335,8 +332,8 @@ pub fn derive_bindings(
 /// padding it would pad batch axes instead.
 pub fn buffer_layout_for(facts: &ValueFacts, theta: Option<SchedPoint>) -> Result<(Layout, Dim)> {
     let shape = &facts.shape;
-    let (bm, bn, splits) = match theta {
-        Some(SchedPoint::Coop { geom, splits, .. }) => (geom.bm, geom.bn, splits),
+    let (bm, bn) = match theta {
+        Some(SchedPoint::Coop { geom, .. }) => (geom.bm, geom.bn),
         _ => {
             let l = Layout::contiguous(shape);
             let e = layout_elements(shape);
@@ -372,7 +369,7 @@ pub fn buffer_layout_for(facts: &ValueFacts, theta: Option<SchedPoint>) -> Resul
         )));
     }
     let padded_elements = {
-        let mut acc: Option<u64> = Some(u64::from(splits.max(1)));
+        let mut acc: Option<u64> = Some(1);
         for d in &padded {
             acc = match (acc, d.as_const()) {
                 (Some(a), Some(v)) => Some(a.saturating_mul(v)),
@@ -385,32 +382,7 @@ pub fn buffer_layout_for(facts: &ValueFacts, theta: Option<SchedPoint>) -> Resul
         }
     };
 
-    if splits <= 1 {
-        let l = Layout::from_parts(Dim::Const(0), shape, &strides)?;
-        return Ok((l, padded_elements));
-    }
-
-    // Split-K scratch: one whole padded output per partial, so the combine
-    // pass reads slice `s` one *whole output* in.
-    //
-    // That distance is the product of every padded extent, batch axes
-    // included — it is exactly the row-major stride a prepended axis gets,
-    // `strides[0] * padded[0]`. One batch element (`padded_m * padded_n`)
-    // would not do: with any leading batch axis,
-    // partial `s` would begin inside partial `s-1` and every batch past the
-    // first would alias.
-    let slice = match (
-        strides.first().and_then(|s| s.as_const()),
-        padded.first().and_then(|d| d.as_const()),
-    ) {
-        (Some(outer_stride), Some(outer_extent)) => Dim::Const(outer_stride * outer_extent),
-        _ => Dim::Sym(UNKNOWN_SYM),
-    };
-    let mut shape_out: Dims = smallvec::smallvec![Dim::Const(splits as u64)];
-    shape_out.extend(shape.iter().copied());
-    let mut strides_out: SmallVec<[Dim; 6]> = smallvec::smallvec![slice];
-    strides_out.extend(strides.iter().copied());
-    let l = Layout::from_parts(Dim::Const(0), &shape_out, &strides_out)?;
+    let l = Layout::from_parts(Dim::Const(0), shape, &strides)?;
     Ok((l, padded_elements))
 }
 

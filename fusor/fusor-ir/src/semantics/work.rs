@@ -421,7 +421,7 @@ fn coop_staged_bytes(sched: &ScheduleDomain, elem: ScalarElement) -> u64 {
     let Some(SchedPoint::Coop { geom, staging, .. }) = sched.point(0) else {
         return 0;
     };
-    crate::verify_launch::coop_tiles(geom, elem, staging)
+    crate::ir::launch::coop_tiles(geom, elem, staging)
         .decls
         .iter()
         .map(|t| t.layout.element_count() * t.element.byte_size())

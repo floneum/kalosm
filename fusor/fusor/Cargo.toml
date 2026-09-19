@@ -24,6 +24,8 @@ bytemuck.workspace = true
 parking_lot.workspace = true
 
 [features]
+# Test-only invariant checks and differential execution of e-class members.
+compiler-tests = ["fusor-ir/compiler-tests", "fusor-cost/compiler-tests", "fusor-cpu?/compiler-tests", "fusor-gpu?/compiler-tests"]
 default = ["cpu", "gpu"]
 # Each backend is its own crate; a facade built without one never links it.
 # At least one must be on.
@@ -32,7 +34,7 @@ gpu = ["dep:fusor-gpu"]
 
 [[example]]
 name = "coop_attn_repro"
-required-features = ["gpu"]
+required-features = ["gpu", "compiler-tests"]
 
 [[example]]
 name = "qgemv_bench"

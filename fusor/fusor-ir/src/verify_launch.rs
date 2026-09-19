@@ -22,60 +22,12 @@ use crate::carrier::SlotTy;
 use crate::device::Caps;
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
-use crate::ir::kernel::{
-    ArenaPlanner, ElementType, MemoryLevel, ScalarElement, TileDecl, TileLayout, Tiles,
-};
-use crate::ir::launch::{
-    AccessPlan, CoopGeom, Effect, IndexSpace, Launch, Operand, ScheduleDomain,
-};
+use crate::ir::kernel::{ArenaPlanner, ScalarElement};
+use crate::ir::launch::{AccessPlan, Effect, IndexSpace, Launch, Operand, ScheduleDomain};
 use crate::ir::logical::ScatterCombine;
 use crate::ir::{Op, VerifyCtx};
 use crate::semantics::effect_of;
 use crate::shape::{Dim, Layout};
-use std::sync::Arc;
-
-/// Workgroup tiles a cooperative geometry declares, before packing.
-///
-/// A-tile `[bm, bk]` and B-tile `[bk, bn / n_passes]`, each replicated
-/// `staging` times, plus one accumulator staging tile `[bm, bn / n_passes]`
-/// when the store element is not `F32` (an f32 accumulator written into
-/// narrower memory needs the staging pass unless the device supports a
-/// mixed-precision cooperative store).
-///
-/// **This is the single source of coop tile shapes.** `verify_launch` and
-/// `fusor-tile`'s `domains::coop` both call it, so an admitted geometry and
-/// a planned one cannot disagree.
-pub fn coop_tiles(geom: CoopGeom, elem: ScalarElement, staging: u8) -> Tiles {
-    let mut tiles = Tiles::default();
-    let n_passes = geom.n_passes.max(1);
-    let bn_pass = geom.bn / n_passes;
-    let element = ElementType::Scalar(elem);
-    let depth = staging.max(1);
-
-    // One decl per staging depth, and they are `depth` distinct tiles:
-    // `TileDecl` is identity-bearing, so `staging: 2` is two `coop_a`
-    // allocations the arena places separately rather than one name used twice.
-    for _ in 0..depth {
-        tiles.decls.push(Arc::new(TileDecl::new(
-            element,
-            TileLayout::contiguous(MemoryLevel::Workgroup, &[geom.bm, geom.bk]),
-            "coop_a",
-        )));
-        tiles.decls.push(Arc::new(TileDecl::new(
-            element,
-            TileLayout::contiguous(MemoryLevel::Workgroup, &[geom.bk, bn_pass]),
-            "coop_b",
-        )));
-    }
-    if elem != ScalarElement::F32 {
-        tiles.decls.push(Arc::new(TileDecl::new(
-            ElementType::Scalar(ScalarElement::F32),
-            TileLayout::contiguous(MemoryLevel::Workgroup, &[geom.bm, bn_pass]),
-            "coop_acc",
-        )));
-    }
-    tiles
-}
 
 /// Verify one Launch node against `caps` and the exact arena plan.
 pub fn verify_launch(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<()> {
@@ -265,33 +217,30 @@ pub fn check_schedule_domain(
         )));
     }
 
-    let elem = element_of(store_dtype(op));
+    let elem = element_of(match op {
+        Launch::Contract { a, .. } => a.pre.dtype(),
+        _ => store_dtype(op),
+    });
     let subgroup_width = caps.subgroup_width();
     let max_lanes = caps.limits.max_compute_invocations_per_workgroup;
     let max_storage = caps.limits.max_compute_workgroup_storage_size;
 
     match sched {
         ScheduleDomain::Coop(domain) => {
-            for &geom in &domain.geoms {
-                if !geom.legal(subgroup_width, max_lanes) {
+            for point in &domain.schedules {
+                let (geom, staging) = (point.geom, point.staging);
+                if !geom.legal(subgroup_width, max_lanes) || !(1..=2).contains(&staging) {
                     return Err(Error::Legality(format!(
-                        "coop geometry {geom:?} is illegal at subgroup width {subgroup_width} \
-                         and {max_lanes} lanes"
+                        "illegal cooperative schedule {point:?}"
                     )));
                 }
-                for &staging in &domain.staging {
-                    // The exact planner value, never an estimator.
-                    let bytes = planner.workgroup_bytes(&coop_tiles(geom, elem, staging), caps)?;
-                    if bytes > max_storage {
-                        return Err(Error::Legality(format!(
-                            "coop geometry {geom:?} at staging {staging} needs {bytes} \
-                             workgroup bytes, over the {max_storage} limit"
-                        )));
-                    }
+                let bytes = planner
+                    .workgroup_bytes(&crate::ir::launch::coop_tiles(geom, elem, staging), caps)?;
+                if bytes > max_storage {
+                    return Err(Error::Legality(format!(
+                        "coop {point:?} needs {bytes} workgroup bytes, limit {max_storage}"
+                    )));
                 }
-            }
-            if domain.splits.contains(&0) {
-                return Err(Error::Legality("a split-K count of 0 is illegal".into()));
             }
         }
         ScheduleDomain::Sgemm(domain) => {

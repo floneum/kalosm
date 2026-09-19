@@ -86,15 +86,18 @@ impl Program {
         raw: &GpuBuffer,
         acceleration: super::ProgramAcceleration,
     ) -> Result<Vec<(wgpu::ComputePipeline, wgpu::BindGroup)>> {
+        #[cfg(any(test, feature = "compiler-tests"))]
         let cooperative = acceleration.cooperative();
         let mut kernels = vec![];
-        for (region, source) in plan
+        for (region, _source) in plan
             .shaders_with(acceleration.native_validation())?
             .into_iter()
             .enumerate()
         {
-            let module = naga::front::wgsl::parse_str(&source)
-                .map_err(|e| Error::Plan(e.emit_to_string(&source)))?;
+            #[cfg(any(not(target_arch = "wasm32"), test, feature = "compiler-tests"))]
+            let module = naga::front::wgsl::parse_str(&_source)
+                .map_err(|e| Error::Plan(e.emit_to_string(&_source)))?;
+            #[cfg(any(test, feature = "compiler-tests"))]
             naga::valid::Validator::new(
                 naga::valid::ValidationFlags::all(),
                 if cooperative {
@@ -107,7 +110,7 @@ impl Program {
                 },
             )
             .validate(&module)
-            .map_err(|e| Error::Plan(e.emit_to_string(&source)))?;
+            .map_err(|e| Error::Plan(e.emit_to_string(&_source)))?;
             #[cfg(target_arch = "wasm32")]
             let shader_source = {
                 let mut source = super::emit::shader(&plan, region, acceleration)?;

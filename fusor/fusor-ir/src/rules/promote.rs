@@ -71,8 +71,8 @@ pub fn private_acc_bytes(caps: &Caps) -> u64 {
     256
 }
 
-/// One promotion's worth of node state. `space`, `ops` and `sched` never
-/// change, which is the whole point of the rebinding spelling.
+/// One promotion's worth of node state. `space` and `ops` stay fixed;
+/// the caller derives a schedule domain for the new carrier.
 #[derive(Clone)]
 struct Promoted {
     vec_axes: SmallVec<[u32; 2]>,
@@ -120,6 +120,7 @@ pub fn promote(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Optio
     // before; a carrier that already had a slot axis absorbs the promoted
     // axis and a pure alias puts it back. Decide before minting.
     let view = recovery_view(carrier, &got, &want)?;
+    let sched = sched.with_fold_carrier(next.carrier.lanes()?, acc.byte_size(), f.caps())?;
     let fold = b
         .add_launch(Launch::Fold {
             space: space.clone(),
@@ -129,7 +130,7 @@ pub fn promote(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Optio
             acc: *acc,
             post: next.post,
             ops: ops.clone(),
-            sched: sched.clone(),
+            sched,
         })
         .ok()?;
     let value = apply_view(b, fold, &view)?;

@@ -3,10 +3,3 @@
 [profile.default]
 slow-timeout = { period = "120s", terminate-after = 10 }
 fail-fast = false
-
-[test-groups]
-training = { max-threads = 1 }
-
-[[profile.default.overrides]]
-filter = 'binary(train_small)'
-test-group = 'training'

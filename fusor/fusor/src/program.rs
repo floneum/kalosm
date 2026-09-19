@@ -186,16 +186,20 @@ mod tests {
             program.run().unwrap();
             let bytes = pollster::block_on(program.read(&output)).unwrap();
             let got: Vec<_> = bytes
-                .chunks_exact(4)
-                .map(|v| f32::from_le_bytes(v.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| f32::from_le_bytes(*v))
                 .collect();
             assert_eq!(got, [step as f32 * 0.5, step as f32 * 1.5]);
             let bytes = pollster::block_on(program.read(&leaf)).unwrap();
             assert_eq!(i32::from_le_bytes(bytes.try_into().unwrap()), step);
             let bytes = pollster::block_on(program.read(&integer_output)).unwrap();
             let got: Vec<_> = bytes
-                .chunks_exact(4)
-                .map(|v| i32::from_le_bytes(v.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|v| i32::from_le_bytes(*v))
                 .collect();
             assert_eq!(got, [3 * (step / 2), 5 * (step / 2)]);
         }

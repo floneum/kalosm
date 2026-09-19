@@ -128,10 +128,9 @@ pub fn emit(ir: &KernelIr, caps: &Caps) -> Result<CpuKernel, EmitError> {
 
 /// Compile one `KernelIr`.
 ///
-/// When a planner is supplied its `verify_uniformity` and `verify_arena` run
-/// **before** compilation and a failure is `EmitError::Validation`, never a
-/// alternate execution path. Without one the arena uses sequential packing,
-/// which is always legal on CPU because thread-local scratch aliases freely.
+/// The supplied planner constructs the arena. Compiler tests independently
+/// check uniformity and arena invariants before compilation. Without a planner
+/// the arena uses sequential packing; CPU thread-local scratch aliases freely.
 pub(crate) fn compile(
     ir: &KernelIr,
     caps: &Caps,
@@ -141,11 +140,13 @@ pub(crate) fn compile(
 
     let arena = match planner {
         Some(p) => {
+            #[cfg(any(test, feature = "compiler-tests"))]
             p.verify_uniformity(ir)
                 .map_err(|e| EmitError::Validation(e.to_string()))?;
             let plan = p
                 .arena_plan(ir, caps)
                 .map_err(|e| EmitError::Validation(e.to_string()))?;
+            #[cfg(any(test, feature = "compiler-tests"))]
             p.verify_arena(ir, &plan)
                 .map_err(|e| EmitError::Validation(e.to_string()))?;
             Some(plan)

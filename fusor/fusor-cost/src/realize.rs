@@ -704,9 +704,7 @@ pub fn node_serial_steps(op: &Op, theta: Option<SchedPoint>, caps: &Caps) -> (u6
                 // A depth step is a staged load and a barrier; `16x16` on
                 // one subgroup (four multiplies per depth) measured the same
                 // as on four (one each), so the multiplies are not the step.
-                Some(SchedPoint::Coop { splits, .. }) => {
-                    (k.div_ceil(depth).div_ceil(u64::from(splits.max(1))), 0)
-                }
+                Some(SchedPoint::Coop { .. }) => (k.div_ceil(depth), 0),
                 // A scalar-tiled lane walks every k with its register tile's
                 // FMAs and staged loads: measured 8-10x a fragment chain on
                 // the same shape (281 us against 33 us at 1024x96x96).
@@ -792,12 +790,11 @@ pub fn geometry(theta: Option<SchedPoint>, space: &IndexSpace, caps: &Caps) -> G
     let total = iterations_of(space);
 
     match theta {
-        Some(SchedPoint::Coop { geom, splits, .. }) => Geometry {
+        Some(SchedPoint::Coop { geom, .. }) => Geometry {
             block: geom.lanes(width).max(1),
             workgroups: m.div_ceil(geom.bm.max(1) as u64)
                 * n.div_ceil(geom.bn.max(1) as u64)
-                * batch
-                * splits.max(1) as u64,
+                * batch,
         },
         Some(SchedPoint::Sgemm(p)) => Geometry {
             block: ((p.bm / p.tm.max(1)) * (p.bn / p.tn.max(1))).max(1),
@@ -1558,45 +1555,10 @@ pub fn fold_footprint(graph: &EGraph, id: Id) -> Option<(u64, u64)> {
     }
 }
 
-/// Whether this device can actually run `id` at `theta`.
-///
-/// Only the fold clause is stated here: it is the only one whose footprint
-/// depends on a node property the schedule domain was generated before
-/// knowing. `PROMOTE` carries the pre-promotion domain over verbatim, but the
-/// inherited strategies were admitted at one accumulator lane and the
-/// promoted nest holds `lanes` of them.
-pub fn point_is_legal(graph: &EGraph, id: Id, theta: SchedPoint, caps: &Caps) -> bool {
-    // A split point needs a combine dispatch the targets do not run; the
-    // `SPLIT_K` rule spells the same split as a batched contraction and a
-    // fold, which every target runs.
-    if let SchedPoint::Coop { splits, .. } = theta
-        && splits > 1
-    {
-        return false;
-    }
-    let Some((lanes, acc_bytes)) = fold_footprint(graph, id) else {
-        return true;
-    };
-    // The same default as [`fold_lane_group`]: a point that is not a fold
-    // strategy lowers at the emitters' full block. The two defaults have to
-    // be the same value or this predicate admits a node whose tiles the arena
-    // then rejects.
-    let strat = match theta {
-        SchedPoint::Fold(s) => s,
-        _ => FoldStrat::WgTree {
-            lane_group: fold_lane_group(Some(theta), caps),
-        },
-    };
-    fusor_ir::ir::launch::fold_scratch_bytes(&strat, lanes, acc_bytes, caps.subgroup_width(), caps)
-        <= u64::from(caps.limits.max_compute_workgroup_storage_size)
-}
-
-/// Whether `id`'s schedule domain offers a point this device can run.
-///
-/// A node whose whole domain is illegal is unselectable, not merely
-/// expensive: a lowering refusal is a hard assert, so selecting one mints a
-/// crash rather than a slow plan.
-pub fn has_legal_point(graph: &EGraph, id: Id, caps: &Caps) -> bool {
+/// Whether a composite can materialize its externally visible values in
+/// this graph. This depends on consumers and buffer choices, not kernel
+/// correctness or the contents of a schedule domain.
+pub fn composite_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
     if matches!(graph.node(id).op, Op::Launch(Launch::Slab { .. }))
         && !slab_bindings_fit(graph, id, caps)
     {
@@ -1607,10 +1569,7 @@ pub fn has_legal_point(graph: &EGraph, id: Id, caps: &Caps) -> bool {
     {
         return false;
     }
-    let Some(domain) = domain_of(graph, id) else {
-        return true;
-    };
-    domain.iter().any(|p| point_is_legal(graph, id, p, caps))
+    true
 }
 
 /// Whether group `id` can bind: each member's own buffers and the distinct
@@ -1843,13 +1802,11 @@ pub fn selectable(graph: &EGraph, class: ClassId, caps: &Caps) -> Vec<Id> {
         .filter(|m| is_runnable(graph, *m))
         .collect();
     let pool = if runnable.is_empty() { pool } else { runnable };
-    // Schedulability filters last and falls back the same way the two filters
-    // above do: a class whose every member is unschedulable is a missing
-    // rule, and `verify_plan` names it precisely.
+    // Account for composites whose externally visible members need buffers.
     let schedulable: Vec<Id> = pool
         .iter()
         .copied()
-        .filter(|m| has_legal_point(graph, *m, caps))
+        .filter(|m| composite_bindings_fit(graph, *m, caps))
         .collect();
     if schedulable.is_empty() {
         pool

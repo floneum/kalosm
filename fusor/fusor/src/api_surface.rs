@@ -45,7 +45,9 @@ use crate::quantized::QMatrix as QMatrixByModulePath;
 use crate::sampling::{
     GpuSampledToken, Mirostat2Sampler, StandardSamplerParams, sample, top_k_pairs,
 };
-use crate::session::{Backend, wrong_member_count};
+use crate::session::Backend;
+#[cfg(feature = "compiler-tests")]
+use crate::session::wrong_member_count;
 use crate::tensor::{
     Dyn, Extent, FromArray, IndexOp, RoundMode, Scalar, TensorIndex, TensorSlice, arange,
     arange_step,

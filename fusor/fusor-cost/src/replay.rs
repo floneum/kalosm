@@ -35,14 +35,8 @@ struct Lru {
     plans: Vec<(ReplayKey, Entry)>,
 }
 
-/// One key's plan, and whether *that* plan has passed `verify_plan` against
-/// the graph term the key names.
 struct Entry {
     plan: Arc<Plan>,
-    /// The plan hash last verified under this key. Carried per entry so
-    /// evicting the plan evicts the record, and a replacement plan never
-    /// inherits its predecessor's clearance.
-    verified: Option<PlanHash>,
 }
 
 impl Lru {
@@ -66,18 +60,9 @@ impl Lru {
     fn insert(&mut self, key: ReplayKey, plan: Arc<Plan>) {
         match self.plans.iter_mut().find(|(k, _)| *k == key) {
             Some(slot) => {
-                if slot.1.verified != Some(plan.hash) {
-                    slot.1.verified = None;
-                }
                 slot.1.plan = plan;
             }
-            None => self.plans.push((
-                key,
-                Entry {
-                    plan,
-                    verified: None,
-                },
-            )),
+            None => self.plans.push((key, Entry { plan })),
         }
         self.touch(key);
         while self.plans.len() > CAPACITY {
@@ -136,31 +121,6 @@ impl ReplayCache {
         let plan = Arc::new(fresh);
         self.entries.lock().insert(key, Arc::clone(&plan));
         Ok((plan, unchanged))
-    }
-
-    /// Whether `hash` is the plan this key already put through `verify_plan`.
-    ///
-    /// `verify_plan` is a pure function of the plan and the graph term it was
-    /// extracted from, and a [`ReplayKey`] is that term's identity. The plan
-    /// hash is carried too, so a replaced entry never inherits the verdict of
-    /// the plan it displaced.
-    pub fn is_verified(&self, key: ReplayKey, hash: PlanHash) -> bool {
-        self.entries
-            .lock()
-            .plans
-            .iter()
-            .any(|(k, e)| *k == key && e.verified == Some(hash))
-    }
-
-    /// Record that `hash` passed `verify_plan` under `key`. A no-op when the
-    /// entry has since been replaced or evicted.
-    pub fn mark_verified(&self, key: ReplayKey, hash: PlanHash) {
-        let mut entries = self.entries.lock();
-        if let Some((_, e)) = entries.plans.iter_mut().find(|(k, _)| *k == key)
-            && e.plan.hash == hash
-        {
-            e.verified = Some(hash);
-        }
     }
 
     pub fn clear(&self) {

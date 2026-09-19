@@ -57,4 +57,4 @@ strip = "debuginfo"
 
 # Opt-in browser regression/benchmark exports, omitted from published builds.
 [features]
-training-checks = []
+training-checks = ["fusor-conformance/compiler-tests"]

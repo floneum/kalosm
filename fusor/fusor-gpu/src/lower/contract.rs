@@ -43,14 +43,7 @@ pub(crate) fn lower_contract(
         );
     }
     match (family, theta) {
-        (
-            Family::Coop,
-            SchedPoint::Coop {
-                geom,
-                splits,
-                staging,
-            },
-        ) => lower_coop(ctx, op, geom, splits, staging),
+        (Family::Coop, SchedPoint::Coop { geom, staging }) => lower_coop(ctx, op, geom, staging),
         (Family::Sgemm, SchedPoint::Sgemm(p)) => lower_sgemm(ctx, op, p).map(|k| vec![k]),
         (Family::Sgemv, SchedPoint::Sgemv(p)) => lower_sgemv(ctx, op, p).map(|k| vec![k]),
         (f, t) => Err(Error::Plan(format!(
@@ -154,17 +147,11 @@ impl CoopShape {
 /// workgroup's own output block, which is disjoint from every other
 /// workgroup's.
 ///
-/// `splits > 1` is refused, not lowered: a split contraction is two launches
-/// — `splits` partial slices, then a combine — and `GpuTarget` builds exactly
-/// one artifact per plan launch, so the combine would never run and the
-/// partial would be returned. Supporting it needs `GpuTarget::build_one` to
-/// launch every kernel `lower_node` returns, in order, sharing one buffer
-/// binding, plus a combine that applies `post` exactly once.
+/// Split-K is represented by separate partial and combine graph nodes.
 pub(crate) fn lower_coop(
     mut ctx: Ctx<'_>,
     op: &Launch,
     geom: CoopGeom,
-    splits: u32,
     staging: u8,
 ) -> Result<Vec<KernelIr>> {
     let Launch::Contract {
@@ -181,18 +168,8 @@ pub(crate) fn lower_coop(
         )));
     }
     let cs = CoopShape::of(geom, width)?;
-    let splits = splits.max(1);
     let depth = u32::from(staging.max(1));
     let dim = CoopGeom::COOP_DIM;
-
-    if splits > 1 {
-        // The target launches one kernel per plan launch, so the combine pass
-        // a split needs cannot run.
-        return Err(Error::Plan(format!(
-            "split-K coop wants {splits} partials and a combine launch; GpuTarget builds one \
-             kernel per launch, so the combine would be dropped and the partial returned"
-        )));
-    }
 
     let acc_elem = scalar_element(*acc);
     let operand_elem = scalar_element(ctx.plan_dtype(a.primary().src)?);
@@ -342,8 +319,14 @@ pub(crate) fn lower_coop(
 
     let post_is_identity = matches!(post.kind(), ScalarKind::Arg(0));
 
-    let needs_stage =
-        !ctx.caps.mixed_precision_coop_store && ElementType::Scalar(acc_elem) != out_elem;
+    // A mixed-type arena has one untyped physical binding. Stage through
+    // the declared accumulator tile so its scratch stays in the arena plan.
+    let mixed_binding = ctx
+        .buffers
+        .iter()
+        .any(|buffer| buffer.binding == out_view.buffer.binding && buffer.element != out_elem);
+    let needs_stage = mixed_binding
+        || (!ctx.caps.mixed_precision_coop_store && ElementType::Scalar(acc_elem) != out_elem);
     let layout_ok = cooperative_store_layout_supported(&out_view.layout);
     let stage_tile: Option<Tile> = if needs_stage || !layout_ok {
         Some(ctx.b.tile(

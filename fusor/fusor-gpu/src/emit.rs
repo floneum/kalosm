@@ -707,7 +707,7 @@ impl<'a> Emitter<'a> {
             incoming_ray_payload: None,
         });
 
-        let info = self.validate()?;
+        let info = self.module_info()?;
         let bindings = bindings_from_module(&self.module);
         Ok(EmittedModule {
             module: self.module,
@@ -718,10 +718,10 @@ impl<'a> Emitter<'a> {
         })
     }
 
-    /// Run naga's validator with exactly the capabilities the analysis raised.
-    /// A failure here is a compiler bug, not a user error — it is what licenses
-    /// the trusted shader-module path, and it is never a silent fallback.
-    pub(crate) fn validate(&self) -> Result<naga::valid::ModuleInfo, EmitError> {
+    /// Naga's backend requires ModuleInfo even when verification is disabled.
+    /// Production computes that analysis with no validation flags; compiler
+    /// tests additionally run all of Naga's independent invariant checks.
+    pub(crate) fn module_info(&self) -> Result<naga::valid::ModuleInfo, EmitError> {
         use naga::valid::Capabilities as C;
         let mut caps = C::empty();
         if self.analysis.uses_f16 {
@@ -736,7 +736,12 @@ impl<'a> Emitter<'a> {
         if self.analysis.uses_coop {
             caps |= C::COOPERATIVE_MATRIX;
         }
-        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), caps)
+        let flags = if cfg!(any(test, feature = "compiler-tests")) {
+            naga::valid::ValidationFlags::all()
+        } else {
+            naga::valid::ValidationFlags::empty()
+        };
+        naga::valid::Validator::new(flags, caps)
             .validate(&self.module)
             .map_err(|e| EmitError::Validation(format!("{e:#?}")))
     }

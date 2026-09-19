@@ -185,12 +185,25 @@ pub trait Extractor: Send + Sync {
     /// Launch; every geometry legal against the exact `ArenaPlan`; every
     /// operand access satisfiable; every buffer stride derivable; no
     /// `InPlace` node inlined. A failure is an error, never a fallback.
+    #[cfg(feature = "compiler-tests")]
     fn verify_plan(&self, graph: &EGraph, plan: &Plan) -> Result<()>;
+
+    /// Test-only member sweep. Coverage is independent of tuning budgets,
+    /// cost thresholds and the timing cache.
+    #[cfg(feature = "compiler-tests")]
+    fn test_launch_variants(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        base: &Plan,
+        launch_ix: usize,
+        cost: &dyn CostModel,
+    ) -> Vec<(String, Plan)>;
 
     /// Alternative plans for one launch of `base`: every `(class member,
     /// schedule point)` pair the launch root's class offers, each re-planned
     /// whole. Family and geometry vary together — see the
-    /// `candidate_geoms_for` doc in `fusor-tile`.
+    /// `candidate_schedules_for` doc in `fusor-tile`.
     ///
     /// Contractions below `min_macs` return nothing. The default is "no
     /// alternatives".

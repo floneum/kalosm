@@ -156,11 +156,6 @@ struct ArtifactEntry {
 /// active lengths (the racing autotuner's, plus the current one).
 const VARIANTS_PER_LAUNCH: usize = 8;
 
-/// One kernel body's `verify_kernel` verdict, or the verify in flight for it.
-/// `true` once the body has passed; a failed verify leaves it `false`, so the
-/// next caller retries rather than inheriting an error it cannot clone.
-type VerifySlot = Arc<parking_lot::Mutex<bool>>;
-
 /// One kernel body's compiled pipeline, or the compile in flight for it.
 ///
 /// A failed build leaves the slot empty, so the next caller retries rather
@@ -170,8 +165,6 @@ type PipelineSlot = Arc<parking_lot::Mutex<Option<Artifact>>>;
 static LAST_EXIT: parking_lot::Mutex<Option<Instant>> = parking_lot::Mutex::new(None);
 pub static COMPILE_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 pub static LOWER_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static VERIFY_US: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-pub static VERIFY_N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 struct CompileGuard(Instant);
 impl Drop for CompileGuard {
     fn drop(&mut self) {
@@ -191,9 +184,15 @@ fn gapstep() -> bool {
 }
 
 /// Whether `FUSOR_VERIFY_ARTIFACT_CACHE` is set, read once.
+#[cfg(feature = "compiler-tests")]
 fn verify_artifact_cache() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| std::env::var_os("FUSOR_VERIFY_ARTIFACT_CACHE").is_some())
+}
+
+#[cfg(not(feature = "compiler-tests"))]
+fn verify_artifact_cache() -> bool {
+    false
 }
 
 /// Whether `FUSOR_NO_PIPELINE_SHARE` is set, read once.
@@ -253,18 +252,6 @@ pub struct GpuTarget {
     /// byte of the emitted module; this tier catches that and skips the
     /// Metal compile.
     pipelines_by_source: parking_lot::Mutex<lru::LruCache<String, Artifact>>,
-    /// Body identities already through [`fusor_tile::verify_kernel`] on this
-    /// target's caps.
-    ///
-    /// `verify_kernel` is a pure function of `(body, caps)` and this target's
-    /// caps are fixed for its life, so a body whose [`pipeline_hash`] is here
-    /// has already been verified. It is never an opt-out: a body reaching
-    /// Kernel for the first time is always verified.
-    ///
-    /// The entry is a slot claimed before the verify and held across it,
-    /// exactly as [`Self::pipelines`] is; a check-then-insert would let a
-    /// whole cohort past an empty entry for the same body.
-    verified: parking_lot::Mutex<lru::LruCache<u128, VerifySlot>>,
     launcher: Launcher,
     config: GpuConfig,
 }
@@ -294,7 +281,6 @@ fn gpu_target_fields_are_send_sync() {
     assert::<parking_lot::Mutex<lru::LruCache<ArtifactKey, ArtifactEntry>>>();
     assert::<parking_lot::Mutex<lru::LruCache<u128, PipelineSlot>>>();
     assert::<parking_lot::Mutex<lru::LruCache<String, Artifact>>>();
-    assert::<parking_lot::Mutex<lru::LruCache<u128, VerifySlot>>>();
     assert::<Launcher>();
     assert::<GpuConfig>();
 }
@@ -327,9 +313,6 @@ impl GpuTarget {
                 NonZeroUsize::new(ARTIFACT_CAPACITY).expect("ARTIFACT_CAPACITY is nonzero"),
             )),
             pipelines: parking_lot::Mutex::new(lru::LruCache::new(
-                NonZeroUsize::new(ARTIFACT_CAPACITY).expect("ARTIFACT_CAPACITY is nonzero"),
-            )),
-            verified: parking_lot::Mutex::new(lru::LruCache::new(
                 NonZeroUsize::new(ARTIFACT_CAPACITY).expect("ARTIFACT_CAPACITY is nonzero"),
             )),
             pipelines_by_source: parking_lot::Mutex::new(lru::LruCache::new(
@@ -389,7 +372,7 @@ impl GpuTarget {
     /// 1. **Serial, plan order** — bind buffers per `Launch::bindings` (binding
     ///    0 is the uniform block), allocate outputs from `Plan::buffers`
     ///    through the pool, resolve grids.
-    /// 2. **Parallel** — plan-cache lookup by [`PlanHash`], else lower, verify
+    /// 2. **Parallel** — plan-cache lookup by [`PlanHash`], else lower
     ///    Kernel, emit and create the pipeline. A serial probe runs first so a warm
     ///    cache never touches the thread pool.
     /// 3. **Serial, exact plan order** — push command records and release
@@ -405,8 +388,7 @@ impl GpuTarget {
         //   in order; `cold` is how many launches the warm probe missed and
         //   `build` therefore had to lower.
         // - `lowus`/`compus`/`verus`/`vern` CPU microseconds this resolve
-        //   spent lowering, in the Metal compiler, and in `verify_kernel` (with
-        //   the number of bodies verified) — summed across the build cohort,
+        //   spent lowering and in the Metal compiler — summed across the build cohort,
         //   so they exceed `build` whenever the workers overlap.
         // - `chunkwait`/`pollus` how long the host was blocked on the GPU
         //   (chunked-submit backpressure, and `poll_wait`).
@@ -809,15 +791,13 @@ impl GpuTarget {
         if gap {
             let end = start.elapsed();
             eprintln!(
-                "p1={:.2} probe={:.2} cold={} build={:.2} lowus={} compus={} verus={} vern={} bind={:.2} enc={:.2} tail={:.2} tot={:.2} n={} compiles={} pollwait={} chunkwait={:.2} pollus={:.2}",
+                "p1={:.2} probe={:.2} cold={} build={:.2} lowus={} compus={} bind={:.2} enc={:.2} tail={:.2} tot={:.2} n={} compiles={} pollwait={} chunkwait={:.2} pollus={:.2}",
                 __t_p1.as_secs_f64() * 1e3,
                 (__t_probe - __t_p1).as_secs_f64() * 1e3,
                 __cold,
                 (__t_p2 - __t_probe).as_secs_f64() * 1e3,
                 LOWER_US.swap(0, std::sync::atomic::Ordering::Relaxed),
                 COMPILE_US.swap(0, std::sync::atomic::Ordering::Relaxed),
-                VERIFY_US.swap(0, std::sync::atomic::Ordering::Relaxed),
-                VERIFY_N.swap(0, std::sync::atomic::Ordering::Relaxed),
                 (__t_bind - __t_p2).as_secs_f64() * 1e3,
                 (__t_enc - __t_bind).as_secs_f64() * 1e3,
                 (end - __t_enc).as_secs_f64() * 1e3,
@@ -1065,7 +1045,7 @@ impl GpuTarget {
         }
     }
 
-    /// Lower, verify, emit and compile a launch whose artifact is not
+    /// Lower, emit and compile a launch whose artifact is not
     /// cached, returning it with **the grid the lowering indexed its body
     /// against**. `Launch::grid` is the cost model's workgroup count, derived
     /// from the schedule point; `KernelIr::grid` is what the kernel body
@@ -1113,26 +1093,8 @@ impl GpuTarget {
             kernels.remove(0)
         };
         let ph = pipeline_hash(&ir);
-        // `verify_kernel` is never optional: a failure is `Error::Lower`. A
-        // body already verified on these caps is not verified twice, and the
-        // slot is held across the check so a cohort lowering the same body
-        // waits for the one verify.
-        let slot: VerifySlot = {
-            let mut lock = self.verified.lock();
-            Arc::clone(lock.get_or_insert(ph, VerifySlot::default))
-        };
-        let mut done = slot.lock();
-        if !*done {
-            let __tv = Instant::now();
-            fusor_tile::verify_kernel(&ir, self.caps())?;
-            VERIFY_US.fetch_add(
-                __tv.elapsed().as_micros() as u64,
-                std::sync::atomic::Ordering::Relaxed,
-            );
-            VERIFY_N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            *done = true;
-        }
-        drop(done);
+        #[cfg(any(test, feature = "compiler-tests"))]
+        fusor_tile::verify_kernel(&ir, self.caps())?;
         Ok(Lowered { ir, ph, binding })
     }
 
@@ -1215,7 +1177,7 @@ impl GpuTarget {
     }
 }
 
-/// One launch lowered and verified, before any compile.
+/// One lowered launch, before compilation.
 struct Lowered {
     ir: KernelIr,
     ph: u128,
@@ -1296,8 +1258,8 @@ impl GpuTarget {
             immediate_size: 0,
         });
         // SAFETY: every load this compiler emits is masked or provably in
-        // range and every loop is counted — `verify_kernel` establishes both
-        // before emission.
+        // range and every loop is counted by construction. The compiler test
+        // harness independently checks these invariants before emission.
         let module = unsafe {
             device.create_shader_module_trusted(
                 wgpu::ShaderModuleDescriptor {
@@ -1407,12 +1369,11 @@ impl GpuTarget {
         }
         let pool = self.pool.counters();
         eprintln!(
-            "[cache-stats] resolves={n} artifacts={} pipelines={} by_source={} verified={} \
+            "[cache-stats] resolves={n} artifacts={} pipelines={} by_source={} \
              bind_groups={} plans={} pool_live_mib={} pool_created={}",
             self.artifacts.lock().len(),
             self.pipelines.lock().len(),
             self.pipelines_by_source.lock().len(),
-            self.verified.lock().len(),
             self.launcher.bind_group_count(),
             self.cache.memory_len(),
             pool.live_bytes >> 20,

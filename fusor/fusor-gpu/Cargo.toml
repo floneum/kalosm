@@ -44,6 +44,8 @@ wgpu = { version = "29", default-features = false, features = ["vulkan"] }
 wgpu = { version = "29", default-features = false, features = ["webgpu", "wgsl", "fragile-send-sync-non-atomic-wasm"] }
 
 [features]
+# Expensive compiler invariants are exercised by conformance, never dispatch.
+compiler-tests = ["fusor-ir/compiler-tests"]
 default = []
 # The wgpu fork contributes exactly two capabilities: workgroup-alias byte-arena
 # packing and mixed-precision cooperative store. Without it the arena falls back

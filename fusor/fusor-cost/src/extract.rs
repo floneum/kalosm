@@ -11,7 +11,7 @@
 //!    4b. `co_select`, the compound move: adopt every reader of one producer
 //!    class together.
 //! 5. Budget, keeping best-so-far. Fully deterministic.
-//! 6. `verify_plan` on the winner — a hard conformance assert, never a
+//! 6. Test builds independently verify the winner — never a
 //!    silent fallback.
 //!
 //! Every decision path iterates classes and nodes in ascending id order.
@@ -441,15 +441,17 @@ impl LocalSearch {
         }
 
         let plan = derive_plan(graph, &ex, &realized, cost.facts(), best_cost)?;
-        // Before verification: a rejected plan is the one worth reading.
+        // Dump the completed plan for diagnostics.
         probe_dump(graph, &plan, &ex, &realized, &self.caps, cost);
+        #[cfg(feature = "compiler-tests")]
         crate::verify_plan::verify_plan_with(
             graph,
             &plan,
             self.arena.as_ref(),
             &self.caps,
             self.registry.as_ref(),
-        )?;
+        )
+        .unwrap_or_else(|e| panic!("constructed plan violates a compiler invariant: {e}"));
 
         stats.observe(plan.hash, &binding_of(graph, &realized));
         trace.micros = started.elapsed().as_micros() as u64;
@@ -479,7 +481,7 @@ impl LocalSearch {
     }
 
     /// The plan a given extraction denotes: realize, repair, re-realize,
-    /// derive, verify. No search. A candidate is priced and built by exactly
+    /// derive. No search. A candidate is priced and built by exactly
     /// the path `extract` returns its winner through.
     ///
     /// The `cache` is the caller's: `Work` is a property of a graph node and
@@ -496,15 +498,16 @@ impl LocalSearch {
             .price(graph, roots, ex, cost, cache)
             .map_err(|_| Error::Plan("autotune candidate does not realize".into()))?;
         let plan = derive_plan(graph, ex, &realized, cost.facts(), exact)?;
-        // A candidate dispatches on the real device against real buffers, so
-        // it passes the same verifier the base plan does — or it is not built.
+        // Conformance checks the plan independently of the constructor.
+        #[cfg(feature = "compiler-tests")]
         crate::verify_plan::verify_plan_with(
             graph,
             &plan,
             self.arena.as_ref(),
             &self.caps,
             self.registry.as_ref(),
-        )?;
+        )
+        .unwrap_or_else(|e| panic!("constructed plan violates a compiler invariant: {e}"));
         Ok(plan)
     }
 
@@ -521,33 +524,9 @@ impl LocalSearch {
     }
 }
 
-impl Extractor for LocalSearch {
-    fn lower_bound(&self, graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds> {
-        crate::lower_bound::lower_bound(graph, cost)
-    }
-
-    fn extract(
-        &self,
-        graph: &EGraph,
-        roots: &[Id],
-        cost: &dyn CostModel,
-        budget: ExtractBudget,
-    ) -> Result<Plan> {
-        self.extract_traced(graph, roots, cost, budget)
-            .map(|(p, _)| p)
-    }
-
-    fn verify_plan(&self, graph: &EGraph, plan: &Plan) -> Result<()> {
-        crate::verify_plan::verify_plan_with(
-            graph,
-            plan,
-            self.arena.as_ref(),
-            &self.caps,
-            self.registry.as_ref(),
-        )
-    }
-
-    fn launch_variants(
+impl LocalSearch {
+    #[allow(clippy::too_many_arguments)]
+    fn candidate_plans(
         &self,
         graph: &EGraph,
         roots: &[Id],
@@ -555,6 +534,8 @@ impl Extractor for LocalSearch {
         launch_ix: usize,
         cost: &dyn CostModel,
         min_macs: u64,
+        points: fn(&ScheduleDomain) -> SmallVec<[SchedPoint; 8]>,
+        limit: usize,
     ) -> Vec<(String, Plan)> {
         let Some(launch) = base.launches.get(launch_ix) else {
             return Vec::new();
@@ -570,11 +551,13 @@ impl Extractor for LocalSearch {
         // explorable.
 
         let class = graph.class_of(root);
-        let fair = fair_points(
+        let fair = fair_points_with(
             graph,
             class,
             base.extraction.theta.get(&root).copied(),
             root,
+            points,
+            limit != usize::MAX,
         );
         let mut out: Vec<(String, Plan)> = Vec::new();
         // One cache for the whole sweep: `Work` is a property of the graph
@@ -584,7 +567,7 @@ impl Extractor for LocalSearch {
         let dbg = std::env::var_os("FUSOR_TUNE_DEBUG").is_some();
         {
             for (member, theta, label) in fair {
-                if out.len() >= TUNE_MAX_VARIANTS {
+                if out.len() >= limit {
                     if dbg {
                         eprintln!("[vdbg] L{launch_ix} cap reached at {}", out.len());
                     }
@@ -637,6 +620,76 @@ impl Extractor for LocalSearch {
         }
         out
     }
+}
+
+impl Extractor for LocalSearch {
+    fn lower_bound(&self, graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds> {
+        crate::lower_bound::lower_bound(graph, cost)
+    }
+
+    fn extract(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        cost: &dyn CostModel,
+        budget: ExtractBudget,
+    ) -> Result<Plan> {
+        self.extract_traced(graph, roots, cost, budget)
+            .map(|(p, _)| p)
+    }
+
+    #[cfg(feature = "compiler-tests")]
+    fn verify_plan(&self, graph: &EGraph, plan: &Plan) -> Result<()> {
+        crate::verify_plan::verify_plan_with(
+            graph,
+            plan,
+            self.arena.as_ref(),
+            &self.caps,
+            self.registry.as_ref(),
+        )
+    }
+
+    fn launch_variants(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        base: &Plan,
+        launch_ix: usize,
+        cost: &dyn CostModel,
+        min_macs: u64,
+    ) -> Vec<(String, Plan)> {
+        self.candidate_plans(
+            graph,
+            roots,
+            base,
+            launch_ix,
+            cost,
+            min_macs,
+            sample_points,
+            TUNE_MAX_VARIANTS,
+        )
+    }
+
+    #[cfg(feature = "compiler-tests")]
+    fn test_launch_variants(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        base: &Plan,
+        launch_ix: usize,
+        cost: &dyn CostModel,
+    ) -> Vec<(String, Plan)> {
+        self.candidate_plans(
+            graph,
+            roots,
+            base,
+            launch_ix,
+            cost,
+            0,
+            test_points,
+            usize::MAX,
+        )
+    }
 
     fn launch_variant_labels(
         &self,
@@ -666,7 +719,7 @@ impl Extractor for LocalSearch {
 
     /// The batch adoption path: resolve each label to its `(member, theta)`
     /// by signature — no replans — apply every selection and schedule move
-    /// onto one cloned extraction, and replan/verify once. The per-swap
+    /// onto one cloned extraction, and construct the plan once. The per-swap
     /// candidate enumeration is `fair_points`, the same walk
     /// `launch_variants` and `launch_variant_labels` offer from, so a label
     /// either of them names resolves here and no other does.
@@ -988,7 +1041,7 @@ fn probe_dump(
                 m,
                 op_tag(&graph.node(*m).op),
                 _ex.theta.get(m),
-                realize::has_legal_point(graph, *m, caps),
+                realize::composite_bindings_fit(graph, *m, caps),
                 realize::domain_of(graph, *m).map(|d| d.len()),
                 graph.members(graph.class_of(*m))
             );
@@ -1307,7 +1360,6 @@ fn seed_theta_trailed(
     cost: &dyn CostModel,
     trail: &mut RepairTrail,
 ) {
-    let caps = &cost.facts().caps;
     let mut selected: Vec<Id> = ex.sigma.values().copied().collect();
     selected.sort_unstable();
     selected.dedup();
@@ -1326,7 +1378,6 @@ fn seed_theta_trailed(
         }
         if let Some(current) = ex.theta.get(&id).copied()
             && domain.iter().any(|p| p == current)
-            && realize::point_is_legal(graph, id, current, caps)
         {
             continue;
         }
@@ -1336,20 +1387,8 @@ fn seed_theta_trailed(
             .map(|c| graph.facts(*c).clone())
             .collect();
         let out = graph.facts(id);
-        // Only points this device can actually run: `has_legal_point` gates
-        // the node, not the point, so without this clause an over-footprint
-        // point can win the seed and nothing is obliged to move off it.
-        // If nothing is legal, fall back the same way `legal_members` did and
-        // let `verify_plan` name it precisely rather than leaving `theta`
-        // unset.
         let mut best: Option<(Picoseconds, usize, _)> = None;
-        let any_legal = domain
-            .iter()
-            .any(|t| realize::point_is_legal(graph, id, t, caps));
         for (i, theta) in domain.iter().enumerate() {
-            if any_legal && !realize::point_is_legal(graph, id, theta, caps) {
-                continue;
-            }
             let s = cost.node_math(node, &ins, out, Some(theta));
             if best.as_ref().is_none_or(|(b, _, _)| s < *b) {
                 best = Some((s, i, theta));
@@ -1891,27 +1930,20 @@ const TUNE_GEOMS: [(u32, u32, u32); 6] = [
 
 /// The points of one domain worth timing.
 ///
-/// `splits` and `staging` are pinned to the domain's first entry — always
-/// `1` and `1`.
+/// Cooperative samples use the first supported depth of each sampled tile.
 fn sample_points(domain: &ScheduleDomain) -> SmallVec<[SchedPoint; 8]> {
     let mut out: SmallVec<[SchedPoint; 8]> = SmallVec::new();
     match domain {
         ScheduleDomain::Point => {}
         ScheduleDomain::Coop(d) => {
-            let (Some(splits), Some(staging)) = (d.splits.first(), d.staging.first()) else {
-                return out;
-            };
             for (bm, bn, bk) in TUNE_GEOMS {
-                if let Some(geom) = d
-                    .geoms
+                if let Some((index, _)) = d
+                    .schedules
                     .iter()
-                    .find(|g| g.bm == bm && g.bn == bn && g.bk == bk)
+                    .enumerate()
+                    .find(|(_, p)| p.geom.bm == bm && p.geom.bn == bn && p.geom.bk == bk)
                 {
-                    out.push(SchedPoint::Coop {
-                        geom: *geom,
-                        splits: *splits,
-                        staging: *staging,
-                    });
+                    out.push(d.point(index).expect("index belongs to the domain"));
                 }
             }
         }
@@ -2242,6 +2274,17 @@ fn fair_points(
     here: Option<SchedPoint>,
     root: Id,
 ) -> Vec<(Id, SchedPoint, String)> {
+    fair_points_with(graph, class, here, root, sample_points, true)
+}
+
+fn fair_points_with(
+    graph: &EGraph,
+    class: ClassId,
+    here: Option<SchedPoint>,
+    root: Id,
+    points: fn(&ScheduleDomain) -> SmallVec<[SchedPoint; 8]>,
+    deduplicate_labels: bool,
+) -> Vec<(Id, SchedPoint, String)> {
     let per_member: Vec<(Id, SmallVec<[SchedPoint; 8]>)> = graph
         .members(class)
         .into_iter()
@@ -2250,7 +2293,7 @@ fn fair_points(
                 return None;
             };
             let domain = l1.schedule()?;
-            Some((member, sample_points(domain)))
+            Some((member, points(domain)))
         })
         .collect();
     let rounds = per_member.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
@@ -2265,9 +2308,14 @@ fn fair_points(
                 continue;
             }
             let label = variant_signature(graph, *member, theta);
-            if !offered.insert(label.clone()) {
+            if deduplicate_labels && !offered.insert(label.clone()) {
                 continue;
             }
+            let label = if deduplicate_labels {
+                label
+            } else {
+                format!("{member}: {label}")
+            };
             fair.push((*member, theta, label));
         }
     }
@@ -2298,4 +2346,19 @@ fn variant_signature(graph: &EGraph, member: Id, theta: SchedPoint) -> String {
         }
     }
     format!("{tag}{q}|{theta:?}")
+}
+
+/// Structural coverage, independent of the tuner. Small domains are
+/// exhaustive; large tiling domains exercise both ends and the midpoint.
+/// Domain construction tests separately check every geometry's resources.
+#[cfg(feature = "compiler-tests")]
+fn test_points(domain: &ScheduleDomain) -> SmallVec<[SchedPoint; 8]> {
+    let n = domain.len();
+    if n <= 32 {
+        return domain.iter().collect();
+    }
+    [0, 1, n / 2, n / 2 + 1, n - 2, n - 1]
+        .into_iter()
+        .filter_map(|i| domain.point(i))
+        .collect()
 }
