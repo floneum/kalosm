@@ -64,7 +64,7 @@ naga = "29"
 # Use Naga from the ealmloff/wgpu fork. It includes the
 # `CooperativeLoad` correctness fix in `bake_ref_count`, so a simdgroup load
 # referenced once cannot sink past the barrier that ordered it. This revision
-# also supplies browser matrix serialization; see docs/browser-dependencies.md.
+# also supplies browser matrix serialization.
 [patch.crates-io]
 wgpu = { git = "https://github.com/ealmloff/wgpu", rev = "24a7d3577213fc147637fe7fb20e0e845a74df8a" }
 naga = { git = "https://github.com/ealmloff/wgpu", rev = "24a7d3577213fc147637fe7fb20e0e845a74df8a" }

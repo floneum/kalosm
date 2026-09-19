@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Prepare complete, deduplicated ASCII stories from a bounded source download.
-
-See assets/TinyStories.md for the pinned input and reproduction command.
+"""Prepare ASCII stories from the first 8,500,000 bytes of:
+https://huggingface.co/datasets/roneneldan/TinyStories/resolve/f54c09fd23315a6f9c86f9dc80f725de7d8f9c64/TinyStoriesV2-GPT4-train.txt
 """
 import hashlib
 import pathlib
@@ -9,7 +8,7 @@ import sys
 import unicodedata
 
 raw = pathlib.Path(sys.argv[1]).read_bytes()
-assert len(raw) == 8_500_000, "Expected the documented byte range, not the full dataset"
+assert len(raw) == 8_500_000, "Expected the first 8,500,000 source bytes"
 assert hashlib.sha256(raw).hexdigest() == "9e59eafca35ea007cb15da6e95cda29d525e79f39b4ae62f197985ef72d35471", "Source slice changed"
 punctuation = str.maketrans({"’": "'", "‘": "'", "“": '"', "”": '"', "—": "-", "–": "-", "…": "..."})
 stories, seen, size = [], set(), 0
