@@ -650,26 +650,13 @@ impl Session {
             let __replayed = memo_eligible && self.inner.saturation.replay(&mut g);
             if !__skipped && !__replayed {
                 let pre = memo_eligible.then(|| g.pre_saturation());
-                // A flat `max_applications` exhausts mid-walk on a model-scale
-                // graph, leaving nodes past the exhaustion point without their
-                // `lower_*` kernel members; scale the ceiling with the
-                // pre-saturation node count.
+                // Scale search with the input graph. The driver finishes
+                // lowering when this budget is exhausted.
                 let mut budget = SaturationBudget::default();
                 budget.max_applications = budget
                     .max_applications
                     .max((g.len() as u32).saturating_mul(16));
                 Driver::new().saturate(&mut g, &caps, &self.inner.rules, budget)?;
-                // The frontier below `len` is the driver's own exhaustion
-                // signal: double and continue until every node has been
-                // offered every rule. Bounded, so a genuinely exploding
-                // graph still terminates.
-                for _ in 0..8 {
-                    if g.saturation_frontier >= g.len() {
-                        break;
-                    }
-                    budget.max_applications = budget.max_applications.saturating_mul(2);
-                    Driver::new().saturate(&mut g, &caps, &self.inner.rules, budget)?;
-                }
                 if let Some(pre) = pre {
                     self.inner.saturation.insert(g.record_saturation(pre));
                 }
@@ -2801,6 +2788,87 @@ fn resolve_elements(shape: &[Dim], graph: &GraphRef) -> Result<u64> {
 mod tests {
     use super::*;
     use crate::graph::Graph;
+
+    #[test]
+    #[cfg(feature = "cpu")]
+    fn exhausted_saturation_still_executes_the_lowering_floor() {
+        let session = Session::new(Backend::cpu().unwrap()).unwrap();
+        let graph = Graph::new(&session);
+        let h = graph.handle();
+        let a = Tensor::from_elements(
+            h,
+            &[Dim::Const(2), Dim::Const(3)],
+            &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
+        )
+        .unwrap();
+        let b = Tensor::from_elements(
+            h,
+            &[Dim::Const(3), Dim::Const(2)],
+            &[7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0],
+        )
+        .unwrap();
+        let out = a
+            .matmul(&b)
+            .unwrap()
+            .add_scalar(1.0)
+            .unwrap()
+            .sum(1)
+            .unwrap();
+        let unrelated = a.add_scalar(5.0).unwrap();
+        let resolving = h.state().resolve_lock.lock();
+        let execute_floor = |out: &Tensor| {
+            let plan = {
+                let mut g = h.state().egraph.lock();
+                g.clear_roots();
+                g.add_root(out.id);
+                let report = Driver::new()
+                    .saturate(
+                        &mut g,
+                        &session.caps(),
+                        &session.inner.rules,
+                        SaturationBudget {
+                            max_applications: 0,
+                            ..SaturationBudget::default()
+                        },
+                    )
+                    .unwrap();
+                assert!(!report.saturated);
+                session
+                    .inner
+                    .extractor
+                    .extract(
+                        &g,
+                        &[out.id],
+                        session.inner.cost.as_ref(),
+                        ExtractBudget::default(),
+                    )
+                    .unwrap()
+            };
+            session.run(h, &plan, std::slice::from_ref(out)).unwrap();
+            let bytes = session.read_bytes_locked(&resolving, h, out.id).unwrap();
+            bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+        };
+        assert_eq!(execute_floor(&out), [124.0, 295.0]);
+        {
+            let mut g = h.state().egraph.lock();
+            g.add_root(a.id);
+            let before = g.len();
+            let report = Driver::new()
+                .saturate(
+                    &mut g,
+                    &session.caps(),
+                    &session.inner.rules,
+                    SaturationBudget::default(),
+                )
+                .unwrap();
+            assert_eq!(
+                report.applications, 0,
+                "revisited an exhausted root closure"
+            );
+            assert_eq!(g.len(), before);
+        }
+        assert_eq!(execute_floor(&unrelated), [6.0, 7.0, 8.0, 9.0, 10.0, 11.0]);
+    }
 
     /// The same expression rebuilt over a fresh input leaf must run the
     /// recorded plan again rather than extract another: the graph grew, so

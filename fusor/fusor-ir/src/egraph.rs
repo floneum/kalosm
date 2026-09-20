@@ -66,27 +66,16 @@ pub struct EGraph {
     roots: Vec<Id>,
     next_sym: u32,
     sem: Arc<dyn Semantics>,
-    /// Nodes below this index have already had every rule offered to them in
-    /// a fully-saturated earlier pass. A rule's applicability is a function
-    /// of `(node, child facts, caps)` — all immutable once minted — so
-    /// re-offering below the frontier can only re-mint. Advanced by the
-    /// saturation driver only when a pass finishes unbudgeted.
-    pub saturation_frontier: usize,
-    /// Nodes that have been offered every rule, by id. Saturation is scoped
-    /// to the roots' reachable closure, so this — not a prefix of the arena
-    /// — is what says a node needs no further offering: a node reachable
-    /// only from a later root set is offered then, and a node no root ever
-    /// reaches again is never re-lowered.
+    /// Nodes covered by a completed bounded search and its lowering floor.
+    /// A node reached only by a later root remains eligible for search.
     offered: FixedBitSet,
     /// The current dim bindings, as a hint for costing: extraction and the
     /// tuner's work gate price a symbolic extent at its bound value rather
     /// than a nominal one, so a symbolic plan is tuned like a concrete one.
     /// Set by the session before it plans; never read by a rule.
     pub dim_hints: FxHashMap<SymId, u64>,
-    /// Root sets whose reachable closure has been offered every rule. The
-    /// arena is append-only and an offered node is never re-fired, so a
-    /// closure once saturated stays saturated whatever is appended later:
-    /// a root set seen here needs no walk at all. Bounded by clearing.
+    /// Root sets whose reachable closure has completed bounded search.
+    /// A root set seen here needs no walk at all. Bounded by clearing.
     pub saturated_root_sets: FxHashSet<Vec<Id>>,
     /// The node count as of the last completed saturation on this graph.
     /// `add` is the only structural mutation, so `saturated_at_len ==
@@ -133,7 +122,6 @@ impl EGraph {
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
             class_ids_memo: (usize::MAX, FxHashMap::default()),
-            saturation_frontier: 0,
             offered: FixedBitSet::new(),
             dim_hints: FxHashMap::default(),
             saturated_root_sets: FxHashSet::default(),
@@ -151,7 +139,7 @@ impl EGraph {
         }
     }
 
-    /// Whether `id` has been offered every rule by an earlier saturation.
+    /// Whether `id` was covered by an earlier bounded search.
     pub fn is_offered(&self, id: Id) -> bool {
         self.offered.contains(id.index())
     }
@@ -513,7 +501,6 @@ impl EGraph {
         self.offered.clone_from(&delta.offered);
         self.roots.clone_from(&delta.roots);
         self.next_sym = delta.next_sym;
-        self.saturation_frontier = self.nodes.len();
         true
     }
 

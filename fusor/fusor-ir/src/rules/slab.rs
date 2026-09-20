@@ -60,6 +60,7 @@ pub fn form_slab(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Op
 
     // Producers first: the launch spelling of each operand, or the longest
     // slab already ending there.
+    let mut producers = Producers::default();
     let mut members: Vec<Id> = Vec::new();
     for o in ops {
         // A value every slab reads the same way — a broadcast scalar, a
@@ -68,7 +69,7 @@ pub fn form_slab(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Op
         if !varies(o, op) {
             continue;
         }
-        if let Some(p) = producer_stage(b, o.src) {
+        if let Some(p) = producers.get(b, o.src) {
             match &b.node(p).op {
                 Op::Launch(Launch::Slab { members: ms, .. }) => members.extend(ms.iter().copied()),
                 _ => members.push(p),
@@ -148,7 +149,7 @@ pub fn form_slab(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Op
                 if !deps.depends(b, c, &seen) {
                     continue;
                 }
-                match producer_stage(b, c).map(|p| (p, b.node(p).op.clone())) {
+                match producers.get(b, c).map(|p| (p, b.node(p).op.clone())) {
                     Some((_, Op::Launch(Launch::Slab { members: ms, .. }))) => {
                         added.extend(ms.iter().copied())
                     }
@@ -415,13 +416,21 @@ pub(crate) fn small_fold(b: &Builder<'_>, id: Id) -> bool {
 /// stage or a copy dispatch the chain would carry), then the most operands
 /// (the most producers inlined), then the earliest id.
 pub(crate) fn stage_rank(b: &Builder<'_>, m: Id) -> (isize, usize, u64, isize) {
+    rank_stage(b, m, |ops| copy_operands(b, ops))
+}
+
+fn rank_stage(
+    b: &Builder<'_>,
+    m: Id,
+    copies: impl FnOnce(&[Operand]) -> usize,
+) -> (isize, usize, u64, isize) {
     let Op::Launch(op) = &b.node(m).op else {
         return (isize::MIN, 0, 0, 0);
     };
     let Some((_, ops)) = stage_parts(op) else {
         return (isize::MIN, 0, 0, 0);
     };
-    let copies = copy_operands(b, ops) as isize;
+    let copies = copies(ops) as isize;
     // Among sums of split-K partials, the most split: the contraction
     // feeding it runs with the most workgroups.
     let splits = match op {
@@ -438,9 +447,13 @@ pub(crate) fn stage_rank(b: &Builder<'_>, m: Id) -> (isize, usize, u64, isize) {
 /// Operands that are copies of some other value and are read varyingly: a
 /// broadcast read of a copy class is a scalar, not a copy dispatch.
 pub(crate) fn copy_operands(b: &Builder<'_>, ops: &[Operand]) -> usize {
+    count_copies(ops, |id| is_copy_class(b, id))
+}
+
+fn count_copies(ops: &[Operand], mut is_copy: impl FnMut(Id) -> bool) -> usize {
     ops.iter()
-        .filter(|o| is_copy_class(b, o.src))
         .filter(|o| o.layout.strides().iter().any(|s| s.as_const() != Some(0)))
+        .filter(|o| is_copy(o.src))
         .count()
 }
 
@@ -464,48 +477,75 @@ pub(crate) fn is_copy_class(b: &Builder<'_>, id: Id) -> bool {
     copy
 }
 
-/// The launch spelling of `src`'s value that can be a stage, or the slab
-/// with the most members already ending in that class.
-fn producer_stage(b: &Builder<'_>, src: Id) -> Option<Id> {
-    let contraction = has_contract_spelling(b, src);
-    let mut best_slab: Option<(usize, Id)> = None;
-    let mut stage: Option<Id> = None;
-    for m in b.class_members(src) {
-        // In a contraction's class only a plain sum of partials, or a
-        // slab ending in one, is a stage; the tiled kernel stays its own
-        // dispatch.
-        if contraction {
-            let last = match &b.node(m).op {
-                Op::Launch(Launch::Slab { members, .. }) => members.last().copied().unwrap_or(m),
-                _ => m,
-            };
-            if !small_fold(b, last) {
-                continue;
-            }
+/// Class metadata stays fixed until `form_slab` finishes choosing its
+/// members and adds the resulting launch.
+#[derive(Default)]
+struct Producers {
+    copies: FxHashMap<ClassId, bool>,
+    chosen: FxHashMap<ClassId, Option<Id>>,
+}
+
+impl Producers {
+    /// The launch spelling that can be a stage, or the longest slab ending
+    /// in this class.
+    fn get(&mut self, b: &Builder<'_>, src: Id) -> Option<Id> {
+        let class = b.class_of(src);
+        if let Some(chosen) = self.chosen.get(&class) {
+            return *chosen;
         }
-        match &b.node(m).op {
-            Op::Launch(Launch::Slab { members, .. }) => {
-                if best_slab.is_none_or(|(n, _)| members.len() > n) {
-                    best_slab = Some((members.len(), m));
+        let contraction = has_contract_spelling(b, src);
+        let mut best_slab: Option<(usize, Id)> = None;
+        let mut stage = None;
+        for m in b.class_members(src) {
+            // In a contraction's class only a plain sum of partials, or a
+            // slab ending in one, is a stage; the tiled kernel stays its own
+            // dispatch.
+            if contraction {
+                let last = match &b.node(m).op {
+                    Op::Launch(Launch::Slab { members, .. }) => {
+                        members.last().copied().unwrap_or(m)
+                    }
+                    _ => m,
+                };
+                if !small_fold(b, last) {
+                    continue;
                 }
             }
-            Op::Launch(op)
-                if stage_parts(op).is_some()
-                    && stage.is_none_or(|s| stage_rank(b, m) > stage_rank(b, s)) =>
-            {
-                stage = Some(m);
+            match &b.node(m).op {
+                Op::Launch(Launch::Slab { members, .. }) => {
+                    if best_slab.is_none_or(|(n, _)| members.len() > n) {
+                        best_slab = Some((members.len(), m));
+                    }
+                }
+                Op::Launch(op) if stage_parts(op).is_some() => {
+                    let rank = rank_stage(b, m, |ops| {
+                        count_copies(ops, |id| {
+                            *self
+                                .copies
+                                .entry(b.class_of(id))
+                                .or_insert_with(|| is_copy_class(b, id))
+                        })
+                    });
+                    if stage.is_none_or(|(best, _)| rank > best) {
+                        stage = Some((rank, m));
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
+        // A stage every workgroup would compute identically — a scalar of the
+        // step count, a broadcast — is one launch every chain shares, not a
+        // member: two slabs may not own one member, and it would make every
+        // chain's slab overlap every other's.
+        let stage = stage.map(|(_, s)| s);
+        let chosen = if stage.is_some_and(|s| invariant_stage(b, s)) {
+            None
+        } else {
+            best_slab.map(|(_, s)| s).or(stage)
+        };
+        self.chosen.insert(class, chosen);
+        chosen
     }
-    // A stage every workgroup would compute identically — a scalar of the
-    // step count, a broadcast — is one launch every chain shares, not a
-    // member: two slabs may not own one member, and it would make every
-    // chain's slab overlap every other's.
-    if stage.is_some_and(|s| invariant_stage(b, s)) {
-        return None;
-    }
-    best_slab.map(|(_, s)| s).or(stage)
 }
 
 /// Whether no operand of the stage varies over its space.
@@ -588,10 +628,7 @@ fn finest(b: &Builder<'_>, m: Id, classes: &FxHashSet<ClassId>) -> Option<u64> {
 /// of idle lanes stepping through barriers.
 fn coarsen(g: u64, widest: u64, caps: &crate::device::Caps) -> Option<u64> {
     let block = u64::from(crate::ir::launch::emitted_block(1, caps));
-    let slabs = (1..=g)
-        .filter(|d| g.is_multiple_of(*d) && widest / d >= block)
-        .max()
-        .unwrap_or(1);
+    let slabs = largest_divisor_at_most(g, widest / block);
     // A chain too small to fill `MIN_SLABS` blocks is a few workgroups
     // whichever way it is cut; one dispatch for it beats several.
     let floor = if widest < MIN_SLABS * block {
@@ -600,6 +637,23 @@ fn coarsen(g: u64, widest: u64, caps: &crate::device::Caps) -> Option<u64> {
         MIN_SLABS
     };
     (slabs >= floor).then_some(slabs)
+}
+
+fn largest_divisor_at_most(n: u64, limit: u64) -> u64 {
+    let mut best = 1;
+    let mut divisor = 1;
+    while divisor <= limit && divisor <= n / divisor {
+        if n.is_multiple_of(divisor) {
+            let paired = n / divisor;
+            // Paired divisors descend, so the first within the limit wins.
+            if paired <= limit {
+                return paired;
+            }
+            best = divisor;
+        }
+        divisor += 1;
+    }
+    best
 }
 
 fn gcd(mut a: u64, mut b: u64) -> u64 {
@@ -859,6 +913,32 @@ impl Deps {
                 continue;
             }
             stack.extend(b.node(x).children.iter().copied());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::largest_divisor_at_most;
+
+    #[test]
+    fn slab_divisor_matches_exhaustive_selection() {
+        for n in 0u64..=256 {
+            for limit in 0..=n + 1 {
+                let expected = (1..=n)
+                    .filter(|d| n.is_multiple_of(*d) && *d <= limit)
+                    .max()
+                    .unwrap_or(1);
+                assert_eq!(largest_divisor_at_most(n, limit), expected);
+            }
+        }
+        for (n, limit, expected) in [
+            (1 << 30, 1000, 512),
+            (1_000_000_007, 1_000_000, 1),
+            (1_000_000_000_000, 1_000_000, 1_000_000),
+            (u64::MAX, 3, 3),
+        ] {
+            assert_eq!(largest_divisor_at_most(n, limit), expected);
         }
     }
 }
