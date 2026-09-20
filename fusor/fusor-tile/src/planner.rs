@@ -22,7 +22,7 @@ use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 
 use crate::arena;
-use crate::liveness::{LivenessInfo, analyze, for_each_addr_expr, for_each_child};
+use crate::liveness::{LivenessInfo, analyze, for_each_addr_expr};
 
 /// Memo key: everything `arena_plan`'s result depends on.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -240,7 +240,7 @@ impl BodyHasher {
     }
 
     /// The per-node payload: everything that is neither a child expression
-    /// (walked by `for_each_child`) nor an identity already folded in above.
+    /// (walked by `TileExprKind::visit_children`) nor an identity already folded in above.
     /// Fold `e`'s identity into `h`, computing it once per distinct node.
     fn expr(&mut self, e: &TileExpr, h: &mut FxHasher) {
         let ptr = e.node_ptr();
@@ -316,7 +316,7 @@ impl BodyHasher {
             | TileExprKind::Dot { .. }
             | TileExprKind::CoopMma { .. } => {}
         }
-        for_each_child(kind, &mut |c| self.expr(c, h));
+        kind.visit_children(&mut |c| self.expr(c, h));
     }
 
     fn merge(&mut self, m: &MergeBody, h: &mut FxHasher) {

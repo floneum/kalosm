@@ -11,7 +11,7 @@
 //! narrow: the emitter half of the `widen-compute` rule.
 
 use fusor_ir::dtype::RoundMode;
-use fusor_ir::ir::kernel::{ScalarElement, TileReduceOp};
+use fusor_ir::ir::kernel::ScalarElement;
 use fusor_ir::scalar::{BinOp, CmpOp, UnOp};
 
 use super::access::AccessForm;
@@ -37,17 +37,6 @@ impl NumTy {
             ScalarElement::I32 => Self::I32,
         }
     }
-}
-
-/// A cross-lane reduction, already resolved to a CPU strategy.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
-pub enum RKind {
-    /// Horizontal reduce of the `W` lanes of one register by `log2(W)`
-    /// shuffle-reduce steps, broadcast back across the register.
-    Subgroup,
-    /// Read a group result the preceding tree pass already broadcast into
-    /// `tile`. `group` is the lane-group width.
-    TileGroup { tile: u16, group: u32 },
 }
 
 /// One tape instruction. `out` is the base register slot; a vector-typed
@@ -168,33 +157,10 @@ pub enum Instr {
         base: Slot,
         component: u32,
     },
-    Dot {
-        out: Slot,
-        a: Slot,
-        b: Slot,
-        lanes: u32,
-    },
-    Reduce {
-        out: Slot,
-        op: TileReduceOp,
-        x: Slot,
-        kind: RKind,
-        /// Lane-group base index, for `RKind::TileGroup`.
-        group_base: Slot,
-    },
     /// Unpack a `u32` of two packed f16s into a 2-lane f32 vector.
     Unpack2x16 {
         out: Slot,
         x: Slot,
-    },
-    /// Run a rank-2 address through the declared divmod chain of
-    /// `maps[map]`. Only the divmods the `MultiFlattenMap` declares are
-    /// performed, because `divmod_ops()` is the cost term.
-    Rc2Index {
-        out: Slot,
-        row: Slot,
-        col: Slot,
-        map: u16,
     },
     Copy {
         out: Slot,
@@ -224,10 +190,7 @@ impl Instr {
             | Instr::Select { out, .. }
             | Instr::VecCompose { out, .. }
             | Instr::VecComponent { out, .. }
-            | Instr::Dot { out, .. }
-            | Instr::Reduce { out, .. }
             | Instr::Unpack2x16 { out, .. }
-            | Instr::Rc2Index { out, .. }
             | Instr::Copy { out, .. } => *out,
         }
     }

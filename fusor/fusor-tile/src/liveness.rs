@@ -337,60 +337,6 @@ pub(crate) fn for_each_tile(kind: &TileExprKind, f: &mut dyn FnMut(&Tile, TileUs
     }
 }
 
-/// Every direct child expression of a node, in a fixed order.
-pub(crate) fn for_each_child(kind: &TileExprKind, f: &mut dyn FnMut(&TileExpr)) {
-    match kind {
-        TileExprKind::Literal(_)
-        | TileExprKind::Builtin(_)
-        | TileExprKind::LoadLocal(_)
-        | TileExprKind::CoopZero { .. } => {}
-        TileExprKind::Load {
-            addr, mask, fill, ..
-        } => {
-            for_each_addr_expr(addr, f);
-            f(mask);
-            f(fill);
-        }
-        TileExprKind::LoadTile { index, .. } => f(index),
-        TileExprKind::Unary { value, .. } => f(value),
-        TileExprKind::Binary { left, right, .. } | TileExprKind::Compare { left, right, .. } => {
-            f(left);
-            f(right);
-        }
-        TileExprKind::Round { value, .. } => f(value),
-        TileExprKind::Cast { value, .. } | TileExprKind::Bitcast { value, .. } => f(value),
-        TileExprKind::Select {
-            condition,
-            accept,
-            reject,
-        } => {
-            f(condition);
-            f(accept);
-            f(reject);
-        }
-        TileExprKind::Vec { parts, .. } => {
-            for part in parts {
-                f(part);
-            }
-        }
-        TileExprKind::VecComponent { vector, .. } => f(vector),
-        TileExprKind::Dot { left, right } => {
-            f(left);
-            f(right);
-        }
-        TileExprKind::Reduce { value, .. } => f(value),
-        TileExprKind::CoopLoad { src, .. } => {
-            f(&src.row);
-            f(&src.col);
-        }
-        TileExprKind::CoopMma { a, b, c } => {
-            f(a);
-            f(b);
-            f(c);
-        }
-    }
-}
-
 /// The expressions inside one address.
 pub(crate) fn for_each_addr_expr(addr: &Addr, f: &mut dyn FnMut(&TileExpr)) {
     match addr {
@@ -491,7 +437,8 @@ impl Walk {
             self.touch(tile, matches!(tile_use, TileUse::CoopRead));
         });
         self.access_kind = AccessKind::Read;
-        for_each_child(expr.kind(), &mut |child| self.visit_expr_once(child));
+        expr.kind()
+            .visit_children(&mut |child| self.visit_expr_once(child));
     }
 
     fn visit_addr(&mut self, addr: &Addr) {

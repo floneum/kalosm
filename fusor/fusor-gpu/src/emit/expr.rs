@@ -548,10 +548,10 @@ impl Emitter<'_> {
         Ok(self.append(Expression::Literal(lit)))
     }
 
-    /// Take the memo cache. Every value it holds is an SSA handle defined in
-    /// the *current* block, so a nested block must start empty and the parent
-    /// must get its entries back on exit.
+    /// Save the enclosing block's memo. Nested blocks may reuse its SSA values,
+    /// except collectives whose active lanes depend on control flow.
     pub(crate) fn push_scope(&mut self) -> Scope {
+        self.memo.retain(|expr, _| !expr.scope_dependent());
         Scope {
             memo: std::mem::take(&mut self.memo),
         }

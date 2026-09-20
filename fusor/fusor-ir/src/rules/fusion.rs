@@ -30,7 +30,7 @@ use crate::ir::launch::{AccessPlan, ContractSide, IndexSpace, Launch, Operand};
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
 use crate::rules::{MapView, access_legal_in, map_view, operand_dtypes, shift_args};
-use crate::scalar::{ScalarExpr, ScalarKind};
+use crate::scalar::ScalarExpr;
 use crate::shape::{AxisGroup, Dim, Layout, MultiFlattenMap};
 use smallvec::SmallVec;
 
@@ -381,26 +381,7 @@ fn covers_for_substitution(iter: &IndexSpace, inner: &MapView) -> bool {
     if !iter.covers(&inner.space) {
         return false;
     }
-    !reads_index_of(&inner.body) || inner.space.covers(iter)
-}
-
-/// Whether `e` names a loop coordinate anywhere.
-fn reads_index_of(e: &ScalarExpr) -> bool {
-    match e.kind() {
-        ScalarKind::IndexOf(_) => true,
-        ScalarKind::Un { x, .. }
-        | ScalarKind::Cast { x, .. }
-        | ScalarKind::Bitcast { x, .. }
-        | ScalarKind::Round { x, .. }
-        | ScalarKind::Splat { x, .. } => reads_index_of(x),
-        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
-            reads_index_of(a) || reads_index_of(b)
-        }
-        ScalarKind::Select { c, t, f } => {
-            reads_index_of(c) || reads_index_of(t) || reads_index_of(f)
-        }
-        ScalarKind::Arg(_) | ScalarKind::Lit(_) | ScalarKind::Uniform(_) => false,
-    }
+    !inner.body.reads_index_of() || inner.space.covers(iter)
 }
 
 /// The first operand slot of `ops` that can be absorbed, spliced.
@@ -783,7 +764,7 @@ fn absorb_into_side(
         // producer axis `perm[j]` is operand axis `j`, so the axis names
         // shift by the inverse. This lets a structural causal mask ride into
         // the contraction instead of materializing the masked scores.
-        if reads_index_of(&inner.body) {
+        if inner.body.reads_index_of() {
             let mut inv: SmallVec<[u32; 4]> = smallvec::smallvec![0; perm.len()];
             for (j, &i) in perm.iter().enumerate() {
                 inv[i] = j as u32;

@@ -20,7 +20,7 @@ pub(crate) type TapeRange = std::ops::Range<u32>;
 
 /// One loop-carried accumulator, held in a register across iterations and
 /// never reloaded.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CAcc {
     pub local: u16,
     pub init_prep: TapeRange,
@@ -32,7 +32,7 @@ pub struct CAcc {
 /// A compiled statement. Every variant carries the tape range it must evaluate
 /// immediately before executing, so a value inside a loop body is recomputed
 /// per iteration while a value hoisted above the loop is not.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CStmt {
     Store {
         prep: TapeRange,
@@ -149,7 +149,7 @@ impl CStmt {
 }
 
 /// One loop over the lane range, containing no barrier.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct LaneLoop {
     pub lanes: u32,
     pub width: u32,

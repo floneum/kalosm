@@ -161,16 +161,7 @@ pub struct Component {
 pub struct Realized {
     /// Selected nodes in post-order, leaves included.
     pub order: Vec<Id>,
-    /// Distinct realized consumers, plus one when the node is a root.
-    pub consumers: IdMap<u32>,
-    /// The consumers themselves, so a per-node query is O(consumers) rather
-    /// than a scan of the whole operand map.
-    pub consumer_nodes: IdMap<SmallVec<[Id; 4]>>,
-    /// Component index per non-leaf selected node.
-    pub launch_of: IdMap<u32>,
     pub components: Vec<Component>,
-    /// Resolved children per selected node, in operand order.
-    pub operands: IdMap<SmallVec<[Id; 4]>>,
     /// The roots after resolution through `sigma`.
     pub roots: Vec<Id>,
 }
@@ -351,21 +342,18 @@ impl Selected {
             roots,
         } = self;
         let caps = &cost.facts().caps;
-        let (consumers, consumer_nodes) = count_consumers(graph.len(), &order, &operands, &roots);
-        let (launch_of, groups) = cut(graph, extraction, &order, &operands).map_err(Error::from)?;
+        let mut readers = IdMap::<SmallVec<[Id; 4]>>::with_len(graph.len());
+        for id in &order {
+            for child in operands.get(*id).into_iter().flatten() {
+                readers.entry_or_default(*child).push(*id);
+            }
+        }
+        let (owners, groups) = cut(graph, extraction, &order, &operands).map_err(Error::from)?;
         let components = groups
             .into_iter()
             .map(|members| {
                 build_component(
-                    graph,
-                    extraction,
-                    &consumers,
-                    &consumer_nodes,
-                    &launch_of,
-                    &roots,
-                    members,
-                    caps,
-                    arena,
+                    graph, extraction, &operands, &readers, &owners, &roots, members, caps, arena,
                     cache,
                 )
             })
@@ -373,11 +361,7 @@ impl Selected {
 
         Ok(Realized {
             order,
-            consumers,
-            consumer_nodes,
-            launch_of,
             components,
-            operands,
             roots,
         })
     }
@@ -392,17 +376,6 @@ pub fn exact_cost(
 ) -> Picoseconds {
     let launches = realized.launches(extraction);
     cost.total(&launches)
-}
-
-/// `Some(is_last)` when `producer` is a member of the slab `consumer`.
-pub fn slab_stage(graph: &EGraph, consumer: Id, producer: Id) -> Option<bool> {
-    let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) =
-        &graph.node(consumer).op
-    else {
-        return None;
-    };
-    let pos = members.iter().position(|m| *m == producer)?;
-    Some(pos + 1 == members.len())
 }
 
 /// The member `sigma` selected for `id`'s class.
@@ -934,95 +907,47 @@ fn walk(
     Ok((order, operands))
 }
 
-type Consumers = (IdMap<u32>, IdMap<SmallVec<[Id; 4]>>);
-
-fn count_consumers(len: usize, order: &[Id], operands: &Operands, roots: &[Id]) -> Consumers {
-    let mut seen: IdMap<SmallVec<[Id; 4]>> = IdMap::with_len(len);
-    for v in order {
-        for c in operands.get(*v).map(|o| o.as_slice()).unwrap_or(&[]) {
-            let e = seen.entry_or_default(*c);
-            if !e.contains(v) {
-                e.push(*v);
-            }
-        }
-    }
-    let mut out: IdMap<u32> = IdMap::with_len(len);
-    for v in order {
-        let mut n = seen.get(*v).map_or(0, |c| c.len() as u32);
-        if roots.contains(v) {
-            n += 1;
-        }
-        out.insert(*v, n);
-    }
-    (out, seen)
-}
-
-/// Disjoint-set over positions in `order`.
-struct Dsu(Vec<usize>);
-
-impl Dsu {
-    fn new(n: usize) -> Self {
-        Self((0..n).collect())
-    }
-    fn find(&mut self, mut x: usize) -> usize {
-        while self.0[x] != x {
-            self.0[x] = self.0[self.0[x]];
-            x = self.0[x];
-        }
-        x
-    }
-    fn union(&mut self, a: usize, b: usize) {
-        let (ra, rb) = (self.find(a), self.find(b));
-        if ra != rb {
-            // Keep the *earlier* position as the representative so component
-            // numbering follows `order` and is therefore deterministic.
-            let (lo, hi) = if ra < rb { (ra, rb) } else { (rb, ra) };
-            self.0[hi] = lo;
-        }
-    }
-}
-
 fn cut(
     graph: &EGraph,
     extraction: &Extraction,
     order: &[Id],
     operands: &Operands,
-) -> std::result::Result<(IdMap<u32>, Vec<Vec<Id>>), WalkFail> {
-    let mut pos: IdMap<usize> = IdMap::with_len(graph.len());
-    for (i, v) in order.iter().enumerate() {
-        pos.insert(*v, i);
-    }
-    let mut dsu = Dsu::new(order.len());
-
-    for (i, v) in order.iter().enumerate() {
-        if leaf_role(graph, *v) != LeafRole::NotLeaf {
+) -> std::result::Result<(IdMap<Id>, Vec<Vec<Id>>), WalkFail> {
+    let mut owners = IdMap::with_len(graph.len());
+    // Consumers follow members in the postorder, so an outer composite
+    // assigns ownership before its nested composites pass it to their stages.
+    for &id in order.iter().rev() {
+        if leaf_role(graph, id) != LeafRole::NotLeaf {
             continue;
         }
-        for c in operands.get(*v).map(|o| o.as_slice()).unwrap_or(&[]) {
-            if slab_stage(graph, *v, *c).is_none() {
-                continue;
-            }
-            if let Some(j) = pos.get(*c) {
-                dsu.union(i, *j);
+        let owner = owners.copied(id).unwrap_or(id);
+        owners.insert(id, owner);
+        if let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) =
+            &graph.node(id).op
+        {
+            for member in members {
+                if owners.copied(*member).is_some_and(|other| other != owner) {
+                    return Err(WalkFail::Cycle(id));
+                }
+                owners.insert(*member, owner);
             }
         }
     }
 
-    let mut index_of: Vec<u32> = vec![u32::MAX; order.len()];
+    let mut index_of = IdMap::with_len(graph.len());
     let mut groups: Vec<Vec<Id>> = Vec::new();
-    let mut launch_of: IdMap<u32> = IdMap::with_len(graph.len());
-    for (i, v) in order.iter().enumerate() {
+    for v in order {
         if leaf_role(graph, *v) != LeafRole::NotLeaf {
             continue;
         }
-        let r = dsu.find(i);
-        if index_of[r] == u32::MAX {
+        let owner = owners.copied(*v).unwrap_or(*v);
+        let idx = index_of.copied(owner).unwrap_or_else(|| {
+            let index = groups.len() as u32;
             groups.push(Vec::new());
-            index_of[r] = (groups.len() - 1) as u32;
-        }
-        let idx = index_of[r];
+            index_of.insert(owner, index);
+            index
+        });
         groups[idx as usize].push(*v);
-        launch_of.insert(*v, idx);
     }
 
     // Groups came out in the order their *first* node appears, which is not
@@ -1037,10 +962,10 @@ fn cut(
         let mut seen: SmallVec<[usize; 8]> = SmallVec::new();
         for v in members {
             for c in operands.get(*v).map(|o| o.as_slice()).unwrap_or(&[]) {
-                let Some(d) = launch_of.copied(*c) else {
+                let Some(owner) = owners.copied(*c) else {
                     continue;
                 };
-                let d = d as usize;
+                let d = index_of.copied(owner).unwrap() as usize;
                 if d == g || seen.contains(&d) {
                     continue;
                 }
@@ -1090,40 +1015,27 @@ fn cut(
                 .unwrap();
         }
     }
-    let mut renumber = vec![0u32; n];
-    for (new, old) in sorted.iter().enumerate() {
-        renumber[*old] = new as u32;
-    }
     let mut reordered: Vec<Vec<Id>> = Vec::with_capacity(n);
     for old in &sorted {
         reordered.push(std::mem::take(&mut groups[*old]));
     }
-    for members in &reordered {
-        for v in members {
-            let old = launch_of.copied(*v).unwrap_or(0);
-            launch_of.insert(*v, renumber[old as usize]);
-        }
-    }
-    Ok((launch_of, reordered))
+    Ok((owners, reordered))
 }
 
 #[allow(clippy::too_many_arguments)]
 fn build_component(
     graph: &EGraph,
     extraction: &Extraction,
-    consumers: &IdMap<u32>,
+    operands: &Operands,
     consumer_nodes: &IdMap<SmallVec<[Id; 4]>>,
-    launch_of: &IdMap<u32>,
+    owners: &IdMap<Id>,
     roots: &[Id],
     members: Vec<Id>,
     caps: &Caps,
     arena: &dyn ArenaPlanner,
     cache: &mut NodeCache,
 ) -> Result<Component> {
-    let own = members
-        .first()
-        .and_then(|m| launch_of.copied(*m))
-        .unwrap_or(0);
+    let own = members.first().and_then(|m| owners.copied(*m));
     // The component's output is the last member that lands in a buffer.
     let root = members
         .iter()
@@ -1144,12 +1056,8 @@ fn build_component(
         let materialized = extraction.is_materialized(*m) || roots.contains(m);
         if materialized {
             writes = writes.saturating_add(bytes_of(out));
-            work = work.add(w);
-        } else {
-            // Inlined into every consumer: pays its math once per consumer
-            // and no traffic.
-            work = work.add(w.scale(consumers.copied(*m).unwrap_or(1).max(1) as u64));
         }
+        work = work.add(w);
     }
 
     // Distinct external operands, with the reread factor the consuming
@@ -1157,17 +1065,8 @@ fn build_component(
     let mut ext: Vec<(Id, u64, u32)> = Vec::new();
     for m in &members {
         let iters = iterations_of(&index_space(graph, *m));
-        let by_id = matches!(
-            graph.node(*m).op,
-            Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
-        );
-        for c in graph.node(*m).children.iter() {
-            let c = if by_id {
-                *c
-            } else {
-                select(graph, extraction, *c)?
-            };
-            if launch_of.copied(c) == Some(own) {
+        for &c in operands.get(*m).into_iter().flatten() {
+            if owners.copied(c) == own {
                 continue;
             }
             if leaf_role(graph, c) == LeafRole::Free {
@@ -1185,7 +1084,6 @@ fn build_component(
     ext.sort_by_key(|(id, _, _)| *id);
 
     let theta = extraction.theta.get(&root).copied();
-    let space = index_space(graph, root);
     // A group's members each take their own workgroups at their own block;
     // the dispatch is their sum at the widest block.
     let group_geoms: Vec<(Id, Geometry)> = match &graph.node(root).op {
@@ -1210,21 +1108,7 @@ fn build_component(
                 .sum::<u64>()
                 .max(1),
         },
-        // One workgroup per slab, at the block the widest stage's share of
-        // one slab asks for — the emitter's own arithmetic.
-        Op::Launch(Launch::Slab { slabs, members, .. }) => {
-            let widest = members
-                .iter()
-                .filter_map(|m| index_space(graph, *m).iterations())
-                .map(|n| n / u64::from((*slabs).max(1)))
-                .max()
-                .unwrap_or(1);
-            Geometry {
-                block: fusor_ir::ir::launch::slab_block(widest, caps),
-                workgroups: u64::from(*slabs).max(1),
-            }
-        }
-        _ => geometry(theta, &space, caps),
+        _ => member_geometry(graph, extraction, root, caps),
     };
     let lanes = fold_footprint(graph, root).map(|(l, _)| l);
     let tiles = tiles_for(theta, scalar_element(graph.facts(root).dtype), lanes, caps);
@@ -1302,10 +1186,6 @@ fn build_component(
 
     if !stage_amp.is_empty() {
         for m in &members {
-            let by_id = matches!(
-                graph.node(*m).op,
-                Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
-            );
             // The fold whose iteration space walks this member's operands:
             // the member itself when it is a stage, else the root.
             let (amp, total) = stage_amp
@@ -1316,14 +1196,9 @@ fn build_component(
             if amp <= 1 {
                 continue;
             }
-            for c in graph.node(*m).children.iter() {
-                let c = if by_id {
-                    *c
-                } else {
-                    select(graph, extraction, *c)?
-                };
+            for &c in operands.get(*m).into_iter().flatten() {
                 let facts = graph.facts(c);
-                if launch_of.copied(c) == Some(own) || elements_of(facts) != total {
+                if owners.copied(c) == own || elements_of(facts) != total {
                     continue;
                 }
                 line_bytes = line_bytes.saturating_add(bytes_of(facts).saturating_mul(amp - 1));

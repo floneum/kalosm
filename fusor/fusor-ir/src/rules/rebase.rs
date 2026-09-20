@@ -296,43 +296,24 @@ fn apply_peels(peels: &[Peel], seed: ScalarExpr) -> ScalarExpr {
     peels.iter().rev().fold(seed, |acc, p| p.apply(acc))
 }
 
-fn children_of(e: &ScalarExpr) -> SmallVec<[ScalarExpr; 3]> {
-    use ScalarKind as K;
-    match e.kind() {
-        K::Un { x, .. }
-        | K::Cast { x, .. }
-        | K::Bitcast { x, .. }
-        | K::Round { x, .. }
-        | K::Splat { x, .. } => smallvec![x.clone()],
-        K::Bin { a, b, .. } | K::Cmp { a, b, .. } | K::Dot { a, b } => {
-            smallvec![a.clone(), b.clone()]
-        }
-        K::Select { c, t, f } => smallvec![c.clone(), t.clone(), f.clone()],
-        _ => SmallVec::new(),
-    }
-}
-
 fn contains(e: &ScalarExpr, pred: &dyn Fn(&ScalarExpr) -> bool) -> bool {
-    pred(e) || children_of(e).iter().any(|c| contains(c, pred))
+    let mut found = false;
+    e.walk(&mut |e| found = found || pred(e));
+    found
 }
 
 fn reads_arg(e: &ScalarExpr, i: u32) -> bool {
     contains(e, &|x| matches!(x.kind(), ScalarKind::Arg(j) if *j == i))
 }
 
-fn reads_any_index(e: &ScalarExpr) -> bool {
-    contains(e, &|x| matches!(x.kind(), ScalarKind::IndexOf(_)))
-}
-
 fn arg_indices(e: &ScalarExpr, out: &mut Vec<u32>) {
-    if let ScalarKind::Arg(i) = e.kind()
-        && !out.contains(i)
-    {
-        out.push(*i);
-    }
-    for c in children_of(e) {
-        arg_indices(&c, out);
-    }
+    e.walk(&mut |e| {
+        if let ScalarKind::Arg(i) = e.kind()
+            && !out.contains(i)
+        {
+            out.push(*i);
+        }
+    });
 }
 
 fn is_lit_value(e: &ScalarExpr, v: f32) -> bool {
@@ -355,23 +336,17 @@ fn splat_f32(s: Splat) -> f32 {
 /// `ScalarExpr` does not canonicalize on construction and the e-graph
 /// canonicalizes only `Op::Union` children.
 fn canon(e: &ScalarExpr) -> ScalarExpr {
-    use ScalarKind as K;
-    match e.kind() {
-        K::Un { op, x } => ScalarExpr::un(*op, canon(x)),
-        K::Bin { op, a, b } => {
-            let (a, b) = (canon(a), canon(b));
-            if op.is_commutative() && b.structural_hash() < a.structural_hash() {
-                ScalarExpr::bin(*op, b, a)
-            } else {
-                ScalarExpr::bin(*op, a, b)
-            }
-        }
-        K::Cmp { op, a, b } => ScalarExpr::cmp(*op, canon(a), canon(b)),
-        K::Select { c, t, f } => ScalarExpr::select(canon(c), canon(t), canon(f)),
-        K::Cast { to, x } => ScalarExpr::cast(*to, canon(x)),
-        K::Bitcast { to, x } => ScalarExpr::bitcast(*to, canon(x)),
-        K::Round { mode, x } => ScalarExpr::round(*mode, canon(x)),
-        _ => e.clone(),
+    let node = match e.kind() {
+        ScalarKind::Dot { .. } | ScalarKind::Splat { .. } => e.clone(),
+        _ => e.map_children(&mut canon),
+    };
+    if let ScalarKind::Bin { op, a, b } = node.kind()
+        && op.is_commutative()
+        && b.structural_hash() < a.structural_hash()
+    {
+        ScalarExpr::bin(*op, b.clone(), a.clone())
+    } else {
+        node
     }
 }
 
@@ -630,7 +605,7 @@ fn hoist_outward(
         })
         .collect();
     let is_invariant = |e: &ScalarExpr| -> bool {
-        if reads_any_index(e) {
+        if e.reads_index_of() {
             return false;
         }
         let mut used = Vec::new();
@@ -665,7 +640,7 @@ fn hoist_outward(
                 }
             }
             let m = match_h(&matched, row, &is_invariant)?;
-            if m.c.as_ref().is_some_and(reads_any_index) {
+            if m.c.as_ref().is_some_and(ScalarExpr::reads_index_of) {
                 return None;
             }
             Some((peels, m))
@@ -788,7 +763,7 @@ fn hoist_inward(
     let closed = |e: &ScalarExpr| -> bool {
         let mut used = Vec::new();
         arg_indices(e, &mut used);
-        used.is_empty() && !reads_any_index(e)
+        used.is_empty() && !e.reads_index_of()
     };
     let (row, m) = HOM_TABLE
         .iter()

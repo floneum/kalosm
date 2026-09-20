@@ -15,8 +15,6 @@ use fusor_ir::ir::kernel::{
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
-use crate::liveness::for_each_child;
-
 /// Whether a value is provably identical across every invocation of the
 /// group. Unknown is treated as `NonUniform`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -92,12 +90,9 @@ impl Ctx {
                 ReduceKind::Workgroup { .. } => self.classify(value),
             },
             _ => {
-                let mut children: Vec<TileExpr> = Vec::new();
-                for_each_child(expr.kind(), &mut |child| children.push(child.clone()));
                 let mut result = Uniformity::Uniform;
-                for child in &children {
-                    result = result.meet(self.classify(child));
-                }
+                expr.kind()
+                    .visit_children(&mut |child| result = result.meet(self.classify(child)));
                 result
             }
         }

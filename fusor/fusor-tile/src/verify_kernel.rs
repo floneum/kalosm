@@ -30,7 +30,7 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
 use crate::arena::scalar_of;
-use crate::liveness::{for_each_addr_expr, for_each_child};
+use crate::liveness::for_each_addr_expr;
 
 fn invalid(msg: impl Into<String>) -> Error {
     Error::Lower(LowerError::Validation(msg.into()))
@@ -307,7 +307,8 @@ fn check_expr(expr: &TileExpr, seen: &mut FxHashSet<u64>) -> Result<()> {
         return Ok(());
     }
     let mut children: Vec<TileExpr> = Vec::new();
-    for_each_child(expr.kind(), &mut |child| children.push(child.clone()));
+    expr.kind()
+        .visit_children(&mut |child| children.push(child.clone()));
     for child in &children {
         check_expr(child, seen)?;
     }
@@ -1140,7 +1141,8 @@ pub(crate) fn visit_unique(
         return;
     }
     let mut children: Vec<TileExpr> = Vec::new();
-    for_each_child(expr.kind(), &mut |child| children.push(child.clone()));
+    expr.kind()
+        .visit_children(&mut |child| children.push(child.clone()));
     for child in &children {
         visit_unique(child, seen, f);
     }

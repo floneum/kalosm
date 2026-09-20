@@ -480,6 +480,8 @@ pub struct TileNode {
     /// set is folded up from the children at construction so a consumer's
     /// memo invalidation is O(1) per entry rather than a re-walk.
     pub mem_reads: MemReads,
+    /// Collective results depend on which invocations reach the expression.
+    pub scope_dependent: bool,
 }
 
 /// The memory spaces a [`TileExpr`] reads.
@@ -622,17 +624,84 @@ pub enum TileExprKind {
     },
 }
 
+impl TileExprKind {
+    /// Every direct child expression of a node, in a fixed order.
+    pub fn visit_children(&self, f: &mut dyn FnMut(&TileExpr)) {
+        match self {
+            TileExprKind::Literal(_)
+            | TileExprKind::Builtin(_)
+            | TileExprKind::LoadLocal(_)
+            | TileExprKind::CoopZero { .. } => {}
+            TileExprKind::Load {
+                addr, mask, fill, ..
+            } => {
+                match addr.as_ref() {
+                    Addr::Linear(index) => f(index),
+                    Addr::Rc2 { row, col } => {
+                        f(row);
+                        f(col);
+                    }
+                }
+                f(mask);
+                f(fill);
+            }
+            TileExprKind::LoadTile { index, .. } => f(index),
+            TileExprKind::Unary { value, .. } => f(value),
+            TileExprKind::Binary { left, right, .. }
+            | TileExprKind::Compare { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            TileExprKind::Round { value, .. } => f(value),
+            TileExprKind::Cast { value, .. } | TileExprKind::Bitcast { value, .. } => f(value),
+            TileExprKind::Select {
+                condition,
+                accept,
+                reject,
+            } => {
+                f(condition);
+                f(accept);
+                f(reject);
+            }
+            TileExprKind::Vec { parts, .. } => {
+                for part in parts {
+                    f(part);
+                }
+            }
+            TileExprKind::VecComponent { vector, .. } => f(vector),
+            TileExprKind::Dot { left, right } => {
+                f(left);
+                f(right);
+            }
+            TileExprKind::Reduce { value, .. } => f(value),
+            TileExprKind::CoopLoad { src, .. } => {
+                f(&src.row);
+                f(&src.col);
+            }
+            TileExprKind::CoopMma { a, b, c } => {
+                f(a);
+                f(b);
+                f(c);
+            }
+        }
+    }
+}
+
 impl TileExpr {
     pub fn new(kind: TileExprKind, ty: ElementType) -> Self {
         let mut h = FxHasher::default();
         kind.hash(&mut h);
         ty.hash(&mut h);
         let mem_reads = kind_mem_reads(&kind);
+        let mut scope_dependent = matches!(&kind, TileExprKind::Reduce { kind, .. }
+            if matches!(kind.as_ref(), ReduceKind::Subgroup));
+        kind.visit_children(&mut |child| scope_dependent |= child.scope_dependent());
         Self(Arc::new(TileNode {
             kind,
             ty,
             hash: h.finish(),
             mem_reads,
+            scope_dependent,
         }))
     }
     pub fn kind(&self) -> &TileExprKind {
@@ -672,6 +741,10 @@ impl TileExpr {
     pub fn mem_reads(&self) -> MemReads {
         self.0.mem_reads
     }
+
+    pub fn scope_dependent(&self) -> bool {
+        self.0.scope_dependent
+    }
 }
 
 /// Fold the memory-read set for one node from its children.
@@ -681,62 +754,32 @@ impl TileExpr {
 /// join the pure half of a backend memo.
 fn kind_mem_reads(kind: &TileExprKind) -> MemReads {
     use TileExprKind as K;
-    let addr = |a: &Addr| match a {
-        Addr::Linear(e) => e.mem_reads(),
-        Addr::Rc2 { row, col } => row.mem_reads().union(col.mem_reads()),
-    };
-    match kind {
-        // Pure leaves.
-        K::Literal(_) | K::Builtin(_) | K::CoopZero { .. } => MemReads::NONE,
-        // Reads, each unioned with whatever its address and predicate read.
+    let direct = match kind {
         K::LoadLocal(_) => MemReads::LOCAL,
-        K::Load {
-            src,
-            addr: a,
-            mask,
-            fill,
-        } => {
-            // Both `Source` arms are storage buffers; a quantized view is a
-            // u32 buffer plus a decode program.
-            let _ = src;
-            MemReads::STORAGE
-                .union(addr(a))
-                .union(mask.mem_reads())
-                .union(fill.mem_reads())
-        }
-        K::LoadTile { index, .. } => MemReads::TILE.union(index.mem_reads()),
-        K::CoopLoad { src, .. } => MemReads::TILE
-            .union(src.row.mem_reads())
-            .union(src.col.mem_reads()),
-        // Pure combinators: the union over the children.
-        K::Unary { value, .. }
-        | K::Round { value, .. }
-        | K::Cast { value, .. }
-        | K::Bitcast { value, .. }
-        | K::VecComponent { vector: value, .. } => value.mem_reads(),
-        // A cross-lane reduction stages through the scratch tile its
-        // `ReduceKind` names, so it reads a workgroup tile on every strategy
-        // but `Subgroup`.
-        K::Reduce { kind, value, .. } => match &**kind {
-            ReduceKind::Subgroup => value.mem_reads(),
-            ReduceKind::Workgroup { .. } => value.mem_reads().union(MemReads::TILE),
+        K::Load { .. } => MemReads::STORAGE,
+        K::LoadTile { .. } | K::CoopLoad { .. } => MemReads::TILE,
+        K::Reduce { kind, .. } => match kind.as_ref() {
+            ReduceKind::Subgroup => MemReads::NONE,
+            ReduceKind::Workgroup { .. } => MemReads::TILE,
         },
-        K::Binary { left, right, .. } | K::Compare { left, right, .. } | K::Dot { left, right } => {
-            left.mem_reads().union(right.mem_reads())
-        }
-        K::Select {
-            condition,
-            accept,
-            reject,
-        } => condition
-            .mem_reads()
-            .union(accept.mem_reads())
-            .union(reject.mem_reads()),
-        K::Vec { parts, .. } => parts
-            .iter()
-            .fold(MemReads::NONE, |acc, p| acc.union(p.mem_reads())),
-        K::CoopMma { a, b, c } => a.mem_reads().union(b.mem_reads()).union(c.mem_reads()),
-    }
+        K::Literal(_)
+        | K::Builtin(_)
+        | K::CoopZero { .. }
+        | K::Unary { .. }
+        | K::Binary { .. }
+        | K::Compare { .. }
+        | K::Round { .. }
+        | K::Cast { .. }
+        | K::Bitcast { .. }
+        | K::Select { .. }
+        | K::Vec { .. }
+        | K::VecComponent { .. }
+        | K::Dot { .. }
+        | K::CoopMma { .. } => MemReads::NONE,
+    };
+    let mut reads = direct;
+    kind.visit_children(&mut |child| reads = reads.union(child.mem_reads()));
+    reads
 }
 
 impl PartialEq for TileExpr {

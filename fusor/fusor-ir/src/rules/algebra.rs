@@ -420,38 +420,17 @@ fn flip(op: CmpOp) -> CmpOp {
 
 /// Whether `e` names the loop coordinate of `axis`.
 fn reads_index_of(e: &ScalarExpr, axis: u32) -> bool {
-    match e.kind() {
-        ScalarKind::IndexOf(a) => *a == axis,
-        ScalarKind::Un { x, .. }
-        | ScalarKind::Cast { x, .. }
-        | ScalarKind::Bitcast { x, .. }
-        | ScalarKind::Round { x, .. }
-        | ScalarKind::Splat { x, .. } => reads_index_of(x, axis),
-        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
-            reads_index_of(a, axis) || reads_index_of(b, axis)
-        }
-        ScalarKind::Select { c, t, f } => {
-            reads_index_of(c, axis) || reads_index_of(t, axis) || reads_index_of(f, axis)
-        }
-        ScalarKind::Arg(_) | ScalarKind::Lit(_) | ScalarKind::Uniform(_) => false,
-    }
+    let mut found = false;
+    e.walk(&mut |e| found |= matches!(e.kind(), ScalarKind::IndexOf(a) if *a == axis));
+    found
 }
 
 /// Whether `e` rounds anywhere: the one syntactic marker of a value whose
 /// contract forbids reassociation.
 fn has_round(e: &ScalarExpr) -> bool {
-    match e.kind() {
-        ScalarKind::Round { .. } => true,
-        ScalarKind::Un { x, .. }
-        | ScalarKind::Cast { x, .. }
-        | ScalarKind::Bitcast { x, .. }
-        | ScalarKind::Splat { x, .. } => has_round(x),
-        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
-            has_round(a) || has_round(b)
-        }
-        ScalarKind::Select { c, t, f } => has_round(c) || has_round(t) || has_round(f),
-        _ => false,
-    }
+    let mut found = false;
+    e.walk(&mut |e| found |= matches!(e.kind(), ScalarKind::Round { .. }));
+    found
 }
 
 /// `Fold{Add, rank-1}(Map{mul(Arg0, Arg1)}(a, b))` also *is* a `Contract`.
@@ -930,42 +909,15 @@ pub fn identity_elim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -
 }
 
 fn simplify(e: &ScalarExpr) -> (ScalarExpr, bool) {
-    let rebuilt = match e.kind() {
-        ScalarKind::Un { op, x } => {
-            let (x, c) = simplify(x);
-            (ScalarExpr::un(*op, x), c)
-        }
-        ScalarKind::Bin { op, a, b } => {
-            let (a, ca) = simplify(a);
-            let (bb, cb) = simplify(b);
-            (ScalarExpr::bin(*op, a, bb), ca || cb)
-        }
-        ScalarKind::Cmp { op, a, b } => {
-            let (a, ca) = simplify(a);
-            let (bb, cb) = simplify(b);
-            (ScalarExpr::cmp(*op, a, bb), ca || cb)
-        }
-        ScalarKind::Select { c, t, f } => {
-            let (c, cc) = simplify(c);
-            let (t, ct) = simplify(t);
-            let (f, cf) = simplify(f);
-            (ScalarExpr::select(c, t, f), cc || ct || cf)
-        }
-        ScalarKind::Cast { to, x } => {
-            let (x, c) = simplify(x);
-            (ScalarExpr::cast(*to, x), c)
-        }
-        ScalarKind::Bitcast { to, x } => {
-            let (x, c) = simplify(x);
-            (ScalarExpr::bitcast(*to, x), c)
-        }
-        ScalarKind::Round { mode, x } => {
-            let (x, c) = simplify(x);
-            (ScalarExpr::round(*mode, x), c)
-        }
-        _ => (e.clone(), false),
+    let mut changed = false;
+    let node = match e.kind() {
+        ScalarKind::Dot { .. } | ScalarKind::Splat { .. } => e.clone(),
+        _ => e.map_children(&mut |child| {
+            let (simpler, did_change) = simplify(child);
+            changed |= did_change;
+            simpler
+        }),
     };
-    let (node, changed) = rebuilt;
     match peephole(&node) {
         Some(simpler) => (simpler, true),
         None => (node, changed),
