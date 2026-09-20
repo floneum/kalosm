@@ -11,7 +11,9 @@ use fusor::sampling::{Mirostat2Sampler, StandardSamplerParams, sample_async, top
 use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
 
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fill_indices, fuzz_case};
+use crate::harness::{
+    CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fill_indices, fuzz_case, member_sweep,
+};
 use crate::suite::support::{Domain, expect_values, graph_of, read, upload};
 
 /// The fixed vocabulary of the hand-authored tie table.
@@ -266,6 +268,7 @@ async fn top_k_filter(session: &Session, shape: &[u64], data_seed: u32) -> CaseR
     let allowed: Vec<u32> = host_top_k(&values, k).into_iter().map(|(_, i)| i).collect();
     let (_graph, t) = upload_logits(session, &values)?;
     for seed in 0..16u64 {
+        let _sweep = member_sweep(seed == 0);
         let params = StandardSamplerParams {
             temperature: 1.5,
             top_k: k as u32,
@@ -292,6 +295,7 @@ async fn top_p_filter(session: &Session, shape: &[u64], data_seed: u32) -> CaseR
     let allowed = nucleus(&values, P);
     let (_graph, t) = upload_logits(session, &values)?;
     for seed in 0..16u64 {
+        let _sweep = member_sweep(seed == 0);
         let params = StandardSamplerParams {
             temperature: 1.0,
             top_p: P,
@@ -346,6 +350,7 @@ async fn min_p_filter(session: &Session, shape: &[u64], data_seed: u32) -> CaseR
 
     let (_graph, t) = upload_logits(session, &values)?;
     for seed in 0..16u64 {
+        let _sweep = member_sweep(seed == 0);
         let params = StandardSamplerParams {
             temperature: 1.0,
             min_p: MIN_P,
@@ -425,6 +430,7 @@ async fn seed_case(session: &Session, shape: &[u64], data_seed: u32) -> CaseResu
             .map_err(Into::into)
     };
     let a = draw(99).await?;
+    let _sweep = member_sweep(false);
     let b = draw(99).await?;
     if a != b {
         return Err(format!("the same seed drew {a} then {b}").into());
