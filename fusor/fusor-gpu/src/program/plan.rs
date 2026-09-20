@@ -512,39 +512,27 @@ impl Plan {
             .collect();
         order.sort_by_key(|i| (std::cmp::Reverse(values[*i].len()), *i));
         let dedicated: u64 = order.iter().map(|i| u64::from(values[*i].len()) * 4).sum();
-        let mut placed: Vec<usize> = vec![];
-        let mut size = 0u32;
-        for i in order {
-            let v = &values[i];
-            let mut off = 0u32;
-            let mut occupied: Vec<(u32, u32)> = placed
-                .iter()
-                .filter_map(|j| {
-                    let b = &values[*j];
-                    (first[&v.id] <= last[&b.id] && first[&b.id] <= last[&v.id])
-                        .then(|| (b.offset.unwrap(), b.len()))
-                })
-                .collect();
-            occupied.sort_unstable();
-            for (start, len) in occupied {
-                if off.checked_add(v.len()).is_some_and(|end| end <= start) {
-                    break;
-                }
-                if off < start + len {
-                    off = start + len;
-                }
-            }
-            let end = off
-                .checked_add(v.len())
-                .ok_or_else(|| Error::Plan("program arena exceeds u32".into()))?;
-            if u64::from(end) * 4 > max_bytes {
-                return Err(Error::Plan(
-                    "program arena exceeds device buffer budget".into(),
-                ));
-            }
-            size = size.max(end);
-            values[i].offset = Some(off);
-            placed.push(i);
+        let requests: Vec<_> = order
+            .iter()
+            .map(|i| (u64::from(values[*i].len()) * 4, 4))
+            .collect();
+        let (size, offsets) = fusor_ir::packing::pack_interference(
+            &requests,
+            fusor_ir::packing::Fit::First,
+            |a, b| {
+                let (a, b) = (values[order[a]].id, values[order[b]].id);
+                first[&a] <= last[&b] && first[&b] <= last[&a]
+            },
+        )?;
+        if size > max_bytes {
+            return Err(Error::Plan(
+                "program arena exceeds device buffer budget".into(),
+            ));
+        }
+        let mut size =
+            u32::try_from(size / 4).map_err(|_| Error::Plan("program arena exceeds u32".into()))?;
+        for (i, offset) in order.into_iter().zip(offsets) {
+            values[i].offset = Some((offset / 4) as u32);
         }
         // Independent pairwise check: no live values may share bytes.
         #[cfg(any(test, feature = "compiler-tests"))]

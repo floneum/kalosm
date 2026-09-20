@@ -104,17 +104,6 @@ pub enum CStmt {
         op: TileReduceOp,
         group: u32,
     },
-    /// As [`CStmt::StageTree`], but each lane first accumulates `iterations`
-    /// evaluations of `prep` while `index` walks `0..iterations`.
-    LoopTree {
-        prep: TapeRange,
-        tile: u16,
-        value: Slot,
-        op: TileReduceOp,
-        group: u32,
-        iterations: u32,
-        index: u16,
-    },
     /// The **N-ary** cross-lane reduction: one scratch tile per accumulator
     /// lane, staged per lane chunk, then a log-tree over each group applying
     /// `merge` at every level and broadcasting the group result back.
@@ -148,7 +137,6 @@ impl CStmt {
         match self {
             CStmt::Barrier
             | CStmt::StageTree { .. }
-            | CStmt::LoopTree { .. }
             | CStmt::CarrierTree { .. }
             | CStmt::FillTile { .. } => true,
             CStmt::If { accept, reject, .. } => {

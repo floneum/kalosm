@@ -13,7 +13,6 @@ pub(crate) mod contract;
 pub(crate) mod gather_scatter;
 pub(crate) mod group;
 pub(crate) mod map_fold;
-pub(crate) mod region;
 pub(crate) mod slab;
 
 use fusor_cost::realize::distribute_workgroups;
@@ -300,17 +299,8 @@ pub(crate) fn flatten_matrix_layout_split(
         shape.push(binding.require(*d)?);
     }
     let mut strides = SmallVec::<[u64; 6]>::new();
-    for (axis, s) in layout.strides().iter().enumerate() {
-        // A `row_major_strides` placeholder means the plan carried a stride it
-        // never derived. Recompute it from the (now concrete) shape rather
-        // than emitting the placeholder.
-        let v = match s {
-            Dim::Sym(sym) if *sym == crate::uniforms::DERIVED_STRIDE => {
-                shape.iter().skip(axis + 1).product::<u64>()
-            }
-            other => binding.require(*other)?,
-        };
-        strides.push(v);
+    for stride in layout.strides() {
+        strides.push(binding.require(*stride)?);
     }
 
     let rows: u64 = shape[..row_dims].iter().product();
@@ -1510,9 +1500,7 @@ impl<'a> Ctx<'a> {
     ///
     /// Emits `offset + Σ_axis ((flat / Π extents-right-of-axis) % extent) *
     /// stride` with every symbolic quantity read from binding 0 via
-    /// [`Ctx::dim_expr`]. The `row_major_strides` placeholder
-    /// (`DERIVED_STRIDE`) is the running right-product itself, which the walk
-    /// already carries. Axes with stride 0 (broadcast) or extent 1 contribute
+    /// [`Ctx::dim_expr`]. Axes with stride 0 (broadcast) or extent 1 contribute
     /// no term but still advance the divisor. The most significant axis skips
     /// its `%`: `flat` is masked below the space total by the caller, so the
     /// quotient is already in range.
@@ -1558,14 +1546,7 @@ impl<'a> Ctx<'a> {
                         .b
                         .binary(TileBinaryOp::Rem, e, m, NumericContract::RELAXED);
                 }
-                let is_derived =
-                    matches!(stride, Dim::Sym(s) if s == crate::uniforms::DERIVED_STRIDE);
-                if is_derived {
-                    // Row-major placeholder: stride == the running product.
-                    if let Some(d) = &div {
-                        e = self.b.mul(e, d.clone());
-                    }
-                } else if !stride.known_eq(Dim::Const(1)) {
+                if !stride.known_eq(Dim::Const(1)) {
                     let s = self.dim_expr(stride)?;
                     e = self.b.mul(e, s);
                 }
@@ -1732,9 +1713,7 @@ impl<'a> Ctx<'a> {
         // The buffer's extent is not the shape product: padding lives in the
         // strides, so the shape product undercounts a padded buffer. For the
         // row-major layouts the plan emits (offset 0), the extent is
-        // `shape[0] * strides[0]`; a `DERIVED_STRIDE` placeholder implies no
-        // padding and resolves as the product of the remaining logical
-        // extents.
+        // `shape[0] * strides[0]`.
         let (plan_layout, _) = bound_layout(self.cx, operand.src);
         let bound = match (plan_layout.shape().first(), plan_layout.strides().first()) {
             (Some(&outer), Some(&stride0)) => {
@@ -1744,20 +1723,6 @@ impl<'a> Ctx<'a> {
                     Some(self.dim_expr(outer)?)
                 };
                 let stride_e = match stride0 {
-                    Dim::Sym(s) if s == crate::uniforms::DERIVED_STRIDE => {
-                        let mut acc: Option<TileExpr> = None;
-                        for d in plan_layout.shape().iter().skip(1).copied() {
-                            if d.known_eq(Dim::Const(1)) {
-                                continue;
-                            }
-                            let e = self.dim_expr(d)?;
-                            acc = Some(match acc {
-                                Some(a) => self.b.mul(a, e),
-                                None => e,
-                            });
-                        }
-                        acc
-                    }
                     s if s.known_eq(Dim::Const(1)) || s.known_eq(Dim::Const(0)) => None,
                     s => Some(self.dim_expr(s)?),
                 };
@@ -1844,10 +1809,8 @@ pub(crate) fn lower_node(
         Launch::Contract { family, .. } => contract::lower_contract(ctx, op, *family, theta),
         Launch::Gather { .. } => gather_scatter::lower_kgather(ctx, op, theta).map(|k| vec![k]),
         Launch::Scatter { .. } => gather_scatter::lower_kscatter(ctx, op, theta),
-        Launch::Region { .. } => region::lower_kregion(ctx, op, theta).map(|k| vec![k]),
         Launch::Slab { .. } => slab::lower_kslab(ctx, op, theta).map(|k| vec![k]),
         Launch::Group { .. } => group::lower_kgroup(ctx, op, theta).map(|k| vec![k]),
-        Launch::Ext { def, .. } => ext::lower(*def, node, theta).map(|k| vec![k]),
     }
 }
 
@@ -1891,59 +1854,6 @@ pub(crate) fn lower_member(
             "a {:?} cannot be a group member",
             other.tag()
         ))),
-    }
-}
-
-/// `Launch::Ext` lowering: the one escape hatch out of the closed `Logical`/`Launch` enums.
-pub(crate) mod ext {
-    use super::*;
-    use fusor_ir::ir::{OpDefId, OpDefRegistry};
-    use std::sync::RwLock;
-
-    /// The registry `Launch::Ext` lowering resolves `OpDefId` against.
-    ///
-    /// [`LowerCtx`] does not carry the [`OpDefRegistry`] the graph was built
-    /// with, so until it grows the field the embedder installs the same
-    /// registry here that it installed on the e-graph's semantics.
-    /// Registration order is id order and must match.
-    static DEFS: RwLock<Option<OpDefRegistry>> = RwLock::new(None);
-
-    /// The installed registry, if the embedder installed one.
-    pub(crate) fn installed() -> Option<OpDefRegistry> {
-        DEFS.read()
-            .expect("the OpDef registry lock is poisoned")
-            .clone()
-    }
-
-    /// Lower one registered extension op through its `"gpu"` row.
-    pub(crate) fn lower(def: OpDefId, node: &Node, theta: SchedPoint) -> Result<KernelIr> {
-        let registry = installed().ok_or_else(|| {
-            Error::Plan(format!(
-                "{def:?} is an extension op, but no OpDefRegistry is installed on the \
-                 GPU target; call fusor_gpu::lower::ext::install"
-            ))
-        })?;
-        let entry = registry
-            .get(def)
-            .ok_or_else(|| Error::Plan(format!("no OpDef is registered as {def:?}")))?;
-        let lower = entry
-            .lower_per_target
-            .iter()
-            .find(|(target, _)| *target == "gpu")
-            .map(|(_, f)| *f)
-            .ok_or_else(|| {
-                Error::Plan(format!(
-                    "OpDef \"{}\" declares no \"gpu\" lowering; its \
-                     lower_per_target names {:?}",
-                    entry.name,
-                    entry
-                        .lower_per_target
-                        .iter()
-                        .map(|(t, _)| *t)
-                        .collect::<Vec<_>>()
-                ))
-            })?;
-        lower(node, &theta)
     }
 }
 

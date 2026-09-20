@@ -2,16 +2,15 @@
 //! Both read their geometry off `theta`.
 
 use fusor_ir::Result;
-use fusor_ir::carrier::{Carrier, SlotTy};
+use fusor_ir::carrier::SlotTy;
 use fusor_ir::dtype::NumericContract;
 use fusor_ir::dtype::Splat;
 use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
     Accumulator, Addr, ElementType, KernelIr, ReduceKind, ScalarElement, Stmt, TileBinaryOp,
-    TileCompareOp, TileExpr, TileReduceOp,
+    TileCompareOp, TileExpr,
 };
 use fusor_ir::ir::launch::{FoldStrat, Launch, MapTiling, SchedPoint};
-use fusor_ir::scalar::BinOp;
 
 use crate::lower::{Ctx, DimBinding, grid_for, scalar_element};
 use fusor_tile::domains::emitted_block;
@@ -209,19 +208,9 @@ fn tiled_grid(
     Ok(full)
 }
 
-/// Lower a `Fold` at a [`FoldStrat`].
-///
-/// Three bodies, one carrier shape each:
-/// * [`FoldStrat::Subgroup`] — a subgroup collective, no scratch, no barrier.
-/// * [`FoldStrat::WgTree`] — a shared-memory tree over one scratch tile.
-/// * [`FoldStrat::LoopThenTree`] — a per-lane accumulate loop, then the tree.
-///
-/// The carrier's `lift` runs before the merge and `post` after it, so a
-/// softmax's `exp` and a mean's divide fuse into the same launch.
-///
-/// One scalar slot merged by a hardware operator takes the collective path
-/// below; anything wider goes to [`lower_kfold_carrier`], which carries one
-/// accumulator per lane and closes with `Stmt::Reduce`'s N-ary merge.
+/// Lower every carrier through one row/axis loop nest. A single scalar
+/// hardware operator closes with a collective; wider carriers use their
+/// expanded merge expressions in the workgroup tree.
 pub(crate) fn lower_kfold(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Result<KernelIr> {
     let Launch::Fold {
         space,
@@ -236,266 +225,10 @@ pub(crate) fn lower_kfold(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> R
     else {
         return Err(Error::Plan("lower_kfold on a non-Fold node".into()));
     };
-    if !vec_axes.is_empty() || fusor_ir::ir::kernel::fast_reduce_op(carrier).is_none() {
-        return lower_kfold_carrier(ctx, op, theta);
-    }
-    let reduce_op = single_slot_reduce_op(carrier)?;
-    let pre = &carrier.lift[0];
-    let post = &post[0];
-    // `SchedPoint::Point` means the node has no schedule parameters: default
-    // to the subgroup collective where the device has subgroups, the
-    // shared-memory tree where it does not.
-    let strat = match theta {
-        SchedPoint::Fold(s) => s,
-        _ if ctx.caps.subgroups.is_some() => FoldStrat::Subgroup,
-        _ => FoldStrat::WgTree {
-            lane_group: emitted_block(1, ctx.caps),
-        },
-    };
-
-    let axis = *axis as usize;
-    if axis >= space.rank() {
-        return Err(Error::Plan(format!(
-            "fold axis {axis} is outside a rank-{} space",
-            space.rank()
-        )));
-    }
-
-    let space_total = space.iterations().unwrap_or(0);
-    let acc_elem = scalar_element(*acc);
-
-    let (block, lane_group) = match strat {
-        FoldStrat::Subgroup => (
-            ctx.caps
-                .subgroup_width()
-                .max(1)
-                .min(ctx.caps.limits.max_compute_invocations_per_workgroup),
-            ctx.caps.subgroup_width().max(1),
-        ),
-        FoldStrat::WgTree { lane_group } | FoldStrat::LoopThenTree { lane_group, .. } => {
-            let lg = lane_group.max(1);
-            (emitted_block(lg, ctx.caps), lg)
-        }
-    };
-    let block = block.max(ctx.block_floor);
-    let limits = ctx.caps.limits;
-
-    // One row per output element; the fold axis is consumed by the lanes.
-    let mut row_space = space.clone();
-    row_space.dims.remove(axis);
-    let rows = space_extent_expr(&mut ctx, &row_space)?;
-    let axis_extent = ctx.dim_expr(space.dims[axis])?;
-    let inner: TileExpr = {
-        let mut acc_e = ctx.b.u32(1);
-        for dim in space.dims.iter().skip(axis + 1) {
-            let e = ctx.dim_expr(*dim)?;
-            acc_e = ctx.b.mul(acc_e, e);
-        }
-        acc_e
-    };
-
-    let out = ctx.output()?;
-    let out_view = ctx.linear_view(out)?;
-    let out_elem = out_view.buffer.element;
-
-    let mut stmts: Vec<Stmt> = Vec::new();
-
-    // The dispatch grid up front: `global_index` linearizes the workgroup id
-    // against it, so it must be the grid this kernel is launched with.
-    let grid = grid_for(&row_space, block / lane_group.max(1), &ctx.binding, &limits)?;
-
-    // Row identity: one lane group per output row.
-    let group = ctx.global_index(block, grid);
-    let lg_e = ctx.b.u32(lane_group);
-    let row = ctx.b.binary(
-        TileBinaryOp::Div,
-        group.clone(),
-        lg_e.clone(),
-        NumericContract::RELAXED,
-    );
-    let lane = ctx.b.binary(
-        TileBinaryOp::Rem,
-        group,
-        lg_e.clone(),
-        NumericContract::RELAXED,
-    );
-    let row_live = ctx.b.compare(TileCompareOp::Lt, row.clone(), rows);
-
-    // Element index of `(row, k)` in the flattened space.
-    let outer = ctx.b.binary(
-        TileBinaryOp::Div,
-        row.clone(),
-        inner.clone(),
-        NumericContract::RELAXED,
-    );
-    let within = ctx.b.binary(
-        TileBinaryOp::Rem,
-        row.clone(),
-        inner.clone(),
-        NumericContract::RELAXED,
-    );
-    let row_stride = ctx.b.mul(inner.clone(), axis_extent.clone());
-    let row_base = {
-        let hi = ctx.b.mul(outer, row_stride);
-        ctx.b.add(hi, within)
-    };
-
-    // One accumulator per slot, seeded from the carrier's own identity.
-    let mut accs: Vec<Accumulator> = Vec::with_capacity(carrier.width());
-    let mut acc_reads: Vec<TileExpr> = Vec::with_capacity(carrier.width());
-    for slot in 0..carrier.width() {
-        let local = ctx.b.local(ElementType::Scalar(acc_elem));
-        let init = identity_expr(&mut ctx, carrier.identity[slot], acc_elem);
-        let read = ctx.b.load_local(local.clone());
-        acc_reads.push(read.clone());
-        accs.push(Accumulator {
-            local,
-            init,
-            update: read,
-        });
-    }
-
-    // The strided element read for one k, with `pre` applied.
-    let read_k = |ctx: &mut Ctx<'_>, k: TileExpr| -> Result<TileExpr> {
-        let idx = {
-            let off = ctx.b.mul(k, inner.clone());
-            ctx.b.add(row_base.clone(), off)
-        };
-        let mut args = Vec::with_capacity(ops.len());
-        for operand in ops {
-            args.push(ctx.load_mapped(operand, idx.clone(), space_total)?);
-        }
-        let coords = ctx.coords_from_linear(idx, space)?;
-        ctx.eval_scalar(pre, &args, &coords)
-    };
-
-    // A lane past the reduced extent contributes the combine's identity; the
-    // collective spans the whole lane group whatever the extent is, so an
-    // unguarded lane would sum the next row into this one.
-    let guard = |ctx: &mut Ctx<'_>, k: &TileExpr, v: TileExpr| -> TileExpr {
-        let in_range = ctx
-            .b
-            .compare(TileCompareOp::Lt, k.clone(), axis_extent.clone());
-        let ident = identity_expr(ctx, carrier.identity[0], acc_elem);
-        ctx.b.select(in_range, v, ident)
-    };
-
-    // One pass of the lane group covers `lane_group` elements of the axis;
-    // anything longer needs the per-lane strided loop first, whichever
-    // collective closes it.
-    let one_pass = space.dims[axis]
-        .as_const()
-        .is_some_and(|k| k <= u64::from(lane_group.max(1)));
-
-    let lane_value = if one_pass {
-        let v = read_k(&mut ctx, lane.clone())?;
-        let v = ctx.b.cast(v, ElementType::Scalar(acc_elem));
-        guard(&mut ctx, &lane, v)
-    } else {
-        // Per-lane loop accumulate. The loop's accumulator is SSA-carried,
-        // never reloaded per iteration. The trip count comes from the runtime
-        // extent, so one formula covers a symbolic extent and both collective
-        // strategies.
-        let index = ctx.b.local(ElementType::Scalar(ScalarElement::U32));
-        let idx_read = ctx.b.load_local(index.clone());
-        let k = {
-            let scaled = ctx.b.mul(idx_read, lg_e.clone());
-            ctx.b.add(scaled, lane.clone())
-        };
-        let v = read_k(&mut ctx, k.clone())?;
-        let v = ctx.b.cast(v, ElementType::Scalar(acc_elem));
-        let guarded = guard(&mut ctx, &k, v);
-        let partial = ctx.b.binary(
-            reduce_op.binary(),
-            acc_reads[0].clone(),
-            guarded,
-            NumericContract::RELAXED,
-        );
-        accs[0].update = partial;
-        let count = {
-            let lg_minus_1 = ctx.b.u32(lane_group.max(1) - 1);
-            let numerator = ctx.b.add(axis_extent.clone(), lg_minus_1);
-            ctx.b.binary(
-                TileBinaryOp::Div,
-                numerator,
-                lg_e.clone(),
-                NumericContract::RELAXED,
-            )
-        };
-        stmts.push(Stmt::Loop {
-            count: Some(count),
-            index: Some(index),
-            accumulators: accs.clone(),
-            body: Vec::new(),
-        });
-        ctx.b.load_local(accs[0].local.clone())
-    };
-
-    let reduced: Vec<TileExpr> = match strat {
-        // One collective over the subgroup: no scratch and no barrier.
-        FoldStrat::Subgroup => vec![ctx.b.reduce(reduce_op, ReduceKind::Subgroup, lane_value)],
-        // A one-lane group owns its whole row, so the close is the identity
-        // and stages nothing. `fold_scratch_bytes` reports 0 for the same
-        // strategy; the two must agree.
-        FoldStrat::WgTree { .. } | FoldStrat::LoopThenTree { .. } if lane_group <= 1 => {
-            vec![lane_value]
-        }
-        FoldStrat::WgTree { .. } | FoldStrat::LoopThenTree { .. } => {
-            let scratch = ctx
-                .b
-                .tile("fold_scratch", ElementType::Scalar(acc_elem), &[block]);
-            vec![ctx.b.reduce(
-                reduce_op,
-                ReduceKind::Workgroup {
-                    scratch,
-                    group_size: lane_group,
-                },
-                lane_value,
-            )]
-        }
-    };
-
-    let value = ctx.eval_scalar(post, &reduced, std::slice::from_ref(&row))?;
-    let value = ctx.b.cast(value, out_elem);
-    let lane_zero = {
-        let z = ctx.b.u32(0);
-        ctx.b.compare(TileCompareOp::Eq, lane, z)
-    };
-    let mask = ctx.b.and(row_live, lane_zero);
-    stmts.push(Stmt::Store {
-        dst: out_view,
-        addr: Addr::Linear(row),
-        value,
-        mask,
-    });
-
-    Ok(ctx.finish("kfold", grid, block, stmts))
-}
-
-/// Lower a `Fold` whose carrier is **wider than one hardware operator**.
-///
-/// One accumulator per carrier lane, seeded from that lane's own identity,
-/// absorbed with the carrier's own `merge`, and closed by `Stmt::Reduce`'s N-ary
-/// tree. The output carries `carrier.lanes()` values per row at the trailing
-/// carrier axis `infer_launch` appends.
-///
-/// There is no subgroup collective for a multi-lane merge, so this always closes
-/// with the workgroup tree; a `Subgroup` point is honoured as a tree at the
-/// subgroup width.
-fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Result<KernelIr> {
-    let Launch::Fold {
-        space,
-        axis,
-        vec_axes,
-        carrier,
-        acc,
-        post,
-        ops,
-        ..
-    } = op
-    else {
-        return Err(Error::Plan("lower_kfold_carrier on a non-Fold node".into()));
-    };
+    let fast = vec_axes
+        .is_empty()
+        .then(|| fusor_ir::ir::kernel::fast_reduce_op(carrier))
+        .flatten();
     let merges = carrier.merge_lanes().ok_or_else(|| {
         Error::Plan("this carrier's merge does not expand to one expression per lane".into())
     })?;
@@ -546,13 +279,28 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resu
     let acc_ty = ElementType::Scalar(acc_elem);
     let limits = ctx.caps.limits;
     let max_block = emitted_block(1, ctx.caps);
-    let lane_group = match theta {
-        SchedPoint::Fold(FoldStrat::WgTree { lane_group })
-        | SchedPoint::Fold(FoldStrat::LoopThenTree { lane_group, .. }) => lane_group.max(1),
-        SchedPoint::Fold(FoldStrat::Subgroup) => ctx.caps.subgroup_width().max(1),
-        _ => max_block,
+    let strat = match theta {
+        SchedPoint::Fold(s) => s,
+        _ if fast.is_some() && ctx.caps.subgroups.is_some() => FoldStrat::Subgroup,
+        _ => FoldStrat::WgTree {
+            lane_group: max_block,
+        },
     };
-    let block = lane_group.max(max_block).max(ctx.block_floor);
+    let lane_group = match strat {
+        FoldStrat::WgTree { lane_group } | FoldStrat::LoopThenTree { lane_group, .. } => {
+            lane_group.max(1)
+        }
+        FoldStrat::Subgroup => ctx.caps.subgroup_width().max(1),
+    };
+    let block = if fast.is_some() {
+        match strat {
+            FoldStrat::Subgroup => lane_group.min(limits.max_compute_invocations_per_workgroup),
+            _ => emitted_block(lane_group, ctx.caps),
+        }
+    } else {
+        lane_group.max(max_block)
+    }
+    .max(ctx.block_floor);
 
     // Output rows are `space` minus the reduced axis and every promoted axis:
     // a promoted extent lives in the carrier's lanes, not in the write map.
@@ -609,7 +357,9 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resu
     // One output row spans every promoted position of every reduced element,
     // so its stride carries `vec_extent`.
     let pos_stride = ctx.b.mul(inner.clone(), axis_extent.clone());
-    let row_stride = {
+    let row_stride = if fast.is_some() {
+        pos_stride.clone()
+    } else {
         let ve = ctx.b.u32(vec_extent as u32);
         ctx.b.mul(pos_stride.clone(), ve)
     };
@@ -704,7 +454,15 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resu
         let mut args = acc_reads.clone();
         args.extend(values);
         for slot in 0..lanes {
-            accs[slot].update = ctx.eval_scalar(&merges[slot], &args, &[])?;
+            accs[slot].update = match fast {
+                Some(op) => ctx.b.binary(
+                    op.binary(),
+                    args[0].clone(),
+                    args[1].clone(),
+                    NumericContract::RELAXED,
+                ),
+                None => ctx.eval_scalar(&merges[slot], &args, &[])?,
+            };
         }
         let count = {
             let lg_minus_1 = ctx.b.u32(lane_group - 1);
@@ -731,7 +489,24 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resu
     // Skipped at a one-lane group: that invocation already reduced the whole
     // axis for its own row and there is no partner to merge with.
     // `fold_scratch_bytes` reports 0 here; the two must agree.
-    let reduced: Vec<TileExpr> = if lane_group <= 1 {
+    let reduced: Vec<TileExpr> = if let Some(op) = fast {
+        let value = partials[0].clone();
+        vec![match strat {
+            FoldStrat::Subgroup => ctx.b.reduce(op, ReduceKind::Subgroup, value),
+            _ if lane_group <= 1 => value,
+            _ => {
+                let scratch = ctx.b.tile("fold_scratch", acc_ty, &[block]);
+                ctx.b.reduce(
+                    op,
+                    ReduceKind::Workgroup {
+                        scratch,
+                        group_size: lane_group,
+                    },
+                    value,
+                )
+            }
+        }]
+    } else if lane_group <= 1 {
         partials
     } else {
         let scratch: smallvec::SmallVec<[fusor_ir::ir::kernel::Tile; 4]> = (0..lanes)
@@ -775,8 +550,12 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resu
     for (slot, post) in posts.iter().enumerate().take(lanes) {
         let value = ctx.eval_scalar(post, &reduced, std::slice::from_ref(&row))?;
         let value = ctx.b.cast(value, out_elem);
-        let off = ctx.b.u32(slot as u32);
-        let addr = ctx.b.add(base.clone(), off);
+        let addr = if fast.is_some() {
+            row.clone()
+        } else {
+            let off = ctx.b.u32(slot as u32);
+            ctx.b.add(base.clone(), off)
+        };
         stmts.push(Stmt::Store {
             dst: out_view.clone(),
             addr: Addr::Linear(addr),
@@ -785,30 +564,16 @@ fn lower_kfold_carrier(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resu
         });
     }
 
-    Ok(ctx.finish("kfold_carrier", grid, block, stmts))
-}
-
-/// The hardware collective this carrier reduces with, or an `Err`. Only one
-/// scalar slot whose merge is a binop maps onto `TileReduceOp`; everything
-/// wider needs the N-lane `Stmt::Reduce`.
-fn single_slot_reduce_op(c: &Carrier) -> Result<TileReduceOp> {
-    if c.width() != 1 || c.slots[0] != SlotTy::Scalar {
-        return Err(Error::Plan(format!(
-            "a {}-slot carrier needs the N-lane collective; the GPU emitter \
-             only lowers a single scalar slot",
-            c.width()
-        )));
-    }
-    match c.kind() {
-        Some(BinOp::Add) => Ok(TileReduceOp::Sum),
-        Some(BinOp::Mul) => Ok(TileReduceOp::Product),
-        Some(BinOp::Max) => Ok(TileReduceOp::Max),
-        Some(BinOp::Min) => Ok(TileReduceOp::Min),
-        other => Err(Error::Plan(format!(
-            "carrier merge {other:?} has no hardware collective; the generic \
-             merge path is not built yet"
-        ))),
-    }
+    Ok(ctx.finish(
+        if fast.is_some() {
+            "kfold"
+        } else {
+            "kfold_carrier"
+        },
+        grid,
+        block,
+        stmts,
+    ))
 }
 
 /// A carrier identity as a tile literal. The infinities go through the

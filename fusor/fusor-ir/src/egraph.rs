@@ -63,7 +63,6 @@ pub struct EGraph {
     /// populated memo.
     memo: Arc<FxHashMap<NodeKey, Id>>,
     parent: Vec<Option<Id>>,
-    defns: FixedBitSet,
     roots: Vec<Id>,
     next_sym: u32,
     sem: Arc<dyn Semantics>,
@@ -126,7 +125,6 @@ impl EGraph {
             facts: Vec::new(),
             memo: Arc::new(FxHashMap::default()),
             parent: Vec::new(),
-            defns: FixedBitSet::new(),
             roots: Vec::new(),
             next_sym: 0,
             sem,
@@ -221,17 +219,6 @@ impl EGraph {
     pub fn clear_roots(&mut self) {
         self.roots.clear();
     }
-    /// Mark an id as a macro op's definitional expansion. Sugar and its
-    /// `defn` are unioned at construction, so there is nothing to
-    /// recognize; a `defn` node is never evicted.
-    pub fn mark_defn(&mut self, id: Id) {
-        self.defns.grow(self.nodes.len());
-        self.defns.insert(id.index());
-    }
-    pub fn is_defn(&self, id: Id) -> bool {
-        self.defns.contains(id.index())
-    }
-
     pub fn fresh_sym(&mut self) -> SymId {
         let s = SymId(self.next_sym);
         self.next_sym += 1;
@@ -318,12 +305,6 @@ impl EGraph {
         self.members(self.class_of(id))
     }
 
-    /// Every id that resolves to `class`, including the `Union` spine.
-    ///
-    /// A `Union` id is still a name a caller holds: `macro_op` returns the id
-    /// `union(defn, sugar)` produced, so the `Tensor` the user reads back is
-    /// the spine node. Anything keyed on "this value" rather than "this
-    /// candidate" has to use this.
     /// Brings the readers index up to `len` nodes: every node added by a
     /// path other than [`Self::add`] — a replayed delta — is indexed here.
     fn index_readers_to(&mut self, len: usize) {
@@ -465,12 +446,11 @@ impl EGraph {
     /// Capture everything saturation may overwrite rather than append.
     ///
     /// `nodes` and `facts` are push-only, so they are captured at record time
-    /// instead; `parent`, `defns`, `roots` and `next_sym` are captured here.
+    /// instead; `parent`, `offered`, `roots` and `next_sym` are captured here.
     pub fn pre_saturation(&self) -> PreSaturation {
         PreSaturation {
             len: self.nodes.len(),
             parent: self.parent.clone(),
-            defns: self.defns.ones().map(|i| i as u32).collect(),
             offered: self.offered.ones().map(|i| i as u32).collect(),
             roots: self.roots.clone(),
             next_sym: self.next_sym,
@@ -490,7 +470,6 @@ impl EGraph {
             // Kept whole: re-inserting the tail would rehash every `NodeKey`.
             memo: Arc::clone(&self.memo),
             parent: self.parent.clone(),
-            defns: self.defns.clone(),
             offered: self.offered.clone(),
             roots: self.roots.clone(),
             next_sym: self.next_sym,
@@ -502,7 +481,7 @@ impl EGraph {
     /// not the one the delta was recorded against.
     ///
     /// The validity check is exact, not a fingerprint: every pre-existing
-    /// node, every parent link, the `defn` set, the root set and the symbol
+    /// node, every parent link, the offered set, the root set and the symbol
     /// counter are compared by value. `len` and `next_sym` reject a mismatch
     /// before any node is looked at.
     pub fn replay_saturation(&mut self, delta: &SaturationDelta) -> bool {
@@ -512,14 +491,6 @@ impl EGraph {
             || self.roots != pre.roots
             || self.parent != pre.parent
             || self.nodes[..] != delta.nodes[..pre.len]
-        {
-            return false;
-        }
-        if !self
-            .defns
-            .ones()
-            .map(|i| i as u32)
-            .eq(pre.defns.iter().copied())
         {
             return false;
         }
@@ -539,7 +510,6 @@ impl EGraph {
         self.index_readers_to(self.nodes.len());
         self.memo = Arc::clone(&delta.memo);
         self.parent.clone_from(&delta.parent);
-        self.defns.clone_from(&delta.defns);
         self.offered.clone_from(&delta.offered);
         self.roots.clone_from(&delta.roots);
         self.next_sym = delta.next_sym;
@@ -645,10 +615,6 @@ impl<'a> Builder<'a> {
     pub fn fresh_sym(&mut self) -> SymId {
         self.graph.fresh_sym()
     }
-    pub fn mark_defn(&mut self, id: Id) {
-        self.graph.mark_defn(id);
-    }
-
     /// Walk a chain of pure `Restride` views down to their base.
     pub fn trace_pure_views(&self, mut v: Id) -> ViewSpine {
         let mut views: SmallVec<[Id; 4]> = SmallVec::new();
@@ -811,7 +777,6 @@ pub struct SaturationReport {
 pub struct PreSaturation {
     len: usize,
     parent: Vec<Option<Id>>,
-    defns: Vec<u32>,
     offered: Vec<u32>,
     roots: Vec<Id>,
     next_sym: u32,
@@ -842,7 +807,6 @@ pub struct SaturationDelta {
     facts: Vec<ValueFacts>,
     memo: Arc<FxHashMap<NodeKey, Id>>,
     parent: Vec<Option<Id>>,
-    defns: FixedBitSet,
     offered: FixedBitSet,
     roots: Vec<Id>,
     next_sym: u32,

@@ -1,14 +1,7 @@
-//! Attention: the macro node carrying `MaskKind`, plus its `defn` expansion.
-//!
-//! `causal` is structural on the sugar node, so the compiler skips
-//! upper-triangle Q.K work without loading a mask tensor.
-//!
-//! Grouped-query attention splits `q`'s head axis into `(Hkv, g)` — a legal
-//! restride at any strides — and `g` becomes a free axis of the contraction.
+//! Attention and its gradients over logical contractions and reductions.
 
 use fusor_autograd::tape::{GraphTape, TapeExt, accum_dtype, splat_of};
 use fusor_ir::autograd::{Tape, Val};
-/// Which structural mask an attention node carries.
 use fusor_ir::ir::launch::MaskKind;
 use fusor_ir::ir::logical::{EinSpec, Label};
 use fusor_ir::scalar::{BinOp, CmpOp, ScalarExpr, UnOp};
@@ -17,7 +10,7 @@ use fusor_ir::{Error, Result};
 use smallvec::SmallVec;
 
 use crate::composite::normalization::softmax_defn;
-use crate::composite::{AttentionOut, MacroAttr, MacroOp, const_dim, macro_op};
+use crate::composite::{const_dim, core_op};
 use crate::graph::GraphRef;
 use crate::tensor::Tensor;
 
@@ -278,21 +271,9 @@ pub fn attention_masked(
 
     let (qi, ki, vi) = (q.id, k.id, v.id);
     let mi = mask_tensor.map(|m| m.id);
-    let mut ops = vec![qi, ki, vi];
-    ops.extend(mi);
-    macro_op(
-        graph,
-        MacroOp::Attention,
-        MacroAttr::Attention {
-            mask,
-            causal: matches!(mask, MaskKind::Causal),
-            groups: groups as u32,
-            produce: AttentionOut::Output,
-            scale: sym,
-        },
-        &ops,
-        move |t| attention_defn(t, qi, ki, vi, groups, sym, mask, mi),
-    )
+    core_op(graph, move |t| {
+        attention_defn(t, qi, ki, vi, groups, sym, mask, mi)
+    })
 }
 
 /// The row log-sum-exp of the attention scores: `m + ln sum exp(s - m)`,
@@ -313,36 +294,22 @@ pub fn attention_lse(
     let sym = scale_uniform(graph, scale_value);
     let (qi, ki) = (q.id, k.id);
     let mi = mask_tensor.map(|m| m.id);
-    let mut ops = vec![qi, ki];
-    ops.extend(mi);
-    macro_op(
-        graph,
-        MacroOp::Attention,
-        MacroAttr::Attention {
-            mask,
-            causal: matches!(mask, MaskKind::Causal),
-            groups: groups as u32,
-            produce: AttentionOut::LogSumExp,
-            scale: sym,
-        },
-        &ops,
-        move |t| {
-            let s = scores(t, qi, ki, groups, sym, mask, mi)?;
-            let dtype = t.dtype_of(s);
-            let rank = t.rank_of(s);
-            let axis = (rank - 1) as u32;
-            let extent = t.shape_of(s)[axis as usize];
-            let m = t.fold_binop(BinOp::Max, axis, dtype, s)?;
-            let mb = t.broadcast_axis(m, axis, extent)?;
-            let centered = t.binary(BinOp::Sub, s, mb)?;
-            let e = t.unary(UnOp::Exp, centered)?;
-            let sum = t.fold_binop(BinOp::Add, axis, accum_dtype(dtype), e)?;
-            let sum = t.cast(dtype, sum)?;
-            let ln = t.unary(UnOp::Log, sum)?;
-            let lse = t.binary(BinOp::Add, m, ln)?;
-            merge_lse_heads(t, lse, groups)
-        },
-    )
+    core_op(graph, move |t| {
+        let s = scores(t, qi, ki, groups, sym, mask, mi)?;
+        let dtype = t.dtype_of(s);
+        let rank = t.rank_of(s);
+        let axis = (rank - 1) as u32;
+        let extent = t.shape_of(s)[axis as usize];
+        let m = t.fold_binop(BinOp::Max, axis, dtype, s)?;
+        let mb = t.broadcast_axis(m, axis, extent)?;
+        let centered = t.binary(BinOp::Sub, s, mb)?;
+        let e = t.unary(UnOp::Exp, centered)?;
+        let sum = t.fold_binop(BinOp::Add, axis, accum_dtype(dtype), e)?;
+        let sum = t.cast(dtype, sum)?;
+        let ln = t.unary(UnOp::Log, sum)?;
+        let lse = t.binary(BinOp::Add, m, ln)?;
+        merge_lse_heads(t, lse, groups)
+    })
 }
 
 /// The `[.., Hkv, g, Lq]` head pair of an lse, merged back to `[.., H, Lq]`.
@@ -392,6 +359,11 @@ pub fn attention_grads(
     mask: MaskKind,
     scale: Option<f32>,
 ) -> Result<(Tensor, Tensor, Tensor)> {
+    if !matches!(mask, MaskKind::None | MaskKind::Causal) {
+        return Err(Error::Shape(
+            "attention_grads requires a structural mask".into(),
+        ));
+    }
     let graph = &q.graph;
     if group_factor(graph, q, k)? != 1 {
         return Err(Error::Shape(
@@ -407,82 +379,58 @@ pub fn attention_grads(
     let index = crate::composite::index_run(graph, 0, lk)?;
     let index_upper = crate::composite::index_run(graph, lk, lk)?;
 
-    let dq = macro_op(
-        graph,
-        MacroOp::Attention,
-        MacroAttr::Attention {
-            mask,
-            causal: matches!(mask, MaskKind::Causal),
-            groups: 1,
-            produce: AttentionOut::GradQ,
-            scale: sym,
-        },
-        &[qi, ki, vi, oi, gi, li],
-        move |t| {
-            let ds = grad_scores(t, qi, ki, vi, oi, gi, li, sym)?;
-            let acc = accum_dtype(t.dtype_of(ds));
-            let dtype = t.dtype_of(qi);
-            let dq = t.contract(
-                ds,
-                ki,
-                EinSpec {
-                    a: labels(&[B, HKV, LQ, LK]),
-                    b: labels(&[B, HKV, LK, DH]),
-                    out: labels(&[B, HKV, LQ, DH]),
-                },
-                acc,
-            )?;
-            t.cast(dtype, dq)
-        },
-    )?;
+    let dq = core_op(graph, move |t| {
+        let ds = grad_scores(t, qi, ki, vi, oi, gi, li, sym, mask)?;
+        let acc = accum_dtype(t.dtype_of(ds));
+        let dtype = t.dtype_of(qi);
+        let dq = t.contract(
+            ds,
+            ki,
+            EinSpec {
+                a: labels(&[B, HKV, LQ, LK]),
+                b: labels(&[B, HKV, LK, DH]),
+                out: labels(&[B, HKV, LQ, DH]),
+            },
+            acc,
+        )?;
+        t.cast(dtype, dq)
+    })?;
 
-    let combined = macro_op(
-        graph,
-        MacroOp::Attention,
-        MacroAttr::Attention {
-            mask,
-            causal: matches!(mask, MaskKind::Causal),
-            groups: 1,
-            produce: AttentionOut::GradKV,
-            scale: sym,
-        },
-        &[qi, ki, vi, oi, gi, li, index, index_upper],
-        move |t| {
-            let dtype = t.dtype_of(qi);
-            let acc = accum_dtype(dtype);
-            let ds = grad_scores(t, qi, ki, vi, oi, gi, li, sym)?;
-            let dk = t.contract(
-                ds,
-                qi,
-                EinSpec {
-                    a: labels(&[B, HKV, LQ, LK]),
-                    b: labels(&[B, HKV, LQ, DH]),
-                    out: labels(&[B, HKV, LK, DH]),
-                },
-                acc,
-            )?;
-            let dk = t.cast(dtype, dk)?;
-            let p = probabilities(t, qi, ki, oi, li, sym)?;
-            let dv = t.contract(
-                p,
-                gi,
-                EinSpec {
-                    a: labels(&[B, HKV, LQ, LK]),
-                    b: labels(&[B, HKV, LQ, DH]),
-                    out: labels(&[B, HKV, LK, DH]),
-                },
-                acc,
-            )?;
-            let dv = t.cast(dtype, dv)?;
+    let combined = core_op(graph, move |t| {
+        let dtype = t.dtype_of(qi);
+        let acc = accum_dtype(dtype);
+        let ds = grad_scores(t, qi, ki, vi, oi, gi, li, sym, mask)?;
+        let dk = t.contract(
+            ds,
+            qi,
+            EinSpec {
+                a: labels(&[B, HKV, LQ, LK]),
+                b: labels(&[B, HKV, LQ, DH]),
+                out: labels(&[B, HKV, LK, DH]),
+            },
+            acc,
+        )?;
+        let dk = t.cast(dtype, dk)?;
+        let p = probabilities(t, qi, ki, li, sym, mask)?;
+        let dv = t.contract(
+            p,
+            gi,
+            EinSpec {
+                a: labels(&[B, HKV, LQ, LK]),
+                b: labels(&[B, HKV, LQ, DH]),
+                out: labels(&[B, HKV, LK, DH]),
+            },
+            acc,
+        )?;
+        let dv = t.cast(dtype, dv)?;
 
-            // One buffer, dk rows then dv rows.
-            let mut shape = t.shape_of(dk);
-            shape[2] = Dim::Const(lk * 2);
-            let base = t.zeros_shaped(dtype, &shape)?;
-            let base = t.scatter_set(2, base, index, dk, true)?;
-            t.scatter_set(2, base, index_upper, dv, true)
-        },
-    )?;
+        // One buffer, dk rows then dv rows.
+        let mut shape = t.shape_of(dk);
+        shape[2] = Dim::Const(lk * 2);
+        let base = t.zeros_shaped(dtype, &shape)?;
+        let base = t.scatter_set(2, base, index, dk, true)?;
+        t.scatter_set(2, base, index_upper, dv, true)
+    })?;
 
     let dk = narrow_axis(&combined, 2, 0, lk)?;
     let dv = narrow_axis(&combined, 2, lk, lk)?;
@@ -495,11 +443,11 @@ fn probabilities(
     t: &mut GraphTape<'_>,
     q: Val,
     k: Val,
-    _o: Val,
     lse: Val,
     scale: SymId,
+    mask: MaskKind,
 ) -> Result<Val> {
-    let s = scores(t, q, k, 1, scale, MaskKind::None, None)?;
+    let s = scores(t, q, k, 1, scale, mask, None)?;
     let axis = (t.rank_of(s) - 1) as u32;
     let extent = t.shape_of(s)[axis as usize];
     let l = t.broadcast_axis(lse, axis, extent)?;
@@ -518,10 +466,11 @@ fn grad_scores(
     grad_o: Val,
     lse: Val,
     scale: SymId,
+    mask: MaskKind,
 ) -> Result<Val> {
     let dtype = t.dtype_of(q);
     let acc = accum_dtype(dtype);
-    let p = probabilities(t, q, k, o, lse, scale)?;
+    let p = probabilities(t, q, k, lse, scale, mask)?;
     let dp = t.contract(
         grad_o,
         v,

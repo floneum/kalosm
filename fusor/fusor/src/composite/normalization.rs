@@ -1,15 +1,11 @@
-//! softmax, rms_norm and layer_norm. All macro ops over `Fold` + `Map`, fused
-//! into one launch by `fold_split` + `map_into_fold`.
-//!
-//! Every softmax spelling shares **one** `defn`, under a sugar node minted in
-//! the same call.
+//! Softmax, RMS normalization and layer normalization over Fold and Map.
 
 use fusor_autograd::tape::{GraphTape, TapeExt, accum_dtype};
 use fusor_ir::autograd::{Tape, Val};
 use fusor_ir::scalar::{BinOp, ScalarExpr, UnOp};
 use fusor_ir::{Error, Result};
 
-use crate::composite::{MacroAttr, MacroOp, NormKind, core_op, macro_op};
+use crate::composite::core_op;
 use crate::graph::GraphRef;
 use crate::tensor::Tensor;
 
@@ -176,17 +172,10 @@ fn last_axis(graph: &GraphRef, x: &Tensor) -> Result<u32> {
 }
 
 impl Tensor {
-    /// Softmax over `axis`, as a macro op: the sugar node carries the axis so
-    /// a rule can read it, and the expansion is in the same class.
+    /// Softmax over `axis`.
     pub fn softmax(&self, axis: u32) -> Result<Tensor> {
         let x = self.id;
-        macro_op(
-            &self.graph,
-            MacroOp::Softmax,
-            MacroAttr::Softmax { axis },
-            &[x],
-            |t| softmax_defn(t, x, axis),
-        )
+        core_op(&self.graph, |t| softmax_defn(t, x, axis))
     }
 
     /// Softmax over the last axis.
@@ -226,24 +215,12 @@ impl Tensor {
         let sym = eps_uniform(&self.graph, eps);
         let (x, r, w) = (self.id, residual.id, weight.id);
         let b = bias.map(|t| t.id);
-        let mut ops = vec![x, r, w];
-        ops.extend(b);
-        macro_op(
-            &self.graph,
-            MacroOp::Norm,
-            MacroAttr::Norm {
-                kind: NormKind::Rms,
-                eps: sym,
-                remove_mean: false,
-            },
-            &ops,
-            |t| {
-                let shape = t.shape_of(x);
-                let r = t.broadcast_to(r, &shape)?;
-                let sum = t.binary(BinOp::Add, x, r)?;
-                rms_norm_defn(t, sum, Some(w), b, sym)
-            },
-        )
+        core_op(&self.graph, |t| {
+            let shape = t.shape_of(x);
+            let r = t.broadcast_to(r, &shape)?;
+            let sum = t.binary(BinOp::Add, x, r)?;
+            rms_norm_defn(t, sum, Some(w), b, sym)
+        })
     }
 
     fn rms_norm_inner(
@@ -256,20 +233,7 @@ impl Tensor {
         let x = self.id;
         let w = weight.map(|t| t.id);
         let b = bias.map(|t| t.id);
-        let mut ops = vec![x];
-        ops.extend(w);
-        ops.extend(b);
-        macro_op(
-            &self.graph,
-            MacroOp::Norm,
-            MacroAttr::Norm {
-                kind: NormKind::Rms,
-                eps: sym,
-                remove_mean: false,
-            },
-            &ops,
-            |t| rms_norm_defn(t, x, w, b, sym),
-        )
+        core_op(&self.graph, |t| rms_norm_defn(t, x, w, b, sym))
     }
 
     /// `(x - mean) / sqrt(var + eps) * weight + bias` over the last axis.
@@ -285,19 +249,9 @@ impl Tensor {
         let x = self.id;
         let w = weight.id;
         let b = bias.map(|t| t.id);
-        let mut ops = vec![x, w];
-        ops.extend(b);
-        macro_op(
-            &self.graph,
-            MacroOp::Norm,
-            MacroAttr::Norm {
-                kind: NormKind::Layer,
-                eps: sym,
-                remove_mean,
-            },
-            &ops,
-            |t| layer_norm_defn(t, x, Some(w), b, sym, remove_mean),
-        )
+        core_op(&self.graph, |t| {
+            layer_norm_defn(t, x, Some(w), b, sym, remove_mean)
+        })
     }
 
     /// `mean(x^2)`-free variance over the last axis, for callers that want the

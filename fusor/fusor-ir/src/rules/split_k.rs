@@ -48,11 +48,7 @@ pub fn split_k(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Opti
     };
     let kc = k.as_const()?;
     // Splitting changes operand coordinates, including the reduced-axis origin.
-    if kc < MIN_K
-        || a.pre.reads_index_of()
-        || rhs.pre.reads_index_of()
-        || std::env::var_os("FUSOR_NO_SPLIT_K").is_some()
-    {
+    if kc < MIN_K || a.pre.reads_index_of() || rhs.pre.reads_index_of() {
         return None;
     }
     let (mc, nc, batch_c) = (m.as_const()?, n.as_const()?, batch.as_const()?);
@@ -65,30 +61,11 @@ pub fn split_k(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Opti
     if batch_elements != batch_c {
         return None;
     }
-    let log = std::env::var_os("FUSOR_SPLIT_LOG").is_some();
-    if log {
-        eprintln!(
-            "SPLITK {id}: m={mc} n={nc} k={kc} b={batch_c} a={:?}/{:?} {:?} b={:?}/{:?} {:?}",
-            a.primary().layout.shape(),
-            a.primary().layout.strides(),
-            a.primary().access,
-            rhs.primary().layout.shape(),
-            rhs.primary().layout.strides(),
-            rhs.primary().access
-        );
-    }
     // `a` is `[batch.., m.., k]` and `b` is `[batch.., k, n..]`, k a single
     // axis on each: the split threads a chunk axis in front of the row
     // group and a chunk stride through k.
     let a_k = k_axis(a.primary().layout.shape(), batch_c, mc, kc, false);
     let b_k = k_axis(rhs.primary().layout.shape(), batch_c, nc, kc, true);
-    if log {
-        eprintln!(
-            "  axes a={:?} b={:?}",
-            a_k.as_ref().map(|k| (k.axis, k.batch_axes)),
-            b_k.as_ref().map(|k| (k.axis, k.batch_axes))
-        );
-    }
     let (a_k, b_k) = (a_k?, b_k?);
     // An `Alias` or a `Pack` reads the operand's own layout; a gather or an
     // unflatten carries its own map, which the chunk stride cannot thread.

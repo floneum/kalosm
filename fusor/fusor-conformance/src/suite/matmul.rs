@@ -4,7 +4,7 @@
 
 use fusor::{Dtype, Session};
 
-use crate::harness::{Case, CaseError, CaseResult, Cases, FuzzDim, dims, fuzz_case};
+use crate::harness::{Case, CaseResult, Cases, FuzzDim, dims, fuzz_case};
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
 
 // Gradients here are analytic (all-ones seed row/column sums), not finite
@@ -178,9 +178,7 @@ async fn wide_n(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let graph = graph_of(session);
     let lhs = upload(graph.handle(), &dims(&[m, k]), &a)?;
     let rhs = upload(graph.handle(), &dims(&[k, n]), &b)?;
-    let y = lhs
-        .matmul(&rhs)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = lhs.matmul(&rhs)?;
     let actual = read(&y).await?;
     let mut expected = vec![0.0f32; (m * n) as usize];
     for i in 0..m as usize {
@@ -215,11 +213,7 @@ async fn qkv_triple(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     for i in 0..3usize {
         let wi = upload(graph.handle(), &dims(&[cin, cout]), &w[i])?;
         let bi = upload(graph.handle(), &dims(&[1, cout]), &bias[i])?;
-        outs.push(
-            a.matmul(&wi)
-                .and_then(|y| y.add_(&bi))
-                .map_err(|e| -> CaseError { e.to_string().into() })?,
-        );
+        outs.push(a.matmul(&wi).and_then(|y| y.add_(&bi))?);
     }
 
     for (i, out) in outs.iter().enumerate() {
@@ -267,9 +261,7 @@ async fn split_k(session: &Session, k: u64, shape: &[u64], seed: u32) -> CaseRes
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dims(&[m, k]), &a_data)?;
     let b = upload(graph.handle(), &dims(&[k, n]), &b_data)?;
-    let y = a
-        .matmul(&b)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = a.matmul(&b)?;
     let actual = read(&y).await?;
 
     let mut expected = vec![0.0f32; (m * n) as usize];
@@ -374,9 +366,7 @@ async fn batched(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dims(&a_shape), &a_data)?;
     let b = upload(graph.handle(), &dims(&b_shape), &b_data)?;
-    let y = a
-        .matmul(&b)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = a.matmul(&b)?;
 
     let actual = read(&y).await?;
     let expected = host_matmul(
@@ -426,9 +416,7 @@ async fn transposed_rhs(session: &Session, shape: &[u64], seed: u32) -> CaseResu
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dims(&[m as u64, k as u64]), &a_data)?;
     let b = upload(graph.handle(), &dims(&[n as u64, k as u64]), &b_data)?;
-    let y = a
-        .matmul_t(&b)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = a.matmul_t(&b)?;
 
     let mut expected = vec![0.0f32; m * n];
     for i in 0..m {
@@ -481,10 +469,7 @@ async fn broadcast_bias(session: &Session, shape: &[u64], seed: u32) -> CaseResu
     let a = upload(graph.handle(), &dims(&[m as u64, k as u64]), &a_data)?;
     let b = upload(graph.handle(), &dims(&[k as u64, n as u64]), &b_data)?;
     let c = upload(graph.handle(), &dims(&[n as u64]), &bias)?;
-    let y = a
-        .matmul(&b)
-        .and_then(|p| p.add_(&c))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = a.matmul(&b).and_then(|p| p.add_(&c))?;
 
     let product = host_matmul(&a_data, &b_data, 1, m, k, n);
     let expected: Vec<f32> = product
@@ -570,8 +555,7 @@ async fn quantized_matmul(
         layout,
         [fusor::Dim::Const(rows), fusor::Dim::Const(k as u64)],
         &bytes,
-    )
-    .map_err(|e| -> CaseError { e.to_string().into() })?;
+    )?;
 
     let act_shape: Vec<u64> = if act_rank == 1 {
         vec![k as u64]
@@ -579,9 +563,7 @@ async fn quantized_matmul(
         vec![batch as u64, k as u64]
     };
     let a = upload(graph.handle(), &dims(&act_shape), &act)?;
-    let y = qm
-        .q_mat_mul(&a)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = qm.q_mat_mul(&a)?;
 
     let mut expected = vec![0.0f32; batch * rows as usize];
     for b in 0..batch {

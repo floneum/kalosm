@@ -1,9 +1,4 @@
-//! Realizing an [`Extraction`] into a DAG, and cutting that DAG into launches.
-//!
-//! Launches are the connected components of the realized DAG cut at `M`
-//! boundaries and at forced boundaries (index-space mismatch, fold-to-fold
-//! dependency). Consumer counts come from the DAG, so rematerialization is
-//! priced as `saved_write + saved_reads - recompute * (consumers - 1)`.
+//! Resolve selected nodes, derive their buffers, and order their dispatches.
 
 use fusor_ir::cost::{CostModel, LaunchPlan, Picoseconds};
 use fusor_ir::device::Caps;
@@ -17,7 +12,7 @@ use fusor_ir::ir::kernel::{
     ArenaPlanner, MemoryLevel, ScalarElement, Tile, TileDecl, TileLayout, Tiles,
 };
 use fusor_ir::ir::launch::{
-    Effect, FoldStrat, IndexSpace, Launch, SchedPoint, ScheduleDomain, slab_lanes_per_row,
+    FoldStrat, IndexSpace, Launch, SchedPoint, ScheduleDomain, slab_lanes_per_row,
     slab_subgroup_width,
 };
 use fusor_ir::ir::logical::{LeafKind, Logical};
@@ -303,44 +298,89 @@ pub fn realize_with(
     arena: &dyn ArenaPlanner,
     cache: &mut NodeCache,
 ) -> Result<Realized> {
-    let caps = &cost.facts().caps;
-    let resolved_roots = roots
-        .iter()
-        .map(|r| select(graph, extraction, *r))
-        .collect::<Result<Vec<_>>>()?;
+    Selected::new(graph, extraction, roots)?.realize(graph, extraction, cost, arena, cache)
+}
 
-    let (order, operands) = walk(graph, extraction, &resolved_roots).map_err(Error::from)?;
-    let (consumers, consumer_nodes) =
-        count_consumers(graph.len(), &order, &operands, &resolved_roots);
-    let (launch_of, groups) =
-        cut(graph, extraction, &order, &operands, &resolved_roots).map_err(Error::from)?;
-    let components = groups
-        .into_iter()
-        .map(|members| {
-            build_component(
-                graph,
-                extraction,
-                &consumers,
-                &consumer_nodes,
-                &launch_of,
-                &resolved_roots,
-                members,
-                caps,
-                arena,
-                cache,
-            )
+pub(crate) struct Selected {
+    pub order: Vec<Id>,
+    operands: Operands,
+    roots: Vec<Id>,
+}
+
+impl Selected {
+    pub(crate) fn new(graph: &EGraph, extraction: &Extraction, roots: &[Id]) -> Result<Self> {
+        let roots = roots
+            .iter()
+            .map(|r| select(graph, extraction, *r))
+            .collect::<Result<Vec<_>>>()?;
+        let (order, operands) = walk(graph, extraction, &roots).map_err(Error::from)?;
+        Ok(Self {
+            order,
+            operands,
+            roots,
         })
-        .collect::<Result<Vec<_>>>()?;
+    }
 
-    Ok(Realized {
-        order,
-        consumers,
-        consumer_nodes,
-        launch_of,
-        components,
-        operands,
-        roots: resolved_roots,
-    })
+    pub(crate) fn buffers(&self, graph: &EGraph) -> fixedbitset::FixedBitSet {
+        let mut buffers = fixedbitset::FixedBitSet::with_capacity(graph.len());
+        for &id in &self.order {
+            if leaf_role(graph, id) == LeafRole::NotLeaf {
+                buffers.insert(id.index());
+            }
+            if let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) =
+                &graph.node(id).op
+                && let Some(last) = members.last()
+            {
+                buffers.remove(last.index());
+            }
+        }
+        buffers
+    }
+
+    pub(crate) fn realize(
+        self,
+        graph: &EGraph,
+        extraction: &Extraction,
+        cost: &dyn CostModel,
+        arena: &dyn ArenaPlanner,
+        cache: &mut NodeCache,
+    ) -> Result<Realized> {
+        let Self {
+            order,
+            operands,
+            roots,
+        } = self;
+        let caps = &cost.facts().caps;
+        let (consumers, consumer_nodes) = count_consumers(graph.len(), &order, &operands, &roots);
+        let (launch_of, groups) = cut(graph, extraction, &order, &operands).map_err(Error::from)?;
+        let components = groups
+            .into_iter()
+            .map(|members| {
+                build_component(
+                    graph,
+                    extraction,
+                    &consumers,
+                    &consumer_nodes,
+                    &launch_of,
+                    &roots,
+                    members,
+                    caps,
+                    arena,
+                    cache,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        Ok(Realized {
+            order,
+            consumers,
+            consumer_nodes,
+            launch_of,
+            components,
+            operands,
+            roots,
+        })
+    }
 }
 
 /// `cost.total` over the realized launches. The accept test for every
@@ -351,34 +391,7 @@ pub fn exact_cost(
     cost: &dyn CostModel,
 ) -> Picoseconds {
     let launches = realized.launches(extraction);
-    cost.total(extraction, &launches)
-}
-
-/// True when an edge must be cut regardless of `M`: a leaf operand, an
-/// index-space mismatch, a fold-to-fold dependency, a merged wave, an
-/// in-place producer, or a producer that is itself a root.
-pub fn forced_boundary(
-    graph: &EGraph,
-    extraction: &Extraction,
-    roots: &[Id],
-    producer: Id,
-    consumer: Id,
-) -> bool {
-    if leaf_role(graph, producer) != LeafRole::NotLeaf {
-        return true;
-    }
-    // A slab's members run as its stages, materialized or not: that is the
-    // one edge a buffer does not cut.
-    if slab_stage(graph, consumer, producer).is_some() {
-        return false;
-    }
-    if extraction.is_materialized(producer) || roots.contains(&producer) {
-        return true;
-    }
-    if graph.semantics().effect(&graph.node(producer).op) != Effect::Pure {
-        return true;
-    }
-    structural_boundary(graph, producer, consumer)
+    cost.total(&launches)
 }
 
 /// `Some(is_last)` when `producer` is a member of the slab `consumer`.
@@ -390,54 +403,6 @@ pub fn slab_stage(graph: &EGraph, consumer: Id, producer: Id) -> Option<bool> {
     };
     let pos = members.iter().position(|m| *m == producer)?;
     Some(pos + 1 == members.len())
-}
-
-/// The half of [`forced_boundary`] that `M` cannot argue with: a merged wave,
-/// an index-space mismatch, or a chained reduction (the consumer's first
-/// iteration needs the producer's whole axis to have landed).
-///
-/// Also the materialization obligation: an edge cut for one of these reasons
-/// puts producer and consumer in different launches, so the producer has to
-/// land in a buffer. `verify_plan`'s clause 3 is this statement.
-pub fn structural_boundary(graph: &EGraph, producer: Id, consumer: Id) -> bool {
-    if !index_space(graph, consumer).covers(&index_space(graph, producer)) {
-        return true;
-    }
-    reduces(graph, producer) && reduces(graph, consumer)
-}
-
-/// True when `producer` must be in `M` for this edge to be runnable.
-///
-/// Either the edge is a [`structural_boundary`], so producer and consumer
-/// land in different launches whatever `M` says. Or the consumer's own node
-/// never absorbed the producer: a launch is lowered from one node, so a
-/// producer can only share a kernel with its consumer where a rule already
-/// folded it into one node whose operands are the producer's. Inlining any
-/// other edge leaves the consumer's kernel reading an operand nothing ever
-/// wrote.
-///
-/// A materialization obligation, not a cut rule: the cost model can still
-/// price an inlined producer; the seed, the repair and the `FLIP` frontier
-/// refuse to ship one.
-pub fn needs_own_buffer(graph: &EGraph, producer: Id, consumer: Id) -> bool {
-    // Every stage but the last lands in its own buffer, where the stages
-    // after it read it; the last stage lands in the slab's.
-    if let Some(last) = slab_stage(graph, consumer, producer) {
-        return !last;
-    }
-    structural_boundary(graph, producer, consumer) || !absorbs(graph, consumer, producer)
-}
-
-/// True when `consumer`'s own node already names `producer`'s class as a
-/// member it computes, rather than as an operand it reads.
-fn absorbs(graph: &EGraph, consumer: Id, producer: Id) -> bool {
-    let class = graph.class_of(producer);
-    match &graph.node(consumer).op {
-        Op::Launch(Launch::Region { members, .. }) => {
-            members.iter().any(|m| graph.class_of(*m) == class)
-        }
-        _ => false,
-    }
 }
 
 /// The member `sigma` selected for `id`'s class.
@@ -458,14 +423,6 @@ pub fn leaf_role(graph: &EGraph, id: Id) -> LeafRole {
         Op::Logical(Logical::Leaf(_)) => LeafRole::External,
         _ => LeafRole::NotLeaf,
     }
-}
-
-pub fn reduces(graph: &EGraph, id: Id) -> bool {
-    matches!(
-        graph.node(id).op,
-        Op::Launch(Launch::Fold { .. } | Launch::Contract { .. })
-            | Op::Logical(Logical::Fold { .. } | Logical::Contract { .. })
-    )
 }
 
 /// The iteration domain of one node. Launch nodes carry it; everything else is
@@ -912,65 +869,12 @@ pub fn selection_cycle(graph: &EGraph, extraction: &Extraction, roots: &[Id]) ->
         .map(|r| select(graph, extraction, *r))
         .collect::<Result<Vec<_>>>()
         .ok()?;
-    let attempt = walk(graph, extraction, &resolved).and_then(|(order, operands)| {
-        let mut seed = extraction.clone();
-        seed.m = materializations(graph, &resolved, &order, &operands);
-        cut(graph, &seed, &order, &operands, &resolved)
-    });
+    let attempt = walk(graph, extraction, &resolved)
+        .and_then(|(order, operands)| cut(graph, extraction, &order, &operands));
     match attempt {
         Err(WalkFail::Cycle(v)) => Some(v),
         _ => None,
     }
-}
-
-pub(crate) fn seed_materializations(
-    graph: &EGraph,
-    extraction: &Extraction,
-    roots: &[Id],
-) -> Result<fixedbitset::FixedBitSet> {
-    let roots = roots
-        .iter()
-        .map(|r| select(graph, extraction, *r))
-        .collect::<Result<Vec<_>>>()?;
-    let (order, operands) = walk(graph, extraction, &roots).map_err(Error::from)?;
-    Ok(materializations(graph, &roots, &order, &operands))
-}
-
-pub(crate) fn selected_order(
-    graph: &EGraph,
-    extraction: &Extraction,
-    roots: &[Id],
-) -> Result<Vec<Id>> {
-    let roots = roots
-        .iter()
-        .map(|r| select(graph, extraction, *r))
-        .collect::<Result<Vec<_>>>()?;
-    walk(graph, extraction, &roots)
-        .map(|(order, _)| order)
-        .map_err(Error::from)
-}
-
-fn materializations(
-    graph: &EGraph,
-    roots: &[Id],
-    order: &[Id],
-    operands: &Operands,
-) -> fixedbitset::FixedBitSet {
-    let (consumers, readers) = count_consumers(graph.len(), order, operands, roots);
-    let mut materialized = fixedbitset::FixedBitSet::with_capacity(graph.len());
-    for &id in order {
-        if leaf_role(graph, id) == LeafRole::NotLeaf
-            && (roots.contains(&id)
-                || graph.semantics().effect(&graph.node(id).op) != Effect::Pure
-                || consumers.copied(id).unwrap_or(0) > 1
-                || readers
-                    .get(id)
-                    .is_some_and(|cs| cs.iter().any(|c| needs_own_buffer(graph, id, *c))))
-        {
-            materialized.insert(id.index());
-        }
-    }
-    materialized
 }
 
 fn walk(
@@ -1083,7 +987,6 @@ fn cut(
     extraction: &Extraction,
     order: &[Id],
     operands: &Operands,
-    roots: &[Id],
 ) -> std::result::Result<(IdMap<u32>, Vec<Vec<Id>>), WalkFail> {
     let mut pos: IdMap<usize> = IdMap::with_len(graph.len());
     for (i, v) in order.iter().enumerate() {
@@ -1096,7 +999,7 @@ fn cut(
             continue;
         }
         for c in operands.get(*v).map(|o| o.as_slice()).unwrap_or(&[]) {
-            if forced_boundary(graph, extraction, roots, *c, *v) {
+            if slab_stage(graph, *v, *c).is_none() {
                 continue;
             }
             if let Some(j) = pos.get(*c) {
@@ -1221,37 +1124,6 @@ fn build_component(
         .first()
         .and_then(|m| launch_of.copied(*m))
         .unwrap_or(0);
-    if std::env::var_os("FUSOR_SLAB_LOG").is_some()
-        && let Some(slab) = members
-            .iter()
-            .find(|m| matches!(graph.node(**m).op, Op::Launch(Launch::Slab { .. })))
-    {
-        let Op::Launch(Launch::Slab { members: sm, .. }) = &graph.node(*slab).op else {
-            unreachable!()
-        };
-        let extra: Vec<Id> = members
-            .iter()
-            .copied()
-            .filter(|m| m != slab && !sm.contains(m))
-            .collect();
-        if !extra.is_empty() {
-            let kinds: Vec<String> = extra
-                .iter()
-                .map(|e| {
-                    format!(
-                        "{e}:{:?}:mat={}",
-                        graph.node(*e).op.tag(),
-                        extraction.is_materialized(*e)
-                    )
-                })
-                .collect();
-            eprintln!(
-                "COMPONENT slab {slab} has {} extra nodes: {kinds:?}",
-                extra.len()
-            );
-        }
-    }
-
     // The component's output is the last member that lands in a buffer.
     let root = members
         .iter()
@@ -1819,14 +1691,6 @@ pub fn slab_layout(
             .count()
         + usize::from(owns(graph.class_of(root)));
     let limit_bufs = caps.limits.max_storage_buffers_per_shader_stage as usize;
-    if bound > limit_bufs && std::env::var_os("FUSOR_SLAB_LOG").is_some() {
-        eprintln!(
-            "LAYOUT slab {root}: {bound} bindings > {limit_bufs}: {} inputs, {} middle, {} private, wg {used}/{limit}",
-            inputs.len(),
-            middle.len(),
-            private.len()
-        );
-    }
     if bound > limit_bufs {
         return Err(Error::Plan(format!(
             "slab {root} binds {bound} storage buffers over the {limit_bufs}-buffer limit: \
@@ -1872,7 +1736,7 @@ pub fn selectable(graph: &EGraph, class: ClassId, caps: &Caps) -> Vec<Id> {
 ///
 /// The mask is closed: every child of every masked node resolves to a masked
 /// class whose ids are all masked, so a fixpoint over masked slots alone
-/// (see `lower_bound_scoped`) equals the whole-graph
+/// (see `bounds_scoped`) equals the whole-graph
 /// fixpoint restricted to the mask.
 pub fn reachable(graph: &EGraph, roots: &[Id]) -> (Vec<ClassId>, fixedbitset::FixedBitSet) {
     let mut mask = fixedbitset::FixedBitSet::with_capacity(graph.len());

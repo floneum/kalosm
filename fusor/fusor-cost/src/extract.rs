@@ -1,46 +1,25 @@
-//! [`LocalSearch`] — the shipped [`Extractor`].
+//! Deterministic extraction over class selections and schedule points.
 //!
-//! 1. Admissible lower bound, bottom-up, O(nodes).
-//! 2. Seed `sigma_0 = argmin lb`; realize; `m_0 = roots u {shared} u
-//!    {index-space mismatch} u {InPlace}`; `theta_0` from the local ranking.
-//! 3. Exact cost on the realized DAG.
-//!    3b. `co_select` over the multi-slot carriers only, from the seed.
-//!    Speculative: when it changes anything, step 4 runs from both states and
-//!    the cheaper plan wins.
-//! 4. Local search over `RESELECT`, `FLIP`, `RESCHEDULE`.
-//!    4b. `co_select`, the compound move: adopt every reader of one producer
-//!    class together.
-//! 5. Budget, keeping best-so-far. Fully deterministic.
-//! 6. Test builds independently verify the winner — never a
-//!    silent fallback.
-//!
-//! Every decision path iterates classes and nodes in ascending id order.
-//! There is no RNG and no hash-map iteration order anywhere in this file.
-//!
-//! A rule that fuses `F` values into one node hands this file a node plus `F`
-//! slot views of it, each in a different e-class. Adopting one view alone is
-//! strictly worse than adopting none, so a search that accepts only single
-//! strict improvements cannot reach those states. `co_select` closes the
-//! gap by adopting every reader of one producer class together.
+//! Lower bounds seed the selection. Single and compound moves compete on
+//! the exact cost of the completed dispatch DAG. Composite ownership fixes
+//! buffer obligations before either costing or plan construction.
 
 use crate::lower_bound::argmin_member;
-use crate::moves::{self, SchedCache};
+use crate::moves::{self, SchedCache, Trail};
 use crate::plan::derive_plan;
 use crate::realize::{self, NodeCache, Realized};
 use fixedbitset::FixedBitSet;
 use fusor_ir::Result;
-use fusor_ir::cost::{CostModel, Picoseconds, ShapeStats};
+use fusor_ir::cost::{CostModel, Picoseconds};
 use fusor_ir::device::Caps;
 use fusor_ir::egraph::{ClassId, EGraph, Id};
 use fusor_ir::error::Error;
 use fusor_ir::extract::{Dispatch, ExtractBudget, Extraction, Extractor, Plan};
 use fusor_ir::facts::ValueFacts;
 use fusor_ir::ir::Op;
-use fusor_ir::ir::OpDefRegistry;
 use fusor_ir::ir::kernel::ArenaPlanner;
-use fusor_ir::ir::launch::{Effect, Launch, SchedPoint, ScheduleDomain};
+use fusor_ir::ir::launch::{Launch, SchedPoint, ScheduleDomain};
 use fusor_ir::shape::Dim;
-use parking_lot::Mutex;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -52,10 +31,6 @@ use web_time::Instant;
 pub struct LocalSearch {
     arena: Arc<dyn ArenaPlanner>,
     caps: Caps,
-    registry: Option<OpDefRegistry>,
-    /// Bounded per-extractor record of which dim bindings each plan has been
-    /// seen at.
-    stats: Mutex<ShapeStats>,
 }
 
 /// What the search actually did. Exposed so conformance can assert the
@@ -74,19 +49,7 @@ pub struct SearchTrace {
 
 impl LocalSearch {
     pub fn new(arena: Arc<dyn ArenaPlanner>, caps: Caps) -> Self {
-        Self {
-            arena,
-            caps,
-            registry: None,
-            stats: Mutex::new(ShapeStats::new()),
-        }
-    }
-
-    /// Supply the registry `Launch::Ext` nodes were built against, so
-    /// `verify_plan`'s sixth clause can check `lower_per_target`.
-    pub fn with_registry(mut self, registry: OpDefRegistry) -> Self {
-        self.registry = Some(registry);
-        self
+        Self { arena, caps }
     }
 
     pub fn caps(&self) -> &Caps {
@@ -107,7 +70,7 @@ impl LocalSearch {
         cost: &dyn CostModel,
     ) -> Result<Extraction> {
         let (classes, mask) = realize::reachable(graph, roots);
-        let launches = crate::lower_bound::launch_bound_scoped(graph, &mask);
+        let launches = crate::lower_bound::bounds_scoped(graph, None, &mask).launches;
         let mut cache = NodeCache::new(graph.len());
         self.seed_realized(graph, roots, lb, &launches, cost, &classes, &mut cache)
             .map(|(ex, _)| ex)
@@ -131,36 +94,21 @@ impl LocalSearch {
             theta: FxHashMap::default(),
         };
         for class in classes {
-            let pick = argmin_member(
-                graph,
-                lb,
-                launches,
-                *class,
-                &self.caps,
-                cost.facts().launch_ps,
-            );
+            let pick = argmin_member(graph, lb, launches, *class, &self.caps);
             sigma_debug(*class, pick, "seed");
             ex.sigma.insert(*class, pick);
         }
         loop {
-            let attempt = pin_selection(graph, roots, &mut ex, &mut RepairTrail::default())
-                .and_then(|()| {
+            let attempt =
+                pin_selection(graph, roots, &mut ex, &mut Trail::default()).and_then(|selected| {
                     seed_theta(graph, &mut ex, cost);
-                    ex.m = realize::seed_materializations(graph, &ex, roots)?;
-                    realize::realize_with(graph, roots, &ex, cost, self.arena.as_ref(), cache)
+                    ex.m = selected.buffers(graph);
+                    selected.realize(graph, &ex, cost, self.arena.as_ref(), cache)
                 });
             match attempt {
                 Ok(realized) => return Ok((ex, realized)),
                 Err(error) => {
-                    if !break_selection_cycles(
-                        graph,
-                        roots,
-                        &mut ex,
-                        lb,
-                        launches,
-                        &self.caps,
-                        cost.facts().launch_ps,
-                    )? {
+                    if !break_selection_cycles(graph, roots, &mut ex, lb, launches, &self.caps)? {
                         return Err(error);
                     }
                 }
@@ -168,37 +116,44 @@ impl LocalSearch {
         }
     }
 
-    /// The full run, with an explicit [`ShapeStats`] so a caller driving many
-    /// steps sees specialization amortize. `Extractor::extract` uses the
-    /// extractor's own.
-    pub fn extract_with_stats(
+    /// Extract a plan and report the deterministic search work.
+    pub fn extract_traced(
         &self,
         graph: &EGraph,
         roots: &[Id],
         cost: &dyn CostModel,
         budget: ExtractBudget,
-        stats: &mut ShapeStats,
     ) -> Result<(Plan, SearchTrace)> {
         let started = Instant::now();
         // Everything below is scoped to the classes this resolve's roots
         // reach; a long-lived session graph holds every value it ever built.
         let (classes, mask) = realize::reachable(graph, roots);
-        let lb = crate::lower_bound::lower_bound_scoped(graph, cost, &mask);
-        let launches = crate::lower_bound::launch_bound_scoped(graph, &mask);
+        let crate::lower_bound::Bounds {
+            costs: lb,
+            launches,
+        } = crate::lower_bound::bounds_scoped(graph, Some(cost), &mask);
         let mut cache = NodeCache::new(graph.len());
         let (mut ex, seeded) =
             self.seed_realized(graph, roots, &lb, &launches, cost, &classes, &mut cache)?;
         // The seed is priced the same way every candidate below is: as the
         // plan it denotes, not as the state the seeding pass left.
-        let (mut realized, mut best_cost) =
-            match self.price(graph, roots, &mut ex, cost, &mut cache) {
-                Ok((r, c, _)) => (r, c),
-                Err(trail) => {
-                    unrepair(&mut ex, trail);
-                    let c = realize::exact_cost(&seeded, &ex, cost);
-                    (seeded, c)
-                }
-            };
+        let mut trail = Trail::default();
+        let (mut realized, mut best_cost) = match price(
+            graph,
+            roots,
+            &mut ex,
+            cost,
+            self.arena.as_ref(),
+            &mut cache,
+            &mut trail,
+        ) {
+            Some(priced) => priced,
+            None => {
+                trail.rollback(&mut ex, 0);
+                let c = realize::exact_cost(&seeded, &ex, cost);
+                (seeded, c)
+            }
+        };
 
         let chains = classes.len() as u32;
         // The cap is the only stopping condition. A wall clock here would
@@ -214,20 +169,9 @@ impl LocalSearch {
         };
         let readers = readers_by_producer(graph, &classes, &self.caps);
 
-        // Step 4b, from the seed, over the joints only — and then the whole
-        // descent twice, keeping the cheaper plan.
-        //
-        // Restricted to producer classes holding a multi-slot carrier: the
-        // only shape where adopting a single reader is provably worse than
-        // adopting none. Unrestricted, a seeded sweep reaches class members
-        // that are unequal to their siblings.
-        //
-        // Speculative, because entering a joint is one-way: once every reader
-        // of a joint reads it, dropping one reader alone recomputes that
-        // slot's nest while the joint still runs, so every single step back
-        // out is a cost increase. When the seeded sweep changes anything, the
-        // descent runs twice, once from each state, and the cheaper plan
-        // wins; a tie keeps the un-seeded one.
+        // Adopting all views of a multi-slot reduction can improve the plan
+        // even when adopting one view alone cannot. Descend from both that
+        // joint adoption and the plain seed, keeping the cheaper result.
         let joints = joint_producers(graph, &readers);
         let plain = (ex.clone(), realized.clone(), best_cost);
         let mut seeded_best: Vec<Picoseconds> = Vec::new();
@@ -250,24 +194,6 @@ impl LocalSearch {
             )?
         {}
 
-        // A root's update chain is one of many the step ends in; a slab
-        // batching several roots is cheaper by their dispatches, which no
-        // per-class bound can see (it prices the other roots' whole chains
-        // into this one). Tried at plan cost, largest batch first.
-        if std::env::var_os("FUSOR_BATCH_ROOTS").is_some() {
-            batch_roots_over(
-                graph,
-                roots,
-                cost,
-                self.arena.as_ref(),
-                &mut ex,
-                &mut realized,
-                &mut best_cost,
-                &mut cache,
-                &self.caps,
-            )?;
-        }
-
         let descend = |ex: &mut Extraction,
                        realized: &mut Realized,
                        best_cost: &mut Picoseconds,
@@ -279,25 +205,34 @@ impl LocalSearch {
             let mut sched = SchedCache::new();
             'search: loop {
                 let mut improved = false;
-                for mv in moves::frontier(graph, ex, &classes, budget) {
+                for mv in moves::frontier(graph, ex, &classes) {
                     if *moves >= cap {
                         break 'search;
                     }
-                    let options = moves::candidates(graph, ex, realized, mv, &lb, &mut sched, cost);
+                    let options = moves::candidates(graph, ex, mv, &lb, &mut sched, cost);
                     for candidate in options {
                         if *moves >= cap {
                             break 'search;
                         }
                         *moves += 1;
-                        let Some(undo) = moves::apply(graph, ex, candidate) else {
+                        let mut trail = Trail::default();
+                        if !trail.apply(ex, candidate) {
                             continue;
-                        };
-                        let attempt = price(graph, roots, ex, cost, self.arena.as_ref(), cache);
+                        }
+                        let attempt = price(
+                            graph,
+                            roots,
+                            ex,
+                            cost,
+                            self.arena.as_ref(),
+                            cache,
+                            &mut trail,
+                        );
                         match attempt {
                             // Strict improvements only; a tie keeps the earlier
                             // (smaller-id) state, which keeps the search
                             // reproducible.
-                            Ok((r, c, _)) if c < *best_cost => {
+                            Some((r, c)) if c < *best_cost => {
                                 *best_cost = c;
                                 *realized = r;
                                 best.push(c);
@@ -306,14 +241,7 @@ impl LocalSearch {
                             }
                             // The move is undone after the obligations it
                             // implied, so a rejected candidate leaves no trace.
-                            Ok((_, _, trail)) => {
-                                unrepair(ex, trail);
-                                moves::undo(ex, undo);
-                            }
-                            Err(trail) => {
-                                unrepair(ex, trail);
-                                moves::undo(ex, undo);
-                            }
+                            _ => trail.rollback(ex, 0),
                         }
                     }
                 }
@@ -345,17 +273,6 @@ impl LocalSearch {
                 )?
             {}
 
-            let trail = repair_trailed(graph, ex, realized, cost);
-            if !trail.is_empty() {
-                match realize::realize_with(graph, roots, ex, cost, self.arena.as_ref(), cache) {
-                    Ok(next) => {
-                        *realized = next;
-                        *best_cost = realize::exact_cost(realized, ex, cost);
-                        best.push(*best_cost);
-                    }
-                    Err(_) => unrepair(ex, trail),
-                }
-            }
             Ok(())
         };
 
@@ -409,45 +326,15 @@ impl LocalSearch {
         // Dump the completed plan for diagnostics.
         probe_dump(graph, &plan, &ex, &realized, &self.caps, cost);
         #[cfg(feature = "compiler-tests")]
-        crate::verify_plan::verify_plan_with(
-            graph,
-            &plan,
-            self.arena.as_ref(),
-            &self.caps,
-            self.registry.as_ref(),
-        )
-        .unwrap_or_else(|e| panic!("constructed plan violates a compiler invariant: {e}"));
+        crate::verify_plan::verify_plan_with(graph, &plan, self.arena.as_ref(), &self.caps)
+            .unwrap_or_else(|e| panic!("constructed plan violates a compiler invariant: {e}"));
 
-        stats.observe(plan.hash, &binding_of(graph, &realized));
         trace.micros = started.elapsed().as_micros() as u64;
         Ok((plan, trace))
     }
 
-    /// Realize, [`repair_trailed`], re-realize: the cost of the plan this state
-    /// denotes, which is the only number an accept test may compare.
-    ///
-    /// A move can put a producer across a structural cut; the buffer that
-    /// producer needs is an obligation of the move and must be priced with it.
-    ///
-    /// The returned [`RepairTrail`] is what a rejecting caller reverts, so the
-    /// obligations die with the move that implied them. The error arm carries
-    /// one too: a state that fails to realize after repair still has the
-    /// repair on it.
-    #[allow(clippy::result_large_err)]
-    fn price(
-        &self,
-        graph: &EGraph,
-        roots: &[Id],
-        ex: &mut Extraction,
-        cost: &dyn CostModel,
-        cache: &mut NodeCache,
-    ) -> PriceResult {
-        price(graph, roots, ex, cost, self.arena.as_ref(), cache)
-    }
-
-    /// The plan a given extraction denotes: realize, repair, re-realize,
-    /// derive. No search. A candidate is priced and built by exactly
-    /// the path `extract` returns its winner through.
+    /// Complete a selection and construct its plan without searching. This
+    /// is the same construction used to price local-search candidates.
     ///
     /// The `cache` is the caller's: `Work` is a property of a graph node and
     /// nothing in it moves with the extraction.
@@ -459,43 +346,34 @@ impl LocalSearch {
         cost: &dyn CostModel,
         cache: &mut NodeCache,
     ) -> Result<Plan> {
-        let (realized, exact, trail) = match self.price(graph, roots, ex, cost, cache) {
-            Ok(priced) => priced,
-            Err(trail) => {
-                unrepair(ex, trail);
+        let mut trail = Trail::default();
+        let (realized, exact) = match price(
+            graph,
+            roots,
+            ex,
+            cost,
+            self.arena.as_ref(),
+            cache,
+            &mut trail,
+        ) {
+            Some(priced) => priced,
+            None => {
+                trail.rollback(ex, 0);
                 return Err(Error::Plan("autotune candidate does not realize".into()));
             }
         };
         let plan = match derive_plan(graph, ex, &realized, cost.facts(), exact) {
             Ok(plan) => plan,
             Err(error) => {
-                unrepair(ex, trail);
+                trail.rollback(ex, 0);
                 return Err(error);
             }
         };
         // Conformance checks the plan independently of the constructor.
         #[cfg(feature = "compiler-tests")]
-        crate::verify_plan::verify_plan_with(
-            graph,
-            &plan,
-            self.arena.as_ref(),
-            &self.caps,
-            self.registry.as_ref(),
-        )
-        .unwrap_or_else(|e| panic!("constructed plan violates a compiler invariant: {e}"));
+        crate::verify_plan::verify_plan_with(graph, &plan, self.arena.as_ref(), &self.caps)
+            .unwrap_or_else(|e| panic!("constructed plan violates a compiler invariant: {e}"));
         Ok(plan)
-    }
-
-    /// The same, reporting what the search did.
-    pub fn extract_traced(
-        &self,
-        graph: &EGraph,
-        roots: &[Id],
-        cost: &dyn CostModel,
-        budget: ExtractBudget,
-    ) -> Result<(Plan, SearchTrace)> {
-        let mut stats = self.stats.lock();
-        self.extract_with_stats(graph, roots, cost, budget, &mut stats)
     }
 }
 
@@ -549,24 +427,22 @@ impl LocalSearch {
                     return out;
                 }
                 let mut ex = base.extraction.clone();
+                let mut trail = Trail::default();
                 if member != root
-                    && moves::apply(
-                        graph,
+                    && !trail.apply(
                         &mut ex,
                         moves::Candidate::Select {
                             class,
                             node: member,
                         },
                     )
-                    .is_none()
                 {
                     if dbg {
                         eprintln!("[vdbg] L{launch_ix} SELECT-FAIL {member:?} {label}",);
                     }
                     continue;
                 }
-                moves::apply(
-                    graph,
+                trail.apply(
                     &mut ex,
                     moves::Candidate::Schedule {
                         node: member,
@@ -615,13 +491,7 @@ impl Extractor for LocalSearch {
 
     #[cfg(feature = "compiler-tests")]
     fn verify_plan(&self, graph: &EGraph, plan: &Plan) -> Result<()> {
-        crate::verify_plan::verify_plan_with(
-            graph,
-            plan,
-            self.arena.as_ref(),
-            &self.caps,
-            self.registry.as_ref(),
-        )
+        crate::verify_plan::verify_plan_with(graph, plan, self.arena.as_ref(), &self.caps)
     }
 
     fn launch_variants(
@@ -708,6 +578,7 @@ impl Extractor for LocalSearch {
         swaps: &[(usize, String)],
     ) -> Option<Plan> {
         let mut ex = base.extraction.clone();
+        let mut trail = Trail::default();
         let mut applied = false;
         for (ix, name) in swaps {
             let Some(launch) = base.launches.get(*ix) else {
@@ -726,20 +597,17 @@ impl Extractor for LocalSearch {
                 continue;
             };
             if member != root
-                && moves::apply(
-                    graph,
+                && !trail.apply(
                     &mut ex,
                     moves::Candidate::Select {
                         class,
                         node: member,
                     },
                 )
-                .is_none()
             {
                 continue;
             }
-            moves::apply(
-                graph,
+            trail.apply(
                 &mut ex,
                 moves::Candidate::Schedule {
                     node: member,
@@ -797,7 +665,7 @@ fn readers_by_producer(
 
 /// One co-selection sweep. For each producer class, adopt together every
 /// class that holds a selectable member reading it; keep on a strict
-/// improvement in exact global cost, revert through [`moves::undo`] otherwise.
+/// improvement in exact global cost, revert the trial otherwise.
 ///
 /// This pass reaches members the budget otherwise keeps unselected, so it
 /// leans on the e-graph invariant that every member of a class computes the
@@ -890,73 +758,28 @@ fn co_select_over(
         if proposal.len() < 2 {
             continue;
         }
-        let mut undos = Vec::with_capacity(proposal.len());
-        for (c, m) in &proposal {
-            if let Some(u) = moves::apply(
-                graph,
+        let mut trail = Trail::default();
+        for (class, node) in &proposal {
+            trail.apply(
                 ex,
-                crate::moves::Candidate::Select {
-                    class: *c,
-                    node: *m,
+                moves::Candidate::Select {
+                    class: *class,
+                    node: *node,
                 },
-            ) {
-                undos.push(u);
-            }
+            );
         }
-        if undos.is_empty() {
+        if trail.mark() == 0 {
             continue;
         }
-        // The obligation the adoption creates, priced with it: adopting `F`
-        // slot views of one joint makes that joint an `F`-consumer node, and
-        // an unmaterialized joint is recomputed once per slot. The seed's
-        // `{c : consumers(c) > 1}` pass ran before these consumers existed,
-        // so the materialize flip is offered alongside the adoption. Both
-        // states are offered and the exact global cost still decides.
-        let producer = ex.sigma.get(p).copied().filter(|n| {
-            !ex.is_materialized(*n) && realize::leaf_role(graph, *n) == realize::LeafRole::NotLeaf
-        });
-        let mut kept = false;
-        for flip in [false, true] {
-            let m_undo = if flip {
-                let Some(pn) = producer else { continue };
-                match moves::apply(
-                    graph,
-                    ex,
-                    crate::moves::Candidate::Materialize { node: pn, on: true },
-                ) {
-                    Some(u) => Some(u),
-                    None => continue,
-                }
-            } else {
-                None
-            };
-            *moves += 1;
-            match price(graph, roots, ex, cost, arena, cache) {
-                // Strict improvements only: a tie keeps the state the search
-                // was already in.
-                Ok((r, c, _)) if c < *best_cost => {
-                    *best_cost = c;
-                    *realized = r;
-                    best.push(c);
-                    improved = true;
-                    kept = true;
-                    break;
-                }
-                Ok((_, _, trail)) | Err(trail) => {
-                    unrepair(ex, trail);
-                    if let Some(u) = m_undo {
-                        moves::undo(ex, u);
-                    }
-                }
+        *moves += 1;
+        match price(graph, roots, ex, cost, arena, cache, &mut trail) {
+            Some((r, c)) if c < *best_cost => {
+                *best_cost = c;
+                *realized = r;
+                best.push(c);
+                improved = true;
             }
-            if *moves >= cap {
-                break;
-            }
-        }
-        if !kept {
-            for u in undos.into_iter().rev() {
-                moves::undo(ex, u);
-            }
+            _ => trail.rollback(ex, 0),
         }
     }
     Ok(improved)
@@ -1043,10 +866,8 @@ fn probe_dump(
                 Op::Launch(fusor_ir::ir::launch::Launch::Contract { .. }) => "Contract",
                 Op::Launch(fusor_ir::ir::launch::Launch::Gather { .. }) => "Gather",
                 Op::Launch(fusor_ir::ir::launch::Launch::Scatter { .. }) => "Scatter",
-                Op::Launch(fusor_ir::ir::launch::Launch::Region { .. }) => "Region",
                 Op::Launch(fusor_ir::ir::launch::Launch::Slab { .. }) => "Slab",
                 Op::Launch(fusor_ir::ir::launch::Launch::Group { .. }) => "Group",
-                Op::Launch(fusor_ir::ir::launch::Launch::Ext { .. }) => "Ext",
                 Op::Logical(_) => "Logical",
                 Op::Union(_, _) => "Union",
             };
@@ -1136,16 +957,6 @@ pub(crate) fn op_tag(op: &Op) -> String {
     }
 }
 
-fn materialize(graph: &EGraph, ex: &mut Extraction, id: Id) {
-    if realize::leaf_role(graph, id) != realize::LeafRole::NotLeaf {
-        return;
-    }
-    if ex.m.len() <= id.index() {
-        ex.m.grow(id.index() + 1);
-    }
-    ex.m.insert(id.index());
-}
-
 /// Re-select, class by class, until the seeded selection is acyclic.
 ///
 /// The seed picks each class's member independently, so two picks can name
@@ -1164,7 +975,6 @@ fn break_selection_cycles(
     lb: &[Picoseconds],
     launches: &[u32],
     caps: &Caps,
-    launch_ps: u64,
 ) -> Result<bool> {
     let mut banned: FxHashMap<ClassId, FxHashSet<Id>> = FxHashMap::default();
     let mut repaired = false;
@@ -1239,9 +1049,8 @@ fn break_selection_cycles(
         }
         let out = banned.entry(class).or_default();
         out.insert(v);
-        let next = crate::lower_bound::argmin_member_excluding(
-            graph, lb, launches, class, caps, launch_ps, out,
-        );
+        let next =
+            crate::lower_bound::argmin_member_excluding(graph, lb, launches, class, caps, out);
         let (class, next) = match next {
             Some(next) => (class, next),
             None => {
@@ -1259,7 +1068,7 @@ fn break_selection_cycles(
                 let out = banned.entry(gclass).or_default();
                 out.insert(group);
                 let Some(next) = crate::lower_bound::argmin_member_excluding(
-                    graph, lb, launches, gclass, caps, launch_ps, out,
+                    graph, lb, launches, gclass, caps, out,
                 ) else {
                     return Err(Error::Plan(format!(
                         "selection is cyclic through {v}; group {group} in class {} has no replacement",
@@ -1305,9 +1114,9 @@ fn cycle_group(graph: &EGraph, ex: &Extraction, v: Id) -> Option<(ClassId, Id)> 
 }
 
 fn seed_theta(graph: &EGraph, ex: &mut Extraction, cost: &dyn CostModel) -> bool {
-    let mut trail = RepairTrail::default();
+    let mut trail = Trail::default();
     seed_theta_trailed(graph, ex, cost, &mut trail);
-    !trail.is_empty()
+    trail.mark() != 0
 }
 
 /// Fill missing schedules and record them for rollback.
@@ -1315,7 +1124,7 @@ fn seed_theta_trailed(
     graph: &EGraph,
     ex: &mut Extraction,
     cost: &dyn CostModel,
-    trail: &mut RepairTrail,
+    trail: &mut Trail,
 ) {
     let mut scheduled: FxHashSet<Id> = ex.sigma.values().copied().collect();
     let mut pending: Vec<Id> = scheduled.iter().copied().collect();
@@ -1344,8 +1153,7 @@ fn seed_theta_trailed(
             continue;
         };
         if matches!(domain, ScheduleDomain::Point) {
-            ex.theta.insert(id, SchedPoint::Point);
-            trail.push_theta(id, None);
+            trail.schedule(ex, id, SchedPoint::Point);
             continue;
         }
         let ins: SmallVec<[ValueFacts; 4]> = node
@@ -1358,8 +1166,7 @@ fn seed_theta_trailed(
             .iter()
             .min_by_key(|theta| cost.node_math(node, &ins, out, Some(*theta)))
         {
-            ex.theta.insert(id, theta);
-            trail.push_theta(id, None);
+            trail.schedule(ex, id, theta);
         }
     }
 }
@@ -1373,144 +1180,6 @@ pub(crate) fn sigma_debug(class: ClassId, node: Id, site: &str) {
     }
 }
 
-/// For every root class selecting a plain stage, the slab spellings of
-/// that class in decreasing member count, kept when the plan gets cheaper.
-#[allow(clippy::too_many_arguments)]
-fn batch_roots_over(
-    graph: &EGraph,
-    roots: &[Id],
-    cost: &dyn CostModel,
-    arena: &dyn ArenaPlanner,
-    ex: &mut Extraction,
-    realized: &mut Realized,
-    best_cost: &mut Picoseconds,
-    cache: &mut NodeCache,
-    _caps: &Caps,
-) -> Result<()> {
-    let mut classes: Vec<ClassId> = roots.iter().map(|r| graph.class_of(*r)).collect();
-    classes.sort_unstable();
-    classes.dedup();
-    let log = std::env::var_os("FUSOR_SLAB_LOG").is_some();
-    for class in classes {
-        let Some(cur) = ex.sigma.get(&class).copied() else {
-            continue;
-        };
-        // Already batched, or a member of a batch kept for another root.
-        if matches!(graph.node(cur).op, Op::Launch(Launch::Slab { .. }))
-            || moves::slab_pinned(graph, ex, class)
-        {
-            if log {
-                eprintln!(
-                    "BATCH class {} skipped: cur {:?} pinned {}",
-                    class.0.index(),
-                    graph.node(cur).op.tag(),
-                    moves::slab_pinned(graph, ex, class)
-                );
-            }
-            continue;
-        }
-        if log {
-            let all: Vec<Id> = graph
-                .members(class)
-                .into_iter()
-                .filter(|m| matches!(graph.node(*m).op, Op::Launch(Launch::Slab { .. })))
-                .collect();
-            let blocked: Vec<Id> = all
-                .iter()
-                .copied()
-                .filter(|m| match &graph.node(*m).op {
-                    Op::Launch(Launch::Slab { members, .. }) => members
-                        .iter()
-                        .any(|x| moves::slab_pinned(graph, ex, graph.class_of(*x))),
-                    _ => false,
-                })
-                .collect();
-            eprintln!(
-                "BATCH class {} ({:?}): {} slab spellings, {} blocked by pinned members",
-                class.0.index(),
-                graph.node(cur).op.tag(),
-                all.len(),
-                blocked.len()
-            );
-        }
-        // Two selected slabs may not share a member, so a batch reaching
-        // into one already kept is not offered. Every slab spelling is
-        // tried, not only what `selectable` admits: its binding check reads
-        // the graph's readers, which count spellings the plan never runs,
-        // and the realizer below is the exact judge.
-        let mut slabs: Vec<(usize, Id)> = graph
-            .members(class)
-            .into_iter()
-            .filter_map(|m| match &graph.node(m).op {
-                Op::Launch(Launch::Slab { members, .. })
-                    if !members
-                        .iter()
-                        .any(|x| moves::slab_pinned(graph, ex, graph.class_of(*x))) =>
-                {
-                    Some((members.len(), m))
-                }
-                _ => None,
-            })
-            .collect();
-        slabs.sort_unstable_by_key(|(n, id)| (std::cmp::Reverse(*n), *id));
-        for (n, slab) in slabs {
-            let Some(undo) = moves::apply(
-                graph,
-                ex,
-                crate::moves::Candidate::Select { class, node: slab },
-            ) else {
-                continue;
-            };
-            match price(graph, roots, ex, cost, arena, cache) {
-                Ok((r, c, _)) if c < *best_cost => {
-                    if log {
-                        eprintln!(
-                            "BATCH class {} slab {slab} ({n} members): {} -> {} us KEPT",
-                            class.0.index(),
-                            best_cost.0 / 1_000_000,
-                            c.0 / 1_000_000
-                        );
-                    }
-                    *best_cost = c;
-                    *realized = r;
-                    break;
-                }
-                Ok((_, c, trail)) => {
-                    if log {
-                        eprintln!(
-                            "BATCH class {} slab {slab} ({n} members): {} -> {} us rejected",
-                            class.0.index(),
-                            best_cost.0 / 1_000_000,
-                            c.0 / 1_000_000
-                        );
-                    }
-                    unrepair(ex, trail);
-                    moves::undo(ex, undo);
-                }
-                Err(trail) => {
-                    if log {
-                        eprintln!(
-                            "BATCH class {} slab {slab} ({n} members): did not realize",
-                            class.0.index()
-                        );
-                    }
-                    unrepair(ex, trail);
-                    moves::undo(ex, undo);
-                }
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Realize, [`repair_trailed`], re-realize. See [`LocalSearch::price`].
-/// A priced extraction, or — when repair could not converge — the trail of
-/// what was tried. The trail travels in `Err` by design: it is the whole
-/// diagnosis, and this is a search-internal result that is never boxed
-/// across a hot boundary.
-type PriceResult = std::result::Result<(Realized, Picoseconds, RepairTrail), RepairTrail>;
-
-#[allow(clippy::result_large_err)]
 fn price(
     graph: &EGraph,
     roots: &[Id],
@@ -1518,162 +1187,35 @@ fn price(
     cost: &dyn CostModel,
     arena: &dyn ArenaPlanner,
     cache: &mut NodeCache,
-) -> PriceResult {
-    // Reselecting slab members can expose further materialization boundaries.
-    // Repeat realization and repair until the extraction stabilizes.
-    const ROUNDS: usize = 6;
-    let mut trail = RepairTrail::default();
-    if pin_selection(graph, roots, ex, &mut trail).is_err() {
-        return Err(trail);
-    }
-    seed_theta_trailed(graph, ex, cost, &mut trail);
-    let mut realized = match realize::realize_with(graph, roots, ex, cost, arena, cache) {
-        Ok(realized) => realized,
-        Err(_) => return Err(trail),
-    };
-    for _ in 0..ROUNDS {
-        let round = repair_trailed(graph, ex, &realized, cost);
-        if round.is_empty() {
-            break;
-        }
-        trail.extend(round);
-        realized = match realize::realize_with(graph, roots, ex, cost, arena, cache) {
-            Ok(r) => r,
-            Err(_) => return Err(trail),
-        };
-    }
+    trail: &mut Trail,
+) -> Option<(Realized, Picoseconds)> {
+    let selected = pin_selection(graph, roots, ex, trail).ok()?;
+    seed_theta_trailed(graph, ex, cost, trail);
+    trail.buffers(ex, selected.buffers(graph));
+    let realized = selected.realize(graph, ex, cost, arena, cache).ok()?;
     let c = realize::exact_cost(&realized, ex, cost);
-    Ok((realized, c, trail))
-}
-
-/// Everything [`repair_trailed`] added to a state, in the order it added it.
-///
-/// A rejected candidate has to revert the obligations its move implied as
-/// well as the move itself.
-#[derive(Clone, Debug, Default)]
-struct RepairTrail {
-    /// Every change a repair made, in the order it made it; undone in
-    /// reverse, so a node materialized in one round and cleared in the next
-    /// ends where it began.
-    entries: SmallVec<[Repair; 16]>,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum Repair {
-    /// Newly inserted into `m`.
-    Materialized(Id),
-    /// Newly removed from `m`: a slab's last member, which its slab writes.
-    Inlined(Id),
-    /// A `theta` entry written, with the value it replaced.
-    Theta(Id, Option<fusor_ir::ir::launch::SchedPoint>),
-    /// A `sigma` entry written, with the value it replaced: a selected slab
-    /// pins its members as their classes' selections.
-    Sigma(ClassId, Option<Id>),
-}
-
-impl RepairTrail {
-    fn is_empty(&self) -> bool {
-        self.entries.is_empty()
-    }
-    fn extend(&mut self, other: RepairTrail) {
-        self.entries.extend(other.entries);
-    }
-    fn push_m(&mut self, id: Id) {
-        self.entries.push(Repair::Materialized(id));
-    }
-    fn push_unm(&mut self, id: Id) {
-        self.entries.push(Repair::Inlined(id));
-    }
-    fn push_theta(&mut self, id: Id, prev: Option<fusor_ir::ir::launch::SchedPoint>) {
-        self.entries.push(Repair::Theta(id, prev));
-    }
-    fn push_sigma(&mut self, class: ClassId, prev: Option<Id>) {
-        self.entries.push(Repair::Sigma(class, prev));
-    }
-}
-
-fn unrepair(ex: &mut Extraction, trail: RepairTrail) {
-    for entry in trail.entries.into_iter().rev() {
-        match entry {
-            Repair::Materialized(id) => {
-                if ex.m.len() > id.index() {
-                    ex.m.remove(id.index());
-                }
-            }
-            Repair::Inlined(id) => {
-                if ex.m.len() <= id.index() {
-                    ex.m.grow(id.index() + 1);
-                }
-                ex.m.insert(id.index());
-            }
-            Repair::Theta(id, Some(p)) => {
-                ex.theta.insert(id, p);
-            }
-            Repair::Theta(id, None) => {
-                ex.theta.remove(&id);
-            }
-            Repair::Sigma(class, Some(p)) => {
-                sigma_debug(class, p, "unrepair");
-                ex.sigma.insert(class, p);
-            }
-            Repair::Sigma(class, None) => {
-                ex.sigma.remove(&class);
-            }
-        }
-    }
-}
-
-fn repair_trailed(
-    graph: &EGraph,
-    ex: &mut Extraction,
-    realized: &Realized,
-    cost: &dyn CostModel,
-) -> RepairTrail {
-    let mut trail = RepairTrail::default();
-    for r in &realized.roots {
-        if !ex.is_materialized(*r) {
-            materialize_trailed(graph, ex, *r, &mut trail);
-        }
-    }
-    for v in &realized.order {
-        if realize::leaf_role(graph, *v) != realize::LeafRole::NotLeaf || ex.is_materialized(*v) {
-            continue;
-        }
-        let in_place = graph.semantics().effect(&graph.node(*v).op) != Effect::Pure;
-        if in_place || moves::at_structural_boundary(graph, realized, *v) {
-            materialize_trailed(graph, ex, *v, &mut trail);
-        }
-    }
-    pin_slabs_trailed(graph, ex, &realized.order, &mut trail);
-    seed_theta_trailed(graph, ex, cost, &mut trail);
-    trail
+    Some((realized, c))
 }
 
 fn pin_selection(
     graph: &EGraph,
     roots: &[Id],
     ex: &mut Extraction,
-    trail: &mut RepairTrail,
-) -> Result<()> {
+    trail: &mut Trail,
+) -> Result<realize::Selected> {
     loop {
-        let before = trail.entries.len();
-        let order = realize::selected_order(graph, ex, roots)?;
-        pin_slabs_trailed(graph, ex, &order, trail);
-        if !trail.entries[before..]
-            .iter()
-            .any(|entry| matches!(entry, Repair::Sigma(..)))
-        {
-            return Ok(());
+        let before = trail.mark();
+        let selected = realize::Selected::new(graph, ex, roots)?;
+        pin_slabs_trailed(graph, ex, &selected.order, trail);
+        if !trail.selected_since(before) {
+            return Ok(selected);
         }
     }
 }
 
-/// A selected slab or group is materialized, every member but its last is
-/// its class's selection and materialized — the stages after it read that
-/// buffer, and so does anything outside — and its last member is not,
-/// because the composite's own buffer is where that value lands. A member
-/// that is itself a slab is pinned the same way, through the composite.
-fn pin_slabs_trailed(graph: &EGraph, ex: &mut Extraction, order: &[Id], trail: &mut RepairTrail) {
+/// Select each composite's concrete middle members and resolve overlapping
+/// ownership before constructing its dispatch and buffers.
+fn pin_slabs_trailed(graph: &EGraph, ex: &mut Extraction, order: &[Id], trail: &mut Trail) {
     use fusor_ir::ir::launch::Launch as L;
     fn members_of(graph: &EGraph, id: Id) -> Option<&smallvec::SmallVec<[Id; 8]>> {
         match &graph.node(id).op {
@@ -1731,45 +1273,30 @@ fn pin_slabs_trailed(graph: &EGraph, ex: &mut Extraction, order: &[Id], trail: &
     slabs.sort_unstable_by_key(|(slab, head, n, id)| (*slab, *head, std::cmp::Reverse(*n), *id));
     slabs.dedup();
 
-    // Pin `id` and, recursively, its member composites. `via` is the
-    // composite `id` ends, whose buffer is `id`'s value.
+    // Pin `id` and its nested composites.
     fn pin(
         graph: &EGraph,
         ex: &mut Extraction,
-        trail: &mut RepairTrail,
+        trail: &mut Trail,
         owned: &mut rustc_hash::FxHashMap<ClassId, Id>,
         id: Id,
-        via: Option<Id>,
     ) {
         let Some(members) = members_of(graph, id) else {
             return;
         };
         owned.extend(members.iter().map(|m| (graph.class_of(*m), id)));
-        if via.is_none() {
-            materialize_trailed(graph, ex, id, trail);
-        }
         let Some((last, middle)) = members.split_last() else {
             return;
         };
         for m in middle {
             let class = graph.class_of(*m);
-            let was = ex.sigma.get(&class).copied();
-            if was != Some(*m) {
-                sigma_debug(class, *m, "pin_slabs member");
-                ex.sigma.insert(class, *m);
-                trail.push_sigma(class, was);
-            }
-            materialize_trailed(graph, ex, *m, trail);
+            trail.select(ex, class, *m);
             if members_of(graph, *m).is_some() {
-                pin(graph, ex, trail, owned, *m, None);
+                pin(graph, ex, trail, owned, *m);
             }
-        }
-        if ex.is_materialized(*last) {
-            ex.m.set(last.index(), false);
-            trail.push_unm(*last);
         }
         if members_of(graph, *last).is_some() {
-            pin(graph, ex, trail, owned, *last, Some(id));
+            pin(graph, ex, trail, owned, *last);
         }
     }
 
@@ -1791,10 +1318,7 @@ fn pin_slabs_trailed(graph: &EGraph, ex: &mut Extraction, order: &[Id], trail: &
             continue;
         }
         let flat = flat_members(graph, id);
-        if let Some(m) = flat
-            .iter()
-            .find(|m| owned.contains_key(&graph.class_of(**m)))
-        {
+        if flat.iter().any(|m| owned.contains_key(&graph.class_of(*m))) {
             let alt = graph
                 .members(class)
                 .into_iter()
@@ -1810,51 +1334,17 @@ fn pin_slabs_trailed(graph: &EGraph, ex: &mut Extraction, order: &[Id], trail: &
                 })
                 .max_by_key(|(n, a)| (*n, std::cmp::Reverse(*a)))
                 .map(|(_, a)| a);
-            if std::env::var_os("FUSOR_SLAB_LOG").is_some() {
-                let owner = owned[&graph.class_of(*m)];
-                let show: String = format!("{:?}", graph.node(*m).op)
-                    .chars()
-                    .take(160)
-                    .collect();
-                eprintln!(
-                    "PIN fallback: {id:?} ({} members) overlaps at {m:?} with {owner:?} ({} members), class {} -> {alt:?}\n    {m:?} = {show}",
-                    members.len(),
-                    members_of(graph, owner).map_or(0, |x| x.len()),
-                    class.0.index()
-                );
-            }
             let next = alt.or_else(|| members.last().copied());
             if let Some(next) = next {
-                sigma_debug(class, next, "pin_slabs overlap fallback");
-                ex.sigma.insert(class, next);
-                trail.push_sigma(class, Some(id));
+                trail.select(ex, class, next);
                 if members_of(graph, next).is_some() {
-                    pin(graph, ex, trail, &mut owned, next, None);
+                    pin(graph, ex, trail, &mut owned, next);
                 }
             }
             continue;
         }
-        pin(graph, ex, trail, &mut owned, id, None);
+        pin(graph, ex, trail, &mut owned, id);
     }
-}
-
-fn materialize_trailed(graph: &EGraph, ex: &mut Extraction, id: Id, trail: &mut RepairTrail) {
-    let before = ex.is_materialized(id);
-    materialize(graph, ex, id);
-    if !before && ex.is_materialized(id) {
-        trail.push_m(id);
-    }
-}
-
-/// The dim binding this run was extracted at: every root's extents, in root
-/// order. `Dim::Sym` stays symbolic, so a symbolic plan records one family
-/// rather than one bucket per length.
-fn binding_of(graph: &EGraph, realized: &Realized) -> Vec<Dim> {
-    let mut out = Vec::new();
-    for r in &realized.roots {
-        out.extend(graph.facts(*r).shape.iter().copied());
-    }
-    out
 }
 
 /// Variants offered per launch, shared round-robin across every member of the
@@ -2085,107 +1575,19 @@ pub fn launch_signature(graph: &EGraph, launch: &Dispatch) -> String {
 /// and one tuning pass, never a wrong answer.
 fn body_digest(op: &Op) -> u64 {
     use fusor_ir::ir::launch::Operand;
+    use fusor_ir::ir::visit::VisitMut;
     use rustc_hash::FxHasher;
     use std::hash::{Hash, Hasher};
-
-    fn operand(o: &Operand, h: &mut FxHasher) {
-        o.layout.hash(h);
-        o.access.hash(h);
+    struct Sources;
+    impl VisitMut for Sources {
+        fn operand(&mut self, operand: &mut Operand) {
+            operand.src = Id(0);
+        }
     }
-
+    let mut op = crate::plan::without_schedule(op);
+    op.visit_mut(&mut Sources);
     let mut h = FxHasher::default();
-    op.tag().hash(&mut h);
-    match op {
-        Op::Launch(Launch::Map {
-            space, body, ops, ..
-        }) => {
-            space.dims.hash(&mut h);
-            body.structural_hash().hash(&mut h);
-            for o in ops {
-                operand(o, &mut h);
-            }
-        }
-        Op::Launch(Launch::Fold {
-            space,
-            axis,
-            vec_axes,
-            carrier,
-            acc,
-            post,
-            ops,
-            ..
-        }) => {
-            space.dims.hash(&mut h);
-            axis.hash(&mut h);
-            vec_axes.hash(&mut h);
-            carrier.hash(&mut h);
-            acc.hash(&mut h);
-            for p in post {
-                p.structural_hash().hash(&mut h);
-            }
-            for o in ops {
-                operand(o, &mut h);
-            }
-        }
-        Op::Launch(Launch::Contract {
-            m,
-            n,
-            k,
-            batch,
-            output,
-            family,
-            post,
-            acc,
-            a,
-            b,
-            ..
-        }) => {
-            (m, n, k, batch, output, family, acc).hash(&mut h);
-            for e in [&a.pre, &b.pre, post] {
-                e.structural_hash().hash(&mut h);
-            }
-            // Arity is part of the key: two sides holding the same leading
-            // operand differ if one has absorbed a producer.
-            (a.len(), b.len()).hash(&mut h);
-            for o in a.ops.iter().chain(b.ops.iter()) {
-                operand(o, &mut h);
-            }
-        }
-        Op::Launch(Launch::Gather {
-            space,
-            axis,
-            mode,
-            ops,
-            ..
-        }) => {
-            space.dims.hash(&mut h);
-            (axis, mode).hash(&mut h);
-            for o in ops {
-                operand(o, &mut h);
-            }
-        }
-        Op::Launch(Launch::Scatter {
-            space,
-            axis,
-            mode,
-            combine,
-            ops,
-            ..
-        }) => {
-            space.dims.hash(&mut h);
-            (axis, mode, combine).hash(&mut h);
-            for o in ops {
-                operand(o, &mut h);
-            }
-        }
-        Op::Launch(Launch::Region { live_outs, .. }) => live_outs.hash(&mut h),
-        Op::Launch(Launch::Slab { slabs, members, .. }) => {
-            slabs.hash(&mut h);
-            members.hash(&mut h);
-        }
-        Op::Launch(Launch::Group { members, .. }) => members.hash(&mut h),
-        Op::Launch(Launch::Ext { .. }) | Op::Logical(_) | Op::Union(..) => {}
-    }
+    op.hash(&mut h);
     h.finish()
 }
 

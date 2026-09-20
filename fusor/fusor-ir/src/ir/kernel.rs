@@ -448,31 +448,16 @@ pub enum Addr {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ReduceKind {
     Subgroup,
-    Workgroup {
-        scratch: Tile,
-        group_size: u32,
-    },
-    Loop {
-        iterations: u32,
-        index: Local,
-        scratch: Tile,
-        group_size: u32,
-    },
+    Workgroup { scratch: Tile, group_size: u32 },
 }
 
 /// Source region of a cooperative fragment load.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum CoopSrc {
-    TileRegion {
-        tile: Tile,
-        row: TileExpr,
-        col: TileExpr,
-        transposed: bool,
-    },
-    BroadcastCol {
-        src: StorageView,
-        col: TileExpr,
-    },
+pub struct CoopSrc {
+    pub tile: Tile,
+    pub row: TileExpr,
+    pub col: TileExpr,
+    pub transposed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -720,12 +705,9 @@ fn kind_mem_reads(kind: &TileExprKind) -> MemReads {
                 .union(fill.mem_reads())
         }
         K::LoadTile { index, .. } => MemReads::TILE.union(index.mem_reads()),
-        K::CoopLoad { src, .. } => match &**src {
-            CoopSrc::TileRegion { row, col, .. } => {
-                MemReads::TILE.union(row.mem_reads()).union(col.mem_reads())
-            }
-            CoopSrc::BroadcastCol { col, .. } => MemReads::STORAGE.union(col.mem_reads()),
-        },
+        K::CoopLoad { src, .. } => MemReads::TILE
+            .union(src.row.mem_reads())
+            .union(src.col.mem_reads()),
         // Pure combinators: the union over the children.
         K::Unary { value, .. }
         | K::Round { value, .. }
@@ -738,10 +720,6 @@ fn kind_mem_reads(kind: &TileExprKind) -> MemReads {
         K::Reduce { kind, value, .. } => match &**kind {
             ReduceKind::Subgroup => value.mem_reads(),
             ReduceKind::Workgroup { .. } => value.mem_reads().union(MemReads::TILE),
-            ReduceKind::Loop { .. } => value
-                .mem_reads()
-                .union(MemReads::TILE)
-                .union(MemReads::LOCAL),
         },
         K::Binary { left, right, .. } | K::Compare { left, right, .. } | K::Dot { left, right } => {
             left.mem_reads().union(right.mem_reads())
@@ -889,8 +867,8 @@ pub enum Stmt {
     /// from `merge`; both emitters open their arm with it and take the existing
     /// collective path unchanged.
     ///
-    /// `scratch` holds one workgroup tile per lane for the `Workgroup`/`Loop`
-    /// kinds and is empty for `Subgroup`. `kind`'s own scratch is `scratch[0]`,
+    /// `scratch` holds one workgroup tile per lane for the `Workgroup`
+    /// kind and is empty for `Subgroup`. `kind`'s own scratch is `scratch[0]`,
     /// so a one-lane reduction is exactly the node it is today.
     Reduce {
         kind: Box<ReduceKind>,
@@ -1054,9 +1032,6 @@ impl fmt::Display for LowerError {
     }
 }
 impl std::error::Error for LowerError {}
-
-/// Per-target lowering of one [`crate::ir::OpDef`] into Kernel.
-pub type LowerFn = fn(&crate::ir::Node, &crate::ir::launch::SchedPoint) -> Result<KernelIr>;
 
 /// `CoopStore` requires an affine rank-2 destination with a unit stride on
 /// one side; anything else falls back to a per-lane store path.

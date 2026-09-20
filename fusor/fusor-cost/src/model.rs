@@ -12,23 +12,18 @@
 //! cost term, because a time-only model eliminates f32 everywhere.
 
 use crate::terms;
-use fusor_ir::cost::{CostModel, DeviceFacts, LaunchPlan, MacUnit, Picoseconds, ShapeStats};
+use fusor_ir::cost::{CostModel, DeviceFacts, LaunchPlan, MacUnit, Picoseconds};
 use fusor_ir::dtype::Dtype;
-use fusor_ir::extract::{Extraction, PlanHash};
 use fusor_ir::facts::ValueFacts;
 use fusor_ir::ir::Node;
 use fusor_ir::ir::launch::SchedPoint;
 use fusor_ir::shape::Dim;
-use parking_lot::RwLock;
-use rustc_hash::{FxHashSet, FxHasher};
-use std::hash::{Hash, Hasher};
 
 /// The one cost model. `score_fs` maps onto its terms one for one:
 /// T1 -> math, T2 -> wg, T3 -> drain, T4 -> the `max`. Split-K combine
 /// work is an ordinary reduction launch in the graph.
 pub struct Roofline {
     facts: DeviceFacts,
-    stats: RwLock<ShapeStats>,
 }
 
 /// The schedule-dependent inputs one launch's terms need, decoded from its
@@ -76,54 +71,7 @@ impl Sched {
 
 impl Roofline {
     pub fn new(facts: DeviceFacts) -> Self {
-        Self {
-            facts,
-            stats: RwLock::new(ShapeStats::new()),
-        }
-    }
-
-    /// Record that this plan ran at this dim binding, and return how many
-    /// times that pair has now been seen.
-    ///
-    /// Also bumps a plan-level counter (the empty binding), which is what
-    /// [`CostModel::total`] amortizes compilation against — a plan is
-    /// compiled once per plan, not once per binding.
-    pub fn observe_binding(&self, plan: PlanHash, binding: &[Dim]) -> u32 {
-        let mut stats = self.stats.write();
-        stats.observe(plan, &[]);
-        stats.observe(plan, binding)
-    }
-
-    /// How many times this plan has been seen at any binding. `1` on first
-    /// sighting, so nothing compiles speculatively and the generic symbolic
-    /// variant wins outright.
-    pub fn expected_reuse(&self, plan: PlanHash) -> u32 {
-        self.stats.read().expected_reuse(plan, &[])
-    }
-
-    /// The compile identity of one launch: its root, its members, the
-    /// schedule points they resolved to, whether the root is materialized,
-    /// and the device fingerprint.
-    ///
-    /// This is a *stand-in*. The authoritative `PlanHash` is
-    /// `plan::plan_hash` over the whole realized term; a launch alone
-    /// cannot see that term.
-    pub fn launch_plan_hash(&self, launch: &LaunchPlan<'_>, materialized: bool) -> PlanHash {
-        let mut h = FxHasher::default();
-        self.facts.fingerprint().hash(&mut h);
-        launch.root.hash(&mut h);
-        materialized.hash(&mut h);
-        for id in launch.members {
-            id.hash(&mut h);
-            launch.theta.get(id).hash(&mut h);
-        }
-        launch.grid.hash(&mut h);
-        let lo = h.finish();
-        // A second lane so a 64-bit collision is not a plan collision.
-        let mut h2 = FxHasher::default();
-        (lo, 0x9e37_79b9_7f4a_7c15u64).hash(&mut h2);
-        launch.work.hash(&mut h2);
-        PlanHash((u128::from(h2.finish()) << 64) | u128::from(lo))
+        Self { facts }
     }
 
     /// [`CostModel::launch_cost`] at an explicit operand dtype.
@@ -317,21 +265,10 @@ impl CostModel for Roofline {
         terms::dram_ps(&self.facts, &[(bytes, rereads)], 0, 0)
     }
 
-    fn compile_amortized(&self, plan: PlanHash, expected_reuse: u32) -> Picoseconds {
-        let _ = plan;
-        Picoseconds(self.facts.compile_ps_per_kernel / u64::from(expected_reuse.max(1)))
-    }
-
-    fn total(&self, extraction: &Extraction, launches: &[LaunchPlan<'_>]) -> Picoseconds {
-        let mut total = Picoseconds(0);
-        let mut compiled = FxHashSet::default();
-        for launch in launches {
-            total += self.launch_cost(launch);
-            let hash = self.launch_plan_hash(launch, extraction.is_materialized(launch.root));
-            if compiled.insert(hash) {
-                total += self.compile_amortized(hash, self.expected_reuse(hash));
-            }
-        }
-        total
+    fn total(&self, launches: &[LaunchPlan<'_>]) -> Picoseconds {
+        launches
+            .iter()
+            .map(|launch| self.launch_cost(launch) + Picoseconds(self.facts.compile_ps_per_kernel))
+            .sum()
     }
 }

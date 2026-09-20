@@ -22,8 +22,8 @@ use fusor_ir::Result;
 use fusor_ir::device::Caps;
 use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
-    Accumulator, Addr, ArenaPlanner, CoopMatrixRole, CoopSrc, ElementType, KernelIr, Local,
-    LowerError, ScalarElement, Source, Stmt, TileExpr, TileExprKind, TileLiteral,
+    Accumulator, Addr, ArenaPlanner, CoopMatrixRole, ElementType, KernelIr, Local, LowerError,
+    ScalarElement, Source, Stmt, TileExpr, TileExprKind, TileLiteral,
     cooperative_store_layout_supported,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -103,14 +103,11 @@ fn for_each_element(ir: &KernelIr, f: &mut dyn FnMut(ElementType)) {
                 TileExprKind::LoadLocal(local) => f(local.element),
                 TileExprKind::Reduce { kind, .. } => match kind.as_ref() {
                     fusor_ir::ir::kernel::ReduceKind::Subgroup => {}
-                    fusor_ir::ir::kernel::ReduceKind::Workgroup { scratch, .. }
-                    | fusor_ir::ir::kernel::ReduceKind::Loop { scratch, .. } => f(scratch.element),
-                },
-                TileExprKind::CoopLoad { src, .. } => {
-                    if let CoopSrc::TileRegion { tile, .. } = src.as_ref() {
-                        f(tile.element);
+                    fusor_ir::ir::kernel::ReduceKind::Workgroup { scratch, .. } => {
+                        f(scratch.element)
                     }
-                }
+                },
+                TileExprKind::CoopLoad { src, .. } => f(src.tile.element),
                 _ => {}
             }
         });
@@ -892,7 +889,7 @@ fn check_one_reduce(
                 return Err(invalid("a subgroup reduction declares scratch tiles"));
             }
         }
-        ReduceKind::Workgroup { scratch: head, .. } | ReduceKind::Loop { scratch: head, .. } => {
+        ReduceKind::Workgroup { scratch: head, .. } => {
             if scratch.len() != n {
                 return Err(invalid(format!(
                     "a {n}-lane reduction declares {} scratch tiles",

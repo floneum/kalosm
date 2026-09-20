@@ -1,5 +1,4 @@
-//! Cross-lane reductions: subgroup collectives, shared-memory trees, and the
-//! loop-then-tree hybrid. The strategy is a parameter on the node.
+//! Cross-lane reductions: subgroup collectives and shared-memory trees.
 
 use fusor_ir::ir::kernel::{
     Builtin, ElementType, ReduceKind, ScalarElement, Tile, TileExpr, TileExprKind, TileReduceOp,
@@ -10,8 +9,8 @@ use naga::{
     Statement, SubgroupOperation,
 };
 
+use super::Emitter;
 use super::expr::{binary_math, binary_operator};
-use super::{Emitter, ScratchKind};
 
 impl Emitter<'_> {
     pub(crate) fn reduce(
@@ -37,20 +36,6 @@ impl Emitter<'_> {
                     self.collective_tree_reduce(out, scratch, v, op, element)
                 } else {
                     self.tree_reduce(out, scratch, v, op, *group_size)
-                }
-            }
-            ReduceKind::Loop {
-                iterations,
-                index,
-                scratch,
-                group_size,
-            } => {
-                let element = value.element();
-                let acc = self.loop_reduce(out, op, value, *iterations, index)?;
-                if self.upgrades_tree(*group_size, element) {
-                    self.collective_tree_reduce(out, scratch, acc, op, element)
-                } else {
-                    self.tree_reduce(out, scratch, acc, op, *group_size)
                 }
             }
         }
@@ -112,36 +97,6 @@ impl Emitter<'_> {
             Span::default(),
         );
         Ok(result)
-    }
-
-    /// Per-lane accumulation into a spill local seeded with the reduce
-    /// identity, then the tree.
-    fn loop_reduce(
-        &mut self,
-        out: &mut Block,
-        op: TileReduceOp,
-        value: &TileExpr,
-        iterations: u32,
-        index: &fusor_ir::ir::kernel::Local,
-    ) -> Result<Handle<Expression>, EmitError> {
-        let element = value.element();
-        let depth = self.depth;
-        let acc = self.scratch_local(ScratchKind::Spill, element, depth)?;
-        let identity = self.reduce_identity(op, element)?;
-        self.store_local(out, acc, identity);
-
-        let iter_local = self.private_local(index)?;
-        let count = self.u32_lit(iterations);
-        let value = value.clone();
-        self.dynamic_loop(out, count, move |em, loop_body, loop_index| {
-            em.store_local(loop_body, iter_local, loop_index);
-            let v = em.expr(&value, loop_body)?;
-            let current = em.load_local_handle(loop_body, acc);
-            let combined = em.combine(loop_body, op, current, v);
-            em.store_local(loop_body, acc, combined);
-            Ok(())
-        })?;
-        Ok(self.load_local_handle(out, acc))
     }
 
     /// `Workgroup` — **barrier, seed `scratch[lane]`, barrier, then the halving
@@ -262,9 +217,8 @@ impl Emitter<'_> {
     /// scratch, evaluating the carrier's `merge` at every level.
     ///
     /// `Subgroup` is refused: there is no hardware collective for a
-    /// multi-lane merge. `Loop` is refused too: per-lane accumulation needs
-    /// the carrier's identities, which live on `Launch::Fold`, so the
-    /// lowering builds that with `Stmt::Loop` and closes with the tree.
+    /// multi-lane merge. Per-lane accumulation is lowered with `Stmt::Loop`
+    /// before this collective.
     ///
     /// Every `merge` expression reads only its formals, so all `lanes` merges
     /// are evaluated before any is written back and no level can read a slot its
@@ -284,14 +238,6 @@ impl Emitter<'_> {
                 return Err(EmitError::Unsupported(
                     "a multi-lane merge has no subgroup collective: one value, one operator is \
                      all the hardware offers"
-                        .into(),
-                ));
-            }
-            ReduceKind::Loop { .. } => {
-                return Err(EmitError::Unsupported(
-                    "a multi-lane loop reduction seeds from the carrier's identities, which the \
-                     lowering carries: build the per-lane loop with Stmt::Loop and close with \
-                     ReduceKind::Workgroup"
                         .into(),
                 ));
             }

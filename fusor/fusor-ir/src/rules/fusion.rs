@@ -22,14 +22,11 @@
 //!
 //! There is no reader-count check. If a producer is read twice, both readers
 //! may absorb it and the pricing crate charges the recompute once per reader.
-//! `Region` is the same rewrite with `live_outs` non-empty.
 //!
 //! [`MAP_INTO_MAP`] is the same law with a `Map` in the consumer position.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
-use crate::ir::launch::{
-    AccessPlan, ContractSide, IndexSpace, Launch, MapDomain, Operand, ScheduleDomain,
-};
+use crate::ir::launch::{AccessPlan, ContractSide, IndexSpace, Launch, Operand};
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
 use crate::rules::{MapView, access_legal_in, map_view, operand_dtypes, shift_args};
@@ -67,14 +64,6 @@ rule!(
     head = OpTag::LaunchMap,
     tag = RuleTag::Additive,
     apply = fold_post_epilogue,
-);
-
-rule!(
-    FORM_KREGION,
-    level = Level::Launch,
-    head = OpTag::LaunchFold,
-    tag = RuleTag::Additive,
-    apply = form_kregion,
 );
 
 /// The result of splicing one elementwise producer into a reader's operand
@@ -950,45 +939,4 @@ pub fn fold_post_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_
         })
         .ok()?;
     b.union(id, extended).ok()
-}
-
-/// The linear schedule domain of a composite whose value is `landed`'s.
-///
-/// `verify_launch` recomputes exactly this from the composite's own inferred
-/// facts, so the two cannot drift.
-pub fn linear_domain_of(b: &Builder<'_>, landed: Id) -> ScheduleDomain {
-    ScheduleDomain::Map(MapDomain::linear_over(b.caps(), &b.facts_of(landed).shape))
-}
-
-/// The multi-output form of [`absorb`]: the absorbed producer also escapes,
-/// so the fused chain becomes a `Region` naming it in `live_outs`. Because
-/// the region and the plain absorbed fold are both live, emitting the extra
-/// buffer competes with recomputing it.
-pub fn form_kregion(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::Launch(k @ Launch::Fold { ops, .. }) = &node.op else {
-        return None;
-    };
-    let iter = k.iter_space();
-    let (slot, _) = ops.iter().enumerate().find_map(|(i, o)| {
-        if !matches!(o.access, AccessPlan::Alias) {
-            return None;
-        }
-        let view = map_view(b, o.src)?;
-        covers_for_substitution(&iter, &view).then_some((i, view))
-    })?;
-    let producer = ops[slot].src;
-    let fused = build_absorbed_fold(b, node, f)?;
-    let members: SmallVec<[Id; 8]> = smallvec::smallvec![producer, fused];
-    // `live_outs: [0]` names the producer, so the region lands the producer's
-    // value and that is the index space its schedule domain is derived from —
-    // the same one `verify_launch` recomputes from the region's inferred facts.
-    let sched = linear_domain_of(b, producer);
-    let region = b
-        .add_launch(Launch::Region {
-            members,
-            live_outs: smallvec::smallvec![0],
-            sched,
-        })
-        .ok()?;
-    b.union(id, region).ok()
 }

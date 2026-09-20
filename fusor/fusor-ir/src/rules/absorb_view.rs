@@ -43,9 +43,6 @@ rule!(
 /// and a broadcast copy is what every optimizer chain shares, so it made
 /// every chain's slab overlap every other's.
 pub fn absorb_view_stage(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    if std::env::var_os("FUSOR_NO_ABSORB").is_some() {
-        return None;
-    }
     let Op::Launch(op) = &node.op else {
         return None;
     };
@@ -82,9 +79,6 @@ pub fn absorb_view_stage(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_
 }
 
 pub fn absorb_view(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    if std::env::var_os("FUSOR_NO_ABSORB").is_some() {
-        return None;
-    }
     let Op::Launch(Launch::Contract {
         output,
         m,
@@ -150,32 +144,9 @@ pub fn absorb_view(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> 
 /// keeps its layout over the source. Otherwise, when `o` reads the copy
 /// densely in the copy's shape, `o` takes the copy's read layout.
 fn through_copy(b: &Builder<'_>, o: &Operand, broadcast_only: bool) -> Option<Operand> {
-    let log = std::env::var_os("FUSOR_ABSORB_LOG").is_some();
     let own = b.class_of(o.src);
     if !matches!(o.access, AccessPlan::Alias | AccessPlan::Pack { .. }) {
-        if log {
-            eprintln!("ABSORB {}: access {:?}", o.src, o.access);
-        }
         return None;
-    }
-    if log {
-        let kinds: Vec<String> = b
-            .class_members(o.src)
-            .iter()
-            .map(|m| match map_view(b, *m) {
-                Some(v) if v.ops.len() == 1 && matches!(v.body.kind(), ScalarKind::Arg(0)) => {
-                    format!("{m}:copy:{}", access_name(&v.ops[0].access))
-                }
-                Some(_) => format!("{m}:map"),
-                None => format!("{m}:{:?}", b.node(*m).op.tag()),
-            })
-            .collect();
-        eprintln!(
-            "ABSORB {} (class {}) read as {}: {kinds:?}",
-            o.src,
-            b.class_of(o.src).0.index(),
-            access_name(&o.access)
-        );
     }
     for m in b.class_members(o.src) {
         let Some(view) = map_view(b, m) else { continue };
@@ -194,25 +165,7 @@ fn through_copy(b: &Builder<'_>, o: &Operand, broadcast_only: bool) -> Option<Op
         }
         let out_shape = b.facts_of(o.src).shape.clone();
         if view.space.dims.as_slice() != out_shape.as_slice() {
-            if log {
-                eprintln!(
-                    "ABSORB {}: copy {m} space {:?} vs shape {:?}",
-                    o.src, view.space.dims, out_shape
-                );
-            }
             continue;
-        }
-        if log {
-            eprintln!(
-                "ABSORB {}: copy {m} src layout {:?}/{:?} contiguous {} ; o layout {:?}/{:?} contiguous {}",
-                o.src,
-                src.layout.shape(),
-                src.layout.strides(),
-                src.layout.is_contiguous(),
-                o.layout.shape(),
-                o.layout.strides(),
-                o.layout.is_contiguous()
-            );
         }
         let out_elems: Option<u64> = out_shape
             .iter()
@@ -245,17 +198,6 @@ fn through_copy(b: &Builder<'_>, o: &Operand, broadcast_only: bool) -> Option<Op
                 layout,
                 access: o.access.clone(),
             });
-        }
-        if log {
-            eprintln!(
-                "ABSORB {}: no composition: o {:?}/{:?} over copy shape {:?}, copy reads {:?}/{:?}",
-                o.src,
-                o.layout.shape(),
-                o.layout.strides(),
-                out_shape,
-                src.layout.shape(),
-                src.layout.strides()
-            );
         }
     }
     None
@@ -297,13 +239,4 @@ fn permute_through(outer: &Layout, shape: &[Dim], inner: &Layout) -> Option<Layo
         }
     }
     Layout::from_parts(inner.offset(), &dims, &strides).ok()
-}
-
-fn access_name(a: &AccessPlan) -> &'static str {
-    match a {
-        AccessPlan::Alias => "Alias",
-        AccessPlan::Gather => "Gather",
-        AccessPlan::Pack { .. } => "Pack",
-        AccessPlan::Unflatten(_) => "Unflatten",
-    }
 }

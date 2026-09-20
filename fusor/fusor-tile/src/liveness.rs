@@ -23,8 +23,8 @@
 use std::sync::Arc;
 
 use fusor_ir::ir::kernel::{
-    Accumulator, Addr, CoopSrc, ElementType, KernelIr, MemoryLevel, ReduceKind, Stmt, Tile,
-    TileExpr, TileExprKind, TileLiteral,
+    Accumulator, Addr, ElementType, KernelIr, MemoryLevel, ReduceKind, Stmt, Tile, TileExpr,
+    TileExprKind, TileLiteral,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -330,14 +330,9 @@ pub(crate) fn for_each_tile(kind: &TileExprKind, f: &mut dyn FnMut(&Tile, TileUs
         TileExprKind::LoadTile { tile, .. } => f(tile, TileUse::Read),
         TileExprKind::Reduce { kind, .. } => match kind.as_ref() {
             ReduceKind::Subgroup => {}
-            ReduceKind::Workgroup { scratch, .. } | ReduceKind::Loop { scratch, .. } => {
-                f(scratch, TileUse::ReadWrite)
-            }
+            ReduceKind::Workgroup { scratch, .. } => f(scratch, TileUse::ReadWrite),
         },
-        TileExprKind::CoopLoad { src, .. } => match src.as_ref() {
-            CoopSrc::TileRegion { tile, .. } => f(tile, TileUse::CoopRead),
-            CoopSrc::BroadcastCol { .. } => {}
-        },
+        TileExprKind::CoopLoad { src, .. } => f(&src.tile, TileUse::CoopRead),
         _ => {}
     }
 }
@@ -384,13 +379,10 @@ pub(crate) fn for_each_child(kind: &TileExprKind, f: &mut dyn FnMut(&TileExpr)) 
             f(right);
         }
         TileExprKind::Reduce { value, .. } => f(value),
-        TileExprKind::CoopLoad { src, .. } => match src.as_ref() {
-            CoopSrc::TileRegion { row, col, .. } => {
-                f(row);
-                f(col);
-            }
-            CoopSrc::BroadcastCol { col, .. } => f(col),
-        },
+        TileExprKind::CoopLoad { src, .. } => {
+            f(&src.row);
+            f(&src.col);
+        }
         TileExprKind::CoopMma { a, b, c } => {
             f(a);
             f(b);

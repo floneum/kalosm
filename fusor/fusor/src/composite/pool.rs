@@ -15,7 +15,7 @@ use fusor_ir::shape::SlidingWindow;
 use fusor_ir::{Error, Result};
 use smallvec::SmallVec;
 
-use crate::composite::{MacroAttr, MacroOp, PoolReduce, macro_op};
+use crate::composite::{PoolReduce, core_op};
 use crate::tensor::Tensor;
 
 /// One pooled axis. `From<usize>` makes the stride equal the window, which is
@@ -135,13 +135,7 @@ fn pool_with(x: &Tensor, pools: &[PoolSize], reduce: PoolReduce) -> Result<Tenso
         .collect::<Result<_>>()?;
 
     let xid = x.id;
-    let attrs = MacroAttr::Pool {
-        windows: specs.clone(),
-        reduce,
-    };
-    macro_op(&x.graph, MacroOp::Pool, attrs, &[xid], move |t| {
-        pool_defn(t, xid, &specs, reduce)
-    })
+    core_op(&x.graph, move |t| pool_defn(t, xid, &specs, reduce))
 }
 
 /// The generic form: window the trailing axes and reduce with `with`.

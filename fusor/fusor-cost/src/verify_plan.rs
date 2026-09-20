@@ -1,6 +1,6 @@
 //! `verify_plan` — the hard conformance assert on the extraction winner.
 //!
-//! Six clauses, each an [`Error::Plan`], **never** a silent fallback:
+//! Compiler invariants checked independently in tests:
 //!
 //! 1. every selected non-`Leaf` node is at `Level::Launch`;
 //! 2. `theta` is a member of the node's `ScheduleDomain`, the geometry's own
@@ -11,12 +11,10 @@
 //! 4. every `BufferPlan` layout has the rank its value needs and no
 //!    undefined symbolic stride;
 //! 5. no `Effect::InPlace` node is inlined;
-//! 6. every root is in `M`, and every `Launch::Ext` node can actually run
-//!    somewhere;
+//! 6. every root is in `M`;
 //! 7. every launch's bind group — its operands **plus the `Uniforms` block** —
 //!    fits `max_storage_buffers_per_shader_stage`.
 
-use crate::plan::UNKNOWN_SYM;
 use crate::realize::{self, scalar_element, tiles_for};
 use fusor_ir::Result;
 use fusor_ir::device::Caps;
@@ -26,8 +24,8 @@ use fusor_ir::extract::Plan;
 use fusor_ir::ir::Op;
 use fusor_ir::ir::kernel::ArenaPlanner;
 use fusor_ir::ir::launch::{Effect, Launch, SchedPoint, ScheduleDomain};
-use fusor_ir::ir::{OpDefId, OpDefRegistry};
 use fusor_ir::shape::Dim;
+use fusor_ir::shape::OPAQUE_SYM;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Clauses 1, 3, 4, 5 and the root half of 6 — everything derivable from the
@@ -231,20 +229,16 @@ pub(crate) fn check_operand_spaces(graph: &EGraph, plan: &Plan) -> Result<()> {
     Ok(())
 }
 
-/// All six clauses. The schedule clause needs the exact planner and the caps
-/// it was admitted against; the extension clause needs the registry the
-/// e-graph's semantics were built with.
+/// Check the plan against the device and arena used to construct it.
 pub(crate) fn verify_plan_with(
     graph: &EGraph,
     plan: &Plan,
     arena: &dyn ArenaPlanner,
     caps: &Caps,
-    registry: Option<&OpDefRegistry>,
 ) -> Result<()> {
     verify_plan(graph, plan)?;
     check_schedules(graph, plan, arena, caps)?;
     check_bind_groups(plan, caps)?;
-    check_extensions(graph, plan, registry)?;
     Ok(())
 }
 
@@ -433,13 +427,13 @@ pub(crate) fn check_buffers(graph: &EGraph, plan: &Plan) -> Result<()> {
             )));
         }
         for (axis, stride) in b.layout.strides().iter().enumerate() {
-            if *stride == Dim::Sym(UNKNOWN_SYM) {
+            if *stride == Dim::Sym(OPAQUE_SYM) {
                 // A `row_major_strides` placeholder is legal exactly when it
                 // is derivable at dispatch: every following extent is a
                 // constant or a bindable symbol.
                 let derivable = b.layout.shape()[axis + 1..]
                     .iter()
-                    .all(|d| !matches!(d, Dim::Sym(s) if *s == UNKNOWN_SYM));
+                    .all(|d| !matches!(d, Dim::Sym(s) if *s == OPAQUE_SYM));
                 if !derivable {
                     return Err(Error::Plan(format!(
                         "buffer for {} has an underivable stride on axis {axis}",
@@ -480,38 +474,6 @@ pub(crate) fn check_roots(graph: &EGraph, plan: &Plan) -> Result<()> {
         if !plan.extraction.is_materialized(sel) {
             return Err(Error::Plan(format!(
                 "root {sel} is not materialized; nothing would land in a buffer"
-            )));
-        }
-    }
-    Ok(())
-}
-
-/// Clause 6, extension half: an `Launch::Ext` whose `lower_per_target` is empty
-/// cannot run on any target and must never be selected.
-pub(crate) fn check_extensions(
-    graph: &EGraph,
-    plan: &Plan,
-    registry: Option<&OpDefRegistry>,
-) -> Result<()> {
-    for id in selected(plan) {
-        let Op::Launch(Launch::Ext { def, .. }) = &graph.node(id).op else {
-            continue;
-        };
-        let Some(registry) = registry else {
-            return Err(Error::Plan(format!(
-                "extension node {id} selected but no OpDefRegistry was supplied to verify it"
-            )));
-        };
-        let Some(entry) = registry.get(*def) else {
-            return Err(Error::Plan(format!(
-                "extension node {id} names unregistered {:?}",
-                OpDefId(def.0)
-            )));
-        };
-        if entry.lower_per_target.is_empty() {
-            return Err(Error::Plan(format!(
-                "extension `{}` selected at {id} lowers on no target",
-                entry.name
             )));
         }
     }

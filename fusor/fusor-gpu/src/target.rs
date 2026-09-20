@@ -1,9 +1,8 @@
 //! [`GpuTarget`] — the [`Target`] implementation tying device, lowering,
-//! emission, the pool, the plan cache and the launcher together.
+//! emission, compiled pipelines, the pool and the launcher together.
 
 use std::hash::{Hash, Hasher};
 use std::num::NonZeroUsize;
-use std::path::PathBuf;
 use std::sync::Arc;
 use web_time::Instant;
 
@@ -23,7 +22,6 @@ use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use crate::device::GpuDevice;
 use crate::launch::{BuildCursor, CommandRecord, GpuArtifact, KernelProfile, Launcher, TimingMode};
-use crate::plan_cache::PlanCache;
 use crate::pool::BufferPool;
 use crate::uniforms::UniformPack;
 
@@ -41,8 +39,6 @@ pub struct GpuConfig {
     /// Allocate a timestamp query set and fold the samples into
     /// [`KernelProfile`]s.
     pub trace_gpu_kernels: bool,
-    /// Root of the on-disk plan tier; `None` disables it.
-    pub cache_dir: Option<PathBuf>,
 }
 
 impl Default for GpuConfig {
@@ -52,22 +48,8 @@ impl Default for GpuConfig {
             poison_allocations: false,
             max_in_flight_submits: 8,
             trace_gpu_kernels: false,
-            cache_dir: default_cache_dir(),
         }
     }
-}
-
-fn default_cache_dir() -> Option<PathBuf> {
-    if let Some(xdg) = std::env::var_os("XDG_CACHE_HOME") {
-        return Some(PathBuf::from(xdg));
-    }
-    let home = std::env::var_os("HOME")?;
-    let home = PathBuf::from(home);
-    Some(if cfg!(target_vendor = "apple") {
-        home.join("Library").join("Caches")
-    } else {
-        home.join(".cache")
-    })
 }
 
 /// Live compiled pipelines retained per target. Must sit above any one plan's
@@ -235,7 +217,6 @@ fn pipeline_hash(ir: &fusor_ir::ir::kernel::KernelIr) -> u128 {
 pub struct GpuTarget {
     device: Arc<GpuDevice>,
     pool: BufferPool,
-    cache: PlanCache,
     artifacts: parking_lot::Mutex<lru::LruCache<ArtifactKey, ArtifactEntry>>,
     /// Compiled pipelines by kernel-body identity ([`pipeline_hash`]), shared
     /// across launches and bindings.
@@ -277,7 +258,6 @@ fn gpu_target_fields_are_send_sync() {
     fn assert<T: Send + Sync>() {}
     assert::<Arc<GpuDevice>>();
     assert::<BufferPool>();
-    assert::<PlanCache>();
     assert::<parking_lot::Mutex<lru::LruCache<ArtifactKey, ArtifactEntry>>>();
     assert::<parking_lot::Mutex<lru::LruCache<u128, PipelineSlot>>>();
     assert::<parking_lot::Mutex<lru::LruCache<String, Artifact>>>();
@@ -303,12 +283,10 @@ impl GpuTarget {
         let backend = device.adapter().get_info().backend;
         let lost = device.lost().clone();
         let pool = BufferPool::new(wgpu_device.clone(), queue.clone(), &config, lost.clone());
-        let cache = PlanCache::with_facts(device.facts(), config.cache_dir.clone());
         let launcher = Launcher::new(wgpu_device, queue, backend, config.clone(), lost);
         Ok(Self {
             device,
             pool,
-            cache,
             artifacts: parking_lot::Mutex::new(lru::LruCache::new(
                 NonZeroUsize::new(ARTIFACT_CAPACITY).expect("ARTIFACT_CAPACITY is nonzero"),
             )),
@@ -334,9 +312,6 @@ impl GpuTarget {
     }
     pub fn pool(&self) -> &BufferPool {
         &self.pool
-    }
-    pub fn plan_cache(&self) -> &PlanCache {
-        &self.cache
     }
     pub fn launcher(&self) -> &Launcher {
         &self.launcher
@@ -401,7 +376,7 @@ impl GpuTarget {
         // One pack for the whole resolve; every lowering this resolve drives
         // needs it.
         let pack = Arc::new(UniformPack::new(plan));
-        let uniforms = pack.fill(plan, &binds.dims, &binds.scalars)?;
+        let uniforms = pack.fill(&binds.dims, &binds.scalars)?;
 
         // Phase 1: serial, plan order.
         let uniform_buf = self
@@ -425,38 +400,9 @@ impl GpuTarget {
             if resolved.contains_key(&buffer.value) || buffer.arena.is_some() {
                 continue;
             }
-            // `BufferPlan::elements` is the derived placeholder whenever any
-            // extent is symbolic; the layout is the authority then. Padding
-            // lives in the strides, so the extent of the plan's row-major
-            // layouts is `shape[0] * strides[0]` — never the shape product,
-            // which undercounts a padded buffer. A `DERIVED_STRIDE` in slot 0
-            // implies no padding (plan derivation refuses the combination),
-            // so it resolves as the product of the remaining extents.
-            let elements = match buffer.elements {
-                d if d == fusor_ir::shape::Dim::Sym(crate::uniforms::DERIVED_STRIDE) => {
-                    match (
-                        buffer.layout.shape().first(),
-                        buffer.layout.strides().first(),
-                    ) {
-                        (Some(first), Some(stride0)) => {
-                            let stride0 = match stride0 {
-                                fusor_ir::shape::Dim::Sym(s)
-                                    if *s == crate::uniforms::DERIVED_STRIDE =>
-                                {
-                                    buffer.layout.shape()[1..].iter().try_fold(1u64, |acc, d| {
-                                        Some(acc.saturating_mul(binds.dim(*d)?))
-                                    })
-                                }
-                                d => binds.dim(*d),
-                            };
-                            stride0.and_then(|s| Some(binds.dim(*first)?.saturating_mul(s)))
-                        }
-                        _ => Some(1),
-                    }
-                }
-                d => binds.dim(d),
-            }
-            .ok_or_else(|| Error::Plan(format!("buffer {} has an unbound extent", buffer.value)))?;
+            let elements = binds.dim(buffer.elements).ok_or_else(|| {
+                Error::Plan(format!("buffer {} has an unbound extent", buffer.value))
+            })?;
             let bytes = elements.saturating_mul(buffer.dtype.byte_size()).max(4);
             // Not allocated yet: a step-local buffer lives from the first
             // launch that binds it to the last, and phase 3 allocates and
@@ -1370,12 +1316,11 @@ impl GpuTarget {
         let pool = self.pool.counters();
         eprintln!(
             "[cache-stats] resolves={n} artifacts={} pipelines={} by_source={} \
-             bind_groups={} plans={} pool_live_mib={} pool_created={}",
+             bind_groups={} pool_live_mib={} pool_created={}",
             self.artifacts.lock().len(),
             self.pipelines.lock().len(),
             self.pipelines_by_source.lock().len(),
             self.launcher.bind_group_count(),
-            self.cache.memory_len(),
             pool.live_bytes >> 20,
             pool.created,
         );

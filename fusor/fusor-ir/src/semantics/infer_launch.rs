@@ -4,34 +4,11 @@
 use crate::dtype::{Dtype, NumericContract, Persistence};
 use crate::error::{Error, Result};
 use crate::facts::ValueFacts;
-use crate::ir::OpDefRegistry;
 use crate::ir::launch::Launch;
 use crate::shape::Dims;
 
 /// Infer the result facts of a Launch node from its operands' facts.
-///
-/// `Launch::Ext` is the one variant this cannot answer alone — its row lives in
-/// the open [`OpDefRegistry`], which only [`crate::CoreSemantics`] holds. Use
-/// [`infer_launch_with`] when you have the registry; this function reports a
-/// typed error rather than guessing.
 pub fn infer_launch(op: &Launch, ins: &[ValueFacts]) -> Result<ValueFacts> {
-    infer_launch_inner(op, ins, None)
-}
-
-/// [`infer_launch`] with the extension registry, so `Launch::Ext` resolves.
-pub fn infer_launch_with(
-    op: &Launch,
-    ins: &[ValueFacts],
-    registry: &OpDefRegistry,
-) -> Result<ValueFacts> {
-    infer_launch_inner(op, ins, Some(registry))
-}
-
-fn infer_launch_inner(
-    op: &Launch,
-    ins: &[ValueFacts],
-    registry: Option<&OpDefRegistry>,
-) -> Result<ValueFacts> {
     match op {
         Launch::Map { space, body, .. } => Ok(ValueFacts {
             dtype: body.dtype(),
@@ -149,37 +126,6 @@ fn infer_launch_inner(
             let mut out = facts.clone();
             out.outs = 1;
             Ok(out)
-        }
-        Launch::Region {
-            members, live_outs, ..
-        } => {
-            let first = *live_outs.first().ok_or_else(|| {
-                Error::Shape("a Region must declare at least one live output".into())
-            })? as usize;
-            if first >= members.len() {
-                return Err(Error::Shape(format!(
-                    "Region live_out {first} names no member (there are {})",
-                    members.len()
-                )));
-            }
-            let facts = ins.get(first).ok_or_else(|| {
-                Error::Shape(format!("Region member {first} has no inferred facts"))
-            })?;
-            let mut out = facts.clone();
-            out.outs = live_outs.len() as u8;
-            Ok(out)
-        }
-
-        Launch::Ext { def, .. } => {
-            let registry = registry.ok_or_else(|| {
-                Error::Shape(
-                    "Launch::Ext inference needs the OpDefRegistry; call infer_launch_with".into(),
-                )
-            })?;
-            let d = registry
-                .get(*def)
-                .ok_or_else(|| Error::Shape(format!("no OpDef registered as {def:?}")))?;
-            (d.infer)(ins)
         }
     }
 }

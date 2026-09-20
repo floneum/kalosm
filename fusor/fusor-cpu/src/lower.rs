@@ -19,7 +19,7 @@ use fusor_ir::ir::launch::{
 };
 use fusor_ir::ir::{Node, Op};
 use fusor_ir::scalar::{BinOp, ScalarExpr, ScalarKind};
-use fusor_ir::shape::{AxisGroup, Dim, Layout, SymId};
+use fusor_ir::shape::{AxisGroup, Dim, Layout};
 use fusor_ir::target::LowerCtx;
 use smallvec::SmallVec;
 use std::sync::Arc;
@@ -62,12 +62,10 @@ pub(crate) fn lower(
         Launch::Gather { .. } | Launch::Scatter { .. } => {
             gather_scatter::lower(caps, node, theta, cx)
         }
-        Launch::Region { members, .. } => compose(caps, members, theta, cx, "cpu_region", false),
         // Members are read by id: the last one shares the slab's class, and
         // selecting it would lower the slab again.
-        Launch::Slab { members, .. } => compose(caps, members, theta, cx, "cpu_slab", true),
-        Launch::Group { members, .. } => compose(caps, members, theta, cx, "cpu_group", true),
-        Launch::Ext { def, .. } => ext::lower(*def, node, theta),
+        Launch::Slab { members, .. } => compose(caps, members, theta, cx, "cpu_slab"),
+        Launch::Group { members, .. } => compose(caps, members, theta, cx, "cpu_group"),
     }
 }
 
@@ -85,7 +83,6 @@ fn compose(
     theta: SchedPoint,
     cx: &LowerCtx<'_>,
     name: &'static str,
-    by_id: bool,
 ) -> Result<KernelIr> {
     if members.is_empty() {
         return Err(Error::Legality(
@@ -109,7 +106,7 @@ fn compose(
     let binds = Binds::build(cx)?;
     let mut kernels = Vec::with_capacity(members.len());
     for m in members {
-        let selected = if by_id { *m } else { cx.selected(*m) };
+        let selected = *m;
         let node = cx.graph.node(selected);
         // Each member is scheduled at its own point, not the composite's.
         let member_theta = cx
@@ -214,57 +211,6 @@ fn redirect_stores(
             Stmt::Loop { body, .. } => redirect_stores(body, from, view),
             _ => {}
         }
-    }
-}
-
-/// `Launch::Ext` lowering: the one escape hatch out of the closed `Logical`/`Launch` enums.
-pub(crate) mod ext {
-    use super::*;
-    use fusor_ir::ir::{OpDefId, OpDefRegistry};
-    use std::sync::RwLock;
-
-    /// The registry `Launch::Ext` lowering resolves `OpDefId` against.
-    ///
-    /// The embedder installs the same registry here that it installed on the
-    /// e-graph's semantics. Registration order is id order and must match.
-    static DEFS: RwLock<Option<OpDefRegistry>> = RwLock::new(None);
-
-    /// The installed registry, if the embedder installed one.
-    pub(crate) fn installed() -> Option<OpDefRegistry> {
-        DEFS.read()
-            .expect("the OpDef registry lock is poisoned")
-            .clone()
-    }
-
-    /// Lower one registered extension op through its `"cpu"` row.
-    pub(crate) fn lower(def: OpDefId, node: &Node, theta: SchedPoint) -> Result<KernelIr> {
-        let registry = installed().ok_or_else(|| {
-            Error::Legality(format!(
-                "{def:?} is an extension op, but no OpDefRegistry is installed on the \
-                 CPU target; call fusor_cpu::lower::ext::install"
-            ))
-        })?;
-        let entry = registry
-            .get(def)
-            .ok_or_else(|| Error::Legality(format!("no OpDef is registered as {def:?}")))?;
-        let lower = entry
-            .lower_per_target
-            .iter()
-            .find(|(target, _)| *target == "cpu")
-            .map(|(_, f)| *f)
-            .ok_or_else(|| {
-                Error::Legality(format!(
-                    "OpDef \"{}\" declares no \"cpu\" lowering; its \
-                     lower_per_target names {:?}",
-                    entry.name,
-                    entry
-                        .lower_per_target
-                        .iter()
-                        .map(|(t, _)| *t)
-                        .collect::<Vec<_>>()
-                ))
-            })?;
-        lower(node, &theta)
     }
 }
 
@@ -460,25 +406,17 @@ impl Binds {
     }
 }
 
-const DERIVED_STRIDE: SymId = SymId(u32::MAX);
-
 /// Resolve a dimension at the concrete binding this CPU artifact is compiled
 /// for. The executable cache includes these values, so embedding them in the
 /// native loop nest cannot reuse code for a different shape.
 pub(crate) fn resolve_dim(cx: &LowerCtx<'_>, dim: Dim) -> Result<u32> {
-    let value = match dim {
-        Dim::Const(value) => value,
-        Dim::Sym(symbol) if symbol != DERIVED_STRIDE => cx
-            .dim_bindings
-            .iter()
-            .find_map(|(bound, value)| (*bound == symbol).then_some(*value))
-            .ok_or_else(|| Error::Legality(format!("dim {symbol} is unbound at CPU lowering")))?,
-        Dim::Sym(_) => {
-            return Err(Error::Legality(
-                "a derived row-major stride is not a standalone extent".into(),
-            ));
-        }
-    };
+    let value = dim
+        .evaluate(&mut |symbol| {
+            cx.dim_bindings
+                .iter()
+                .find_map(|(bound, value)| (*bound == symbol).then_some(*value))
+        })
+        .ok_or_else(|| Error::Legality(format!("dim {dim} is unbound at CPU lowering")))?;
     u32::try_from(value)
         .map_err(|_| Error::Legality(format!("CPU dimension {value} exceeds u32 indexing")))
 }
@@ -487,27 +425,14 @@ pub(crate) fn const_extents(cx: &LowerCtx<'_>, shape: &[Dim]) -> Result<Vec<u32>
     shape.iter().map(|dim| resolve_dim(cx, *dim)).collect()
 }
 
-/// Concrete offset, extents and strides for the current artifact. Contiguous
-/// layouts use `DERIVED_STRIDE` after a symbolic axis; derive those strides
-/// from the now-concrete following extents just as session allocation does.
+/// Concrete offset, extents and strides for the current artifact.
 pub(crate) fn resolved_layout(
     cx: &LowerCtx<'_>,
     layout: &Layout,
 ) -> Result<(u32, Vec<u32>, Vec<u32>)> {
     let offset = resolve_dim(cx, layout.offset())?;
     let extents = const_extents(cx, layout.shape())?;
-    let strides = layout
-        .strides()
-        .iter()
-        .enumerate()
-        .map(|(axis, stride)| match stride {
-            Dim::Sym(symbol) if *symbol == DERIVED_STRIDE => extents[axis + 1..]
-                .iter()
-                .try_fold(1u32, |product, extent| product.checked_mul(*extent))
-                .ok_or_else(|| Error::Legality("CPU derived stride exceeds u32 indexing".into())),
-            other => resolve_dim(cx, *other),
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let strides = const_extents(cx, layout.strides())?;
     Ok((offset, extents, strides))
 }
 

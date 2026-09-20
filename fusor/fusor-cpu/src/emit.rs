@@ -12,7 +12,6 @@
 pub(crate) mod access;
 pub(crate) mod expr;
 pub(crate) mod quantized;
-pub(crate) mod reduce;
 pub(crate) mod stmt;
 
 use fusor_ir::Result;
@@ -564,14 +563,6 @@ impl<'a> Compiler<'a> {
                                 .into(),
                         ));
                     }
-                    fusor_ir::ir::kernel::ReduceKind::Loop { .. } => {
-                        return Err(EmitError::Unsupported(
-                            "a multi-lane loop reduction seeds from the carrier's identities, \
-                             which the lowering carries: build the per-lane loop with Stmt::Loop \
-                             and close with ReduceKind::Workgroup"
-                                .into(),
-                        ));
-                    }
                 };
                 let block = self.ir.block.max(1);
                 if group == 0
@@ -625,7 +616,7 @@ impl<'a> Compiler<'a> {
         })
     }
 
-    /// Hoist every `Reduce{Workgroup|Loop}` reachable from a statement into a
+    /// Hoist every collective reduction reachable from a statement into a
     /// collective staging pass in front of it, and record the tile read that
     /// replaces it.
     fn stage_reduces_in(&mut self, s: &Stmt) -> std::result::Result<(), EmitError> {
@@ -645,32 +636,11 @@ impl<'a> Compiler<'a> {
         let TileExprKind::Reduce { op, kind, value } = e.kind() else {
             return Ok(());
         };
-        let (tile, scratch, group, iterations, index) = match &**kind {
+        let (tile, scratch, group) = match &**kind {
             fusor_ir::ir::kernel::ReduceKind::Workgroup {
                 scratch,
                 group_size,
-            } => (
-                self.tile_of(scratch),
-                Arc::clone(scratch),
-                *group_size,
-                None,
-                None,
-            ),
-            fusor_ir::ir::kernel::ReduceKind::Loop {
-                iterations,
-                index,
-                scratch,
-                group_size,
-            } => {
-                let li = self.local_of(index);
-                (
-                    self.tile_of(scratch),
-                    Arc::clone(scratch),
-                    *group_size,
-                    Some(*iterations),
-                    Some(li),
-                )
-            }
+            } => (self.tile_of(scratch), Arc::clone(scratch), *group_size),
             fusor_ir::ir::kernel::ReduceKind::Subgroup => {
                 let scratch = Arc::new(TileDecl::new(
                     e.element(),
@@ -681,8 +651,6 @@ impl<'a> Compiler<'a> {
                     self.tile_of(&scratch),
                     scratch,
                     self.width.min(self.ir.block.max(1)),
-                    None,
-                    None,
                 )
             }
         };
@@ -690,23 +658,12 @@ impl<'a> Compiler<'a> {
         let v = self.compile_expr(value)?;
         let prep = start..self.end();
         let group = group.max(1);
-        self.pre.push(match (iterations, index) {
-            (Some(iterations), Some(index)) => CStmt::LoopTree {
-                prep,
-                tile,
-                value: v,
-                op: *op,
-                group,
-                iterations,
-                index,
-            },
-            _ => CStmt::StageTree {
-                prep,
-                tile,
-                value: v,
-                op: *op,
-                group,
-            },
+        self.pre.push(CStmt::StageTree {
+            prep,
+            tile,
+            value: v,
+            op: *op,
+            group,
         });
         // The replacement read: `tile[(lane / group) * group]`.
         let u32_ty = ElementType::Scalar(ScalarElement::U32);

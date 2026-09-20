@@ -516,10 +516,77 @@ fn grouped_padding_symbols_reach_the_uniform_plan() {
     );
 }
 
+#[test]
+fn fold_split_declines_unbound_carrier_slots_and_changed_coordinates_before_minting() {
+    use fusor_ir::carrier::{Carrier, oracle};
+    use fusor_ir::scalar::{BinOp, ScalarExpr};
+
+    let sum = Carrier::binop(BinOp::Add, fusor_ir::dtype::Splat::F32(0.0), Dtype::F32);
+    for (carrier, should_split) in [
+        (oracle::welford(Dtype::F32), false),
+        (
+            sum.clone()
+                .with_lift([ScalarExpr::cast(Dtype::F32, ScalarExpr::index_of(1))]),
+            false,
+        ),
+        (sum, true),
+    ] {
+        let caps = caps();
+        let mut graph = EGraph::new(fusor_ir::CoreSemantics::new(Arc::new(
+            fusor_tile::Planner::new(),
+        )));
+        let input = graph
+            .add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
+                name: BufferId(0),
+                dtype: Dtype::F32,
+                shape: [Dim::Const(4), Dim::Const(996)].into_iter().collect(),
+            })))
+            .unwrap();
+        if carrier.width() > 1 {
+            let before = graph.len();
+            assert!(
+                graph
+                    .add(Op::Logical(Logical::Fold {
+                        carrier: carrier.as_merge(),
+                        axis: 1,
+                        acc: Dtype::F32,
+                        ins: smallvec::smallvec![input],
+                    }))
+                    .is_err()
+            );
+            assert_eq!(
+                graph.len(),
+                before,
+                "unbound lift operands must never enter the graph"
+            );
+        }
+        let id = graph
+            .add(Op::Logical(Logical::Fold {
+                carrier,
+                axis: 1,
+                acc: Dtype::F32,
+                ins: smallvec::smallvec![input],
+            }))
+            .unwrap();
+        let node = graph.node(id).clone();
+        let facts = graph.facts_view(id, &caps);
+        let before = graph.len();
+        let variant = fusor_ir::rules::algebra::strip(&mut graph.builder(&caps), id, &node, &facts);
+        assert_eq!(variant.is_some(), should_split);
+        if !should_split {
+            assert_eq!(
+                graph.len(),
+                before,
+                "declined splits must not leave invalid orphan folds"
+            );
+        }
+        assert_graph_invariants(&graph, &caps);
+    }
+}
+
 fn assert_graph_invariants(graph: &EGraph, caps: &Caps) {
     use fusor_ir::egraph::Id;
-    use fusor_ir::ir::{OpDefRegistry, VerifyCtx};
-    let registry = OpDefRegistry::new();
+    use fusor_ir::ir::VerifyCtx;
     for index in 0..graph.len() {
         let id = Id(index as u32);
         let node = graph.node(id);
@@ -549,7 +616,6 @@ fn assert_graph_invariants(graph: &EGraph, caps: &Caps) {
                 operands: &operands,
                 result: graph.facts(id),
                 caps,
-                registry: &registry,
             })
             .unwrap();
         if let Op::Union(a, b) = node.op {

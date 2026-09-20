@@ -113,8 +113,7 @@ fn cooperative_size(size: u32) -> Result<naga::CooperativeSize, EmitError> {
 
 impl Emitter<'_> {
     /// `CoopLoad`. From a tile region the fragment origin is swapped and
-    /// `row_major: transposed`; from a rank-1 broadcast column the stride is
-    /// zero and `row_major: false`.
+    /// `row_major: transposed`.
     pub(crate) fn coop_load_parts(
         &mut self,
         out: &mut Block,
@@ -127,101 +126,41 @@ impl Emitter<'_> {
         let role = naga_role(role);
         let columns = cooperative_size(cols)?;
         let rows_size = cooperative_size(rows)?;
-        match src {
-            CoopSrc::TileRegion {
-                tile,
-                row,
-                col,
-                transposed,
-            } => {
-                // A `CoopLoad{scalar: F32}` off an f16 tile reads the right
-                // addresses at twice the width and comes back with plausible
-                // garbage, so the scalars are checked here where both are in
-                // hand.
-                fragment_scalar_matches(scalar, tile.element, "a workgroup tile")?;
-                let stride_u = row_major_tile_stride(tile)?;
-                let row_h = self.expr(row, out)?;
-                let col_h = self.expr(col, out)?;
-                let (first, second) = if *transposed {
-                    (col_h, row_h)
-                } else {
-                    (row_h, col_h)
-                };
-                let index = self.tile_matrix_index(out, first, second, stride_u);
-                let pointer = self.tile_dynamic_pointer(out, tile, index)?;
-                let stride = self.u32_lit(stride_u);
-                Ok(self.emit_expr(
-                    out,
-                    Expression::CooperativeLoad {
-                        columns,
-                        rows: rows_size,
-                        role,
-                        data: CooperativeData {
-                            pointer,
-                            stride,
-                            row_major: *transposed,
-                        },
-                    },
-                ))
-            }
-            CoopSrc::BroadcastCol { src, col } => {
-                if src.layout.extents.len() != 1 {
-                    return Err(EmitError::Unsupported(
-                        "a cooperative broadcast load needs rank-1 storage".into(),
-                    ));
-                }
-                fragment_scalar_matches(scalar, src.buffer.element, "a broadcast source")?;
-                let col_h = self.expr(col, out)?;
-                let pointer = if self.buffer_element(&src.buffer) == src.buffer.element
-                    && !self.analysis.atomic_buffers.contains(&src.buffer.binding)
-                {
-                    self.storage_dynamic_pointer(out, src, col_h)?
-                } else {
-                    let (staging, offset) = self.subgroup_staging(out, src.buffer.element, rows)?;
-                    out.push(
-                        Statement::ControlBarrier(Barrier::WORK_GROUP),
-                        Span::default(),
-                    );
-                    self.staged_copy(out, rows, rows, |em, block, _, i| {
-                        let source = em.add_u32(block, col_h, i);
-                        let value = em.load_storage_value(block, src, source)?;
-                        let base = em.global_var(staging);
-                        let index = em.add_u32(block, offset, i);
-                        let pointer = em.emit_expr(block, Expression::Access { base, index });
-                        block.push(Statement::Store { pointer, value }, Span::default());
-                        Ok(())
-                    })?;
-                    out.push(
-                        Statement::ControlBarrier(Barrier::WORK_GROUP),
-                        Span::default(),
-                    );
-                    let base = self.global_var(staging);
-                    self.emit_expr(
-                        out,
-                        Expression::Access {
-                            base,
-                            index: offset,
-                        },
-                    )
-                };
-                let stride = self.u32_lit(0);
-                Ok(self.emit_expr(
-                    out,
-                    Expression::CooperativeLoad {
-                        columns,
-                        rows: rows_size,
-                        role,
-                        data: CooperativeData {
-                            pointer,
-                            stride,
-                            // A broadcast C participates in the same
-                            // transposed accumulator representation.
-                            row_major: false,
-                        },
-                    },
-                ))
-            }
-        }
+        let CoopSrc {
+            tile,
+            row,
+            col,
+            transposed,
+        } = src;
+        // A `CoopLoad{scalar: F32}` off an f16 tile reads the right
+        // addresses at twice the width and comes back with plausible
+        // garbage, so the scalars are checked here where both are in
+        // hand.
+        fragment_scalar_matches(scalar, tile.element, "a workgroup tile")?;
+        let stride_u = row_major_tile_stride(tile)?;
+        let row_h = self.expr(row, out)?;
+        let col_h = self.expr(col, out)?;
+        let (first, second) = if *transposed {
+            (col_h, row_h)
+        } else {
+            (row_h, col_h)
+        };
+        let index = self.tile_matrix_index(out, first, second, stride_u);
+        let pointer = self.tile_dynamic_pointer(out, tile, index)?;
+        let stride = self.u32_lit(stride_u);
+        Ok(self.emit_expr(
+            out,
+            Expression::CooperativeLoad {
+                columns,
+                rows: rows_size,
+                role,
+                data: CooperativeData {
+                    pointer,
+                    stride,
+                    row_major: *transposed,
+                },
+            },
+        ))
     }
 
     /// `CoopMma` -> `a * b + c`. When `c` is a `LoadLocal` of an accumulator

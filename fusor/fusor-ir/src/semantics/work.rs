@@ -1,6 +1,4 @@
-//! `work()` rows for every op. The verifier rejects a registration whose work
-//! does not vary with shape. `index_ops` is exactly the term the view-fold-vs-gather
-//! tradeoff needs.
+//! Shape-dependent work rows; `index_ops` prices view-fold versus gather.
 //!
 //! Symbolic dims price as `1`. A `Sym` extent is bound at dispatch, so a
 //! shape-family plan is costed at its smallest legal binding and the specialised
@@ -17,10 +15,6 @@ use crate::shape::Dim;
 use rustc_hash::FxHashSet;
 
 /// Work one op performs at these shapes.
-///
-/// `Launch::Ext` has no row here — its cost lives in the open registry, which
-/// only [`crate::CoreSemantics`] holds. This function reports the honest
-/// index-op floor for it; [`work_of_with`] uses the registered row.
 pub fn work_of(op: &Op, ins: &[ValueFacts], out: &ValueFacts) -> Work {
     match op {
         Op::Logical(o) => work_l0(o, ins, out),
@@ -28,21 +22,6 @@ pub fn work_of(op: &Op, ins: &[ValueFacts], out: &ValueFacts) -> Work {
         // A union node is a choice, not a computation.
         Op::Union(..) => Work::default(),
     }
-}
-
-/// [`work_of`] with the extension registry, so `Launch::Ext` reports its own row.
-pub fn work_of_with(
-    op: &Op,
-    ins: &[ValueFacts],
-    out: &ValueFacts,
-    registry: &crate::ir::OpDefRegistry,
-) -> Work {
-    if let Op::Launch(Launch::Ext { def, .. }) = op
-        && let Some(d) = registry.get(*def)
-    {
-        return (d.work)(ins, out);
-    }
-    work_of(op, ins, out)
 }
 
 /// `(arith, transcendental, index)` of evaluating every slot's lift once.
@@ -328,25 +307,8 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             }
         }
 
-        // A region's true work is the sum of its members'. `ins` carries only
-        // their *facts*, so this row is the shape-varying floor every member
-        // pays to land its output; `fusor-cost` sums the exact rows on the
-        // realized DAG, where it has the member nodes ([`sum_work`]).
-        // The members are launch nodes of their own and carry their work; the
-        // node that sequences them adds none.
+        // Members carry their own work; sequencing adds none.
         Launch::Slab { .. } | Launch::Group { .. } => Work::default(),
-        Launch::Region { .. } => ins.iter().fold(Work::default(), |acc, f| {
-            acc.add(Work {
-                index_ops: elements(f),
-                ..Work::default()
-            })
-        }),
-
-        // Honest floor without the registry; see [`work_of_with`].
-        Launch::Ext { ops, .. } => Work {
-            index_ops: e.saturating_add(operand_index_ops(ops, e)),
-            ..Work::default()
-        },
     }
 }
 
@@ -449,14 +411,4 @@ fn elements(f: &ValueFacts) -> u64 {
 /// A symbolic dim prices as 1.
 fn priced(d: Dim) -> u64 {
     d.as_const().unwrap_or(1)
-}
-
-/// True when `work` varies across two distinct shape bindings — the check
-/// [`crate::ir::Semantics::verify`] applies to an `OpDef` registration.
-pub fn work_is_shape_sensitive(
-    work: fn(&[ValueFacts], &ValueFacts) -> Work,
-    small: (&[ValueFacts], &ValueFacts),
-    large: (&[ValueFacts], &ValueFacts),
-) -> bool {
-    work(small.0, small.1) != work(large.0, large.1)
 }

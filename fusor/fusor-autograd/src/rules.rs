@@ -377,45 +377,7 @@ fn rewrite_inner(
     f: &dyn Fn(&ScalarExpr) -> Option<ScalarExpr>,
     changed: &mut bool,
 ) -> ScalarExpr {
-    let rebuilt = match e.kind() {
-        ScalarKind::Arg(_)
-        | ScalarKind::Lit(_)
-        | ScalarKind::Uniform(_)
-        | ScalarKind::IndexOf(_) => e.clone(),
-        ScalarKind::Un { op, x } => ScalarExpr::un(*op, rewrite_inner(x, f, changed)),
-        ScalarKind::Bin { op, a, b } => ScalarExpr::bin(
-            *op,
-            rewrite_inner(a, f, changed),
-            rewrite_inner(b, f, changed),
-        ),
-        ScalarKind::Cmp { op, a, b } => ScalarExpr::cmp(
-            *op,
-            rewrite_inner(a, f, changed),
-            rewrite_inner(b, f, changed),
-        ),
-        ScalarKind::Select { c, t, f: e_f } => ScalarExpr::select(
-            rewrite_inner(c, f, changed),
-            rewrite_inner(t, f, changed),
-            rewrite_inner(e_f, f, changed),
-        ),
-        ScalarKind::Cast { to, x } => ScalarExpr::cast(*to, rewrite_inner(x, f, changed)),
-        ScalarKind::Bitcast { to, x } => ScalarExpr::bitcast(*to, rewrite_inner(x, f, changed)),
-        ScalarKind::Round { mode, x } => ScalarExpr::round(*mode, rewrite_inner(x, f, changed)),
-        ScalarKind::Dot { a, b } => ScalarExpr::new(
-            ScalarKind::Dot {
-                a: rewrite_inner(a, f, changed),
-                b: rewrite_inner(b, f, changed),
-            },
-            e.dtype(),
-        ),
-        ScalarKind::Splat { lanes, x } => ScalarExpr::new(
-            ScalarKind::Splat {
-                lanes: *lanes,
-                x: rewrite_inner(x, f, changed),
-            },
-            e.dtype(),
-        ),
-    };
+    let rebuilt = e.map_children(&mut |e| rewrite_inner(e, f, changed));
     match f(&rebuilt) {
         Some(next) => {
             *changed = true;

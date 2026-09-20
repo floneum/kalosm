@@ -88,23 +88,6 @@ fn best_spelling(b: &Builder<'_>, class: ClassId) -> Option<Id> {
             }
         }
     }
-    if std::env::var_os("FUSOR_GROUP_LOG").is_some()
-        && let Some((_, s)) = best_slab
-    {
-        let all: Vec<String> = b
-            .class_members(class.0)
-            .into_iter()
-            .filter_map(|m| match &b.node(m).op {
-                Op::Launch(Launch::Slab { members, .. }) => Some(format!(
-                    "{m}:c{}:n{}",
-                    slab_copies(b, members),
-                    members.len()
-                )),
-                _ => None,
-            })
-            .collect();
-        eprintln!("PICK class {} -> {s} from {all:?}", class.0.index());
-    }
     best_slab.map(|(_, s)| s).or(stage)
 }
 
@@ -176,71 +159,8 @@ fn covered_class(b: &Builder<'_>, head: Id, class: ClassId) -> bool {
     own.contains(&class)
 }
 
-/// Earlier stage launches of `id`'s kind over its index space, one per
-/// class, in the order they were minted. A registry per graph, filled as
-/// heads fire, so a firing scans only its own shape.
-fn siblings(b: &Builder<'_>, id: Id) -> Vec<Id> {
-    use std::cell::RefCell;
-    type Siblings = rustc_hash::FxHashMap<(OpTag, Vec<crate::shape::Dim>), Vec<Id>>;
-    thread_local! {
-        static SEEN: RefCell<(u64, Siblings)> =
-            RefCell::new((0, rustc_hash::FxHashMap::default()));
-    }
-    const MAX_SIBLINGS: usize = 24;
-    let Op::Launch(op) = &b.node(id).op else {
-        return Vec::new();
-    };
-    let (tag, space) = match op {
-        Launch::Map { space, .. } | Launch::Fold { space, .. } => (op.tag(), space.dims.to_vec()),
-        Launch::Slab { members, .. } => {
-            let Some(last) = members.last() else {
-                return Vec::new();
-            };
-            let Op::Launch(lop) = &b.node(*last).op else {
-                return Vec::new();
-            };
-            (op.tag(), lop.iter_space().dims.to_vec())
-        }
-        _ => return Vec::new(),
-    };
-    let arena = b.arena_id();
-    SEEN.with(|s| {
-        let mut s = s.borrow_mut();
-        if s.0 != arena {
-            *s = (arena, rustc_hash::FxHashMap::default());
-        }
-        let list = s.1.entry((tag, space)).or_default();
-        let class = b.class_of(id);
-        let mut out: Vec<Id> = Vec::new();
-        let mut seen_classes: FxHashSet<ClassId> = FxHashSet::default();
-        for x in list.iter().rev() {
-            if x.index() >= b.len() || b.class_of(*x) == class {
-                continue;
-            }
-            let xc = b.class_of(*x);
-            if !seen_classes.insert(xc) {
-                continue;
-            }
-            // The class's current best spelling, not the one that fired.
-            if let Some(best) = best_spelling(b, xc) {
-                out.push(best);
-            }
-            if out.len() >= MAX_SIBLINGS {
-                break;
-            }
-        }
-        if !list.contains(&id) {
-            list.push(id);
-        }
-        out.reverse();
-        out
-    })
-}
-
 pub fn form_group(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    if b.caps().kind != crate::device::DeviceKind::Gpu
-        || std::env::var_os("FUSOR_NO_GROUP").is_some()
-    {
+    if b.caps().kind != crate::device::DeviceKind::Gpu {
         return None;
     }
     let Op::Launch(_) = &node.op else { return None };
@@ -254,30 +174,19 @@ pub fn form_group(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> O
         .iter()
         .copied()
         .filter(|r| b.class_of(*r) == class)
-        .min();
+        .min()?;
 
-    // Candidates: for a root, every earlier root's best spelling; for
-    // anything else, the earlier launches of the same kind over the same
-    // index space — the sums of split-K partials, the bias gradients —
-    // which run side by side whenever neither depends on the other.
-    let candidates: Vec<Id> = match head_root {
-        Some(head_root) => roots
-            .iter()
-            .copied()
-            .filter(|r| *r < head_root)
-            .filter_map(|r| {
-                let rc = b.class_of(r);
-                (!covered_class(b, id, rc))
-                    .then(|| best_spelling(b, rc))
-                    .flatten()
-            })
-            .collect(),
-        // Same-shaped independent siblings (`siblings`) measured a net
-        // loss: groups of plain spellings tie the fused ones on the bound
-        // and the plan comes apart. Roots only until the bound prices that.
-        None if std::env::var_os("FUSOR_GROUP_SIBLINGS").is_some() => siblings(b, id),
-        None => Vec::new(),
-    };
+    let candidates: Vec<Id> = roots
+        .iter()
+        .copied()
+        .filter(|r| *r < head_root)
+        .filter_map(|r| {
+            let rc = b.class_of(r);
+            (!covered_class(b, id, rc))
+                .then(|| best_spelling(b, rc))
+                .flatten()
+        })
+        .collect();
 
     let mut covered: FxHashSet<ClassId> = FxHashSet::default();
     covers(b, id, &mut covered);
@@ -328,21 +237,12 @@ pub fn form_group(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> O
         }
         let own: FxHashSet<ClassId> = tail.iter().map(|m| b.class_of(*m)).collect();
         let inputs = inputs.iter().filter(|c| !own.contains(c)).count();
-        if std::env::var_os("FUSOR_GROUP_LOG").is_some() {
-            eprintln!(
-                "GROUP {id}: cut {cut} tail {} outs {outs} inputs {inputs} budget {budget}",
-                tail.len()
-            );
-        }
         if 2 + outs + inputs <= budget {
             chosen = Some(tail.to_vec());
             break;
         }
     }
     let members = chosen?;
-    if std::env::var_os("FUSOR_GROUP_LOG").is_some() {
-        eprintln!("GROUP {id}: {} members {members:?}", members.len());
-    }
     let group = b
         .add_launch(Launch::Group {
             members: SmallVec::from_vec(members),

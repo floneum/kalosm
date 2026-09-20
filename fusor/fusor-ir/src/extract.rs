@@ -16,9 +16,8 @@ use smallvec::SmallVec;
 pub struct Extraction {
     /// E-class -> the selected member of that class.
     pub sigma: FxHashMap<ClassId, Id>,
-    /// The materialized set. A node in `M` pays one write and each consumer
-    /// pays one read; a node outside `M` is inlined into every consumer,
-    /// paying its math once per consumer and no traffic.
+    /// Buffer outputs derived from the selected DAG. A composite's final
+    /// stage aliases its owner instead of allocating another output.
     pub m: FixedBitSet,
     /// Schedule point per selected node carrying a `ScheduleDomain`.
     pub theta: FxHashMap<Id, SchedPoint>,
@@ -33,13 +32,10 @@ impl Extraction {
     }
 }
 
-/// The three moves local search makes. `Flip` is refused when the node is
-/// pinned: an `Effect::InPlace` node is pinned in `M`, since inlining an
-/// atomic scatter into two consumers doubles the effect.
+/// Choices local search makes over valid graph variants and schedules.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Move {
     Reselect(ClassId),
-    Flip(Id),
     Reschedule(Id),
 }
 

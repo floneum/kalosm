@@ -6,7 +6,7 @@
 use crate::carrier::Carrier;
 use crate::dtype::Dtype;
 use crate::egraph::Id;
-use crate::ir::{AttrId, OpDefId, OpTag};
+use crate::ir::OpTag;
 use crate::scalar::ScalarExpr;
 use crate::shape::{Dim, Layout, MultiFlattenMap, SlidingWindow};
 use smallvec::SmallVec;
@@ -90,19 +90,6 @@ pub enum Launch {
         sched: ScheduleDomain,
     },
 
-    /// A multi-output region: the same rewrite as producer inlining,
-    /// differing only in that it emits an extra buffer.
-    ///
-    /// `sched` is the members' shared index space walked as one linearized
-    /// body — see [`MapDomain::linear_over`]. Without it the one node family
-    /// the architecture calls its own fusion primitive would be the one whose
-    /// geometry is not a selection.
-    Region {
-        members: SmallVec<[Id; 8]>,
-        live_outs: SmallVec<[u32; 4]>,
-        sched: ScheduleDomain,
-    },
-
     /// A pipeline of launches run by one dispatch: `members`, in dependency
     /// order, each computed stage by stage inside one workgroup per slab.
     ///
@@ -130,13 +117,6 @@ pub enum Launch {
         members: SmallVec<[Id; 8]>,
         sched: ScheduleDomain,
     },
-
-    /// The one open extension point.
-    Ext {
-        def: OpDefId,
-        ops: Vec<Operand>,
-        attrs: AttrId,
-    },
 }
 impl Launch {
     pub const fn tag(&self) -> OpTag {
@@ -146,10 +126,8 @@ impl Launch {
             Self::Contract { .. } => OpTag::LaunchContract,
             Self::Gather { .. } => OpTag::LaunchGather,
             Self::Scatter { .. } => OpTag::LaunchScatter,
-            Self::Region { .. } => OpTag::LaunchRegion,
             Self::Slab { .. } => OpTag::LaunchSlab,
             Self::Group { .. } => OpTag::LaunchGroup,
-            Self::Ext { .. } => OpTag::Ext,
         }
     }
 
@@ -176,11 +154,7 @@ impl Launch {
         }
     }
 
-    /// This node's enumerable schedule space, or `None` when it has none.
-    ///
-    /// `Ext` is the only `None`: the open extension point carries an
-    /// `OpDef`-supplied lowering that fusor cannot enumerate geometries for,
-    /// so its lowering is handed `SchedPoint::Point` and nothing else.
+    /// This node's enumerable schedule space.
     pub fn schedule(&self) -> Option<&ScheduleDomain> {
         match self {
             Self::Map { sched, .. }
@@ -188,10 +162,8 @@ impl Launch {
             | Self::Contract { sched, .. }
             | Self::Gather { sched, .. }
             | Self::Scatter { sched, .. }
-            | Self::Region { sched, .. }
             | Self::Slab { sched, .. }
             | Self::Group { sched, .. } => Some(sched),
-            Self::Ext { .. } => None,
         }
     }
 }
@@ -956,59 +928,6 @@ pub struct MapTiling {
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct MapDomain {
     pub tilings: SmallVec<[MapTiling; 8]>,
-}
-
-/// Outputs per lane worth scoring for a linearized body. A *policy* constant,
-/// and it belongs beside the generator that reads it rather than in a
-/// lowering — same rule `fusor_tile::domains` follows for `BLOCK_CHOICES`.
-const LINEAR_TM_CHOICES: [u32; 3] = [2, 4, 8];
-
-impl MapDomain {
-    /// Every tiling worth scoring for a body that walks **one linearized
-    /// index** over `elements` outputs — the shape [`Launch::Region`] takes on
-    /// either backend.
-    ///
-    /// `dim` is always `None` because there is no axis to name: `tm` is the
-    /// register tile along the linear index and `vector` is the SIMD width,
-    /// which a composite body does not choose. A tiling survives only when it
-    /// leaves at least one full subgroup of work, so a body too small to tile
-    /// reports one point and says so, rather than offering a point that would
-    /// launch empty lanes.
-    ///
-    /// This needs `Caps` and an element count and nothing else — no arena
-    /// plan — which is why it lives here and both the rule that mints the
-    /// node and the verifier that checks it call the same function.
-    pub fn linear(caps: &crate::device::Caps, elements: u64) -> Self {
-        let sgw = u64::from(caps.subgroup_width().max(1));
-        let mut tilings: SmallVec<[MapTiling; 8]> = SmallVec::new();
-        tilings.push(MapTiling {
-            dim: None,
-            tm: 1,
-            vector: 1,
-        });
-        for tm in LINEAR_TM_CHOICES {
-            if elements >= u64::from(tm).saturating_mul(sgw) {
-                tilings.push(MapTiling {
-                    dim: None,
-                    tm,
-                    vector: 1,
-                });
-            }
-        }
-        Self { tilings }
-    }
-
-    /// [`Self::linear`] over a value's shape. A symbolic extent prices as 1,
-    /// the same convention `semantics::work` uses, so a shape-family node
-    /// gets the conservative domain rather than a tiling its smallest legal
-    /// binding cannot fill.
-    pub fn linear_over(caps: &crate::device::Caps, shape: &[Dim]) -> Self {
-        let elements = shape
-            .iter()
-            .map(|d| d.as_const().unwrap_or(1))
-            .fold(1u64, |a, b| a.saturating_mul(b));
-        Self::linear(caps, elements)
-    }
 }
 
 /// Window geometry a structural adjoint reads. Two integers decide the

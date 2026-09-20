@@ -395,7 +395,7 @@ pub(crate) fn lower_coop(
                             operand_elem,
                             dim,
                             dim,
-                            CoopSrc::TileRegion {
+                            CoopSrc {
                                 tile: a_tile.clone(),
                                 row: a_row_d.clone(),
                                 col: a_col,
@@ -407,7 +407,7 @@ pub(crate) fn lower_coop(
                             operand_elem,
                             dim,
                             dim,
-                            CoopSrc::TileRegion {
+                            CoopSrc {
                                 tile: b_tile.clone(),
                                 row: b_row,
                                 col: b_col.clone(),

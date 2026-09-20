@@ -16,19 +16,6 @@ use rustc_hash::{FxHashMap, FxHasher};
 use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 
-/// One postorder sweep from `0`. The operator is monotone, so the sweep is
-/// exact wherever the class graph is acyclic and an underestimate through a
-/// class cycle — still admissible, which is all the bound promises.
-///
-/// Not iterated to a fixpoint: through the identity-shaped cycles a large
-/// graph carries (a value unioned with a copy of itself, a region reading
-/// its own class) every further sweep compounds the cycle's cost into every
-/// reader, ~35× per sweep on a 140k-node vision graph, until both bounds
-/// saturate and every class downstream ties at infinity. The seed then
-/// falls to the smallest id, which is the definitional fold of every
-/// contraction.
-const MAX_PASSES: u32 = 1;
-
 /// Ceiling on `node_math` evaluations spent scanning schedule domains. Past
 /// it a node's math term degrades to zero, which is still a *lower* bound and
 /// therefore still admissible.
@@ -51,60 +38,44 @@ fn domain_len(graph: &EGraph, id: Id) -> usize {
     }
 }
 
-/// Indexed by node id. One bottom-up sweep in dependency postorder.
+pub(crate) struct Bounds {
+    pub costs: Vec<Picoseconds>,
+    pub launches: Vec<u32>,
+}
+
 pub(crate) fn lower_bound(graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds> {
     let ids: Vec<Id> = (0..graph.len()).map(|i| Id(i as u32)).collect();
-    lower_bound_over(graph, cost, &ids)
+    bounds_over(graph, Some(cost), &ids).costs
 }
 
-/// [`lower_bound`] over the masked slots only. The vector is still indexed by
-/// node id — unmasked slots stay `0`. The mask must come from
-/// [`crate::realize::reachable`], which is closed under both class membership
-/// and children, so every id the extractor can index is masked.
-pub(crate) fn lower_bound_scoped(
+/// Both bounds use the same dependency postorder. Unmasked slots stay zero.
+pub(crate) fn bounds_scoped(
     graph: &EGraph,
-    cost: &dyn CostModel,
+    cost: Option<&dyn CostModel>,
     mask: &fixedbitset::FixedBitSet,
-) -> Vec<Picoseconds> {
+) -> Bounds {
     let ids: Vec<Id> = mask.ones().map(|i| Id(i as u32)).collect();
-    lower_bound_over(graph, cost, &ids)
+    bounds_over(graph, cost, &ids)
 }
 
-/// The fixpoint over `ids`, in dependency postorder. `ids` must be closed:
-/// every child class root and every union operand of a listed node is itself
-/// listed.
-///
-/// Postorder puts every child value before its consumers, so one pass
-/// converges the acyclic graph exactly; the remaining passes only chase class
-/// cycles, where the capped iteration keeps a safe underestimate.
-fn lower_bound_over(graph: &EGraph, cost: &dyn CostModel, ids: &[Id]) -> Vec<Picoseconds> {
-    let n = graph.len();
-    let mut lb = vec![Picoseconds(0); n];
-    if n == 0 || ids.is_empty() {
-        return lb;
+fn bounds_over(graph: &EGraph, cost: Option<&dyn CostModel>, ids: &[Id]) -> Bounds {
+    let mut bounds = Bounds {
+        costs: vec![Picoseconds(0); graph.len()],
+        launches: vec![0; graph.len()],
+    };
+    let math = cost.map_or_else(
+        || vec![Picoseconds(0); graph.len()],
+        |cost| node_math_table(graph, cost, ids),
+    );
+    let launch_ps = cost.map_or(0, |cost| cost.facts().launch_ps);
+    // One sweep underestimates class cycles. Iterating compounds their cost
+    // into their readers until every downstream member ties at saturation.
+    for id in postorder(graph, ids) {
+        let (time, launches) = combine(graph, id, &math, &bounds, launch_ps);
+        bounds.costs[id.index()] = time;
+        bounds.launches[id.index()] = launches;
     }
-    let math = node_math_table(graph, cost, ids);
-    let order = postorder(graph, ids);
-
-    let debug = std::env::var_os("FUSOR_SEED_DEBUG").is_some();
-    for pass in 0..MAX_PASSES {
-        let mut changed = 0usize;
-        for id in &order {
-            let next = combine(graph, *id, &math, &lb, cost.facts().launch_ps);
-            if next != lb[id.index()] {
-                lb[id.index()] = next;
-                changed += 1;
-            }
-        }
-        if debug {
-            let max = lb.iter().map(|p| p.0).max().unwrap_or(0);
-            eprintln!("[lb] pass {pass}: {changed} changed, max {max}");
-        }
-        if changed == 0 {
-            break;
-        }
-    }
-    lb
+    bounds
 }
 
 /// Dependency postorder over the masked ids: every edge a [`combine`] reads —
@@ -203,7 +174,6 @@ pub(crate) fn argmin_member(
     launches: &[u32],
     class: ClassId,
     caps: &Caps,
-    launch_ps: u64,
 ) -> Id {
     if crate::realize::is_singleton(graph, class) {
         return class.0;
@@ -234,7 +204,6 @@ pub(crate) fn argmin_member(
                                 launches,
                                 c,
                                 caps,
-                                launch_ps,
                                 &Default::default()
                             )
                         )
@@ -250,16 +219,8 @@ pub(crate) fn argmin_member(
             );
         }
     }
-    let chosen = argmin_member_excluding(
-        graph,
-        lb,
-        launches,
-        class,
-        caps,
-        launch_ps,
-        &Default::default(),
-    )
-    .unwrap_or(class.0);
+    let chosen = argmin_member_excluding(graph, lb, launches, class, caps, &Default::default())
+        .unwrap_or(class.0);
     if let Ok(want) = std::env::var("FUSOR_SEED_DEBUG")
         && want == class.0.index().to_string()
     {
@@ -277,172 +238,84 @@ pub(crate) fn argmin_member_excluding(
     launches: &[u32],
     class: ClassId,
     caps: &Caps,
-    launch_ps: u64,
     banned: &rustc_hash::FxHashSet<Id>,
 ) -> Option<Id> {
     crate::realize::selectable(graph, class, caps)
         .into_iter()
         .filter(|m| !banned.contains(m))
-        .min_by_key(|m| {
-            let _ = launch_ps;
-            (lb[m.index()], launches[m.index()], *m)
-        })
+        .min_by_key(|m| (lb[m.index()], launches[m.index()], *m))
 }
 
-/// The launch-count analogue of [`lower_bound_scoped`]: per node, the fewest
-/// launches any realization of that node's chain can dispatch — every
-/// non-leaf node is one launch plus its distinct child chains, sharing free,
-/// `min` over members. Same Kleene iteration, same closure requirement on the
-/// mask. Consumed by [`argmin_member`] as the tie-break only.
-pub(crate) fn launch_bound_scoped(graph: &EGraph, mask: &fixedbitset::FixedBitSet) -> Vec<u32> {
-    let ids: Vec<Id> = mask.ones().map(|i| Id(i as u32)).collect();
-    launch_bound_over(graph, &ids)
-}
-
-fn launch_bound_over(graph: &EGraph, ids: &[Id]) -> Vec<u32> {
-    let mut l = vec![0u32; graph.len()];
-    if ids.is_empty() {
-        return l;
-    }
-    let order = postorder(graph, ids);
-    for _ in 0..MAX_PASSES {
-        let mut changed = false;
-        for id in &order {
-            let next = launch_combine(graph, *id, &l);
-            if next != l[id.index()] {
-                l[id.index()] = next;
-                changed = true;
-            }
-        }
-        if !changed {
-            break;
-        }
-    }
-    l
-}
-
-fn launch_combine(graph: &EGraph, id: Id, l: &[u32]) -> u32 {
-    let node = graph.node(id);
-    match &node.op {
-        Op::Union(a, b) => l[a.index()].min(l[b.index()]),
-        Op::Logical(Logical::Leaf(_)) => 0,
-        // One dispatch for every stage, plus whatever feeds the stages from
-        // outside.
-        Op::Launch(Launch::Slab { members, .. }) => {
-            let mut total = 1u32;
-            for class in slab_inputs(graph, members) {
-                total = total.saturating_add(l[class.0.index()]);
-            }
-            total
-        }
-        // The last member's chain, less the dispatches the other members
-        // would have been.
-        Op::Launch(Launch::Group { members, .. }) => {
-            let last = members.last().copied().unwrap_or(id);
-            let mut total = l[last.index()].saturating_sub(members.len().saturating_sub(1) as u32);
-            for m in &members[..members.len().saturating_sub(1)] {
-                let excess = l[m.index()].saturating_sub(l[graph.class_of(*m).0.index()]);
-                total = total.saturating_add(excess);
-            }
-            total
-        }
-        _ => {
-            let mut seen: SmallVec<[ClassId; 4]> = SmallVec::new();
-            let mut total = 1u32;
-            for child in node.children.iter() {
-                let class = graph.class_of(*child);
-                if seen.contains(&class) {
-                    continue;
-                }
-                seen.push(class);
-                total = total.saturating_add(l[class.0.index()]);
-            }
-            total
-        }
-    }
-}
-
-/// A launch node's bound is its math, its own dispatch, and its children's
-/// bounds; a slab's is one dispatch, its stages' math, and its inputs'
-/// bounds. The dispatch is in the bound itself so a spelling that fuses
-/// launches away is cheaper by that much in one number — a separate launch
-/// count, relaxed on its own, credits a fold over split partials with the
-/// unsplit contraction's single dispatch.
 fn combine(
     graph: &EGraph,
     id: Id,
     math: &[Picoseconds],
-    lb: &[Picoseconds],
+    bounds: &Bounds,
     launch_ps: u64,
-) -> Picoseconds {
+) -> (Picoseconds, u32) {
+    let (lb, launches) = (&bounds.costs, &bounds.launches);
     let node = graph.node(id);
     match &node.op {
-        Op::Union(a, b) => lb[a.index()].min(lb[b.index()]),
-        Op::Logical(Logical::Leaf(_)) => Picoseconds(0),
-        // The stages' own math, once each, plus the bound of what feeds them
-        // from outside. Summing the members' bounds would count every
-        // stage's producers once per stage that reads them.
+        Op::Union(a, b) => (
+            lb[a.index()].min(lb[b.index()]),
+            launches[a.index()].min(launches[b.index()]),
+        ),
+        Op::Logical(Logical::Leaf(_)) => (Picoseconds(0), 0),
         Op::Launch(Launch::Slab { members, .. }) => {
-            let mut total = math[id.index()] + Picoseconds(launch_ps);
+            let mut time = math[id.index()] + Picoseconds(launch_ps);
+            let mut count = 1u32;
             for m in members {
-                total += math[m.index()];
+                time += math[m.index()];
             }
             for class in slab_inputs(graph, members) {
-                total += lb[class.0.index()];
+                time += lb[class.0.index()];
+                count = count.saturating_add(launches[class.0.index()]);
             }
-            // A middle member that is a root of the graph — an optimizer
-            // state, say — would be its own dispatch otherwise; the slab
-            // computes it on the way. The bound is for the plan, and the
-            // plan pays that dispatch nowhere else.
             let roots: SmallVec<[ClassId; 8]> =
                 graph.roots().iter().map(|r| graph.class_of(*r)).collect();
             let saved = members[..members.len().saturating_sub(1)]
                 .iter()
                 .filter(|m| roots.contains(&graph.class_of(**m)))
                 .count() as u64;
-            Picoseconds(total.0.saturating_sub(saved.saturating_mul(launch_ps)))
+            (
+                Picoseconds(time.0.saturating_sub(saved.saturating_mul(launch_ps))),
+                count,
+            )
         }
-        // Every member but the last is computed anyway — each is a root or
-        // another launch's input — so the group ties its last member's own
-        // spelling and wins on the launch count. Crediting the dispatches
-        // here would flow into every reader's bound.
-        // A member spelled worse than its class's best costs the group the
-        // difference: groups minted before the fused spellings existed
-        // carry the plain ones.
-        // Each other member is computed anyway — a root, or another
-        // launch's input — and the group is its dispatch cheaper. The
-        // credit reaches a root's readers as a uniform shift, which moves
-        // no choice of theirs.
         Op::Launch(Launch::Group { members, .. }) => {
             let last = members.last().copied().unwrap_or(id);
-            let mut total = lb[last.index()];
-            for m in &members[..members.len().saturating_sub(1)] {
-                let excess = lb[m.index()]
-                    .0
-                    .saturating_sub(lb[graph.class_of(*m).0.index()].0);
-                total = Picoseconds(total.0.saturating_add(excess));
+            let saved = members.len().saturating_sub(1);
+            let mut time = lb[last.index()];
+            let mut count = launches[last.index()].saturating_sub(saved as u32);
+            for m in &members[..saved] {
+                let class = graph.class_of(*m).0.index();
+                time = Picoseconds(
+                    time.0
+                        .saturating_add(lb[m.index()].0.saturating_sub(lb[class].0)),
+                );
+                count = count.saturating_add(launches[m.index()].saturating_sub(launches[class]));
             }
-            let saved = members.len().saturating_sub(1) as u64;
-            Picoseconds(total.0.saturating_sub(saved.saturating_mul(launch_ps)))
+            (
+                Picoseconds(
+                    time.0
+                        .saturating_sub((saved as u64).saturating_mul(launch_ps)),
+                ),
+                count,
+            )
         }
         _ => {
-            // Deduplicate children by class: a node reading the same class
-            // twice contributes once, which is what makes sharing free.
             let mut seen: SmallVec<[ClassId; 4]> = SmallVec::new();
-            // A logical node is computed by some launch too; without its
-            // dispatch every class's bound would run through its logical
-            // spelling and no fusion would ever look cheaper than none.
-            let dispatch = launch_ps;
-            let mut total = math[id.index()] + Picoseconds(dispatch);
+            let mut time = math[id.index()] + Picoseconds(launch_ps);
+            let mut count = 1u32;
             for child in node.children.iter() {
                 let class = graph.class_of(*child);
-                if seen.contains(&class) {
-                    continue;
+                if !seen.contains(&class) {
+                    seen.push(class);
+                    time += lb[class.0.index()];
+                    count = count.saturating_add(launches[class.0.index()]);
                 }
-                seen.push(class);
-                total += lb[class.0.index()];
             }
-            total
+            (time, count)
         }
     }
 }

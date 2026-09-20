@@ -51,7 +51,6 @@ pub static CORE_RULES: &[Rule] = &[
     fusion::MAP_INTO_CONTRACT,
     fusion::MAP_INTO_MAP,
     fusion::FOLD_POST_EPILOGUE,
-    fusion::FORM_KREGION,
     slab::FORM_SLAB_MAP,
     slab::FORM_SLAB_FOLD,
     // Launch fold algebra — the carrier laws. `HOIST` and `RETARGET` are two

@@ -13,7 +13,7 @@ use fusor_ir::shape::{Dim, SlidingWindow, StrideSpec};
 use fusor_ir::{Error, Result};
 use smallvec::SmallVec;
 
-use crate::composite::{MacroAttr, MacroOp, const_dim, index_run, macro_op};
+use crate::composite::{const_dim, core_op, index_run};
 use crate::tensor::Tensor;
 
 /// Zero-pad one axis by `left` before and `right` after.
@@ -178,31 +178,16 @@ pub fn grouped_conv(
         .map(|i| const_dim(wf.shape[2 + i], "conv kernel"))
         .collect::<Result<_>>()?;
 
-    // Padding happens before the macro node so the scatter's index leaf is an
-    // ordinary operand.
     let mut padded = x.clone();
     for (i, p) in padding.iter().enumerate() {
         padded = pad_with_zeros(&padded, (2 + i) as u32, *p as u64, *p as u64)?;
     }
 
-    let ops = {
-        let mut v = vec![padded.id, weight.id];
-        if let Some(b) = bias {
-            v.push(b.id);
-        }
-        v
-    };
-    let attrs = MacroAttr::Conv {
-        padding: padding.iter().copied().collect(),
-        stride: stride.iter().copied().collect(),
-        groups: groups as u32,
-        spatial: spatial as u32,
-    };
     let (xid, wid) = (padded.id, weight.id);
     let bid = bias.map(|b| b.id);
     let stride: SmallVec<[u32; 3]> = stride.iter().copied().collect();
 
-    macro_op(graph, MacroOp::Conv, attrs, &ops, move |t| {
+    core_op(graph, move |t| {
         conv_defn(t, xid, wid, bid, &kernel, &stride, spatial, groups, out_ch)
     })
 }

@@ -6,7 +6,7 @@ use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
 
 use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fuzz_case};
+use crate::harness::{CaseResult, Cases, FuzzDim, Rng, dims, fuzz_case};
 use crate::suite::support::{
     Domain, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss, read_scalar,
     upload,
@@ -668,7 +668,7 @@ async fn reduction_case(
 
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dimv, &data)?;
-    let y = op(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = op(&x)?;
 
     let actual = read(&y).await?;
     let expected: Vec<f32> = data.chunks(axis as usize).map(reference).collect();
@@ -677,7 +677,7 @@ async fn reduction_case(
     let analytic = gradient_of(&graph, &y, &x).await?;
     let probe_graph = graph_of(session);
     let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
-    let probe_y = op(&probe_x).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let probe_y = op(&probe_x)?;
     let probe_loss = loss_of(&probe_y)?;
     let numeric = finite_difference_gradient(&[rows as usize, axis as usize], &data, |p| {
         read_probe_loss(&probe_x, &probe_loss, p)
@@ -710,9 +710,7 @@ async fn sum_high_rank(session: &Session, shape: &[u64], seed: u32) -> CaseResul
     let x = upload(graph.handle(), &dimv, &data)?;
     // Axis 2 of 4: interior, so neither the innermost nor the outermost
     // special case covers it.
-    let y = x
-        .sum(2)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.sum(2)?;
 
     let actual = read(&y).await?;
     let mut expected = vec![0.0f32; b_n * c_n * w_n];
@@ -761,8 +759,7 @@ async fn extrema_tie_case(session: &Session, is_max: bool) -> CaseResult {
     let dimv = dims(&[3, 5]);
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dimv, &data)?;
-    let y = if is_max { x.max(1) } else { x.min(1) }
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = if is_max { x.max(1) } else { x.min(1) }?;
 
     let grad = gradient_of(&graph, &y, &x).await?;
     let expected: Vec<f32> = vec![
@@ -829,9 +826,7 @@ async fn product_zero_aware(session: &Session, shape: &[u64], seed: u32) -> Case
     let dimv = dims(shape);
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dimv, &data)?;
-    let y = x
-        .product(1)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.product(1)?;
     let grad = gradient_of(&graph, &y, &x).await?;
 
     let mut expected = vec![0.0f32; data.len()];
@@ -880,9 +875,7 @@ async fn fold_split_agrees(session: &Session, shape: &[u64], seed: u32) -> CaseR
 
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dimv, &data)?;
-    let y = x
-        .sum_all()
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.sum_all()?;
     let actual = read_scalar(&y).await?;
 
     // f64-accumulated reference: a split fold and an unsplit one must both

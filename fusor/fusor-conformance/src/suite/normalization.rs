@@ -274,15 +274,9 @@ async fn layer_norm_sum_gradient_is_zero(
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(&[rows, width]), &data)?;
     let w = upload(graph.handle(), &dims(&[width]), &weight)?;
-    let y = x
-        .layer_norm(&w, None, 1e-5, true)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let loss = y
-        .sum_all()
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let grads = graph
-        .backward_with(&loss, std::slice::from_ref(&x))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.layer_norm(&w, None, 1e-5, true)?;
+    let loss = y.sum_all()?;
+    let grads = graph.backward_with(&loss, std::slice::from_ref(&x))?;
     let dx = grads
         .get(&x)
         .ok_or_else(|| -> CaseError { "no gradient reached x".into() })?;
@@ -323,8 +317,7 @@ async fn row_case(
     let analytic = gradient_of(&graph, &y, &x).await?;
     let probe_graph = graph_of(session);
     let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
-    let probe_y =
-        build(&probe_x, width as u64).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let probe_y = build(&probe_x, width as u64)?;
     let probe_loss = loss_of(&probe_y)?;
     let numeric = finite_difference_gradient(&[rows, width], &data, |probe| {
         read_probe_loss(&probe_x, &probe_loss, probe)
@@ -375,8 +368,7 @@ async fn weighted_case(
     let probe_b = with_bias
         .then(|| upload(probe_graph.handle(), &wdim, &bias))
         .transpose()?;
-    let probe_y = build(&probe_x, &probe_w, probe_b.as_ref())
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let probe_y = build(&probe_x, &probe_w, probe_b.as_ref())?;
     let probe_loss = loss_of(&probe_y)?;
     let numeric = finite_difference_gradient(&[rows, width], &data, |probe| {
         read_probe_loss(&probe_x, &probe_loss, probe)
@@ -422,9 +414,7 @@ async fn residual_case(session: &Session, shape: &[u64], seed: u32) -> CaseResul
     let x = upload(graph.handle(), &dimv, &data)?;
     let r = upload(graph.handle(), &dimv, &residual)?;
     let w = upload(graph.handle(), &wdim, &weight)?;
-    let y = x
-        .rms_norm_residual(&r, &w, None, EPS)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.rms_norm_residual(&r, &w, None, EPS)?;
 
     let summed: Vec<f32> = data.iter().zip(&residual).map(|(a, b)| a + b).collect();
     let expected = affine(&by_row(&summed, width, host_rms), &weight, None);
@@ -450,9 +440,7 @@ async fn variance_case(session: &Session, shape: &[u64], seed: u32) -> CaseResul
     let dimv = dims(shape);
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dimv, &data)?;
-    let y = x
-        .variance_last()
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.variance_last()?;
 
     let expected: Vec<f32> = data
         .chunks(width)
@@ -473,9 +461,7 @@ async fn variance_case(session: &Session, shape: &[u64], seed: u32) -> CaseResul
     let analytic = gradient_of(&graph, &y, &x).await?;
     let probe_graph = graph_of(session);
     let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
-    let probe_y = probe_x
-        .variance_last()
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let probe_y = probe_x.variance_last()?;
     let probe_loss = loss_of(&probe_y)?;
     let numeric = finite_difference_gradient(&[rows, width], &data, |probe| {
         read_probe_loss(&probe_x, &probe_loss, probe)
@@ -493,9 +479,7 @@ async fn rows_sum_to_one(session: &Session, shape: &[u64], seed: u32) -> CaseRes
     let data = Domain::Custom(-4.0, 4.0).sample(seed, rows * width);
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let p = x
-        .softmax_last_dim()
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let p = x.softmax_last_dim()?;
     let got = read(&p).await?;
     for (r, row) in got.chunks(width).enumerate() {
         let sum: f32 = row.iter().sum();
@@ -518,12 +502,8 @@ async fn shift_invariance(session: &Session, shape: &[u64], seed: u32) -> CaseRe
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dims(shape), &data)?;
     let b = upload(graph.handle(), &dims(shape), &shifted)?;
-    let pa = a
-        .softmax_last_dim()
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let pb = b
-        .softmax_last_dim()
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let pa = a.softmax_last_dim()?;
+    let pb = b.softmax_last_dim()?;
     let (va, vb) = (read(&pa).await?, read(&pb).await?);
     if vb.iter().any(|v| !v.is_finite()) {
         return Err("softmax overflowed on a +60 shift: the max fold was elided".into());
@@ -550,7 +530,7 @@ async fn softmax_backward(session: &Session, shape: &[u64], seed: u32) -> CaseRe
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dimv, &data)?;
     let w = upload(graph.handle(), &dimv, &weights)?;
-    let y = build(&x, &w).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = build(&x, &w)?;
     let analytic = gradient_of(&graph, &y, &x).await?;
 
     // Host Jacobian-vector product, row by row.
@@ -588,17 +568,11 @@ async fn welford_carrier(session: &Session, shape: &[u64], seed: u32) -> CaseRes
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
 
-    let welford = x
-        .variance_last()
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let naive = x
-        .sqr()
-        .and_then(|s| s.mean(1))
-        .and_then(|ms| {
-            let m = x.mean(1)?;
-            ms.sub(&m.sqr()?)
-        })
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let welford = x.variance_last()?;
+    let naive = x.sqr().and_then(|s| s.mean(1)).and_then(|ms| {
+        let m = x.mean(1)?;
+        ms.sub(&m.sqr()?)
+    })?;
 
     let (a, b) = (read(&welford).await?, read(&naive).await?);
     // The naive form loses precision at mean ~10.5, so the bar is relative to

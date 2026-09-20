@@ -1,5 +1,5 @@
 //! [`CoreSemantics`]: the single [`Semantics`] implementation covering the
-//! closed `Logical`/`Launch` enums plus the open [`OpDefRegistry`]. Total inference,
+//! closed `Logical`/`Launch` enums. Total inference,
 //! work rows, effects and the two level verifiers hang off this type.
 
 pub mod children;
@@ -7,13 +7,12 @@ pub mod infer_launch;
 pub mod infer_logical;
 pub mod work;
 
-use crate::device::Caps;
 use crate::error::{Error, Result};
 use crate::facts::{ValueFacts, Work};
 use crate::ir::kernel::ArenaPlanner;
 use crate::ir::launch::{BufferRole, Effect, Launch, ScatterMode};
 use crate::ir::logical::ScatterCombine;
-use crate::ir::{Children, Level, Op, OpDefRegistry, Semantics, VerifyCtx};
+use crate::ir::{Children, Level, Op, Semantics, VerifyCtx};
 use std::sync::Arc;
 
 /// The core semantics. Holds the [`ArenaPlanner`] because `verify_launch` admits
@@ -22,7 +21,6 @@ use std::sync::Arc;
 /// admission mismatch.
 pub struct CoreSemantics {
     planner: Arc<dyn ArenaPlanner>,
-    registry: OpDefRegistry,
 }
 
 impl CoreSemantics {
@@ -30,26 +28,11 @@ impl CoreSemantics {
     /// Returns `Arc<dyn Semantics>`: the e-graph only ever holds the trait object.
     #[allow(clippy::new_ret_no_self)]
     pub fn new(planner: Arc<dyn ArenaPlanner>) -> Arc<dyn Semantics> {
-        Arc::new(Self {
-            planner,
-            registry: OpDefRegistry::new(),
-        })
-    }
-
-    /// Same, with a pre-populated extension registry.
-    pub fn with_registry(
-        planner: Arc<dyn ArenaPlanner>,
-        registry: OpDefRegistry,
-    ) -> Arc<dyn Semantics> {
-        Arc::new(Self { planner, registry })
+        Arc::new(Self { planner })
     }
 
     pub fn planner(&self) -> &Arc<dyn ArenaPlanner> {
         &self.planner
-    }
-
-    pub fn registry(&self) -> &OpDefRegistry {
-        &self.registry
     }
 }
 
@@ -61,7 +44,7 @@ impl Semantics for CoreSemantics {
     fn infer(&self, op: &Op, ins: &[ValueFacts]) -> Result<ValueFacts> {
         match op {
             Op::Logical(o) => infer_logical::infer_logical(o, ins),
-            Op::Launch(o) => infer_launch::infer_launch_with(o, ins, &self.registry),
+            Op::Launch(o) => infer_launch::infer_launch(o, ins),
             // A union stands for alternatives that infer identically by
             // construction; pass the first through.
             Op::Union(..) => ins
@@ -72,7 +55,7 @@ impl Semantics for CoreSemantics {
     }
 
     fn work(&self, op: &Op, ins: &[ValueFacts], out: &ValueFacts) -> Work {
-        work::work_of_with(op, ins, out, &self.registry)
+        work::work_of(op, ins, out)
     }
 
     fn verify(&self, cx: &VerifyCtx<'_>) -> Result<()> {
@@ -114,53 +97,4 @@ pub fn effect_of(op: &Op) -> Effect {
 /// defaults to `Logical`.
 pub fn level_of(op: &Op) -> Level {
     op.level().unwrap_or(Level::Logical)
-}
-
-/// A trivially-correct [`ArenaPlanner`] for callers that need a
-/// [`CoreSemantics`] before `fusor-tile`'s planner exists — notably
-/// `fusor-ir`'s own tests and the CPU target, which has no workgroup memory
-/// at all, so the exact footprint of any tile set really is the sum of its
-/// declared bytes.
-pub struct SumArenaPlanner;
-
-impl ArenaPlanner for SumArenaPlanner {
-    fn arena_plan(
-        &self,
-        _ir: &crate::ir::kernel::KernelIr,
-        _caps: &Caps,
-    ) -> Result<crate::ir::kernel::ArenaPlan> {
-        Ok(crate::ir::kernel::ArenaPlan {
-            mode: crate::ir::kernel::ArenaMode::Regions,
-            total_bytes: 0,
-            placements: Default::default(),
-            barriers_inserted: Default::default(),
-        })
-    }
-
-    fn workgroup_bytes(&self, tiles: &crate::ir::kernel::Tiles, _caps: &Caps) -> Result<u32> {
-        Ok(tiles
-            .decls
-            .iter()
-            .map(|t| (t.layout.element_count() * t.element.byte_size()) as u32)
-            .sum())
-    }
-
-    fn barrier_suggestions(
-        &self,
-        _ir: &crate::ir::kernel::KernelIr,
-    ) -> Vec<crate::ir::kernel::BarrierSuggestion> {
-        Vec::new()
-    }
-
-    fn verify_arena(
-        &self,
-        _ir: &crate::ir::kernel::KernelIr,
-        _plan: &crate::ir::kernel::ArenaPlan,
-    ) -> Result<()> {
-        Ok(())
-    }
-
-    fn verify_uniformity(&self, _ir: &crate::ir::kernel::KernelIr) -> Result<()> {
-        Ok(())
-    }
 }

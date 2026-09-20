@@ -21,10 +21,9 @@ use fusor_ir::dtype::Persistence;
 use fusor_ir::egraph::{ClassId, EGraph, Id, Rule, Saturate, SaturationBudget, SaturationDelta};
 use fusor_ir::extract::{ExtractBudget, Extractor, Plan, ReplayKey};
 use fusor_ir::ir::launch::Effect;
-use fusor_ir::ir::launch::Launch;
 use fusor_ir::ir::logical::BufferId;
 use fusor_ir::ir::logical::{LeafKind, Logical};
-use fusor_ir::ir::{Level, Op, OpDefRegistry, Semantics};
+use fusor_ir::ir::{Level, Op, Semantics};
 use fusor_ir::saturate::Driver;
 use fusor_ir::shape::{Dim, Layout, SymId};
 #[cfg(feature = "cpu")]
@@ -33,7 +32,6 @@ use fusor_ir::target::{Buf, Target};
 use fusor_tile::{Planner, SCHED_RULES};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::composite::register_macro_ops;
 use crate::graph::GraphRef;
 use crate::graph::WeakGraphRef;
 use crate::tensor::Tensor;
@@ -377,37 +375,23 @@ struct Twin {
     leaves: Vec<(Id, usize)>,
 }
 
-/// `layout` with every symbol replaced by its binding. A derived stride
-/// (the row-major sentinel) is recomputed from the concrete shape.
+/// Resolve symbolic extents and strides without changing the physical layout.
 fn concrete_layout(layout: &Layout, bindings: &FxHashMap<SymId, u64>) -> Result<Layout> {
-    let value = |d: Dim| -> Result<Dim> {
-        match d {
-            Dim::Sym(s) => bindings.get(&s).map(|v| Dim::Const(*v)).ok_or_else(|| {
-                Error::Plan(format!(
-                    "shape family output layout mentions unbound symbol {s}"
-                ))
-            }),
-            c => Ok(c),
-        }
+    let value = |d: Dim| {
+        d.evaluate(&mut |s| bindings.get(&s).copied())
+            .map(Dim::Const)
+            .ok_or_else(|| Error::Plan(format!("unbound layout dimension {d}")))
     };
-    let shape: Vec<Dim> = layout
+    let shape = layout
         .shape()
         .iter()
         .map(|d| value(*d))
-        .collect::<Result<_>>()?;
-    if layout.is_contiguous() {
-        return Ok(Layout::contiguous(&shape));
-    }
-    let row_major = Layout::row_major_strides(&shape);
-    let strides: Vec<Dim> = layout
+        .collect::<Result<Vec<_>>>()?;
+    let strides = layout
         .strides()
         .iter()
-        .enumerate()
-        .map(|(axis, d)| match d {
-            Dim::Sym(s) if s.0 == u32::MAX => Ok(row_major[axis]),
-            d => value(*d),
-        })
-        .collect::<Result<_>>()?;
+        .map(|d| value(*d))
+        .collect::<Result<Vec<_>>>()?;
     Layout::from_parts(value(layout.offset())?, &shape, &strides)
 }
 
@@ -421,8 +405,7 @@ fn slot_dim(slot: usize) -> Dim {
 
 fn slot_of(d: Dim) -> Option<usize> {
     match d {
-        // `SymId(u32::MAX)` is `Layout::row_major_strides`' derived-stride
-        // sentinel, not a slot.
+        // The opaque-dimension sentinel is not a family slot.
         Dim::Sym(s) if s.0 >= FAMILY_SLOT_BASE && s.0 != u32::MAX => {
             Some((s.0 - FAMILY_SLOT_BASE) as usize)
         }
@@ -442,19 +425,13 @@ impl Session {
         let planner = Planner::shared();
         let device_fingerprint = device.caps().fingerprint();
 
-        // The one registration point. Ids follow table order because
-        // `PlanHash` reads registration order.
-        let mut registry = OpDefRegistry::new();
-        register_macro_ops(&mut registry);
-
-        let semantics =
-            fusor_ir::CoreSemantics::with_registry(Arc::clone(&planner), registry.clone());
+        let semantics = fusor_ir::CoreSemantics::new(Arc::clone(&planner));
         let target = device.target();
         let cost: Arc<dyn CostModel> = Arc::new(Roofline::new(target.facts().clone()));
-        let extractor: Arc<dyn Extractor> = Arc::new(
-            LocalSearch::new(Arc::clone(&planner), target.caps().clone())
-                .with_registry(registry.clone()),
-        );
+        let extractor: Arc<dyn Extractor> = Arc::new(LocalSearch::new(
+            Arc::clone(&planner),
+            target.caps().clone(),
+        ));
 
         // Rule order carries no semantics; the fixed order exists only for
         // reproducibility.
@@ -1343,37 +1320,11 @@ impl Session {
         // bookkeeping only, and the download blocks on the device regardless.
         self.inner.in_flight.store(0, Ordering::Relaxed);
 
-        // A selected `Coop`/`Sgemm` geometry pads the output buffer to its
-        // tile multiple, so the bytes on the device are not the value's own
-        // dense shape. Read the whole padded buffer and gather the value out
-        // of it; a dense layout takes the straight path.
-        //
-        // The registered layout is stated against the selected member's
-        // shape, and the id being read may be a reshaped spelling of the same
-        // class, so the layout is restated over the reader's shape
-        // (`restate_layout`) — never dropped, because a dense read of a
-        // padded buffer returns padding zeros as if they were the value.
-        // Padding lives in the strides, never in the shape: a padded buffer
-        // is detected by its strides departing from the row-major set or a
-        // nonzero offset, not by its shape.
+        // The registered layout retains the value's logical axes; padding is
+        // represented by its strides and is gathered only at readback.
         let padded = graph
             .device_layout(id)
-            .filter(|l| {
-                l.shape() != &facts.shape[..]
-                    || !l.offset().known_eq(fusor_ir::shape::Dim::Const(0))
-                    || l.strides() != &fusor_ir::shape::Layout::row_major_strides(l.shape())[..]
-            })
-            .map(|l| {
-                restate_layout(&l, &facts.shape, graph).ok_or_else(|| {
-                    Error::Plan(format!(
-                        "value {id} is shaped {:?} over a device buffer laid out {:?}; \
-                         the shapes do not factor",
-                        facts.shape,
-                        l.shape()
-                    ))
-                })
-            })
-            .transpose()?;
+            .filter(|layout| !layout.is_contiguous());
         let Some(layout) = padded else {
             let elements = resolve_elements(&facts.shape, graph)?;
             return Ok(ReadPlan {
@@ -1386,7 +1337,7 @@ impl Session {
         let base = resolve_dim(layout.offset(), graph)?;
         let strides: Vec<u64> = resolve_strides(&layout, graph)?;
         // The bytes to pull are the layout's address span, not its element
-        // count: a restated layout addresses far past `product(shape)`, and a
+        // count: a padded layout addresses past `product(shape)`, and a
         // short download gathers zeros for everything past its end.
         let mut span = 1u64;
         for (d, s) in layout.shape().iter().zip(&strides) {
@@ -1471,11 +1422,7 @@ impl Session {
     /// Register `buf` under every id in `id`'s e-class, `Union` spine
     /// included.
     ///
-    /// The class — not the member — is the stable identity of a value: which
-    /// member wins is an artifact of one extraction that a later resolve may
-    /// change. `macro_op` hands the caller a `Union` spine node, so binding
-    /// only the selectable members would leave every sugared spelling
-    /// unreadable.
+    /// A handle may name any member, including a union created by a rewrite.
     fn bind_class(
         &self,
         graph: &GraphRef,
@@ -1578,7 +1525,7 @@ impl Session {
             if !wanted.contains(&buffer.value) && !in_place_roots.contains(&buffer.value) {
                 continue;
             }
-            let elements = resolve_buffer_elements(buffer.elements, &buffer.layout, graph)?;
+            let elements = resolve_dim(buffer.elements, graph)?;
             let bytes = (elements * buffer.dtype.byte_size()).max(4);
             #[cfg(feature = "cpu")]
             if self.inner.device.is_cpu()
@@ -1685,7 +1632,7 @@ impl Session {
             if supplied.contains_key(&buffer.value) {
                 continue;
             }
-            let elements = resolve_buffer_elements(buffer.elements, &buffer.layout, graph)?;
+            let elements = resolve_dim(buffer.elements, graph)?;
             let bytes = (elements * buffer.dtype.byte_size()).max(4);
             if let Some(existing) = graph.device_buf(buffer.value)
                 && existing
@@ -2341,30 +2288,6 @@ fn rebuild_op(op: &Op, children: &[Id], dims: &mut dyn FnMut(Dim) -> Dim) -> Opt
             slot: *slot,
             x: child(0)?,
         }),
-        Op::Launch(Launch::Ext { def, ops, attrs }) => {
-            let mut ops = ops.clone();
-            if ops.len() != children.len() {
-                return None;
-            }
-            for (operand, child) in ops.iter_mut().zip(children) {
-                operand.src = *child;
-                let layout = &operand.layout;
-                let shape: Vec<Dim> = layout.shape().iter().map(|d| dims(*d)).collect();
-                // A contiguous operand keeps its strides derived from its
-                // shape, the spelling the IR uses for symbolic extents.
-                operand.layout = if layout.is_contiguous() {
-                    Layout::contiguous(&shape)
-                } else {
-                    let strides: Vec<Dim> = layout.strides().iter().map(|d| dims(*d)).collect();
-                    Layout::from_parts(dims(layout.offset()), &shape, &strides).ok()?
-                };
-            }
-            Op::Launch(Launch::Ext {
-                def: *def,
-                ops,
-                attrs: *attrs,
-            })
-        }
         Op::Union(..) => Op::Union(child(0)?, child(1)?),
         Op::Launch(_) => return None,
     })
@@ -2837,23 +2760,6 @@ impl Gather {
     }
 }
 
-/// Restate a device buffer layout over a reader's shape.
-///
-/// The layout is stated against the selected member's own shape — a contract
-/// says `[batch, m_pad, n_pad]` — while the reader may hold a reshaped
-/// spelling of the same value, `[b, h, q, d]`. Same bytes, different
-/// coordinates. Each layout axis is either
-///
-/// - **unpadded** (a run of reader dims multiplies to exactly its extent):
-///   the run splits it row-major, so `[b, h]` over an extent-`b*h` batch axis
-///   takes strides `[s*h, s]`; or
-/// - **padded** (no run can reach the extent): the one next reader dim maps
-///   alone at the axis's stride and reads the unpadded prefix, which is what
-///   `m = 3` inside `m_pad = 16` means.
-///
-/// `None` when the shapes do not factor this way — the caller turns that
-/// into an error rather than a dense read, because reading a padded buffer
-/// densely returns padding as data.
 /// Whether `id`'s bound device buffer holds its value densely.
 ///
 /// A `Coop` output is padded to whole blocks, and the padding lives in the
@@ -2869,180 +2775,18 @@ fn dense_bound(graph: &GraphRef, id: Id) -> bool {
         && layout.strides() == &fusor_ir::shape::Layout::row_major_strides(layout.shape())[..]
 }
 
-fn restate_layout(
-    layout: &fusor_ir::shape::Layout,
-    shape: &[Dim],
-    graph: &GraphRef,
-) -> Option<fusor_ir::shape::Layout> {
-    if layout.shape() == shape {
-        return Some(layout.clone());
-    }
-    let l_ext: Vec<u64> = layout
-        .shape()
-        .iter()
-        .map(|d| resolve_dim(*d, graph).ok())
-        .collect::<Option<_>>()?;
-    let l_str: Vec<u64> = layout
-        .strides()
-        .iter()
-        .map(|d| resolve_dim(*d, graph).ok())
-        .collect::<Option<_>>()?;
-    let r_ext: Vec<u64> = shape
-        .iter()
-        .map(|d| resolve_dim(*d, graph).ok())
-        .collect::<Option<_>>()?;
-
-    // Backtracking assignment. An exact run and a padded singleton can both
-    // look viable locally — `[2, 2, 4, 4]` over `[4, 16, 16]` has `4 * 4`
-    // exactly filling the padded 16 — and only the remainder decides which
-    // reading was right, so a greedy walk mis-factors exactly the shapes a
-    // backward pass produces.
-    fn assign(l_ext: &[u64], l_str: &[u64], r_ext: &[u64], strides: &mut Vec<u64>) -> bool {
-        let Some((&ext, l_rest)) = l_ext.split_first() else {
-            // Layout exhausted: only unit reader dims may remain.
-            if r_ext.iter().all(|&e| e == 1) {
-                strides.extend(std::iter::repeat_n(0, r_ext.len()));
-                return true;
-            }
-            return false;
-        };
-        let (&stride, s_rest) = l_str.split_first().expect("shapes and strides zip");
-        if ext == 1 {
-            return assign(l_rest, s_rest, r_ext, strides);
-        }
-        // Exact runs first — every prefix of reader dims whose product is
-        // the extent — longest first so a `[a, b]` split is preferred over
-        // treating the axis as padded when both parse.
-        let mut prod = 1u64;
-        let mut end = 0usize;
-        while prod < ext && end < r_ext.len() {
-            prod = prod.saturating_mul(r_ext[end]);
-            end += 1;
-        }
-        if prod == ext {
-            let mark = strides.len();
-            let mut inner = stride;
-            let mut group = vec![0u64; end];
-            for j in (0..end).rev() {
-                group[j] = inner;
-                inner = inner.saturating_mul(r_ext[j]);
-            }
-            strides.extend_from_slice(&group);
-            if assign(l_rest, s_rest, &r_ext[end..], strides) {
-                return true;
-            }
-            strides.truncate(mark);
-        }
-        // Padded run: one or more reader dims whose product fits inside the
-        // extent, laid out row-major over the value's own extents and reading
-        // the unpadded prefix. Shortest run first; longer runs are only
-        // reached once the singleton reading has failed the remainder.
-        //
-        // A padded axis holds exactly one logical axis, so the run may
-        // contain at most one non-unit reader dim: a second real axis nested
-        // inside the padded one would read the padding between the logical
-        // extent and the block edge as data.
-        let mut prod = 1u64;
-        let mut non_unit = 0usize;
-        for take in 1..=r_ext.len() {
-            prod = prod.saturating_mul(r_ext[take - 1]);
-            if prod > ext {
-                break;
-            }
-            if r_ext[take - 1] != 1 {
-                non_unit += 1;
-                if non_unit > 1 {
-                    break;
-                }
-            }
-            let mark = strides.len();
-            let mut inner = stride;
-            let mut group = vec![0u64; take];
-            for j in (0..take).rev() {
-                group[j] = inner;
-                inner = inner.saturating_mul(r_ext[j]);
-            }
-            strides.extend_from_slice(&group);
-            if assign(l_rest, s_rest, &r_ext[take..], strides) {
-                return true;
-            }
-            strides.truncate(mark);
-        }
-        false
-    }
-
-    let mut strides: Vec<u64> = Vec::with_capacity(r_ext.len());
-    if !assign(&l_ext, &l_str, &r_ext, &mut strides) {
-        return None;
-    }
-    // The padded parse is ambiguous in principle (only the producer knows its
-    // logical extents), so this records which parse won.
-    if std::env::var_os("FUSOR_RESTATE_LOG").is_some() {
-        eprintln!("[restate] layout={l_ext:?}/{l_str:?} reader={r_ext:?} -> strides={strides:?}");
-    }
-    fusor_ir::shape::Layout::from_parts(
-        layout.offset(),
-        shape,
-        &strides.iter().map(|&s| Dim::Const(s)).collect::<Vec<_>>(),
-    )
-    .ok()
-}
-
 fn resolve_dim(d: Dim, graph: &GraphRef) -> Result<u64> {
     // A derived symbol evaluates through the symbols its expression reaches.
     d.evaluate(&mut |s| graph.dim_binding(s))
         .ok_or_else(|| Error::Plan(format!("dim {d} is unbound at dispatch")))
 }
 
-/// The `row_major_strides` placeholder (`SymId(u32::MAX)`): a stride past a
-/// symbolic axis, derived at dispatch as the product of the following
-/// extents. Mirrors `UniformPack::resolve_stride`.
-const DERIVED_STRIDE: fusor_ir::shape::SymId = fusor_ir::shape::SymId(u32::MAX);
-
-/// Concrete strides of a layout at the current binding, deriving any
-/// placeholder from the (now concrete) shape.
 fn resolve_strides(layout: &fusor_ir::shape::Layout, graph: &GraphRef) -> Result<Vec<u64>> {
-    let shape = layout.shape();
     layout
         .strides()
         .iter()
-        .enumerate()
-        .map(|(axis, d)| match d {
-            Dim::Sym(s) if *s == DERIVED_STRIDE => {
-                let mut acc = 1u64;
-                for e in &shape[axis + 1..] {
-                    acc = acc.saturating_mul(resolve_dim(*e, graph)?);
-                }
-                Ok(acc)
-            }
-            other => resolve_dim(*other, graph),
-        })
+        .map(|d| resolve_dim(*d, graph))
         .collect()
-}
-
-/// A buffer's element count at the current binding. `BufferPlan::elements`
-/// is the placeholder whenever any extent is symbolic; the layout's shape is
-/// the authority then.
-fn resolve_buffer_elements(
-    elements: Dim,
-    layout: &fusor_ir::shape::Layout,
-    graph: &GraphRef,
-) -> Result<u64> {
-    match elements {
-        Dim::Sym(s) if s == DERIVED_STRIDE => {
-            // Padding lives in the strides: for the plan's row-major layouts
-            // the buffer extent is `shape[0] * strides[0]`, never the shape
-            // product, which undercounts a padded buffer.
-            let Some(first) = layout.shape().first() else {
-                return Ok(1);
-            };
-            let strides = resolve_strides(layout, graph)?;
-            Ok(resolve_dim(*first, graph)?
-                .saturating_mul(strides[0])
-                .max(1))
-        }
-        d => resolve_dim(d, graph),
-    }
 }
 
 fn resolve_elements(shape: &[Dim], graph: &GraphRef) -> Result<u64> {
@@ -3225,13 +2969,7 @@ mod tests {
 
     /// The smallest moving-offset view: a fresh `[len, D]` leaf narrowed at
     /// row `step`. The twin's view offset is a derived symbol.
-    #[test]
-    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-    fn a_shape_family_twin_reads_a_view_at_a_symbolic_offset() {
-        let Ok(backend) = Backend::gpu_blocking() else {
-            return;
-        };
-        let session = Session::new(backend).unwrap();
+    fn shape_family_symbolic_offset(session: Session) {
         let graph = Graph::new(&session);
         let h = graph.handle();
         const D: usize = 4;
@@ -3245,6 +2983,30 @@ mod tests {
             let got: Vec<f32> = bytemuck::cast_slice(&h.read_back(tail.id).unwrap()).to_vec();
             assert_eq!(got, host[step * D..(step + 1) * D], "step {step}");
         }
+        assert!(
+            session
+                .inner
+                .families
+                .lock()
+                .values()
+                .any(|family| family.symbolic.is_some() && !family.blocked),
+            "symbolic offsets must execute without falling back to concrete plans"
+        );
+    }
+
+    #[test]
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    fn a_shape_family_twin_reads_a_view_at_a_symbolic_offset() {
+        let Ok(backend) = Backend::gpu_blocking() else {
+            return;
+        };
+        shape_family_symbolic_offset(Session::new(backend).unwrap());
+    }
+
+    #[test]
+    #[cfg(feature = "cpu")]
+    fn a_shape_family_twin_reads_a_cpu_view_at_a_symbolic_offset() {
+        shape_family_symbolic_offset(Session::new(Backend::cpu().unwrap()).unwrap());
     }
 
     #[test]

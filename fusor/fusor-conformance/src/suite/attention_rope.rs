@@ -230,7 +230,7 @@ fn causal_mask(lq: usize, lk: usize, i: usize, j: usize) -> f32 {
     }
 }
 
-/// Host `(dq, dk, dv)` for unmasked attention at `heads_kv == H`.
+/// Host `(dq, dk, dv)` at `heads_kv == H`.
 fn host_attention_grads(
     q: &[f32],
     k: &[f32],
@@ -238,6 +238,7 @@ fn host_attention_grads(
     g: &[f32],
     d: AttnDims,
     scale: f32,
+    causal: bool,
 ) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
     let AttnDims {
         b: bs,
@@ -257,7 +258,12 @@ fn host_attention_grads(
                 let mut p = vec![0.0f32; lk];
                 for (j, s) in p.iter_mut().enumerate() {
                     let kb = ((b * hs + h) * lk + j) * dh;
-                    *s = (0..dh).map(|x| q[qb + x] * k[kb + x]).sum::<f32>() * scale;
+                    *s = (0..dh).map(|x| q[qb + x] * k[kb + x]).sum::<f32>() * scale
+                        + if causal {
+                            causal_mask(lq, lk, i, j)
+                        } else {
+                            0.0
+                        };
                 }
                 let max = p.iter().copied().fold(f32::NEG_INFINITY, f32::max);
                 let mut sum = 0.0f32;
@@ -512,14 +518,23 @@ pub fn cases() -> Cases {
             with_lse_case(s, dense_dims(shape), seed).await
         },
     ));
-    cases.push_case(fuzz_case(
-        "attention_rope",
-        "attention_grads",
-        GRADS_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            grads_case(s, dense_dims(shape), seed).await
-        },
-    ));
+    for (name, mask) in [
+        ("attention_grads", MaskKind::None),
+        ("attention_grads_causal", MaskKind::Causal),
+    ] {
+        cases.push_case(fuzz_case(
+            "attention_rope",
+            name,
+            GRADS_SPEC,
+            async move |s: &Session, shape: &[u64], seed: u32| {
+                let mut d = dense_dims(shape);
+                if matches!(mask, MaskKind::Causal) {
+                    d.lk = d.lk.max(d.lq);
+                }
+                grads_case(s, d, seed, mask).await
+            },
+        ));
+    }
     cases.push(
         "attention_rope",
         "attention_grads_refuse_grouped_heads",
@@ -748,8 +763,7 @@ async fn attention_scale_case(session: &Session, d: AttnDims, seed: u32) -> Case
     let q = upload(graph.handle(), &dims(&d.q_shape()), &q_data)?;
     let k = upload(graph.handle(), &dims(&d.kv_shape()), &k_data)?;
     let v = upload(graph.handle(), &dims(&d.kv_shape()), &v_data)?;
-    let o = attention(&q, &k, &v, MaskKind::None, Some(SCALE))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let o = attention(&q, &k, &v, MaskKind::None, Some(SCALE))?;
 
     let (expected, _) = host_attention(&q_data, &k_data, &v_data, d, SCALE, &no_mask);
     expect_values(
@@ -782,8 +796,7 @@ async fn qk_mask_case(session: &Session, d: AttnDims, seed: u32) -> CaseResult {
     let k = upload(graph.handle(), &dims(&d.kv_shape()), &k_data)?;
     let v = upload(graph.handle(), &dims(&d.kv_shape()), &v_data)?;
     let m = upload(graph.handle(), &dims(&[d.lq as u64, d.lk as u64]), &mask)?;
-    let o = attention_masked(&q, &k, &v, MaskKind::QkMask, Some(&m), None)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let o = attention_masked(&q, &k, &v, MaskKind::QkMask, Some(&m), None)?;
 
     let (expected, _) = host_attention(&q_data, &k_data, &v_data, d, d.default_scale(), &|i, j| {
         mask[i * d.lk + j]
@@ -834,8 +847,7 @@ async fn lse_case(session: &Session, d: AttnDims, seed: u32) -> CaseResult {
     let graph = graph_of(session);
     let q = upload(graph.handle(), &dims(&d.q_shape()), &q_data)?;
     let k = upload(graph.handle(), &dims(&d.kv_shape()), &k_data)?;
-    let lse = attention_lse(&q, &k, MaskKind::None, None, None)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let lse = attention_lse(&q, &k, MaskKind::None, None, None)?;
 
     // v is unused by lse; zeros keep the host helper's shapes honest.
     let v_data = vec![0.0f32; d.kv_len()];
@@ -860,8 +872,7 @@ async fn with_lse_case(session: &Session, d: AttnDims, seed: u32) -> CaseResult 
     let q = upload(graph.handle(), &dims(&d.q_shape()), &q_data)?;
     let k = upload(graph.handle(), &dims(&d.kv_shape()), &k_data)?;
     let v = upload(graph.handle(), &dims(&d.kv_shape()), &v_data)?;
-    let (o, lse) = attention_with_lse(&q, &k, &v, MaskKind::None, None)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let (o, lse) = attention_with_lse(&q, &k, &v, MaskKind::None, None)?;
 
     let (want_o, want_lse) =
         host_attention(&q_data, &k_data, &v_data, d, d.default_scale(), &no_mask);
@@ -882,7 +893,7 @@ async fn with_lse_case(session: &Session, d: AttnDims, seed: u32) -> CaseResult 
 /// dk and dv are halves of one `[B, H, 2*Lk, Dh]` buffer handed back as
 /// zero-cost views, so the element counts prove the halves were sliced the
 /// right way round and the values prove they were not swapped.
-async fn grads_case(session: &Session, d: AttnDims, seed: u32) -> CaseResult {
+async fn grads_case(session: &Session, d: AttnDims, seed: u32, mask: MaskKind) -> CaseResult {
     let q_data = Domain::Wide.sample(seed, d.q_len());
     let k_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, d.kv_len());
     let v_data = Domain::Wide.sample(seed.wrapping_add(1), d.kv_len());
@@ -893,13 +904,18 @@ async fn grads_case(session: &Session, d: AttnDims, seed: u32) -> CaseResult {
     let k = upload(graph.handle(), &dims(&d.kv_shape()), &k_data)?;
     let v = upload(graph.handle(), &dims(&d.kv_shape()), &v_data)?;
     let g = upload(graph.handle(), &dims(&d.q_shape()), &g_data)?;
-    let (o, lse) = attention_with_lse(&q, &k, &v, MaskKind::None, None)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let (dq, dk, dv) = attention_grads(&q, &k, &v, &o, &g, &lse, MaskKind::None, None)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let (o, lse) = attention_with_lse(&q, &k, &v, mask, None)?;
+    let (dq, dk, dv) = attention_grads(&q, &k, &v, &o, &g, &lse, mask, None)?;
 
-    let (want_dq, want_dk, want_dv) =
-        host_attention_grads(&q_data, &k_data, &v_data, &g_data, d, d.default_scale());
+    let (want_dq, want_dk, want_dv) = host_attention_grads(
+        &q_data,
+        &k_data,
+        &v_data,
+        &g_data,
+        d,
+        d.default_scale(),
+        matches!(mask, MaskKind::Causal),
+    );
     expect_values(
         session,
         &d.q_shape(),
@@ -983,11 +999,17 @@ async fn attention_backward(session: &Session, d: AttnDims, seed: u32) -> CaseRe
     let q = upload(graph.handle(), &dims(&d.q_shape()), &q_data)?;
     let k = upload(graph.handle(), &dims(&d.kv_shape()), &k_data)?;
     let v = upload(graph.handle(), &dims(&d.kv_shape()), &v_data)?;
-    let o = attention(&q, &k, &v, MaskKind::None, None)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let o = attention(&q, &k, &v, MaskKind::None, None)?;
 
-    let (want_dq, want_dk, want_dv) =
-        host_attention_grads(&q_data, &k_data, &v_data, &ones, d, d.default_scale());
+    let (want_dq, want_dk, want_dv) = host_attention_grads(
+        &q_data,
+        &k_data,
+        &v_data,
+        &ones,
+        d,
+        d.default_scale(),
+        false,
+    );
     for (label, tensor, want) in [
         ("dq", &q, &want_dq),
         ("dk", &k, &want_dk),
@@ -1125,8 +1147,7 @@ async fn rope_position_case(
     let graph = graph_of(session);
     let (ct, st, cos, sin) = upload_tables(graph.handle(), d.dh, max_len)?;
     let x = upload(graph.handle(), &dims(&d.shape()), &x_data)?;
-    let p = from_u32(graph.handle(), &dims(&[d.l as u64]), &positions)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let p = from_u32(graph.handle(), &dims(&[d.l as u64]), &positions)?;
     let y = build(&x, &ct, &st, &p).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
     let expected = host_rope_at(&x_data, &cos, &sin, &positions, d, interleaved);
@@ -1150,8 +1171,7 @@ async fn rope_position_pair_case(
     let (ct, st, cos, sin) = upload_tables(graph.handle(), d.dh, max_len)?;
     let q = upload(graph.handle(), &dims(&d.shape()), &q_data)?;
     let k = upload(graph.handle(), &dims(&d.shape()), &k_data)?;
-    let p = from_u32(graph.handle(), &dims(&[d.l as u64]), &positions)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let p = from_u32(graph.handle(), &dims(&[d.l as u64]), &positions)?;
     let (rq, rk) =
         build(&q, &k, &ct, &st, &p).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
@@ -1174,7 +1194,7 @@ async fn rotate_half_case(session: &Session, d: RopeDims, seed: u32) -> CaseResu
     let x_data = Domain::Wide.sample(seed, d.len());
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(&d.shape()), &x_data)?;
-    let y = rotate_half(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = rotate_half(&x)?;
 
     let half = d.dh / 2;
     let mut expected = vec![0.0f32; d.len()];
@@ -1196,7 +1216,7 @@ async fn rope_norm_preserving(session: &Session, d: RopeDims, seed: u32) -> Case
     let graph = graph_of(session);
     let (ct, st, _, _) = upload_tables(graph.handle(), d.dh, d.l)?;
     let x = upload(graph.handle(), &dims(&d.shape()), &x_data)?;
-    let y = rope(&x, &ct, &st, 0).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = rope(&x, &ct, &st, 0)?;
     let got = read(&y).await?;
     for (head, chunk) in got.chunks(d.dh).enumerate() {
         let src = &x_data[head * d.dh..head * d.dh + d.dh];
@@ -1221,7 +1241,7 @@ async fn rope_backward(session: &Session, d: RopeDims, seed: u32) -> CaseResult 
     let graph = graph_of(session);
     let (ct, st, cos, sin) = upload_tables(graph.handle(), d.dh, d.l)?;
     let x = upload(graph.handle(), &dims(&d.shape()), &x_data)?;
-    let y = rope(&x, &ct, &st, 0).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = rope(&x, &ct, &st, 0)?;
     let got = gradient_of(&graph, &y, &x).await?;
 
     let half = d.dh / 2;

@@ -12,9 +12,9 @@ use std::sync::{Arc, OnceLock};
 use fusor_ir::Result;
 use fusor_ir::device::Caps;
 use fusor_ir::ir::kernel::{
-    Addr, ArenaMode, ArenaPlan, ArenaPlanner, BarrierSuggestion, Buffer, CoopSrc, ElementType,
-    KernelIr, Local, MergeBody, QuantizedView, ReduceKind, ScalarElement, Source, Stmt,
-    StorageView, Tile, TileExpr, TileExprKind, TileLiteral, Tiles,
+    Addr, ArenaMode, ArenaPlan, ArenaPlanner, BarrierSuggestion, Buffer, ElementType, KernelIr,
+    Local, MergeBody, QuantizedView, ReduceKind, ScalarElement, Source, Stmt, StorageView, Tile,
+    TileExpr, TileExprKind, TileLiteral, Tiles,
 };
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHasher};
@@ -236,17 +236,6 @@ impl BodyHasher {
                 self.tile(scratch, h);
                 group_size.hash(h);
             }
-            ReduceKind::Loop {
-                iterations,
-                index,
-                scratch,
-                group_size,
-            } => {
-                iterations.hash(h);
-                self.local(index, h);
-                self.tile(scratch, h);
-                group_size.hash(h);
-            }
         }
     }
 
@@ -319,16 +308,8 @@ impl BodyHasher {
                 scalar.hash(h);
                 rows.hash(h);
                 cols.hash(h);
-                std::mem::discriminant(src.as_ref()).hash(h);
-                match src.as_ref() {
-                    CoopSrc::TileRegion {
-                        tile, transposed, ..
-                    } => {
-                        self.tile(tile, h);
-                        transposed.hash(h);
-                    }
-                    CoopSrc::BroadcastCol { src, .. } => self.view(src, h),
-                }
+                self.tile(&src.tile, h);
+                src.transposed.hash(h);
             }
             // No payload beyond the children.
             TileExprKind::Select { .. }

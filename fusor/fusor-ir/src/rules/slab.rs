@@ -45,51 +45,16 @@ const MAX_MEMBERS: usize = 512;
 const MIN_SLABS: u64 = 32;
 
 pub fn form_slab(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    let r = form_slab_inner(b, id, node);
-    if std::env::var_os("FUSOR_SLAB_LOG").is_some() {
-        eprintln!("SLAB {id} -> {r:?} ({})", LAST_REASON.with(|c| c.get()));
-    }
-    r
-}
-
-thread_local! { static LAST_REASON: std::cell::Cell<&'static str> = const { std::cell::Cell::new("") }; }
-fn why(r: &'static str) {
-    LAST_REASON.with(|c| c.set(r));
-}
-
-fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
-    why("ok");
     // The CPU target runs one lane count per dispatch and pays nothing per
     // dispatch that a slab would save; a slab is a GPU shape.
     if b.caps().kind != crate::device::DeviceKind::Gpu {
-        why("cpu");
-        return None;
-    }
-    // Bisection aids: `FUSOR_NO_SLAB` disables the rule, `FUSOR_SLAB_MAX_MEMBERS`
-    // caps a slab's length.
-    if std::env::var_os("FUSOR_NO_SLAB").is_some() {
-        why("disabled");
-        return None;
-    }
-    // `FUSOR_SLAB_HEAD_MAX=<id>`: only heads up to that id form slabs, for
-    // bisecting a wrong plan down to one slab.
-    if let Some(max) = std::env::var("FUSOR_SLAB_HEAD_MAX")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        && id.0 > max
-    {
-        why("disabled");
         return None;
     }
     let Op::Launch(op) = &node.op else {
         return None;
     };
-    let Some((_, ops)) = stage_parts(op) else {
-        why("not a stage");
-        return None;
-    };
+    let (_, ops) = stage_parts(op)?;
     if is_contraction(b, id) {
-        why("not a stage");
         return None;
     }
 
@@ -110,115 +75,7 @@ fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
             }
         }
     }
-    // A root's update chain — an optimizer state, a parameter — is one of
-    // many independent chains the step ends in. Every earlier root stage
-    // joins this head's slab: independent members run as stages with
-    // nothing between them but a barrier, and one dispatch replaces one per
-    // root. The tail that fits the bindings is what gets minted.
-    // Opt-in (`FUSOR_BATCH_ROOTS`): measured a net loss on the transformer
-    // step — the batches it wins are outweighed by the unfused spellings
-    // they carry and the extraction time the trials cost.
-    if std::env::var_os("FUSOR_BATCH_ROOTS").is_some()
-        && b.roots().iter().any(|r| b.class_of(*r) == b.class_of(id))
-    {
-        if std::env::var_os("FUSOR_SLAB_LOG").is_some() {
-            eprintln!("  ROOTHEAD {id}: {} roots", b.roots().len());
-        }
-        let mut seen_root: FxHashSet<ClassId> = FxHashSet::default();
-        seen_root.insert(b.class_of(id));
-        // Roots before this one in the caller's order, whichever spelling
-        // of each is best — the fused ones are minted late and have ids
-        // past the head's.
-        let head_root = b
-            .roots()
-            .iter()
-            .copied()
-            .filter(|r| b.class_of(*r) == b.class_of(id))
-            .min()
-            .unwrap_or(id);
-        for r in b.roots().to_vec() {
-            let class = b.class_of(r);
-            if r >= head_root || !seen_root.insert(class) {
-                continue;
-            }
-            let pick = b
-                .class_members(r)
-                .into_iter()
-                .filter(|m| !is_contraction(b, *m))
-                .filter(|m| matches!(&b.node(*m).op, Op::Launch(op) if stage_parts(op).is_some()))
-                .max_by_key(|m| stage_rank(b, *m));
-            if let Some(m) = pick {
-                if std::env::var_os("FUSOR_SLAB_LOG").is_some() {
-                    let ranks: Vec<String> = b
-                        .class_members(r)
-                        .into_iter()
-                        .filter(|m| !is_contraction(b, *m))
-                        .filter(|m| matches!(&b.node(*m).op, Op::Launch(op) if stage_parts(op).is_some()))
-                        .map(|m| format!("{m}:{:?}", stage_rank(b, m)))
-                        .collect();
-                    eprintln!(
-                        "  ROOTPICK {id}: root class {} -> {m} from {ranks:?}",
-                        class.0.index()
-                    );
-                }
-                members.push(m);
-            }
-        }
-    }
-    let trace = std::env::var("FUSOR_SLAB_TRACE")
-        .ok()
-        .and_then(|v| v.parse::<u32>().ok())
-        == Some(id.0);
-    if trace {
-        let ops_s: Vec<String> = ops
-            .iter()
-            .map(|o| {
-                format!(
-                    "{}:c{}:varies={}:prod={:?}",
-                    o.src,
-                    b.class_of(o.src).0.index(),
-                    varies(o, op),
-                    producer_stage(b, o.src)
-                )
-            })
-            .collect();
-        eprintln!("TRACE {id}: ops {ops_s:?} members {members:?}");
-        // Each member's own operands: where a chain stops and why.
-        let mut seen_m: FxHashSet<Id> = FxHashSet::default();
-        let mut stack: Vec<Id> = members.clone();
-        while let Some(m) = stack.pop() {
-            if !seen_m.insert(m) {
-                continue;
-            }
-            let Op::Launch(mop) = &b.node(m).op else {
-                continue;
-            };
-            let Some((_, mops)) = stage_parts(mop) else {
-                continue;
-            };
-            for o in mops {
-                let c = b.class_of(o.src);
-                let kinds: Vec<String> = b
-                    .class_members(o.src)
-                    .iter()
-                    .map(|x| format!("{x}:{:?}:sf={}", b.node(*x).op.tag(), small_fold(b, *x)))
-                    .collect();
-                eprintln!(
-                    "TRACE {id}: member {m} reads {}:c{} varies={} contraction={} prod={:?} {kinds:?}",
-                    o.src,
-                    c.0.index(),
-                    varies(o, mop),
-                    has_contract_spelling(b, o.src),
-                    producer_stage(b, o.src)
-                );
-                if let Some(p) = producer_stage(b, o.src) {
-                    stack.push(p);
-                }
-            }
-        }
-    }
     if members.is_empty() {
-        why("no producer stage");
         return None;
     }
     members.push(id);
@@ -261,7 +118,6 @@ fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
         }
         members.extend(added);
         if members.len() > MAX_MEMBERS {
-            why("member count");
             return None;
         }
     }
@@ -307,7 +163,6 @@ fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
                 seen.remove(c);
             }
             if !members.contains(&id) {
-                why("a dependent input has no stage");
                 return None;
             }
             continue;
@@ -319,37 +174,21 @@ fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
         }
         members.extend(added);
         if members.len() > MAX_MEMBERS {
-            why("member count");
             return None;
         }
     }
     if !converged {
-        if std::env::var_os("FUSOR_SLAB_LOG").is_some() {
-            eprintln!("  NOCONVERGE {id}: {} members", members.len());
-        }
-        why("closure did not converge");
         return None;
     }
-    let cap = std::env::var("FUSOR_SLAB_MAX_MEMBERS")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .unwrap_or(MAX_MEMBERS);
     if members.len() < 2 {
-        why("member count");
         return None;
     }
     // The head is the chain's sink — nothing added has a larger id, so
     // nothing reads it — and goes last whatever position the closure's
     // additions took.
     let rest: Vec<Id> = members.iter().copied().filter(|m| *m != id).collect();
-    let Some(mut members) = order_members(b, rest) else {
-        why("cycle");
-        return None;
-    };
+    let mut members = order_members(b, rest)?;
     members.push(id);
-    if trace {
-        eprintln!("TRACE {id}: closed {members:?}");
-    }
 
     // The longest tail of the chain that partitions and fits the bindings.
     // Dropping a prefix of the topological order is always sound: a dropped
@@ -359,7 +198,7 @@ fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
     // reads — one nothing else reads stays in workgroup memory.
     let budget = b.caps().limits.max_storage_buffers_per_shader_stage as usize;
     let root_classes: FxHashSet<ClassId> = b.roots().iter().map(|r| b.class_of(*r)).collect();
-    let first = members.len().saturating_sub(cap);
+    let first = members.len().saturating_sub(MAX_MEMBERS);
     // Each member's finest partition against the whole chain. A tail has
     // fewer members, so fewer member operands to be local to, so its finest
     // is a multiple of this one; a count that divides this divides that.
@@ -374,7 +213,6 @@ fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
         })
         .collect();
     let mut chosen: Option<(Vec<Id>, u64)> = None;
-    let mut reason = "no common slab count";
     for cut in first..members.len() - 1 {
         let tail = &members[cut..];
         let mut g = 0u64;
@@ -391,12 +229,6 @@ fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
             continue;
         }
         let Some(slabs) = coarsen(g, widest, b.caps()) else {
-            if std::env::var_os("FUSOR_SLAB_LOG").is_some() {
-                eprintln!(
-                    "  NOSLAB {id} cut {cut}: gcd {g} widest {widest} finests {:?}",
-                    &finests[cut..]
-                );
-            }
             continue;
         };
         let classes: FxHashSet<ClassId> = tail.iter().map(|m| b.class_of(*m)).collect();
@@ -430,22 +262,13 @@ fn form_slab_inner(b: &mut Builder<'_>, id: Id, node: &Node) -> Option<Id> {
                 })
         };
         let inputs = inputs.iter().filter(|c| owns(c)).count();
-        if trace {
-            eprintln!(
-                "TRACE {id}: cut {cut} slabs {slabs} inputs {inputs} root_members {root_members}"
-            );
-        }
         if 3 + inputs + root_members > budget {
-            reason = "over the binding budget";
             continue;
         }
         chosen = Some((tail.to_vec(), slabs));
         break;
     }
-    let Some((members, slabs)) = chosen else {
-        why(reason);
-        return None;
-    };
+    let (members, slabs) = chosen?;
 
     let slab = b
         .add_launch(Launch::Slab {
@@ -830,8 +653,7 @@ fn slab_local(
     let inner: u64 = dims[end..].iter().product();
     let outer = inner * leading;
     let above = total / outer;
-    let log = std::env::var_os("FUSOR_SLAB_LOG").is_some();
-    for (oi, o) in st.ops.iter().enumerate() {
+    for o in st.ops {
         // An outside operand is read whole from a buffer complete before
         // the dispatch; the closure in `form_slab` saw to it that none is
         // computed from a member.
@@ -850,37 +672,15 @@ fn slab_local(
             return false;
         }
         let Some(map) = o.address_map() else {
-            if log {
-                eprintln!("  LOCAL {m} op{oi}: no address map ({:?})", o.access);
-            }
             return false;
         };
-        let fail = |what: &str| {
-            if log {
-                eprintln!(
-                    "  LOCAL {m} op{oi}: {what}; space {dims:?} prefix {start}..{end} leading \
-                     {leading} inner {inner} elements {elements} offset {} terms {:?}",
-                    map.offset,
-                    map.terms
-                        .iter()
-                        .map(|t| (t.divisor, t.modulus, t.stride))
-                        .collect::<Vec<_>>()
-                );
-            }
-        };
-        let (lead, rest) = match address_span(&map, total, inner, leading, above) {
-            Ok(v) => v,
-            Err(what) => {
-                fail(what);
-                return false;
-            }
+        let Some((lead, rest)) = address_span(&map, total, inner, leading, above) else {
+            return false;
         };
         if lead == 0 {
-            fail("a member is read the same way from every slab");
             return false;
         }
         if lead.checked_mul(leading) != Some(elements) || rest >= lead {
-            fail("leading stride does not partition the operand");
             return false;
         }
     }
@@ -898,8 +698,7 @@ fn address_span(
     inner: u64,
     leading: u64,
     above: u64,
-) -> Result<(u64, u64), &'static str> {
-    const OVERFLOW: &str = "address arithmetic overflows";
+) -> Option<(u64, u64)> {
     let outer = inner * leading;
     let mut lead: u64 = 0;
     let mut rest: u64 = u64::from(map.offset);
@@ -910,7 +709,7 @@ fn address_span(
             u64::from(t.stride),
         );
         if d == 0 || n == 0 {
-            return Err("a degenerate term");
+            return None;
         }
         let wraps = map.needs_modulo(i, total);
         if (!wraps && d >= total) || s == 0 {
@@ -920,58 +719,44 @@ fn address_span(
             // Wholly above the slab prefix: bounded, and paid whatever the
             // slab.
             let span = if wraps { n - 1 } else { (total - 1) / d };
-            rest = span
-                .checked_mul(s)
-                .and_then(|v| rest.checked_add(v))
-                .ok_or(OVERFLOW)?;
+            rest = span.checked_mul(s).and_then(|v| rest.checked_add(v))?;
             continue;
         }
         if !inner.is_multiple_of(d) {
-            return Err("term divisor does not divide the inner block");
+            return None;
         }
         let q = inner / d;
         if wraps {
             // `(c_above * q * leading + c * q + r / d) % n`.
             if q.is_multiple_of(n) {
-                rest = (n - 1)
-                    .checked_mul(s)
-                    .and_then(|v| rest.checked_add(v))
-                    .ok_or(OVERFLOW)?;
+                rest = (n - 1).checked_mul(s).and_then(|v| rest.checked_add(v))?;
                 continue;
             }
             if !n.is_multiple_of(q) {
-                return Err("wrap straddles the inner block");
+                return None;
             }
             let span = n / q;
             if span < leading {
-                return Err("wrap folds slabs together");
+                return None;
             }
             if span > leading {
                 if !span.is_multiple_of(leading) {
-                    return Err("wrap straddles the slab prefix");
+                    return None;
                 }
                 let above_span = (span / leading).min(above);
                 rest = (above_span - 1)
                     .checked_mul(q * leading * s)
-                    .and_then(|v| rest.checked_add(v))
-                    .ok_or(OVERFLOW)?;
+                    .and_then(|v| rest.checked_add(v))?;
             }
         } else if above > 1 {
             rest = (above - 1)
                 .checked_mul(q * leading * s)
-                .and_then(|v| rest.checked_add(v))
-                .ok_or(OVERFLOW)?;
+                .and_then(|v| rest.checked_add(v))?;
         }
-        lead = q
-            .checked_mul(s)
-            .and_then(|v| lead.checked_add(v))
-            .ok_or(OVERFLOW)?;
-        rest = (q - 1)
-            .checked_mul(s)
-            .and_then(|v| rest.checked_add(v))
-            .ok_or(OVERFLOW)?;
+        lead = q.checked_mul(s).and_then(|v| lead.checked_add(v))?;
+        rest = (q - 1).checked_mul(s).and_then(|v| rest.checked_add(v))?;
     }
-    Ok((lead, rest))
+    Some((lead, rest))
 }
 
 /// Dependence on the member classes, memoized across one rule application.

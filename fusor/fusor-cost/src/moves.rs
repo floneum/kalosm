@@ -1,21 +1,13 @@
-//! The three local-search moves and their incremental deltas.
-//!
-//! Each move's delta is recomputed over only the affected launches, via a
-//! union-find over the realized cut. The accept test is always the exact
-//! global cost; the schedule score only orders the `RESCHEDULE` frontier,
-//! never gates it.
-//!
-//! `FLIP` is refused when the node is pinned: inlining an `Effect::InPlace`
-//! node (an atomic scatter) into two consumers doubles the write. Purity is
-//! a precondition of the materialization move.
+//! Reversible selection and schedule moves. Schedule estimates only order
+//! candidates; exact realized cost decides whether to keep them.
 
-use crate::realize::{self, Realized};
+use crate::realize;
 use fusor_ir::cost::{CostModel, Picoseconds};
 use fusor_ir::egraph::{ClassId, EGraph, Id};
-use fusor_ir::extract::{ExtractBudget, Extraction, Move};
+use fusor_ir::extract::{Extraction, Move};
 use fusor_ir::facts::ValueFacts;
 use fusor_ir::ir::Op;
-use fusor_ir::ir::launch::{Effect, Launch, SchedPoint, ScheduleDomain};
+use fusor_ir::ir::launch::{Launch, SchedPoint, ScheduleDomain};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
@@ -24,30 +16,86 @@ use smallvec::SmallVec;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Candidate {
     Select { class: ClassId, node: Id },
-    Materialize { node: Id, on: bool },
     Schedule { node: Id, theta: SchedPoint },
 }
 
-/// Enough state to revert one move exactly.
-#[derive(Clone, Debug)]
-pub(crate) enum Undo {
-    /// `node` and `node_was_materialized` are the *new* member's own prior
-    /// state: a reselect carries `M` across with the selection, so reverting
-    /// has to put the new member's bit back as well as the old selection.
-    Reselect {
-        class: ClassId,
-        was: Id,
-        node: Id,
-        node_was_materialized: bool,
-    },
-    Flip {
-        node: Id,
-        was_materialized: bool,
-    },
-    Reschedule {
-        node: Id,
-        was: Option<SchedPoint>,
-    },
+/// Trial edits and their construction obligations share one rollback log.
+#[derive(Default)]
+pub(crate) struct Trail(SmallVec<[Change; 16]>);
+
+enum Change {
+    Buffers(fixedbitset::FixedBitSet),
+    Select(ClassId, Option<Id>),
+    Schedule(Id, Option<SchedPoint>),
+}
+
+impl Trail {
+    pub(crate) fn mark(&self) -> usize {
+        self.0.len()
+    }
+
+    pub(crate) fn selected_since(&self, mark: usize) -> bool {
+        self.0[mark..]
+            .iter()
+            .any(|c| matches!(c, Change::Select(..)))
+    }
+
+    pub(crate) fn buffers(&mut self, ex: &mut Extraction, buffers: fixedbitset::FixedBitSet) {
+        self.0
+            .push(Change::Buffers(std::mem::replace(&mut ex.m, buffers)));
+    }
+
+    pub(crate) fn select(&mut self, ex: &mut Extraction, class: ClassId, node: Id) {
+        let was = ex.sigma.insert(class, node);
+        if was != Some(node) {
+            crate::extract::sigma_debug(class, node, "select");
+            self.0.push(Change::Select(class, was));
+        }
+    }
+
+    pub(crate) fn schedule(&mut self, ex: &mut Extraction, node: Id, theta: SchedPoint) {
+        let was = ex.theta.insert(node, theta);
+        if was != Some(theta) {
+            self.0.push(Change::Schedule(node, was));
+        }
+    }
+
+    pub(crate) fn rollback(&mut self, ex: &mut Extraction, mark: usize) {
+        for change in self.0.drain(mark..).rev() {
+            match change {
+                Change::Buffers(was) => ex.m = was,
+                Change::Select(class, Some(was)) => {
+                    ex.sigma.insert(class, was);
+                }
+                Change::Select(class, None) => {
+                    ex.sigma.remove(&class);
+                }
+                Change::Schedule(node, Some(was)) => {
+                    ex.theta.insert(node, was);
+                }
+                Change::Schedule(node, None) => {
+                    ex.theta.remove(&node);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn apply(&mut self, ex: &mut Extraction, c: Candidate) -> bool {
+        let mark = self.mark();
+        match c {
+            Candidate::Select { class, node } => {
+                let Some(was) = ex.selected(class) else {
+                    return false;
+                };
+                if was == node {
+                    return false;
+                }
+                self.select(ex, class, node);
+            }
+            Candidate::Schedule { node, theta } => self.schedule(ex, node, theta),
+        }
+        self.mark() != mark
+    }
 }
 
 /// Schedule ordering for one search with a fixed graph and cost model.
@@ -98,13 +146,7 @@ impl SchedCache {
 
 /// Every move worth offering at this state, in a deterministic order:
 /// classes ascending, then nodes ascending.
-pub(crate) fn frontier(
-    graph: &EGraph,
-    extraction: &Extraction,
-    classes: &[ClassId],
-    budget: ExtractBudget,
-) -> Vec<Move> {
-    let _ = budget;
+pub(crate) fn frontier(graph: &EGraph, extraction: &Extraction, classes: &[ClassId]) -> Vec<Move> {
     let mut out = Vec::new();
     for class in classes {
         if !realize::is_singleton(graph, *class) {
@@ -115,7 +157,6 @@ pub(crate) fn frontier(
     selected.sort_unstable();
     selected.dedup();
     for id in selected {
-        out.push(Move::Flip(id));
         if let Some(d) = domain(graph, id)
             && d.len() > 1
         {
@@ -130,7 +171,6 @@ pub(crate) fn frontier(
 pub(crate) fn candidates(
     graph: &EGraph,
     extraction: &Extraction,
-    realized: &Realized,
     mv: Move,
     lb: &[Picoseconds],
     cache: &mut SchedCache,
@@ -155,18 +195,6 @@ pub(crate) fn candidates(
                 }
             }
         }
-        Move::Flip(node) => {
-            let on = !extraction.is_materialized(node);
-            // Only leaving `M` needs a guard: a node cut from a consumer by
-            // structure has to land in a buffer, or the consumer's launch
-            // reads a value nothing ever wrote.
-            let blocked = !on
-                && (is_pinned(graph, &realized.roots, node)
-                    || at_structural_boundary(graph, realized, node));
-            if !blocked {
-                out.push(Candidate::Materialize { node, on });
-            }
-        }
         Move::Reschedule(node) => {
             let current = extraction.theta.get(&node).copied();
             for theta in cache.ordered(graph, node, cost) {
@@ -180,127 +208,6 @@ pub(crate) fn candidates(
         }
     }
     out
-}
-
-/// Apply a candidate in place, returning the previous state.
-pub(crate) fn apply(graph: &EGraph, extraction: &mut Extraction, c: Candidate) -> Option<Undo> {
-    match c {
-        Candidate::Select { class, node } => {
-            let was = *extraction.sigma.get(&class)?;
-            if was == node {
-                return None;
-            }
-            let node_was_materialized = extraction.is_materialized(node);
-            crate::extract::sigma_debug(class, node, "move select");
-            extraction.sigma.insert(class, node);
-            // `M` is keyed by node, but the decision it records belongs to the
-            // class: a value that had to land in a buffer still has to,
-            // whichever member computes it.
-            if extraction.is_materialized(was)
-                && realize::leaf_role(graph, node) == realize::LeafRole::NotLeaf
-            {
-                set_materialized(extraction, node, true);
-            }
-            Some(Undo::Reselect {
-                class,
-                was,
-                node,
-                node_was_materialized,
-            })
-        }
-        Candidate::Materialize { node, on } => {
-            let was = extraction.is_materialized(node);
-            if was == on {
-                return None;
-            }
-            if on && realize::leaf_role(graph, node) != realize::LeafRole::NotLeaf {
-                // A leaf already lives in a buffer (or is a literal); there
-                // is no write for `M` to pay for.
-                return None;
-            }
-            set_materialized(extraction, node, on);
-            Some(Undo::Flip {
-                node,
-                was_materialized: was,
-            })
-        }
-        Candidate::Schedule { node, theta } => {
-            let was = extraction.theta.insert(node, theta);
-            if was == Some(theta) {
-                return None;
-            }
-            Some(Undo::Reschedule { node, was })
-        }
-    }
-}
-
-pub(crate) fn undo(extraction: &mut Extraction, undo: Undo) {
-    match undo {
-        Undo::Reselect {
-            class,
-            was,
-            node,
-            node_was_materialized,
-        } => {
-            set_materialized(extraction, node, node_was_materialized);
-            crate::extract::sigma_debug(class, was, "move undo");
-            extraction.sigma.insert(class, was);
-        }
-        Undo::Flip {
-            node,
-            was_materialized,
-        } => {
-            set_materialized(extraction, node, was_materialized);
-        }
-        Undo::Reschedule { node, was } => match was {
-            Some(t) => {
-                extraction.theta.insert(node, t);
-            }
-            None => {
-                extraction.theta.remove(&node);
-            }
-        },
-    }
-}
-
-/// Set one node's `M` bit, growing the set when the id is past its end.
-fn set_materialized(extraction: &mut Extraction, node: Id, on: bool) {
-    if extraction.m.len() <= node.index() {
-        extraction.m.grow(node.index() + 1);
-    }
-    extraction.m.set(node.index(), on);
-}
-
-/// True when some realized consumer of `id` [`realize::needs_own_buffer`],
-/// so `id` cannot leave `M` without breaking that consumer's launch.
-pub(crate) fn at_structural_boundary(graph: &EGraph, realized: &Realized, id: Id) -> bool {
-    realized
-        .consumer_nodes
-        .get(id)
-        .map(|c| c.as_slice())
-        .unwrap_or(&[])
-        .iter()
-        .any(|c| realize::needs_own_buffer(graph, id, *c))
-}
-
-/// True when `id` may not leave the materialized set: an `Effect::InPlace`
-/// node, a root, or a leaf (which has no write to elide).
-pub(crate) fn is_pinned(graph: &EGraph, roots: &[Id], id: Id) -> bool {
-    if roots.contains(&id) {
-        return true;
-    }
-    // A slab is the buffer its consumers read; inlined, its stages would run
-    // once per consumer.
-    if matches!(
-        graph.node(id).op,
-        Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
-    ) {
-        return true;
-    }
-    if realize::leaf_role(graph, id) != realize::LeafRole::NotLeaf {
-        return true;
-    }
-    graph.semantics().effect(&graph.node(id).op) != Effect::Pure
 }
 
 /// Whether `class` is a middle member's class of some selected slab.

@@ -231,7 +231,7 @@ async fn chain_case(
     let analytic = gradient_of(&graph, &y, &x).await?;
     let probe_graph = graph_of(session);
     let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
-    let probe_y = build(&probe_x, shape).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let probe_y = build(&probe_x, shape)?;
     let probe_loss = loss_of(&probe_y)?;
     let numeric = finite_difference_gradient(&usize_shape(shape), &data, |probe| {
         read_probe_loss(&probe_x, &probe_loss, probe)
@@ -293,9 +293,7 @@ async fn clamp_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     data[2] = 0.4;
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let y = x
-        .clamp(LO, HI)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.clamp(LO, HI)?;
 
     let expected: Vec<f32> = data.iter().map(|v| v.clamp(LO, HI)).collect();
     expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await?;
@@ -321,14 +319,10 @@ async fn where_cond_case(session: &Session, shape: &[u64], seed: u32) -> CaseRes
 
     let graph = graph_of(session);
     let c = upload(graph.handle(), &dims(shape), &cond_src)?;
-    let mask = c
-        .gt_scalar(0.0f32)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let mask = c.gt_scalar(0.0f32)?;
     let a = upload(graph.handle(), &dims(shape), &a_data)?;
     let b = upload(graph.handle(), &dims(shape), &b_data)?;
-    let y = mask
-        .where_cond(&a, &b)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = mask.where_cond(&a, &b)?;
 
     let picks: Vec<f32> = cond_src.iter().map(|v| f32::from(*v > 0.0)).collect();
     let expected: Vec<f32> = (0..len)
@@ -366,9 +360,7 @@ async fn where_cond_zero(session: &Session, shape: &[u64], seed: u32) -> CaseRes
         &dims(shape),
         &Domain::Wide.sample(seed.wrapping_add(1), len),
     )?;
-    let y = c
-        .where_cond(&a, &b)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = c.where_cond(&a, &b)?;
     let d_c = gradient_of(&graph, &y, &c)
         .await
         .map_err(|e| -> CaseError {
@@ -389,9 +381,7 @@ async fn pow_tensor_case(session: &Session, shape: &[u64], seed: u32) -> CaseRes
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dimv, &a_data)?;
     let b = upload(graph.handle(), &dimv, &b_data)?;
-    let y = a
-        .pow(&b)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = a.pow(&b)?;
 
     let expected: Vec<f32> = a_data
         .iter()
@@ -427,9 +417,7 @@ async fn broadcast_case(session: &Session, shape: &[u64], seed: u32) -> CaseResu
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &x_data)?;
     let b = upload(graph.handle(), &dims(&[cols as u64]), &bias)?;
-    let y = x
-        .add_(&b)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.add_(&b)?;
 
     let expected: Vec<f32> = x_data
         .iter()
@@ -453,9 +441,7 @@ async fn broadcast_mul_case(session: &Session, shape: &[u64], seed: u32) -> Case
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &x_data)?;
     let s = upload(graph.handle(), &dims(&[cols as u64]), &scale)?;
-    let y = x
-        .mul_(&s)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.mul_(&s)?;
 
     let d_s = gradient_of(&graph, &y, &s).await?;
     let want: Vec<f32> = (0..cols)
@@ -488,9 +474,7 @@ async fn gelu_analytic(session: &Session, shape: &[u64], seed: u32) -> CaseResul
     let data = Domain::Custom(-2.5, 2.5).sample(seed, len);
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let y = x
-        .gelu()
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.gelu()?;
     // The forward must be the tanh approximation, not the erf one, or the
     // analytic derivative below is being compared against the wrong function.
     let expected: Vec<f32> = data.iter().copied().map(host_gelu).collect();
@@ -523,9 +507,7 @@ async fn relu_kink(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     data[0] = 0.0;
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let y = x
-        .relu()
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.relu()?;
 
     let expected: Vec<f32> = data.iter().map(|v| v.max(0.0)).collect();
     expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await?;
@@ -547,9 +529,7 @@ async fn straight_through_case(session: &Session, shape: &[u64], seed: u32) -> C
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
     let scale = upload(graph.handle(), &dims(&[1]), &[0.25f32])?;
-    let q = x
-        .fake_quant(7, &scale)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let q = x.fake_quant(7, &scale)?;
 
     let expected: Vec<f32> = data
         .iter()
@@ -575,13 +555,9 @@ async fn detach_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult 
     let data = Domain::Wide.sample(seed, len_of(shape));
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let mid = x.sqr().map_err(|e| -> CaseError { e.to_string().into() })?;
-    let cut = mid
-        .detach()
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let y = cut
-        .mul_scalar(3.0f32)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let mid = x.sqr()?;
+    let cut = mid.detach()?;
+    let y = cut.mul_scalar(3.0f32)?;
 
     // The detached copy holds the same values...
     let expected: Vec<f32> = data.iter().map(|v| 3.0 * v * v).collect();
@@ -602,10 +578,7 @@ async fn diamond_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult
     let data = Domain::Wide.sample(seed, len);
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let y = x
-        .mul(&x)
-        .and_then(|sq| sq.add(&x))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.mul(&x).and_then(|sq| sq.add(&x))?;
     let grad = gradient_of(&graph, &y, &x).await?;
     let want: Vec<f32> = data.iter().map(|v| 2.0 * v + 1.0).collect();
     crate::compare::approx_or_relative_eq(backend_of(session), &[len], &want, &grad, 1e-4, 1e-4)
@@ -624,7 +597,7 @@ async fn seeded_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult 
     let data = Domain::Wide.sample(seed, len);
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let y = x.sqr().map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.sqr()?;
     let loss = loss_of(&y)?;
     let seed_t = upload(graph.handle(), &dims(&[]), &[SCALE]).or_else(|_| {
         // A rank-0 upload may not be expressible; a [1] seed is the same value.
@@ -651,7 +624,7 @@ async fn cross_graph(session: &Session) -> CaseResult {
     let b = graph_of(session);
     let x = upload(a.handle(), &dims(SHAPE), &Domain::Wide.sample(1451, LEN))?;
     let other = upload(b.handle(), &dims(SHAPE), &Domain::Wide.sample(1453, LEN))?;
-    let loss = loss_of(&x.sqr().map_err(|e| -> CaseError { e.to_string().into() })?)?;
+    let loss = loss_of(&x.sqr()?)?;
     if b.backward_with(&loss, std::slice::from_ref(&other)).is_ok() {
         return Err("backward accepted a loss from a different graph".into());
     }
@@ -670,11 +643,7 @@ async fn every_parent(session: &Session, shape: &[u64], seed: u32) -> CaseResult
     let a = upload(graph.handle(), &dims(shape), &a_data)?;
     let b = upload(graph.handle(), &dims(shape), &b_data)?;
     let c = upload(graph.handle(), &dims(shape), &c_data)?;
-    let y = a
-        .mul(&b)
-        .and_then(|p| p.sub(&c))
-        .and_then(|d| d.div(&b))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = a.mul(&b).and_then(|p| p.sub(&c)).and_then(|d| d.div(&b))?;
 
     for (label, operand) in [("a", &a), ("b", &b), ("c", &c)] {
         let grad = gradient_of(&graph, &y, operand)

@@ -89,7 +89,7 @@ impl Ctx {
             }
             K::Reduce { kind, value, .. } => match kind.as_ref() {
                 ReduceKind::Subgroup => Uniformity::NonUniform,
-                ReduceKind::Workgroup { .. } | ReduceKind::Loop { .. } => self.classify(value),
+                ReduceKind::Workgroup { .. } => self.classify(value),
             },
             _ => {
                 let mut children: Vec<TileExpr> = Vec::new();
@@ -152,30 +152,6 @@ fn collect_assignments(
     }
 }
 
-/// `ReduceKind::Loop` carries its own counter local, which is uniform for the
-/// same reason a counted loop's index is.
-fn collect_reduce_counters(body: &[Stmt], counters: &mut Vec<LocalKey>) {
-    let mut seen = rustc_hash::FxHashSet::default();
-    crate::verify_kernel::for_each_root_expr(body, &mut |expr| {
-        crate::verify_kernel::visit_unique(expr, &mut seen, &mut |node| {
-            if let TileExprKind::Reduce { kind, .. } = node.kind()
-                && let ReduceKind::Loop { index, .. } = kind.as_ref()
-            {
-                counters.push(local_key(index));
-            }
-        });
-    });
-    // The N-ary form carries its kind on the statement, not inside an
-    // expression, so the expression walk above cannot see its counter.
-    crate::verify_kernel::for_each_stmt(body, &mut |stmt| {
-        if let Stmt::Reduce { kind, .. } = stmt
-            && let ReduceKind::Loop { index, .. } = kind.as_ref()
-        {
-            counters.push(local_key(index));
-        }
-    });
-}
-
 /// Fixpoint: start every assigned local `Uniform` and downgrade it the moment
 /// any assignment is non-uniform. Monotone, so it terminates; a loop-carried
 /// local settles after at most one extra pass per dependency edge.
@@ -183,7 +159,6 @@ fn classify_locals(body: &[Stmt], ctx: &mut Ctx) {
     let mut assignments = Vec::new();
     let mut counters = Vec::new();
     collect_assignments(body, &mut assignments, &mut counters);
-    collect_reduce_counters(body, &mut counters);
     for (key, _) in &assignments {
         ctx.locals.entry(*key).or_insert(Uniformity::Uniform);
     }
@@ -230,14 +205,12 @@ fn walk_stmt(stmt: &Stmt, enclosing: Uniformity, ctx: &mut Ctx, path: &mut Vec<u
             }
             Ok(())
         }
-        // A workgroup or loop reduction lowers to a staged tree with a barrier
+        // A workgroup reduction lowers to a staged tree with a barrier
         // between every level. Those barriers are emitted, not written, so they
         // are checked here at the statement that produces them.
         Stmt::Reduce { kind, .. } => {
-            if matches!(
-                kind.as_ref(),
-                ReduceKind::Workgroup { .. } | ReduceKind::Loop { .. }
-            ) && enclosing == Uniformity::NonUniform
+            if matches!(kind.as_ref(), ReduceKind::Workgroup { .. })
+                && enclosing == Uniformity::NonUniform
             {
                 return Err(Error::Lower(LowerError::NonUniformBarrier(format!(
                     "the staged reduction at {} is under a non-uniform predicate",

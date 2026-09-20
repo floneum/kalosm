@@ -17,7 +17,7 @@ use fusor_ir::shape::{Dim, StrideSpec};
 use fusor_ir::{Error, Result};
 use smallvec::SmallVec;
 
-use crate::composite::{MacroAttr, MacroOp, const_dim, index_leaf, index_run, macro_op};
+use crate::composite::{const_dim, core_op, index_leaf, index_run};
 use crate::graph::GraphRef;
 use crate::tensor::Tensor;
 
@@ -211,21 +211,7 @@ fn rope_with(
     let graph = &x.graph;
     let ops = prepare(graph, x, cos, pairing, rows)?;
     let (xi, ci, si) = (x.id, cos.id, sin.id);
-    let mut operands = vec![xi, ci, si, ops.perm, ops.signs, ops.expand];
-    if let Rows::Positions(p) = ops.rows {
-        operands.push(p);
-    }
-    macro_op(
-        graph,
-        MacroOp::Rope,
-        MacroAttr::Rope {
-            interleaved: matches!(pairing, Pairing::Interleaved),
-            paired: false,
-            with_position: matches!(ops.rows, Rows::Positions(_)),
-        },
-        &operands,
-        move |t| rope_defn(t, xi, ci, si, &ops),
-    )
+    core_op(graph, move |t| rope_defn(t, xi, ci, si, &ops))
 }
 
 /// Non-interleaved rope: pairs `(i, i + Dh/2)`.
@@ -301,32 +287,16 @@ fn rope_pair_with(
     let lower = index_run(graph, 0, hq)?;
     let upper = index_run(graph, hq, hk)?;
     let (qi, ki, ci, si) = (q.id, k.id, cos.id, sin.id);
-    let mut operands = vec![
-        qi, ki, ci, si, ops.perm, ops.signs, ops.expand, lower, upper,
-    ];
-    if let Rows::Positions(p) = ops.rows {
-        operands.push(p);
-    }
 
-    let joined = macro_op(
-        graph,
-        MacroOp::Rope,
-        MacroAttr::Rope {
-            interleaved: matches!(pairing, Pairing::Interleaved),
-            paired: true,
-            with_position: matches!(ops.rows, Rows::Positions(_)),
-        },
-        &operands,
-        move |t| {
-            let dtype = t.dtype_of(qi);
-            let mut shape = t.shape_of(qi);
-            shape[1] = Dim::Const(hq + hk);
-            let base = t.zeros_shaped(dtype, &shape)?;
-            let base = t.scatter_set(1, base, lower, qi, true)?;
-            let both = t.scatter_set(1, base, upper, ki, true)?;
-            rope_defn(t, both, ci, si, &ops)
-        },
-    )?;
+    let joined = core_op(graph, move |t| {
+        let dtype = t.dtype_of(qi);
+        let mut shape = t.shape_of(qi);
+        shape[1] = Dim::Const(hq + hk);
+        let base = t.zeros_shaped(dtype, &shape)?;
+        let base = t.scatter_set(1, base, lower, qi, true)?;
+        let both = t.scatter_set(1, base, upper, ki, true)?;
+        rope_defn(t, both, ci, si, &ops)
+    })?;
 
     Ok((
         narrow_heads(&joined, 0, hq)?,

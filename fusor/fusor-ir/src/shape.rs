@@ -367,6 +367,22 @@ impl Layout {
         out
     }
 
+    pub fn visit_dims_mut(&mut self, f: &mut impl FnMut(&mut Dim)) {
+        let mut changed = false;
+        for dim in std::iter::once(&mut self.offset)
+            .chain(&mut self.shape)
+            .chain(&mut self.strides)
+        {
+            let before = *dim;
+            f(dim);
+            changed |= before != *dim;
+        }
+        if changed {
+            self.contiguous = self.offset == Dim::Const(0)
+                && self.strides == Self::row_major_strides(&self.shape);
+        }
+    }
+
     pub const fn offset(&self) -> Dim {
         self.offset
     }

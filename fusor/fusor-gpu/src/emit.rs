@@ -15,7 +15,7 @@ pub(crate) mod types;
 
 use fusor_ir::device::Caps;
 use fusor_ir::ir::kernel::{
-    Accumulator, Addr, ArenaPlan, Buffer, Builtin, CoopSrc, ElementType, KernelIr, Local, MemReads,
+    Accumulator, Addr, ArenaPlan, Buffer, Builtin, ElementType, KernelIr, Local, MemReads,
     ReduceKind, ScalarElement, Source, Stmt, Tile, TileExpr, TileExprKind,
 };
 use fusor_ir::target::EmitError;
@@ -320,15 +320,11 @@ impl Analysis {
                 // two-stage upgrade applies to it.
                 if values.len() == 1 && fast.is_some() {
                     match &**kind {
-                        ReduceKind::Workgroup { group_size, .. }
-                        | ReduceKind::Loop { group_size, .. } => {
+                        ReduceKind::Workgroup { group_size, .. } => {
                             self.note_tree(*group_size, values[0].element());
                         }
                         ReduceKind::Subgroup => {}
                     }
-                }
-                if let ReduceKind::Loop { index, .. } = &**kind {
-                    self.note_local(index, seen);
                 }
                 for tile in scratch {
                     self.note_tile(tile, seen);
@@ -429,32 +425,14 @@ impl Analysis {
                         self.note_tile(scratch, seen);
                         self.note_tree(*group_size, value.element());
                     }
-                    ReduceKind::Loop {
-                        index,
-                        scratch,
-                        group_size,
-                        ..
-                    } => {
-                        self.note_local(index, seen);
-                        self.note_tile(scratch, seen);
-                        self.note_tree(*group_size, value.element());
-                    }
                 }
                 self.expr(value, seen);
             }
             TileExprKind::CoopLoad { src, .. } => {
                 self.uses_coop = true;
-                match &**src {
-                    CoopSrc::TileRegion { tile, row, col, .. } => {
-                        self.note_tile(tile, seen);
-                        self.expr(row, seen);
-                        self.expr(col, seen);
-                    }
-                    CoopSrc::BroadcastCol { src, col } => {
-                        self.note_buffer(&src.buffer, seen);
-                        self.expr(col, seen);
-                    }
-                }
+                self.note_tile(&src.tile, seen);
+                self.expr(&src.row, seen);
+                self.expr(&src.col, seen);
             }
             TileExprKind::CoopMma { a, b, c } => {
                 self.uses_coop = true;
@@ -503,8 +481,6 @@ pub(crate) enum ScratchKind {
     LoopIndex,
     /// A masked-value spill local (one per masked load/reduce).
     Value,
-    /// A reduce-accumulator spill local; deepens with nesting.
-    Spill,
 }
 
 /// Per-kernel emission state: the naga arenas plus the Kernel -> naga handle maps.

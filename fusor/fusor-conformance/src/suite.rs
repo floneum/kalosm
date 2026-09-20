@@ -92,9 +92,7 @@ pub mod support {
 
     /// Read a tensor back as f32. One of exactly three host syncs.
     pub async fn read(t: &Tensor) -> Result<Vec<f32>, CaseError> {
-        t.to_vec_f32_async()
-            .await
-            .map_err(|e| -> CaseError { e.to_string().into() })
+        t.to_vec_f32_async().await.map_err(Into::into)
     }
 
     /// Read a rank-0 (or one-element) tensor.
@@ -113,7 +111,7 @@ pub mod support {
 
     /// Upload `data` into `graph` as an f32 buffer of `shape`.
     pub fn upload(graph: &GraphRef, shape: &[Dim], data: &[f32]) -> Result<Tensor, CaseError> {
-        from_f32(graph, shape, data).map_err(|e| -> CaseError { e.to_string().into() })
+        from_f32(graph, shape, data).map_err(Into::into)
     }
 
     /// The `sum_all` of a tensor, as the scalar loss every backward case seeds.
@@ -136,9 +134,7 @@ pub mod support {
         for value in &probe {
             bytes.extend_from_slice(&value.to_le_bytes());
         }
-        input
-            .set_bytes(bytes)
-            .map_err(|e| -> CaseError { e.to_string().into() })?;
+        input.set_bytes(bytes)?;
         // `resolve` deliberately returns early for an already-materialized
         // root. The input update invalidates its leaf buffer; invalidate the
         // requested loss as well so this perturbation executes the plan.
@@ -207,7 +203,7 @@ pub mod support {
         let dimv = dims(shape);
         let graph = graph_of(session);
         let x = upload(graph.handle(), &dimv, data)?;
-        let y = build(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
+        let y = build(&x)?;
 
         let actual = read(&y).await?;
         let expected: Vec<f32> = data.iter().copied().map(reference).collect();
@@ -228,7 +224,7 @@ pub mod support {
         let usize_shape: Vec<usize> = shape.iter().map(|n| *n as usize).collect();
         let probe_graph = graph_of(session);
         let probe_x = upload(probe_graph.handle(), &dimv, data)?;
-        let probe_y = build(&probe_x).map_err(|e| -> CaseError { e.to_string().into() })?;
+        let probe_y = build(&probe_x)?;
         let probe_loss = loss_of(&probe_y)?;
         let numeric = finite_difference_gradient(&usize_shape, data, |probe| {
             read_probe_loss(&probe_x, &probe_loss, probe)
@@ -291,7 +287,7 @@ pub mod support {
                 let graph = graph_of(session);
                 let a = upload(graph.handle(), &dimv, &lhs)?;
                 let b = upload(graph.handle(), &dimv, &rhs)?;
-                let y = build(&a, &b).map_err(|e| -> CaseError { e.to_string().into() })?;
+                let y = build(&a, &b)?;
 
                 let actual = read(&y).await?;
                 let expected: Vec<f32> = lhs
@@ -305,8 +301,7 @@ pub mod support {
                 let lhs_graph = graph_of(session);
                 let lhs_a = upload(lhs_graph.handle(), &dimv, &lhs)?;
                 let lhs_b = upload(lhs_graph.handle(), &dimv, &rhs)?;
-                let lhs_y =
-                    build(&lhs_a, &lhs_b).map_err(|e| -> CaseError { e.to_string().into() })?;
+                let lhs_y = build(&lhs_a, &lhs_b)?;
                 let lhs_loss = loss_of(&lhs_y)?;
                 let numeric_lhs = finite_difference_gradient(&usize_shape, &lhs, |probe| {
                     read_probe_loss(&lhs_a, &lhs_loss, probe)
@@ -318,8 +313,7 @@ pub mod support {
                 let rhs_graph = graph_of(session);
                 let rhs_a = upload(rhs_graph.handle(), &dimv, &lhs)?;
                 let rhs_b = upload(rhs_graph.handle(), &dimv, &rhs)?;
-                let rhs_y =
-                    build(&rhs_a, &rhs_b).map_err(|e| -> CaseError { e.to_string().into() })?;
+                let rhs_y = build(&rhs_a, &rhs_b)?;
                 let rhs_loss = loss_of(&rhs_y)?;
                 let numeric_rhs = finite_difference_gradient(&usize_shape, &rhs, |probe| {
                     read_probe_loss(&rhs_b, &rhs_loss, probe)
@@ -351,7 +345,7 @@ pub mod support {
                 let dimv = dims(shape);
                 let graph = graph_of(session);
                 let x = upload(graph.handle(), &dimv, &data)?;
-                let y = build(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
+                let y = build(&x)?;
 
                 let actual = read(&y).await?;
                 let expected: Vec<f32> = data.iter().copied().map(reference).collect();

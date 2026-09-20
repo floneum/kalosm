@@ -12,8 +12,7 @@
 //! 4. A fold dim may not appear with nonzero stride in the write map.
 //! 5. Every operand's `AccessPlan` satisfies that operand's access
 //!    predicate. A failed access analysis disqualifies **this rewrite only**.
-//! 6. A composite node carries the linear schedule domain its members'
-//!    shared index space implies, rather than an unsearchable point.
+//! 6. A composite sequences at least two independently scheduled members.
 //! 7. Every node carries an `Effect`.
 //! 8. Allocation is *not* described at Launch; a node claiming a buffer is an
 //!    error.
@@ -55,7 +54,7 @@ pub fn verify_launch(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<(
     check_operand_access(op).map_err(|e| relabel(cx, format!("{e}")))?;
 
     // 6.
-    check_composite_domain(cx, op).map_err(|e| relabel(cx, format!("{e}")))?;
+    check_composite_domain(op).map_err(|e| relabel(cx, format!("{e}")))?;
 
     // 7.
     let declared = effect_of(&cx.node.op);
@@ -80,105 +79,31 @@ pub fn verify_launch(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<(
         }
     }
 
-    // The `verify_l0` constant-work tripwire, applied to the one Launch variant
-    // whose row comes from outside the crate. An `OpDef` registering
-    // `Work { macs: 1, .. }` is exactly the reference's
-    // `Attention { work: 1 }` placeholder wearing an extension hat.
-    if let Launch::Ext { def, .. } = op
-        && let Some(d) = cx.registry.get(*def)
-    {
-        let small = (d.work)(cx.operands, cx.result);
-        let doubled_ins: Vec<crate::facts::ValueFacts> = cx.operands.iter().map(doubled).collect();
-        let doubled_out = doubled(cx.result);
-        let large = (d.work)(&doubled_ins, &doubled_out);
-        let has_const = cx
-            .operands
-            .iter()
-            .chain(std::iter::once(cx.result))
-            .flat_map(|f| f.shape.iter())
-            .any(|dim| dim.as_const().is_some());
-        if has_const && small == large && small != crate::facts::Work::default() {
-            return Err(relabel(
-                cx,
-                format!("OpDef `{}`: work() does not vary with shape", d.name),
-            ));
-        }
-    }
-
     Ok(())
 }
 
-/// Every `Const` dim doubled — the second binding the work tripwire prices.
-fn doubled(f: &crate::facts::ValueFacts) -> crate::facts::ValueFacts {
-    let mut out = f.clone();
-    for d in out.shape.iter_mut() {
-        if let Dim::Const(v) = *d {
-            *d = Dim::Const(v.saturating_mul(2));
-        }
-    }
-    out
-}
-
-/// Invariant 6: a composite node's schedule domain is the one its members'
-/// shared index space implies.
-///
-/// A `Region` is a list of Launch nodes run in one dispatch over one linearized
-/// index to both backends, so its geometry is
-/// [`crate::ir::launch::MapDomain::linear_over`] of the value they land, and
-/// nothing else. Checking it against the *node's own inferred shape* rather
-/// than against whatever the minting rule felt like is what makes the domain
-/// a property of the node instead of a field a rule may drift.
-///
-/// The clause is exact rather than a bound: the mint site calls the same
-/// generator on the same facts, so an inequality is a rule that stopped
-/// deriving the domain, not a legal variation.
-fn check_composite_domain(cx: &VerifyCtx<'_>, op: &Launch) -> Result<()> {
-    let sched = match op {
-        Launch::Region { sched, .. } => sched,
-        // A slab has one geometry, a workgroup per slab, and nothing to
-        // enumerate.
+/// Composite members keep their own schedules.
+fn check_composite_domain(op: &Launch) -> Result<()> {
+    let (sched, members) = match op {
         Launch::Slab {
             sched,
             slabs,
             members,
         } => {
-            if *slabs < 2 || members.len() < 2 {
+            if *slabs < 2 {
                 return Err(Error::Legality(format!(
-                    "a Slab needs at least two slabs and two members, got {slabs} and {}",
-                    members.len()
+                    "a Slab needs at least two slabs, got {slabs}"
                 )));
             }
-            if *sched != ScheduleDomain::Point {
-                return Err(Error::Legality(format!(
-                    "a Slab's schedule domain is Point; got {sched:?}"
-                )));
-            }
-            return Ok(());
+            (sched, members)
         }
-        Launch::Group { sched, members } => {
-            if members.len() < 2 {
-                return Err(Error::Legality(format!(
-                    "a Group needs at least two members, got {}",
-                    members.len()
-                )));
-            }
-            if *sched != ScheduleDomain::Point {
-                return Err(Error::Legality(format!(
-                    "a Group's schedule domain is Point; got {sched:?}"
-                )));
-            }
-            return Ok(());
-        }
+        Launch::Group { sched, members } => (sched, members),
         _ => return Ok(()),
     };
-    let want = ScheduleDomain::Map(crate::ir::launch::MapDomain::linear_over(
-        cx.caps,
-        &cx.result.shape,
-    ));
-    if *sched != want {
+    if members.len() < 2 || *sched != ScheduleDomain::Point {
         return Err(Error::Legality(format!(
-            "a composite node's schedule domain is the linear map domain of its \
-             members' shared index space; got {sched:?}, want {want:?}"
+            "a composite needs at least two members and a Point domain, got {} and {sched:?}",
+            members.len()
         )));
     }
     Ok(())
@@ -765,10 +690,9 @@ fn operands_of(op: &Launch) -> Vec<Operand> {
         Launch::Map { ops, .. }
         | Launch::Fold { ops, .. }
         | Launch::Gather { ops, .. }
-        | Launch::Scatter { ops, .. }
-        | Launch::Ext { ops, .. } => ops.clone(),
+        | Launch::Scatter { ops, .. } => ops.clone(),
         Launch::Contract { a, b, .. } => a.ops.iter().chain(b.ops.iter()).cloned().collect(),
-        Launch::Region { .. } | Launch::Slab { .. } | Launch::Group { .. } => Vec::new(),
+        Launch::Slab { .. } | Launch::Group { .. } => Vec::new(),
     }
 }
 

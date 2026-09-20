@@ -64,20 +64,6 @@ impl Evaluation {
     }
 }
 
-/// One parameter and the Adam state that follows it.
-struct Slot {
-    value: Dyn,
-    m: Dyn,
-    v: Dyn,
-}
-
-/// Where one step's new parameter and moments land.
-struct Update {
-    value: Dyn,
-    m: Dyn,
-    v: Dyn,
-}
-
 /// One transformer block's parameters.
 #[derive(Clone)]
 struct Block {
@@ -89,6 +75,14 @@ struct Block {
     mlp_norm: Tensor<1, f32>,
     up: Tensor<2, f32>,
     down: Tensor<2, f32>,
+}
+
+struct Weights {
+    embed: Tensor<2, f32>,
+    positions: Tensor<2, f32>,
+    blocks: Vec<Block>,
+    final_norm: Tensor<1, f32>,
+    head: Tensor<2, f32>,
 }
 
 /// The batch-of-one graph the generator and the interpretability panels run.
@@ -125,14 +119,8 @@ pub struct Lm {
     /// `[loss, accuracy]` over the current batch, for [`Lm::evaluate`].
     scored: Tensor<1, f32>,
 
-    embed: Tensor<2, f32>,
-    positions: Tensor<2, f32>,
-    blocks: Vec<Block>,
-    final_norm: Tensor<1, f32>,
-    head: Tensor<2, f32>,
-
-    slots: Vec<Slot>,
-    updates: Vec<Update>,
+    weights: Weights,
+    feedback: Vec<(Dyn, Dyn)>,
     roots: Vec<Dyn>,
     /// The forward's intermediates, cleared whenever a leaf's bytes change.
     chain: Vec<Dyn>,
@@ -225,18 +213,15 @@ impl Lm {
         let final_norm = ones(config.dim);
         let head = weight(&mut rng, config.dim, vocab, INIT_STD);
 
+        let weights = Weights {
+            embed,
+            positions,
+            blocks,
+            final_norm,
+            head,
+        };
         let mut chain = Vec::new();
-        let hidden = forward(
-            &tokens,
-            &embed,
-            &positions,
-            &blocks,
-            &final_norm,
-            config,
-            &mut chain,
-        );
-        let logits: Tensor<3, f32> = Linear::new(head.clone(), None).forward(&hidden);
-        chain.push(logits.as_dyn().clone());
+        let logits = weights.forward(&tokens, config, &mut chain, None);
         let flat = logits.reshape([config.tokens(), vocab]);
         chain.push(flat.as_dyn().clone());
 
@@ -274,20 +259,14 @@ impl Lm {
         // trip through the browser's event loop for four bytes.
         let scored = fusor::stack::<0, 1, f32, _>([loss.clone(), hits], 0);
 
-        let mut parameters: Vec<Dyn> = vec![embed.as_dyn().clone(), positions.as_dyn().clone()];
-        for block in &blocks {
-            parameters.extend(block.parameters());
-        }
-        parameters.push(final_norm.as_dyn().clone());
-        parameters.push(head.as_dyn().clone());
+        let parameters = weights.parameters();
 
         // Forward and backward are one graph with one root set; the extractor
         // decides what to keep and what to recompute.
         let gradients = device.graph().backward_with(loss.as_dyn(), &parameters)?;
 
         let alpha_dyn = alpha.as_dyn().clone();
-        let mut slots = Vec::with_capacity(parameters.len());
-        let mut updates = Vec::with_capacity(parameters.len());
+        let mut feedback = Vec::with_capacity(parameters.len() * 3);
         let mut roots = vec![loss.as_dyn().clone()];
         for value in parameters {
             let gradient = gradients
@@ -301,27 +280,23 @@ impl Lm {
             let bytes = vec![0u8; count * 4];
             let handle = device.graph().handle();
             let shape = value.shape();
-            let slot = Slot {
-                m: Dyn::from_slice(handle, Dtype::F32, &shape, &bytes)?,
-                v: Dyn::from_slice(handle, Dtype::F32, &shape, &bytes)?,
-                value,
-            };
+            let m = Dyn::from_slice(handle, Dtype::F32, &shape, &bytes)?;
+            let v = Dyn::from_slice(handle, Dtype::F32, &shape, &bytes)?;
 
             // Adam, with the bias correction folded into `alpha` on the host.
-            let m = slot
-                .m
+            let next_m = m
                 .mul_scalar(BETA1)?
                 .add(&gradient.mul_scalar(1.0 - BETA1)?)?;
-            let v = slot
-                .v
+            let next_v = v
                 .mul_scalar(BETA2)?
                 .add(&gradient.sqr()?.mul_scalar(1.0 - BETA2)?)?;
-            let update = m.mul_(&alpha_dyn)?.div(&v.sqrt()?.add_scalar(EPS)?)?;
-            let value = slot.value.sub(&update)?;
-
-            roots.extend([value.clone(), m.clone(), v.clone()]);
-            updates.push(Update { value, m, v });
-            slots.push(slot);
+            let update = next_m
+                .mul_(&alpha_dyn)?
+                .div(&next_v.sqrt()?.add_scalar(EPS)?)?;
+            let next_value = value.sub(&update)?;
+            let next = [next_value, next_m, next_v];
+            roots.extend(next.iter().cloned());
+            feedback.extend([value, m, v].into_iter().zip(next));
         }
 
         Ok(Self {
@@ -336,13 +311,8 @@ impl Lm {
             alpha,
             loss,
             scored,
-            embed,
-            positions,
-            blocks,
-            final_norm,
-            head,
-            slots,
-            updates,
+            weights,
+            feedback,
             roots,
             chain,
             single: None,
@@ -362,27 +332,18 @@ impl Lm {
     ) -> Result<()> {
         if let Some(program) = &self.compiled {
             let state: Vec<_> = self
-                .slots
+                .feedback
                 .iter()
-                .flat_map(|s| [s.value.clone(), s.m.clone(), s.v.clone()])
+                .map(|(state, _)| state.clone())
                 .collect();
             program.export(&state)?;
         }
-        let feedback: Vec<_> = self
-            .slots
-            .iter()
-            .zip(&self.updates)
-            .flat_map(|(s, u)| {
-                [
-                    (s.value.clone(), u.value.clone()),
-                    (s.m.clone(), u.m.clone()),
-                    (s.v.clone(), u.v.clone()),
-                ]
-            })
-            .collect();
-        let program =
-            fusor::program::TrainingProgram::compile_with_options(&self.roots, &feedback, options)
-                .await?;
+        let program = fusor::program::TrainingProgram::compile_with_options(
+            &self.roots,
+            &self.feedback,
+            options,
+        )
+        .await?;
         self.compiled = Some(program);
         self.published_step = None;
         Ok(())
@@ -394,8 +355,7 @@ impl Lm {
     fn publish_parameters(&mut self) -> Result<()> {
         if self.published_step != Some(self.step) {
             if let Some(program) = &self.compiled {
-                let parameters: Vec<_> = self.slots.iter().map(|s| s.value.clone()).collect();
-                program.export(&parameters)?;
+                program.export(&self.weights.parameters())?;
             }
             self.published_step = Some(self.step);
         }
@@ -476,10 +436,8 @@ impl Lm {
 
         // Device-side detach: every leaf takes over the buffer its update
         // landed in, so the next step re-runs the very same graph.
-        for (slot, update) in self.slots.iter().zip(&self.updates) {
-            slot.value.adopt_buffer(&update.value)?;
-            slot.m.adopt_buffer(&update.m)?;
-            slot.v.adopt_buffer(&update.v)?;
+        for (state, next) in &self.feedback {
+            state.adopt_buffer(next)?;
         }
         Ok(rate)
     }
@@ -629,8 +587,8 @@ impl Lm {
     /// Pairwise cosine similarity between token embeddings.
     pub async fn embedding_similarity(&mut self) -> Result<Vec<f32>> {
         self.publish_parameters()?;
-        self.embed.as_dyn().clear_device_buf();
-        let rows = self.embed.to_vec_f32_async().await?;
+        self.weights.embed.as_dyn().clear_device_buf();
+        let rows = self.weights.embed.to_vec_f32_async().await?;
         let v = self.vocab;
         let norms: Vec<f32> = (0..v)
             .map(|i| {
@@ -707,81 +665,11 @@ impl Lm {
             &vec![0u32; self.config.context],
         );
         let mut chain = Vec::new();
-        let hidden = forward(
-            &tokens,
-            &self.embed,
-            &self.positions,
-            &self.blocks,
-            &self.final_norm,
-            self.config,
-            &mut chain,
-        );
-        let logits: Tensor<3, f32> = Linear::new(self.head.clone(), None).forward(&hidden);
-        chain.push(logits.as_dyn().clone());
-
-        // The lens. `attention` is one fused op with no probability tensor to
-        // read, so the maps come from the same arithmetic spelled out: scaled
-        // scores, an additive causal mask, a softmax.
-        let mut causal = vec![0.0f32; self.config.context * self.config.context];
-        for query in 0..self.config.context {
-            for key in (query + 1)..self.config.context {
-                causal[query * self.config.context + key] = -MASK_FLOOR;
-            }
-        }
-        let mask = Tensor::<2, f32>::from_slice(
-            &self.device,
-            [self.config.context, self.config.context],
-            &causal,
-        );
-        let scale = 1.0 / (self.config.head_dim() as f32).sqrt();
-
-        let embedded: Tensor<3, f32> = Embedding::new(self.embed.clone()).forward(&tokens);
-        let mut x = embedded.add_::<2, 3, _>(&self.positions);
-        chain.push(x.as_dyn().clone());
+        let logits = self.weights.forward(&tokens, self.config, &mut chain, None);
         let mut attention = Vec::with_capacity(self.config.blocks);
-        for block in &self.blocks {
-            let h = x.rms_norm(&block.attn_norm, 1e-5);
-            chain.push(h.as_dyn().clone());
-            let flat = h.reshape([self.config.context, self.config.dim]);
-            let heads = |w: &Tensor<2, f32>| -> Tensor<4, f32> {
-                let projected: Tensor<2, f32> = Linear::new(w.clone(), None).forward(&flat);
-                projected
-                    .reshape([
-                        1,
-                        self.config.context,
-                        self.config.heads,
-                        self.config.head_dim(),
-                    ])
-                    .permute([0, 2, 1, 3])
-            };
-            let (q, k, v) = (heads(&block.q), heads(&block.k), heads(&block.v));
-            let probabilities = q
-                .matmul_t(&k)
-                .mul_scalar(scale)
-                .add_::<2, 4, _>(&mask)
-                .softmax(3usize);
-            chain.push(probabilities.as_dyn().clone());
-            let merged = probabilities.matmul(&v).permute([0, 2, 1, 3]).reshape([
-                1,
-                self.config.context,
-                self.config.dim,
-            ]);
-            attention.push(probabilities.reshape([
-                self.config.heads,
-                self.config.context,
-                self.config.context,
-            ]));
-            x = x.add(&Linear::new(block.proj.clone(), None).forward(&merged));
-            chain.push(x.as_dyn().clone());
-            x = block.feed_forward(&x, 1, self.config, &mut chain);
-        }
-        let normed = x.rms_norm(&self.final_norm, 1e-5);
-        chain.push(normed.as_dyn().clone());
-        let lens_logits: Tensor<3, f32> = Linear::new(self.head.clone(), None).forward(&normed);
-        chain.push(lens_logits.as_dyn().clone());
-        for map in &attention {
-            chain.push(map.as_dyn().clone());
-        }
+        let lens_logits =
+            self.weights
+                .forward(&tokens, self.config, &mut chain, Some(&mut attention));
 
         Ok(Single {
             compiled: None,
@@ -795,22 +683,6 @@ impl Lm {
 }
 
 impl Block {
-    fn parameters(&self) -> Vec<Dyn> {
-        [
-            &self.attn_norm.as_dyn().clone(),
-            &self.q.as_dyn().clone(),
-            &self.k.as_dyn().clone(),
-            &self.v.as_dyn().clone(),
-            &self.proj.as_dyn().clone(),
-            &self.mlp_norm.as_dyn().clone(),
-            &self.up.as_dyn().clone(),
-            &self.down.as_dyn().clone(),
-        ]
-        .into_iter()
-        .cloned()
-        .collect()
-    }
-
     /// Pre-norm feed-forward, added back into the residual stream.
     fn feed_forward(
         &self,
@@ -830,58 +702,104 @@ impl Block {
         chain.push(out.as_dyn().clone());
         out
     }
-
-    /// Pre-norm multi-head causal attention, added back into the stream.
-    fn attend(
-        &self,
-        x: &Tensor<3, f32>,
-        rows: usize,
-        config: ModelConfig,
-        chain: &mut Vec<Dyn>,
-    ) -> Tensor<3, f32> {
-        let h = x
-            .rms_norm(&self.attn_norm, 1e-5)
-            .reshape([rows * config.context, config.dim]);
-        chain.push(h.as_dyn().clone());
-        let heads = |w: &Tensor<2, f32>| -> Tensor<4, f32> {
-            let projected: Tensor<2, f32> = Linear::new(w.clone(), None).forward(&h);
-            projected
-                .reshape([rows, config.context, config.heads, config.head_dim()])
-                .permute([0, 2, 1, 3])
-        };
-        let merged = heads(&self.q)
-            .attention(&heads(&self.k), &heads(&self.v), MaskKind::Causal, None)
-            .permute([0, 2, 1, 3])
-            .reshape([rows * config.context, config.dim]);
-        chain.push(merged.as_dyn().clone());
-        let projected: Tensor<2, f32> = Linear::new(self.proj.clone(), None).forward(&merged);
-        let out = x.add(&projected.reshape([rows, config.context, config.dim]));
-        chain.push(out.as_dyn().clone());
-        out
-    }
 }
 
-/// Embed, run the blocks, and normalize — everything before the head.
-fn forward(
-    tokens: &Tensor<2, u32>,
-    embed: &Tensor<2, f32>,
-    positions: &Tensor<2, f32>,
-    blocks: &[Block],
-    final_norm: &Tensor<1, f32>,
-    config: ModelConfig,
-    chain: &mut Vec<Dyn>,
-) -> Tensor<3, f32> {
-    let rows = tokens.shape()[0];
-    let embedded: Tensor<3, f32> = Embedding::new(embed.clone()).forward(tokens);
-    let mut x = embedded.add_::<2, 3, _>(positions);
-    chain.push(x.as_dyn().clone());
-    for block in blocks {
-        x = block.attend(&x, rows, config, chain);
-        x = block.feed_forward(&x, rows, config, chain);
+impl Weights {
+    fn parameters(&self) -> Vec<Dyn> {
+        let mut parameters = vec![self.embed.as_dyn().clone(), self.positions.as_dyn().clone()];
+        for block in &self.blocks {
+            parameters.extend(
+                [
+                    block.attn_norm.as_dyn(),
+                    block.q.as_dyn(),
+                    block.k.as_dyn(),
+                    block.v.as_dyn(),
+                    block.proj.as_dyn(),
+                    block.mlp_norm.as_dyn(),
+                    block.up.as_dyn(),
+                    block.down.as_dyn(),
+                ]
+                .into_iter()
+                .cloned(),
+            );
+        }
+        parameters.extend([self.final_norm.as_dyn().clone(), self.head.as_dyn().clone()]);
+        parameters
     }
-    let normed = x.rms_norm(final_norm, 1e-5);
-    chain.push(normed.as_dyn().clone());
-    normed
+
+    /// The same transformer builds training, generation and attention-map graphs.
+    /// Requesting maps exposes the probabilities through explicit masked attention.
+    fn forward(
+        &self,
+        tokens: &Tensor<2, u32>,
+        config: ModelConfig,
+        chain: &mut Vec<Dyn>,
+        mut maps: Option<&mut Vec<Tensor<3, f32>>>,
+    ) -> Tensor<3, f32> {
+        let rows = tokens.shape()[0];
+        let mask = maps.as_ref().map(|_| {
+            let causal: Vec<_> = (0..config.context * config.context)
+                .map(|i| {
+                    if i % config.context > i / config.context {
+                        -MASK_FLOOR
+                    } else {
+                        0.0
+                    }
+                })
+                .collect();
+            Tensor::<2, f32>::from_slice(
+                &tokens.device(),
+                [config.context, config.context],
+                &causal,
+            )
+        });
+        let embedded: Tensor<3, f32> = Embedding::new(self.embed.clone()).forward(tokens);
+        let mut x = embedded.add_::<2, 3, _>(&self.positions);
+        chain.push(x.as_dyn().clone());
+        for block in &self.blocks {
+            let h = x
+                .rms_norm(&block.attn_norm, 1e-5)
+                .reshape([rows * config.context, config.dim]);
+            chain.push(h.as_dyn().clone());
+            let heads = |w: &Tensor<2, f32>| -> Tensor<4, f32> {
+                let projected: Tensor<2, f32> = Linear::new(w.clone(), None).forward(&h);
+                projected
+                    .reshape([rows, config.context, config.heads, config.head_dim()])
+                    .permute([0, 2, 1, 3])
+            };
+            let (q, k, v) = (heads(&block.q), heads(&block.k), heads(&block.v));
+            let attended = match (&mask, maps.as_mut()) {
+                (Some(mask), Some(maps)) => {
+                    let probabilities = q
+                        .matmul_t(&k)
+                        .mul_scalar(1.0 / (config.head_dim() as f32).sqrt())
+                        .add_::<2, 4, _>(mask)
+                        .softmax(3usize);
+                    let map = probabilities.reshape([
+                        rows * config.heads,
+                        config.context,
+                        config.context,
+                    ]);
+                    chain.extend([probabilities.as_dyn().clone(), map.as_dyn().clone()]);
+                    maps.push(map);
+                    probabilities.matmul(&v)
+                }
+                _ => q.attention(&k, &v, MaskKind::Causal, None),
+            };
+            let merged = attended
+                .permute([0, 2, 1, 3])
+                .reshape([rows * config.context, config.dim]);
+            chain.push(merged.as_dyn().clone());
+            let projected: Tensor<2, f32> = Linear::new(block.proj.clone(), None).forward(&merged);
+            x = x.add(&projected.reshape([rows, config.context, config.dim]));
+            chain.push(x.as_dyn().clone());
+            x = block.feed_forward(&x, rows, config, chain);
+        }
+        let normed = x.rms_norm(&self.final_norm, 1e-5);
+        let logits = Linear::new(self.head.clone(), None).forward(&normed);
+        chain.extend([normed.as_dyn().clone(), logits.as_dyn().clone()]);
+        logits
+    }
 }
 
 /// What the attention panel draws.
@@ -959,9 +877,10 @@ mod tests {
                     .unwrap();
                 compiled.compile_training(Default::default()).await.unwrap();
                 let allocated: usize = compiled
-                    .slots
+                    .weights
+                    .parameters()
                     .iter()
-                    .map(|s| s.value.elem_count().unwrap() as usize)
+                    .map(|s| s.elem_count().unwrap() as usize)
                     .sum();
                 assert_eq!(allocated, config.parameters(corpus.vocab_size()));
                 for _ in 0..3 {
@@ -970,15 +889,15 @@ mod tests {
                     assert!((a.loss - b.loss).abs() < 2e-4, "{} vs {}", a.loss, b.loss);
                 }
                 let state: Vec<_> = compiled
-                    .slots
+                    .feedback
                     .iter()
-                    .flat_map(|s| [s.value.clone(), s.m.clone(), s.v.clone()])
+                    .map(|(state, _)| state.clone())
                     .collect();
                 compiled.compiled.as_ref().unwrap().export(&state).unwrap();
                 let expected: Vec<_> = reference
-                    .slots
+                    .feedback
                     .iter()
-                    .flat_map(|s| [s.value.clone(), s.m.clone(), s.v.clone()])
+                    .map(|(state, _)| state.clone())
                     .collect();
                 for (index, (a, b)) in expected.iter().zip(&state).enumerate() {
                     let a = a.to_bytes_async().await.unwrap();

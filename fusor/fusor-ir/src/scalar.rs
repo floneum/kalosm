@@ -248,101 +248,87 @@ impl ScalarExpr {
         Self::new(ScalarKind::Round { mode, x }, dtype)
     }
 
-    /// `IndexOf(i)` rewritten to `IndexOf(map(i))` throughout. What an
-    /// absorbed producer's coordinates are called in its consumer's space —
-    /// a permuted contraction operand walks producer axis `perm[j]` at its
-    /// own axis `j`, so the body's axis names shift by `perm⁻¹`.
-    pub fn remap_index_axes(&self, map: &impl Fn(u32) -> u32) -> Self {
-        match &self.0.kind {
-            ScalarKind::IndexOf(axis) => Self::index_of(map(*axis)),
-            ScalarKind::Arg(_) | ScalarKind::Lit(_) | ScalarKind::Uniform(_) => self.clone(),
-            ScalarKind::Un { op, x } => Self::un(*op, x.remap_index_axes(map)),
-            ScalarKind::Bin { op, a, b } => {
-                Self::bin(*op, a.remap_index_axes(map), b.remap_index_axes(map))
+    /// Replace an expression before descending into its children. Returning
+    /// `None` preserves the node and recursively rewrites its operands.
+    pub fn rewrite(&self, f: &mut impl FnMut(&Self) -> Option<Self>) -> Self {
+        if let Some(replacement) = f(self) {
+            return replacement;
+        }
+        self.map_children(&mut |child| child.rewrite(f))
+    }
+
+    /// Rebuild the immediate operands, retaining the node's operator.
+    pub fn map_children(&self, f: &mut impl FnMut(&Self) -> Self) -> Self {
+        match self.kind() {
+            ScalarKind::Arg(_)
+            | ScalarKind::Lit(_)
+            | ScalarKind::Uniform(_)
+            | ScalarKind::IndexOf(_) => self.clone(),
+            ScalarKind::Un { op, x } => Self::un(*op, f(x)),
+            ScalarKind::Bin { op, a, b } => Self::bin(*op, f(a), f(b)),
+            ScalarKind::Cmp { op, a, b } => Self::cmp(*op, f(a), f(b)),
+            ScalarKind::Select { c, t, f: other } => Self::select(f(c), f(t), f(other)),
+            ScalarKind::Cast { to, x } => Self::cast(*to, f(x)),
+            ScalarKind::Bitcast { to, x } => Self::bitcast(*to, f(x)),
+            ScalarKind::Round { mode, x } => Self::round(*mode, f(x)),
+            ScalarKind::Dot { a, b } => {
+                Self::new(ScalarKind::Dot { a: f(a), b: f(b) }, self.dtype())
             }
-            ScalarKind::Cmp { op, a, b } => {
-                Self::cmp(*op, a.remap_index_axes(map), b.remap_index_axes(map))
-            }
-            ScalarKind::Select { c, t, f } => Self::select(
-                c.remap_index_axes(map),
-                t.remap_index_axes(map),
-                f.remap_index_axes(map),
-            ),
-            ScalarKind::Cast { to, x } => Self::cast(*to, x.remap_index_axes(map)),
-            ScalarKind::Bitcast { to, x } => Self::bitcast(*to, x.remap_index_axes(map)),
-            ScalarKind::Round { mode, x } => Self::round(*mode, x.remap_index_axes(map)),
-            ScalarKind::Dot { a, b } => Self::new(
-                ScalarKind::Dot {
-                    a: a.remap_index_axes(map),
-                    b: b.remap_index_axes(map),
-                },
-                self.0.dtype,
-            ),
             ScalarKind::Splat { lanes, x } => Self::new(
                 ScalarKind::Splat {
                     lanes: *lanes,
-                    x: x.remap_index_axes(map),
+                    x: f(x),
                 },
-                self.0.dtype,
+                self.dtype(),
             ),
         }
     }
 
-    /// Whether this expression names a loop coordinate anywhere. A lowering
-    /// that evaluates a body with no coordinate vector consults this to know
-    /// whether it must build one.
-    pub fn reads_index_of(&self) -> bool {
-        match &self.0.kind {
-            ScalarKind::IndexOf(_) => true,
-            ScalarKind::Arg(_) | ScalarKind::Lit(_) | ScalarKind::Uniform(_) => false,
+    /// Pre-order traversal; shared subexpressions are visited for each use.
+    pub fn walk(&self, f: &mut impl FnMut(&Self)) {
+        f(self);
+        match self.kind() {
             ScalarKind::Un { x, .. }
             | ScalarKind::Cast { x, .. }
             | ScalarKind::Bitcast { x, .. }
             | ScalarKind::Round { x, .. }
-            | ScalarKind::Splat { x, .. } => x.reads_index_of(),
+            | ScalarKind::Splat { x, .. } => x.walk(f),
             ScalarKind::Bin { a, b, .. }
             | ScalarKind::Cmp { a, b, .. }
-            | ScalarKind::Dot { a, b } => a.reads_index_of() || b.reads_index_of(),
-            ScalarKind::Select { c, t, f } => {
-                c.reads_index_of() || t.reads_index_of() || f.reads_index_of()
+            | ScalarKind::Dot { a, b } => {
+                a.walk(f);
+                b.walk(f);
             }
+            ScalarKind::Select { c, t, f: other } => {
+                c.walk(f);
+                t.walk(f);
+                other.walk(f);
+            }
+            _ => {}
         }
     }
 
-    /// Substitute `args` for `Arg(i)` throughout. This *is*
-    /// elementwise-into-elementwise fusion: `pre.compose(body)` needs no
-    /// rewrite rule at all, only a tree substitution.
+    /// Resolve an absorbed producer's axes in its consumer's iteration space.
+    pub fn remap_index_axes(&self, map: &impl Fn(u32) -> u32) -> Self {
+        self.rewrite(&mut |e| match e.kind() {
+            ScalarKind::IndexOf(axis) => Some(Self::index_of(map(*axis))),
+            _ => None,
+        })
+    }
+
+    /// Whether the body needs iteration coordinates during lowering.
+    pub fn reads_index_of(&self) -> bool {
+        let mut found = false;
+        self.walk(&mut |e| found |= matches!(e.kind(), ScalarKind::IndexOf(_)));
+        found
+    }
+
+    /// Substitute operand expressions for `Arg(i)` throughout the body.
     pub fn compose(&self, args: &[ScalarExpr]) -> Self {
-        match &self.0.kind {
-            ScalarKind::Arg(i) => args
-                .get(*i as usize)
-                .cloned()
-                .unwrap_or_else(|| self.clone()),
-            ScalarKind::Lit(_) | ScalarKind::Uniform(_) | ScalarKind::IndexOf(_) => self.clone(),
-            ScalarKind::Un { op, x } => Self::un(*op, x.compose(args)),
-            ScalarKind::Bin { op, a, b } => Self::bin(*op, a.compose(args), b.compose(args)),
-            ScalarKind::Cmp { op, a, b } => Self::cmp(*op, a.compose(args), b.compose(args)),
-            ScalarKind::Select { c, t, f } => {
-                Self::select(c.compose(args), t.compose(args), f.compose(args))
-            }
-            ScalarKind::Cast { to, x } => Self::cast(*to, x.compose(args)),
-            ScalarKind::Bitcast { to, x } => Self::bitcast(*to, x.compose(args)),
-            ScalarKind::Round { mode, x } => Self::round(*mode, x.compose(args)),
-            ScalarKind::Dot { a, b } => Self::new(
-                ScalarKind::Dot {
-                    a: a.compose(args),
-                    b: b.compose(args),
-                },
-                self.0.dtype,
-            ),
-            ScalarKind::Splat { lanes, x } => Self::new(
-                ScalarKind::Splat {
-                    lanes: *lanes,
-                    x: x.compose(args),
-                },
-                self.0.dtype,
-            ),
-        }
+        self.rewrite(&mut |e| match e.kind() {
+            ScalarKind::Arg(i) => args.get(*i as usize).cloned(),
+            _ => None,
+        })
     }
 }
 
