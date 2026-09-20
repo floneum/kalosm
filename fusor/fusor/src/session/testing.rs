@@ -102,11 +102,7 @@ impl Session {
                     WRONG_MEMBERS.fetch_add(1, Ordering::Relaxed);
                     wrong += 1;
                     let detail = expected.iter().zip(&actual).enumerate().find_map(
-                        |(o, ((dt, a), (_, b)))| {
-                            (*dt == Dtype::F32)
-                                .then(|| first_mismatch(a, b).map(|m| (o, m)))
-                                .flatten()
-                        },
+                        |(o, ((dt, a), (_, b)))| first_mismatch(*dt, a, b).map(|m| (o, m)),
                     );
                     eprintln!(
                         "[compiler-test] MISCOMPILE: candidate `{label}` of launch {ix}: {detail:?}"
@@ -125,23 +121,35 @@ impl Session {
     }
 }
 
-/// The first disagreeing f32 element and the worst one, for the MISCOMPILE
+/// The first disagreeing float element and the worst one, for the MISCOMPILE
 /// report: `(first_index, expected, got, worst_abs_diff)`.
-pub(super) fn first_mismatch(a: &[u8], b: &[u8]) -> Option<(usize, f32, f32, f32)> {
+pub(super) fn first_mismatch(dtype: Dtype, a: &[u8], b: &[u8]) -> Option<(usize, f32, f32, f32)> {
+    if !dtype.is_float() {
+        return None;
+    }
     let f = |s: &[u8]| {
-        s.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
+        s.chunks_exact(dtype.byte_size() as usize)
+            .map(|c| match dtype {
+                Dtype::F16 => half::f16::from_le_bytes(c.try_into().unwrap()).to_f32(),
+                Dtype::BF16 => half::bf16::from_le_bytes(c.try_into().unwrap()).to_f32(),
+                _ => f32::from_le_bytes(c.try_into().unwrap()),
+            })
             .collect::<Vec<f32>>()
     };
     let (x, y) = (f(a), f(b));
-    let scale = x.iter().fold(1.0f32, |m, v| m.max(v.abs()));
+    let scale = x
+        .iter()
+        .filter(|v| v.is_finite())
+        .fold(1.0f32, |m, v| m.max(v.abs()));
+    let tolerance = if dtype == Dtype::BF16 { 1e-2 } else { 1e-3 } * scale;
     let mut first = None;
     let mut worst = 0.0f32;
     for (i, (p, q)) in x.iter().zip(&y).enumerate() {
+        if p == q {
+            continue;
+        }
         let d = (p - q).abs();
-        if d > 1e-3 * scale && first.is_none() {
+        if (!p.is_finite() || !q.is_finite() || d > tolerance) && first.is_none() {
             first = Some((i, *p, *q));
         }
         worst = worst.max(d);
@@ -156,17 +164,53 @@ pub(super) fn agrees(dtype: Dtype, a: &[u8], b: &[u8]) -> bool {
     if a == b {
         return true;
     }
-    if dtype != Dtype::F32 {
-        return false;
+    dtype.is_float()
+        && a.len().is_multiple_of(dtype.byte_size() as usize)
+        && first_mismatch(dtype, a, b).is_none()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn member_comparison_handles_narrow_float_rounding() {
+        let a = half::f16::from_f32(1.000_976_6).to_f32();
+        let b = half::f16::from_f32(1.018_554_7).to_f32();
+        let separate = half::f16::from_f32(half::f16::from_f32(a * b).to_f32() + a);
+        let fused = half::f16::from_f32(a.mul_add(b, a));
+        assert_ne!(separate, fused);
+        assert!(agrees(
+            Dtype::F16,
+            &separate.to_le_bytes(),
+            &fused.to_le_bytes()
+        ));
+        for dtype in [Dtype::F16, Dtype::BF16, Dtype::F32] {
+            assert!(!agrees(dtype, &[0], &[1]));
+            let bytes = |v| match dtype {
+                Dtype::F16 => half::f16::from_f32(v).to_le_bytes().to_vec(),
+                Dtype::BF16 => half::bf16::from_f32(v).to_le_bytes().to_vec(),
+                _ => v.to_le_bytes().to_vec(),
+            };
+            let rounded = if dtype == Dtype::BF16 {
+                2.015625
+            } else {
+                2.001
+            };
+            assert!(agrees(dtype, &bytes(2.0), &bytes(rounded)));
+            for wrong in [2.125, f32::INFINITY, f32::NEG_INFINITY, f32::NAN] {
+                assert!(!agrees(dtype, &bytes(2.0), &bytes(wrong)));
+            }
+            assert!(!agrees(
+                dtype,
+                &[bytes(f32::INFINITY), bytes(2.0)].concat(),
+                &[bytes(f32::INFINITY), bytes(2.125)].concat()
+            ));
+        }
+        assert!(!agrees(
+            Dtype::U32,
+            &10000u32.to_le_bytes(),
+            &10001u32.to_le_bytes()
+        ));
     }
-    let f = |s: &[u8]| {
-        s.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect::<Vec<f32>>()
-    };
-    let (x, y) = (f(a), f(b));
-    let scale = x.iter().fold(1.0f32, |m, v| m.max(v.abs()));
-    x.iter().zip(&y).all(|(p, q)| (p - q).abs() <= 1e-3 * scale)
 }

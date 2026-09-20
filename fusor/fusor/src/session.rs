@@ -1188,12 +1188,12 @@ impl Session {
                 let concrete = self.read_bytes_locked(resolving, graph, value.id)?;
                 let dtype = graph.facts(value.id).dtype;
                 if !agrees(dtype, &concrete, twin_bytes) {
-                    let detail = (dtype == Dtype::F32)
-                        .then(|| first_mismatch(&concrete, twin_bytes))
-                        .flatten()
-                        .map_or_else(String::new, |(i, p, q, w)| {
+                    let detail = first_mismatch(dtype, &concrete, twin_bytes).map_or_else(
+                        String::new,
+                        |(i, p, q, w)| {
                             format!(" (elem {i}: concrete {p} vs twin {q}, worst |d| {w})")
-                        });
+                        },
+                    );
                     return Err(Error::Plan(format!(
                         "shape family twin disagrees with its member on output {o} ({} vs {} \
                          bytes){detail}",
