@@ -14,7 +14,7 @@ use fusor::composite::{
 };
 use fusor::graph::GraphRef;
 use fusor::tensor::Dyn as Tensor;
-use fusor::{Dtype, Session};
+use fusor::{Dim, Dtype, Session};
 use fusor_ir::ir::launch::MaskKind;
 
 use crate::harness::{
@@ -230,6 +230,79 @@ fn causal_mask(lq: usize, lk: usize, i: usize, j: usize) -> f32 {
     }
 }
 
+async fn symbolic_causal_attention(session: &Session) -> CaseResult {
+    for derived in [false, true] {
+        let graph = graph_of(session);
+        let q_sym = graph.sym("query_count");
+        let k_sym = graph.sym("key_count");
+        let q_len = if derived {
+            q_sym * Dim::Const(2) + Dim::ONE
+        } else {
+            Dim::Const(3)
+        };
+        let k_len = if derived {
+            k_sym * Dim::Const(2) + Dim::ONE
+        } else {
+            k_sym
+        };
+        let q = graph.leaf(
+            "",
+            &[Dim::ONE, Dim::Const(2), q_len, Dim::Const(4)],
+            Dtype::F32,
+        )?;
+        let k = graph.leaf(
+            "",
+            &[Dim::ONE, Dim::Const(2), k_len, Dim::Const(4)],
+            Dtype::F32,
+        )?;
+        let v = graph.leaf("", &k.shape(), Dtype::F32)?;
+        let out = attention_causal(&q, &k, &v, None)?;
+        for (step, (query, key)) in [(3, 3), (3, 7), (5, 17), (1, 7), (5, 17), (3, 1)]
+            .into_iter()
+            .enumerate()
+        {
+            let query = if derived { query } else { 3 };
+            graph.bind("query_count", ((query - 1) / 2) as u64);
+            graph.bind(
+                "key_count",
+                if derived { (key - 1) / 2 } else { key } as u64,
+            );
+            let d = AttnDims {
+                b: 1,
+                h: 2,
+                heads_kv: 2,
+                lq: query,
+                lk: key,
+                dh: 4,
+            };
+            let q_host = Domain::Wide.sample(step as u32 * 3 + 1, d.q_len());
+            let k_host = Domain::Wide.sample(step as u32 * 3 + 2, d.kv_len());
+            let v_host = Domain::Wide.sample(step as u32 * 3 + 3, d.kv_len());
+            for (tensor, values) in [(&q, &q_host), (&k, &k_host), (&v, &v_host)] {
+                tensor.set_bytes(values.iter().flat_map(|v| v.to_le_bytes()).collect())?;
+            }
+            out.clear_device_buf();
+            let expected =
+                host_attention(&q_host, &k_host, &v_host, d, d.default_scale(), &|i, j| {
+                    if j <= i + key.saturating_sub(query) {
+                        0.
+                    } else {
+                        f32::NEG_INFINITY
+                    }
+                })
+                .0;
+            let actual = out
+                .to_bytes_async()
+                .await?
+                .chunks_exact(4)
+                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .collect::<Vec<_>>();
+            expect_values(session, &d.q_shape(), Dtype::F32, &actual, &expected).await?;
+        }
+    }
+    Ok(())
+}
+
 /// Host `(dq, dk, dv)` at `heads_kv == H`.
 fn host_attention_grads(
     q: &[f32],
@@ -396,6 +469,11 @@ fn rope_tables(dh: usize, max_len: usize) -> (Vec<f32>, Vec<f32>) {
 
 pub fn cases() -> Cases {
     let mut cases = Cases::new();
+    cases.push(
+        "attention_rope",
+        "attention_causal_symbolic_lengths",
+        symbolic_causal_attention,
+    );
 
     cases.push_case(fuzz_case(
         "attention_rope",

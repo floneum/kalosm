@@ -28,7 +28,7 @@ impl CoreSaturate {
 }
 
 /// Dense index of an [`OpTag`], for the O(1) head-dispatch table.
-const TAG_COUNT: usize = 18;
+const TAG_COUNT: usize = 19;
 
 const fn tag_index(tag: OpTag) -> usize {
     match tag {
@@ -50,6 +50,7 @@ const fn tag_index(tag: OpTag) -> usize {
         OpTag::Union => 15,
         OpTag::LaunchSlab => 16,
         OpTag::LaunchGroup => 17,
+        OpTag::LaunchStreamFold => 18,
     }
 }
 
@@ -76,7 +77,6 @@ impl Saturate for CoreSaturate {
     ) -> Result<SaturationReport> {
         let start = Instant::now();
         let initial = graph.len();
-        let max_nodes = budget.node_slope as usize * initial + budget.node_slack as usize;
 
         let by_head = head_table(rules);
         let mut fired_counts = vec![0u32; rules.len()];
@@ -84,12 +84,6 @@ impl Saturate for CoreSaturate {
         let mut saturated = true;
         let mut rounds = 0u32;
         let mut applications = 0u32;
-
-        // One rule fires at most once per node. The stride is fixed for the
-        // whole call so a bit's index never moves; the set itself grows with
-        // the graph.
-        let stride = max_nodes.max(initial).saturating_add(4096).max(64);
-        let mut fired = FixedBitSet::with_capacity(rules.len().saturating_mul(64));
 
         // Creation order is already a topological order: children are
         // strictly smaller ids. Only what the roots reach is offered: a
@@ -104,6 +98,21 @@ impl Saturate for CoreSaturate {
             .map(|i| Id(i as u32))
             .filter(|id| !graph.is_offered(*id))
             .collect();
+        let new_nodes = work.len();
+        let max_nodes = (initial - new_nodes)
+            .saturating_add((budget.node_slope as usize).saturating_mul(new_nodes))
+            .saturating_add(budget.node_slack as usize);
+        let max_applications = budget.max_applications.max(
+            budget
+                .application_slope
+                .saturating_mul(new_nodes.min(u32::MAX as usize) as u32),
+        );
+        // One rule fires at most once per node. The stride is fixed for the
+        // whole call so a bit's index never moves; the set itself grows with
+        // the graph.
+        let stride = max_nodes.max(initial).saturating_add(4096).max(64);
+        let mut fired = FixedBitSet::with_capacity(rules.len().saturating_mul(64));
+
         let mut next: Vec<Id> = Vec::new();
 
         'rounds: while rounds < budget.max_rounds && !work.is_empty() {
@@ -120,7 +129,7 @@ impl Saturate for CoreSaturate {
                 let node = graph.node(id).clone();
                 let facts = graph.facts_view(id, caps);
                 for &rid in candidates.iter() {
-                    if graph.len() >= max_nodes || applications >= budget.max_applications {
+                    if graph.len() >= max_nodes || applications >= max_applications {
                         saturated = false;
                         let class = graph.class_of(id).0;
                         if !truncated.contains(&class) {

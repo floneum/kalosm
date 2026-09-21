@@ -829,10 +829,18 @@ impl Launcher {
     /// group pins the buffers it was built over, so one built for a kernel
     /// nobody will dispatch again is holding memory for nothing.
     pub fn retain_bind_groups(&self, live: &rustc_hash::FxHashSet<u64>) {
+        self.retain_groups(|key| live.contains(&key.artifact));
+    }
+
+    pub(crate) fn prune_dead_bind_groups(&self) {
+        self.retain_groups(|_| true);
+    }
+
+    fn retain_groups(&self, keep: impl Fn(&BindGroupKey) -> bool) {
         let mut groups = self.bind_groups.lock();
         let dead: Vec<BindGroupKey> = groups
             .iter()
-            .filter(|(k, _)| !live.contains(&k.artifact))
+            .filter(|(k, e)| !keep(k) || e.witnesses.iter().any(|w| !w.alive()))
             .map(|(k, _)| k.clone())
             .collect();
         for k in dead {
@@ -971,7 +979,7 @@ impl Launcher {
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
             state("copy");
         }
-        let done = self.begin_map(staging)?;
+        let done = self.begin_map(staging, bytes)?;
         // A dropped future must not leave the map outstanding: the staging
         // buffer returns to the pool, and a mapped one panics the next
         // readback that draws it.
@@ -996,31 +1004,31 @@ impl Launcher {
                 }
             })?
             .map_err(|e| Error::Device(format!("buffer map failed: {e}")))?;
-        Self::finish_map(staging)
+        Self::finish_map(staging, bytes)
     }
 
-    /// Issue the map of the whole staging buffer; the returned signal
+    /// Issue the map of the requested bytes; the returned signal
     /// completes when the callback runs.
     ///
     /// See [`MapGuard`] for what happens if nobody waits for it.
-    fn begin_map(&self, staging: &Buf) -> Result<MapDone> {
+    fn begin_map(&self, staging: &Buf, bytes: u64) -> Result<MapDone> {
         let gpu = staging
             .downcast_ref::<GpuBuffer>()
             .ok_or_else(|| Error::Device("staging buffer is not pooled".into()))?;
         let done = MapDone::default();
         let signal = done.clone();
         gpu.buffer
-            .slice(..)
+            .slice(..bytes)
             .map_async(wgpu::MapMode::Read, move |r| signal.complete(r));
         Ok(done)
     }
 
     /// Copy the mapped bytes out and unmap.
-    fn finish_map(staging: &Buf) -> Result<Vec<u8>> {
+    fn finish_map(staging: &Buf, bytes: u64) -> Result<Vec<u8>> {
         let gpu = staging
             .downcast_ref::<GpuBuffer>()
             .ok_or_else(|| Error::Device("staging buffer is not pooled".into()))?;
-        let out = gpu.buffer.slice(..).get_mapped_range().to_vec();
+        let out = gpu.buffer.slice(..bytes).get_mapped_range().to_vec();
         gpu.buffer.unmap();
         Ok(out)
     }

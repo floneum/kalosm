@@ -47,8 +47,11 @@ pub(crate) enum StagedSource {
     Const(TileExpr),
     Indexed {
         operand: Box<Operand>,
-        rows: u32,
-        cols: u32,
+        cols: Dim,
+        elements: u64,
+        // Proven axis boundaries of the independent batch, row and column coordinates.
+        axes: Option<(usize, usize)>,
+        rows_per_batch: Dim,
     },
 }
 pub(crate) fn bound_layout(cx: &LowerCtx<'_>, value: Id) -> (Layout, Dtype) {
@@ -101,7 +104,7 @@ pub(crate) struct DimBinding {
     values: FxHashMap<SymId, u64>,
     consulted: std::sync::Arc<parking_lot::Mutex<rustc_hash::FxHashSet<SymId>>>,
     /// Symbols read *only* to fold the dispatch grid, and the
-    /// `(space, block)` pairs those reads served. The grid is not the body:
+    /// `(space, block, inner_tile)` grids those reads served. The grid is not the body:
     /// a symbol that moved only the workgroup count leaves the emitted
     /// module byte-identical, so it must not force a rebuild. Recording the
     /// derivation lets the artifact cache recompute the grid at the new
@@ -113,13 +116,13 @@ pub(crate) struct DimBinding {
 #[derive(Clone, Debug, Default)]
 struct GridReads {
     symbols: rustc_hash::FxHashSet<SymId>,
-    /// Every distinct `(space, block)` [`grid_for`] was called with. More
+    /// Every distinct dispatch grid requested by the lowering. More
     /// than one and the lowering's committed grid is ambiguous from here, so
     /// nothing is replayable and the reads fall back to `consulted`.
     specs: Vec<GridSpec>,
 }
 
-/// The index space and workgroup width one [`grid_for`] call folded.
+/// The index space, innermost-axis tile and workgroup width of a dispatch.
 ///
 /// This is the whole of a dispatch grid's dependence on the binding: replaying
 /// it at another binding is exactly what re-lowering would have computed.
@@ -127,6 +130,7 @@ struct GridReads {
 pub(crate) struct GridSpec {
     pub space: IndexSpace,
     pub block: u32,
+    pub inner_tile: u32,
 }
 
 impl DimBinding {
@@ -200,7 +204,7 @@ impl DimBinding {
             }
             first
         };
-        (grid_from(&spec.space, spec.block, self, limits).ok()? == grid).then_some(spec)
+        (spec.grid(self, limits).ok()? == grid).then_some(spec)
     }
 
     /// Every symbol whose value the emitted module can depend on.
@@ -226,36 +230,45 @@ pub(crate) fn grid_for(
     binding: &DimBinding,
     limits: &Limits,
 ) -> Result<[u32; 3]> {
-    binding.grid.lock().specs.push(GridSpec {
-        space: space.clone(),
-        block,
-    });
-    grid_from(space, block, binding, limits)
+    tiled_grid_for(space, block, 1, binding, limits)
 }
 
-/// Fold a grid without recording the fold. [`grid_for`] is this plus the
-/// record the artifact cache replays; a caller that already *holds* a
-/// [`GridSpec`] is evaluating that record, not making a new one.
-pub(crate) fn grid_from(
+pub(crate) fn tiled_grid_for(
     space: &IndexSpace,
     block: u32,
+    inner_tile: u32,
     binding: &DimBinding,
     limits: &Limits,
 ) -> Result<[u32; 3]> {
-    let mut elements: u64 = 1;
-    for dim in &space.dims {
-        elements = elements
-            .checked_mul(binding.require_for_grid(*dim)?)
-            .ok_or_else(|| Error::Plan("index space overflows a u64".into()))?;
+    let spec = GridSpec {
+        space: space.clone(),
+        block,
+        inner_tile,
+    };
+    binding.grid.lock().specs.push(spec.clone());
+    spec.grid(binding, limits)
+}
+
+impl GridSpec {
+    pub(crate) fn grid(&self, binding: &DimBinding, limits: &Limits) -> Result<[u32; 3]> {
+        let mut elements: u64 = 1;
+        for (axis, dim) in self.space.dims.iter().enumerate() {
+            let mut extent = binding.require_for_grid(*dim)?;
+            if axis + 1 == self.space.rank() {
+                extent = extent.div_ceil(u64::from(self.inner_tile.max(1)));
+            }
+            elements = elements
+                .checked_mul(extent)
+                .ok_or_else(|| Error::Plan("index space overflows a u64".into()))?;
+        }
+        let groups = elements.div_ceil(u64::from(self.block.max(1)));
+        let groups = u32::try_from(groups)
+            .map_err(|_| Error::Plan(format!("{groups} workgroups exceeds a u32")))?;
+        Ok(distribute_workgroups(
+            groups,
+            limits.max_compute_workgroups_per_dimension,
+        ))
     }
-    let block = u64::from(block.max(1));
-    let groups = elements.div_ceil(block);
-    let groups = u32::try_from(groups)
-        .map_err(|_| Error::Plan(format!("{groups} workgroups exceeds a u32")))?;
-    Ok(distribute_workgroups(
-        groups,
-        limits.max_compute_workgroups_per_dimension,
-    ))
 }
 
 /// An N-D strided operand seen as a 2-D matrix.
@@ -1159,9 +1172,11 @@ impl<'a> Ctx<'a> {
     pub(crate) fn contract_side_sources(
         &mut self,
         side: &ContractSide,
-        rows: u32,
-        cols: u32,
+        batch: u32,
+        rows_per_batch: Dim,
+        cols: Dim,
     ) -> Result<Vec<StagedSource>> {
+        let rows = Dim::Const(u64::from(batch)) * rows_per_batch;
         side.ops
             .iter()
             .map(|o| {
@@ -1171,12 +1186,55 @@ impl<'a> Ctx<'a> {
                 if let Some(lit) = self.const_operand(o.src) {
                     return Ok(StagedSource::Const(lit));
                 }
-                match self.contract_operand_view(o, rows, cols)? {
+                let view = match (rows.as_const(), cols.as_const()) {
+                    (Some(rows), Some(cols))
+                        if o.layout.shape().iter().all(|d| d.as_const().is_some())
+                            && o.layout.strides().iter().all(|d| d.as_const().is_some())
+                            && o.layout.offset().as_const().is_some() =>
+                    {
+                        let extent = |value| {
+                            u32::try_from(value).map_err(|_| {
+                                Error::Plan("contraction matrix extent exceeds a u32".into())
+                            })
+                        };
+                        self.contract_operand_view(o, extent(rows)?, extent(cols)?)?
+                    }
+                    _ => None,
+                };
+                match view {
                     Some(view) => Ok(StagedSource::Mem(self.contract_stage_source(o, &view)?)),
                     None => Ok(StagedSource::Indexed {
                         operand: Box::new(o.clone()),
-                        rows,
                         cols,
+                        rows_per_batch,
+                        axes: if matches!(o.access, fusor_ir::ir::launch::AccessPlan::Unflatten(_))
+                        {
+                            None
+                        } else {
+                            let shape = o.layout.shape();
+                            let product = |dims: &[Dim]| {
+                                let value = dims.iter().copied().fold(Dim::ONE, |a, b| a * b);
+                                (value != Dim::Sym(fusor_ir::shape::OPAQUE_SYM)).then_some(value)
+                            };
+                            (0..=shape.len()).rev().find_map(|column| {
+                                if product(&shape[column..]) != Some(cols) {
+                                    return None;
+                                }
+                                (0..=column)
+                                    .rev()
+                                    .find(|&row| {
+                                        product(&shape[..row]) == Some(Dim::Const(u64::from(batch)))
+                                            && product(&shape[row..column]) == Some(rows_per_batch)
+                                    })
+                                    .map(|row| (row, column))
+                            })
+                        },
+                        elements: o
+                            .layout
+                            .shape()
+                            .iter()
+                            .try_fold(1u64, |n, d| n.checked_mul(d.as_const()?))
+                            .unwrap_or(u64::MAX),
                     }),
                 }
             })
@@ -1346,6 +1404,9 @@ impl<'a> Ctx<'a> {
                 fusor_ir::dtype::Splat::U32(v) => self.b.u32(v),
                 fusor_ir::dtype::Splat::I32(v) => self.b.i32(v),
             },
+            K::Uniform(sym) if expr.dtype() == Dtype::U32 && self.pack.dim_slot(*sym).is_some() => {
+                self.dim_expr(Dim::Sym(*sym))?
+            }
             K::Uniform(sym) => self.scalar_expr(*sym)?,
             K::IndexOf(axis) => {
                 let c = coords.get(*axis as usize).cloned().ok_or_else(|| {
@@ -1514,25 +1575,30 @@ impl<'a> Ctx<'a> {
                 operand.src, operand.layout
             )));
         }
-        let layout = operand.layout.clone();
-        // A contiguous offset-0 layout is the identity over its own space —
-        // the dense read every elementwise kernel does.
-        if layout.is_contiguous() && layout.offset().known_eq(Dim::Const(0)) {
+        let layout = &operand.layout;
+        let offset = self.dim_expr(layout.offset())?;
+        let relative = self.strided_address(flat, layout.shape(), layout.strides())?;
+        Ok(self.b.add(offset, relative))
+    }
+
+    fn strided_address(
+        &mut self,
+        flat: TileExpr,
+        shape: &[Dim],
+        strides: &[Dim],
+    ) -> Result<TileExpr> {
+        if shape.iter().all(|extent| extent.known_eq(Dim::ONE)) {
+            return Ok(self.b.u32(0));
+        }
+        if strides == Layout::row_major_strides(shape).as_slice() {
             return Ok(flat);
         }
-        let shape: Vec<Dim> = layout.shape().to_vec();
-        let strides: Vec<Dim> = layout.strides().to_vec();
-        let mut acc: Option<TileExpr> = match layout.offset() {
-            Dim::Const(0) => None,
-            d => Some(self.dim_expr(d)?),
-        };
-        // Product of extents right of the current axis, as an expression;
-        // `None` is 1.
+        let mut acc: Option<TileExpr> = None;
         let mut div: Option<TileExpr> = None;
         for axis in (0..shape.len()).rev() {
             let extent = shape[axis];
             let stride = strides[axis];
-            let contributes = !stride.known_eq(Dim::Const(0)) && !extent.known_eq(Dim::Const(1));
+            let contributes = !stride.known_eq(Dim::Const(0)) && !extent.known_eq(Dim::ONE);
             if contributes {
                 let mut e = flat.clone();
                 if let Some(d) = &div {
@@ -1546,7 +1612,7 @@ impl<'a> Ctx<'a> {
                         .b
                         .binary(TileBinaryOp::Rem, e, m, NumericContract::RELAXED);
                 }
-                if !stride.known_eq(Dim::Const(1)) {
+                if !stride.known_eq(Dim::ONE) {
                     let s = self.dim_expr(stride)?;
                     e = self.b.mul(e, s);
                 }
@@ -1555,7 +1621,7 @@ impl<'a> Ctx<'a> {
                     None => e,
                 });
             }
-            if !extent.known_eq(Dim::Const(1)) {
+            if !extent.known_eq(Dim::ONE) {
                 let m = self.dim_expr(extent)?;
                 div = Some(match div {
                     Some(d) => self.b.mul(d, m),
@@ -1563,10 +1629,7 @@ impl<'a> Ctx<'a> {
                 });
             }
         }
-        Ok(match acc {
-            Some(a) => a,
-            None => self.b.u32(0),
-        })
+        Ok(acc.unwrap_or_else(|| self.b.u32(0)))
     }
 
     /// Re-address a **logical** dense element index of `src` into the buffer
@@ -1805,7 +1868,9 @@ pub(crate) fn lower_node(
     let ctx = Ctx::with_pack(caps, cx, binding, pack)?;
     match op {
         Launch::Map { .. } => map_fold::lower_kmap(ctx, op, theta).map(|k| vec![k]),
-        Launch::Fold { .. } => map_fold::lower_kfold(ctx, op, theta).map(|k| vec![k]),
+        Launch::Fold { .. } | Launch::StreamFold { .. } => {
+            map_fold::lower_kfold(ctx, op, theta).map(|k| vec![k])
+        }
         Launch::Contract { family, .. } => contract::lower_contract(ctx, op, *family, theta),
         Launch::Gather { .. } => gather_scatter::lower_kgather(ctx, op, theta).map(|k| vec![k]),
         Launch::Scatter { .. } => gather_scatter::lower_kscatter(ctx, op, theta),
@@ -1840,7 +1905,7 @@ pub(crate) fn lower_member(
     ctx.block_floor = block_floor;
     match op {
         Launch::Map { .. } => map_fold::lower_kmap(ctx, op, theta),
-        Launch::Fold { .. } => map_fold::lower_kfold(ctx, op, theta),
+        Launch::Fold { .. } | Launch::StreamFold { .. } => map_fold::lower_kfold(ctx, op, theta),
         Launch::Slab { .. } => slab::lower_kslab(ctx, op, theta),
         Launch::Gather { .. } => gather_scatter::lower_kgather(ctx, op, theta),
         Launch::Contract { family, .. } => {

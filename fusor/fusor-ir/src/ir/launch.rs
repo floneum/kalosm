@@ -10,12 +10,9 @@ use crate::ir::OpTag;
 use crate::scalar::ScalarExpr;
 use crate::shape::{Dim, Layout, MultiFlattenMap, SlidingWindow};
 use smallvec::SmallVec;
+use std::sync::Arc;
 
 /// The Launch op family.
-// `Contract` carries its whole tile vocabulary inline and dwarfs the other
-// variants. Nodes are hash-consed once and read many times, and every rule
-// destructures them by value pattern; the indirection boxing would add is
-// not worth the size of a variant that is a minority of any real graph.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Launch {
@@ -48,6 +45,18 @@ pub enum Launch {
         /// a post never changes the appended carrier axis.
         post: SmallVec<[ScalarExpr; 4]>,
         ops: Vec<Operand>,
+        sched: ScheduleDomain,
+    },
+
+    /// Inline a scalar producer Fold at one operand of another Fold.
+    /// Both recipes contain ordinary Folds; the replaced operand's `src`
+    /// is ignored and canonicalized to `Id(0)`. Its layout maps consumer
+    /// coordinates into the producer's dense output. Only the recipes'
+    /// external operands are graph children.
+    StreamFold {
+        producer: Box<Launch>,
+        fold: Box<Launch>,
+        operand: u32,
         sched: ScheduleDomain,
     },
 
@@ -119,10 +128,187 @@ pub enum Launch {
     },
 }
 impl Launch {
+    /// A producer read must address a scalar Fold's dense output. Constant
+    /// layouts admit bounded striding; symbolic layouts must be a projection
+    /// of its axes, including permutation and broadcast.
+    pub fn stream_fold(producer: Self, mut fold: Self, operand: u32) -> Option<Self> {
+        let Self::Fold { sched, ops, .. } = &mut fold else {
+            return None;
+        };
+        let sched = sched.clone();
+        ops.get_mut(operand as usize)?.src = Id(0);
+        let op = Self::StreamFold {
+            producer: Box::new(producer),
+            fold: Box::new(fold),
+            operand,
+            sched,
+        };
+        op.stream_compatible().then_some(op)
+    }
+
+    pub fn stream_compatible(&self) -> bool {
+        let Self::StreamFold {
+            producer,
+            fold,
+            operand,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        let Self::Fold {
+            space: source,
+            axis,
+            carrier,
+            vec_axes,
+            post,
+            ..
+        } = producer.as_ref()
+        else {
+            return false;
+        };
+        let Self::Fold { space, ops, .. } = fold.as_ref() else {
+            return false;
+        };
+        if carrier.slots.as_slice() != [crate::carrier::SlotTy::Scalar]
+            || !vec_axes.is_empty()
+            || post.len() != 1
+            || !carrier.associative
+            || *axis as usize >= source.rank()
+        {
+            return false;
+        }
+        let mut supported = true;
+        post[0].walk(&mut |e| {
+            if matches!(e.kind(), crate::scalar::ScalarKind::IndexOf(i) if *i > 0) {
+                supported = false;
+            }
+        });
+        for merge in &carrier.merge {
+            merge.walk(&mut |e| {
+                if matches!(e.kind(), crate::scalar::ScalarKind::IndexOf(_)) {
+                    supported = false;
+                }
+            });
+        }
+        if !supported {
+            return false;
+        }
+        let Some(read) = ops.get(*operand as usize) else {
+            return false;
+        };
+        if !matches!(read.access, AccessPlan::Alias)
+            || !read.layout.offset().known_eq(Dim::Const(0))
+            || read.layout.rank() != space.rank()
+            || !read
+                .layout
+                .shape()
+                .iter()
+                .zip(&space.dims)
+                .all(|(a, b)| a.known_eq(*b) || a.known_eq(Dim::ONE))
+        {
+            return false;
+        }
+        let output: Vec<Dim> = source
+            .dims
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| (i != *axis as usize).then_some(*d))
+            .collect();
+        if output.iter().any(|d| d.known_eq(Dim::Const(0))) {
+            return false;
+        }
+        let count = output
+            .iter()
+            .try_fold(1u64, |n, d| n.checked_mul(d.as_const()?));
+        let last = read
+            .layout
+            .shape()
+            .iter()
+            .zip(read.layout.strides())
+            .try_fold(0u64, |n, (d, s)| {
+                n.checked_add(d.as_const()?.saturating_sub(1).checked_mul(s.as_const()?)?)
+            });
+        if let (Some(count), Some(last)) = (count, last) {
+            return last < count;
+        }
+        let strides = Layout::row_major_strides(&output);
+        let mut used = vec![false; output.len()];
+        for (extent, stride) in read.layout.shape().iter().zip(read.layout.strides()) {
+            if extent.known_eq(Dim::ONE) || stride.known_eq(Dim::Const(0)) {
+                continue;
+            }
+            let Some(i) = output
+                .iter()
+                .zip(&strides)
+                .enumerate()
+                .position(|(i, (d, s))| {
+                    !used[i]
+                        && extent.known_eq(*d)
+                        && stride.known_eq(*s)
+                        && *s != Dim::Sym(crate::shape::OPAQUE_SYM)
+                })
+            else {
+                return false;
+            };
+            used[i] = true;
+        }
+        true
+    }
+
+    /// The GPU fold strategy and block width before a composite widens its block.
+    pub fn fold_schedule(
+        &self,
+        theta: Option<SchedPoint>,
+        caps: &crate::device::Caps,
+    ) -> Option<FoldSchedule> {
+        if let Self::StreamFold { fold, .. } = self {
+            return fold.fold_schedule(theta, caps);
+        }
+        let Self::Fold {
+            carrier, vec_axes, ..
+        } = self
+        else {
+            return None;
+        };
+        if caps.kind != crate::device::DeviceKind::Gpu {
+            return None;
+        }
+        let fast = vec_axes.is_empty() && super::kernel::fast_reduce_op(carrier).is_some();
+        let default = emitted_block(1, caps);
+        let strat = match theta {
+            Some(SchedPoint::Fold(s)) => s,
+            _ if fast && caps.subgroups.is_some() => FoldStrat::Subgroup,
+            _ => FoldStrat::WgTree {
+                lane_group: default,
+            },
+        };
+        let lanes = strat.lane_group(caps.subgroup_width()).max(1);
+        let block = if fast {
+            match strat {
+                FoldStrat::Subgroup => lanes.min(caps.limits.max_compute_invocations_per_workgroup),
+                _ => emitted_block(lanes, caps),
+            }
+        } else {
+            lanes.max(default)
+        };
+        let scratch = if lanes <= 1 || (fast && strat == FoldStrat::Subgroup) {
+            0
+        } else {
+            block
+        };
+        Some(FoldSchedule {
+            strategy: strat,
+            block,
+            scratch,
+        })
+    }
+
     pub const fn tag(&self) -> OpTag {
         match self {
             Self::Map { .. } => OpTag::LaunchMap,
             Self::Fold { .. } => OpTag::LaunchFold,
+            Self::StreamFold { .. } => OpTag::LaunchStreamFold,
             Self::Contract { .. } => OpTag::LaunchContract,
             Self::Gather { .. } => OpTag::LaunchGather,
             Self::Scatter { .. } => OpTag::LaunchScatter,
@@ -136,6 +322,7 @@ impl Launch {
     /// but a promoted `Fold`.
     pub fn iter_space(&self) -> IndexSpace {
         match self {
+            Self::StreamFold { fold, .. } => fold.iter_space(),
             Self::Fold {
                 space, vec_axes, ..
             } if !vec_axes.is_empty() => IndexSpace::new(
@@ -159,6 +346,7 @@ impl Launch {
         match self {
             Self::Map { sched, .. }
             | Self::Fold { sched, .. }
+            | Self::StreamFold { sched, .. }
             | Self::Contract { sched, .. }
             | Self::Gather { sched, .. }
             | Self::Scatter { sched, .. }
@@ -529,11 +717,11 @@ pub struct BufferRole(pub u32);
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ScheduleDomain {
     Point,
-    Coop(CoopDomain),
-    Sgemm(SgemmDomain),
-    Sgemv(SgemvDomain),
-    Fold(FoldDomain),
-    Map(MapDomain),
+    Coop(Arc<CoopDomain>),
+    Sgemm(Arc<SgemmDomain>),
+    Sgemv(Arc<SgemvDomain>),
+    Fold(Arc<FoldDomain>),
+    Map(Arc<MapDomain>),
 }
 
 impl ScheduleDomain {
@@ -767,6 +955,14 @@ pub enum FoldStrat {
     LoopThenTree { iterations: u32, lane_group: u32 },
 }
 
+/// The GPU fold's strategy, thread block, and scratch elements per carrier lane.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FoldSchedule {
+    pub strategy: FoldStrat,
+    pub block: u32,
+    pub scratch: u32,
+}
+
 impl FoldStrat {
     /// The lane group this strategy closes over. `Subgroup` closes over the
     /// device's subgroup, so the caller supplies that width.
@@ -910,7 +1106,7 @@ impl ScheduleDomain {
         if strategies.is_empty() {
             return None;
         }
-        Some(Self::Fold(FoldDomain { strategies }))
+        Some(Self::Fold(FoldDomain { strategies }.into()))
     }
 }
 

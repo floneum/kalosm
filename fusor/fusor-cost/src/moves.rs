@@ -146,14 +146,17 @@ impl SchedCache {
 
 /// Every move worth offering at this state, in a deterministic order:
 /// classes ascending, then nodes ascending.
-pub(crate) fn frontier(graph: &EGraph, extraction: &Extraction, classes: &[ClassId]) -> Vec<Move> {
+pub(crate) fn frontier(graph: &EGraph, selected: &[Id]) -> Vec<Move> {
     let mut out = Vec::new();
+    let mut classes: Vec<_> = selected.iter().map(|id| graph.class_of(*id)).collect();
+    classes.sort_unstable();
+    classes.dedup();
     for class in classes {
-        if !realize::is_singleton(graph, *class) {
-            out.push(Move::Reselect(*class));
+        if !realize::is_singleton(graph, class) {
+            out.push(Move::Reselect(class));
         }
     }
-    let mut selected: Vec<Id> = extraction.sigma.values().copied().collect();
+    let mut selected = selected.to_vec();
     selected.sort_unstable();
     selected.dedup();
     for id in selected {
@@ -171,6 +174,7 @@ pub(crate) fn frontier(graph: &EGraph, extraction: &Extraction, classes: &[Class
 pub(crate) fn candidates(
     graph: &EGraph,
     extraction: &Extraction,
+    selected: &[Id],
     mv: Move,
     lb: &[Picoseconds],
     cache: &mut SchedCache,
@@ -180,7 +184,9 @@ pub(crate) fn candidates(
     match mv {
         Move::Reselect(class) => {
             // A member of a selected slab is that slab's to select.
-            if slab_pinned(graph, extraction, class) {
+            if !selected.iter().any(|id| graph.class_of(*id) == class)
+                || slab_pinned(graph, selected, class)
+            {
                 return out;
             }
             let current = extraction.sigma.get(&class).copied();
@@ -196,6 +202,9 @@ pub(crate) fn candidates(
             }
         }
         Move::Reschedule(node) => {
+            if !selected.contains(&node) {
+                return out;
+            }
             let current = extraction.theta.get(&node).copied();
             for theta in cache.ordered(graph, node, cost) {
                 if Some(*theta) != current {
@@ -210,9 +219,9 @@ pub(crate) fn candidates(
     out
 }
 
-/// Whether `class` is a middle member's class of some selected slab.
-pub(crate) fn slab_pinned(graph: &EGraph, extraction: &Extraction, class: ClassId) -> bool {
-    extraction.sigma.values().any(|sel| {
+/// Whether `class` is a middle member's class of a live composite.
+fn slab_pinned(graph: &EGraph, selected: &[Id], class: ClassId) -> bool {
+    selected.iter().any(|sel| {
         let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) =
             &graph.node(*sel).op
         else {

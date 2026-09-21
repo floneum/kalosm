@@ -49,7 +49,9 @@ pub(crate) fn lower(
         ));
     };
     match op {
-        Launch::Map { .. } | Launch::Fold { .. } => map_fold::lower(caps, node, theta, cx),
+        Launch::Map { .. } | Launch::Fold { .. } | Launch::StreamFold { .. } => {
+            map_fold::lower(caps, node, theta, cx)
+        }
         Launch::Contract { family, .. } => {
             if *family == Family::Coop {
                 // Caps report no cooperative config, so this alternative is never selectable

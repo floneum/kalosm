@@ -212,6 +212,15 @@ fn tiled_grid(
 /// hardware operator closes with a collective; wider carriers use their
 /// expanded merge expressions in the workgroup tree.
 pub(crate) fn lower_kfold(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Result<KernelIr> {
+    let (op, producer) = match op {
+        Launch::StreamFold {
+            producer,
+            fold,
+            operand,
+            ..
+        } => (fold.as_ref(), Some((producer.as_ref(), *operand as usize))),
+        _ => (op, None),
+    };
     let Launch::Fold {
         space,
         axis,
@@ -278,29 +287,10 @@ pub(crate) fn lower_kfold(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> R
     let acc_elem = scalar_element(*acc);
     let acc_ty = ElementType::Scalar(acc_elem);
     let limits = ctx.caps.limits;
-    let max_block = emitted_block(1, ctx.caps);
-    let strat = match theta {
-        SchedPoint::Fold(s) => s,
-        _ if fast.is_some() && ctx.caps.subgroups.is_some() => FoldStrat::Subgroup,
-        _ => FoldStrat::WgTree {
-            lane_group: max_block,
-        },
-    };
-    let lane_group = match strat {
-        FoldStrat::WgTree { lane_group } | FoldStrat::LoopThenTree { lane_group, .. } => {
-            lane_group.max(1)
-        }
-        FoldStrat::Subgroup => ctx.caps.subgroup_width().max(1),
-    };
-    let block = if fast.is_some() {
-        match strat {
-            FoldStrat::Subgroup => lane_group.min(limits.max_compute_invocations_per_workgroup),
-            _ => emitted_block(lane_group, ctx.caps),
-        }
-    } else {
-        lane_group.max(max_block)
-    }
-    .max(ctx.block_floor);
+    let schedule = op.fold_schedule(Some(theta), ctx.caps).expect("GPU Fold");
+    let strat = schedule.strategy;
+    let lane_group = strat.lane_group(ctx.caps.subgroup_width()).max(1);
+    let block = schedule.block.max(ctx.block_floor);
 
     // Output rows are `space` minus the reduced axis and every promoted axis:
     // a promoted extent lives in the carrier's lanes, not in the write map.
@@ -376,55 +366,90 @@ pub(crate) fn lower_kfold(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> R
     // A `Vector` slot is `vec_extent` registers, and lane `(slot, p)` reads
     // every operand at promoted position `p`; an operand invariant in the
     // promoted axes is hash-consed back to one read reused across positions.
-    let lift_at = |ctx: &mut Ctx<'_>, k: &TileExpr| -> Result<Vec<TileExpr>> {
-        let in_range = ctx
-            .b
-            .compare(TileCompareOp::Lt, k.clone(), axis_extent.clone());
-        let mut per_pos: Vec<(Vec<TileExpr>, Vec<TileExpr>)> =
-            Vec::with_capacity(vec_extent as usize);
-        for p in 0..vec_extent {
-            let idx = {
-                let off = ctx.b.mul(k.clone(), inner.clone());
-                let base = ctx.b.add(row_base.clone(), off);
-                if p == 0 {
-                    base
-                } else {
-                    let pe = ctx.b.u32(p as u32);
-                    let shift = ctx.b.mul(pos_stride.clone(), pe);
-                    ctx.b.add(base, shift)
+    let lift_at =
+        |ctx: &mut Ctx<'_>, k: &TileExpr, body: &mut Vec<Stmt>| -> Result<Vec<TileExpr>> {
+            let in_range = ctx
+                .b
+                .compare(TileCompareOp::Lt, k.clone(), axis_extent.clone());
+            let mut per_pos: Vec<(Vec<TileExpr>, Vec<TileExpr>)> =
+                Vec::with_capacity(vec_extent as usize);
+            let mut produced: rustc_hash::FxHashMap<TileExpr, TileExpr> =
+                rustc_hash::FxHashMap::default();
+            let mut first_index = None;
+            for p in 0..vec_extent {
+                let idx = {
+                    let off = ctx.b.mul(k.clone(), inner.clone());
+                    let base = ctx.b.add(row_base.clone(), off);
+                    if p == 0 {
+                        base
+                    } else {
+                        let pe = ctx.b.u32(p as u32);
+                        let shift = ctx.b.mul(pos_stride.clone(), pe);
+                        ctx.b.add(base, shift)
+                    }
+                };
+                let first = first_index.get_or_insert_with(|| idx.clone());
+                let mut args = Vec::with_capacity(ops.len());
+                for (slot, operand) in ops.iter().enumerate() {
+                    if let Some((source, source_slot)) = producer
+                        && slot == source_slot
+                    {
+                        let invariant = !matches!(
+                            operand.access,
+                            fusor_ir::ir::launch::AccessPlan::Unflatten(_)
+                        ) && operand.layout.rank() == space.rank()
+                            && vec_axes.iter().all(|axis| {
+                                operand.layout.strides()[*axis as usize]
+                                    .known_eq(fusor_ir::shape::Dim::Const(0))
+                            });
+                        let at = ctx.operand_address(
+                            operand,
+                            if invariant {
+                                first.clone()
+                            } else {
+                                idx.clone()
+                            },
+                            space_total,
+                        )?;
+                        let value = if let Some(value) = produced.get(&at) {
+                            value.clone()
+                        } else {
+                            let value = fold_element(ctx, source, at.clone(), body)?;
+                            produced.insert(at, value.clone());
+                            value
+                        };
+                        args.push(value);
+                    } else {
+                        args.push(ctx.load_mapped(operand, idx.clone(), space_total)?);
+                    }
                 }
-            };
-            let mut args = Vec::with_capacity(ops.len());
-            for operand in ops {
-                args.push(ctx.load_mapped(operand, idx.clone(), space_total)?);
+                // `IndexOf` on this node names an ITERATION axis; resolve it
+                // through `iter_axes` rather than against `space` directly.
+                let full = ctx.coords_from_linear(idx, space)?;
+                let coords: Vec<TileExpr> = iter_axes.iter().map(|i| full[*i].clone()).collect();
+                per_pos.push((args, coords));
             }
-            // `IndexOf` on this node names an ITERATION axis; resolve it
-            // through `iter_axes` rather than against `space` directly.
-            let full = ctx.coords_from_linear(idx, space)?;
-            let coords: Vec<TileExpr> = iter_axes.iter().map(|i| full[*i].clone()).collect();
-            per_pos.push((args, coords));
-        }
-        let lane_slots = carrier
-            .lane_slots()
-            .ok_or_else(|| Error::Plan("this carrier has a symbolic Vector extent".into()))?;
-        let mut out = Vec::with_capacity(lanes);
-        for (slot, p) in lane_slots {
-            let (args, coords) = &per_pos[p as usize];
-            let (args, coords) = (args.clone(), coords.clone());
-            let v = ctx.eval_scalar(&carrier.lift[slot], &args, &coords)?;
-            let v = ctx.b.cast(v, acc_ty);
-            let ident = identity_expr(ctx, carrier.identity[slot], acc_elem);
-            out.push(ctx.b.select(in_range.clone(), v, ident));
-        }
-        Ok(out)
-    };
+            let lane_slots = carrier
+                .lane_slots()
+                .ok_or_else(|| Error::Plan("this carrier has a symbolic Vector extent".into()))?;
+            let mut out = Vec::with_capacity(lanes);
+            for (slot, p) in lane_slots {
+                let (args, coords) = &per_pos[p as usize];
+                let (args, coords) = (args.clone(), coords.clone());
+                let v = ctx.eval_scalar(&carrier.lift[slot], &args, &coords)?;
+                let v = ctx.b.cast(v, acc_ty);
+                let ident = identity_expr(ctx, carrier.identity[slot], acc_elem);
+                out.push(ctx.b.select(in_range.clone(), v, ident));
+            }
+            Ok(out)
+        };
 
     let one_pass = space.dims[axis]
         .as_const()
         .is_some_and(|k| k <= u64::from(lane_group));
 
     let partials: Vec<TileExpr> = if one_pass {
-        lift_at(&mut ctx, &lane)?
+        lift_at(&mut ctx, &lane, &mut stmts)?
     } else {
         // The per-lane strided loop, carrying `lanes` SSA accumulators seeded
         // from the carrier's identities and absorbed with its own `merge`.
@@ -450,7 +475,8 @@ pub(crate) fn lower_kfold(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> R
                 update: read,
             });
         }
-        let values = lift_at(&mut ctx, &k)?;
+        let mut loop_body = Vec::new();
+        let values = lift_at(&mut ctx, &k, &mut loop_body)?;
         let mut args = acc_reads.clone();
         args.extend(values);
         for slot in 0..lanes {
@@ -478,7 +504,7 @@ pub(crate) fn lower_kfold(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> R
             count: Some(count),
             index: Some(index),
             accumulators: accs.clone(),
-            body: Vec::new(),
+            body: loop_body,
         });
         accs.iter()
             .map(|a| ctx.b.load_local(a.local.clone()))
@@ -565,7 +591,9 @@ pub(crate) fn lower_kfold(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> R
     }
 
     Ok(ctx.finish(
-        if fast.is_some() {
+        if producer.is_some() {
+            "kstream_fold"
+        } else if fast.is_some() {
             "kfold"
         } else {
             "kfold_carrier"
@@ -574,6 +602,97 @@ pub(crate) fn lower_kfold(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> R
         block,
         stmts,
     ))
+}
+
+fn fold_element(
+    ctx: &mut Ctx<'_>,
+    source: &Launch,
+    row: TileExpr,
+    body: &mut Vec<Stmt>,
+) -> Result<TileExpr> {
+    let Launch::Fold {
+        space,
+        axis,
+        carrier,
+        acc,
+        post,
+        ops,
+        ..
+    } = source
+    else {
+        return Err(Error::Plan("a streamed producer must be a Fold".into()));
+    };
+    let element = scalar_element(*acc);
+    let ty = ElementType::Scalar(element);
+    let extent = ctx.dim_expr(space.dims[*axis as usize])?;
+    let mut inner = ctx.b.u32(1);
+    for dim in space.dims.iter().skip(*axis as usize + 1) {
+        let size = ctx.dim_expr(*dim)?;
+        inner = ctx.b.mul(inner, size);
+    }
+    let outer = ctx.b.binary(
+        TileBinaryOp::Div,
+        row.clone(),
+        inner.clone(),
+        NumericContract::RELAXED,
+    );
+    let within = ctx.b.binary(
+        TileBinaryOp::Rem,
+        row.clone(),
+        inner.clone(),
+        NumericContract::RELAXED,
+    );
+    let stride = ctx.b.mul(inner.clone(), extent.clone());
+    let base = ctx.b.mul(outer, stride);
+    let base = ctx.b.add(base, within);
+    let index = ctx.b.local(ScalarElement::U32.element());
+    let k = ctx.b.load_local(index.clone());
+    let offset = ctx.b.mul(k.clone(), inner);
+    let at = ctx.b.add(base, offset);
+    let mut output_space = space.clone();
+    output_space.dims.remove(*axis as usize);
+    let mut coords = ctx.coords_from_linear(row.clone(), &output_space)?;
+    coords.insert(*axis as usize, k);
+    let args = ops
+        .iter()
+        .map(|o| {
+            if !matches!(o.access, fusor_ir::ir::launch::AccessPlan::Unflatten(_))
+                && o.layout.shape() == space.dims.as_slice()
+            {
+                let mut address = ctx.dim_expr(o.layout.offset())?;
+                for (coordinate, stride) in coords.iter().zip(o.layout.strides()) {
+                    if stride.known_eq(fusor_ir::shape::Dim::Const(0)) {
+                        continue;
+                    }
+                    let stride = ctx.dim_expr(*stride)?;
+                    let offset = ctx.b.mul(coordinate.clone(), stride);
+                    address = ctx.b.add(address, offset);
+                }
+                ctx.load_operand(o, address)
+            } else {
+                ctx.load_mapped(o, at.clone(), space.iterations().unwrap_or(0))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let lifted = ctx.eval_scalar(&carrier.lift[0], &args, &coords)?;
+    let lifted = ctx.b.cast(lifted, ty);
+    let accumulator = ctx.b.local(ty);
+    let value = ctx.b.load_local(accumulator.clone());
+    let update = ctx.eval_scalar(&carrier.merge[0], &[value, lifted], &[])?;
+    let init = identity_expr(ctx, carrier.identity[0], element);
+    body.push(Stmt::Loop {
+        count: Some(extent),
+        index: Some(index),
+        accumulators: vec![Accumulator {
+            local: accumulator.clone(),
+            init,
+            update,
+        }],
+        body: Vec::new(),
+    });
+    let value = ctx.b.load_local(accumulator);
+    let value = ctx.eval_scalar(&post[0], &[value], &[row])?;
+    Ok(ctx.b.cast(value, ty))
 }
 
 /// A carrier identity as a tile literal. The infinities go through the

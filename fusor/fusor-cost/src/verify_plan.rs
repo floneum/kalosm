@@ -367,13 +367,8 @@ pub(crate) fn check_schedules(
             }
             _ => {}
         }
-        let lanes = realize::fold_footprint(graph, id).map(|(l, _)| l);
-        let tiles = tiles_for(
-            Some(theta),
-            scalar_element(graph.facts(id).dtype),
-            lanes,
-            caps,
-        );
+        let scratch = realize::fold_scratch_elements(graph, id, Some(theta), caps);
+        let tiles = tiles_for(Some(theta), scalar_element(graph.facts(id).dtype), scratch);
         let bytes = arena.workgroup_bytes(&tiles, caps)?;
         if bytes > max_storage {
             return Err(Error::Plan(format!(

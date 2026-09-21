@@ -286,21 +286,21 @@ fn lower_family(
             if dom.is_empty() {
                 return None;
             }
-            ScheduleDomain::Coop(dom)
+            ScheduleDomain::Coop(dom.into())
         }
         Family::Sgemm => {
             let dom = sgemm_domain(operand_dtype.byte_size() as u32, &cx);
             if dom.params.is_empty() {
                 return None;
             }
-            ScheduleDomain::Sgemm(dom)
+            ScheduleDomain::Sgemm(dom.into())
         }
         Family::Sgemv => {
             let dom = sgemv_domain(&cx);
             if dom.params.is_empty() {
                 return None;
             }
-            ScheduleDomain::Sgemv(dom)
+            ScheduleDomain::Sgemv(dom.into())
         }
     };
 
@@ -373,7 +373,7 @@ pub fn lower_generic(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
     if domain.strategies.is_empty() {
         return None;
     }
-    *sched = ScheduleDomain::Fold(domain);
+    *sched = ScheduleDomain::Fold(domain.into());
     let new = b.add_launch(fold).ok()?;
     b.union(id, new).ok()?;
     Some(new)
@@ -423,7 +423,7 @@ pub fn unfuse_coop_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<
             space: output.clone(),
             body: post,
             ops: vec![alias(inner, &inner_facts)],
-            sched: ScheduleDomain::Map(map_domain(&output.dims, &[AccessPlan::Alias], &cx)),
+            sched: ScheduleDomain::Map(map_domain(&output.dims, &[AccessPlan::Alias], &cx).into()),
         })
         .ok()?;
     b.union(id, outer).ok()?;

@@ -158,19 +158,19 @@ fn broadcast_table(t: &mut GraphTape<'_>, table: Val, like: Val) -> Result<Val> 
 
 /// The `[L, Dh]` slice of one table this call uses.
 fn table_rows(t: &mut GraphTape<'_>, table: Val, ops: &RopeOperands) -> Result<Val> {
-    let expanded = t.gather(1, table, ops.expand)?;
-    match ops.rows {
-        Rows::Offset(0) if t.shape_of(expanded)[0].known_eq(ops.seq) => Ok(expanded),
+    let rows = match ops.rows {
+        Rows::Offset(0) if t.shape_of(table)[0].known_eq(ops.seq) => table,
         Rows::Offset(off) => {
-            let shape = t.shape_of(expanded);
+            let shape = t.shape_of(table);
             let specs: SmallVec<[StrideSpec; 6]> = smallvec::smallvec![
                 StrideSpec::dim(0, ops.seq).with_offset(Dim::Const(off)),
                 StrideSpec::dim(1, shape[1]),
             ];
-            t.restride(&specs, expanded)
+            t.restride(&specs, table)?
         }
-        Rows::Positions(p) => t.gather(0, expanded, p),
-    }
+        Rows::Positions(p) => t.gather(0, table, p)?,
+    };
+    t.gather(1, rows, ops.expand)
 }
 
 /// `x * cos + rot(x) * sin`.
@@ -409,4 +409,52 @@ pub fn rope_interleaved_with_position(
         Pairing::Interleaved,
         Rows::Positions(positions.id),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fusor_ir::dtype::Dtype;
+    use fusor_ir::egraph::EGraph;
+    use std::sync::Arc;
+
+    #[test]
+    fn rope_table_work_is_bounded_by_requested_rows() -> Result<()> {
+        let mut graph = EGraph::new(fusor_ir::CoreSemantics::new(Arc::new(
+            fusor_tile::Planner::new(),
+        )));
+        let mut tape = GraphTape::new(&mut graph);
+        let table = tape.zeros_shaped(Dtype::F32, &[Dim::Const(131072), Dim::Const(64)])?;
+        let expand = tape.zeros_shaped(Dtype::U32, &[Dim::Const(128)])?;
+        let positions = tape.zeros_shaped(Dtype::U32, &[Dim::Const(3)])?;
+        for rows in [Rows::Offset(0), Rows::Offset(7), Rows::Positions(positions)] {
+            let first = tape.graph().len();
+            let result = table_rows(
+                &mut tape,
+                table,
+                &RopeOperands {
+                    perm: expand,
+                    signs: table,
+                    expand,
+                    rows,
+                    seq: Dim::Const(3),
+                },
+            )?;
+            assert_eq!(
+                tape.shape_of(result).as_slice(),
+                &[Dim::Const(3), Dim::Const(128)]
+            );
+            for i in first..tape.graph().len() {
+                let elements: u64 = tape
+                    .graph()
+                    .facts(Id(i as u32))
+                    .shape
+                    .iter()
+                    .map(|d| d.as_const().unwrap())
+                    .product();
+                assert!(elements <= 3 * 128, "RoPE materializes unused context rows");
+            }
+        }
+        Ok(())
+    }
 }

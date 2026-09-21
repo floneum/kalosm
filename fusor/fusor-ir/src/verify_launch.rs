@@ -38,6 +38,47 @@ pub fn verify_launch(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<(
         ));
     };
 
+    if let Launch::StreamFold {
+        producer,
+        fold,
+        operand,
+        sched,
+    } = op
+    {
+        if !op.stream_compatible() || !cx.result.numeric.reassoc {
+            return Err(relabel(
+                cx,
+                "a streamed Fold needs a bounded scalar producer and reassociation".into(),
+            ));
+        }
+        let count = crate::semantics::children::children_launch(producer).len();
+        let produced =
+            crate::semantics::infer_launch::infer_launch(producer, &cx.operands[..count])?;
+        let mut inputs = cx.operands[count..].to_vec();
+        inputs.insert(*operand as usize, produced.clone());
+        for (recipe, operands, result) in [
+            (producer.as_ref(), &cx.operands[..count], &produced),
+            (fold.as_ref(), inputs.as_slice(), cx.result),
+        ] {
+            let node = crate::ir::Node {
+                op: Op::Launch(recipe.clone()),
+                level: crate::ir::Level::Launch,
+                children: crate::semantics::children::children_launch(recipe),
+            };
+            verify_launch(
+                &VerifyCtx {
+                    node: &node,
+                    id: cx.id,
+                    operands,
+                    result,
+                    caps: cx.caps,
+                },
+                planner,
+            )?;
+        }
+        return check_schedule_domain(fold, sched, cx.caps, planner);
+    }
+
     // 1 + 2.
     if let Some(sched) = op.schedule() {
         check_schedule_domain(op, sched, cx.caps, planner)
@@ -692,6 +733,21 @@ fn operands_of(op: &Launch) -> Vec<Operand> {
         | Launch::Gather { ops, .. }
         | Launch::Scatter { ops, .. } => ops.clone(),
         Launch::Contract { a, b, .. } => a.ops.iter().chain(b.ops.iter()).cloned().collect(),
+        Launch::StreamFold {
+            producer,
+            fold,
+            operand,
+            ..
+        } => {
+            let mut ops = operands_of(producer);
+            ops.extend(
+                operands_of(fold)
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, op)| (i != *operand as usize).then_some(op)),
+            );
+            ops
+        }
         Launch::Slab { .. } | Launch::Group { .. } => Vec::new(),
     }
 }

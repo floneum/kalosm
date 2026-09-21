@@ -96,7 +96,6 @@ pub struct DeviceFacts {
     pub store_ps_per_element: u64,
     pub saturation_lanes: u32,
     pub single_buffered_traffic_pct: u32,
-    pub compile_ps_per_kernel: u64,
     /// Cost of waking the CPU worker pool for one parallel region.
     /// Replaces `PARALLEL_THRESHOLD = 16_777_216`.
     pub thread_wake_ps: u64,

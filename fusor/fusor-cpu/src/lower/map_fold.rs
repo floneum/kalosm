@@ -61,7 +61,13 @@ pub(crate) fn lower(
         // both scalar operators and multi-slot carriers, so lowering every
         // fold through it prevents the planner from selecting a second shape
         // that has no Cranelift implementation.
-        Launch::Fold { .. } => lower_fold_carrier(caps, node, theta, cx),
+        Launch::Fold { .. } => lower_fold_carrier(caps, op, theta, cx, None),
+        Launch::StreamFold {
+            producer,
+            fold,
+            operand,
+            ..
+        } => lower_fold_carrier(caps, fold, theta, cx, Some((producer, *operand))),
         _ => Err(Error::Legality("map_fold got a foreign node".into())),
     }
 }
@@ -155,11 +161,12 @@ fn lower_map(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> 
 /// the scratch tree.
 fn lower_fold_carrier(
     caps: &Caps,
-    node: &Node,
+    fold: &Launch,
     theta: SchedPoint,
     cx: &LowerCtx<'_>,
+    stream: Option<(&Launch, u32)>,
 ) -> Result<KernelIr> {
-    let Op::Launch(Launch::Fold {
+    let Launch::Fold {
         space,
         axis,
         vec_axes,
@@ -167,7 +174,7 @@ fn lower_fold_carrier(
         post,
         ops,
         ..
-    }) = &node.op
+    } = fold
     else {
         return Err(Error::Legality("not a Fold".into()));
     };
@@ -222,7 +229,7 @@ fn lower_fold_carrier(
     let iter_axes: Vec<usize> = (0..extents.len())
         .filter(|i| !vec_axes.contains(&(*i as u32)))
         .collect();
-    let axis_extent = extents[axis].max(1);
+    let axis_extent = extents[axis];
     let inner: u32 = extents[axis + 1..].iter().product::<u32>().max(1);
     let outer: u32 = extents[..axis]
         .iter()
@@ -263,11 +270,13 @@ fn lower_fold_carrier(
     // Lane `(slot, p)` reads every operand at promoted position `p`. An
     // operand invariant in the promoted axes is read at the same address for
     // every position and the emitter's CSE collapses it to one load.
-    let lift_at = |k: TileExpr| -> Result<Vec<TileExpr>> {
+    let lift_at = |k: TileExpr, body: &mut Vec<Stmt>| -> Result<Vec<TileExpr>> {
         let mask = cmp(CmpOp::Lt, k.clone(), lit_u32(axis_extent));
         let row_elems = axis_extent.saturating_mul(vec_extent);
         let mut per_pos: Vec<(Vec<TileExpr>, Vec<TileExpr>)> =
             Vec::with_capacity(vec_extent as usize);
+        let mut produced: rustc_hash::FxHashMap<TileExpr, TileExpr> = Default::default();
+        let mut first_index = None;
         for p in 0..vec_extent {
             let within = bin(
                 BinOp::Add,
@@ -291,16 +300,42 @@ fn lower_fold_carrier(
                 inner_idx.clone(),
                 u32_ty(),
             );
+            let first = first_index.get_or_insert_with(|| flat.clone());
             let mut args = Vec::with_capacity(ops.len());
-            for o in ops {
-                args.push(super::operand_at(
-                    cx,
-                    &binds,
-                    o,
-                    flat.clone(),
-                    space_total,
-                    mask.clone(),
-                )?);
+            for (i, o) in ops.iter().enumerate() {
+                args.push(
+                    if let Some((producer, operand)) = stream
+                        && i == operand as usize
+                    {
+                        let invariant = o.layout.rank() == space.rank()
+                            && vec_axes.iter().all(|axis| {
+                                o.layout.strides()[*axis as usize]
+                                .known_eq(fusor_ir::shape::Dim::Const(0))
+                            });
+                        let flat = if invariant {
+                            first.clone()
+                        } else {
+                            flat.clone()
+                        };
+                        let row = super::address_of(cx, o, flat, space_total)?;
+                        if let Some(value) = produced.get(&row) {
+                            value.clone()
+                        } else {
+                            let value = fold_element(
+                                cx,
+                                &binds,
+                                producer,
+                                row.clone(),
+                                mask.clone(),
+                                body,
+                            )?;
+                            produced.insert(row, value.clone());
+                            value
+                        }
+                    } else {
+                        super::operand_at(cx, &binds, o, flat.clone(), space_total, mask.clone())?
+                    },
+                );
             }
             let full = coords_of(&flat, &extents);
             let coords: Vec<TileExpr> = iter_axes.iter().map(|i| full[*i].clone()).collect();
@@ -339,7 +374,8 @@ fn lower_fold_carrier(
             lane.clone(),
             u32_ty(),
         );
-        let values = lift_at(k)?;
+        let mut loop_body = Vec::new();
+        let values = lift_at(k, &mut loop_body)?;
         let locals: Vec<Arc<LocalDecl>> = (0..lanes)
             .map(|_| Arc::new(LocalDecl::new(f32_ty)))
             .collect();
@@ -366,11 +402,11 @@ fn lower_fold_carrier(
             count: Some(lit_u32(passes)),
             index: Some(index),
             accumulators,
-            body: Vec::new(),
+            body: loop_body,
         });
         reads
     } else {
-        lift_at(lane.clone())?
+        lift_at(lane.clone(), &mut body)?
     };
 
     let scratch: smallvec::SmallVec<[Arc<TileDecl>; 4]> = (0..lanes)
@@ -458,6 +494,95 @@ fn lower_fold_carrier(
         byte_arena: None,
         name: "cpu_fold_carrier",
     })
+}
+
+fn fold_element(
+    cx: &LowerCtx<'_>,
+    binds: &Binds,
+    producer: &Launch,
+    row: TileExpr,
+    mask: TileExpr,
+    body: &mut Vec<Stmt>,
+) -> Result<TileExpr> {
+    let Launch::Fold {
+        space,
+        axis,
+        carrier,
+        acc,
+        post,
+        ops,
+        ..
+    } = producer
+    else {
+        return Err(Error::Legality("a streamed producer must be a Fold".into()));
+    };
+    let extents = const_extents(cx, &space.dims)?;
+    let axis = *axis as usize;
+    let width = extents[axis];
+    let inner = extents[axis + 1..].iter().product::<u32>().max(1);
+    let total = extents.iter().map(|v| u64::from(*v)).product();
+    let index = Arc::new(LocalDecl::new(u32_ty()));
+    let k = TileExpr::new(TileExprKind::LoadLocal(index.clone()), u32_ty());
+    let flat = bin(
+        BinOp::Add,
+        bin(
+            BinOp::Mul,
+            bin(
+                BinOp::Add,
+                bin(
+                    BinOp::Mul,
+                    bin(BinOp::Div, row.clone(), lit_u32(inner), u32_ty()),
+                    lit_u32(width),
+                    u32_ty(),
+                ),
+                k,
+                u32_ty(),
+            ),
+            lit_u32(inner),
+            u32_ty(),
+        ),
+        bin(BinOp::Rem, row.clone(), lit_u32(inner), u32_ty()),
+        u32_ty(),
+    );
+    let coords = coords_of(&flat, &extents);
+    let args = ops
+        .iter()
+        .map(|operand| super::operand_at(cx, binds, operand, flat.clone(), total, mask.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    let uniforms = binds.buffers.first().cloned();
+    let lifted = Translate {
+        args: &args,
+        coords: &coords,
+        uniforms: uniforms.clone(),
+    }
+    .run(&carrier.lift[0])?;
+    let f32_ty = ElementType::Scalar(ScalarElement::F32);
+    let local = Arc::new(LocalDecl::new(f32_ty));
+    let value = TileExpr::new(TileExprKind::LoadLocal(local.clone()), f32_ty);
+    let update = Translate {
+        args: &[value.clone(), lifted],
+        coords: &[],
+        uniforms: uniforms.clone(),
+    }
+    .run(&carrier.merge[0])?;
+    body.push(Stmt::Loop {
+        count: Some(lit_u32(width)),
+        index: Some(index),
+        accumulators: vec![fusor_ir::ir::kernel::Accumulator {
+            local,
+            init: lit_f32(splat_f32(carrier.identity[0])),
+            update,
+        }],
+        body: Vec::new(),
+    });
+    let value = Translate {
+        args: &[value],
+        coords: std::slice::from_ref(&row),
+        uniforms,
+    }
+    .run(&post[0])?;
+    let ty = ElementType::Scalar(super::elem_of(*acc)?);
+    Ok(TileExpr::new(TileExprKind::Cast { value, to: ty }, ty))
 }
 
 /// A carrier identity as a host float.

@@ -17,6 +17,7 @@ mod lower_bound;
 mod model;
 mod moves;
 pub mod plan;
+mod quantized;
 pub mod realize;
 pub mod replay;
 mod terms;

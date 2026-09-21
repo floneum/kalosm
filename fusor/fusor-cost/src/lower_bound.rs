@@ -1,9 +1,5 @@
-//! The admissible lower bound.
-//!
-//! `lb(c) = min over n in c of ( math_ps(n) + sum over *distinct* child chains
-//! lb(child) )` — zero traffic, free sharing, min over the schedule domain.
-//! Admissible in both regimes, so it works as a seed and as a
-//! branch-and-bound prune.
+//! Per-node arithmetic estimates for initial selection and candidate ordering.
+//! Complete selected DAGs are compared through the realized cost model.
 
 use fusor_ir::cost::{CostModel, Picoseconds};
 use fusor_ir::device::Caps;
@@ -12,21 +8,8 @@ use fusor_ir::facts::ValueFacts;
 use fusor_ir::ir::Op;
 use fusor_ir::ir::launch::{Launch, ScheduleDomain};
 use fusor_ir::ir::logical::Logical;
-use rustc_hash::{FxHashMap, FxHasher};
+use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
-use std::hash::{Hash, Hasher};
-
-/// Ceiling on `node_math` evaluations spent scanning schedule domains. Past
-/// it a node's math term degrades to zero, which is still a *lower* bound and
-/// therefore still admissible.
-const MATH_CALL_BUDGET: usize = 200_000;
-
-/// The budget for one graph. Scales with the node count so a 100k+ node model
-/// graph keeps a meaningful bound; an exhausted budget zeroes every later
-/// node's math term and selection then falls to the tie-break alone.
-fn math_call_budget(nodes: usize) -> usize {
-    MATH_CALL_BUDGET.max(nodes.saturating_mul(16))
-}
 
 /// Domain size past which a node earns a memo entry.
 const MEMO_THRESHOLD: usize = 8;
@@ -40,6 +23,7 @@ fn domain_len(graph: &EGraph, id: Id) -> usize {
 
 pub(crate) struct Bounds {
     pub costs: Vec<Picoseconds>,
+    /// The node itself needs a dispatch unless it is a leaf or a union.
     pub launches: Vec<u32>,
 }
 
@@ -48,7 +32,7 @@ pub(crate) fn lower_bound(graph: &EGraph, cost: &dyn CostModel) -> Vec<Picosecon
     bounds_over(graph, Some(cost), &ids).costs
 }
 
-/// Both bounds use the same dependency postorder. Unmasked slots stay zero.
+/// Unmasked slots stay zero; all selected candidate plans are priced separately.
 pub(crate) fn bounds_scoped(
     graph: &EGraph,
     cost: Option<&dyn CostModel>,
@@ -68,106 +52,37 @@ fn bounds_over(graph: &EGraph, cost: Option<&dyn CostModel>, ids: &[Id]) -> Boun
         |cost| node_math_table(graph, cost, ids),
     );
     let launch_ps = cost.map_or(0, |cost| cost.facts().launch_ps);
-    // One sweep underestimates class cycles. Iterating compounds their cost
-    // into their readers until every downstream member ties at saturation.
-    for id in postorder(graph, ids) {
-        let (time, launches) = combine(graph, id, &math, &bounds, launch_ps);
+    for &id in ids {
+        let (time, launches) = match &graph.node(id).op {
+            Op::Union(a, b) => (
+                bounds.costs[a.index()].min(bounds.costs[b.index()]),
+                bounds.launches[a.index()].min(bounds.launches[b.index()]),
+            ),
+            Op::Logical(Logical::Leaf(_)) => (Picoseconds(0), 0),
+            Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) => {
+                let time = members.iter().fold(Picoseconds(launch_ps), |sum, m| {
+                    sum + Picoseconds(bounds.costs[m.index()].0.saturating_sub(launch_ps))
+                });
+                (time, 1)
+            }
+            _ => (math[id.index()] + Picoseconds(launch_ps), 1),
+        };
         bounds.costs[id.index()] = time;
         bounds.launches[id.index()] = launches;
     }
     bounds
 }
 
-/// Dependency postorder over the masked ids: every edge a [`combine`] reads —
-/// a union operand, or a child's class root — is visited before its reader
-/// wherever the class graph is acyclic. Iterative, deterministic (roots
-/// ascending, edges in operand order), and restricted to `ids`.
-fn postorder(graph: &EGraph, ids: &[Id]) -> Vec<Id> {
-    let n = graph.len();
-    let mut masked = fixedbitset::FixedBitSet::with_capacity(n);
-    for id in ids {
-        masked.insert(id.index());
-    }
-    // 0 = unseen, 1 = open, 2 = done.
-    let mut state = vec![0u8; n];
-    let mut out: Vec<Id> = Vec::with_capacity(ids.len());
-    let mut stack: Vec<(Id, bool)> = Vec::new();
-    for root in ids {
-        if state[root.index()] != 0 {
-            continue;
-        }
-        stack.push((*root, false));
-        while let Some((id, expanded)) = stack.pop() {
-            if expanded {
-                if state[id.index()] != 2 {
-                    state[id.index()] = 2;
-                    out.push(id);
-                }
-                continue;
-            }
-            if state[id.index()] != 0 {
-                continue;
-            }
-            state[id.index()] = 1;
-            stack.push((id, true));
-            let node = graph.node(id);
-            let debug = std::env::var_os("FUSOR_SEED_DEBUG").is_some();
-            let push = |next: Id, stack: &mut Vec<(Id, bool)>| {
-                if state[next.index()] == 0 && masked.contains(next.index()) {
-                    stack.push((next, false));
-                } else if debug && state[next.index()] == 1 {
-                    // A back edge: the class graph has a cycle through here,
-                    // and both bounds will climb until they saturate.
-                    let show = |i: Id| {
-                        let s = format!("{:?}", graph.node(i).op);
-                        s.chars().take(160).collect::<String>()
-                    };
-                    eprintln!(
-                        "[lb] class cycle edge {id:?} -> {next:?}\n      {id:?} = {}\n      {next:?} = {}",
-                        show(id),
-                        show(next)
-                    );
-                }
-            };
-            match &node.op {
-                Op::Union(a, b) => {
-                    push(*a, &mut stack);
-                    push(*b, &mut stack);
-                }
-                // A composite names its members by id, and its last member
-                // shares its class: through the class that edge is a cycle
-                // and the member's bound would be read before it is made.
-                Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) => {
-                    for m in members.iter() {
-                        push(*m, &mut stack);
-                        // A member's class too: a group prices each member
-                        // against its class's best.
-                        push(graph.class_of(*m).0, &mut stack);
-                    }
-                }
-                _ => {
-                    for child in node.children.iter() {
-                        push(graph.class_of(*child).0, &mut stack);
-                    }
-                }
-            }
-        }
-    }
-    out
-}
-
 /// The cheapest **selectable** member of `class`, picosecond ties broken by
-/// the launch bound, then by smaller [`Id`]. The seed selection is exactly
-/// this, per class.
+/// own dispatch count, then by smaller [`Id`]. Used for cycle repair and
+/// classes without an ordinary lowering.
 ///
 /// Selectable, not just cheapest: the floor lowerings tie with the `Logical` node
 /// they replace on math, so an unrestricted `min_by_key` would return the
 /// un-lowered original every time. See [`crate::realize::selectable`].
 ///
-/// The relaxation erases exactly the launch and traffic a fusion deletes,
-/// so fused and unfused spellings tie on picoseconds; each launch the chain
-/// keeps is priced at the device's dispatch cost, which is what a fusion
-/// saves.
+/// Dependencies are deliberately absent from this ordering estimate. Their
+/// complete shared DAG is priced when the candidate selection is realized.
 pub(crate) fn argmin_member(
     graph: &EGraph,
     lb: &[Picoseconds],
@@ -246,101 +161,11 @@ pub(crate) fn argmin_member_excluding(
         .min_by_key(|m| (lb[m.index()], launches[m.index()], *m))
 }
 
-fn combine(
-    graph: &EGraph,
-    id: Id,
-    math: &[Picoseconds],
-    bounds: &Bounds,
-    launch_ps: u64,
-) -> (Picoseconds, u32) {
-    let (lb, launches) = (&bounds.costs, &bounds.launches);
-    let node = graph.node(id);
-    match &node.op {
-        Op::Union(a, b) => (
-            lb[a.index()].min(lb[b.index()]),
-            launches[a.index()].min(launches[b.index()]),
-        ),
-        Op::Logical(Logical::Leaf(_)) => (Picoseconds(0), 0),
-        Op::Launch(Launch::Slab { members, .. }) => {
-            let mut time = math[id.index()] + Picoseconds(launch_ps);
-            let mut count = 1u32;
-            for m in members {
-                time += math[m.index()];
-            }
-            for class in slab_inputs(graph, members) {
-                time += lb[class.0.index()];
-                count = count.saturating_add(launches[class.0.index()]);
-            }
-            let roots: SmallVec<[ClassId; 8]> =
-                graph.roots().iter().map(|r| graph.class_of(*r)).collect();
-            let saved = members[..members.len().saturating_sub(1)]
-                .iter()
-                .filter(|m| roots.contains(&graph.class_of(**m)))
-                .count() as u64;
-            (
-                Picoseconds(time.0.saturating_sub(saved.saturating_mul(launch_ps))),
-                count,
-            )
-        }
-        Op::Launch(Launch::Group { members, .. }) => {
-            let last = members.last().copied().unwrap_or(id);
-            let saved = members.len().saturating_sub(1);
-            let mut time = lb[last.index()];
-            let mut count = launches[last.index()].saturating_sub(saved as u32);
-            for m in &members[..saved] {
-                let class = graph.class_of(*m).0.index();
-                time = Picoseconds(
-                    time.0
-                        .saturating_add(lb[m.index()].0.saturating_sub(lb[class].0)),
-                );
-                count = count.saturating_add(launches[m.index()].saturating_sub(launches[class]));
-            }
-            (
-                Picoseconds(
-                    time.0
-                        .saturating_sub((saved as u64).saturating_mul(launch_ps)),
-                ),
-                count,
-            )
-        }
-        _ => {
-            let mut seen: SmallVec<[ClassId; 4]> = SmallVec::new();
-            let mut time = math[id.index()] + Picoseconds(launch_ps);
-            let mut count = 1u32;
-            for child in node.children.iter() {
-                let class = graph.class_of(*child);
-                if !seen.contains(&class) {
-                    seen.push(class);
-                    time += lb[class.0.index()];
-                    count = count.saturating_add(launches[class.0.index()]);
-                }
-            }
-            (time, count)
-        }
-    }
-}
-
-/// The classes a slab reads that none of its members produce, each once.
-fn slab_inputs(graph: &EGraph, members: &[Id]) -> Vec<ClassId> {
-    let own: SmallVec<[ClassId; 8]> = members.iter().map(|m| graph.class_of(*m)).collect();
-    let mut out: Vec<ClassId> = Vec::new();
-    for m in members {
-        for child in graph.node(*m).children.iter() {
-            let class = graph.class_of(*child);
-            if !own.contains(&class) && !out.contains(&class) {
-                out.push(class);
-            }
-        }
-    }
-    out
-}
-
 fn node_math_table(graph: &EGraph, cost: &dyn CostModel, ids: &[Id]) -> Vec<Picoseconds> {
     let n = graph.len();
     let mut out = vec![Picoseconds(0); n];
     // Identical nodes at identical operand facts share a scan.
-    let mut memo: FxHashMap<u64, Picoseconds> = FxHashMap::default();
-    let mut budget = math_call_budget(ids.len());
+    let mut memo: FxHashMap<ShapeKey, Picoseconds> = FxHashMap::default();
     for id in ids {
         let id = *id;
         let node = graph.node(id);
@@ -351,7 +176,7 @@ fn node_math_table(graph: &EGraph, cost: &dyn CostModel, ids: &[Id]) -> Vec<Pico
         // Hashing operand facts costs about two `node_math` calls, so only a
         // domain wide enough to pay for it gets a memo entry.
         if domain_len(graph, id) <= MEMO_THRESHOLD {
-            *slot = best_math(graph, cost, id, &mut budget);
+            *slot = best_math(graph, cost, id);
             if slot.0 >= u64::MAX / 4 && std::env::var_os("FUSOR_SEED_DEBUG").is_some() {
                 let show: String = format!("{:?}", node.op).chars().take(200).collect();
                 eprintln!("[lb] math saturated at {id:?}: {show}");
@@ -362,7 +187,7 @@ fn node_math_table(graph: &EGraph, cost: &dyn CostModel, ids: &[Id]) -> Vec<Pico
         *slot = match memo.get(&key) {
             Some(hit) => *hit,
             None => {
-                let v = best_math(graph, cost, id, &mut budget);
+                let v = best_math(graph, cost, id);
                 memo.insert(key, v);
                 v
             }
@@ -376,7 +201,7 @@ fn node_math_table(graph: &EGraph, cost: &dyn CostModel, ids: &[Id]) -> Vec<Pico
                     .take(120)
                     .collect();
                 eprintln!(
-                    "[math] class {want} node {id} math={} budget_left={budget} {show}",
+                    "[math] class {want} node {id} math={} {show}",
                     out[id.index()].0
                 );
             }
@@ -387,7 +212,7 @@ fn node_math_table(graph: &EGraph, cost: &dyn CostModel, ids: &[Id]) -> Vec<Pico
 
 /// `argmin over sched.iter()` of `node_math`; `ScheduleDomain::Point` passes
 /// `None`, as does any node without a domain.
-fn best_math(graph: &EGraph, cost: &dyn CostModel, id: Id, budget: &mut usize) -> Picoseconds {
+fn best_math(graph: &EGraph, cost: &dyn CostModel, id: Id) -> Picoseconds {
     let node = graph.node(id);
     let ins: SmallVec<[ValueFacts; 4]> = node
         .children
@@ -401,13 +226,7 @@ fn best_math(graph: &EGraph, cost: &dyn CostModel, id: Id, budget: &mut usize) -
         _ => None,
     };
     match domain {
-        None | Some(ScheduleDomain::Point) => {
-            if *budget == 0 {
-                return Picoseconds(0);
-            }
-            *budget -= 1;
-            cost.node_math(node, &ins, out, None)
-        }
+        None | Some(ScheduleDomain::Point) => cost.node_math(node, &ins, out, None),
         Some(domain) => {
             // `node_math` depends on the point only through the MAC unit and
             // the padded tile, so a domain is scanned once per *math-distinct*
@@ -426,19 +245,24 @@ fn best_math(graph: &EGraph, cost: &dyn CostModel, id: Id, budget: &mut usize) -
                     fusor_ir::ir::launch::SchedPoint::Fold(s) => {
                         (3u8, s.lane_group(cost.facts().caps.subgroup_width()), 0)
                     }
+                    fusor_ir::ir::launch::SchedPoint::Sgemv(p) => {
+                        let caps = &cost.facts().caps;
+                        let width = caps.subgroup_width();
+                        let lanes = if p.cols > 1 {
+                            width
+                        } else {
+                            (p.subgroups.max(1) * width)
+                                .min(caps.limits.max_compute_invocations_per_workgroup)
+                                .max(1)
+                        };
+                        (4u8, lanes, 0)
+                    }
                     _ => (0u8, 0, 0),
                 };
                 if seen.contains(&key) {
                     continue;
                 }
                 seen.push(key);
-                if *budget == 0 {
-                    // An unfinished scan is still a lower bound only if we
-                    // drop the term entirely; a partial min could exceed the
-                    // true minimum and break admissibility.
-                    return Picoseconds(0);
-                }
-                *budget -= 1;
                 let v = cost.node_math(node, &ins, out, Some(theta));
                 best = Some(match best {
                     Some(b) if b <= v => b,
@@ -450,13 +274,25 @@ fn best_math(graph: &EGraph, cost: &dyn CostModel, id: Id, budget: &mut usize) -
     }
 }
 
-fn shape_key(graph: &EGraph, id: Id) -> u64 {
-    let node = graph.node(id);
-    let mut h = FxHasher::default();
-    node.op.hash(&mut h);
-    for c in node.children.iter() {
-        graph.facts(*c).hash(&mut h);
+pub(crate) type ShapeKey = (Op, SmallVec<[ValueFacts; 4]>, ValueFacts);
+
+pub(crate) fn shape_key(graph: &EGraph, id: Id) -> ShapeKey {
+    struct ArithmeticOperands;
+    impl fusor_ir::ir::visit::VisitMut for ArithmeticOperands {
+        fn operand(&mut self, operand: &mut fusor_ir::ir::launch::Operand) {
+            operand.src = Id(0);
+        }
     }
-    graph.facts(id).hash(&mut h);
-    h.finish()
+    let node = graph.node(id);
+    let mut op = node.op.clone();
+    // Arithmetic depends on operand facts and access maps, not their arena ids.
+    op.visit_mut(&mut ArithmeticOperands);
+    (
+        op,
+        node.children
+            .iter()
+            .map(|c| graph.facts(*c).clone())
+            .collect(),
+        graph.facts(id).clone(),
+    )
 }

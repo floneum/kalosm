@@ -24,7 +24,7 @@
 
 use crate::carrier::{
     Carrier, HOM_TABLE, HomRow, HomShape, RETARGET_TABLE, RetargetRow, SlotTy, is_total_on,
-    map_args, probes_for,
+    map_args,
 };
 use crate::dtype::{Dtype, Splat};
 use crate::egraph::{Builder, Facts, Id, RuleTag};
@@ -35,7 +35,7 @@ use crate::rule;
 use crate::rules::{
     access_legal_in, alias_operand_of, composed_layout, map_view, operand_dtypes, shift_args,
 };
-use crate::scalar::{BinOp, ScalarExpr, ScalarKind, UnOp};
+use crate::scalar::{BinOp, CmpOp, ScalarExpr, ScalarKind, UnOp};
 use crate::shape::{Dim, Layout};
 use smallvec::{SmallVec, smallvec};
 
@@ -398,7 +398,9 @@ fn slot_accum(c: &Carrier, k: usize) -> Option<BinOp> {
     let (lhs, rhs) = (ScalarKind::Arg(k as u32), ScalarKind::Arg((w + k) as u32));
     let forward = a.kind() == &lhs && b.kind() == &rhs;
     let swapped = a.kind() == &rhs && b.kind() == &lhs;
-    (forward || (swapped && op.is_commutative())).then_some(*op)
+    (forward || (swapped && op.is_commutative()))
+        .then_some(*op)
+        .filter(|op| Carrier::binop_identity(*op, c.identity[k].dtype()) == Some(c.identity[k]))
 }
 
 /// One matched application of a [`HomRow`]'s `h` inside a lift.
@@ -666,9 +668,6 @@ fn hoist_outward(
         None => (smallvec![lift], ops.clone()),
     };
     let inner_carrier = base.with_lift(inner_lift);
-    if !inner_carrier.identity_closed(probes_for(*acc)) {
-        return None;
-    }
 
     // The outer map reads the fold plus whichever invariant operands the peeled
     // factors name, each re-viewed at the fold's own output space. Slot 0 is
@@ -775,9 +774,6 @@ fn hoist_inward(
         })?;
     let pushed = rebind_accum(carrier, row.to, *acc)?
         .with_lift([m.apply(carrier.lift[0].clone(), &|c| c.clone())]);
-    if !pushed.identity_closed(probes_for(*acc)) {
-        return None;
-    }
     let alt = b
         .add_launch(Launch::Fold {
             space: space.clone(),
@@ -1017,9 +1013,8 @@ struct RefFold {
 /// The law never invents a reference: it fires only where the source program
 /// already computed one.
 ///
-/// Two unions are written: this fold to the body slot view, and the reference
-/// fold to the reference slot view. Without the second, extraction keeps
-/// computing the reference separately.
+/// The body is read from the new carrier. The reference remains local to
+/// this candidate; other consumers keep their own reference choices.
 pub fn retarget(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Launch(Launch::Fold {
         space,
@@ -1080,7 +1075,7 @@ pub fn retarget(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opti
         // Acyclicity: no operand the joint fold keeps may be the reference,
         // since the second union puts the reference's class above the joint
         // node.
-        if (0..ops.len()).any(|i| i != r && class_members(b, reads[i].1).contains(&reference.id)) {
+        if (0..ops.len()).any(|i| i != r && b.class_members(reads[i].1).contains(&reference.id)) {
             continue;
         }
         if let Some(hit) = mint_retarget(b, id, node, r, &reference) {
@@ -1088,27 +1083,6 @@ pub fn retarget(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opti
         }
     }
     None
-}
-
-/// The non-`Union` members reachable downward from `id`. A `Builder` cannot
-/// see a class's root, so this sees exactly the alternatives an operand edge
-/// already names.
-fn class_members(b: &Builder<'_>, id: Id) -> SmallVec<[Id; 8]> {
-    let mut out: SmallVec<[Id; 8]> = SmallVec::new();
-    let mut stack = vec![id];
-    while let Some(cur) = stack.pop() {
-        if out.contains(&cur) {
-            continue;
-        }
-        match &b.node(cur).op {
-            Op::Union(x, y) => {
-                stack.push(*x);
-                stack.push(*y);
-            }
-            _ => out.push(cur),
-        }
-    }
-    out
 }
 
 /// A reduction nest in either spelling — the `Logical::Fold` the frontend
@@ -1173,7 +1147,7 @@ fn reference_fold(
     axis: u32,
     reader: &[(Operand, Id)],
 ) -> Option<RefFold> {
-    for cand in class_members(b, src) {
+    for cand in b.class_members(src) {
         let Some(v) = fold_view(b, cand) else {
             continue;
         };
@@ -1267,6 +1241,14 @@ fn common_basis(b: &Builder<'_>, v: &FoldView, reader: &[(Operand, Id)]) -> Opti
     None
 }
 
+fn float_magnitude_bits(value: ScalarExpr) -> ScalarExpr {
+    ScalarExpr::bin(
+        BinOp::BitAnd,
+        ScalarExpr::bitcast(Dtype::U32, ScalarExpr::cast(Dtype::F32, value)),
+        ScalarExpr::lit(Splat::U32(0x7fffffff)),
+    )
+}
+
 fn mint_retarget(
     b: &mut Builder<'_>,
     id: Id,
@@ -1338,7 +1320,7 @@ fn mint_retarget(
             // element needs no special case.
             lifts.push(apply_peels(&peels, ScalarExpr::lit(seed)));
         }
-        if !ok {
+        if !ok || lifts.iter().any(|e| reads_arg(e, ref_arg)) {
             continue;
         }
         // The reference must be exactly what this fold subtracts, or the
@@ -1347,6 +1329,22 @@ fn mint_retarget(
         let u = bound?;
         if !expr_eq(&u, &reference.lift) {
             continue;
+        }
+        let invalid = match row.accum {
+            BinOp::Add => ScalarExpr::cast(
+                *acc,
+                ScalarExpr::bitcast(Dtype::F32, ScalarExpr::lit(Splat::U32(0x7fc00000))),
+            ),
+            BinOp::Max => ScalarExpr::lit(Carrier::binop_identity(BinOp::Max, *acc)?),
+            _ => continue,
+        };
+        let nan_input = ScalarExpr::cmp(
+            CmpOp::Gt,
+            float_magnitude_bits(u.clone()),
+            ScalarExpr::lit(Splat::U32(0x7f800000)),
+        );
+        for lift in &mut lifts {
+            *lift = ScalarExpr::select(nan_input.clone(), invalid.clone(), lift.clone());
         }
 
         // Discharge the feedback operand: the joint fold reads the reference's
@@ -1383,12 +1381,10 @@ fn mint_retarget(
             tie: carrier.tie,
         };
         let joint = Carrier::retarget(&stat, row, &body, 0)?;
-        if !joint.identity_closed(probes_for(*acc)) {
-            continue;
-        }
         // Slot ranges are counted in lanes, not slots: a `Vector` slot is as
         // many lanes as it has positions.
         let (lanes, body_lanes) = (joint.lanes()?, carrier.lanes()?);
+        let sched = sched.with_fold_carrier(lanes, acc.byte_size(), b.caps())?;
         let Some(body_axis) = carrier.out_dim() else {
             continue;
         };
@@ -1409,10 +1405,37 @@ fn mint_retarget(
             continue;
         }
 
-        // Slot 0 is the reference; the rest are this fold's, so every `post`
-        // shifts by one and the reference's is the identity.
+        // Safe merge deltas preserve the empty identity. A nonempty row
+        // with a nonfinite reference retains the original shifted result.
+        let nonempty = match space.dims[*axis as usize] {
+            Dim::Const(n) => ScalarExpr::lit(Splat::U32(u32::from(n != 0))),
+            Dim::Sym(crate::shape::OPAQUE_SYM) => continue,
+            Dim::Sym(sym) => ScalarExpr::cmp(
+                CmpOp::Ne,
+                ScalarExpr::uniform(sym, Dtype::U32),
+                ScalarExpr::lit(Splat::U32(0)),
+            ),
+        };
+        let invalid_reference = ScalarExpr::bin(
+            BinOp::BitAnd,
+            nonempty,
+            ScalarExpr::cmp(
+                CmpOp::Ge,
+                float_magnitude_bits(ScalarExpr::arg(0, *acc)),
+                ScalarExpr::lit(Splat::U32(0x7f800000)),
+            ),
+        );
+        let finalized: Vec<_> = (0..w)
+            .map(|i| {
+                ScalarExpr::select(
+                    invalid_reference.clone(),
+                    invalid.clone(),
+                    ScalarExpr::arg(i as u32 + 1, *acc),
+                )
+            })
+            .collect();
         let joint_post: SmallVec<[ScalarExpr; 4]> = std::iter::once(ScalarExpr::arg(0, *acc))
-            .chain(post.iter().map(|e| map_args(e, &|i| i + 1)))
+            .chain(post.iter().map(|e| e.compose(&finalized)))
             .collect();
 
         let joint_id = b
@@ -1424,7 +1447,7 @@ fn mint_retarget(
                 acc: *acc,
                 post: joint_post,
                 ops: new_ops,
-                sched: sched.clone(),
+                sched,
             })
             .ok()?;
 

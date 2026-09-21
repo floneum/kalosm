@@ -59,10 +59,7 @@ pub struct ExtractBudget {
 impl Default for ExtractBudget {
     /// `64 * |chains|` moves, 90k realized node visits.
     ///
-    /// Raising 90k regresses `attention_causal_plan_is_no_worse_than_dense`:
-    /// at convergence the causal graph's local optimum keeps a 100-element
-    /// buffer where dense finds a 40-element one, so both searches must stay
-    /// truncated until the causal side can reach the two-slot carrier.
+    /// Limits additional local-search work after the complete seed sweep.
     fn default() -> Self {
         // `FUSOR_MOVE_WORK` overrides the visit budget, for measuring what
         // a longer search buys on a given graph.
@@ -163,9 +160,9 @@ pub struct Plan {
 /// local search; `fusor-conformance` ships a debug ILP oracle behind the
 /// same trait that must agree with it on small graphs.
 pub trait Extractor: Send + Sync {
-    /// Admissible lower bound, bottom-up, `O(nodes)`: `min over n in c of
-    /// (math_ps(n) + sum over *distinct* child chains lb(child))` — zero
-    /// traffic, free sharing, min over the schedule domain. Indexed by node id.
+    /// Per-node arithmetic floor, indexed by node id, for candidate ordering.
+    /// It is not a dependency-DAG cost: selection compares complete realized
+    /// plans so every shared producer and every distinct branch is counted.
     fn lower_bound(&self, graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds>;
 
     /// Seed, realize, cost exactly, then local-search under `budget`.
@@ -176,6 +173,20 @@ pub trait Extractor: Send + Sync {
         cost: &dyn CostModel,
         budget: ExtractBudget,
     ) -> Result<Plan>;
+
+    /// Extend a previous selection from this graph to the requested roots.
+    /// The seed is a search hint; its buffers and cost must be constructed again.
+    fn extract_seeded(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        cost: &dyn CostModel,
+        budget: ExtractBudget,
+        seed: &Plan,
+    ) -> Result<Plan> {
+        let _ = seed;
+        self.extract(graph, roots, cost, budget)
+    }
 
     /// Hard conformance assert on the winner: every selected non-leaf is
     /// Launch; every geometry legal against the exact `ArenaPlan`; every
@@ -216,8 +227,9 @@ pub trait Extractor: Send + Sync {
         Vec::new()
     }
 
-    /// The labels [`Self::launch_variants`] would offer for one launch,
-    /// without building a single plan.
+    /// Candidate labels and their complete realized costs, without deriving
+    /// buffers, bindings or plan hashes. Lower costs come first; a label that
+    /// cannot realize keeps its place in the offering with the maximum cost.
     ///
     /// The list is a superset of what `launch_variants` returns — a label
     /// here may still fail to realize — and is exactly the label space
@@ -226,11 +238,13 @@ pub trait Extractor: Send + Sync {
     fn launch_variant_labels(
         &self,
         graph: &EGraph,
+        roots: &[Id],
         base: &Plan,
         launch_ix: usize,
+        cost: &dyn CostModel,
         min_macs: u64,
-    ) -> Vec<String> {
-        let _ = (graph, base, launch_ix, min_macs);
+    ) -> Vec<(String, Picoseconds)> {
+        let _ = (graph, roots, base, launch_ix, cost, min_macs);
         Vec::new()
     }
 

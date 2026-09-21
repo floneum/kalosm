@@ -12,12 +12,12 @@ use fusor_ir::device::Caps;
 use fusor_ir::dtype::NumericContract;
 use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
-    Accumulator, Addr, Builtin, CoopMatrixRole, CoopSrc, ElementType, KernelIr, ReduceKind,
+    Accumulator, Addr, Builtin, CoopMatrixRole, CoopSrc, ElementType, KernelIr, Local, ReduceKind,
     ScalarElement, Source, Stmt, StorageView, Tile, TileBinaryOp, TileCompareOp, TileExpr,
     TileReduceOp, cooperative_store_layout_supported,
 };
 use fusor_ir::ir::launch::{
-    ContractSide, CoopGeom, Family, Launch, SchedPoint, SgemmParams, SgemvParams,
+    ContractSide, CoopGeom, Family, IndexSpace, Launch, SchedPoint, SgemmParams, SgemvParams,
 };
 use fusor_ir::scalar::{ScalarExpr, ScalarKind};
 use fusor_ir::shape::Dim;
@@ -54,8 +54,8 @@ pub(crate) fn lower_contract(
 
 struct Shape {
     m: u32,
-    n: u32,
-    k: u32,
+    n: Dim,
+    k: Dim,
     batch: u32,
 }
 
@@ -71,10 +71,50 @@ fn shape_of(ctx: &Ctx<'_>, op: &Launch) -> Result<Shape> {
     };
     Ok(Shape {
         m: get(*m)?,
-        n: get(*n)?,
-        k: get(*k)?,
+        n: positive(*n),
+        k: positive(*k),
         batch: get(*batch)?.max(1),
     })
+}
+
+fn positive(dim: Dim) -> Dim {
+    match dim {
+        Dim::Const(value) => Dim::Const(value.max(1)),
+        _ => dim,
+    }
+}
+
+fn bound_u32(ctx: &Ctx<'_>, dim: Dim) -> Result<u32> {
+    let value = ctx.binding.require(dim)?;
+    u32::try_from(value)
+        .map_err(|_| Error::Plan(format!("contraction extent {value} exceeds a u32")))
+}
+
+fn ceil_extent(ctx: &mut Ctx<'_>, dim: Dim, divisor: u32) -> Result<TileExpr> {
+    if let Some(value) = dim.as_const() {
+        let value = u32::try_from(value.div_ceil(u64::from(divisor.max(1))))
+            .map_err(|_| Error::Plan("contraction tile count exceeds a u32".into()))?;
+        return Ok(ctx.b.u32(value));
+    }
+    let value = ctx.dim_expr(dim)?;
+    if divisor <= 1 {
+        return Ok(value);
+    }
+    let divisor = ctx.b.u32(divisor.max(1));
+    let whole = ctx.b.binary(
+        TileBinaryOp::Div,
+        value.clone(),
+        divisor.clone(),
+        NumericContract::RELAXED,
+    );
+    let rem = ctx
+        .b
+        .binary(TileBinaryOp::Rem, value, divisor, NumericContract::RELAXED);
+    let zero = ctx.b.u32(0);
+    let tail = ctx.b.compare(TileCompareOp::Gt, rem, zero.clone());
+    let one = ctx.b.u32(1);
+    let tail = ctx.b.select(tail, one, zero);
+    Ok(ctx.b.add(whole, tail))
 }
 
 /// Grid swizzle group along M: the number of M blocks one traversal of the N
@@ -161,6 +201,7 @@ pub(crate) fn lower_coop(
         return Err(Error::Plan("lower_coop on a non-Contract node".into()));
     };
     let shape = shape_of(&ctx, op)?;
+    let n = bound_u32(&ctx, shape.n)?.max(1);
     let width = ctx.caps.subgroup_width();
     if !geom.legal(width, ctx.caps.limits.max_compute_invocations_per_workgroup) {
         return Err(Error::Plan(format!(
@@ -177,14 +218,14 @@ pub(crate) fn lower_coop(
     // The operands as 2-D matrices in their own strides: A is `[batch * m, k]`
     // and B is `[batch * k, n]`, whatever ranks those extents are spread
     // across. A transposed rhs is a stride swap, never a copy.
-    let a_rows = shape.batch.saturating_mul(shape.m).max(1);
-    let b_rows = shape.batch.saturating_mul(shape.k).max(1);
+    let a_rows = Dim::Const(u64::from(shape.batch.saturating_mul(shape.m).max(1)));
+    let b_rows = Dim::Const(u64::from(shape.batch)) * shape.k;
 
     // Allocation maps logical output axes onto whole padded matrix tiles.
     // Cooperative stores use their flattened physical matrix coordinates.
     let out = ctx.output()?;
     let tiles_m = shape.m.max(1).div_ceil(geom.bm.max(1)).max(1);
-    let tiles_n = shape.n.max(1).div_ceil(geom.bn.max(1)).max(1);
+    let tiles_n = n.div_ceil(geom.bn.max(1)).max(1);
     let m_padded = tiles_m.saturating_mul(geom.bm);
     let n_padded = tiles_n.saturating_mul(geom.bn);
     let want_rows = shape.batch.saturating_mul(m_padded).max(1);
@@ -216,10 +257,11 @@ pub(crate) fn lower_coop(
     // The staging sources, one per buffer each side reads. A side that has
     // absorbed a producer brings several, all loaded at the same `(row, col)`
     // the staging fill already computes, then combined by the side's `pre`.
-    let a_sources = ctx.contract_side_sources(a, a_rows, shape.k.max(1))?;
-    let b_sources = ctx.contract_side_sources(b, b_rows, shape.n.max(1))?;
-    let a_coords = SideCoords::for_side(&ctx, a, u64::from(a_rows), u64::from(shape.k.max(1)))?;
-    let b_coords = SideCoords::for_side(&ctx, b, u64::from(b_rows), u64::from(shape.n.max(1)))?;
+    let a_sources =
+        ctx.contract_side_sources(a, shape.batch, Dim::Const(u64::from(shape.m)), shape.k)?;
+    let b_sources = ctx.contract_side_sources(b, shape.batch, shape.k, shape.n)?;
+    let a_coords = SideCoords::for_side(&ctx, a, a_rows, shape.k)?;
+    let b_coords = SideCoords::for_side(&ctx, b, b_rows, shape.n)?;
 
     let block = cs.lanes;
     let groups = shape
@@ -235,7 +277,7 @@ pub(crate) fn lower_coop(
 
     let per_batch = tiles_m.saturating_mul(tiles_n).max(1);
     let (batch_index, local_tile) = split_const(&mut ctx, tile_id, shape.batch.max(1), per_batch);
-    let group_m = swizzle_group_m(geom, shape.n);
+    let group_m = swizzle_group_m(geom, n);
     let (m_tile, n_tile) = swizzle_tile(&mut ctx, local_tile, tiles_m, tiles_n, group_m);
 
     let bm_e = ctx.b.u32(geom.bm.max(1));
@@ -245,7 +287,7 @@ pub(crate) fn lower_coop(
 
     // Operand row origins of this batch element.
     let m_e = ctx.b.u32(shape.m.max(1));
-    let k_e = ctx.b.u32(shape.k.max(1));
+    let k_e = ctx.dim_expr(shape.k)?;
     let a_batch_base = ctx.b.mul(batch_index.clone(), m_e.clone());
     let b_batch_base = ctx.b.mul(batch_index.clone(), k_e.clone());
     let a_row_base = ctx.b.add(a_batch_base.clone(), row_block.clone());
@@ -254,7 +296,7 @@ pub(crate) fn lower_coop(
 
     // Output row origin: the batch index walks the *padded* row space.
     let mp_e = ctx.b.u32(m_padded.max(1));
-    let out_row_origin = ctx.b.mul(batch_index, mp_e);
+    let out_row_origin = ctx.b.mul(batch_index.clone(), mp_e);
     let out_row_base = ctx.b.add(out_row_origin, row_block);
     // The same row in the *logical* space, which is what a `post` body's
     // `IndexOf` reads: `row` counts `(batch, m)` and `col` counts `n`, exactly
@@ -278,9 +320,6 @@ pub(crate) fn lower_coop(
     let sg_row_base = ctx.b.mul(sg_row, sg_rows_e);
     let sg_col_base = ctx.b.mul(sg_col, sg_cols_e);
 
-    let k_tiles = shape.k.max(1).div_ceil(geom.bk.max(1)).max(1);
-    let iters = k_tiles.div_ceil(depth).max(1);
-
     let post_is_identity = matches!(post.kind(), ScalarKind::Arg(0));
 
     // A mixed-type arena has one untyped physical binding. Stage through
@@ -302,8 +341,8 @@ pub(crate) fn lower_coop(
         None
     };
 
-    let k_limit = ctx.b.u32(shape.k.max(1));
-    let n_limit = ctx.b.u32(shape.n.max(1));
+    let k_limit = ctx.dim_expr(shape.k)?;
+    let n_limit = ctx.b.u32(n);
 
     let mut body: Vec<Stmt> = Vec::new();
     for pass in 0..geom.n_passes.max(1) {
@@ -330,6 +369,7 @@ pub(crate) fn lower_coop(
                 &a_sources,
                 a_coords.as_ref(),
                 &lane,
+                &batch_index,
                 a_row_base.clone(),
                 k_base.clone(),
                 a_row_limit.clone(),
@@ -349,6 +389,7 @@ pub(crate) fn lower_coop(
                 &b_sources,
                 b_coords.as_ref(),
                 &lane,
+                &batch_index,
                 b_row_base,
                 pass_col_base.clone(),
                 b_row_limit.clone(),
@@ -426,7 +467,7 @@ pub(crate) fn lower_coop(
             }
         }
 
-        let count = ctx.b.u32(iters);
+        let count = ceil_extent(&mut ctx, shape.k, geom.bk.max(1).saturating_mul(depth))?;
         body.push(Stmt::Loop {
             count: Some(count),
             index: Some(k_index),
@@ -565,6 +606,30 @@ fn workgroup_index(ctx: &mut Ctx<'_>, grid: [u32; 3], groups: u32) -> TileExpr {
     }
 }
 
+fn column_workgroup_index(
+    ctx: &mut Ctx<'_>,
+    grid: [u32; 3],
+    rows: u32,
+    columns: Dim,
+    tile: u32,
+) -> Result<TileExpr> {
+    if let Some(n) = columns.as_const() {
+        let groups = u64::from(rows).saturating_mul(n.div_ceil(u64::from(tile.max(1))));
+        let groups = u32::try_from(groups)
+            .map_err(|_| Error::Plan("contraction workgroup count exceeds a u32".into()))?;
+        return Ok(workgroup_index(ctx, grid, groups));
+    }
+    let n = ceil_extent(ctx, columns, tile)?;
+    let rows = ctx.b.u32(rows);
+    let groups = ctx.b.mul(rows, n);
+    let one = ctx.b.u32(1);
+    let last = ctx.b.sub(groups, one);
+    let id = ctx.linear_workgroup();
+    Ok(ctx
+        .b
+        .binary(TileBinaryOp::Min, id, last, NumericContract::RELAXED))
+}
+
 /// `(index / stride, index % stride)`, skipping both operations when the
 /// quotient can only ever be zero.
 fn split_const(
@@ -696,38 +761,45 @@ fn swizzle_tile(
 ///
 /// Built only when the side's `pre` names a coordinate.
 struct SideCoords {
-    extents: Vec<u64>,
+    extents: Vec<Dim>,
     split: usize,
 }
 
 impl SideCoords {
-    fn for_side(ctx: &Ctx<'_>, side: &ContractSide, rows: u64, cols: u64) -> Result<Option<Self>> {
+    fn for_side(ctx: &Ctx<'_>, side: &ContractSide, rows: Dim, cols: Dim) -> Result<Option<Self>> {
         if !side.pre.reads_index_of() {
             return Ok(None);
         }
         let layout = &side.primary().layout;
-        let split = crate::lower::matrix_split_for(layout, &ctx.binding, rows, cols)?;
-        let extents = layout
-            .shape()
-            .iter()
-            .map(|d| ctx.binding.require(*d))
-            .collect::<Result<Vec<u64>>>()?;
+        let product = |dims: &[Dim]| dims.iter().copied().fold(Dim::ONE, |a, b| a * b);
+        let split = match (0..=layout.rank()).rev().find(|&split| {
+            product(&layout.shape()[..split]).known_eq(rows)
+                && product(&layout.shape()[split..]).known_eq(cols)
+        }) {
+            Some(split) => split,
+            None => crate::lower::matrix_split_for(
+                layout,
+                &ctx.binding,
+                ctx.binding.require(rows)?,
+                ctx.binding.require(cols)?,
+            )?,
+        };
+        let extents = layout.shape().to_vec();
         Ok(Some(Self { extents, split }))
     }
 
     /// The per-axis coordinates at `(row, col)`, innermost axis of each group
     /// varying fastest.
-    fn at(&self, ctx: &mut Ctx<'_>, row: &TileExpr, col: &TileExpr) -> Vec<TileExpr> {
+    fn at(&self, ctx: &mut Ctx<'_>, row: &TileExpr, col: &TileExpr) -> Result<Vec<TileExpr>> {
         let mut out = vec![ctx.b.u32(0); self.extents.len()];
         let decompose = |ctx: &mut Ctx<'_>,
                          flat: &TileExpr,
                          axes: std::ops::Range<usize>,
-                         out: &mut Vec<TileExpr>| {
+                         out: &mut Vec<TileExpr>|
+         -> Result<()> {
             let mut rest = flat.clone();
             for i in axes.rev() {
-                let e = ctx
-                    .b
-                    .u32(u32::try_from(self.extents[i]).unwrap_or(u32::MAX).max(1));
+                let e = ctx.dim_expr(positive(self.extents[i]))?;
                 out[i] = ctx.b.binary(
                     TileBinaryOp::Rem,
                     rest.clone(),
@@ -738,10 +810,11 @@ impl SideCoords {
                     .b
                     .binary(TileBinaryOp::Div, rest, e, NumericContract::RELAXED);
             }
+            Ok(())
         };
-        decompose(ctx, row, 0..self.split, &mut out);
-        decompose(ctx, col, self.split..self.extents.len(), &mut out);
-        out
+        decompose(ctx, row, 0..self.split, &mut out)?;
+        decompose(ctx, col, self.split..self.extents.len(), &mut out)?;
+        Ok(out)
     }
 }
 
@@ -764,6 +837,7 @@ fn load_staged(
     row: &TileExpr,
     col: &TileExpr,
     mask: &TileExpr,
+    batch: &TileExpr,
 ) -> Result<Vec<TileExpr>> {
     sources
         .iter()
@@ -783,13 +857,36 @@ fn load_staged(
             }
             StagedSource::Indexed {
                 operand,
-                rows,
                 cols,
+                elements,
+                axes,
+                rows_per_batch,
             } => {
-                let width = ctx.b.u32(*cols);
-                let base = ctx.b.mul(row.clone(), width);
-                let flat = ctx.b.add(base, col.clone());
-                let value = ctx.load_mapped(operand, flat, u64::from(*rows) * u64::from(*cols))?;
+                let value = if let Some((row_axis, col_axis)) = axes {
+                    let rows = ctx.dim_expr(*rows_per_batch)?;
+                    let base = ctx.b.mul(batch.clone(), rows);
+                    let local_row = ctx.b.sub(row.clone(), base);
+                    let layout = &operand.layout;
+                    let mut address = ctx.dim_expr(layout.offset())?;
+                    for (coordinate, axes) in [
+                        (batch, 0..*row_axis),
+                        (&local_row, *row_axis..*col_axis),
+                        (col, *col_axis..layout.rank()),
+                    ] {
+                        let term = ctx.strided_address(
+                            coordinate.clone(),
+                            &layout.shape()[axes.clone()],
+                            &layout.strides()[axes],
+                        )?;
+                        address = ctx.b.add(address, term);
+                    }
+                    ctx.load_operand(operand, address)?
+                } else {
+                    let width = ctx.dim_expr(*cols)?;
+                    let base = ctx.b.mul(row.clone(), width);
+                    let flat = ctx.b.add(base, col.clone());
+                    ctx.load_mapped(operand, flat, *elements)?
+                };
                 let fill = ctx.zero_of(value.element());
                 Ok(ctx.b.select(mask.clone(), value, fill))
             }
@@ -806,6 +903,7 @@ fn stage_operand_tile(
     srcs: &[StagedSource],
     coords: Option<&SideCoords>,
     lane: &TileExpr,
+    batch: &TileExpr,
     row_base: TileExpr,
     col_base: TileExpr,
     row_limit: TileExpr,
@@ -818,6 +916,19 @@ fn stage_operand_tile(
 ) -> Result<()> {
     let total = rows.saturating_mul(cols).max(1);
     let lanes = lanes.max(1);
+    let column_major = rows > 1
+        && srcs.iter().any(|s| matches!(s, StagedSource::Mem(_)))
+        && srcs.iter().all(|source| {
+            let layout = match source {
+                StagedSource::Const(_) => return true,
+                StagedSource::Indexed { .. } => return false,
+                StagedSource::Mem(Source::Storage(view)) => &view.layout,
+                StagedSource::Mem(Source::Quantized(view)) => &view.data.layout,
+            };
+            matches!(layout.indexing.groups.as_slice(), [row, col]
+                if matches!(row.sub_axes.as_slice(), [r] if r.stride == 1)
+                    && matches!(col.sub_axes.as_slice(), [c] if c.stride > 1))
+        });
     for pass in 0..total.div_ceil(lanes) {
         let flat = if pass == 0 {
             lane.clone()
@@ -825,19 +936,32 @@ fn stage_operand_tile(
             let off = ctx.b.u32(pass.saturating_mul(lanes));
             ctx.b.add(lane.clone(), off)
         };
-        let cols_e = ctx.b.u32(cols.max(1));
-        let local_row = ctx.b.binary(
+        // Lane order follows the source; the shared tile keeps its row-major layout.
+        let inner = ctx.b.u32(if column_major { rows } else { cols }.max(1));
+        let major = ctx.b.binary(
             TileBinaryOp::Div,
             flat.clone(),
-            cols_e.clone(),
+            inner.clone(),
             NumericContract::RELAXED,
         );
-        let local_col = ctx.b.binary(
+        let minor = ctx.b.binary(
             TileBinaryOp::Rem,
             flat.clone(),
-            cols_e,
+            inner,
             NumericContract::RELAXED,
         );
+        let (local_row, local_col) = if column_major {
+            (minor, major)
+        } else {
+            (major, minor)
+        };
+        let tile_index = if column_major {
+            let stride = ctx.b.u32(cols);
+            let row_offset = ctx.b.mul(local_row.clone(), stride);
+            ctx.b.add(row_offset, local_col.clone())
+        } else {
+            flat.clone()
+        };
         let row = ctx.b.add(row_base.clone(), local_row);
         let col = ctx.b.add(col_base.clone(), local_col);
         let in_row = ctx
@@ -861,19 +985,19 @@ fn stage_operand_tile(
         // Each out-of-range fill takes its own source's element type, not the
         // staging tile's: a decode reads `u32` words and only becomes `elem`
         // after `pre` has run.
-        let raws = load_staged(ctx, srcs, &row, &col, &active)?;
+        let raws = load_staged(ctx, srcs, &row, &col, &active, batch)?;
         let coord_exprs = match coords {
-            Some(c) => c.at(ctx, &row, &col),
+            Some(c) => c.at(ctx, &row, &col)?,
             None => Vec::new(),
         };
         let value = ctx.eval_scalar(pre, &raws, &coord_exprs)?;
         let value = ctx.b.cast(value, ElementType::Scalar(elem));
         let value = ctx.b.select(active, value, fill);
         let index = if tile_base == 0 {
-            flat
+            tile_index
         } else {
             let base = ctx.b.u32(tile_base);
-            ctx.b.add(base, flat)
+            ctx.b.add(base, tile_index)
         };
         let store = Stmt::StoreTile {
             dst: tile.clone(),
@@ -1034,29 +1158,36 @@ fn contract_rows(
     let (tn, block) = row_tiling(theta, ctx.caps);
     // One source per buffer each side reads, all indexed by that side's own
     // `(row, col)`. A side that absorbed a producer simply has more of them.
-    let a_rows = shape.batch.saturating_mul(shape.m).max(1);
-    let b_rows = shape.batch.saturating_mul(shape.k).max(1);
-    let a_sources = ctx.contract_side_sources(a, a_rows, shape.k.max(1))?;
-    let b_sources = ctx.contract_side_sources(b, b_rows, shape.n.max(1))?;
-    let a_coords = SideCoords::for_side(&ctx, a, u64::from(a_rows), u64::from(shape.k.max(1)))?;
-    let b_coords = SideCoords::for_side(&ctx, b, u64::from(b_rows), u64::from(shape.n.max(1)))?;
+    let a_rows = Dim::Const(u64::from(shape.batch.saturating_mul(shape.m).max(1)));
+    let b_rows = Dim::Const(u64::from(shape.batch)) * shape.k;
+    let a_sources =
+        ctx.contract_side_sources(a, shape.batch, Dim::Const(u64::from(shape.m)), shape.k)?;
+    let b_sources = ctx.contract_side_sources(b, shape.batch, shape.k, shape.n)?;
+    let a_coords = SideCoords::for_side(&ctx, a, a_rows, shape.k)?;
+    let b_coords = SideCoords::for_side(&ctx, b, b_rows, shape.n)?;
     let out = ctx.output()?;
     let out_view = ctx.linear_view(out)?;
     let out_elem = out_view.buffer.element;
     let limits = ctx.caps.limits;
 
-    let n = shape.n.max(1);
-    let tn = tn.clamp(1, n);
-    let n_tiles = n.div_ceil(tn).max(1);
-    let rows = shape.m.saturating_mul(shape.batch).max(1);
-    let tiles = rows.saturating_mul(n_tiles);
-
-    let grid = distribute_workgroups(
-        tiles.div_ceil(block.max(1)).max(1),
-        limits.max_compute_workgroups_per_dimension,
+    let tn = tn.clamp(
+        1,
+        shape
+            .n
+            .as_const()
+            .unwrap_or(u64::from(tn))
+            .min(u64::from(tn)) as u32,
     );
+    let rows = shape.m.saturating_mul(shape.batch).max(1);
+    let grid = crate::lower::tiled_grid_for(
+        &IndexSpace::new([Dim::Const(u64::from(rows)), shape.n]),
+        block,
+        tn,
+        &ctx.binding,
+        &limits,
+    )?;
     let index = ctx.global_index(block, grid);
-    let n_tiles_e = ctx.b.u32(n_tiles);
+    let n_tiles_e = ceil_extent(&mut ctx, shape.n, tn)?;
     let row = ctx.b.binary(
         TileBinaryOp::Div,
         index.clone(),
@@ -1066,10 +1197,11 @@ fn contract_rows(
     let col_tile = ctx.b.binary(
         TileBinaryOp::Rem,
         index.clone(),
-        n_tiles_e,
+        n_tiles_e.clone(),
         NumericContract::RELAXED,
     );
-    let tiles_e = ctx.b.u32(tiles);
+    let rows_e = ctx.b.u32(rows);
+    let tiles_e = ctx.b.mul(rows_e, n_tiles_e);
     let live = ctx.b.compare(TileCompareOp::Lt, index, tiles_e);
 
     // B's own row is `batch_index * k + kk`; the batch index rides in `row`.
@@ -1080,14 +1212,14 @@ fn contract_rows(
         m_e,
         NumericContract::RELAXED,
     );
-    let k_e = ctx.b.u32(shape.k.max(1));
-    let b_row_base = ctx.b.mul(batch_index, k_e);
+    let k_e = ctx.dim_expr(shape.k)?;
+    let b_row_base = ctx.b.mul(batch_index.clone(), k_e);
 
     let k_index = ctx.b.local(ElementType::Scalar(ScalarElement::U32));
     let kk = ctx.b.load_local(k_index.clone());
-    let avs = load_staged(&mut ctx, &a_sources, &row, &kk, &live)?;
+    let avs = load_staged(&mut ctx, &a_sources, &row, &kk, &live, &batch_index)?;
     let a_coord_exprs = match &a_coords {
-        Some(c) => c.at(&mut ctx, &row, &kk),
+        Some(c) => c.at(&mut ctx, &row, &kk)?,
         None => Vec::new(),
     };
     let av = ctx.eval_scalar(&a.pre, &avs, &a_coord_exprs)?;
@@ -1101,12 +1233,12 @@ fn contract_rows(
     for j in 0..tn {
         let off = ctx.b.u32(j);
         let col = ctx.b.add(col0.clone(), off);
-        let n_bound = ctx.b.u32(n);
+        let n_bound = ctx.dim_expr(shape.n)?;
         let in_n = ctx.b.compare(TileCompareOp::Lt, col.clone(), n_bound);
         let ok = ctx.b.and(live.clone(), in_n);
-        let bvs = load_staged(&mut ctx, &b_sources, &b_row, &col, &ok)?;
+        let bvs = load_staged(&mut ctx, &b_sources, &b_row, &col, &ok, &batch_index)?;
         let b_coord_exprs = match &b_coords {
-            Some(c) => c.at(&mut ctx, &b_row, &col),
+            Some(c) => c.at(&mut ctx, &b_row, &col)?,
             None => Vec::new(),
         };
         let bv = ctx.eval_scalar(&b.pre, &bvs, &b_coord_exprs)?;
@@ -1123,7 +1255,7 @@ fn contract_rows(
         cols.push((col, ok));
     }
 
-    let count = ctx.b.u32(shape.k.max(1));
+    let count = ctx.dim_expr(shape.k)?;
     let locals: Vec<_> = accs.iter().map(|a| a.local.clone()).collect();
     let mut body = vec![Stmt::Loop {
         count: Some(count),
@@ -1132,7 +1264,7 @@ fn contract_rows(
         body: Vec::new(),
     }];
 
-    let n_e = ctx.b.u32(n);
+    let n_e = ctx.dim_expr(shape.n)?;
     for (local, (col, ok)) in locals.into_iter().zip(cols) {
         let total = ctx.b.load_local(local);
         let value = ctx.eval_scalar(post, &[total], &[row.clone(), col.clone()])?;
@@ -1155,8 +1287,128 @@ fn contract_rows(
     Ok(ctx.finish(name, grid, block, body))
 }
 
-/// Vector-family contraction: `subgroups` lane groups per row, each summing a
-/// `chunk`-long, `vector`-wide slice of K.
+/// Full vector passes followed by the remaining contiguous K slices. A runtime
+/// extent keeps the tail loop uniform while masking only its final slice.
+#[allow(clippy::too_many_arguments)]
+fn gemv_partials(
+    ctx: &mut Ctx<'_>,
+    body: &mut Vec<Stmt>,
+    k: Dim,
+    lanes: u32,
+    vector: u32,
+    mut locals: Vec<Local>,
+    pass_at: impl Fn(&mut Ctx<'_>, TileExpr, bool, &[Local], u32, bool) -> Result<Vec<TileExpr>>,
+) -> Result<Vec<Local>> {
+    let pass = (lanes * vector).max(1);
+    let known = k
+        .as_const()
+        .map(u32::try_from)
+        .transpose()
+        .map_err(|_| Error::Plan("contraction extent exceeds a u32".into()))?;
+    let full = if let Some(k) = known {
+        ctx.b.u32(k / pass)
+    } else {
+        let k = ctx.dim_expr(k)?;
+        let divisor = ctx.b.u32(pass);
+        ctx.b
+            .binary(TileBinaryOp::Div, k, divisor, NumericContract::RELAXED)
+    };
+    if known.is_none_or(|k| k >= pass) {
+        let index = ctx.b.local(ElementType::Scalar(ScalarElement::U32));
+        let i = ctx.b.load_local(index.clone());
+        let stride = ctx.b.u32(pass);
+        let step = ctx.b.mul(i, stride);
+        let updates = pass_at(ctx, step, false, &locals, vector, false)?;
+        let accumulators = locals
+            .iter()
+            .zip(updates)
+            .map(|(local, update)| Accumulator {
+                local: local.clone(),
+                init: ctx.zero_of(local.element),
+                update,
+            })
+            .collect();
+        body.push(Stmt::Loop {
+            count: Some(full.clone()),
+            index: Some(index),
+            accumulators,
+            body: Vec::new(),
+        });
+    } else {
+        for local in &locals {
+            body.push(Stmt::StoreLocal {
+                dst: local.clone(),
+                value: ctx.zero_of(local.element),
+            });
+        }
+    }
+
+    let mut tail = |ctx: &mut Ctx<'_>,
+                    start: TileExpr,
+                    count: TileExpr,
+                    vector: u32,
+                    masked: bool,
+                    stride: Option<u32>|
+     -> Result<()> {
+        let index = stride.map(|_| ctx.b.local(ElementType::Scalar(ScalarElement::U32)));
+        let step = if let (Some(stride), Some(index)) = (stride, &index) {
+            let i = ctx.b.load_local(index.clone());
+            let stride = ctx.b.u32(stride);
+            let offset = ctx.b.mul(i, stride);
+            ctx.b.add(start, offset)
+        } else {
+            start
+        };
+        let next: Vec<_> = locals
+            .iter()
+            .map(|local| ctx.b.local(local.element))
+            .collect();
+        let updates = pass_at(ctx, step, masked, &next, vector, true)?;
+        let accumulators = next
+            .iter()
+            .zip(&locals)
+            .zip(updates)
+            .map(|((local, from), update)| Accumulator {
+                local: local.clone(),
+                init: ctx.b.load_local(from.clone()),
+                update,
+            })
+            .collect();
+        body.push(Stmt::Loop {
+            count: Some(count),
+            index,
+            accumulators,
+            body: Vec::new(),
+        });
+        locals = next;
+        Ok(())
+    };
+    if let Some(k) = known {
+        let rem = k % pass;
+        let mut at = k - rem;
+        for (count, masked) in [(rem / lanes, false), (rem % lanes, true)] {
+            if count == 0 {
+                continue;
+            }
+            let vector = if masked { 1 } else { count };
+            let start = ctx.b.u32(at);
+            let one = ctx.b.u32(1);
+            tail(ctx, start, one, vector, masked, None)?;
+            at += if masked { count } else { count * lanes };
+        }
+    } else {
+        let rounds = ceil_extent(ctx, k, lanes)?;
+        let vector = ctx.b.u32(vector);
+        let full_rounds = ctx.b.mul(full.clone(), vector);
+        let count = ctx.b.sub(rounds, full_rounds);
+        let stride = ctx.b.u32(pass);
+        let start = ctx.b.mul(full, stride);
+        tail(ctx, start, count, 1, true, Some(lanes))?;
+    }
+    Ok(locals)
+}
+
+/// Vector contraction with `vector` elements of K per lane per iteration.
 pub(crate) fn lower_sgemv(mut ctx: Ctx<'_>, op: &Launch, p: SgemvParams) -> Result<KernelIr> {
     let Launch::Contract {
         post, acc, a, b, ..
@@ -1177,22 +1429,13 @@ pub(crate) fn lower_sgemv(mut ctx: Ctx<'_>, op: &Launch, p: SgemvParams) -> Resu
     // A is `[batch * m, k]` and B is `[batch * k, n]`, whatever ranks those
     // extents are spread across. A quantized operand decodes at the same
     // coordinates through `contract_stage_source`.
-    let a_rows = shape.batch.saturating_mul(shape.m).max(1);
-    let b_rows = shape.batch.saturating_mul(shape.k).max(1);
-    let a_views = ctx.contract_side_sources(a, a_rows, shape.k.max(1))?;
-    let b_views = ctx.contract_side_sources(b, b_rows, shape.n.max(1))?;
-    let a_coords = SideCoords::for_side(
-        &ctx,
-        a,
-        u64::from(shape.m.saturating_mul(shape.batch).max(1)),
-        u64::from(shape.k.max(1)),
-    )?;
-    let b_coords = SideCoords::for_side(
-        &ctx,
-        b,
-        u64::from(shape.batch.saturating_mul(shape.k).max(1)),
-        u64::from(shape.n.max(1)),
-    )?;
+    let a_rows = Dim::Const(u64::from(shape.batch.saturating_mul(shape.m).max(1)));
+    let b_rows = Dim::Const(u64::from(shape.batch)) * shape.k;
+    let a_views =
+        ctx.contract_side_sources(a, shape.batch, Dim::Const(u64::from(shape.m)), shape.k)?;
+    let b_views = ctx.contract_side_sources(b, shape.batch, shape.k, shape.n)?;
+    let a_coords = SideCoords::for_side(&ctx, a, a_rows, shape.k)?;
+    let b_coords = SideCoords::for_side(&ctx, b, b_rows, shape.n)?;
     let out = ctx.output()?;
     let out_view = ctx.linear_view(out)?;
     let out_elem = out_view.buffer.element;
@@ -1210,15 +1453,15 @@ pub(crate) fn lower_sgemv(mut ctx: Ctx<'_>, op: &Launch, p: SgemvParams) -> Resu
     // is linearized against the dispatch grid — never raw `ProgramId(X)`,
     // because past the per-dimension cap `distribute_workgroups` folds the
     // dispatch onto a second slab.
-    let groups = u32::try_from(
-        u64::from(shape.m.saturating_mul(shape.batch).max(1))
-            .saturating_mul(u64::from(shape.n.max(1)))
-            .min(u64::from(u32::MAX)),
-    )
-    .expect("min'd to u32::MAX");
-    let grid = distribute_workgroups(groups, ctx.caps.limits.max_compute_workgroups_per_dimension);
-    let wg = workgroup_index(&mut ctx, grid, groups);
-    let n_e = ctx.b.u32(shape.n.max(1));
+    let rows = shape.m.saturating_mul(shape.batch).max(1);
+    let grid = crate::lower::grid_for(
+        &IndexSpace::new([Dim::Const(u64::from(rows)), shape.n]),
+        1,
+        &ctx.binding,
+        &ctx.caps.limits,
+    )?;
+    let wg = column_workgroup_index(&mut ctx, grid, rows, shape.n, 1)?;
+    let n_e = ctx.dim_expr(shape.n)?;
     // `wg` enumerates `[batch, m, n]` row-major: `row` is the A matrix row
     // (`batch * m + m_idx` — exactly the flat `wg / n`), and B's row is the
     // batch's k block plus the loop's own k.
@@ -1228,6 +1471,10 @@ pub(crate) fn lower_sgemv(mut ctx: Ctx<'_>, op: &Launch, p: SgemvParams) -> Resu
         n_e.clone(),
         NumericContract::RELAXED,
     );
+    let last_row = ctx.b.u32(rows - 1);
+    let row = ctx
+        .b
+        .binary(TileBinaryOp::Min, row, last_row, NumericContract::RELAXED);
     let col = ctx.b.binary(
         TileBinaryOp::Rem,
         wg.clone(),
@@ -1241,12 +1488,11 @@ pub(crate) fn lower_sgemv(mut ctx: Ctx<'_>, op: &Launch, p: SgemvParams) -> Resu
         m_e,
         NumericContract::RELAXED,
     );
-    let k_e = ctx.b.u32(shape.k.max(1));
-    let b_row_base = ctx.b.mul(batch_idx, k_e);
+    let k_e = ctx.dim_expr(shape.k)?;
+    let b_row_base = ctx.b.mul(batch_idx.clone(), k_e);
 
     let acc_local = ctx.b.local(ElementType::Scalar(acc_elem));
     let vector = p.vector.max(1);
-    let pass = (block * vector).max(1);
 
     // One pass of the k loop starting at `step`: the lane's partial,
     // continued from its accumulator. `masked` bounds each element against
@@ -1277,22 +1523,22 @@ pub(crate) fn lower_sgemv(mut ctx: Ctx<'_>, op: &Launch, p: SgemvParams) -> Resu
             let v_off = ctx.b.u32(v);
             let k = ctx.b.add(lane_base.clone(), v_off);
             let mask = if masked {
-                let k_bound = ctx.b.u32(shape.k.max(1));
+                let k_bound = ctx.dim_expr(shape.k)?;
                 ctx.b.compare(TileCompareOp::Lt, k.clone(), k_bound)
             } else {
                 ctx.b.bool(true)
             };
-            let avs = load_staged(ctx, &a_views, &row, &k, &mask)?;
+            let avs = load_staged(ctx, &a_views, &row, &k, &mask, &batch_idx)?;
             let b_row = ctx.b.add(b_row_base.clone(), k.clone());
-            let bvs = load_staged(ctx, &b_views, &b_row, &col, &mask)?;
+            let bvs = load_staged(ctx, &b_views, &b_row, &col, &mask, &batch_idx)?;
             let a_coord_exprs = match &a_coords {
-                Some(c) => c.at(ctx, &row, &k),
+                Some(c) => c.at(ctx, &row, &k)?,
                 None => Vec::new(),
             };
             let b_coord_exprs = match &b_coords {
                 Some(c) => {
                     let b_row = ctx.b.add(b_row_base.clone(), k.clone());
-                    c.at(ctx, &b_row, &col)
+                    c.at(ctx, &b_row, &col)?
                 }
                 None => Vec::new(),
             };
@@ -1314,73 +1560,18 @@ pub(crate) fn lower_sgemv(mut ctx: Ctx<'_>, op: &Launch, p: SgemvParams) -> Resu
         Ok(partial)
     };
 
-    // The loop advances `block * vector` elements of k per iteration — the
-    // stride the body actually indexes with — so that is what the count
-    // divides by: the full passes, unmasked, then the tail if k leaves one.
-    let full = shape.k.max(1) / pass;
-    let rem = shape.k.max(1) % pass;
-    if full > 0 {
-        let k_index = ctx.b.local(ElementType::Scalar(ScalarElement::U32));
-        let kk = ctx.b.load_local(k_index.clone());
-        let stride = ctx.b.u32(pass);
-        let step = ctx.b.mul(kk, stride);
-        let update = pass_at(&mut ctx, step, false, &acc_local, vector)?;
-        let init = ctx.b.zero(acc_elem);
-        let count = ctx.b.u32(full);
-        body.push(Stmt::Loop {
-            count: Some(count),
-            index: Some(k_index),
-            accumulators: vec![Accumulator {
-                local: acc_local.clone(),
-                init,
-                update,
-            }],
-            body: Vec::new(),
-        });
-    } else {
-        // A k shorter than one pass: no full pass to loop over, and an
-        // unmasked body under a zero count is not provably in range.
-        let zero = ctx.b.zero(acc_elem);
-        body.push(Stmt::StoreLocal {
-            dst: acc_local.clone(),
-            value: zero,
-        });
-    }
-    // The tail: the remainder spread evenly over the lanes as one unmasked
-    // pass of `rem / block` elements per lane, then the few elements that
-    // do not divide as one masked pass of one element per lane. Each is a
-    // one-iteration loop over its own accumulator seeded from the previous
-    // stage's: a loop's accumulator may only be written by that loop.
-    let mut acc_local = acc_local;
-    let mut at = full * pass;
-    let stages = [(rem / block, false), (rem % block, true)];
-    for (count, masked) in stages {
-        if count == 0 {
-            continue;
-        }
-        let (vector_n, span) = if masked {
-            (1, count)
-        } else {
-            (count, count * block)
-        };
-        let tail_local = ctx.b.local(ElementType::Scalar(acc_elem));
-        let step = ctx.b.u32(at);
-        let update = pass_at(&mut ctx, step, masked, &tail_local, vector_n)?;
-        let init = ctx.b.load_local(acc_local.clone());
-        let one = ctx.b.u32(1);
-        body.push(Stmt::Loop {
-            count: Some(one),
-            index: None,
-            accumulators: vec![Accumulator {
-                local: tail_local.clone(),
-                init,
-                update,
-            }],
-            body: Vec::new(),
-        });
-        acc_local = tail_local;
-        at += span;
-    }
+    let partials = gemv_partials(
+        &mut ctx,
+        &mut body,
+        shape.k,
+        block,
+        vector,
+        vec![acc_local],
+        |ctx, step, masked, locals, vector, _| {
+            Ok(vec![pass_at(ctx, step, masked, &locals[0], vector)?])
+        },
+    )?;
+    let acc_local = partials.into_iter().next().expect("one column");
 
     let lane_partial = ctx.b.load_local(acc_local);
     let fixed_subgroup = ctx.caps.subgroups.is_some_and(|s| s.is_fixed()) && block == width;
@@ -1479,25 +1670,27 @@ fn lower_sgemv_subgroup_cols(
             p.gap
         )));
     }
-    let n = shape.n.max(1);
     let rows = shape.batch.saturating_mul(shape.m).max(1);
-    let groups_per_row = n.div_ceil(p.cols);
-    let groups = u32::try_from(
-        u64::from(rows)
-            .saturating_mul(u64::from(groups_per_row))
-            .min(u64::from(u32::MAX)),
-    )
-    .expect("min'd to u32::MAX");
-    let grid = distribute_workgroups(groups, ctx.caps.limits.max_compute_workgroups_per_dimension);
+    let grid = crate::lower::tiled_grid_for(
+        &IndexSpace::new([Dim::Const(u64::from(rows)), shape.n]),
+        1,
+        p.cols,
+        &ctx.binding,
+        &ctx.caps.limits,
+    )?;
     let mut body: Vec<Stmt> = Vec::new();
-    let wg = workgroup_index(&mut ctx, grid, groups);
-    let gpr_e = ctx.b.u32(groups_per_row);
+    let wg = column_workgroup_index(&mut ctx, grid, rows, shape.n, p.cols)?;
+    let gpr_e = ceil_extent(&mut ctx, shape.n, p.cols)?;
     let row = ctx.b.binary(
         TileBinaryOp::Div,
         wg.clone(),
         gpr_e.clone(),
         NumericContract::RELAXED,
     );
+    let last_row = ctx.b.u32(rows - 1);
+    let row = ctx
+        .b
+        .binary(TileBinaryOp::Min, row, last_row, NumericContract::RELAXED);
     let col_group = ctx
         .b
         .binary(TileBinaryOp::Rem, wg, gpr_e, NumericContract::RELAXED);
@@ -1508,8 +1701,8 @@ fn lower_sgemv_subgroup_cols(
         m_e,
         NumericContract::RELAXED,
     );
-    let k_e = ctx.b.u32(shape.k.max(1));
-    let b_row_base = ctx.b.mul(batch_idx, k_e);
+    let k_e = ctx.dim_expr(shape.k)?;
+    let b_row_base = ctx.b.mul(batch_idx.clone(), k_e);
 
     let sg = ctx.b.builtin(Builtin::SubgroupId);
     let sg_lane = ctx.b.builtin(Builtin::SubgroupLane);
@@ -1522,9 +1715,11 @@ fn lower_sgemv_subgroup_cols(
     };
 
     let vector = p.vector.max(1);
-    let pass = (width * vector).max(1);
-    let col_exact = n.is_multiple_of(p.cols);
-    let n_e = ctx.b.u32(n);
+    let col_exact = shape
+        .n
+        .as_const()
+        .is_some_and(|n| n.is_multiple_of(u64::from(p.cols)));
+    let n_e = ctx.dim_expr(shape.n)?;
 
     // One accumulator per owned column, all advanced by the same loop.
     let cols_of_subgroup: Vec<(TileExpr, TileExpr)> = (0..cps)
@@ -1543,17 +1738,8 @@ fn lower_sgemv_subgroup_cols(
         .map(|_| ctx.b.local(ElementType::Scalar(acc_elem)))
         .collect();
 
-    // One pass of the k loop starting at `step`: every owned column's
-    // partial, continued from its accumulator local.
-    //
-    // `masked` bounds each element against k. Only the tail past the last
-    // full pass needs it: a full pass is in bounds by construction, and an
-    // unmasked pass keeps the unclamped straight-line loads and the
-    // aligned-window word sharing a quantized decode hash-conses onto. A
-    // k that is not a multiple of the pass used to mask *every* pass, and
-    // on a block-quantized operand that meant one decode per element —
-    // 100× the cost of the exact loop — for every model whose hidden width
-    // is not a multiple of 1024.
+    // Full passes are unmasked so aligned quantized loads share decoded
+    // words. Only the final partial pass needs bounds checks.
     let pass_at = |ctx: &mut Ctx<'_>,
                    step: TileExpr,
                    masked: bool,
@@ -1612,14 +1798,14 @@ fn lower_sgemv_subgroup_cols(
             let v_off = ctx.b.u32(off);
             let k = ctx.b.add(lane_base.clone(), v_off);
             let mask = if masked {
-                let k_bound = ctx.b.u32(shape.k.max(1));
+                let k_bound = ctx.dim_expr(shape.k)?;
                 ctx.b.compare(TileCompareOp::Lt, k.clone(), k_bound)
             } else {
                 ctx.b.bool(true)
             };
-            let avs = load_staged(ctx, a_views, &row, &k, &mask)?;
+            let avs = load_staged(ctx, a_views, &row, &k, &mask, &batch_idx)?;
             let a_coord_exprs = match a_coords {
-                Some(c) => c.at(ctx, &row, &k),
+                Some(c) => c.at(ctx, &row, &k)?,
                 None => Vec::new(),
             };
             let av = ctx.eval_scalar(&a.pre, &avs, &a_coord_exprs)?;
@@ -1644,11 +1830,11 @@ fn lower_sgemv_subgroup_cols(
                     ctx.b.and(mask.clone(), col_ok.clone())
                 };
                 let b_row = ctx.b.add(b_row_base.clone(), k.clone());
-                let bvs = load_staged(ctx, b_views, &b_row, col, &load_mask)?;
+                let bvs = load_staged(ctx, b_views, &b_row, col, &load_mask, &batch_idx)?;
                 let b_coord_exprs = match b_coords {
                     Some(c) => {
                         let b_row = ctx.b.add(b_row_base.clone(), k.clone());
-                        c.at(ctx, &b_row, col)
+                        c.at(ctx, &b_row, col)?
                     }
                     None => Vec::new(),
                 };
@@ -1665,85 +1851,7 @@ fn lower_sgemv_subgroup_cols(
         Ok(partials)
     };
 
-    // The full passes, unmasked; then the tail, if k leaves one.
-    let full = shape.k.max(1) / pass;
-    let rem = shape.k.max(1) % pass;
-    if full > 0 {
-        let k_index = ctx.b.local(ElementType::Scalar(ScalarElement::U32));
-        let kk = ctx.b.load_local(k_index.clone());
-        let stride = ctx.b.u32(pass);
-        let step = ctx.b.mul(kk, stride);
-        let updates = pass_at(&mut ctx, step, false, &locals, vector, false)?;
-        let accs: Vec<Accumulator> = locals
-            .iter()
-            .zip(updates)
-            .map(|(local, update)| Accumulator {
-                local: local.clone(),
-                init: ctx.b.zero(acc_elem),
-                update,
-            })
-            .collect();
-        let count = ctx.b.u32(full);
-        body.push(Stmt::Loop {
-            count: Some(count),
-            index: Some(k_index),
-            accumulators: accs,
-            body: Vec::new(),
-        });
-    } else {
-        // A k shorter than one pass: no full pass to loop over, and an
-        // unmasked body under a zero count is not provably in range.
-        for local in &locals {
-            let zero = ctx.b.zero(acc_elem);
-            body.push(Stmt::StoreLocal {
-                dst: local.clone(),
-                value: zero,
-            });
-        }
-    }
-    // The tail: the remainder spread evenly over the lanes as one unmasked
-    // contiguous pass of `rem / width` elements per lane, then the few
-    // elements that do not divide as one masked pass of one element per
-    // lane. Each is a one-iteration loop over its own accumulators seeded
-    // from the previous stage's: a loop's accumulator may only be written
-    // by that loop, so a stage cannot store into an earlier stage's locals.
-    let mut locals = locals;
-    let mut at = full * pass;
-    let stages = [(rem / width, false), (rem % width, true)];
-    for (count, masked) in stages {
-        if count == 0 {
-            continue;
-        }
-        let (vector_n, span) = if masked {
-            (1, count)
-        } else {
-            (count, count * width)
-        };
-        let tail_locals: Vec<_> = (0..cps)
-            .map(|_| ctx.b.local(ElementType::Scalar(acc_elem)))
-            .collect();
-        let step = ctx.b.u32(at);
-        let tail = pass_at(&mut ctx, step, masked, &tail_locals, vector_n, true)?;
-        let accs: Vec<Accumulator> = tail_locals
-            .iter()
-            .zip(locals.iter())
-            .zip(tail)
-            .map(|((local, from), update)| Accumulator {
-                local: local.clone(),
-                init: ctx.b.load_local(from.clone()),
-                update,
-            })
-            .collect();
-        let one = ctx.b.u32(1);
-        body.push(Stmt::Loop {
-            count: Some(one),
-            index: None,
-            accumulators: accs,
-            body: Vec::new(),
-        });
-        locals = tail_locals;
-        at += span;
-    }
+    let locals = gemv_partials(&mut ctx, &mut body, shape.k, width, vector, locals, pass_at)?;
 
     // Each column's partials never leave its subgroup, so the close is a
     // subgroup sum and the store is that subgroup's lane 0.

@@ -11,12 +11,16 @@ repository.workspace = true
 [dependencies]
 web-time.workspace = true
 fusor-ir.workspace = true
+fusor-gguf.workspace = true
 smallvec.workspace = true
 rustc-hash.workspace = true
 fixedbitset.workspace = true
 parking_lot.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+
+[dev-dependencies]
+fusor-tile.workspace = true
 
 [features]
 # Instrumentation for the compiler conformance harness only.

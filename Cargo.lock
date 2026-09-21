@@ -2527,6 +2527,7 @@ name = "fusor-cost"
 version = "0.1.0"
 dependencies = [
  "fixedbitset 0.5.7",
+ "fusor-gguf",
  "fusor-ir",
  "parking_lot",
  "rustc-hash 2.1.2",

@@ -17,6 +17,7 @@ pub mod rebase;
 pub mod scatter_fold;
 pub mod sink;
 pub mod slab;
+pub mod stream;
 pub mod specialize;
 pub mod split_k;
 pub mod tuple;
@@ -53,6 +54,7 @@ pub static CORE_RULES: &[Rule] = &[
     fusion::FOLD_POST_EPILOGUE,
     slab::FORM_SLAB_MAP,
     slab::FORM_SLAB_FOLD,
+    stream::STREAM_FOLD,
     // Launch fold algebra — the carrier laws. `HOIST` and `RETARGET` are two
     // entries sharing one dependence query: the driver's fired set is per
     // `(RuleId, Id)`, so one merged rule could fire at most once per node

@@ -373,6 +373,24 @@ fn contract_operand(
     b_shape: &[Dim],
 ) -> Option<Operand> {
     let strides = Layout::row_major_strides(shape);
+    if contracted.len() <= 1 {
+        let stride = |label: Label| {
+            labels
+                .iter()
+                .zip(&strides)
+                .filter(|(l, _)| **l == label)
+                .fold(Dim::Const(0), |sum, (_, s)| sum + *s)
+        };
+        let mut dims: SmallVec<[Dim; 6]> = out_shape.iter().copied().collect();
+        dims.push(fold_extent(contracted, spec, a_shape, b_shape)?);
+        let mut mapped: SmallVec<[Dim; 6]> = spec.out.iter().map(|l| stride(*l)).collect();
+        mapped.push(contracted.first().map_or(Dim::Const(0), |l| stride(*l)));
+        return Some(Operand {
+            src,
+            layout: Layout::from_parts(Dim::Const(0), &dims, &mapped).ok()?,
+            access: AccessPlan::Alias,
+        });
+    }
     // A label repeated within one operand is a diagonal read: its strides add.
     let stride_of = |l: Label| -> Option<u32> {
         let mut acc: u64 = 0;

@@ -657,7 +657,16 @@ fn extremum_adjoint(
             let m0 = tape.arg_like(mask, 0);
             let g1 = tape.arg_like(bg, 1);
             let c2 = tape.arg_like(bcount, 2);
-            let body = ScalarExpr::bin(BinOp::Div, ScalarExpr::bin(BinOp::Mul, m0, g1), c2);
+            // `count` is the number of ties. By construction the extremum is
+            // one of `x`'s values, so `count >= 1` — *unless* the fold's input
+            // was reassociated (streamed) away from the value this adjoint
+            // reads, in which case the equality finds no match, `mask` is all
+            // zero and the correct shift gradient is zero anyway. Dividing by
+            // `max(count, 1)` yields that zero without a `0/0`, and is
+            // identical to `count` whenever a tie exists.
+            let one = crate::tape::lit(1.0, acc)?;
+            let denom = ScalarExpr::bin(BinOp::Max, c2, one);
+            let body = ScalarExpr::bin(BinOp::Div, ScalarExpr::bin(BinOp::Mul, m0, g1), denom);
             tape.map(body, &[mask, bg, bcount])
         }
         TiePolicy::FirstWins => {

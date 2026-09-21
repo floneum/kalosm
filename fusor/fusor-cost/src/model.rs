@@ -150,7 +150,7 @@ impl Roofline {
         ins: &[ValueFacts],
         theta: Option<SchedPoint>,
     ) -> Picoseconds {
-        let fusor_ir::ir::Op::Launch(fusor_ir::ir::launch::Launch::Fold { space, axis, .. }) =
+        let fusor_ir::ir::Op::Launch(op @ fusor_ir::ir::launch::Launch::Fold { space, axis, .. }) =
             &node.op
         else {
             return Picoseconds(0);
@@ -160,6 +160,10 @@ impl Roofline {
         };
         let dims: Vec<u64> = space.dims.iter().filter_map(|d| d.as_const()).collect();
         let caps = &self.facts.caps;
+        let theta = op
+            .fold_schedule(theta, caps)
+            .map(|s| SchedPoint::Fold(s.strategy))
+            .or(theta);
         let lane_group = match theta {
             Some(SchedPoint::Fold(s)) => s.lane_group(caps.subgroup_width()),
             // The emitters' default at a bare point: the subgroup collective
@@ -266,9 +270,6 @@ impl CostModel for Roofline {
     }
 
     fn total(&self, launches: &[LaunchPlan<'_>]) -> Picoseconds {
-        launches
-            .iter()
-            .map(|launch| self.launch_cost(launch) + Picoseconds(self.facts.compile_ps_per_kernel))
-            .sum()
+        launches.iter().map(|launch| self.launch_cost(launch)).sum()
     }
 }

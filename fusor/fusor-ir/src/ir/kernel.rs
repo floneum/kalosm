@@ -1317,6 +1317,22 @@ fn carry_free_add(e: &TileExpr) -> Option<(TileExpr, u32)> {
 /// collapses to one word load per window as a *consequence*; the rewrite
 /// itself never heard of any of them.
 pub fn simplify_index(e: &TileExpr) -> TileExpr {
+    simplify_index_cached(e, &mut rustc_hash::FxHashMap::default())
+}
+
+fn simplify_index_cached(
+    e: &TileExpr,
+    memo: &mut rustc_hash::FxHashMap<TileExpr, TileExpr>,
+) -> TileExpr {
+    if let Some(result) = memo.get(e) {
+        return result.clone();
+    }
+    let result = rewrite_index(e, memo);
+    memo.insert(e.clone(), result.clone());
+    result
+}
+
+fn rewrite_index(e: &TileExpr, memo: &mut rustc_hash::FxHashMap<TileExpr, TileExpr>) -> TileExpr {
     let rebuilt = match e.kind() {
         TileExprKind::Binary {
             op,
@@ -1324,8 +1340,8 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
             right,
             numeric,
         } => {
-            let l = simplify_index(left);
-            let r = simplify_index(right);
+            let l = simplify_index_cached(left, memo);
+            let r = simplify_index_cached(right, memo);
             TileExpr::new(
                 TileExprKind::Binary {
                     op: *op,
@@ -1339,7 +1355,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
         TileExprKind::Unary { op, value, numeric } => TileExpr::new(
             TileExprKind::Unary {
                 op: *op,
-                value: simplify_index(value),
+                value: simplify_index_cached(value, memo),
                 numeric: *numeric,
             },
             e.element(),
@@ -1347,21 +1363,21 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
         TileExprKind::Compare { op, left, right } => TileExpr::new(
             TileExprKind::Compare {
                 op: *op,
-                left: simplify_index(left),
-                right: simplify_index(right),
+                left: simplify_index_cached(left, memo),
+                right: simplify_index_cached(right, memo),
             },
             e.element(),
         ),
         TileExprKind::Cast { value, to } => TileExpr::new(
             TileExprKind::Cast {
-                value: simplify_index(value),
+                value: simplify_index_cached(value, memo),
                 to: *to,
             },
             e.element(),
         ),
         TileExprKind::Bitcast { value, to } => TileExpr::new(
             TileExprKind::Bitcast {
-                value: simplify_index(value),
+                value: simplify_index_cached(value, memo),
                 to: *to,
             },
             e.element(),
@@ -1372,16 +1388,16 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
             reject,
         } => TileExpr::new(
             TileExprKind::Select {
-                condition: simplify_index(condition),
-                accept: simplify_index(accept),
-                reject: simplify_index(reject),
+                condition: simplify_index_cached(condition, memo),
+                accept: simplify_index_cached(accept, memo),
+                reject: simplify_index_cached(reject, memo),
             },
             e.element(),
         ),
         TileExprKind::Round { mode, value } => TileExpr::new(
             TileExprKind::Round {
                 mode: *mode,
-                value: simplify_index(value),
+                value: simplify_index_cached(value, memo),
             },
             e.element(),
         ),
@@ -1397,21 +1413,24 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
             TileExprKind::Vec {
                 scalar: *scalar,
                 lanes: *lanes,
-                parts: parts.iter().map(simplify_index).collect(),
+                parts: parts
+                    .iter()
+                    .map(|part| simplify_index_cached(part, memo))
+                    .collect(),
             },
             e.element(),
         ),
         TileExprKind::VecComponent { vector, component } => TileExpr::new(
             TileExprKind::VecComponent {
-                vector: simplify_index(vector),
+                vector: simplify_index_cached(vector, memo),
                 component: *component,
             },
             e.element(),
         ),
         TileExprKind::Dot { left, right } => TileExpr::new(
             TileExprKind::Dot {
-                left: simplify_index(left),
-                right: simplify_index(right),
+                left: simplify_index_cached(left, memo),
+                right: simplify_index_cached(right, memo),
             },
             e.element(),
         ),
@@ -1422,18 +1441,18 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
             fill,
         } => {
             let addr = match addr.as_ref() {
-                Addr::Linear(i) => Addr::Linear(simplify_index(i)),
+                Addr::Linear(i) => Addr::Linear(simplify_index_cached(i, memo)),
                 Addr::Rc2 { row, col } => Addr::Rc2 {
-                    row: simplify_index(row),
-                    col: simplify_index(col),
+                    row: simplify_index_cached(row, memo),
+                    col: simplify_index_cached(col, memo),
                 },
             };
             TileExpr::new(
                 TileExprKind::Load {
                     src: src.clone(),
                     addr: Box::new(addr),
-                    mask: simplify_index(mask),
-                    fill: simplify_index(fill),
+                    mask: simplify_index_cached(mask, memo),
+                    fill: simplify_index_cached(fill, memo),
                 },
                 e.element(),
             )
@@ -1441,7 +1460,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
         TileExprKind::LoadTile { tile, index } => TileExpr::new(
             TileExprKind::LoadTile {
                 tile: tile.clone(),
-                index: simplify_index(index),
+                index: simplify_index_cached(index, memo),
             },
             e.element(),
         ),
@@ -1531,7 +1550,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
                     right: lit(s),
                     numeric: *numeric,
                 });
-                return simplify_index(&add(shifted, c >> s.min(31)));
+                return simplify_index_cached(&add(shifted, c >> s.min(31)), memo);
             }
             // Mod-interval second chance: the literal is far beyond the
             // base's alignment (a split window's run offset), but the base's
@@ -1547,7 +1566,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
                         right: lit(s),
                         numeric: *numeric,
                     });
-                    return simplify_index(&add(shifted, c >> s));
+                    return simplify_index_cached(&add(shifted, c >> s), memo);
                 }
             }
         }
@@ -1569,7 +1588,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
                     right: lit(m),
                     numeric: *numeric,
                 });
-                return simplify_index(&add(anded, c & m));
+                return simplify_index_cached(&add(anded, c & m), memo);
             }
             // Mod-interval second chance for a low mask: no carry across
             // the mask's top, so the AND distributes over the sum.
@@ -1584,7 +1603,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
                         right: lit(m),
                         numeric: *numeric,
                     });
-                    return simplify_index(&add(anded, c & m));
+                    return simplify_index_cached(&add(anded, c & m), memo);
                 }
             }
         }
@@ -1600,7 +1619,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
                         right: lit(d),
                         numeric: *numeric,
                     });
-                    return simplify_index(&add(divided, c / d));
+                    return simplify_index_cached(&add(divided, c / d), memo);
                 }
             }
             if let (Some((a, c)), Some(d)) = (top_literal_add(left), lit_u32(right))
@@ -1615,7 +1634,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
                         right: lit(d),
                         numeric: *numeric,
                     });
-                    return simplify_index(&add(divided, c / d));
+                    return simplify_index_cached(&add(divided, c / d), memo);
                 }
             }
         }
@@ -1639,7 +1658,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
                         right: lit(d),
                         numeric: *numeric,
                     });
-                    return simplify_index(&add(reduced, c % d));
+                    return simplify_index_cached(&add(reduced, c % d), memo);
                 }
             }
         }

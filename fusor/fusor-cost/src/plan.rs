@@ -345,6 +345,22 @@ pub fn classified_symbols_of(graph: &EGraph, realized: &Realized) -> (Vec<SymId>
     scalars.retain(|s| *s != OPAQUE_SYM);
     dims.sort_unstable();
     dims.dedup();
+    let mut index = 0;
+    while index < dims.len() {
+        if let Some(fusor_ir::shape::DimExpr::Add(a, b) | fusor_ir::shape::DimExpr::Mul(a, b)) =
+            dims[index].derived_expr()
+        {
+            for dim in [a, b] {
+                if let Dim::Sym(sym) = dim
+                    && !dims.contains(&sym)
+                {
+                    dims.push(sym);
+                }
+            }
+        }
+        index += 1;
+    }
+    dims.sort_unstable();
     scalars.sort_unstable();
     scalars.dedup();
     // A symbol used as an extent is bound as a dim; it must not also be
@@ -424,6 +440,7 @@ pub(crate) fn without_schedule(op: &Op) -> Op {
     if let Op::Launch(
         Launch::Map { sched, .. }
         | Launch::Fold { sched, .. }
+        | Launch::StreamFold { sched, .. }
         | Launch::Contract { sched, .. }
         | Launch::Gather { sched, .. }
         | Launch::Scatter { sched, .. }

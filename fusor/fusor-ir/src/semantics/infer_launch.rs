@@ -10,6 +10,31 @@ use crate::shape::Dims;
 /// Infer the result facts of a Launch node from its operands' facts.
 pub fn infer_launch(op: &Launch, ins: &[ValueFacts]) -> Result<ValueFacts> {
     match op {
+        Launch::StreamFold {
+            producer,
+            fold,
+            operand,
+            ..
+        } => {
+            if !op.stream_compatible() {
+                return Err(Error::Legality(
+                    "streamed Fold recipes or generated read are incompatible".into(),
+                ));
+            }
+            let count = super::children::children_launch(producer).len();
+            if count > ins.len()
+                || *operand as usize > ins.len() - count
+                || count + super::children::children_launch(fold).len() != ins.len() + 1
+            {
+                return Err(Error::Shape(
+                    "streamed Fold operand facts are incomplete".into(),
+                ));
+            }
+            let produced = infer_launch(producer, &ins[..count])?;
+            let mut inputs = ins[count..].to_vec();
+            inputs.insert(*operand as usize, produced);
+            infer_launch(fold, &inputs)
+        }
         Launch::Map { space, body, .. } => Ok(ValueFacts {
             dtype: body.dtype(),
             shape: space.dims.clone(),

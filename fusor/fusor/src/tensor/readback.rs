@@ -154,6 +154,15 @@ impl TensorSlice {
             )));
         }
         let n: usize = shape.iter().product();
+        if self.layout.is_contiguous() {
+            let raw = n
+                .checked_mul(std::mem::size_of::<D>())
+                .and_then(|len| self.bytes.get(..len))
+                .ok_or_else(|| Error::Shape("readback index out of range".into()))?;
+            let mut out = vec![D::zeroed(); n];
+            bytemuck::cast_slice_mut(&mut out).copy_from_slice(raw);
+            return Ok(out);
+        }
         let mut out = Vec::with_capacity(n);
         let mut idx = vec![0usize; shape.len()];
         for _ in 0..n {
@@ -216,6 +225,35 @@ impl TensorSlice {
                 )));
             }
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn flat_readback_respects_layout_and_logical_length() {
+        let bytes = bytemuck::cast_slice(&[9.0f32, 1.0, 2.0, 3.0, 4.0]).to_vec();
+        let shape = [Dim::Const(2), Dim::Const(2)];
+        for (layout, expected) in [
+            (Layout::contiguous(&shape), [9.0, 1.0, 2.0, 3.0]),
+            (
+                Layout::from_parts(Dim::ONE, &shape, &[Dim::Const(2), Dim::ONE]).unwrap(),
+                [1.0, 2.0, 3.0, 4.0],
+            ),
+            (
+                Layout::from_parts(Dim::ONE, &shape, &[Dim::ONE, Dim::Const(2)]).unwrap(),
+                [1.0, 3.0, 2.0, 4.0],
+            ),
+        ] {
+            let slice = TensorSlice::new(bytes.clone(), layout, Dtype::F32);
+            assert_eq!(slice.to_flat::<f32>().unwrap(), expected);
+            assert!(slice.to_flat::<u32>().is_err());
+        }
+        let truncated =
+            TensorSlice::new(bytes[..12].to_vec(), Layout::contiguous(&shape), Dtype::F32);
+        assert!(truncated.to_flat::<f32>().is_err());
     }
 }
 

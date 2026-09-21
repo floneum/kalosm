@@ -123,15 +123,18 @@ fn plan_artifact_keys(plan: &Plan, pack: &UniformPack, arena: u64) -> Vec<Artifa
 struct ArtifactEntry {
     /// The symbols the last lowering's **body** consulted, sorted.
     consulted: Vec<fusor_ir::shape::SymId>,
-    /// How that lowering folded its dispatch grid, when the fold is
-    /// replayable. Present means the grid — and only the grid — moves with
-    /// the binding, so a length change is answered by replaying the fold
-    /// rather than by re-lowering.
-    grid_space: Option<crate::lower::GridSpec>,
     /// `hash(consulted syms + their bound values)` -> compiled kernel, the
     /// grid the lowering finished with, and the lowered body's identity hash
     /// (for cache verification).
-    variants: lru::LruCache<u64, (Artifact, [u32; 3], u128)>,
+    variants: lru::LruCache<u64, ArtifactVariant>,
+}
+
+#[derive(Clone)]
+struct ArtifactVariant {
+    artifact: Artifact,
+    grid: [u32; 3],
+    grid_space: Option<crate::lower::GridSpec>,
+    ph: u128,
 }
 
 /// Variants kept per launch: a decode loop in flight sees a handful of
@@ -211,6 +214,15 @@ fn pipeline_hash(ir: &fusor_ir::ir::kernel::KernelIr) -> u128 {
     // safe against allocator reuse, and a collision here is a silent wrong
     // kernel.
     fusor_tile::planner::kernel_identity(ir)
+}
+
+fn wgsl_text(emitted: &crate::emit::EmittedModule) -> Result<String> {
+    naga::back::wgsl::write_string(
+        &emitted.module,
+        &emitted.info,
+        naga::back::wgsl::WriterFlags::EXPLICIT_TYPES,
+    )
+    .map_err(|e| Error::Device(format!("wgsl serialization: {e}")))
 }
 
 /// The wgpu backend.
@@ -327,6 +339,72 @@ impl GpuTarget {
     /// The plan is the cache key.
     pub const fn plan_key(&self, plan: &Plan) -> PlanHash {
         plan.hash
+    }
+
+    /// Prepare a selected candidate's uploads and changed launches from owned data.
+    /// Dispatch still resolves its current symbol bindings through the cache.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub fn prepare_resources(
+        self: &Arc<Self>,
+        plan: &Plan,
+        graph: &EGraph,
+        dims: &[(SymId, u64)],
+        launches: &[usize],
+        uploads: Vec<Arc<Vec<u8>>>,
+    ) -> Result<Option<std::thread::JoinHandle<Result<Vec<Buf>>>>> {
+        if no_pipeline_share() || launches.is_empty() {
+            return Ok(None);
+        }
+        let pack = Arc::new(UniformPack::new(plan));
+        let binds = BindingEnv {
+            dims: dims.iter().copied().collect(),
+            ..BindingEnv::default()
+        };
+        let mut kernels = launches
+            .iter()
+            .map(|&launch_ix| {
+                let launch = plan
+                    .launches
+                    .get(launch_ix)
+                    .ok_or_else(|| Error::Plan(format!("no launch at index {launch_ix}")))?;
+                let item = LaunchWork {
+                    root: launch.root,
+                    launch_ix,
+                    grid: launch.grid,
+                    artifact: None,
+                };
+                self.lower_uncached(plan, graph, &item, &binds, &pack)
+                    .map(|lowered| (lowered.ir, lowered.ph))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        kernels.retain(|(_, ph)| {
+            self.pipelines
+                .lock()
+                .peek(ph)
+                .is_none_or(|slot| slot.try_lock().is_none_or(|built| built.is_none()))
+        });
+        if kernels.is_empty() && uploads.is_empty() {
+            return Ok(None);
+        }
+        let target = Arc::clone(self);
+        Ok(Some(std::thread::spawn(move || {
+            let buffers = uploads
+                .iter()
+                .map(|bytes| {
+                    target
+                        .pool
+                        .create_buffer_init(bytes, crate::pool::TENSOR_USAGE)
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if !buffers.is_empty() {
+                // Flush write_buffer uploads as well as the pool's submitted copies.
+                target.device.queue().submit([]);
+            }
+            for (ir, ph) in kernels {
+                target.pipeline_for(&ir, ph)?;
+            }
+            Ok(buffers)
+        })))
     }
 
     /// [`Launcher::wait_async`]: every submission so far has retired.
@@ -734,6 +812,9 @@ impl GpuTarget {
             self.pool.recycle(arena);
         }
         self.pool.repoison_free_buffers();
+        if self.pool.take_retired_buffers() {
+            self.launcher.prune_dead_bind_groups();
+        }
         if gap {
             let end = start.elapsed();
             eprintln!(
@@ -887,14 +968,14 @@ impl GpuTarget {
                     // The stored grid belongs to the binding that built the
                     // entry, so whenever a fold was recorded it is replayed
                     // here rather than reused.
-                    Some((artifact, grid, ph)) => {
-                        let grid = match &entry.grid_space {
-                            Some(spec) => crate::lower::grid_from(
-                                &spec.space,
-                                spec.block,
-                                binding,
-                                &self.caps().limits,
-                            )?,
+                    Some(ArtifactVariant {
+                        artifact,
+                        grid,
+                        grid_space,
+                        ph,
+                    }) => {
+                        let grid = match &grid_space {
+                            Some(spec) => spec.grid(binding, &self.caps().limits)?,
                             None => grid,
                         };
                         Some((artifact, grid, ph))
@@ -931,7 +1012,19 @@ impl GpuTarget {
             let mut kernels =
                 crate::lower::lower_node(self.caps(), node, theta, &cx, binding, pack.clone())?;
             let ir = kernels.remove(0);
-            if pipeline_hash(&ir) != cached_ph || ir.grid != grid {
+            let same_body = if pipeline_hash(&ir) == cached_ph {
+                true
+            } else {
+                let emitted = crate::emit::emit(&ir, self.caps()).map_err(Error::from)?;
+                let key = format!("{}\n{}", ir.block, wgsl_text(&emitted)?);
+                self.pipelines_by_source
+                    .lock()
+                    .peek(&key)
+                    .and_then(|a| a.downcast_ref::<GpuArtifact>())
+                    .zip(artifact.downcast_ref::<GpuArtifact>())
+                    .is_some_and(|(a, b)| a.id == b.id)
+            };
+            if !same_body || ir.grid != grid {
                 eprintln!(
                     "[artifact-cache] MISMATCH root {} name {}: body {} grid {:?} cached ({}, {:?})",
                     launch.root,
@@ -965,10 +1058,7 @@ impl GpuTarget {
         let _g = scopeguard_compile(__t);
         let share = !no_pipeline_share();
         let emitted = crate::emit::emit(ir, self.caps()).map_err(Error::from)?;
-        let mut flags = naga::back::wgsl::WriterFlags::empty();
-        flags.set(naga::back::wgsl::WriterFlags::EXPLICIT_TYPES, true);
-        let text = naga::back::wgsl::write_string(&emitted.module, &emitted.info, flags)
-            .map_err(|e| Error::Device(format!("wgsl serialization: {e}")))?;
+        let text = wgsl_text(&emitted)?;
         if let Some(dir) = wgsl_dump_dir() {
             let _ = std::fs::create_dir_all(dir);
             let _ = std::fs::write(dir.join(format!("{}_{:016x}.wgsl", ir.name, ph)), &text);
@@ -1113,12 +1203,18 @@ impl GpuTarget {
         let mut lock = self.artifacts.lock();
         let entry = lock.get_or_insert_mut(key, || ArtifactEntry {
             consulted: Vec::new(),
-            grid_space: None,
             variants: lru::LruCache::new(NonZeroUsize::new(VARIANTS_PER_LAUNCH).expect("nonzero")),
         });
-        entry.grid_space = grid_space;
         entry.consulted = consulted;
-        entry.variants.put(vh, (artifact.clone(), grid, ph));
+        entry.variants.put(
+            vh,
+            ArtifactVariant {
+                artifact: artifact.clone(),
+                grid,
+                grid_space,
+                ph,
+            },
+        );
         Ok(grid)
     }
 }
@@ -1399,7 +1495,7 @@ impl GpuTarget {
             .lock()
             .iter()
             .flat_map(|(_, entry)| entry.variants.iter())
-            .filter_map(|(_, (artifact, _, _))| artifact.downcast_ref::<GpuArtifact>())
+            .filter_map(|(_, variant)| variant.artifact.downcast_ref::<GpuArtifact>())
             .map(|a| a.id)
             .collect();
         let id_of = |artifact: &Artifact| artifact.downcast_ref::<GpuArtifact>().map(|a| a.id);

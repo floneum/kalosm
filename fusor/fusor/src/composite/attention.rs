@@ -5,7 +5,7 @@ use fusor_ir::autograd::{Tape, Val};
 use fusor_ir::ir::launch::MaskKind;
 use fusor_ir::ir::logical::{EinSpec, Label};
 use fusor_ir::scalar::{BinOp, CmpOp, ScalarExpr, UnOp};
-use fusor_ir::shape::{Dim, StrideSpec, SymId};
+use fusor_ir::shape::{Dim, DimExpr, OPAQUE_SYM, StrideSpec, SymId};
 use fusor_ir::{Error, Result};
 use smallvec::SmallVec;
 
@@ -109,6 +109,21 @@ fn merge_heads(t: &mut GraphTape<'_>, v: Val, groups: u64) -> Result<Val> {
     t.restride(&specs, v)
 }
 
+fn dim_scalar(dim: Dim) -> Result<ScalarExpr> {
+    match dim {
+        Dim::Const(value) => Ok(ScalarExpr::lit(fusor_ir::dtype::Splat::U32(
+            u32::try_from(value)
+                .map_err(|_| Error::Shape("attention extent exceeds u32".into()))?,
+        ))),
+        Dim::Sym(OPAQUE_SYM) => Err(Error::Shape("attention extent is not representable".into())),
+        Dim::Sym(sym) => Ok(match sym.derived_expr() {
+            Some(DimExpr::Add(a, b)) => ScalarExpr::bin(BinOp::Add, dim_scalar(a)?, dim_scalar(b)?),
+            Some(DimExpr::Mul(a, b)) => ScalarExpr::bin(BinOp::Mul, dim_scalar(a)?, dim_scalar(b)?),
+            None => ScalarExpr::uniform(sym, fusor_ir::dtype::Dtype::U32),
+        }),
+    }
+}
+
 /// `q . k^T * scale`, plus whatever the mask contributes.
 ///
 /// `MaskKind::Causal` compiles to an `IndexOf` comparison inside the scaling
@@ -157,14 +172,14 @@ fn scores(
         // Right-aligned: query `i` sees keys up to `i + (Lk - Lq)`. When
         // `Lq != Lk` the Lq queries are the last Lq of the Lk keys (decode
         // against a KV cache).
-        let bound = match (shape_lq.as_const(), shape_lk.as_const()) {
-            (Some(lq), Some(lk)) if lk > lq => ScalarExpr::bin(
-                BinOp::Add,
-                ScalarExpr::index_of(lq_axis),
-                ScalarExpr::lit(fusor_ir::dtype::Splat::U32((lk - lq) as u32)),
-            ),
-            _ => ScalarExpr::index_of(lq_axis),
+        let offset = match (shape_lq.as_const(), shape_lk.as_const()) {
+            (Some(lq), Some(lk)) => dim_scalar(Dim::Const(lk.saturating_sub(lq)))?,
+            _ => {
+                let (lq, lk) = (dim_scalar(shape_lq)?, dim_scalar(shape_lk)?);
+                ScalarExpr::bin(BinOp::Sub, lk.clone(), ScalarExpr::bin(BinOp::Min, lk, lq))
+            }
         };
+        let bound = ScalarExpr::bin(BinOp::Add, ScalarExpr::index_of(lq_axis), offset);
         ScalarExpr::select(
             ScalarExpr::cmp(CmpOp::Le, ScalarExpr::index_of(lk_axis), bound),
             scaled,

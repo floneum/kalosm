@@ -73,55 +73,74 @@ impl Op {
                 | Logical::Dequant { .. }
                 | Logical::Project { .. } => {}
             },
-            Op::Launch(op) => match op {
-                Launch::Map {
-                    space, body, ops, ..
-                } => {
-                    dims(&mut space.dims, visitor);
-                    visitor.scalar(body);
-                    operands(ops, visitor);
-                }
-                Launch::Fold {
-                    space,
-                    carrier: c,
-                    post,
-                    ops,
-                    ..
-                } => {
-                    dims(&mut space.dims, visitor);
-                    carrier(c, visitor);
-                    for expr in post {
-                        visitor.scalar(expr);
-                    }
-                    operands(ops, visitor);
-                }
-                Launch::Contract {
-                    output,
-                    m,
-                    n,
-                    k,
-                    batch,
-                    post,
-                    a,
-                    b,
-                    ..
-                } => {
-                    dims(&mut output.dims, visitor);
-                    for dim in [m, n, k, batch] {
-                        visitor.dim(dim);
-                    }
-                    for side in [a, b] {
-                        visitor.scalar(&mut side.pre);
-                        operands(&mut side.ops, visitor);
-                    }
-                    visitor.scalar(post);
-                }
-                Launch::Gather { space, ops, .. } | Launch::Scatter { space, ops, .. } => {
-                    dims(&mut space.dims, visitor);
-                    operands(ops, visitor);
-                }
-                Launch::Slab { .. } | Launch::Group { .. } => {}
-            },
+            Op::Launch(op) => launch(op, visitor, None),
         }
+    }
+}
+
+fn launch(op: &mut Launch, visitor: &mut impl VisitMut, generated: Option<usize>) {
+    match op {
+        Launch::Map {
+            space, body, ops, ..
+        } => {
+            dims(&mut space.dims, visitor);
+            visitor.scalar(body);
+            operands(ops, visitor);
+        }
+        Launch::Fold {
+            space,
+            carrier: c,
+            post,
+            ops,
+            ..
+        } => {
+            dims(&mut space.dims, visitor);
+            carrier(c, visitor);
+            for expr in post {
+                visitor.scalar(expr);
+            }
+            for (i, operand) in ops.iter_mut().enumerate() {
+                if Some(i) == generated {
+                    operand.layout.visit_dims_mut(&mut |d| visitor.dim(d));
+                } else {
+                    operands(std::slice::from_mut(operand), visitor);
+                }
+            }
+        }
+        Launch::StreamFold {
+            producer,
+            fold,
+            operand,
+            ..
+        } => {
+            launch(producer, visitor, None);
+            launch(fold, visitor, Some(*operand as usize));
+        }
+        Launch::Contract {
+            output,
+            m,
+            n,
+            k,
+            batch,
+            post,
+            a,
+            b,
+            ..
+        } => {
+            dims(&mut output.dims, visitor);
+            for dim in [m, n, k, batch] {
+                visitor.dim(dim);
+            }
+            for side in [a, b] {
+                visitor.scalar(&mut side.pre);
+                operands(&mut side.ops, visitor);
+            }
+            visitor.scalar(post);
+        }
+        Launch::Gather { space, ops, .. } | Launch::Scatter { space, ops, .. } => {
+            dims(&mut space.dims, visitor);
+            operands(ops, visitor);
+        }
+        Launch::Slab { .. } | Launch::Group { .. } => {}
     }
 }

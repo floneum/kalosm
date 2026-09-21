@@ -70,7 +70,6 @@ fn seed_facts(caps: &Caps) -> DeviceFacts {
         store_ps_per_element: 300,
         saturation_lanes: (threads * lanes * 4) as u32,
         single_buffered_traffic_pct: 100,
-        compile_ps_per_kernel: 200_000_000,
         // Measured order of magnitude for waking a parked worker and joining.
         thread_wake_ps: 2_000_000,
         caps: caps.clone(),

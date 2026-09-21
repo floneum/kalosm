@@ -710,18 +710,22 @@ impl fmt::Debug for Rule {
 /// depend on how loaded the machine was.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SaturationBudget {
-    /// `MAX_NODES = node_slope * initial + node_slack`.
+    /// Retain existing nodes and allow `node_slope * new_nodes + node_slack`
+    /// for nodes reached by this search that have not been offered before.
     pub node_slope: u32,
     pub node_slack: u32,
     pub max_rounds: u32,
     /// Rule bodies invoked; keeps a pathological graph's compile time bounded
     /// without reading a clock.
     pub max_applications: u32,
+    /// Raise the application limit to at least this many invocations per
+    /// newly offered reachable node. Zero keeps `max_applications` fixed.
+    pub application_slope: u32,
 }
 
 impl Default for SaturationBudget {
-    /// The shipped budget: `8 * initial + 4096` nodes, 10 rounds, 200k rule
-    /// applications.
+    /// The shipped budget: eight nodes per newly offered node plus 4096,
+    /// retaining existing history; 10 rounds and 200k rule applications.
     ///
     /// A round count bounds chain depth; the deepest chain in the suite is
     /// attention, whose slowest member first saturates at 9 rounds, so 10 is
@@ -736,6 +740,7 @@ impl Default for SaturationBudget {
             node_slack: 4096,
             max_rounds: 10,
             max_applications: 200_000,
+            application_slope: 0,
         }
     }
 }

@@ -42,6 +42,21 @@ pub fn children_launch(op: &Launch) -> Children {
         | Launch::Gather { ops, .. }
         | Launch::Scatter { ops, .. } => ops.iter().map(|o| o.src).collect(),
         Launch::Contract { a, b, .. } => a.ops.iter().chain(b.ops.iter()).map(|o| o.src).collect(),
+        Launch::StreamFold {
+            producer,
+            fold,
+            operand,
+            ..
+        } => {
+            let mut children = children_launch(producer);
+            children.extend(
+                children_launch(fold)
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, id)| (i != *operand as usize).then_some(id)),
+            );
+            children
+        }
         Launch::Slab { members, .. } | Launch::Group { members, .. } => {
             members.iter().copied().collect()
         }

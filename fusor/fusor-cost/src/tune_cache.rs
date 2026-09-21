@@ -199,6 +199,13 @@ impl TuneCache {
             .map_or(0, Vec::len)
     }
 
+    /// Whether a family of timing fields contains enough samples to compare.
+    pub fn has_observations_with_prefix(&self, prefix: &str, minimum: usize) -> bool {
+        self.seen.lock().iter().any(|(field, variants)| {
+            field.starts_with(prefix) && variants.values().any(|window| window.len() >= minimum)
+        })
+    }
+
     /// The fastest observed variant and its window-min time.
     pub fn best(&self, launch: &str) -> Option<(String, u64)> {
         self.seen
@@ -407,17 +414,23 @@ mod tests {
         cache.observe("launch", "a", 40);
         cache.observe("launch", "a", 50);
         cache.record_combo("plan", vec![Some("a".into())], 12);
+        cache.observe("diff:plan", "candidate", 30);
+        assert!(!cache.has_observations_with_prefix("diff:", 2));
+        cache.observe("diff:plan", "candidate", 40);
         cache.save();
         let restored = at_path(&path);
         assert_eq!(restored.window_min("launch", "a"), Some(40));
         assert_eq!(restored.observations("launch", "a"), 2);
         assert_eq!(restored.combo("plan"), Some(vec![Some("a".into())]));
+        assert!(restored.has_observations_with_prefix("diff:", 2));
+        assert!(!restored.has_observations_with_prefix("other:", 2));
         let mut disk: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         disk["format"] = (FORMAT + 1).into();
         std::fs::write(&path, serde_json::to_string(&disk).unwrap()).unwrap();
         let obsolete = at_path(&path);
         assert!(obsolete.is_empty());
+        assert!(!obsolete.has_observations_with_prefix("diff:", 2));
         assert_eq!(obsolete.combo("plan"), None);
         std::fs::remove_file(path).unwrap();
     }

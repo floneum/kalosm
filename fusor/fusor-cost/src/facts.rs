@@ -68,7 +68,6 @@ pub fn seed_facts_gpu(caps: &Caps) -> DeviceFacts {
         store_ps_per_element: 4,
         saturation_lanes: 65_536,
         single_buffered_traffic_pct: 105,
-        compile_ps_per_kernel: 1_000_000_000,
         thread_wake_ps: 5_000_000,
         caps: caps.clone(),
     }
@@ -98,7 +97,6 @@ pub fn seed_facts_cpu(caps: &Caps) -> DeviceFacts {
         store_ps_per_element: 4,
         saturation_lanes: caps.threads.max(1).saturating_mul(8),
         single_buffered_traffic_pct: 105,
-        compile_ps_per_kernel: 50_000_000,
         thread_wake_ps: 5_000_000,
         caps: caps.clone(),
     }

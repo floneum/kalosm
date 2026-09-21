@@ -135,8 +135,53 @@ fn splice(
             .filter(|(j, _)| *j != slot)
             .map(|(_, o)| o.clone()),
     );
-    new_ops.extend(inner.ops.iter().cloned());
+    for o in &inner.ops {
+        if space == &inner.space {
+            new_ops.push(o.clone());
+        } else {
+            let (o, _) = crate::rules::rebase::effective(b, o, &inner.space);
+            new_ops.push(widen_operand(&o, &inner.space, space, vec_axes)?);
+        }
+    }
     Some(Spliced { ops: new_ops, args })
+}
+
+/// Restate a producer read over a wider iteration space without changing its
+/// address. Promoted and trailing broadcast axes contribute zero stride.
+pub(crate) fn widen_operand(
+    o: &Operand,
+    producer: &IndexSpace,
+    space: &IndexSpace,
+    vec_axes: &[u32],
+) -> Option<Operand> {
+    if matches!(o.access, AccessPlan::Alias) && o.layout.shape() == producer.dims.as_slice() {
+        let mut axis = 0;
+        let strides: Vec<_> = space
+            .dims
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                if vec_axes.contains(&(i as u32)) {
+                    return Some(Dim::Const(0));
+                }
+                let at = axis;
+                axis += 1;
+                match producer.dims.get(at) {
+                    None => Some(Dim::Const(0)),
+                    Some(p) if p.known_eq(Dim::ONE) => Some(Dim::Const(0)),
+                    Some(p) if p.known_eq(*d) => o.layout.strides().get(at).copied(),
+                    _ => None,
+                }
+            })
+            .collect::<Option<_>>()?;
+        return Some(Operand {
+            src: o.src,
+            layout: Layout::from_parts(o.layout.offset(), &space.dims, &strides).ok()?,
+            access: AccessPlan::Alias,
+        });
+    }
+    let groups = widen_groups(&operand_groups(o)?, space, vec_axes)?;
+    operand_from_groups(o, &groups, space)
 }
 
 /// Per-logical-axis groups of an operand's own index map, in the producer's
@@ -245,11 +290,9 @@ pub(crate) fn operand_from_groups(
 /// iteration coordinate — the condition under which the producer's body may be
 /// substituted for `Arg(slot)` unrenumbered.
 ///
-/// Stated as an `AddressMap` equality against [`dense_read_map`], which
-/// derives its divisors from const extents. A `Dim::Sym` axis has no such
-/// map, so the fallback checks the part decidable without extents: a non-zero
-/// offset is a window whatever the extents are. A permuted or strided read
-/// over a symbolic axis is not caught.
+/// Compare concrete address maps when available. Symbolic reads must have
+/// the same coordinate extents and provably dense producer strides, with
+/// zero strides on promoted axes and trailing broadcasts.
 fn reads_producer_densely(
     o: &Operand,
     producer_shape: &[Dim],
@@ -261,7 +304,29 @@ fn reads_producer_densely(
         o.address_map(),
     ) {
         (Some(want), Some(got)) => want == got,
-        _ => o.layout.offset().known_eq(Dim::Const(0)),
+        _ => {
+            if !o.layout.offset().known_eq(Dim::Const(0))
+                || o.layout.shape() != space.dims.as_slice()
+            {
+                return false;
+            }
+            let dense = Layout::row_major_strides(producer_shape);
+            let mut strides = dense.iter();
+            space
+                .dims
+                .iter()
+                .zip(o.layout.strides())
+                .enumerate()
+                .all(|(axis, (extent, stride))| {
+                    let want = if vec_axes.contains(&(axis as u32)) {
+                        Dim::Const(0)
+                    } else {
+                        strides.next().copied().unwrap_or(Dim::Const(0))
+                    };
+                    extent.known_eq(Dim::ONE)
+                        || (want != Dim::Sym(crate::shape::OPAQUE_SYM) && stride.known_eq(want))
+                })
+        }
     }
 }
 
@@ -390,13 +455,6 @@ fn covers_for_substitution(iter: &IndexSpace, inner: &MapView) -> bool {
 /// [`map_view`] reads elementwise producers only, so a fold-to-fold edge is
 /// left alone by construction.
 ///
-/// KNOWN GAP: the two paths restate the producer's operands differently.
-/// [`splice_through_address_map`] widens each one through [`widen_groups`]
-/// onto the consumer's full `space`; [`splice`] clones them at the producer's
-/// own rank. On a promoted consumer the rank mismatch makes
-/// [`build_absorbed_fold`]'s access check discard the whole fused chain.
-/// Teaching `splice` to widen only pays once `fusor_cost::extract`'s accept
-/// test is the plan's own cost — see the note there.
 fn absorb_step(
     b: &Builder<'_>,
     ops: &[Operand],
@@ -477,6 +535,23 @@ fn build_absorbed_fold(b: &mut Builder<'_>, node: &Node, f: &Facts<'_>) -> Optio
     if !fired {
         return None;
     }
+    let mut distinct = Vec::new();
+    let remap: Vec<_> = cur
+        .iter()
+        .map(|operand| {
+            if let Some(slot) = distinct.iter().position(|other| other == operand) {
+                slot as u32
+            } else {
+                distinct.push(operand.clone());
+                (distinct.len() - 1) as u32
+            }
+        })
+        .collect();
+    lift = lift
+        .iter()
+        .map(|e| crate::carrier::map_args(e, &|i| remap[i as usize]))
+        .collect();
+    let cur = distinct;
     let fused = Launch::Fold {
         space: space.clone(),
         axis: *axis,

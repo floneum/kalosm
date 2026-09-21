@@ -48,7 +48,7 @@ fn mint(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>, mode: GatherMod
         axis,
         mode,
         ops: vec![x_op, idx_op],
-        sched: ScheduleDomain::Map(map_domain(&out, &accesses, &cx)),
+        sched: ScheduleDomain::Map(map_domain(&out, &accesses, &cx).into()),
     };
     let new = b.add_launch(op).ok()?;
     b.union(id, new).ok()?;
@@ -124,7 +124,7 @@ pub fn gather_quantized_rows(
         axis,
         mode: GatherMode::QuantizedRows,
         ops: vec![x_op, idx_op],
-        sched: ScheduleDomain::Map(map_domain(&out, &accesses, &cx)),
+        sched: ScheduleDomain::Map(map_domain(&out, &accesses, &cx).into()),
     };
     let new = b.add_launch(op).ok()?;
     b.union(id, new).ok()?;

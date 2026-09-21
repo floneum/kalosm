@@ -94,6 +94,7 @@ pub enum OpTag {
     // Launch
     LaunchMap,
     LaunchFold,
+    LaunchStreamFold,
     LaunchContract,
     LaunchGather,
     LaunchScatter,
