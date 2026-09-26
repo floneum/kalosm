@@ -37,56 +37,53 @@ impl Expr {
                 x => *terms.entry(x).or_default() += factor,
             }
         }
-        // Mixed-radix recomposition: x%a + a*((x/a)%b) = x%(a*b). A group
-        // index split into several coordinates reassembles digit by digit.
+        // Digit recomposition. A term `c*((x/d)%m)` is digit `(x, d, m)` of x
+        // in mixed radix; `c*(x/d)` is the unbounded top digit. The next digit
+        // up, `c*m*((x/(d*m))%m2)` or `c*m*(x/(d*m))`, merges into it:
+        // `(x/d)%(m*m2)` or `x/d` (and `x` itself when d = 1). Euclid's
+        // `n*(x/n) + x%n = x` and `x%a + a*((x/a)%b) = x%(a*b)` are both cases.
+        fn digit(term: &Expr) -> Option<(Expr, u64, Option<u64>)> {
+            match term {
+                Expr::Mod(inner, m) => Some(match inner.as_ref() {
+                    Expr::Div(x, d) => ((**x).clone(), *d, Some(*m)),
+                    x => (x.clone(), 1, Some(*m)),
+                }),
+                Expr::Div(x, d) => Some(((**x).clone(), *d, None)),
+                _ => None,
+            }
+        }
         loop {
-            let pair = terms.iter().find_map(|(term, c)| {
-                let Self::Mod(x, a) = term else { return None };
-                terms.iter().find_map(|(other, d)| {
-                    let Self::Mod(inner, b) = other else { return None };
-                    let Self::Div(y, a2) = inner.as_ref() else { return None };
-                    (y == x && a2 == a && *d == c * a).then(|| {
-                        (term.clone(), other.clone(), Self::Mod(x.clone(), a * b), *c)
+            let pair = terms.iter().find_map(|(low, c_low)| {
+                let (x, d, Some(m)) = digit(low)? else {
+                    return None;
+                };
+                terms.iter().find_map(|(high, c_high)| {
+                    let (x2, d2, m2) = digit(high)?;
+                    let amount = (*c_low).min(c_high / m);
+                    (x2 == x && d2 == d * m && amount > 0).then(|| {
+                        (low.clone(), high.clone(), x.clone(), d, m, m2, amount)
                     })
                 })
             });
-            let Some((low, high, merged, c)) = pair else {
+            let Some((low, high, x, d, m, m2, amount)) = pair else {
                 break;
             };
-            terms.remove(&low);
-            terms.remove(&high);
-            *terms.entry(merged).or_default() += c;
-        }
-        // Euclidean recomposition: n*(x/n) + x%n = x. This cancels
-        // reshape/transpose round trips without inspecting any tensor element.
-        loop {
-            let pair = terms.iter().find_map(|(term, c)| {
-                if let Self::Mod(x, n) = term {
-                    let div = Self::Div(x.clone(), *n);
-                    if let Some(d) = terms.get(&div) {
-                        let count = (*c).min(d / n);
-                        if count > 0 {
-                            return Some((term.clone(), div, (**x).clone(), *n, count));
+            *terms.get_mut(&low).unwrap() -= amount;
+            *terms.get_mut(&high).unwrap() -= amount * m;
+            terms.retain(|_, k| *k != 0);
+            let quotient = if d == 1 { x } else { Self::Div(Box::new(x), d) };
+            match m2 {
+                Some(m2) => *terms.entry(Self::Mod(Box::new(quotient), m * m2)).or_default() += amount,
+                None => match quotient {
+                    Self::Const(v) => constant += v * amount,
+                    Self::Sum(inner) => {
+                        for (term, k) in inner {
+                            *terms.entry(term).or_default() += k * amount;
                         }
                     }
-                }
-                None
-            });
-            let Some((modulo, div, x, n, count)) = pair else {
-                break;
-            };
-            *terms.get_mut(&modulo).unwrap() -= count;
-            *terms.get_mut(&div).unwrap() -= n * count;
-            match x {
-                Self::Const(c) => constant += c * count,
-                Self::Sum(inner) => {
-                    for (term, c) in inner {
-                        *terms.entry(term).or_default() += c * count;
-                    }
-                }
-                x => *terms.entry(x).or_default() += count,
+                    other => *terms.entry(other).or_default() += amount,
+                },
             }
-            terms.retain(|_, c| *c != 0);
         }
         // Nested sums can contain constants; normalize those too.
         terms.retain(|term, factor| {
@@ -267,6 +264,81 @@ impl Expr {
         }
         None
     }
+    /// [`Self::simplify`] after splitting every variable the expression
+    /// divides directly by a constant `d` into two fresh digit variables,
+    /// `v = d*hi + lo` with `lo < d`. The split exposes the carries that view
+    /// compositions hide (a head-split transpose becomes plain strides). The
+    /// digits then return as `v/d` and `v%d`, and digit recomposition folds
+    /// whatever stayed untouched back into `v`.
+    pub(super) fn simplify_digits(&self, bounds: &Bounds) -> Self {
+        let mut divisors = BTreeMap::<usize, u64>::new();
+        self.walk(&mut |e| {
+            if let Self::Div(x, d) | Self::Mod(x, d) = e
+                && let Self::Var(v) = x.as_ref()
+                && bounds.get(v).is_some_and(|b| *b >= *d)
+            {
+                let slot = divisors.entry(*v).or_insert(*d);
+                *slot = (*slot).max(*d);
+            }
+        });
+        if divisors.is_empty() {
+            return self.simplify(bounds);
+        }
+        // Fresh ids below GROUP/LOCAL and far from any caller's variables.
+        let hi = |v: usize| (1 << 40) + 2 * v;
+        let lo = |v: usize| (1 << 40) + 2 * v + 1;
+        let mut split = bounds.clone();
+        for (v, d) in &divisors {
+            split.insert(hi(*v), bounds[v] / d);
+            split.insert(lo(*v), bounds[v].min(d - 1));
+        }
+        let expanded = self.map_vars(&|x| match x {
+            Self::Var(v) => divisors.get(v).map(|d| {
+                Self::weighted([(Self::Var(hi(*v)), *d), (Self::Var(lo(*v)), 1)])
+            }),
+            Self::Div(y, e) | Self::Mod(y, e) => match y.as_ref() {
+                Self::Var(v) if divisors.get(v) == Some(e) => Some(if matches!(x, Self::Div(..)) {
+                    Self::Var(hi(*v))
+                } else {
+                    Self::Var(lo(*v))
+                }),
+                _ => None,
+            },
+            _ => None,
+        });
+        let reduced = expanded.simplify(&split);
+        reduced
+            .map_vars(&|x| match x {
+                Self::Var(id) => divisors.iter().find_map(|(v, d)| {
+                    (*id == hi(*v))
+                        .then(|| Self::Div(Box::new(Self::Var(*v)), *d))
+                        .or_else(|| (*id == lo(*v)).then(|| Self::Mod(Box::new(Self::Var(*v)), *d)))
+                }),
+                _ => None,
+            })
+            .simplify(bounds)
+    }
+    fn walk(&self, f: &mut impl FnMut(&Self)) {
+        f(self);
+        match self {
+            Self::Sum(xs) => xs.iter().for_each(|(x, _)| x.walk(f)),
+            Self::Div(x, _) | Self::Mod(x, _) => x.walk(f),
+            _ => {}
+        }
+    }
+    /// Rebuild bottom-up through the normalizing constructors, replacing
+    /// any node `f` maps.
+    fn map_vars(&self, f: &impl Fn(&Self) -> Option<Self>) -> Self {
+        if let Some(x) = f(self) {
+            return x;
+        }
+        match self {
+            Self::Sum(xs) => Self::weighted(xs.iter().map(|(x, c)| (x.map_vars(f), *c))),
+            Self::Div(x, d) => x.map_vars(f).div(*d as usize),
+            Self::Mod(x, d) => x.map_vars(f).modulo(*d as usize),
+            x => x.clone(),
+        }
+    }
     #[cfg(test)]
     pub(super) fn eval(&self, vars: &impl Fn(usize) -> usize) -> usize {
         match self {
@@ -317,6 +389,57 @@ mod tests {
                     assert_eq!(owner.eval(&vars), simplified.eval(&vars));
                 }
             }
+        }
+    }
+
+    /// The head-split view of a transposed buffer, as a matmul A load.
+    #[test]
+    fn head_split_transpose_address_becomes_strides() {
+        let bounds = Bounds::from([(1, 1023u64), (3, 95u64)]);
+        let (row, ka) = (|| Expr::var(1), || Expr::var(3));
+        let x = Expr::sum([
+            row().scale(24),
+            ka(),
+            row().div(64).scale(4608),
+            ka().div(24).scale(1512),
+        ]);
+        let inner = Expr::sum([row().scale(24), ka(), ka().div(24).scale(1512)]);
+        let address = Expr::sum([
+            x.clone().div(6144).scale(6144),
+            row().modulo(64),
+            ka().modulo(24).scale(64),
+            Expr::sum([row().div(64).scale(3), inner.div(1536)]).modulo(4).scale(1536),
+        ]);
+        let simplified = address.simplify_digits(&bounds);
+        let expected = Expr::sum([
+            row().div(64).scale(6144),
+            ka().div(24).scale(1536),
+            ka().modulo(24).scale(64),
+            row().modulo(64),
+        ]);
+        assert_eq!(simplified, expected.simplify(&bounds), "{simplified:?}");
+        // No division by anything but the digit radices survives.
+        for r in 0..1024 {
+            for k in 0..96 {
+                let vars = |v| if v == 1 { r } else { k };
+                assert_eq!(address.eval(&vars), simplified.eval(&vars));
+            }
+        }
+    }
+
+    #[test]
+    fn nested_quotient_digits_recombine() {
+        let bounds = Bounds::from([(GROUP, 262143u64)]);
+        let at = || Expr::var(GROUP);
+        // (at/16384)*256 + (at/64)%64 + ((at/4096)%4)*64 == at/64
+        let stat = Expr::sum([
+            at().div(16384).scale(256),
+            at().div(64).modulo(64),
+            at().div(4096).modulo(4).scale(64),
+        ]);
+        assert_eq!(stat.simplify(&bounds), at().div(64));
+        for x in (0..262144).step_by(97) {
+            assert_eq!(stat.eval(&|_| x), x / 64);
         }
     }
 

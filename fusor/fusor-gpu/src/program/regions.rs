@@ -220,7 +220,7 @@ pub(crate) fn schedule(
                             || index
                                 .clone()
                                 .div(values[map[dep]].len().div_ceil(groups) as usize)
-                                .simplify(bounds)
+                                .simplify_digits(bounds)
                                 == Expr::var(GROUP)
                     });
                 if !safe && std::env::var_os("FUSOR_DEBUG_REGIONS").is_some() {
@@ -230,7 +230,7 @@ pub(crate) fn schedule(
                             "fusor program: {id} {:?}{:?} cannot own its read of {dep}: {:?}",
                             value.op.tag(),
                             value.shape,
-                            index.clone().div(share).simplify(bounds)
+                            index.clone().div(share).simplify_digits(bounds)
                         );
                     }
                 }

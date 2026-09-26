@@ -241,7 +241,7 @@ fn load_expr(
             let source = p.value(*x);
             let mapped = index
                 .restride(&v.shape, &source.shape, specs)
-                .simplify(bounds);
+                .simplify_digits(bounds);
             load_expr(p, *x, mapped, variables, bounds)
         }
         Logical::Map { ins, .. } if v.forwarded => {
@@ -311,7 +311,7 @@ pub(crate) fn shader(
             }
         });
     }
-    let mut out = "@group(0) @binding(0) var<storage,read_write> arena: array<u32>;\nvar<workgroup> tile_a:array<f32,512>;\nvar<workgroup> tile_b:array<f32,256>;\nvar<workgroup> reduce_scratch:array<u32,256>;\nvar<private> owner:u32;\nfn f32_bits(bits:u32)->f32{return bitcast<f32>(bits);}\n".to_string();
+    let mut out = "@group(0) @binding(0) var<storage,read_write> arena: array<u32>;\nvar<workgroup> tile_a:array<f32,512>;\nvar<workgroup> tile_b:array<f32,256>;\nvar<workgroup> reduce_scratch:array<u32,256>;\nfn f32_bits(bits:u32)->f32{return bitcast<f32>(bits);}\n".to_string();
     if cooperative {
         out.insert_str(
             0,
@@ -330,23 +330,12 @@ pub(crate) fn shader(
     }
     for v in p.values.iter().filter(|v| used_reads.contains(&v.id)) {
         let dtype = ty(v.dtype)?;
-        let bound = if let Some(job) = jobs
-            .iter()
-            .find(|j| j.groups > 1 && j.stages.contains(&v.id))
-        {
-            format!(
-                "if(i/{}u != owner){{return {dtype}(0);}}",
-                v.len().div_ceil(job.groups)
-            )
-        } else {
-            String::new()
-        };
-        // Logical ranges are checked by the caller before view composition.
-        // Keep the ownership mask for values produced inside a multi-group job;
-        // repeating the logical bounds branch here obscures matrix addressing.
+        // Logical ranges are checked by the caller before view composition, and
+        // `regions::schedule` admits a same-job read only with a proof that the
+        // reading workgroup owns it, so a read needs no mask of its own.
         writeln!(
             out,
-            "fn read_{}(i:u32)->{dtype}{{{bound}return bitcast<{dtype}>(arena[{}u+i]);}}",
+            "fn read_{}(i:u32)->{dtype}{{return bitcast<{dtype}>(arena[{}u+i]);}}",
             v.id.0,
             v.offset.unwrap()
         )
@@ -392,7 +381,7 @@ pub(crate) fn shader(
         let tiled = job.tiled;
         writeln!(
             out,
-            "if(group.x>={group_base}u){{if(group.x<{}u){{let gid=group.x-{group_base}u;owner=gid;",
+            "if(group.x>={group_base}u){{if(group.x<{}u){{let gid=group.x-{group_base}u;",
             group_base + groups
         )
         .unwrap();
@@ -652,7 +641,7 @@ fn contraction(
                 .coordinate(dims, i)
                 .scale(stride(shape, axis) as usize)
         }))
-        .simplify(&bounds)
+        .simplify_digits(&bounds)
     };
     let address = |labels: &[Label], shape: &[u32], r: &str, c: &str, k: &str| {
         index_wgsl(&address_expr(labels, shape), &["batch", r, c, k])
