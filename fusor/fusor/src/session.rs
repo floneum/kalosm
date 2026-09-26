@@ -1755,8 +1755,10 @@ impl Session {
                 {
                     let values: Vec<f32> = buffer
                         .as_slice()
-                        .chunks_exact(4)
-                        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|bytes| f32::from_le_bytes(*bytes))
                         .collect();
                     eprintln!("[DEBUG-cpu-nan] launch={launch_ix} root={root} values={values:?}");
                     if values.iter().any(|v| v.is_nan()) {
@@ -3156,7 +3158,9 @@ mod tests {
             assert_eq!(actual.len(), 12);
             for row in 0..2 {
                 let scores: Vec<f64> = keys
-                    .chunks_exact(4)
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
                     .map(|key| {
                         (0..4)
                             .map(|d| f64::from(queries[row * 4 + d]) * f64::from(key[d]))

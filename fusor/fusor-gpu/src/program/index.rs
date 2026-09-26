@@ -445,7 +445,10 @@ mod tests {
     fn reserved_group_ids_split_without_overflow() {
         let bounds = Bounds::from([(GROUP, 127u64), (LOCAL, 2047u64)]);
         let at = Expr::sum([Expr::var(GROUP).scale(2048), Expr::var(LOCAL)]);
-        let owner = Expr::sum([at.clone().div(16384).scale(8), at.clone().div(2048).modulo(8)]);
+        let owner = Expr::sum([
+            at.clone().div(16384).scale(8),
+            at.clone().div(2048).modulo(8),
+        ]);
         assert_eq!(owner.simplify_digits(&bounds), Expr::var(GROUP));
     }
 

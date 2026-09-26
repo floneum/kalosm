@@ -734,8 +734,10 @@ mod tests {
             .unwrap();
         pollster::block_on(target.readback(&output, bytes))
             .unwrap()
-            .chunks_exact(4)
-            .map(|bytes| u32::from_le_bytes(bytes.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| u32::from_le_bytes(*bytes))
             .collect()
     }
 
@@ -805,10 +807,8 @@ mod tests {
             name: "subgroup_scope",
         };
         let values = run(&target, &ir, Uniforms::default());
-        for (invocation, values) in values.chunks_exact(5).enumerate() {
-            let [size, lane, full, inside, after] = values else {
-                unreachable!()
-            };
+        for (invocation, values) in values.as_chunks::<5>().0.iter().enumerate() {
+            let [size, lane, full, inside, after] = values;
             let half = if *lane < size / 2 { size / 2 } else { 0 };
             assert_eq!(*full, *size, "invocation {invocation}: full subgroup");
             assert_eq!(*inside, half, "invocation {invocation}: divergent branch");

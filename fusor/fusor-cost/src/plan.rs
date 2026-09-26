@@ -77,7 +77,12 @@ pub fn derive_plan(
 
     let mut buffers = buffers;
     let arena_bytes = if facts.caps.kind == fusor_ir::device::DeviceKind::Gpu {
-        pack_arena(&mut buffers, &mut launches, realized)?
+        pack_arena(
+            &mut buffers,
+            &mut launches,
+            realized,
+            facts.caps.limits.max_storage_buffer_binding_size,
+        )?
     } else {
         0
     };
@@ -102,6 +107,7 @@ fn pack_arena(
     buffers: &mut [BufferPlan],
     launches: &mut [Dispatch],
     realized: &Realized,
+    max_binding: u64,
 ) -> Result<u64> {
     const ALIGN: u64 = 256;
     let mut first: FxHashMap<Id, usize> = FxHashMap::default();
@@ -132,14 +138,23 @@ fn pack_arena(
         items.push((*s, *e, bytes, i));
     }
     items.sort_unstable_by_key(|(s, e, bytes, i)| (*s, *e, std::cmp::Reverse(*bytes), *i));
-    let sizes: Vec<_> = items
-        .iter()
-        .map(|(_, _, bytes, _)| (*bytes, ALIGN))
-        .collect();
-    let (top, offsets) =
-        fusor_ir::packing::pack_interference(&sizes, fusor_ir::packing::Fit::Best, |i, j| {
-            items[i].0 <= items[j].1 && items[j].0 <= items[i].1
-        })?;
+    // A launch binds the whole arena, so it must fit one storage binding:
+    // the largest values leave it (as their own buffers) until it does.
+    let (top, offsets) = loop {
+        let sizes: Vec<_> = items
+            .iter()
+            .map(|(_, _, bytes, _)| (*bytes, ALIGN))
+            .collect();
+        let (top, offsets) =
+            fusor_ir::packing::pack_interference(&sizes, fusor_ir::packing::Fit::Best, |i, j| {
+                items[i].0 <= items[j].1 && items[j].0 <= items[i].1
+            })?;
+        if top <= max_binding || items.is_empty() {
+            break (top, offsets);
+        }
+        let largest = (0..items.len()).max_by_key(|i| items[*i].2).unwrap();
+        items.remove(largest);
+    };
     for ((_, _, _, i), offset) in items.iter().zip(offsets) {
         buffers[*i].arena = Some(offset);
     }

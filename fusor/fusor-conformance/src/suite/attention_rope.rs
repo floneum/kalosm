@@ -294,8 +294,10 @@ async fn symbolic_causal_attention(session: &Session) -> CaseResult {
             let actual = out
                 .to_bytes_async()
                 .await?
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
                 .collect::<Vec<_>>();
             expect_values(session, &d.q_shape(), Dtype::F32, &actual, &expected).await?;
         }

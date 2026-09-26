@@ -287,7 +287,7 @@ mod tests {
         assert!(native_work.1 > aligned_work.1);
 
         let mut native = vec![0u8; (n * k / 256 * fmt.block_bytes(QLayout::Native)) as usize];
-        for (block, bytes) in native.chunks_exact_mut(210).enumerate() {
+        for (block, bytes) in native.as_chunks_mut::<210>().0.iter_mut().enumerate() {
             for (i, byte) in bytes[..208].iter_mut().enumerate() {
                 *byte = (i as u8).wrapping_mul(29).wrapping_add(block as u8);
             }
@@ -303,7 +303,12 @@ mod tests {
             &mut aligned,
         )?;
         assert!(aligned.len() > native.len());
-        for (a, b) in native.chunks_exact(210).zip(aligned.chunks_exact(212)) {
+        for (a, b) in native
+            .as_chunks::<210>()
+            .0
+            .iter()
+            .zip(aligned.as_chunks::<212>().0)
+        {
             let (mut av, mut bv) = ([0.0f32; 256], [0.0f32; 256]);
             fusor_gguf::blocks::cpu_dequantize_block(fmt, QLayout::Native, a, &mut av);
             fusor_gguf::blocks::cpu_dequantize_block(fmt, QLayout::F32Scales, b, &mut bv);

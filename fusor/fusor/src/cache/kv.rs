@@ -932,8 +932,10 @@ mod tests {
                 .as_dyn()
                 .to_bytes()
                 .unwrap()
-                .chunks_exact(4)
-                .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
                 .collect::<Vec<_>>()
         };
         let mut expected = [Vec::new(), Vec::new()];
