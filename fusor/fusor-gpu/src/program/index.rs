@@ -287,11 +287,13 @@ impl Expr {
         if divisors.is_empty() {
             return self.simplify(bounds);
         }
-        // Fresh ids far from callers' small variable ids and below GROUP/LOCAL,
-        // at any pointer width (wasm32 included).
+        // Fresh ids numbered by the split variable's rank, not its id: the
+        // split set includes GROUP and LOCAL at the top of the range. They sit
+        // far from callers' small ids and below GROUP at any pointer width.
         const DIGITS: usize = usize::MAX / 4;
-        let hi = |v: usize| DIGITS + 2 * v;
-        let lo = |v: usize| DIGITS + 2 * v + 1;
+        let rank = |v: usize| divisors.keys().position(|k| *k == v).unwrap();
+        let hi = |v: usize| DIGITS + 2 * rank(v);
+        let lo = |v: usize| DIGITS + 2 * rank(v) + 1;
         let mut split = bounds.clone();
         for (v, d) in &divisors {
             split.insert(hi(*v), bounds[v] / d);
@@ -436,6 +438,15 @@ mod tests {
                 assert_eq!(address.eval(&vars), simplified.eval(&vars));
             }
         }
+    }
+
+    /// GROUP and LOCAL are split too; their fresh digits must not overflow.
+    #[test]
+    fn reserved_group_ids_split_without_overflow() {
+        let bounds = Bounds::from([(GROUP, 127u64), (LOCAL, 2047u64)]);
+        let at = Expr::sum([Expr::var(GROUP).scale(2048), Expr::var(LOCAL)]);
+        let owner = Expr::sum([at.clone().div(16384).scale(8), at.clone().div(2048).modulo(8)]);
+        assert_eq!(owner.simplify_digits(&bounds), Expr::var(GROUP));
     }
 
     #[test]
