@@ -9,6 +9,21 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+/// `FUSOR_PROGRAM_REPEAT=<class>:<extra>` re-dispatches every region of a
+/// class `extra` more times; non-commit regions are idempotent, so the
+/// wall-time delta is that class's pipelined cost. Classes: `tiled` (holds a
+/// matrix job), `linear` (holds none), or a region index.
+fn repeat() -> Option<&'static (String, u32)> {
+    static REPEAT: std::sync::OnceLock<Option<(String, u32)>> = std::sync::OnceLock::new();
+    REPEAT
+        .get_or_init(|| {
+            let v = std::env::var("FUSOR_PROGRAM_REPEAT").ok()?;
+            let (class, extra) = v.split_once(':')?;
+            Some((class.to_owned(), extra.parse().ok()?))
+        })
+        .as_ref()
+}
+
 /// Owns the arena, compiled shader and binding of a fixed logical program.
 /// Inputs and feedback state are independent of the graph used to compile it.
 pub struct Program {
@@ -62,6 +77,9 @@ impl Program {
                 }
                 Err(error) => return Err(error),
             };
+        if std::env::var_os("FUSOR_PROFILE_PROGRAM").is_some() {
+            target.launcher().set_tuning(true);
+        }
         let cooperative = acceleration.cooperative();
         let grids = (0..kernels.len())
             .map(|i| plan.groups(i, cooperative))
@@ -87,6 +105,15 @@ impl Program {
         acceleration: super::ProgramAcceleration,
     ) -> Result<Vec<(wgpu::ComputePipeline, wgpu::BindGroup)>> {
         let mut kernels = vec![];
+        if let Some(dir) = std::env::var_os("FUSOR_PROGRAM_DUMP") {
+            let dir = std::path::PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            for region in 0..plan.stats().kernels {
+                if let Ok(source) = super::emit::shader(plan, region, acceleration) {
+                    let _ = std::fs::write(dir.join(format!("region{region:03}.wgsl")), source);
+                }
+            }
+        }
         for region in 0..plan.stats().kernels {
             #[cfg(any(not(target_arch = "wasm32"), test, feature = "compiler-tests"))]
             let _module = {
@@ -296,9 +323,23 @@ impl Program {
         } else {
             let mut pass = encoder.begin_compute_pass(&Default::default());
             for (i, (pipeline, binding)) in self.kernels.iter().enumerate() {
+                let extra = match (repeat(), self.plan.regions.get(i)) {
+                    (Some((class, extra)), Some(region)) => {
+                        let tiled = region.jobs.iter().any(|j| j.tiled);
+                        let hit = match class.as_str() {
+                            "tiled" => tiled,
+                            "linear" => !tiled,
+                            index => index.parse::<usize>().ok() == Some(i),
+                        };
+                        if hit { *extra } else { 0 }
+                    }
+                    _ => 0,
+                };
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, binding, &[]);
-                pass.dispatch_workgroups(self.grids[i], 1, 1);
+                for _ in 0..=extra {
+                    pass.dispatch_workgroups(self.grids[i], 1, 1);
+                }
             }
         }
         device.queue().submit([encoder.finish()]);
@@ -309,6 +350,15 @@ impl Program {
                 &set,
                 self.kernels.len(),
             )?;
+            if std::env::var_os("FUSOR_PROFILE_PROGRAM").is_some() {
+                for (i, us) in profile.iter().enumerate().take(self.plan.regions.len()) {
+                    eprintln!(
+                        "fusor program region {i}: {us:.2}us grid={}{}",
+                        self.grids[i],
+                        self.plan.describe_region(i)
+                    );
+                }
+            }
             self.target.launcher().set_last_profile(profile);
         }
         self.submissions += 1;

@@ -652,6 +652,20 @@ impl Plan {
     pub fn stats(&self) -> &ProgramStats {
         &self.stats
     }
+    /// One line per stage of `region`: op kind, shape and whether it is stored.
+    pub fn describe_region(&self, region: usize) -> String {
+        let mut out = String::new();
+        for job in &self.regions[region].jobs {
+            out.push_str(&format!(" [job groups={} tiled={}]", job.groups, job.tiled));
+            for id in &job.stages {
+                let v = self.value(*id);
+                let tag = format!("{:?}", v.op);
+                let tag: String = tag.chars().take_while(|c| c.is_alphanumeric()).collect();
+                out.push_str(&format!(" {tag}{:?}{}", v.shape, if v.materialized() { "" } else { "*" }));
+            }
+        }
+        out
+    }
     pub(crate) fn job_groups(&self, job: &super::regions::Job, cooperative: bool) -> u32 {
         if job.tiled {
             super::regions::matrix_groups(self.value(job.stages[0]), cooperative)

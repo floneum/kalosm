@@ -223,6 +223,17 @@ pub(crate) fn schedule(
                                 .simplify(bounds)
                                 == Expr::var(GROUP)
                     });
+                if !safe && std::env::var_os("FUSOR_DEBUG_REGIONS").is_some() {
+                    for (dep, index) in reads.iter().filter(|(d, _)| local.contains(d)) {
+                        let share = values[map[dep]].len().div_ceil(groups) as usize;
+                        eprintln!(
+                            "fusor program: {id} {:?}{:?} cannot own its read of {dep}: {:?}",
+                            value.op.tag(),
+                            value.shape,
+                            index.clone().div(share).simplify(bounds)
+                        );
+                    }
+                }
                 if safe {
                     current.stages.push(*id);
                     local.insert(*id);

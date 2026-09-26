@@ -187,6 +187,8 @@ impl Expr {
                 let x = x.simplify(bounds);
                 if x.upper(bounds) < *n {
                     Self::Const(0)
+                } else if let Some((g, major, _)) = x.split_below(*n, bounds) {
+                    major.div((*n / g) as usize)
                 } else {
                     x.div(*n as usize)
                 }
@@ -195,6 +197,8 @@ impl Expr {
                 let x = x.simplify(bounds);
                 if x.upper(bounds) < *n {
                     x
+                } else if let Some((g, major, minor)) = x.split_below(*n, bounds) {
+                    Self::weighted([(major.modulo((*n / g) as usize), g), (minor, 1)])
                 } else {
                     x.modulo(*n as usize)
                 }
@@ -207,6 +211,41 @@ impl Expr {
         } else {
             out
         }
+    }
+    /// `self = g*major + minor` with `g | n`, `g > 1` and `minor <= g - 1`,
+    /// so `self / n = major / (n/g)` and `self % n = g*(major % (n/g)) + minor`.
+    /// The largest such `g` among the term coefficients is chosen.
+    fn split_below(&self, n: u64, bounds: &Bounds) -> Option<(u64, Self, Self)> {
+        let Self::Sum(xs) = self else { return None };
+        let mut candidates: Vec<u64> = xs
+            .iter()
+            .map(|(x, c)| match x {
+                Self::Const(v) => v * c,
+                _ => *c,
+            })
+            .filter(|g| *g > 1 && n % g == 0)
+            .collect();
+        candidates.sort_unstable_by(|a, b| b.cmp(a));
+        candidates.dedup();
+        for g in candidates {
+            let (mut major, mut minor) = (vec![], vec![]);
+            for (x, c) in xs {
+                match x {
+                    Self::Const(v) => {
+                        let v = v * c;
+                        major.push((Self::Const(v / g), 1));
+                        minor.push((Self::Const(v % g), 1));
+                    }
+                    x if c % g == 0 => major.push((x.clone(), c / g)),
+                    x => minor.push((x.clone(), *c)),
+                }
+            }
+            let minor = Self::weighted(minor);
+            if minor.upper(bounds) < g {
+                return Some((g, Self::weighted(major), minor));
+            }
+        }
+        None
     }
     #[cfg(test)]
     pub(super) fn eval(&self, vars: &impl Fn(usize) -> usize) -> usize {
@@ -232,6 +271,61 @@ pub(super) fn reduction_index(shape: &[usize], axis: usize, output: Expr, reduct
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A row statistic broadcast back over its row: the `[b, h, i]` value an
+    /// element `(b, h, i, j)` reads is owned by the element's own group
+    /// whenever a group owns whole `(b, h)` slices.
+    #[test]
+    fn broadcast_row_statistic_is_group_owned() {
+        for (batch, heads, rows, cols) in [(2, 3, 4, 5), (4, 4, 8, 8), (3, 2, 5, 7)] {
+            let groups = batch * heads;
+            let share = rows * cols;
+            let bounds = Bounds::from([(GROUP, groups as u64 - 1), (LOCAL, share as u64 - 1)]);
+            let at = Expr::sum([Expr::var(GROUP).scale(share), Expr::var(LOCAL)]);
+            let shape = [batch as u32, heads as u32, rows as u32, cols as u32];
+            let stat = Expr::sum([
+                at.clone().coordinate(&shape, 0).scale(heads * rows),
+                at.clone().coordinate(&shape, 1).scale(rows),
+                at.clone().coordinate(&shape, 2),
+            ]);
+            let owner = stat.clone().div(rows);
+            let simplified = owner.simplify(&bounds);
+            assert_eq!(simplified, Expr::var(GROUP), "{batch}x{heads}x{rows}x{cols}");
+            for group in 0..groups {
+                for local in 0..share {
+                    let vars = |v| if v == GROUP { group } else { local };
+                    assert_eq!(owner.eval(&vars), simplified.eval(&vars));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn split_division_and_remainder_agree_with_evaluation() {
+        let bounds = Bounds::from([(0, 9), (1, 5), (2, 3)]);
+        let exprs = [
+            Expr::sum([Expr::var(0).scale(24), Expr::var(1).scale(4), Expr::var(2)]),
+            Expr::sum([Expr::var(0).scale(8), Expr::var(2), Expr::Const(4)]),
+            Expr::sum([Expr::var(1).scale(6), Expr::var(2).scale(2)]),
+        ];
+        for e in &exprs {
+            for n in [2, 3, 4, 6, 8, 12, 24, 48] {
+                for (op, simplified) in [
+                    (Expr::Div(Box::new(e.clone()), n), Expr::Div(Box::new(e.clone()), n).simplify(&bounds)),
+                    (Expr::Mod(Box::new(e.clone()), n), Expr::Mod(Box::new(e.clone()), n).simplify(&bounds)),
+                ] {
+                    for a in 0..=9 {
+                        for b in 0..=5 {
+                            for c in 0..=3 {
+                                let vars = |v| [a, b, c][v];
+                                assert_eq!(op.eval(&vars), simplified.eval(&vars), "{op:?} -> {simplified:?}");
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn ownership_simplification_agrees_with_exhaustive_indices() {
