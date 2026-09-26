@@ -691,22 +691,28 @@ fn contraction(
         "var acc=0.0;"
     };
     writeln!(out,"// tiled contraction {id}\n{{\nlet tr=lane/16u;let tc=lane%16u;\nfor(var tile={begin};tile<{end};tile+={tile_step}u){{\nlet batch=tile/{}u;let mt=tile/{nt}u%{mt}u;let nt=tile%{nt}u;\nlet row=mt*{tm}u+tr;let col=nt*16u+tc;{accumulator}\nfor(var kt=0u;kt<{}u;kt+=1u){{\nlet ka=kt*16u+tc;let kb=kt*16u+tr;\nvar va=0.0;var vb=0.0;",mt*nt,k.div_ceil(16)).unwrap();
+    // Tail guards only where an extent leaves a partial tile: a tile never
+    // starts past its axis, so a multiple of the tile size needs no test.
+    let (m_tail, n_tail, k_tail) = (m % tm != 0, n % 16 != 0, k % 16 != 0);
     writeln!(
         out,
-        "if(row<{m}u && ka<{k}u){{va={};}}",
+        "if({}){{va={};}}",
+        guard(&[(m_tail, format!("row<{m}u")), (k_tail, format!("ka<{k}u"))]),
         matrix_load(a, &spec.a, &av.shape, "row", "0u", "ka")?
     )
     .unwrap();
     writeln!(
         out,
-        "if(col<{n}u && kb<{k}u){{vb={};}}",
+        "if({}){{vb={};}}",
+        guard(&[(n_tail, format!("col<{n}u")), (k_tail, format!("kb<{k}u"))]),
         matrix_load(b, &spec.b, &bv.shape, "0u", "col", "kb")?
     )
     .unwrap();
     if cooperative {
         writeln!(
             out,
-            "var va2=0.0;if(row+16u<{m}u && ka<{k}u){{va2={};}}tile_a[lane+256u]=va2;",
+            "var va2=0.0;if({}){{va2={};}}tile_a[lane+256u]=va2;",
+            guard(&[(m_tail, format!("row+16u<{m}u")), (k_tail, format!("ka<{k}u"))]),
             matrix_load(a, &spec.a, &av.shape, "row+16u", "0u", "ka")?
         )
         .unwrap();
@@ -748,7 +754,17 @@ fn contraction(
         }
     };
     let output_at = address(&spec.out, &v.shape, "row", "col", "0u");
-    writeln!(out, "if(row<{m}u && col<{n}u && {}){{", owned(&output_at)).unwrap();
+    let owned_at = owned(&output_at);
+    writeln!(
+        out,
+        "if({}){{",
+        guard(&[
+            (m_tail, format!("row<{m}u")),
+            (n_tail, format!("col<{n}u")),
+            (owned_at != "true", owned_at.clone()),
+        ])
+    )
+    .unwrap();
     store(
         out,
         p,
@@ -759,7 +775,17 @@ fn contraction(
     out.push_str("}\n");
     if cooperative {
         let index = address(&spec.out, &v.shape, "row+16u", "col", "0u");
-        writeln!(out, "if(row+16u<{m}u && col<{n}u && {}){{", owned(&index)).unwrap();
+        let owned_index = owned(&index);
+        writeln!(
+            out,
+            "if({}){{",
+            guard(&[
+                (m_tail, format!("row+16u<{m}u")),
+                (n_tail, format!("col<{n}u")),
+                (owned_index != "true", owned_index.clone()),
+            ])
+        )
+        .unwrap();
         store(out, p, id, &index, "tile_c[lane+256u]");
         out.push_str("}\n");
     }
@@ -772,6 +798,20 @@ fn contraction(
     out.push_str("}\n}\nstorageBarrier();\n");
     Ok(())
 }
+/// The conjunction of the conditions that apply, or `true`.
+fn guard(parts: &[(bool, String)]) -> String {
+    let parts: Vec<&str> = parts
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, c)| c.as_str())
+        .collect();
+    if parts.is_empty() {
+        "true".into()
+    } else {
+        parts.join(" && ")
+    }
+}
+
 fn reduction(out: &mut String, p: &Plan, id: Id, groups: u32, cooperative: bool) -> Result<()> {
     let v = p.value(id);
     let Logical::Fold {
