@@ -957,7 +957,17 @@ fn bucketed_scatter(out: &mut String, p: &Plan, id: Id, groups: u32) -> Result<(
         .unwrap();
     }
     out.push_str("if(hit){positions[total+before+rank]=k;}total+=count;workgroupBarrier();}\n");
-    writeln!(out,"for(var col=lane;col<{inner}u;col+=256u){{let at=row*{inner}u+col;var acc={};for(var i=0u;i<total;i+=1u){{let picked=positions[i];acc+= {};}}",load(p,*base,"at")?,load(p,*upd,&format!("(row/{width}u)*{}u+picked*{inner}u+col",count*inner))?).unwrap();
+    // Matches are summed in their original order; eight loads issue ahead of
+    // their adds so a frequent bucket's long run is not one load at a time.
+    let update = |picked: &str| load(p, *upd, &format!("(row/{width}u)*{}u+({picked})*{inner}u+col", count * inner));
+    writeln!(out,"for(var col=lane;col<{inner}u;col+=256u){{let at=row*{inner}u+col;var acc={};var i=0u;for(;i+8u<=total;i+=8u){{",load(p,*base,"at")?).unwrap();
+    for j in 0..8 {
+        writeln!(out, "let u{j}={};", update(&format!("positions[i+{j}u]"))?).unwrap();
+    }
+    for j in 0..8 {
+        writeln!(out, "acc+=u{j};").unwrap();
+    }
+    writeln!(out, "}}for(;i<total;i+=1u){{acc+={};}}", update("positions[i]")?).unwrap();
     store(out, p, id, "at", "acc");
     out.push_str("}workgroupBarrier();}}storageBarrier();\n");
     Ok(())
