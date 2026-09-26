@@ -311,7 +311,9 @@ pub(crate) fn shader(
             }
         });
     }
-    let mut out = "@group(0) @binding(0) var<storage,read_write> arena: array<u32>;\nvar<workgroup> tile_a:array<f32,512>;\nvar<workgroup> tile_b:array<f32,256>;\nvar<workgroup> reduce_scratch:array<u32,256>;\nfn f32_bits(bits:u32)->f32{return bitcast<f32>(bits);}\n".to_string();
+    // A fixed-size arena: its bounds checks clamp against a constant rather
+    // than the runtime buffer length, and binding validates the size once.
+    let mut out = format!("@group(0) @binding(0) var<storage,read_write> arena: array<u32,{}>;\n", p.stats().arena_bytes / 4) + "var<workgroup> tile_a:array<f32,512>;\nvar<workgroup> tile_b:array<f32,256>;\nvar<workgroup> reduce_scratch:array<u32,256>;\nfn f32_bits(bits:u32)->f32{return bitcast<f32>(bits);}\n";
     if cooperative {
         out.insert_str(
             0,
