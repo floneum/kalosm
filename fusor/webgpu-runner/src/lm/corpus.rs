@@ -4,99 +4,80 @@ const SNAPSHOT: &str = "https://raw.githubusercontent.com/floneum/kalosm/117a8a0
 const TRAIN_HASH: &str = "4b26bc79469080b97a984fd79d3e61ebd5c3b86f7b9cf79fbc463a349b6cc7e2";
 const BENCHMARK_HASH: &str = "87b2de1e357184eee2de1cfa116ac7d41a202cf84ef89068cd86867e905e10e7";
 
-/// The corpus as token ids, plus the character each id denotes.
+use super::tokenizer::{MAX_VOCAB, Tokenizer};
+
+/// The corpus as token ids, plus the tokenizer that produced them.
 #[derive(PartialEq)]
 pub struct Corpus {
-    /// Every character of the text, as a vocabulary index.
+    /// The whole text, as token ids.
     tokens: Vec<u8>,
-    /// Index -> character.
-    vocab: Vec<char>,
-    /// Character -> index, over the vocabulary's contiguous code point range.
-    index: Vec<Option<u8>>,
-    lowest: u32,
-    /// Where the held-out tail starts.
+    tokenizer: Tokenizer,
+    /// Where the held-out tail starts, in tokens.
     split: usize,
 }
 
 impl Corpus {
     /// Download once, or reuse the verified local copy on subsequent visits.
+    /// Tokens are byte-pair merges learned from the training stories.
     pub async fn load() -> Result<Self, String> {
         let text = fetch("tinystories.txt", 7_999_444, TRAIN_HASH).await?;
         let split = text[..text.len() * 9 / 10]
             .rfind("\n\n\n")
             .ok_or("Training text has no story boundary")?;
-        Ok(Self::from_text(&text, split))
+        Ok(Self::from_text(&text, split, MAX_VOCAB))
     }
 
-    /// Load the fixed corpus used by compiler benchmarks.
+    /// Load the fixed corpus used by compiler benchmarks. It stays
+    /// character-level so benchmark timings compare across versions.
     #[allow(dead_code)]
     pub async fn benchmark() -> Result<Self, String> {
         let text = fetch("tinystories-benchmark.txt", 319_868, BENCHMARK_HASH).await?;
-        Ok(Self::from_text(&text, ((text.len() as f32) * 0.9) as usize))
+        Ok(Self::from_text(
+            &text,
+            ((text.len() as f32) * 0.9) as usize,
+            0,
+        ))
     }
 
-    fn from_text(text: &str, split: usize) -> Self {
+    /// `split` is a byte offset; merges are learned from the text before it.
+    fn from_text(text: &str, split: usize, vocab: usize) -> Self {
         assert!(
             text.is_ascii(),
             "Corpus preparation must normalize text to ASCII"
         );
-        let mut seen = [false; 128];
-        for c in text.bytes() {
-            seen[c as usize] = true;
-        }
-        let vocab: Vec<char> = (0u32..128)
-            .filter(|c| seen[*c as usize])
-            .filter_map(char::from_u32)
-            .collect();
-        let lowest = vocab.first().map_or(0, |c| *c as u32);
-        let highest = vocab.last().map_or(0, |c| *c as u32);
-        let mut index = vec![None; (highest - lowest + 1) as usize];
-        for (i, c) in vocab.iter().enumerate() {
-            index[(*c as u32 - lowest) as usize] = Some(i as u8);
-        }
-        let tokens: Vec<u8> = text
-            .chars()
-            .filter_map(|c| index.get((c as u32).wrapping_sub(lowest) as usize).copied())
-            .flatten()
-            .collect();
+        let (train, test) = text.split_at(split);
+        let tokenizer = Tokenizer::train_on(text, train, vocab);
+        let mut tokens = tokenizer.encode(train);
+        let split = tokens.len();
+        tokens.extend(tokenizer.encode(test));
         Self {
             tokens,
-            vocab,
-            index,
-            lowest,
+            tokenizer,
             split,
         }
     }
 
-    /// How many distinct characters the model has to spell with.
+    /// How many distinct tokens the model has to write with.
     pub fn vocab_size(&self) -> usize {
-        self.vocab.len()
+        self.tokenizer.vocab_size()
     }
 
-    /// The character an id denotes.
-    pub fn decode(&self, id: usize) -> char {
-        self.vocab.get(id).copied().unwrap_or('?')
+    /// The text a token id stands for.
+    pub fn decode(&self, id: usize) -> &str {
+        self.tokenizer.decode(id)
     }
 
-    /// Every character, in id order.
-    pub fn alphabet(&self) -> &[char] {
-        &self.vocab
-    }
-
-    /// The id of `c`, when the corpus contains it.
-    pub fn encode(&self, c: char) -> Option<u8> {
-        self.index
-            .get((c as u32).wrapping_sub(self.lowest) as usize)
-            .copied()
-            .flatten()
+    /// Every token's text, in id order.
+    pub fn pieces(&self) -> &[String] {
+        self.tokenizer.pieces()
     }
 
     /// `text` as ids, dropping characters the corpus never used.
     pub fn encode_all(&self, text: &str) -> Vec<u8> {
-        text.chars().filter_map(|c| self.encode(c)).collect()
+        self.tokenizer.encode(text)
     }
 
-    /// Total characters.
+    /// Total tokens.
     pub fn len(&self) -> usize {
         self.tokens.len()
     }
@@ -123,12 +104,12 @@ impl Corpus {
         &self.tokens[start..(start + span + 1).min(hi)]
     }
 
-    /// A readable excerpt of the training text, for the UI to show what the
-    /// model is being asked to imitate.
-    pub fn excerpt(&self, chars: usize) -> String {
+    /// A readable excerpt of the training text, `tokens` tokens long, for
+    /// the UI to show what the model is being asked to imitate.
+    pub fn excerpt(&self, tokens: usize) -> String {
         self.tokens
             .iter()
-            .take(chars)
+            .take(tokens)
             .map(|id| self.decode(*id as usize))
             .collect()
     }
@@ -215,12 +196,13 @@ mod tests {
     #[test]
     fn expanded_data_round_trips_and_windows_stay_in_their_split() {
         let corpus = pollster::block_on(Corpus::load()).unwrap();
-        assert!(corpus.len() > 7_900_000);
-        assert_eq!(corpus.len(), 7_999_444);
-        assert_eq!(corpus.split, 7_199_486);
+        assert_eq!(corpus.vocab_size(), MAX_VOCAB);
         let text = corpus.excerpt(corpus.len());
-        assert!(text[corpus.split..].starts_with("\n\n\n"));
+        assert_eq!(text.len(), 7_999_444);
         assert!(verified(text.as_bytes(), 7_999_444, TRAIN_HASH));
+        // Merges shorten the stories well below one token per character.
+        assert!(corpus.len() < text.len() / 2, "{} tokens", corpus.len());
+        assert!(corpus.excerpt(corpus.split).len() == 7_199_486);
         for split in [Split::Train, Split::Test] {
             for at in [0, corpus.len() - 1, usize::MAX] {
                 let window = corpus.window(split, at, 512);
@@ -232,6 +214,13 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn the_benchmark_corpus_stays_character_level() {
+        let corpus = pollster::block_on(Corpus::benchmark()).unwrap();
+        assert!(corpus.pieces().iter().all(|p| p.len() == 1));
+        assert_eq!(corpus.len(), 319_868);
     }
 }
 

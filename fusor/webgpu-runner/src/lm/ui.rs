@@ -1,5 +1,4 @@
-//! The Train route: watch a transformer learn to write, one character at a
-//! time.
+//! The Train route: watch a transformer learn to write, one token at a time.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -25,10 +24,10 @@ const SYNCS_PER_EVAL: usize = 8;
 const EVAL_BATCHES: usize = 2;
 /// Syncs between re-samples of the live continuation.
 const SYNCS_PER_SAMPLE: usize = 24;
-/// Characters generated between training intervals.
-const LIVE_CHARS: usize = 48;
-/// Characters the Write button produces.
-const FULL_CHARS: usize = 400;
+/// Tokens generated between training intervals.
+const LIVE_CHARS: usize = 24;
+/// Tokens the Write button produces.
+const FULL_CHARS: usize = 200;
 /// What the demo opens with, and what Reset returns to.
 const DEFAULT_PROMPT: &str = "Once upon a time, there was a little girl named";
 /// Sampling temperature the demo opens at.
@@ -188,8 +187,8 @@ impl Cost {
 /// What the interpretability panel is currently showing.
 #[derive(Clone, PartialEq)]
 struct Insight {
-    /// The text the maps are about.
-    context: String,
+    /// The tokens the maps are about.
+    context: Vec<String>,
     /// `[BLOCKS][HEADS]` maps of `CONTEXT * CONTEXT` probabilities.
     maps: Vec<Vec<Vec<f32>>>,
     /// Real positions in the window; the rest are left padding.
@@ -197,7 +196,7 @@ struct Insight {
     window: usize,
     /// Largest logit gap between the model and the lens the maps come from.
     disagreement: f32,
-    /// The next-character distribution at the end of `context`.
+    /// The next-token distribution at the end of `context`.
     next: Vec<f32>,
     /// `vocab * vocab` cosine similarities between token embeddings.
     similarity: Vec<f32>,
@@ -463,7 +462,7 @@ fn Training(corpus: Rc<Corpus>) -> Element {
         let corpus = corpus.clone();
         move || corpus.excerpt(560)
     });
-    let alphabet: Vec<char> = corpus.alphabet().to_vec();
+    let alphabet: Vec<String> = corpus.pieces().to_vec();
     let setup = configuration();
     let parsed = draft.read().parse(vocab);
     let pending = parsed.as_ref().is_ok_and(|next| *next != setup);
@@ -477,7 +476,8 @@ fn Training(corpus: Rc<Corpus>) -> Element {
             header { class: "lm-hero",
                 h1 { "A transformer that learns to write, in your browser" }
                 p { class: "lm-hero-sub",
-                    "A {parameters} parameter character-level language model, initialized from "
+                    "A {parameters} parameter language model over a {vocab}-token byte-pair "
+                    "vocabulary learned from the stories, initialized from "
                     "noise and trained from scratch on WebGPU — no pretrained weights, nothing "
                     "downloaded but the text. Forward, backward and the Adam update are one "
                     "fusor graph, built once and re-run every step."
@@ -486,14 +486,14 @@ fn Training(corpus: Rc<Corpus>) -> Element {
                     Fact { value: "{setup.model.blocks}", label: "blocks" }
                     Fact { value: "{setup.model.heads}", label: "heads" }
                     Fact { value: "{setup.model.context}", label: "context" }
-                    Fact { value: "{vocab}", label: "characters" }
+                    Fact { value: "{vocab}", label: "tokens" }
                 }
             }
 
             Card { class: "lm-card",
                 CardHeader {
                     CardTitle { "Architecture & training" }
-                    CardDescription { "Choose the shape, then start a fresh run. One token is one character." }
+                    CardDescription { "Choose the shape, then start a fresh run. A token is a character or a common piece of a word." }
                 }
                 CardContent {
                     div { class: "lm-config-presets",
@@ -591,7 +591,7 @@ fn Training(corpus: Rc<Corpus>) -> Element {
                     CardHeader {
                         CardTitle { "Training" }
                         CardDescription {
-                            "Cross-entropy in nats per character. The dashed line is held-out "
+                            "Cross-entropy in nats per token. The dashed line is held-out "
                             "text the optimizer never sees."
                         }
                     }
@@ -658,7 +658,7 @@ fn Training(corpus: Rc<Corpus>) -> Element {
                             }
                         }
                         p { class: "lm-note",
-                            "Perplexity is how many characters the model is effectively choosing "
+                            "Perplexity is how many tokens the model is effectively choosing "
                             "between at each position. Untrained, that is all {vocab} of them. "
                             "The second row is what the loop costs: training time per step, the "
                             "GPU dispatches each step issues — which is what a browser pays for "
@@ -672,7 +672,7 @@ fn Training(corpus: Rc<Corpus>) -> Element {
                     CardHeader {
                         CardTitle { "What it writes" }
                         CardDescription {
-                            "Sampled one character at a time from the model's own output, fed "
+                            "Sampled one token at a time from the model's own output, fed "
                             "back into its context."
                         }
                     }
@@ -720,7 +720,7 @@ fn Training(corpus: Rc<Corpus>) -> Element {
                                     want_write.set(true);
                                     run_id += 1;
                                 },
-                                "Write {FULL_CHARS} characters"
+                                "Write {FULL_CHARS} tokens"
                             }
                             span { class: "lm-hint",
                                 "Low temperature repeats itself; high temperature invents words."
@@ -734,7 +734,7 @@ fn Training(corpus: Rc<Corpus>) -> Element {
                 CardHeader {
                     CardTitle { "What it is learning from" }
                     CardDescription {
-                        "A {Thousands(corpus.len() as u64)} character slice of TinyStories, "
+                        "A {Thousands(corpus.len() as u64)} token slice of TinyStories, "
                         "downloaded once and cached on this device. About 90% trains the model; the remaining stories are held out."
                     }
                 }
@@ -742,7 +742,7 @@ fn Training(corpus: Rc<Corpus>) -> Element {
                     pre { class: "lm-corpus", "{excerpt}…" }
                     div { class: "lm-alphabet",
                         for c in alphabet.iter() {
-                            span { class: "lm-char", "{printable(*c)}" }
+                            span { class: "lm-char", "{printable(c)}" }
                         }
                     }
                 }
@@ -752,7 +752,7 @@ fn Training(corpus: Rc<Corpus>) -> Element {
                 CardHeader {
                     CardTitle { "Inside the model" }
                     CardDescription {
-                        "Attention maps, the next-character distribution, and which characters "
+                        "Attention maps, the next-token distribution, and which tokens "
                         "the embedding has learned to treat alike — all read off the very same "
                         "parameters that are training."
                     }
@@ -788,25 +788,25 @@ fn Training(corpus: Rc<Corpus>) -> Element {
 
 /// Everything the interpretability card draws once a read has happened.
 #[component]
-fn Inside(insight: Insight, alphabet: Vec<char>) -> Element {
-    let context: Vec<char> = insight.context.chars().collect();
+fn Inside(insight: Insight, alphabet: Vec<String>) -> Element {
+    let context = &insight.context;
     let shown = context.len().min(insight.filled);
     let tail = context.len().saturating_sub(shown);
 
-    // Rank the next-character distribution once, here, rather than sorting
+    // Rank the next-token distribution once, here, rather than sorting
     // inside the render loop.
     let mut ranked: Vec<(usize, f32)> = insight.next.iter().copied().enumerate().collect();
     ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
-    let top: Vec<(char, f32)> = ranked
+    let top: Vec<(String, f32)> = ranked
         .iter()
         .take(10)
-        .map(|(i, p)| (alphabet.get(*i).copied().unwrap_or('?'), *p))
+        .map(|(i, p)| (alphabet.get(*i).cloned().unwrap_or_else(|| "?".into()), *p))
         .collect();
 
-    // The five characters each character's embedding is closest to. Its own
+    // The five tokens each token's embedding is closest to. Its own
     // row is dropped: everything is most similar to itself.
     let v = alphabet.len();
-    let neighbours: Vec<(char, Vec<char>)> = (0..v)
+    let neighbours: Vec<(String, Vec<String>)> = (0..v)
         .map(|i| {
             let mut row: Vec<(usize, f32)> = insight.similarity[i * v..(i + 1) * v]
                 .iter()
@@ -816,11 +816,11 @@ fn Inside(insight: Insight, alphabet: Vec<char>) -> Element {
                 .collect();
             row.sort_by(|a, b| b.1.total_cmp(&a.1));
             (
-                alphabet[i],
+                alphabet[i].clone(),
                 row.iter()
                     .take(5)
-                    .map(|(j, _)| alphabet[*j])
-                    .collect::<Vec<char>>(),
+                    .map(|(j, _)| alphabet[*j].clone())
+                    .collect::<Vec<String>>(),
             )
         })
         .collect();
@@ -844,11 +844,11 @@ fn Inside(insight: Insight, alphabet: Vec<char>) -> Element {
             }
         }
 
-        h4 { class: "lm-section", "Next character" }
+        h4 { class: "lm-section", "Next token" }
         div { class: "lm-dist",
             for (c, p) in top.iter() {
                 div { class: "lm-dist-row",
-                    span { class: "lm-dist-char", "{printable(*c)}" }
+                    span { class: "lm-dist-char", "{printable(c)}" }
                     div { class: "lm-dist-bar",
                         div { class: "lm-dist-fill", style: "width: {p * 100.0}%" }
                     }
@@ -876,23 +876,23 @@ fn Inside(insight: Insight, alphabet: Vec<char>) -> Element {
         div { class: "lm-context",
             span { class: "lm-hint", "window:" }
             for c in context[tail..].iter() {
-                span { class: "lm-char", "{printable(*c)}" }
+                span { class: "lm-char", "{printable(c)}" }
             }
         }
 
-        h4 { class: "lm-section", "Learned character similarity" }
+        h4 { class: "lm-section", "Learned token similarity" }
         p { class: "lm-note",
-            "The five characters each one's embedding points most nearly at. Vowels finding "
-            "vowels, and a capital finding its own lower case, is the model having noticed "
-            "something about spelling that nobody told it."
+            "The five tokens each one's embedding points most nearly at. Pieces that play "
+            "the same part in a sentence drifting together is the model having noticed "
+            "something about language that nobody told it."
         }
         div { class: "lm-neighbours",
             for (c, near) in neighbours.iter() {
                 div { class: "lm-neighbour",
-                    span { class: "lm-char lm-char-key", "{printable(*c)}" }
+                    span { class: "lm-char lm-char-key", "{printable(c)}" }
                     span { class: "lm-hint", "→" }
                     for n in near.iter() {
-                        span { class: "lm-char", "{printable(*n)}" }
+                        span { class: "lm-char", "{printable(n)}" }
                     }
                 }
             }
@@ -1034,7 +1034,7 @@ async fn look_inside(
     Ok(Insight {
         context: tokens
             .iter()
-            .map(|id| corpus.decode(*id as usize))
+            .map(|id| corpus.decode(*id as usize).to_string())
             .collect(),
         window,
         maps,
@@ -1045,13 +1045,17 @@ async fn look_inside(
     })
 }
 
-/// A character as something that survives being put in a `<span>`.
-fn printable(c: char) -> String {
-    match c {
-        ' ' => "␣".into(),
-        '\n' => "⏎".into(),
-        other => other.to_string(),
-    }
+/// A token as something that survives being put in a `<span>`: spaces and
+/// newlines are drawn rather than collapsed.
+fn printable(piece: &str) -> String {
+    piece
+        .chars()
+        .map(|c| match c {
+            ' ' => '␣',
+            '\n' => '⏎',
+            other => other,
+        })
+        .collect()
 }
 
 /// Digit grouping, so "characters seen" is readable at seven figures.

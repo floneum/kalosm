@@ -76,9 +76,9 @@ impl ModelConfig {
                 return Err(format!("{name} must be a positive whole number."));
             }
         }
-        // The corpus encodes ASCII characters, independently of model size.
-        if !(2..=128).contains(&vocab) {
-            return Err("The character vocabulary must contain between 2 and 128 symbols.".into());
+        // Token ids are bytes, independently of model size.
+        if !(2..=256).contains(&vocab) {
+            return Err("The vocabulary must contain between 2 and 256 tokens.".into());
         }
         if !self.dim.is_multiple_of(self.heads) {
             return Err("Model width must be divisible by attention heads.".into());

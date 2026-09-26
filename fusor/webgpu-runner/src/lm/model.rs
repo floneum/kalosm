@@ -543,7 +543,7 @@ impl Lm {
         for _ in 0..count {
             let probabilities = self.next_char(&written, temperature).await?;
             let picked = self.rng.pick(&probabilities);
-            out.push(corpus.decode(picked));
+            out.push_str(corpus.decode(picked));
             written.push(picked as u8);
         }
         Ok(out)
@@ -938,14 +938,15 @@ mod tests {
                         }
                     }
                 }
-                assert_eq!(
+                // Four tokens, each at least one character.
+                assert!(
                     compiled
                         .generate(&corpus, &probe, 4, 0.8)
                         .await
                         .unwrap()
                         .chars()
-                        .count(),
-                    4
+                        .count()
+                        >= 4
                 );
                 assert_eq!(
                     compiled.embedding_similarity().await.unwrap().len(),
@@ -1029,7 +1030,12 @@ mod tests {
         // And the sampler produces text drawn from the corpus's alphabet.
         let written = pollster::block_on(model.generate(&corpus, &prompt, 64, 0.8)).expect("write");
         assert_eq!(written.chars().count(), 64);
-        assert!(written.chars().all(|c| corpus.encode(c).is_some()));
+        let known: String = corpus
+            .encode_all(&written)
+            .iter()
+            .map(|id| corpus.decode(*id as usize))
+            .collect();
+        assert_eq!(known, written);
     }
 }
 

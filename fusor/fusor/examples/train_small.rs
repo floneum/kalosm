@@ -9,6 +9,8 @@ mod corpus;
 mod model;
 #[path = "../../webgpu-runner/src/lm/rng.rs"]
 mod rng;
+#[path = "../../webgpu-runner/src/lm/tokenizer.rs"]
+mod tokenizer;
 
 fn main() -> fusor::Result<()> {
     pollster::block_on(async {
