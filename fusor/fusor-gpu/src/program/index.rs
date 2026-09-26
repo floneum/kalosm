@@ -37,6 +37,26 @@ impl Expr {
                 x => *terms.entry(x).or_default() += factor,
             }
         }
+        // Mixed-radix recomposition: x%a + a*((x/a)%b) = x%(a*b). A group
+        // index split into several coordinates reassembles digit by digit.
+        loop {
+            let pair = terms.iter().find_map(|(term, c)| {
+                let Self::Mod(x, a) = term else { return None };
+                terms.iter().find_map(|(other, d)| {
+                    let Self::Mod(inner, b) = other else { return None };
+                    let Self::Div(y, a2) = inner.as_ref() else { return None };
+                    (y == x && a2 == a && *d == c * a).then(|| {
+                        (term.clone(), other.clone(), Self::Mod(x.clone(), a * b), *c)
+                    })
+                })
+            });
+            let Some((low, high, merged, c)) = pair else {
+                break;
+            };
+            terms.remove(&low);
+            terms.remove(&high);
+            *terms.entry(merged).or_default() += c;
+        }
         // Euclidean recomposition: n*(x/n) + x%n = x. This cancels
         // reshape/transpose round trips without inspecting any tensor element.
         loop {
@@ -297,6 +317,21 @@ mod tests {
                     assert_eq!(owner.eval(&vars), simplified.eval(&vars));
                 }
             }
+        }
+    }
+
+    #[test]
+    fn mixed_radix_digits_recombine() {
+        let bounds = Bounds::from([(GROUP, 255u64)]);
+        let g = || Expr::var(GROUP);
+        let owner = Expr::sum([
+            g().div(8).scale(8),
+            g().modulo(2),
+            g().div(2).modulo(4).scale(2),
+        ]);
+        assert_eq!(owner.simplify(&bounds), g());
+        for group in 0..256 {
+            assert_eq!(owner.eval(&|_| group), group);
         }
     }
 

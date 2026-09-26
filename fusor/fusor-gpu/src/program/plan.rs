@@ -13,13 +13,19 @@ use fusor_ir::{
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub(crate) const BLOCK: u32 = 256;
+/// Linear-job workgroups when the caller does not choose. At 64 a GPU with
+/// a few dozen cores holds under two linear workgroups per core; 128 fills
+/// them (the TINY transformer step: 1.57 -> 1.44 ms). A power of two keeps
+/// row-aligned ownership shares for power-of-two shapes.
+const DEFAULT_GROUPS: u32 = 128;
 
 /// Scheduling controls for fixed-shape programs.
 #[derive(Clone, Copy, Debug)]
 pub struct ProgramOptions {
     /// Linear-job workgroups (1..=256). One forces a single-workgroup schedule;
-    /// None selects by workload size. Parallel matrix and indexed-reduction jobs
-    /// use their own bounded grids, sized to the work they actually perform.
+    /// None selects by workload size (one for tiny programs, else 128).
+    /// Parallel matrix and indexed-reduction jobs use their own bounded grids,
+    /// sized to the work they actually perform.
     pub workgroups: Option<u32>,
     /// Use f32 matrix instructions when the backend and device support them.
     pub matrix_acceleration: bool,
@@ -139,7 +145,7 @@ impl Plan {
         max_bytes: u64,
         options: ProgramOptions,
     ) -> Result<Self> {
-        let groups = options.workgroups.unwrap_or(64);
+        let groups = options.workgroups.unwrap_or(DEFAULT_GROUPS);
         if groups == 0 || groups > 256 || options.max_region_stages == 0 {
             return Err(Error::Plan(
                 "program workgroups must be between 1 and 256".into(),
