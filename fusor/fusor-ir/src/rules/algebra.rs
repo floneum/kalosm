@@ -116,23 +116,8 @@ pub fn strip(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<
     split.or(elided)
 }
 
-/// SPLIT: `Fold{c, axis}` == `Fold{c.as_merge(), axis} . Fold{c, axis+1} . block(x)`.
-///
-/// The carrier rides through untouched: at a contraction's summed axis this
-/// is split-K, at a `(max, sum)` carrier it is online softmax, at
-/// `(n, mean, m2)` it is the stable variance accumulator.
-///
-/// The outer level uses [`crate::carrier::Carrier::as_merge`]: its elements are partial
-/// accumulators, not raw elements, and it reads ONE operand carrying the
-/// inner fold's trailing carrier axis. Reusing the inner carrier applies
-/// `lift` to a partial max and silently computes a wrong value; at a
-/// single-slot binop the two spellings coincide.
-///
-/// Without the `reassoc` guard the split and unsplit forms are declared
-/// value-equal and extraction may swap them on an f16 accumulator.
-///
-/// Every operand is blocked: one blocking view is applied to each input, and
-/// inputs that do not agree on the shape it is stated against decline.
+/// Split a scalar reduction into partial reductions and a final merge.
+/// Reassociation requires the numeric contract's permission.
 fn fold_split(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Logical(Logical::Fold {
         carrier,
@@ -143,6 +128,14 @@ fn fold_split(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option
     else {
         return None;
     };
+    // Partial carriers occupy a trailing output axis. Reading several slots
+    // requires separate operand views; a single operand only binds Arg(0).
+    // Blocking also renumbers iteration coordinates used by an indexed lift.
+    if carrier.slots.as_slice() != [crate::carrier::SlotTy::Scalar]
+        || carrier.lift.iter().any(ScalarExpr::reads_index_of)
+    {
+        return None;
+    }
     // The outer level reads partial accumulators, so the carrier must be
     // associative; `f.own().numeric` is the meet over every operand.
     if !carrier.associative || !f.own().numeric.reassoc {
@@ -212,7 +205,11 @@ fn fold_split(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option
         for &x in ins {
             let Ok(v) = b.add_logical(Logical::Restride {
                 specs: specs.clone(),
-                bounds: BoundsProof::RuntimeMask,
+                bounds: if shape.iter().all(|dim| dim.as_const().is_some()) {
+                    BoundsProof::Static
+                } else {
+                    BoundsProof::RuntimeMask
+                },
                 x,
             }) else {
                 break;
@@ -423,38 +420,17 @@ fn flip(op: CmpOp) -> CmpOp {
 
 /// Whether `e` names the loop coordinate of `axis`.
 fn reads_index_of(e: &ScalarExpr, axis: u32) -> bool {
-    match e.kind() {
-        ScalarKind::IndexOf(a) => *a == axis,
-        ScalarKind::Un { x, .. }
-        | ScalarKind::Cast { x, .. }
-        | ScalarKind::Bitcast { x, .. }
-        | ScalarKind::Round { x, .. }
-        | ScalarKind::Splat { x, .. } => reads_index_of(x, axis),
-        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
-            reads_index_of(a, axis) || reads_index_of(b, axis)
-        }
-        ScalarKind::Select { c, t, f } => {
-            reads_index_of(c, axis) || reads_index_of(t, axis) || reads_index_of(f, axis)
-        }
-        ScalarKind::Arg(_) | ScalarKind::Lit(_) | ScalarKind::Uniform(_) => false,
-    }
+    let mut found = false;
+    e.walk(&mut |e| found |= matches!(e.kind(), ScalarKind::IndexOf(a) if *a == axis));
+    found
 }
 
 /// Whether `e` rounds anywhere: the one syntactic marker of a value whose
 /// contract forbids reassociation.
 fn has_round(e: &ScalarExpr) -> bool {
-    match e.kind() {
-        ScalarKind::Round { .. } => true,
-        ScalarKind::Un { x, .. }
-        | ScalarKind::Cast { x, .. }
-        | ScalarKind::Bitcast { x, .. }
-        | ScalarKind::Splat { x, .. } => has_round(x),
-        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
-            has_round(a) || has_round(b)
-        }
-        ScalarKind::Select { c, t, f } => has_round(c) || has_round(t) || has_round(f),
-        _ => false,
-    }
+    let mut found = false;
+    e.walk(&mut |e| found |= matches!(e.kind(), ScalarKind::Round { .. }));
+    found
 }
 
 /// `Fold{Add, rank-1}(Map{mul(Arg0, Arg1)}(a, b))` also *is* a `Contract`.
@@ -933,42 +909,15 @@ pub fn identity_elim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -
 }
 
 fn simplify(e: &ScalarExpr) -> (ScalarExpr, bool) {
-    let rebuilt = match e.kind() {
-        ScalarKind::Un { op, x } => {
-            let (x, c) = simplify(x);
-            (ScalarExpr::un(*op, x), c)
-        }
-        ScalarKind::Bin { op, a, b } => {
-            let (a, ca) = simplify(a);
-            let (bb, cb) = simplify(b);
-            (ScalarExpr::bin(*op, a, bb), ca || cb)
-        }
-        ScalarKind::Cmp { op, a, b } => {
-            let (a, ca) = simplify(a);
-            let (bb, cb) = simplify(b);
-            (ScalarExpr::cmp(*op, a, bb), ca || cb)
-        }
-        ScalarKind::Select { c, t, f } => {
-            let (c, cc) = simplify(c);
-            let (t, ct) = simplify(t);
-            let (f, cf) = simplify(f);
-            (ScalarExpr::select(c, t, f), cc || ct || cf)
-        }
-        ScalarKind::Cast { to, x } => {
-            let (x, c) = simplify(x);
-            (ScalarExpr::cast(*to, x), c)
-        }
-        ScalarKind::Bitcast { to, x } => {
-            let (x, c) = simplify(x);
-            (ScalarExpr::bitcast(*to, x), c)
-        }
-        ScalarKind::Round { mode, x } => {
-            let (x, c) = simplify(x);
-            (ScalarExpr::round(*mode, x), c)
-        }
-        _ => (e.clone(), false),
+    let mut changed = false;
+    let node = match e.kind() {
+        ScalarKind::Dot { .. } | ScalarKind::Splat { .. } => e.clone(),
+        _ => e.map_children(&mut |child| {
+            let (simpler, did_change) = simplify(child);
+            changed |= did_change;
+            simpler
+        }),
     };
-    let (node, changed) = rebuilt;
     match peephole(&node) {
         Some(simpler) => (simpler, true),
         None => (node, changed),

@@ -220,7 +220,6 @@ mod tests {
             regs: 0,
             locals: 0,
             tiles: Vec::new(),
-            maps: Vec::new(),
             buffer_elements: Vec::new(),
             arena_bytes: 0,
             block: 1,

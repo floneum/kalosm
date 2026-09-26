@@ -6,6 +6,7 @@ on:
       - main
     paths:
       - fusor/**
+      - .cargo/config.toml
       - .github/workflows/webgpu-runner.yml
       - .github/workflows/webgpu-runner-pages.yml
       - Cargo.toml
@@ -17,6 +18,7 @@ on:
       - main
     paths:
       - fusor/**
+      - .cargo/config.toml
       - .github/workflows/webgpu-runner.yml
       - .github/workflows/webgpu-runner-pages.yml
       - Cargo.toml

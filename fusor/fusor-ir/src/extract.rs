@@ -16,9 +16,8 @@ use smallvec::SmallVec;
 pub struct Extraction {
     /// E-class -> the selected member of that class.
     pub sigma: FxHashMap<ClassId, Id>,
-    /// The materialized set. A node in `M` pays one write and each consumer
-    /// pays one read; a node outside `M` is inlined into every consumer,
-    /// paying its math once per consumer and no traffic.
+    /// Buffer outputs derived from the selected DAG. A composite's final
+    /// stage aliases its owner instead of allocating another output.
     pub m: FixedBitSet,
     /// Schedule point per selected node carrying a `ScheduleDomain`.
     pub theta: FxHashMap<Id, SchedPoint>,
@@ -33,13 +32,10 @@ impl Extraction {
     }
 }
 
-/// The three moves local search makes. `Flip` is refused when the node is
-/// pinned: an `Effect::InPlace` node is pinned in `M`, since inlining an
-/// atomic scatter into two consumers doubles the effect.
+/// Choices local search makes over valid graph variants and schedules.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Move {
     Reselect(ClassId),
-    Flip(Id),
     Reschedule(Id),
 }
 
@@ -63,14 +59,17 @@ pub struct ExtractBudget {
 impl Default for ExtractBudget {
     /// `64 * |chains|` moves, 90k realized node visits.
     ///
-    /// Raising 90k regresses `attention_causal_plan_is_no_worse_than_dense`:
-    /// at convergence the causal graph's local optimum keeps a 100-element
-    /// buffer where dense finds a 40-element one, so both searches must stay
-    /// truncated until the causal side can reach the two-slot carrier.
+    /// Limits additional local-search work after the complete seed sweep.
     fn default() -> Self {
+        // `FUSOR_MOVE_WORK` overrides the visit budget, for measuring what
+        // a longer search buys on a given graph.
+        let max_move_work = std::env::var("FUSOR_MOVE_WORK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(90_000);
         Self {
             moves_per_chain: 64,
-            max_move_work: 90_000,
+            max_move_work,
         }
     }
 }
@@ -107,6 +106,9 @@ pub struct BindingPlan {
     pub binding: u32,
     pub value: Id,
     pub kind: BindKind,
+    /// The value lives in the plan's step arena: all arena values in a
+    /// launch share one binding, with typed views at their own offsets.
+    pub arena: bool,
 }
 
 /// One buffer the plan allocates. Allocation is derived from the plan:
@@ -119,6 +121,9 @@ pub struct BufferPlan {
     pub elements: Dim,
     pub dtype: crate::dtype::Dtype,
     pub persistence: crate::dtype::Persistence,
+    /// Byte offset in the step arena, for a step-local intermediate whose
+    /// live range was packed there; `None` allocates its own buffer.
+    pub arena: Option<u64>,
 }
 
 /// One dispatch in the extracted plan. `grid` is after the 3-D fold against
@@ -139,6 +144,9 @@ pub struct Plan {
     pub extraction: Extraction,
     pub launches: Vec<Dispatch>,
     pub buffers: Vec<BufferPlan>,
+    /// Bytes of the step arena: intermediates with disjoint live ranges
+    /// share it, interval-colored at derivation.
+    pub arena_bytes: u64,
     pub symbols: Vec<crate::shape::SymId>,
     /// The subset of `symbols` that are runtime scalars (`Leaf::Uniform`),
     /// carried as `f32` words. Every other symbol is an extent, offset or
@@ -152,9 +160,9 @@ pub struct Plan {
 /// local search; `fusor-conformance` ships a debug ILP oracle behind the
 /// same trait that must agree with it on small graphs.
 pub trait Extractor: Send + Sync {
-    /// Admissible lower bound, bottom-up, `O(nodes)`: `min over n in c of
-    /// (math_ps(n) + sum over *distinct* child chains lb(child))` — zero
-    /// traffic, free sharing, min over the schedule domain. Indexed by node id.
+    /// Per-node arithmetic floor, indexed by node id, for candidate ordering.
+    /// It is not a dependency-DAG cost: selection compares complete realized
+    /// plans so every shared producer and every distinct branch is counted.
     fn lower_bound(&self, graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds>;
 
     /// Seed, realize, cost exactly, then local-search under `budget`.
@@ -166,16 +174,43 @@ pub trait Extractor: Send + Sync {
         budget: ExtractBudget,
     ) -> Result<Plan>;
 
+    /// Extend a previous selection from this graph to the requested roots.
+    /// The seed is a search hint; its buffers and cost must be constructed again.
+    fn extract_seeded(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        cost: &dyn CostModel,
+        budget: ExtractBudget,
+        seed: &Plan,
+    ) -> Result<Plan> {
+        let _ = seed;
+        self.extract(graph, roots, cost, budget)
+    }
+
     /// Hard conformance assert on the winner: every selected non-leaf is
     /// Launch; every geometry legal against the exact `ArenaPlan`; every
     /// operand access satisfiable; every buffer stride derivable; no
     /// `InPlace` node inlined. A failure is an error, never a fallback.
+    #[cfg(feature = "compiler-tests")]
     fn verify_plan(&self, graph: &EGraph, plan: &Plan) -> Result<()>;
+
+    /// Test-only member sweep. Coverage is independent of tuning budgets,
+    /// cost thresholds and the timing cache.
+    #[cfg(feature = "compiler-tests")]
+    fn test_launch_variants(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        base: &Plan,
+        launch_ix: usize,
+        cost: &dyn CostModel,
+    ) -> Vec<(String, Plan)>;
 
     /// Alternative plans for one launch of `base`: every `(class member,
     /// schedule point)` pair the launch root's class offers, each re-planned
     /// whole. Family and geometry vary together — see the
-    /// `candidate_geoms_for` doc in `fusor-tile`.
+    /// `candidate_schedules_for` doc in `fusor-tile`.
     ///
     /// Contractions below `min_macs` return nothing. The default is "no
     /// alternatives".
@@ -192,8 +227,9 @@ pub trait Extractor: Send + Sync {
         Vec::new()
     }
 
-    /// The labels [`Self::launch_variants`] would offer for one launch,
-    /// without building a single plan.
+    /// Candidate labels and their complete realized costs, without deriving
+    /// buffers, bindings or plan hashes. Lower costs come first; a label that
+    /// cannot realize keeps its place in the offering with the maximum cost.
     ///
     /// The list is a superset of what `launch_variants` returns — a label
     /// here may still fail to realize — and is exactly the label space
@@ -202,11 +238,13 @@ pub trait Extractor: Send + Sync {
     fn launch_variant_labels(
         &self,
         graph: &EGraph,
+        roots: &[Id],
         base: &Plan,
         launch_ix: usize,
+        cost: &dyn CostModel,
         min_macs: u64,
-    ) -> Vec<String> {
-        let _ = (graph, base, launch_ix, min_macs);
+    ) -> Vec<(String, Picoseconds)> {
+        let _ = (graph, roots, base, launch_ix, cost, min_macs);
         Vec::new()
     }
 

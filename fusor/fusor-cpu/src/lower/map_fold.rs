@@ -7,12 +7,12 @@
 //! `LoopThenTree` to per-lane loop accumulation followed by that tree.
 
 use fusor_ir::Result;
-use fusor_ir::carrier::{Carrier, SlotTy};
+use fusor_ir::carrier::SlotTy;
 use fusor_ir::device::Caps;
 use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
     Addr, Builtin, ElementType, KernelIr, LocalDecl, MemoryLevel, ReduceKind, ScalarElement, Stmt,
-    StorageView, TileDecl, TileExpr, TileExprKind, TileLayout, TileReduceOp, WorkgroupAxis,
+    StorageView, TileDecl, TileExpr, TileExprKind, TileLayout, WorkgroupAxis,
 };
 use fusor_ir::ir::launch::{FoldStrat, Launch, SchedPoint};
 use fusor_ir::ir::{Node, Op};
@@ -61,7 +61,13 @@ pub(crate) fn lower(
         // both scalar operators and multi-slot carriers, so lowering every
         // fold through it prevents the planner from selecting a second shape
         // that has no Cranelift implementation.
-        Launch::Fold { .. } => lower_fold_carrier(caps, node, theta, cx),
+        Launch::Fold { .. } => lower_fold_carrier(caps, op, theta, cx, None),
+        Launch::StreamFold {
+            producer,
+            fold,
+            operand,
+            ..
+        } => lower_fold_carrier(caps, fold, theta, cx, Some((producer, *operand))),
         _ => Err(Error::Legality("map_fold got a foreign node".into())),
     }
 }
@@ -143,191 +149,6 @@ fn lower_map(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> 
     })
 }
 
-/// One workgroup per output row; the reduced axis is walked with vector loads
-/// and finished by the strategy `theta` selected. The epilogue fuses straight
-/// onto the reduced value, so nothing is materialized in between.
-#[allow(dead_code)]
-fn lower_fold(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
-    let Op::Launch(Launch::Fold {
-        space,
-        axis,
-        vec_axes,
-        carrier,
-        post,
-        ops,
-        ..
-    }) = &node.op
-    else {
-        return Err(Error::Legality("not a Fold".into()));
-    };
-    if !vec_axes.is_empty() || fusor_ir::ir::kernel::fast_reduce_op(carrier).is_none() {
-        return lower_fold_carrier(caps, node, theta, cx);
-    }
-    let pre = &carrier.lift[0];
-    let post = &post[0];
-    let binds = Binds::build(cx)?;
-    let uniforms = binds.buffers.first().cloned();
-    let extents = const_extents(cx, &space.dims)?;
-    let axis = *axis as usize;
-    if axis >= extents.len() {
-        return Err(Error::Legality("fold axis is out of range".into()));
-    }
-    let rop = reduce_op(carrier)?;
-    let axis_extent = extents[axis].max(1);
-    let inner: u32 = extents[axis + 1..].iter().product::<u32>().max(1);
-    let outer: u32 = extents[..axis].iter().product::<u32>().max(1);
-    let rows = (outer as u64) * (inner as u64);
-    // A point that names no lane group falls back to the domain's own default
-    // width — the same `emitted_block` the fold domain prices with, so the
-    // number the cost model charged and the number this allocates agree.
-    let strat = match theta {
-        SchedPoint::Fold(s) => s,
-        _ => FoldStrat::WgTree {
-            lane_group: default_block(caps),
-        },
-    };
-    let block = fold_block(strat, caps, axis_extent);
-
-    // One pass of the block covers `block` elements of the axis, so longer
-    // axes need a per-lane strided loop, and its counter has to enter the
-    // address: `ReduceKind::Loop` re-evaluates the staging expression per
-    // iteration, so an index-free body would combine the same element
-    // `iterations` times.
-    let passes = axis_extent.div_ceil(block).max(1);
-    let loop_index = (passes > 1).then(|| Arc::new(LocalDecl::new(u32_ty())));
-
-    let row = TileExpr::new(
-        TileExprKind::Builtin(Builtin::ProgramId(WorkgroupAxis::X)),
-        u32_ty(),
-    );
-    let lane = TileExpr::new(TileExprKind::Builtin(Builtin::Lane), u32_ty());
-    let outer_idx = bin(BinOp::Div, row.clone(), lit_u32(inner), u32_ty());
-    let inner_idx = bin(BinOp::Rem, row.clone(), lit_u32(inner), u32_ty());
-
-    let k = match &loop_index {
-        None => lane.clone(),
-        Some(index) => {
-            let pass = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(index)), u32_ty());
-            bin(
-                BinOp::Add,
-                bin(BinOp::Mul, pass, lit_u32(block), u32_ty()),
-                lane.clone(),
-                u32_ty(),
-            )
-        }
-    };
-
-    // The reduced axis is strided by `inner`, so a lane walks it with vector
-    // loads rather than a scalar index iterator.
-    let flat = bin(
-        BinOp::Add,
-        bin(
-            BinOp::Mul,
-            bin(
-                BinOp::Add,
-                bin(BinOp::Mul, outer_idx, lit_u32(axis_extent), u32_ty()),
-                k.clone(),
-                u32_ty(),
-            ),
-            lit_u32(inner),
-            u32_ty(),
-        ),
-        inner_idx,
-        u32_ty(),
-    );
-    let mask = cmp(CmpOp::Lt, k, lit_u32(axis_extent));
-
-    let space_total = extents
-        .iter()
-        .map(|e| u64::from(*e))
-        .product::<u64>()
-        .max(1);
-    let mut args = Vec::with_capacity(ops.len());
-    for o in ops {
-        args.push(super::operand_at(
-            cx,
-            &binds,
-            o,
-            flat.clone(),
-            space_total,
-            mask.clone(),
-        )?);
-    }
-    let coords = coords_of(&flat, &extents);
-    let contribution = Translate {
-        args: &args,
-        coords: &coords,
-        uniforms: uniforms.clone(),
-    }
-    .run(pre)?;
-    // Inactive lanes contribute the identity, so a partial tail cannot skew a
-    // max or a product.
-    let f32_ty = ElementType::Scalar(ScalarElement::F32);
-    let contribution = TileExpr::new(
-        TileExprKind::Select {
-            condition: mask,
-            accept: contribution,
-            reject: lit_f32(crate::emit::reduce::identity_f32(rop)),
-        },
-        f32_ty,
-    );
-
-    let scratch: Arc<TileDecl> = Arc::new(TileDecl::new(
-        f32_ty,
-        TileLayout::contiguous(MemoryLevel::Workgroup, &[block]),
-        "fold_scratch",
-    ));
-    // The group is the whole block, never the strategy's `lane_group`: this
-    // kernel launches one workgroup per output row and every lane of it walks
-    // that row's axis, so a tree over fewer lanes would drop the rest. The
-    // strategy chooses the shape; the trip count comes from the extent.
-    let kind = match (&loop_index, strat) {
-        (Some(index), _) => ReduceKind::Loop {
-            iterations: passes,
-            index: Arc::clone(index),
-            scratch: Arc::clone(&scratch),
-            group_size: block,
-        },
-        (None, FoldStrat::Subgroup) => ReduceKind::Subgroup,
-        (None, _) => ReduceKind::Workgroup {
-            scratch: Arc::clone(&scratch),
-            group_size: block,
-        },
-    };
-
-    let reduced = TileExpr::new(
-        TileExprKind::Reduce {
-            op: rop,
-            kind: Box::new(kind),
-            value: contribution,
-        },
-        f32_ty,
-    );
-    let value = Translate {
-        args: &[reduced],
-        coords: &coords,
-        uniforms,
-    }
-    .run(post)?;
-
-    let out_buf = binds.of(cx.launch.root)?;
-    let body = vec![Stmt::Store {
-        dst: view(&out_buf),
-        addr: Addr::Linear(row),
-        value,
-        mask: cmp(CmpOp::Eq, lane, lit_u32(0)),
-    }];
-
-    Ok(KernelIr {
-        buffers: binds.buffers,
-        grid: [rows.max(1) as u32, 1, 1],
-        block,
-        body,
-        byte_arena: None,
-        name: "cpu_fold",
-    })
-}
-
 /// Lower a `Fold` whose carrier is wider than one hardware operator.
 ///
 /// One accumulator per carrier lane, seeded from that lane's own identity,
@@ -340,11 +161,12 @@ fn lower_fold(caps: &Caps, node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) ->
 /// the scratch tree.
 fn lower_fold_carrier(
     caps: &Caps,
-    node: &Node,
+    fold: &Launch,
     theta: SchedPoint,
     cx: &LowerCtx<'_>,
+    stream: Option<(&Launch, u32)>,
 ) -> Result<KernelIr> {
-    let Op::Launch(Launch::Fold {
+    let Launch::Fold {
         space,
         axis,
         vec_axes,
@@ -352,7 +174,7 @@ fn lower_fold_carrier(
         post,
         ops,
         ..
-    }) = &node.op
+    } = fold
     else {
         return Err(Error::Legality("not a Fold".into()));
     };
@@ -407,7 +229,7 @@ fn lower_fold_carrier(
     let iter_axes: Vec<usize> = (0..extents.len())
         .filter(|i| !vec_axes.contains(&(*i as u32)))
         .collect();
-    let axis_extent = extents[axis].max(1);
+    let axis_extent = extents[axis];
     let inner: u32 = extents[axis + 1..].iter().product::<u32>().max(1);
     let outer: u32 = extents[..axis]
         .iter()
@@ -448,11 +270,13 @@ fn lower_fold_carrier(
     // Lane `(slot, p)` reads every operand at promoted position `p`. An
     // operand invariant in the promoted axes is read at the same address for
     // every position and the emitter's CSE collapses it to one load.
-    let lift_at = |k: TileExpr| -> Result<Vec<TileExpr>> {
+    let lift_at = |k: TileExpr, body: &mut Vec<Stmt>| -> Result<Vec<TileExpr>> {
         let mask = cmp(CmpOp::Lt, k.clone(), lit_u32(axis_extent));
         let row_elems = axis_extent.saturating_mul(vec_extent);
         let mut per_pos: Vec<(Vec<TileExpr>, Vec<TileExpr>)> =
             Vec::with_capacity(vec_extent as usize);
+        let mut produced: rustc_hash::FxHashMap<TileExpr, TileExpr> = Default::default();
+        let mut first_index = None;
         for p in 0..vec_extent {
             let within = bin(
                 BinOp::Add,
@@ -476,16 +300,42 @@ fn lower_fold_carrier(
                 inner_idx.clone(),
                 u32_ty(),
             );
+            let first = first_index.get_or_insert_with(|| flat.clone());
             let mut args = Vec::with_capacity(ops.len());
-            for o in ops {
-                args.push(super::operand_at(
-                    cx,
-                    &binds,
-                    o,
-                    flat.clone(),
-                    space_total,
-                    mask.clone(),
-                )?);
+            for (i, o) in ops.iter().enumerate() {
+                args.push(
+                    if let Some((producer, operand)) = stream
+                        && i == operand as usize
+                    {
+                        let invariant = o.layout.rank() == space.rank()
+                            && vec_axes.iter().all(|axis| {
+                                o.layout.strides()[*axis as usize]
+                                    .known_eq(fusor_ir::shape::Dim::Const(0))
+                            });
+                        let flat = if invariant {
+                            first.clone()
+                        } else {
+                            flat.clone()
+                        };
+                        let row = super::address_of(cx, o, flat, space_total)?;
+                        if let Some(value) = produced.get(&row) {
+                            value.clone()
+                        } else {
+                            let value = fold_element(
+                                cx,
+                                &binds,
+                                producer,
+                                row.clone(),
+                                mask.clone(),
+                                body,
+                            )?;
+                            produced.insert(row, value.clone());
+                            value
+                        }
+                    } else {
+                        super::operand_at(cx, &binds, o, flat.clone(), space_total, mask.clone())?
+                    },
+                );
             }
             let full = coords_of(&flat, &extents);
             let coords: Vec<TileExpr> = iter_axes.iter().map(|i| full[*i].clone()).collect();
@@ -524,7 +374,8 @@ fn lower_fold_carrier(
             lane.clone(),
             u32_ty(),
         );
-        let values = lift_at(k)?;
+        let mut loop_body = Vec::new();
+        let values = lift_at(k, &mut loop_body)?;
         let locals: Vec<Arc<LocalDecl>> = (0..lanes)
             .map(|_| Arc::new(LocalDecl::new(f32_ty)))
             .collect();
@@ -551,11 +402,11 @@ fn lower_fold_carrier(
             count: Some(lit_u32(passes)),
             index: Some(index),
             accumulators,
-            body: Vec::new(),
+            body: loop_body,
         });
         reads
     } else {
-        lift_at(lane.clone())?
+        lift_at(lane.clone(), &mut body)?
     };
 
     let scratch: smallvec::SmallVec<[Arc<TileDecl>; 4]> = (0..lanes)
@@ -645,6 +496,95 @@ fn lower_fold_carrier(
     })
 }
 
+fn fold_element(
+    cx: &LowerCtx<'_>,
+    binds: &Binds,
+    producer: &Launch,
+    row: TileExpr,
+    mask: TileExpr,
+    body: &mut Vec<Stmt>,
+) -> Result<TileExpr> {
+    let Launch::Fold {
+        space,
+        axis,
+        carrier,
+        acc,
+        post,
+        ops,
+        ..
+    } = producer
+    else {
+        return Err(Error::Legality("a streamed producer must be a Fold".into()));
+    };
+    let extents = const_extents(cx, &space.dims)?;
+    let axis = *axis as usize;
+    let width = extents[axis];
+    let inner = extents[axis + 1..].iter().product::<u32>().max(1);
+    let total = extents.iter().map(|v| u64::from(*v)).product();
+    let index = Arc::new(LocalDecl::new(u32_ty()));
+    let k = TileExpr::new(TileExprKind::LoadLocal(index.clone()), u32_ty());
+    let flat = bin(
+        BinOp::Add,
+        bin(
+            BinOp::Mul,
+            bin(
+                BinOp::Add,
+                bin(
+                    BinOp::Mul,
+                    bin(BinOp::Div, row.clone(), lit_u32(inner), u32_ty()),
+                    lit_u32(width),
+                    u32_ty(),
+                ),
+                k,
+                u32_ty(),
+            ),
+            lit_u32(inner),
+            u32_ty(),
+        ),
+        bin(BinOp::Rem, row.clone(), lit_u32(inner), u32_ty()),
+        u32_ty(),
+    );
+    let coords = coords_of(&flat, &extents);
+    let args = ops
+        .iter()
+        .map(|operand| super::operand_at(cx, binds, operand, flat.clone(), total, mask.clone()))
+        .collect::<Result<Vec<_>>>()?;
+    let uniforms = binds.buffers.first().cloned();
+    let lifted = Translate {
+        args: &args,
+        coords: &coords,
+        uniforms: uniforms.clone(),
+    }
+    .run(&carrier.lift[0])?;
+    let f32_ty = ElementType::Scalar(ScalarElement::F32);
+    let local = Arc::new(LocalDecl::new(f32_ty));
+    let value = TileExpr::new(TileExprKind::LoadLocal(local.clone()), f32_ty);
+    let update = Translate {
+        args: &[value.clone(), lifted],
+        coords: &[],
+        uniforms: uniforms.clone(),
+    }
+    .run(&carrier.merge[0])?;
+    body.push(Stmt::Loop {
+        count: Some(lit_u32(width)),
+        index: Some(index),
+        accumulators: vec![fusor_ir::ir::kernel::Accumulator {
+            local,
+            init: lit_f32(splat_f32(carrier.identity[0])),
+            update,
+        }],
+        body: Vec::new(),
+    });
+    let value = Translate {
+        args: &[value],
+        coords: std::slice::from_ref(&row),
+        uniforms,
+    }
+    .run(&post[0])?;
+    let ty = ElementType::Scalar(super::elem_of(*acc)?);
+    Ok(TileExpr::new(TileExprKind::Cast { value, to: ty }, ty))
+}
+
 /// A carrier identity as a host float.
 fn splat_f32(s: fusor_ir::dtype::Splat) -> f32 {
     use fusor_ir::dtype::Splat;
@@ -655,32 +595,4 @@ fn splat_f32(s: fusor_ir::dtype::Splat) -> f32 {
         Splat::U32(v) => v as f32,
         Splat::I32(v) => v as f32,
     }
-}
-
-/// The hardware collective this carrier reduces with.
-///
-/// `Carrier::kind()` — one scalar slot merged by a binop — mapped onto
-/// `TileReduceOp`. A multi-slot or promoted carrier needs N accumulators and
-/// an N-lane reduce, which this emitter does not have, so it refuses rather
-/// than reducing slot 0 and dropping the rest.
-pub(crate) fn reduce_op(c: &Carrier) -> Result<TileReduceOp> {
-    if c.width() != 1 || c.slots[0] != SlotTy::Scalar {
-        return Err(Error::Legality(format!(
-            "a {}-slot carrier needs the N-lane reduce; the CPU emitter only \
-             lowers a single scalar slot",
-            c.width()
-        )));
-    }
-    Ok(match c.kind() {
-        Some(BinOp::Add) => TileReduceOp::Sum,
-        Some(BinOp::Mul) => TileReduceOp::Product,
-        Some(BinOp::Max) => TileReduceOp::Max,
-        Some(BinOp::Min) => TileReduceOp::Min,
-        other => {
-            return Err(Error::Legality(format!(
-                "carrier merge {other:?} has no CPU collective; the generic \
-                 merge path is not built yet"
-            )));
-        }
-    })
 }

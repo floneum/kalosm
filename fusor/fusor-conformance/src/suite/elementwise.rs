@@ -220,7 +220,7 @@ pub fn cases() -> Cases {
                 non_vacuous(name, &data, reference)?;
                 let graph = graph_of(session);
                 let x = upload(graph.handle(), &dims(shape), &data)?;
-                let y = op(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
+                let y = op(&x)?;
                 let expected: Vec<f32> = data.iter().copied().map(reference).collect();
                 expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await
             },
@@ -376,7 +376,7 @@ async fn tensor_comparison_case(
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dimv, &lhs)?;
     let b = upload(graph.handle(), &dimv, &rhs)?;
-    let y = op(&a, &b).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = op(&a, &b)?;
 
     let actual = read(&y).await?;
     let expected: Vec<f32> = lhs
@@ -411,7 +411,7 @@ async fn broadcast_case(
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dims(&[rows, cols]), &lhs)?;
     let b = upload(graph.handle(), &dims(&[cols]), &rhs)?;
-    let y = op(&a, &b).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = op(&a, &b)?;
 
     let actual = read(&y).await?;
     let expected: Vec<f32> = (0..(rows * cols) as usize)
@@ -431,7 +431,7 @@ async fn broadcast_case(
     let probe_graph = graph_of(session);
     let probe_a = upload(probe_graph.handle(), &dims(&[rows, cols]), &lhs)?;
     let probe_b = upload(probe_graph.handle(), &dims(&[cols]), &rhs)?;
-    let probe_y = op(&probe_a, &probe_b).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let probe_y = op(&probe_a, &probe_b)?;
     let probe_loss = loss_of(&probe_y)?;
     let numeric = finite_difference_gradient(&[cols as usize], &rhs, |probe| {
         read_probe_loss(&probe_b, &probe_loss, probe)
@@ -457,7 +457,7 @@ async fn expr_case(
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dimv, &lhs)?;
     let b = upload(graph.handle(), &dimv, &rhs)?;
-    let y = build(&a, &b).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = build(&a, &b)?;
 
     let actual = read(&y).await?;
     let expected: Vec<f32> = lhs
@@ -471,7 +471,7 @@ async fn expr_case(
     let probe_graph = graph_of(session);
     let probe_a = upload(probe_graph.handle(), &dimv, &lhs)?;
     let probe_b = upload(probe_graph.handle(), &dimv, &rhs)?;
-    let probe_y = build(&probe_a, &probe_b).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let probe_y = build(&probe_a, &probe_b)?;
     let probe_loss = loss_of(&probe_y)?;
     let numeric = finite_difference_gradient(&[len], &lhs, |probe| {
         read_probe_loss(&probe_a, &probe_loss, probe)
@@ -503,7 +503,7 @@ async fn approximate_exp_case(
         )
         .into());
     };
-    let y = y.map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = y?;
 
     let actual = read(&y).await?;
     let exact: Vec<f32> = data.iter().map(|v| v.exp()).collect();
@@ -544,9 +544,7 @@ async fn where_cond_case(session: &Session, shape: &[u64], seed: u32) -> CaseRes
     let c = upload(graph.handle(), &dimv, &cond)?;
     let t = upload(graph.handle(), &dimv, &on_true)?;
     let f = upload(graph.handle(), &dimv, &on_false)?;
-    let y = c
-        .where_cond(&t, &f)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = c.where_cond(&t, &f)?;
 
     let actual = read(&y).await?;
     let expected: Vec<f32> = (0..len)

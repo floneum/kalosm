@@ -117,8 +117,13 @@ pub(crate) fn effective_read_bytes(llc_bytes: u64, bytes: u64, rereads: u32) -> 
 /// `reads` is one `(bytes, rereads)` pair per *distinct* operand, so a value
 /// two consumers share is counted once and its reread factor carries the
 /// sharing.
-pub(crate) fn dram_ps(facts: &DeviceFacts, reads: &[(u64, u32)], writes: u64) -> Picoseconds {
-    let mut total = u128::from(writes);
+pub(crate) fn dram_ps(
+    facts: &DeviceFacts,
+    reads: &[(u64, u32)],
+    writes: u64,
+    line_bytes: u64,
+) -> Picoseconds {
+    let mut total = u128::from(writes) + u128::from(line_bytes);
     for &(bytes, rereads) in reads {
         total += effective_read_bytes(facts.llc_bytes, bytes, rereads);
     }
@@ -150,19 +155,4 @@ pub(crate) fn occupancy_scale_num_den(facts: &DeviceFacts, resident_lanes: u64) 
 /// Apply an occupancy rational to a duration, saturating.
 pub(crate) fn scaled(value: Picoseconds, num: u128, den: u128) -> Picoseconds {
     ps(u128::from(value.0) * num / den.max(1))
-}
-
-/// T5: the combine dispatch reads every partial slice and writes the output
-/// behind its own barrier, so it **adds** rather than overlapping.
-///
-/// `padded_bytes` is one split's padded output, so `(splits + 1)` counts
-/// reading `splits` partials and writing one result.
-pub(crate) fn combine_ps(facts: &DeviceFacts, splits: u32, padded_bytes: u64) -> Picoseconds {
-    if splits <= 1 {
-        return Picoseconds(0);
-    }
-    ps(
-        u128::from(splits + 1) * u128::from(padded_bytes) * PS_PER_US
-            / u128::from(facts.dram_bytes_per_us.max(1)),
-    )
 }

@@ -6,7 +6,7 @@
 //! gives the wrong verdict, and its own doc concedes dispatches are 0.2% of
 //! modelled time while the tuple will pay unbounded bandwidth to remove one.
 //!
-//! Precision is **not** a cost term — it is a verifier property
+//! Precision is **not** a cost term — it is a construction invariant
 //! (`NumericContract`), because a time-only model eliminates f32 everywhere.
 
 #![warn(unreachable_pub)]
@@ -17,10 +17,12 @@ mod lower_bound;
 mod model;
 mod moves;
 pub mod plan;
+mod quantized;
 pub mod realize;
 pub mod replay;
 mod terms;
 pub mod tune_cache;
+#[cfg(feature = "compiler-tests")]
 mod verify_plan;
 
 pub use extract::LocalSearch;

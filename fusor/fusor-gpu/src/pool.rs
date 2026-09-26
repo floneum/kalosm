@@ -3,7 +3,13 @@
 //! On macOS, exceeding unified memory kills the OS rather than erroring, which
 //! is why the ceiling is a hard gate and not a warning.
 
+pub static UPLOAD_UNIFORM: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static UPLOAD_INIT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static COPY_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static POISON_BYTES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use fusor_ir::Result;
 use fusor_ir::dtype::Persistence;
@@ -14,8 +20,8 @@ use rustc_hash::FxHashMap;
 
 use crate::target::GpuConfig;
 
-/// Free buffers retained per bucket.
-pub const FREE_PER_BUCKET: usize = if cfg!(target_arch = "wasm32") { 1 } else { 4 };
+/// Minimum idle buffers retained per size class, below its observed peak usage.
+pub const FREE_PER_BUCKET: usize = 4;
 
 /// Usage set for a tensor buffer.
 pub const TENSOR_USAGE: wgpu::BufferUsages = wgpu::BufferUsages::STORAGE
@@ -45,6 +51,38 @@ pub struct BufferPoolCounters {
     pub cap_retries: u64,
 }
 
+/// Buffers and peak concurrent usage for one size class.
+#[derive(Debug, Default)]
+struct Bucket {
+    bufs: Vec<Buf>,
+    peak: usize,
+    last_used: u64,
+}
+
+impl Bucket {
+    fn take(&mut self, request: u64) -> Option<Buf> {
+        let hit = self.bufs.iter().find(|b| b.refcount() == 1).cloned();
+        if hit.is_some() {
+            self.last_used = self.last_used.max(request);
+            self.observe();
+            self.peak = self.peak.max(1);
+        }
+        hit
+    }
+
+    /// Note how many of this size are currently handed out.
+    fn observe(&mut self) {
+        let in_use = self.bufs.iter().filter(|b| b.refcount() > 1).count();
+        self.peak = self.peak.max(in_use);
+    }
+
+    /// Idle buffers worth keeping: the working set, floored at
+    /// [`FREE_PER_BUCKET`].
+    fn keep(&self) -> usize {
+        self.peak.max(FREE_PER_BUCKET)
+    }
+}
+
 /// A pooled device buffer. `Buf` wraps this in an `Arc<dyn Any>`, so
 /// `Buf::refcount() == 1` means the pool holds the only handle.
 #[derive(Debug)]
@@ -58,14 +96,13 @@ pub struct GpuBuffer {
 pub struct BufferPool {
     device: Arc<wgpu::Device>,
     queue: Arc<wgpu::Queue>,
-    /// Free-list buckets by size and usage. A plain map: a bounded cache
-    /// evicted whole buckets once a run used more sizes than its capacity,
-    /// dropping their tracking while `live_bytes` kept counting them.
-    free: Mutex<FxHashMap<PoolKey, Vec<Buf>>>,
+    /// Buckets retain all live buffers so `live_bytes` accounts for every allocation.
+    free: Mutex<FxHashMap<PoolKey, Bucket>>,
     counters: Mutex<BufferPoolCounters>,
     ceiling_bytes: Mutex<u64>,
     poison: bool,
     upload_staging: Mutex<Vec<StagingChunk>>,
+    retired_buffers: AtomicBool,
     lost: crate::device::LostFlag,
 }
 
@@ -112,6 +149,7 @@ impl BufferPool {
             ceiling_bytes: Mutex::new(ceiling),
             poison: config.poison_allocations,
             upload_staging: Mutex::new(Vec::new()),
+            retired_buffers: AtomicBool::new(false),
             lost,
         }
     }
@@ -127,25 +165,32 @@ impl BufferPool {
     /// Blocks and retries at the ceiling rather than failing — one of exactly
     /// three host syncs in the whole runtime.
     pub fn alloc_with_usage(&self, bytes: u64, usage: wgpu::BufferUsages) -> Result<Buf> {
-        let size = padded_copy_size(bytes.max(4));
+        let size = allocation_size(bytes)?;
         let key = PoolKey {
             size,
             usage: usage.bits(),
         };
-        self.counters.lock().requested += 1;
+        let request = {
+            let mut counters = self.counters.lock();
+            counters.requested += 1;
+            counters.requested
+        };
 
-        if let Some(hit) = self.take_free(key) {
+        if let Some(hit) = self.take_free(key, request) {
             return Ok(hit);
         }
 
         let ceiling = *self.ceiling_bytes.lock();
+        // Idle storage gets a small share of the device budget; old shape
+        // classes must not accumulate up to the device's allocation ceiling.
+        self.trim((ceiling / 16).min(256 << 20));
         if self.counters.lock().live_bytes.saturating_add(size) > ceiling {
             // Retire everything in flight, then retry the cache. Only after
             // both fail is the working set genuinely over the cap.
             self.counters.lock().cap_retries += 1;
             self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
             self.reclaim();
-            if let Some(hit) = self.take_free(key) {
+            if let Some(hit) = self.take_free(key, request) {
                 return Ok(hit);
             }
             let live = self.counters.lock().live_bytes;
@@ -157,8 +202,8 @@ impl BufferPool {
                     let mut rows: Vec<(u64, usize, usize)> = free
                         .iter()
                         .map(|(k, b)| {
-                            let pinned = b.iter().filter(|x| x.refcount() > 1).count();
-                            (k.size, pinned, b.len() - pinned)
+                            let pinned = b.bufs.iter().filter(|x| x.refcount() > 1).count();
+                            (k.size, pinned, b.bufs.len() - pinned)
                         })
                         .collect();
                     rows.sort_by_key(|(size, pinned, _)| std::cmp::Reverse(size * *pinned as u64));
@@ -170,9 +215,9 @@ impl BufferPool {
                     }
                     let tracked: u64 = free
                         .iter()
-                        .map(|(k, b)| k.size.saturating_mul(b.len() as u64))
+                        .map(|(k, b)| k.size.saturating_mul(b.bufs.len() as u64))
                         .sum();
-                    let entries: usize = free.values().map(Vec::len).sum();
+                    let entries: usize = free.values().map(|b| b.bufs.len()).sum();
                     eprintln!(
                         "[pool] tracked {} MB in {entries} entries across {} buckets; live_bytes {} MB",
                         tracked >> 20,
@@ -191,12 +236,13 @@ impl BufferPool {
         // without an error; the first write to it would then fail as a
         // validation panic with no mention of the loss.
         self.lost.check()?;
-        Ok(self.create(size, usage))
+        Ok(self.create(size, usage, request))
     }
 
     /// Upload initial contents through `queue.write_buffer_with`, padding to
     /// `COPY_BUFFER_ALIGNMENT`.
     pub fn create_buffer_init(&self, data: &[u8], usage: wgpu::BufferUsages) -> Result<Buf> {
+        UPLOAD_INIT.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let size = padded_copy_size(data.len() as u64);
         let buf = self.alloc_with_usage(size, usage)?;
         let gpu = buf
@@ -313,12 +359,13 @@ impl BufferPool {
         let released = {
             let mut free = self.free.lock();
             let bucket = free.entry(key).or_default();
-            if !bucket.iter().any(|b| b.addr() == addr) {
-                bucket.push(buf);
+            if !bucket.bufs.iter().any(|b| b.addr() == addr) {
+                bucket.bufs.push(buf);
             }
             prune_bucket(bucket)
         };
         if released > 0 {
+            self.retired_buffers.store(true, Ordering::Release);
             let mut counters = self.counters.lock();
             counters.live_bytes = counters
                 .live_bytes
@@ -346,9 +393,9 @@ impl BufferPool {
             let mut free = self.free.lock();
             match free.get_mut(&key) {
                 Some(bucket) => {
-                    let before = bucket.len();
-                    bucket.retain(|b| b.addr() != addr);
-                    before - bucket.len()
+                    let before = bucket.bufs.len();
+                    bucket.bufs.retain(|b| b.addr() != addr);
+                    before - bucket.bufs.len()
                 }
                 None => 0,
             }
@@ -363,23 +410,20 @@ impl BufferPool {
     /// Drop every free buffer whose only handle is the pool's, releasing their
     /// bytes back to the ceiling budget.
     pub fn reclaim(&self) {
-        let mut free = self.free.lock();
-        let mut released = 0u64;
-        let keys: Vec<PoolKey> = free.keys().copied().collect();
-        for key in keys {
-            if let Some(bucket) = free.get_mut(&key) {
-                bucket.retain(|b| {
-                    if b.refcount() == 1 {
-                        released = released.saturating_add(key.size);
-                        false
-                    } else {
-                        true
-                    }
-                });
-            }
+        self.trim(0);
+    }
+
+    fn trim(&self, idle_budget: u64) {
+        let released = trim_idle(&mut self.free.lock(), idle_budget);
+        if released > 0 {
+            self.retired_buffers.store(true, Ordering::Release);
         }
         let mut counters = self.counters.lock();
         counters.live_bytes = counters.live_bytes.saturating_sub(released);
+    }
+
+    pub(crate) fn take_retired_buffers(&self) -> bool {
+        self.retired_buffers.swap(false, Ordering::Acquire)
     }
 
     /// Refill every free buffer with `0xCD` at the end of a resolve, so the
@@ -393,7 +437,7 @@ impl BufferPool {
         for bucket in free.values() {
             // The pool tracks in-use buffers now; poisoning one would
             // overwrite a live tensor.
-            for buf in bucket.iter().filter(|b| b.refcount() == 1) {
+            for buf in bucket.bufs.iter().filter(|b| b.refcount() == 1) {
                 if let Some(gpu) = buf.downcast_ref::<GpuBuffer>() {
                     self.poison_fill(gpu);
                 }
@@ -417,16 +461,16 @@ impl BufferPool {
         &self.queue
     }
 
-    fn take_free(&self, key: PoolKey) -> Option<Buf> {
+    fn take_free(&self, key: PoolKey, request: u64) -> Option<Buf> {
         let mut free = self.free.lock();
         let bucket = free.get_mut(&key)?;
         // The pool holds its own handle, so `refcount() == 1` is exactly "no
         // caller has this one". Handing back a clone leaves the entry tracked,
         // which makes a dropped buffer reusable with no `recycle` call.
-        bucket.iter().find(|b| b.refcount() == 1).cloned()
+        bucket.take(request)
     }
 
-    fn create(&self, size: u64, usage: wgpu::BufferUsages) -> Buf {
+    fn create(&self, size: u64, usage: wgpu::BufferUsages, request: u64) -> Buf {
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fusor pooled buffer"),
             size,
@@ -453,10 +497,18 @@ impl BufferPool {
         let released = {
             let mut free = self.free.lock();
             let bucket = free.entry(key).or_default();
+            bucket.last_used = bucket.last_used.max(request);
+            // Creating means the bucket could not serve the request, so its
+            // working set is at least one larger than what it holds.
+            bucket.observe();
+            bucket.peak = bucket.peak.saturating_add(1);
             let released = prune_bucket(bucket);
-            bucket.push(buf.clone());
+            bucket.bufs.push(buf.clone());
             released
         };
+        if released > 0 {
+            self.retired_buffers.store(true, Ordering::Release);
+        }
         let mut counters = self.counters.lock();
         counters.created += 1;
         counters.live_bytes = counters
@@ -469,6 +521,7 @@ impl BufferPool {
     /// Pre-fill with `0xCD` so a kernel that assumes zero-initialized storage
     /// fails loudly instead of reading whatever the last tenant left.
     fn poison_fill(&self, gpu: &GpuBuffer) {
+        POISON_BYTES.fetch_add(gpu.size, std::sync::atomic::Ordering::Relaxed);
         if !gpu.usage.contains(wgpu::BufferUsages::COPY_DST) {
             return;
         }
@@ -482,21 +535,59 @@ impl BufferPool {
     }
 }
 
+fn trim_idle(buckets: &mut FxHashMap<PoolKey, Bucket>, budget: u64) -> u64 {
+    let mut idle = 0u64;
+    let mut oldest: Vec<_> = buckets
+        .iter()
+        .filter_map(|(key, bucket)| {
+            let count = bucket.bufs.iter().filter(|b| b.refcount() == 1).count() as u64;
+            idle = idle.saturating_add(key.size.saturating_mul(count));
+            (count > 0).then_some((bucket.last_used, *key))
+        })
+        .collect();
+    if idle <= budget {
+        return 0;
+    }
+    oldest.sort_unstable_by_key(|(used, key)| (*used, key.size, key.usage));
+    let mut released = 0u64;
+    for (_, key) in oldest {
+        let bucket = buckets.get_mut(&key).expect("collected above");
+        bucket.bufs.retain(|b| {
+            if idle > budget && b.refcount() == 1 {
+                idle = idle.saturating_sub(key.size);
+                released = released.saturating_add(key.size);
+                false
+            } else {
+                true
+            }
+        });
+        bucket.peak = bucket.peak.min(bucket.bufs.len());
+        if bucket.bufs.is_empty() {
+            buckets.remove(&key);
+        }
+        if idle <= budget {
+            break;
+        }
+    }
+    released
+}
+
 /// Drop idle entries past [`FREE_PER_BUCKET`], returning how many were
 /// released so the caller can decrement `live_bytes`.
 ///
 /// An entry with an outstanding caller handle (`refcount() > 1`) is **always**
 /// kept: the pool's clone is what tracks the buffer, and dropping it would
 /// untrack a live allocation and lose the reuse this pool exists for.
-fn prune_bucket(bucket: &mut Vec<Buf>) -> u64 {
+fn prune_bucket(bucket: &mut Bucket) -> u64 {
+    let keep = bucket.keep();
     let mut idle = 0usize;
     let mut released = 0u64;
-    bucket.retain(|b| {
+    bucket.bufs.retain(|b| {
         if b.refcount() > 1 {
             return true;
         }
         idle += 1;
-        if idle <= FREE_PER_BUCKET {
+        if idle <= keep {
             true
         } else {
             released += 1;
@@ -559,26 +650,44 @@ pub fn padded_copy_size(bytes: u64) -> u64 {
     bytes.div_ceil(align).max(1) * align
 }
 
+/// Geometric size classes, capped at 64 KiB between capacities.
+/// Copy and readback lengths remain independent of allocation capacity.
+fn allocation_size(bytes: u64) -> Result<u64> {
+    let bytes = bytes.max(wgpu::COPY_BUFFER_ALIGNMENT);
+    let quantum = 1u64 << bytes.ilog2().saturating_sub(4).clamp(2, 16);
+    bytes
+        .checked_next_multiple_of(quantum)
+        .ok_or_else(|| Error::Device("buffer allocation size overflows u64".into()))
+}
+
 /// The platform memory ceiling.
 ///
 /// On Apple silicon, exceeding unified memory panics macOS rather than
 /// returning an error, so two thirds of `hw.memsize` is a hard gate. Elsewhere
 /// the driver reports allocation failure and the pool does not need to guess.
 pub fn default_ceiling() -> u64 {
-    #[cfg(target_vendor = "apple")]
+    // A browser tab has no business holding a workstation's worth of GPU
+    // buffers, and nothing there reports how much it may have. Without a
+    // ceiling `reclaim` never runs, so a bucket's retained working set is
+    // whatever the largest thing that ever happened needed.
+    #[cfg(target_arch = "wasm32")]
+    {
+        512 << 20
+    }
+    #[cfg(all(not(target_arch = "wasm32"), target_vendor = "apple"))]
     {
         if let Some(total) = hw_memsize() {
             return total / 3 * 2;
         }
         u64::MAX
     }
-    #[cfg(not(target_vendor = "apple"))]
+    #[cfg(all(not(target_arch = "wasm32"), not(target_vendor = "apple")))]
     {
         u64::MAX
     }
 }
 
-#[cfg(target_vendor = "apple")]
+#[cfg(all(not(target_arch = "wasm32"), target_vendor = "apple"))]
 fn hw_memsize() -> Option<u64> {
     // SAFETY: `sysctlbyname` writes at most `len` bytes into `value`, which is
     // a live `u64`, and reads a NUL-terminated name. Both preconditions hold
@@ -607,22 +716,136 @@ fn hw_memsize() -> Option<u64> {
     }
 }
 
-// Explicit auto-trait impls; see the note on `Launcher`.
+// Explicit auto-trait impls; see the note on `GpuTarget`. Without them the
+// auto-trait walk recurses through wgpu_core's resource graph and overflows
+// (E0275) in downstream crates whose `Send` futures reach a pool or buffer.
 //
-// SAFETY: `pool_fields_are_send_sync` asserts `Send + Sync` for every field
-// type, which is exactly what the auto impls would require.
+// SAFETY: the `*_fields_are_send_sync` functions assert `Send + Sync` for
+// every field type, which is exactly what the auto impls would require.
 unsafe impl Send for BufferPool {}
 unsafe impl Sync for BufferPool {}
+unsafe impl Send for GpuBuffer {}
+unsafe impl Sync for GpuBuffer {}
 
 #[allow(dead_code)]
 fn pool_fields_are_send_sync() {
     fn assert<T: Send + Sync>() {}
     assert::<Arc<wgpu::Device>>();
     assert::<Arc<wgpu::Queue>>();
-    assert::<Mutex<FxHashMap<PoolKey, Vec<Buf>>>>();
+    assert::<Mutex<FxHashMap<PoolKey, Bucket>>>();
     assert::<Mutex<BufferPoolCounters>>();
     assert::<Mutex<u64>>();
     assert::<bool>();
     assert::<Mutex<Vec<StagingChunk>>>();
+    assert::<AtomicBool>();
     assert::<crate::device::LostFlag>();
+    assert::<wgpu::Buffer>();
+    assert::<u64>();
+    assert::<wgpu::BufferUsages>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn idle_budget_bounds_growing_kv_scratch_and_keeps_live_buffers() {
+        let mut buckets = FxHashMap::default();
+        let pinned = Buf::new(());
+        let pinned_key = PoolKey {
+            size: 2 << 30,
+            usage: TENSOR_USAGE.bits(),
+        };
+        buckets.insert(
+            pinned_key,
+            Bucket {
+                bufs: vec![pinned.clone()],
+                ..Bucket::default()
+            },
+        );
+        let budget = 256 << 20;
+        for len in 1..=8192 {
+            let key = PoolKey {
+                size: allocation_size(8 * len * 128 * 4).unwrap(),
+                usage: TENSOR_USAGE.bits(),
+            };
+            if buckets.get_mut(&key).and_then(|b| b.take(len)).is_some() {
+                continue;
+            }
+            let before: u64 = buckets
+                .iter()
+                .map(|(k, b)| k.size * b.bufs.len() as u64)
+                .sum();
+            let released = trim_idle(&mut buckets, budget);
+            let after: u64 = buckets
+                .iter()
+                .map(|(k, b)| k.size * b.bufs.len() as u64)
+                .sum();
+            assert_eq!(before - after, released);
+            assert!(after <= pinned_key.size + budget);
+            buckets.insert(
+                key,
+                Bucket {
+                    bufs: vec![Buf::new(())],
+                    last_used: len,
+                    ..Bucket::default()
+                },
+            );
+        }
+        trim_idle(&mut buckets, 0);
+        assert_eq!(buckets.len(), 1);
+        assert_eq!(buckets[&pinned_key].bufs[0].addr(), pinned.addr());
+    }
+
+    #[test]
+    fn reuse_keeps_a_size_class_ahead_of_older_idle_storage() {
+        let keys = [64, 128, 256].map(|size| PoolKey { size, usage: 0 });
+        let mut buckets: FxHashMap<_, _> = keys
+            .into_iter()
+            .enumerate()
+            .map(|(i, key)| {
+                (
+                    key,
+                    Bucket {
+                        bufs: vec![Buf::new(())],
+                        last_used: i as u64,
+                        ..Bucket::default()
+                    },
+                )
+            })
+            .collect();
+        drop(buckets.get_mut(&keys[0]).unwrap().take(3).unwrap());
+        assert_eq!(trim_idle(&mut buckets, 320), 128);
+        assert!(buckets.contains_key(&keys[0]));
+        assert!(!buckets.contains_key(&keys[1]));
+        assert!(buckets.contains_key(&keys[2]));
+    }
+
+    #[test]
+    fn growing_attention_scratch_reuses_size_classes() {
+        let capacities: rustc_hash::FxHashSet<_> = (1..=8192)
+            .map(|len| allocation_size(32 * len * 4).unwrap())
+            .collect();
+        assert!(capacities.len() <= 160);
+        assert!(capacities.iter().sum::<u64>() < 25 << 20);
+    }
+
+    #[test]
+    fn allocation_slack_is_bounded_without_padding_copy_lengths() {
+        let boundaries = (2..=62).flat_map(|shift| {
+            let size = 1u64 << shift;
+            [size - 1, size, size + 1]
+        });
+        for bytes in (0..=256).chain(boundaries).chain([4_700_000_000]) {
+            let capacity = allocation_size(bytes).unwrap();
+            let copied = padded_copy_size(bytes);
+            assert!(capacity >= copied);
+            assert_eq!(capacity % wgpu::COPY_BUFFER_ALIGNMENT, 0);
+            assert_eq!(allocation_size(capacity).unwrap(), capacity);
+            assert!(capacity - bytes < 65536);
+            assert!(capacity - bytes <= (bytes / 16).max(4));
+            assert!(copied - bytes <= 4);
+        }
+        assert!(allocation_size(u64::MAX).is_err());
+    }
 }

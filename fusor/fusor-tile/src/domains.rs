@@ -38,13 +38,9 @@ impl<'a> DomainCtx<'a> {
     }
 }
 
-/// Hard ceiling on split-K candidates. Bounds the candidate count; it is not
-/// a profitability judgement.
-pub const MAX_SPLITS: u32 = 64;
-
 /// A process-wide memo for a shape-independent candidate table.
 ///
-/// The heavy generators (`coop::candidate_geoms_for`, `sgemm::sgemm_domain`)
+/// The heavy generators (`coop::candidate_schedules_for`, `sgemm::sgemm_domain`)
 /// are pure functions of `(Caps, element, planner)` — no extent reaches them
 /// — so the enumeration runs once per device, not once per node.
 pub(crate) struct DomainMemo<K, V> {

@@ -13,7 +13,7 @@ use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
 
 use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fuzz_case};
+use crate::harness::{CaseResult, Cases, FuzzDim, Rng, dims, fuzz_case};
 use crate::suite::support::{
     Domain, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss, upload,
 };
@@ -148,7 +148,7 @@ async fn check_view(
     let dimv = dims(shape);
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dimv, &data)?;
-    let y = build(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = build(&x)?;
 
     let (out_shape, expected) = reference(&data);
     let actual = read(&y).await?;
@@ -165,7 +165,7 @@ async fn check_view(
     let analytic = gradient_of(&graph, &y, &x).await?;
     let probe_graph = graph_of(session);
     let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
-    let probe_y = build(&probe_x).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let probe_y = build(&probe_x)?;
     let probe_loss = loss_of(&probe_y)?;
     let numeric = finite_difference_gradient(&[len], &data, |probe| {
         read_probe_loss(&probe_x, &probe_loss, probe)
@@ -543,8 +543,7 @@ async fn cat_case(session: &Session, shape: &[u64], axis: usize, seed: u32) -> C
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dims(shape), &left)?;
     let b = upload(graph.handle(), &dims(&rshape), &right)?;
-    let y = Tensor::cat(&[a.clone(), b.clone()], axis)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = Tensor::cat(&[a.clone(), b.clone()], axis)?;
 
     let actual = read(&y).await?;
     if actual.len() != llen + rlen {
@@ -601,8 +600,7 @@ async fn stack_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dimv, &a_data)?;
     let b = upload(graph.handle(), &dimv, &b_data)?;
-    let y = Tensor::stack(&[a.clone(), b.clone()], 0)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = Tensor::stack(&[a.clone(), b.clone()], 0)?;
 
     let actual = read(&y).await?;
     let mut expected = a_data.clone();
@@ -644,9 +642,7 @@ async fn slice_assign_case(session: &Session, shape: &[u64], seed: u32) -> CaseR
         &dims(&[len0 as u64, len1 as u64]),
         &patch_data,
     )?;
-    let y = base
-        .slice_assign(&[start0..start0 + len0, start1..start1 + len1], &patch)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = base.slice_assign(&[start0..start0 + len0, start1..start1 + len1], &patch)?;
 
     let actual = read(&y).await?;
     let mut expected = base_data.clone();

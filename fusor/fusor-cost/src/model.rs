@@ -2,33 +2,28 @@
 //!
 //! Per launch:
 //! `launch_ps + max(dram_ps, occupancy * (math_ps + wg_ps)) + occupancy *
-//! drain_ps + combine_ps`.
+//! drain_ps_ps`.
 //!
 //! T1 and T2 are **summed** inside the `max` because they contend for the
 //! same per-core issue and load/store slots; DRAM overlaps them; the combine
 //! dispatch sits behind its own barrier and adds.
 //!
-//! One scalar. Precision is a verifier property (`NumericContract`), not a
+//! One scalar. Precision is a construction invariant (`NumericContract`), not a
 //! cost term, because a time-only model eliminates f32 everywhere.
 
 use crate::terms;
-use fusor_ir::cost::{CostModel, DeviceFacts, LaunchPlan, MacUnit, Picoseconds, ShapeStats};
+use fusor_ir::cost::{CostModel, DeviceFacts, LaunchPlan, MacUnit, Picoseconds};
 use fusor_ir::dtype::Dtype;
-use fusor_ir::extract::{Extraction, PlanHash};
 use fusor_ir::facts::ValueFacts;
 use fusor_ir::ir::Node;
 use fusor_ir::ir::launch::SchedPoint;
 use fusor_ir::shape::Dim;
-use parking_lot::RwLock;
-use rustc_hash::{FxHashSet, FxHasher};
-use std::hash::{Hash, Hasher};
 
 /// The one cost model. `score_fs` maps onto its terms one for one:
-/// T1 -> math, T2 -> wg, T3 -> drain, T4 -> the `max`, T5 -> the combine
-/// launch.
+/// T1 -> math, T2 -> wg, T3 -> drain, T4 -> the `max`. Split-K combine
+/// work is an ordinary reduction launch in the graph.
 pub struct Roofline {
     facts: DeviceFacts,
-    stats: RwLock<ShapeStats>,
 }
 
 /// The schedule-dependent inputs one launch's terms need, decoded from its
@@ -38,7 +33,6 @@ struct Sched {
     unit: MacUnit,
     /// 1 loses the load/MMA overlap the threadgroup rate was fitted on.
     staging: u8,
-    splits: u32,
     /// Emitting subgroups per workgroup — the epilogue drain is per element
     /// *and* per subgroup.
     subgroups: u32,
@@ -49,7 +43,6 @@ impl Default for Sched {
         Self {
             unit: MacUnit::Fma,
             staging: 2,
-            splits: 1,
             subgroups: 1,
         }
     }
@@ -58,14 +51,9 @@ impl Default for Sched {
 impl Sched {
     fn of(theta: Option<SchedPoint>) -> Self {
         match theta {
-            Some(SchedPoint::Coop {
-                geom,
-                splits,
-                staging,
-            }) => Self {
+            Some(SchedPoint::Coop { geom, staging }) => Self {
                 unit: MacUnit::Coop,
                 staging,
-                splits,
                 subgroups: (geom.rg * geom.cg).max(1),
             },
             Some(SchedPoint::Sgemm(p)) => Self {
@@ -83,54 +71,7 @@ impl Sched {
 
 impl Roofline {
     pub fn new(facts: DeviceFacts) -> Self {
-        Self {
-            facts,
-            stats: RwLock::new(ShapeStats::new()),
-        }
-    }
-
-    /// Record that this plan ran at this dim binding, and return how many
-    /// times that pair has now been seen.
-    ///
-    /// Also bumps a plan-level counter (the empty binding), which is what
-    /// [`CostModel::total`] amortizes compilation against — a plan is
-    /// compiled once per plan, not once per binding.
-    pub fn observe_binding(&self, plan: PlanHash, binding: &[Dim]) -> u32 {
-        let mut stats = self.stats.write();
-        stats.observe(plan, &[]);
-        stats.observe(plan, binding)
-    }
-
-    /// How many times this plan has been seen at any binding. `1` on first
-    /// sighting, so nothing compiles speculatively and the generic symbolic
-    /// variant wins outright.
-    pub fn expected_reuse(&self, plan: PlanHash) -> u32 {
-        self.stats.read().expected_reuse(plan, &[])
-    }
-
-    /// The compile identity of one launch: its root, its members, the
-    /// schedule points they resolved to, whether the root is materialized,
-    /// and the device fingerprint.
-    ///
-    /// This is a *stand-in*. The authoritative `PlanHash` is
-    /// `plan::plan_hash` over the whole realized term; a launch alone
-    /// cannot see that term.
-    pub fn launch_plan_hash(&self, launch: &LaunchPlan<'_>, materialized: bool) -> PlanHash {
-        let mut h = FxHasher::default();
-        self.facts.fingerprint().hash(&mut h);
-        launch.root.hash(&mut h);
-        materialized.hash(&mut h);
-        for id in launch.members {
-            id.hash(&mut h);
-            launch.theta.get(id).hash(&mut h);
-        }
-        launch.grid.hash(&mut h);
-        let lo = h.finish();
-        // A second lane so a 64-bit collision is not a plan collision.
-        let mut h2 = FxHasher::default();
-        (lo, 0x9e37_79b9_7f4a_7c15u64).hash(&mut h2);
-        launch.work.hash(&mut h2);
-        PlanHash((u128::from(h2.finish()) << 64) | u128::from(lo))
+        Self { facts }
     }
 
     /// [`CostModel::launch_cost`] at an explicit operand dtype.
@@ -164,16 +105,24 @@ impl Roofline {
             den,
         );
 
-        let dram = terms::dram_ps(f, launch.reads, launch.writes);
-        // One split's padded output; `(splits + 1)` then counts reading
-        // every partial and writing the result.
-        let combine = terms::combine_ps(
-            f,
-            sched.splits,
-            launch.writes / u64::from(sched.splits.max(1)),
+        // Bandwidth is not free of parallelism: a launch resident on a
+        // fraction of the device cannot keep DRAM busy, and the shortfall
+        // that throttles issue throttles the memory pipe too. Without it a
+        // reduction is priced on bytes alone, so every lane group reads the
+        // same total and occupancy never enters the comparison.
+        let dram = terms::scaled(
+            terms::dram_ps(f, launch.reads, launch.writes, launch.line_bytes),
+            num,
+            den,
         );
-
-        Picoseconds(f.launch_ps) + dram.max(issue) + drain + combine
+        // What one workgroup cannot finish faster than: its dependent chain.
+        let serial = Picoseconds(
+            launch
+                .coop_steps
+                .saturating_mul(f.coop_step_ps)
+                .saturating_add(launch.lane_steps.saturating_mul(f.lane_step_ps)),
+        );
+        Picoseconds(f.launch_ps) + dram.max(issue).max(serial) + drain
     }
 }
 
@@ -189,6 +138,59 @@ fn unit_and_dtype(
     match theta {
         Some(SchedPoint::Coop { .. }) => (MacUnit::Coop, dtype),
         _ => (MacUnit::Fma, dtype),
+    }
+}
+
+impl Roofline {
+    /// Line traffic beyond the useful bytes a fold moves at `theta`'s lane
+    /// group, over the operands it walks at its own iteration space.
+    fn fold_line_floor(
+        &self,
+        node: &Node,
+        ins: &[ValueFacts],
+        theta: Option<SchedPoint>,
+    ) -> Picoseconds {
+        let fusor_ir::ir::Op::Launch(op @ fusor_ir::ir::launch::Launch::Fold { space, axis, .. }) =
+            &node.op
+        else {
+            return Picoseconds(0);
+        };
+        let Some(total) = space.iterations() else {
+            return Picoseconds(0);
+        };
+        let dims: Vec<u64> = space.dims.iter().filter_map(|d| d.as_const()).collect();
+        let caps = &self.facts.caps;
+        let theta = op
+            .fold_schedule(theta, caps)
+            .map(|s| SchedPoint::Fold(s.strategy))
+            .or(theta);
+        let lane_group = match theta {
+            Some(SchedPoint::Fold(s)) => s.lane_group(caps.subgroup_width()),
+            // The emitters' default at a bare point: the subgroup collective
+            // where there is one, the full block otherwise.
+            _ if caps.subgroups.is_some() => caps.subgroup_width(),
+            _ => fusor_ir::ir::launch::emitted_block(1, caps),
+        };
+        let mut extra = 0u64;
+        for f in ins {
+            let elems = f
+                .shape
+                .iter()
+                .try_fold(1u64, |a, d| d.as_const().map(|d| a * d));
+            if elems != Some(total) {
+                continue;
+            }
+            let elem = f.dtype.byte_size().max(1);
+            let amp = crate::realize::fold_line_amplification(
+                &dims,
+                *axis as usize,
+                lane_group,
+                caps,
+                elem,
+            );
+            extra = extra.saturating_add(total.saturating_mul(elem).saturating_mul(amp - 1));
+        }
+        terms::dram_ps(&self.facts, &[], 0, extra)
     }
 }
 
@@ -246,28 +248,28 @@ impl CostModel for Roofline {
         }
         // Zero traffic, no occupancy scaling. The admissible lower bound is
         // built from this, and either addition would break admissibility.
-        terms::math_ps(&self.facts, work, unit, dtype)
+        // The one memory term that is a floor of the node itself: a fold's
+        // line amplification at this point, which every plan through the
+        // point pays whatever it inlines around it.
+        let t =
+            terms::math_ps(&self.facts, work, unit, dtype) + self.fold_line_floor(node, ins, theta);
+        // A workgroup's dependent chain is a floor of the node at this point
+        // too: nothing around it shortens the k loop.
+        if std::env::var_os("FUSOR_NO_SEED_FLOOR").is_some() {
+            return t;
+        }
+        let (coop, lane) = crate::realize::node_serial_steps(&node.op, theta, &self.facts.caps);
+        let serial = coop
+            .saturating_mul(self.facts.coop_step_ps)
+            .saturating_add(lane.saturating_mul(self.facts.lane_step_ps));
+        t.max(Picoseconds(serial))
     }
 
     fn traffic(&self, bytes: u64, rereads: u32) -> Picoseconds {
-        terms::dram_ps(&self.facts, &[(bytes, rereads)], 0)
+        terms::dram_ps(&self.facts, &[(bytes, rereads)], 0, 0)
     }
 
-    fn compile_amortized(&self, plan: PlanHash, expected_reuse: u32) -> Picoseconds {
-        let _ = plan;
-        Picoseconds(self.facts.compile_ps_per_kernel / u64::from(expected_reuse.max(1)))
-    }
-
-    fn total(&self, extraction: &Extraction, launches: &[LaunchPlan<'_>]) -> Picoseconds {
-        let mut total = Picoseconds(0);
-        let mut compiled = FxHashSet::default();
-        for launch in launches {
-            total += self.launch_cost(launch);
-            let hash = self.launch_plan_hash(launch, extraction.is_materialized(launch.root));
-            if compiled.insert(hash) {
-                total += self.compile_amortized(hash, self.expected_reuse(hash));
-            }
-        }
-        total
+    fn total(&self, launches: &[LaunchPlan<'_>]) -> Picoseconds {
+        launches.iter().map(|launch| self.launch_cost(launch)).sum()
     }
 }

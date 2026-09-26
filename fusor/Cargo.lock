@@ -2411,6 +2411,7 @@ dependencies = [
  "parking_lot",
  "pollster",
  "rustc-hash 2.1.3",
+ "sha2",
  "smallvec",
  "web-time",
 ]
@@ -2448,7 +2449,9 @@ name = "fusor-cost"
 version = "0.1.0"
 dependencies = [
  "fixedbitset",
+ "fusor-gguf",
  "fusor-ir",
+ "fusor-tile",
  "parking_lot",
  "rustc-hash 2.1.3",
  "serde",
@@ -3646,7 +3649,7 @@ dependencies = [
 [[package]]
 name = "naga"
 version = "29.0.3"
-source = "git+https://github.com/ealmloff/wgpu?rev=c4f55cabaadc22b942c1dd8894bf85f17f2718dc#c4f55cabaadc22b942c1dd8894bf85f17f2718dc"
+source = "git+https://github.com/ealmloff/wgpu?rev=24a7d3577213fc147637fe7fb20e0e845a74df8a#24a7d3577213fc147637fe7fb20e0e845a74df8a"
 dependencies = [
  "arrayvec",
  "bit-set",
@@ -5973,8 +5976,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 [[package]]
 name = "wgpu"
 version = "29.0.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "76e8840e1ba2881d4cbb18d2147627a56af426ff064c0401eb0c8410c6325d07"
+source = "git+https://github.com/ealmloff/wgpu?rev=24a7d3577213fc147637fe7fb20e0e845a74df8a#24a7d3577213fc147637fe7fb20e0e845a74df8a"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.1",

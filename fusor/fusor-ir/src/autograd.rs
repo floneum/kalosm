@@ -70,23 +70,6 @@ pub struct Adjoint {
     pub kind: AdjointKind,
 }
 
-/// The whole reverse-mode transform. Object-safe.
-pub trait Autograd: Send + Sync {
-    /// The adjoint table. Seven entries.
-    fn adjoints(&self) -> &'static [Adjoint];
-
-    /// Build the backward graph for `root` with respect to `wrt`, seeded
-    /// with `seed`. The result is ingested **together with** the forward as
-    /// one graph with one root set.
-    fn backward(
-        &self,
-        tape: &mut dyn Tape,
-        root: Val,
-        seed: Val,
-        wrt: &[Val],
-    ) -> Result<Vec<Option<Val>>>;
-}
-
 /// Where a user-supplied backward sends a gradient. A bare node id, never a
 /// tensor handle: a closure capturing a graph handle would close an `Arc`
 /// cycle pinning every cached activation for the process lifetime.

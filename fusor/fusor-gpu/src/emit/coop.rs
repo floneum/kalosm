@@ -113,8 +113,7 @@ fn cooperative_size(size: u32) -> Result<naga::CooperativeSize, EmitError> {
 
 impl Emitter<'_> {
     /// `CoopLoad`. From a tile region the fragment origin is swapped and
-    /// `row_major: transposed`; from a rank-1 broadcast column the stride is
-    /// zero and `row_major: false`.
+    /// `row_major: transposed`.
     pub(crate) fn coop_load_parts(
         &mut self,
         out: &mut Block,
@@ -127,70 +126,41 @@ impl Emitter<'_> {
         let role = naga_role(role);
         let columns = cooperative_size(cols)?;
         let rows_size = cooperative_size(rows)?;
-        match src {
-            CoopSrc::TileRegion {
-                tile,
-                row,
-                col,
-                transposed,
-            } => {
-                // A `CoopLoad{scalar: F32}` off an f16 tile reads the right
-                // addresses at twice the width and comes back with plausible
-                // garbage, so the scalars are checked here where both are in
-                // hand.
-                fragment_scalar_matches(scalar, tile.element, "a workgroup tile")?;
-                let stride_u = row_major_tile_stride(tile)?;
-                let row_h = self.expr(row, out)?;
-                let col_h = self.expr(col, out)?;
-                let (first, second) = if *transposed {
-                    (col_h, row_h)
-                } else {
-                    (row_h, col_h)
-                };
-                let index = self.tile_matrix_index(out, first, second, stride_u);
-                let pointer = self.tile_dynamic_pointer(out, tile, index)?;
-                let stride = self.u32_lit(stride_u);
-                Ok(self.emit_expr(
-                    out,
-                    Expression::CooperativeLoad {
-                        columns,
-                        rows: rows_size,
-                        role,
-                        data: CooperativeData {
-                            pointer,
-                            stride,
-                            row_major: *transposed,
-                        },
-                    },
-                ))
-            }
-            CoopSrc::BroadcastCol { src, col } => {
-                if src.layout.extents.len() != 1 {
-                    return Err(EmitError::Unsupported(
-                        "a cooperative broadcast load needs rank-1 storage".into(),
-                    ));
-                }
-                fragment_scalar_matches(scalar, src.buffer.element, "a broadcast source")?;
-                let col_h = self.expr(col, out)?;
-                let pointer = self.storage_dynamic_pointer(out, src, col_h)?;
-                let stride = self.u32_lit(0);
-                Ok(self.emit_expr(
-                    out,
-                    Expression::CooperativeLoad {
-                        columns,
-                        rows: rows_size,
-                        role,
-                        data: CooperativeData {
-                            pointer,
-                            stride,
-                            // A broadcast C participates in the same
-                            // transposed accumulator representation.
-                            row_major: false,
-                        },
-                    },
-                ))
-            }
-        }
+        let CoopSrc {
+            tile,
+            row,
+            col,
+            transposed,
+        } = src;
+        // A `CoopLoad{scalar: F32}` off an f16 tile reads the right
+        // addresses at twice the width and comes back with plausible
+        // garbage, so the scalars are checked here where both are in
+        // hand.
+        fragment_scalar_matches(scalar, tile.element, "a workgroup tile")?;
+        let stride_u = row_major_tile_stride(tile)?;
+        let row_h = self.expr(row, out)?;
+        let col_h = self.expr(col, out)?;
+        let (first, second) = if *transposed {
+            (col_h, row_h)
+        } else {
+            (row_h, col_h)
+        };
+        let index = self.tile_matrix_index(out, first, second, stride_u);
+        let pointer = self.tile_dynamic_pointer(out, tile, index)?;
+        let stride = self.u32_lit(stride_u);
+        Ok(self.emit_expr(
+            out,
+            Expression::CooperativeLoad {
+                columns,
+                rows: rows_size,
+                role,
+                data: CooperativeData {
+                    pointer,
+                    stride,
+                    row_major: *transposed,
+                },
+            },
+        ))
     }
 
     /// `CoopMma` -> `a * b + c`. When `c` is a `LoadLocal` of an accumulator
@@ -265,7 +235,10 @@ impl Emitter<'_> {
                 )));
             }
         };
-        if acc_scalar != dst_scalar && !self.caps.mixed_precision_coop_store {
+        if (acc_scalar != dst_scalar && !self.caps.mixed_precision_coop_store)
+            || self.buffer_element(&dst.buffer) != dst.buffer.element
+            || self.analysis.atomic_buffers.contains(&dst.buffer.binding)
+        {
             // Footprint, never a wrong answer: stage the fragment into an f32
             // workgroup tile, then cast and store per lane.
             return self.staged_coop_store(acc, dst, addr, out, acc_scalar, rows, cols);
@@ -360,12 +333,17 @@ impl Emitter<'_> {
             }
         };
         let element = ElementType::Scalar(acc_scalar);
-        let staging = self.staging_tile(element, rows * cols)?;
+        let (staging, offset) = self.subgroup_staging(out, element, rows * cols)?;
 
         let target = self.expr(acc, out)?;
         let base = self.global_var(staging);
-        let zero = self.u32_lit(0);
-        let pointer = self.emit_expr(out, Expression::Access { base, index: zero });
+        let pointer = self.emit_expr(
+            out,
+            Expression::Access {
+                base,
+                index: offset,
+            },
+        );
         let stride = self.u32_lit(cols);
         out.push(
             Statement::ControlBarrier(Barrier::WORK_GROUP),
@@ -392,30 +370,38 @@ impl Emitter<'_> {
         let dst = dst.clone();
         let dst_element = dst.buffer.element;
         let total = rows * cols;
-        self.staged_copy(out, total, cols, staging, move |em, block, i, j| {
+        self.staged_copy(out, total, cols, move |em, block, i, j| {
             let base = em.global_var(staging);
             let index = em.tile_matrix_index(block, i, j, cols);
+            let index = em.add_u32(block, offset, index);
             let ptr = em.emit_expr(block, Expression::Access { base, index });
             let value = em.emit_load(block, ptr);
             let value = em.cast_tile_value(block, value, element, dst_element)?;
             let global_row = em.add_u32(block, row_h, i);
             let global_col = em.add_u32(block, col_h, j);
             let flat = em.storage_index_from_coords(block, &dst, &[global_row, global_col])?;
-            let dst_ptr = em.storage_dynamic_pointer(block, &dst, flat)?;
-            block.push(
-                Statement::Store {
-                    pointer: dst_ptr,
-                    value,
-                },
-                Span::default(),
-            );
-            Ok(())
+            em.store_storage_value(block, &dst, flat, value)
         })?;
         out.push(
             Statement::ControlBarrier(Barrier::WORK_GROUP),
             Span::default(),
         );
         Ok(())
+    }
+
+    /// Each subgroup owns a fragment and needs a disjoint staging region.
+    fn subgroup_staging(
+        &mut self,
+        out: &mut Block,
+        element: ElementType,
+        elements: u32,
+    ) -> Result<(Handle<GlobalVariable>, Handle<Expression>), EmitError> {
+        let width = self.caps.subgroup_width();
+        let groups = self.workgroup_invocations.div_ceil(width);
+        let staging = self.staging_tile(element, elements * groups)?;
+        let subgroup = self.function_arg(self.subgroup_args[0].expect("cooperative subgroup id"));
+        let offset = self.mul_literal_u32(out, subgroup, elements);
+        Ok((staging, offset))
     }
 
     /// A workgroup allocation outside the arena plan, for the staging path.
@@ -458,7 +444,6 @@ impl Emitter<'_> {
         out: &mut Block,
         total: u32,
         cols: u32,
-        _staging: Handle<GlobalVariable>,
         mut build: impl FnMut(
             &mut Self,
             &mut Block,
@@ -466,11 +451,11 @@ impl Emitter<'_> {
             Handle<Expression>,
         ) -> Result<(), EmitError>,
     ) -> Result<(), EmitError> {
-        let lanes = self.workgroup_invocations.max(1);
+        let lanes = self.caps.subgroup_width();
         let passes = total.div_ceil(lanes);
         for pass in 0..passes {
             let full = (pass + 1) * lanes <= total;
-            let lane = self.lane();
+            let lane = self.function_arg(self.subgroup_args[1].expect("cooperative subgroup lane"));
             let flat = self.add_literal_u32(out, lane, pass * lanes);
             let condition = if full {
                 None

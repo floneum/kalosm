@@ -158,8 +158,7 @@ impl LowerCtx<'_> {
 
 /// A compute backend. Object-safe: the session holds `Arc<dyn Target>`.
 pub trait Target: Send + Sync {
-    /// Stable name; keys `OpDef::lower_per_target` and the calibration
-    /// cache.
+    /// Stable name used by the calibration cache.
     fn name(&self) -> &'static str;
 
     /// What this device can do. Legality only.

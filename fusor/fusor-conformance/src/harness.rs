@@ -446,12 +446,9 @@ pub fn fuzz_case(
         // for it rather than all of them. Which run is fixed per case and
         // spread across the suite, so shape-dependent members still get
         // swept somewhere.
-        let sweep = sweeping_members();
         let sweep_run = case_seed(name, 0) % runs();
         for run in 0..runs() {
-            if sweep {
-                fusor::session::set_verify_members(run == sweep_run);
-            }
+            let _sweep = member_sweep(run == sweep_run);
             let seed = case_seed(name, run);
             let shape = sample_shape(&mut Rng::new(seed), spec);
             body(session, &shape, seed)
@@ -466,25 +463,40 @@ pub fn fuzz_case(
                             format!("run {run} at shape {shape:?} (seed {seed}): {message}").into()
                         }
                     }
-                })
-                .inspect_err(|_| {
-                    if sweep {
-                        fusor::session::set_verify_members(true);
-                    }
                 })?;
-        }
-        if sweep {
-            fusor::session::set_verify_members(true);
         }
         Ok(())
     })
 }
 
-/// Whether this process was asked to sweep class members at all, read once:
-/// the flag itself is toggled per run, so it cannot be the source of truth.
+/// Restrict a repeated case's member sweep and restore its enclosing setting.
+pub(crate) fn member_sweep(on: bool) -> MemberSweep {
+    let previous = sweeping_members();
+    set_member_sweep(previous && on);
+    MemberSweep(previous)
+}
+
+pub(crate) struct MemberSweep(bool);
+
+impl Drop for MemberSweep {
+    fn drop(&mut self) {
+        set_member_sweep(self.0);
+    }
+}
+
+#[cfg(feature = "compiler-tests")]
 fn sweeping_members() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(fusor::session::verify_members)
+    fusor::session::verify_members()
+}
+
+#[cfg(not(feature = "compiler-tests"))]
+fn sweeping_members() -> bool {
+    false
+}
+
+fn set_member_sweep(_on: bool) {
+    #[cfg(feature = "compiler-tests")]
+    fusor::session::set_verify_members(_on);
 }
 
 /// Element count of a fully constant shape. Panics on a symbolic extent: a

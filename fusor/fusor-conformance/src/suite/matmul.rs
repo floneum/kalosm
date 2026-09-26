@@ -4,7 +4,7 @@
 
 use fusor::{Dtype, Session};
 
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fuzz_case};
+use crate::harness::{Case, CaseResult, Cases, FuzzDim, dims, fuzz_case};
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
 
 // Gradients here are analytic (all-ones seed row/column sums), not finite
@@ -93,6 +93,48 @@ pub fn cases() -> Cases {
         QMATMUL_RANK1_SPEC,
         async move |s: &Session, sh: &[u64], seed: u32| quantized_matmul(s, 1, sh, seed).await,
     ));
+    for (name, dtype, batch) in [
+        ("q_mat_mul_rank1_gradient", Dtype::F32, 1),
+        ("q_mat_mul_rank1_gradient_f16", Dtype::F16, 1),
+        ("q_mat_mul_gradient_f16", Dtype::F16, 16),
+    ] {
+        cases.push_case(Case::new("matmul", name, async move |session: &Session| {
+            use fusor_ir::dtype::{QFmt, QLayout};
+            if dtype == Dtype::F16 && !session.caps().f16 {
+                return Err(crate::harness::skip("device has no f16 support"));
+            }
+            let graph = graph_of(session);
+            let mut block = [1u8; 34];
+            block[..2].copy_from_slice(&half::f16::ONE.to_le_bytes());
+            for (i, q) in block[2..].iter_mut().enumerate() {
+                *q = (i as i8 - 16) as u8;
+            }
+            let weight = fusor::QMatrix::from_raw_bytes(
+                &graph,
+                QFmt::Q8_0,
+                QLayout::Native,
+                [fusor::Dim::Const(8), fusor::Dim::Const(32)],
+                &block.repeat(8),
+            )?;
+            let shape = if batch == 1 {
+                vec![32]
+            } else {
+                vec![batch, 32]
+            };
+            let input = upload(
+                graph.handle(),
+                &dims(&shape),
+                &vec![0.; batch as usize * 32],
+            )?
+            .cast(dtype)?;
+            let output = weight.q_mat_mul(&input)?;
+            let gradient = gradient_of(&graph, &output, &input).await?;
+            let expected: Vec<f32> = (0..batch * 32)
+                .map(|i| 8. * ((i % 32) as f32 - 16.))
+                .collect();
+            expect_values(session, &shape, dtype, &gradient, &expected).await
+        }));
+    }
     // Split-K at the extents the trainer and this suite actually use. The
     // shipped `extent.at_least(4096)` gate refuses every one of them, so
     // whether the reduction runs split or unsplit is a schedule decision
@@ -105,6 +147,12 @@ pub fn cases() -> Cases {
             async move |s: &Session, sh: &[u64], seed: u32| split_k(s, k, sh, seed).await,
         ));
     }
+    cases.push_case(Case::new("matmul", "split_k_multi_axis", async |s| {
+        multi_axis(s, false).await
+    }));
+    cases.push_case(Case::new("matmul", "grouped_reshape_chain", async |s| {
+        multi_axis(s, true).await
+    }));
     cases.push_case(fuzz_case("matmul", "wide_n_columns", WIDE_N_SPEC, wide_n));
     cases.push_case(fuzz_case(
         "matmul",
@@ -130,9 +178,7 @@ async fn wide_n(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let graph = graph_of(session);
     let lhs = upload(graph.handle(), &dims(&[m, k]), &a)?;
     let rhs = upload(graph.handle(), &dims(&[k, n]), &b)?;
-    let y = lhs
-        .matmul(&rhs)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = lhs.matmul(&rhs)?;
     let actual = read(&y).await?;
     let mut expected = vec![0.0f32; (m * n) as usize];
     for i in 0..m as usize {
@@ -167,11 +213,7 @@ async fn qkv_triple(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     for i in 0..3usize {
         let wi = upload(graph.handle(), &dims(&[cin, cout]), &w[i])?;
         let bi = upload(graph.handle(), &dims(&[1, cout]), &bias[i])?;
-        outs.push(
-            a.matmul(&wi)
-                .and_then(|y| y.add_(&bi))
-                .map_err(|e| -> CaseError { e.to_string().into() })?,
-        );
+        outs.push(a.matmul(&wi).and_then(|y| y.add_(&bi))?);
     }
 
     for (i, out) in outs.iter().enumerate() {
@@ -219,9 +261,7 @@ async fn split_k(session: &Session, k: u64, shape: &[u64], seed: u32) -> CaseRes
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dims(&[m, k]), &a_data)?;
     let b = upload(graph.handle(), &dims(&[k, n]), &b_data)?;
-    let y = a
-        .matmul(&b)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = a.matmul(&b)?;
     let actual = read(&y).await?;
 
     let mut expected = vec![0.0f32; (m * n) as usize];
@@ -271,6 +311,44 @@ fn host_matmul(a: &[f32], b: &[f32], batch: usize, m: usize, k: usize, n: usize)
     out
 }
 
+async fn multi_axis(session: &Session, chain: bool) -> CaseResult {
+    use fusor_ir::ir::logical::{EinSpec, Label};
+    let graph = graph_of(session);
+    let a_data: Vec<_> = (0..2 * 12 * 256)
+        .map(|i| ((i % 17) as f32 - 8.) * 0.125)
+        .collect();
+    let b_data: Vec<_> = (0..2 * 256 * 30)
+        .map(|i| ((i % 13) as f32 - 6.) * 0.125)
+        .collect();
+    let a = upload(graph.handle(), &dims(&[2, 1, 3, 4, 256]), &a_data)?;
+    let b = upload(graph.handle(), &dims(&[2, 1, 256, 5, 6]), &b_data)?;
+    let out = a.contract(
+        &b,
+        EinSpec {
+            a: [0, 1, 2, 3, 6].map(Label).into_iter().collect(),
+            b: [0, 1, 6, 4, 5].map(Label).into_iter().collect(),
+            out: [0, 1, 2, 3, 4, 5].map(Label).into_iter().collect(),
+        },
+        Dtype::F32,
+    )?;
+    let expected = host_matmul(&a_data, &b_data, 2, 12, 256, 30);
+    if chain {
+        let c_data: Vec<_> = (0..30 * 7).map(|i| ((i % 7) as f32 - 3.) * 0.125).collect();
+        let c = upload(graph.handle(), &dims(&[30, 7]), &c_data)?;
+        let out = out.reshape_dims(&dims(&[24, 30]))?.matmul(&c)?;
+        let expected = host_matmul(&expected, &c_data, 1, 24, 30, 7);
+        return expect_values(session, &[24, 7], Dtype::F32, &read(&out).await?, &expected).await;
+    }
+    expect_values(
+        session,
+        &[2, 1, 3, 4, 5, 6],
+        Dtype::F32,
+        &read(&out).await?,
+        &expected,
+    )
+    .await
+}
+
 /// One contraction at an arbitrary batch prefix (`shape` is
 /// `[prefix..., m, k, n]`). Batch dims must already match: there is no
 /// implicit broadcast, the frontend emits the restride.
@@ -288,9 +366,7 @@ async fn batched(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dims(&a_shape), &a_data)?;
     let b = upload(graph.handle(), &dims(&b_shape), &b_data)?;
-    let y = a
-        .matmul(&b)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = a.matmul(&b)?;
 
     let actual = read(&y).await?;
     let expected = host_matmul(
@@ -340,9 +416,7 @@ async fn transposed_rhs(session: &Session, shape: &[u64], seed: u32) -> CaseResu
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dims(&[m as u64, k as u64]), &a_data)?;
     let b = upload(graph.handle(), &dims(&[n as u64, k as u64]), &b_data)?;
-    let y = a
-        .matmul_t(&b)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = a.matmul_t(&b)?;
 
     let mut expected = vec![0.0f32; m * n];
     for i in 0..m {
@@ -395,10 +469,7 @@ async fn broadcast_bias(session: &Session, shape: &[u64], seed: u32) -> CaseResu
     let a = upload(graph.handle(), &dims(&[m as u64, k as u64]), &a_data)?;
     let b = upload(graph.handle(), &dims(&[k as u64, n as u64]), &b_data)?;
     let c = upload(graph.handle(), &dims(&[n as u64]), &bias)?;
-    let y = a
-        .matmul(&b)
-        .and_then(|p| p.add_(&c))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = a.matmul(&b).and_then(|p| p.add_(&c))?;
 
     let product = host_matmul(&a_data, &b_data, 1, m, k, n);
     let expected: Vec<f32> = product
@@ -484,8 +555,7 @@ async fn quantized_matmul(
         layout,
         [fusor::Dim::Const(rows), fusor::Dim::Const(k as u64)],
         &bytes,
-    )
-    .map_err(|e| -> CaseError { e.to_string().into() })?;
+    )?;
 
     let act_shape: Vec<u64> = if act_rank == 1 {
         vec![k as u64]
@@ -493,9 +563,7 @@ async fn quantized_matmul(
         vec![batch as u64, k as u64]
     };
     let a = upload(graph.handle(), &dims(&act_shape), &act)?;
-    let y = qm
-        .q_mat_mul(&a)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = qm.q_mat_mul(&a)?;
 
     let mut expected = vec![0.0f32; batch * rows as usize];
     for b in 0..batch {

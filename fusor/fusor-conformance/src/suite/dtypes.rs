@@ -93,8 +93,7 @@ fn upload_as(
             Dtype::Q(_) => return Err("cannot upload a dense buffer as a quantized dtype".into()),
         }
     }
-    Tensor::from_slice(graph, dtype, &dimv, &bytes)
-        .map_err(|e| -> CaseError { e.to_string().into() })
+    Tensor::from_slice(graph, dtype, &dimv, &bytes).map_err(Into::into)
 }
 
 /// Values every dtype in [`DENSE`] can hold exactly: small non-negative
@@ -269,13 +268,8 @@ async fn cast_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResul
     let data = Domain::Custom(0.5, 2.0).sample(seed, len);
     let graph = graph_of(session);
     let master = upload(graph.handle(), &dims(shape), &data)?;
-    let half = master
-        .cast(Dtype::F16)
-        .and_then(|h| h.mul(&h))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let back = half
-        .cast(Dtype::F32)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let half = master.cast(Dtype::F16).and_then(|h| h.mul(&h))?;
+    let back = half.cast(Dtype::F32)?;
 
     let grad = gradient_of(&graph, &back, &master).await?;
     if grad.len() != len {
@@ -301,14 +295,8 @@ async fn f16_round_trip(session: &Session, shape: &[u64], seed: u32) -> CaseResu
     let data = Domain::Wide.sample(seed, len);
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let once = x
-        .cast(Dtype::F16)
-        .and_then(|h| h.cast(Dtype::F32))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let twice = once
-        .cast(Dtype::F16)
-        .and_then(|h| h.cast(Dtype::F32))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let once = x.cast(Dtype::F16).and_then(|h| h.cast(Dtype::F32))?;
+    let twice = once.cast(Dtype::F16).and_then(|h| h.cast(Dtype::F32))?;
     // Exact: the second trip is a no-op on an already-representable value.
     let (a, b) = (read(&once).await?, read(&twice).await?);
     crate::compare::exact_eq(backend_of(session), &[len], &a, &b)?;
@@ -354,11 +342,8 @@ async fn comparison_dtype(session: &Session, shape: &[u64], seed: u32) -> CaseRe
     // Values in [0, 8) straddle the >= 3 threshold, so both mask values occur.
     let values = fill_indices(seed, len_of(shape), 8);
     let graph = graph_of(session);
-    let x = from_u32(graph.handle(), &dims(shape), &values)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let mask = x
-        .gte_scalar(3u32)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let x = from_u32(graph.handle(), &dims(shape), &values)?;
+    let mask = x.gte_scalar(3u32)?;
     if mask.dtype() != Dtype::U32 {
         return Err(format!(
             "a u32 comparison produced {:?}; comparisons return 1/0 in the operand's own \
@@ -371,9 +356,7 @@ async fn comparison_dtype(session: &Session, shape: &[u64], seed: u32) -> CaseRe
     expect_values(session, shape, Dtype::U32, &read(&mask).await?, &expected).await?;
 
     // The mask is usable as an operand at its own dtype, without a cast.
-    let gated = x
-        .mul(&mask)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let gated = x.mul(&mask)?;
     let want: Vec<f32> = values
         .iter()
         .map(|v| if *v >= 3 { *v as f32 } else { 0.0 })
@@ -391,13 +374,9 @@ async fn rem_u32_only(session: &Session, shape: &[u64], seed: u32) -> CaseResult
     let divisor = crate::harness::Rng::new(seed ^ 0x5eed).range(1, 9) as u32;
     let values = fill_indices(seed, len, 64);
     let graph = graph_of(session);
-    let a = from_u32(graph.handle(), &dims(shape), &values)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let b = from_u32(graph.handle(), &dims(shape), &vec![divisor; len])
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let y = a
-        .rem(&b)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let a = from_u32(graph.handle(), &dims(shape), &values)?;
+    let b = from_u32(graph.handle(), &dims(shape), &vec![divisor; len])?;
+    let y = a.rem(&b)?;
     let expected: Vec<f32> = values.iter().map(|v| (v % divisor) as f32).collect();
     expect_values(session, shape, Dtype::U32, &read(&y).await?, &expected).await?;
 
@@ -471,10 +450,7 @@ async fn float_int_round_trip(session: &Session, shape: &[u64], seed: u32) -> Ca
     let data = fill_range(seed, len, -8.0, 8.0);
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let y = x
-        .cast(Dtype::I32)
-        .and_then(|i| i.cast(Dtype::F32))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.cast(Dtype::I32).and_then(|i| i.cast(Dtype::F32))?;
     let expected: Vec<f32> = data.iter().map(|v| v.trunc()).collect();
     crate::compare::exact_eq(backend_of(session), &[len], &expected, &read(&y).await?)?;
     Ok(())
@@ -492,9 +468,7 @@ async fn widening_accumulator(session: &Session, shape: &[u64], _seed: u32) -> C
     let data = vec![1.0f32; n as usize];
     let graph = graph_of(session);
     let x = upload_as(graph.handle(), Dtype::F16, &[n], &data)?;
-    let y = x
-        .sum(0)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.sum(0)?;
     let got = read(&y).await?;
     let total = got.first().copied().unwrap_or(f32::NAN);
     if (total - n as f32).abs() > 1.0 {

@@ -71,8 +71,8 @@ pub fn private_acc_bytes(caps: &Caps) -> u64 {
     256
 }
 
-/// One promotion's worth of node state. `space`, `ops` and `sched` never
-/// change, which is the whole point of the rebinding spelling.
+/// One promotion's worth of node state. `space` and `ops` stay fixed;
+/// the caller derives a schedule domain for the new carrier.
 #[derive(Clone)]
 struct Promoted {
     vec_axes: SmallVec<[u32; 2]>,
@@ -120,6 +120,7 @@ pub fn promote(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Optio
     // before; a carrier that already had a slot axis absorbs the promoted
     // axis and a pure alias puts it back. Decide before minting.
     let view = recovery_view(carrier, &got, &want)?;
+    let sched = sched.with_fold_carrier(next.carrier.lanes()?, acc.byte_size(), f.caps())?;
     let fold = b
         .add_launch(Launch::Fold {
             space: space.clone(),
@@ -129,7 +130,7 @@ pub fn promote(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Optio
             acc: *acc,
             post: next.post,
             ops: ops.clone(),
-            sched: sched.clone(),
+            sched,
         })
         .ok()?;
     let value = apply_view(b, fold, &view)?;
@@ -507,64 +508,28 @@ fn demote(c: &Carrier, e: u64) -> Option<Carrier> {
 /// down, `by < 0`) or `j >= from` (shifting up). Every other node rides
 /// through untouched.
 fn shift_index_of(e: &ScalarExpr, from: u32, by: i32) -> ScalarExpr {
-    use ScalarKind as K;
-    let rec = |x: &ScalarExpr| shift_index_of(x, from, by);
-    match e.kind() {
-        K::IndexOf(a) => {
-            let moves = if by < 0 { *a > from } else { *a >= from };
-            if moves {
-                ScalarExpr::index_of(a.wrapping_add_signed(by))
-            } else {
-                e.clone()
-            }
+    e.rewrite(&mut |e| match e.kind() {
+        ScalarKind::IndexOf(a) if *a > from || *a == from && by >= 0 => {
+            Some(ScalarExpr::index_of(a.wrapping_add_signed(by)))
         }
-        K::Un { op, x } => ScalarExpr::un(*op, rec(x)),
-        K::Bin { op, a, b } => ScalarExpr::bin(*op, rec(a), rec(b)),
-        K::Cmp { op, a, b } => ScalarExpr::cmp(*op, rec(a), rec(b)),
-        K::Select { c, t, f } => ScalarExpr::select(rec(c), rec(t), rec(f)),
-        K::Cast { to, x } => ScalarExpr::cast(*to, rec(x)),
-        K::Bitcast { to, x } => ScalarExpr::bitcast(*to, rec(x)),
-        K::Round { mode, x } => ScalarExpr::round(*mode, rec(x)),
-        _ => e.clone(),
-    }
+        ScalarKind::Dot { .. } | ScalarKind::Splat { .. } => Some(e.clone()),
+        _ => None,
+    })
 }
 
 fn reads_index_of(e: &ScalarExpr, axis: u32) -> bool {
-    use ScalarKind as K;
-    match e.kind() {
-        K::IndexOf(a) => *a == axis,
-        K::Un { x, .. } | K::Cast { x, .. } | K::Bitcast { x, .. } | K::Round { x, .. } => {
-            reads_index_of(x, axis)
-        }
-        K::Bin { a, b, .. } | K::Cmp { a, b, .. } | K::Dot { a, b } => {
-            reads_index_of(a, axis) || reads_index_of(b, axis)
-        }
-        K::Select { c, t, f } => {
-            reads_index_of(c, axis) || reads_index_of(t, axis) || reads_index_of(f, axis)
-        }
-        K::Splat { x, .. } => reads_index_of(x, axis),
-        _ => false,
-    }
+    let mut found = false;
+    e.walk(&mut |e| found |= matches!(e.kind(), ScalarKind::IndexOf(a) if *a == axis));
+    found
 }
 
 /// The largest `Arg` index an expression reads.
 fn max_arg(e: &ScalarExpr) -> Option<u32> {
-    use ScalarKind as K;
-    match e.kind() {
-        K::Arg(i) => Some(*i),
-        K::Un { x, .. }
-        | K::Cast { x, .. }
-        | K::Bitcast { x, .. }
-        | K::Round { x, .. }
-        | K::Splat { x, .. } => max_arg(x),
-        K::Bin { a, b, .. } | K::Cmp { a, b, .. } | K::Dot { a, b } => {
-            max_arg(a).into_iter().chain(max_arg(b)).max()
+    let mut max = None;
+    e.walk(&mut |e| {
+        if let ScalarKind::Arg(i) = e.kind() {
+            max = max.max(Some(*i));
         }
-        K::Select { c, t, f } => max_arg(c)
-            .into_iter()
-            .chain(max_arg(t))
-            .chain(max_arg(f))
-            .max(),
-        _ => None,
-    }
+    });
+    max
 }

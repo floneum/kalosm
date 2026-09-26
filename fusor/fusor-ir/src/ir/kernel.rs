@@ -165,8 +165,9 @@ impl TileLayout {
 }
 
 /// A storage buffer declaration. `binding` is the one externally meaningful
-/// name; read-only-ness is what the derived bind group reads back out of
-/// the emitted module.
+/// name; declarations with the same binding are typed views of one buffer.
+/// Read-only-ness is what the derived bind group reads back out of the
+/// emitted module.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BufferDecl {
     pub binding: u32,
@@ -447,31 +448,16 @@ pub enum Addr {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ReduceKind {
     Subgroup,
-    Workgroup {
-        scratch: Tile,
-        group_size: u32,
-    },
-    Loop {
-        iterations: u32,
-        index: Local,
-        scratch: Tile,
-        group_size: u32,
-    },
+    Workgroup { scratch: Tile, group_size: u32 },
 }
 
 /// Source region of a cooperative fragment load.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-pub enum CoopSrc {
-    TileRegion {
-        tile: Tile,
-        row: TileExpr,
-        col: TileExpr,
-        transposed: bool,
-    },
-    BroadcastCol {
-        src: StorageView,
-        col: TileExpr,
-    },
+pub struct CoopSrc {
+    pub tile: Tile,
+    pub row: TileExpr,
+    pub col: TileExpr,
+    pub transposed: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -494,6 +480,8 @@ pub struct TileNode {
     /// set is folded up from the children at construction so a consumer's
     /// memo invalidation is O(1) per entry rather than a re-walk.
     pub mem_reads: MemReads,
+    /// Collective results depend on which invocations reach the expression.
+    pub scope_dependent: bool,
 }
 
 /// The memory spaces a [`TileExpr`] reads.
@@ -636,17 +624,84 @@ pub enum TileExprKind {
     },
 }
 
+impl TileExprKind {
+    /// Every direct child expression of a node, in a fixed order.
+    pub fn visit_children(&self, f: &mut dyn FnMut(&TileExpr)) {
+        match self {
+            TileExprKind::Literal(_)
+            | TileExprKind::Builtin(_)
+            | TileExprKind::LoadLocal(_)
+            | TileExprKind::CoopZero { .. } => {}
+            TileExprKind::Load {
+                addr, mask, fill, ..
+            } => {
+                match addr.as_ref() {
+                    Addr::Linear(index) => f(index),
+                    Addr::Rc2 { row, col } => {
+                        f(row);
+                        f(col);
+                    }
+                }
+                f(mask);
+                f(fill);
+            }
+            TileExprKind::LoadTile { index, .. } => f(index),
+            TileExprKind::Unary { value, .. } => f(value),
+            TileExprKind::Binary { left, right, .. }
+            | TileExprKind::Compare { left, right, .. } => {
+                f(left);
+                f(right);
+            }
+            TileExprKind::Round { value, .. } => f(value),
+            TileExprKind::Cast { value, .. } | TileExprKind::Bitcast { value, .. } => f(value),
+            TileExprKind::Select {
+                condition,
+                accept,
+                reject,
+            } => {
+                f(condition);
+                f(accept);
+                f(reject);
+            }
+            TileExprKind::Vec { parts, .. } => {
+                for part in parts {
+                    f(part);
+                }
+            }
+            TileExprKind::VecComponent { vector, .. } => f(vector),
+            TileExprKind::Dot { left, right } => {
+                f(left);
+                f(right);
+            }
+            TileExprKind::Reduce { value, .. } => f(value),
+            TileExprKind::CoopLoad { src, .. } => {
+                f(&src.row);
+                f(&src.col);
+            }
+            TileExprKind::CoopMma { a, b, c } => {
+                f(a);
+                f(b);
+                f(c);
+            }
+        }
+    }
+}
+
 impl TileExpr {
     pub fn new(kind: TileExprKind, ty: ElementType) -> Self {
         let mut h = FxHasher::default();
         kind.hash(&mut h);
         ty.hash(&mut h);
         let mem_reads = kind_mem_reads(&kind);
+        let mut scope_dependent = matches!(&kind, TileExprKind::Reduce { kind, .. }
+            if matches!(kind.as_ref(), ReduceKind::Subgroup));
+        kind.visit_children(&mut |child| scope_dependent |= child.scope_dependent());
         Self(Arc::new(TileNode {
             kind,
             ty,
             hash: h.finish(),
             mem_reads,
+            scope_dependent,
         }))
     }
     pub fn kind(&self) -> &TileExprKind {
@@ -686,6 +741,10 @@ impl TileExpr {
     pub fn mem_reads(&self) -> MemReads {
         self.0.mem_reads
     }
+
+    pub fn scope_dependent(&self) -> bool {
+        self.0.scope_dependent
+    }
 }
 
 /// Fold the memory-read set for one node from its children.
@@ -695,69 +754,32 @@ impl TileExpr {
 /// join the pure half of a backend memo.
 fn kind_mem_reads(kind: &TileExprKind) -> MemReads {
     use TileExprKind as K;
-    let addr = |a: &Addr| match a {
-        Addr::Linear(e) => e.mem_reads(),
-        Addr::Rc2 { row, col } => row.mem_reads().union(col.mem_reads()),
-    };
-    match kind {
-        // Pure leaves.
-        K::Literal(_) | K::Builtin(_) | K::CoopZero { .. } => MemReads::NONE,
-        // Reads, each unioned with whatever its address and predicate read.
+    let direct = match kind {
         K::LoadLocal(_) => MemReads::LOCAL,
-        K::Load {
-            src,
-            addr: a,
-            mask,
-            fill,
-        } => {
-            // Both `Source` arms are storage buffers; a quantized view is a
-            // u32 buffer plus a decode program.
-            let _ = src;
-            MemReads::STORAGE
-                .union(addr(a))
-                .union(mask.mem_reads())
-                .union(fill.mem_reads())
-        }
-        K::LoadTile { index, .. } => MemReads::TILE.union(index.mem_reads()),
-        K::CoopLoad { src, .. } => match &**src {
-            CoopSrc::TileRegion { row, col, .. } => {
-                MemReads::TILE.union(row.mem_reads()).union(col.mem_reads())
-            }
-            CoopSrc::BroadcastCol { col, .. } => MemReads::STORAGE.union(col.mem_reads()),
+        K::Load { .. } => MemReads::STORAGE,
+        K::LoadTile { .. } | K::CoopLoad { .. } => MemReads::TILE,
+        K::Reduce { kind, .. } => match kind.as_ref() {
+            ReduceKind::Subgroup => MemReads::NONE,
+            ReduceKind::Workgroup { .. } => MemReads::TILE,
         },
-        // Pure combinators: the union over the children.
-        K::Unary { value, .. }
-        | K::Round { value, .. }
-        | K::Cast { value, .. }
-        | K::Bitcast { value, .. }
-        | K::VecComponent { vector: value, .. } => value.mem_reads(),
-        // A cross-lane reduction stages through the scratch tile its
-        // `ReduceKind` names, so it reads a workgroup tile on every strategy
-        // but `Subgroup`.
-        K::Reduce { kind, value, .. } => match &**kind {
-            ReduceKind::Subgroup => value.mem_reads(),
-            ReduceKind::Workgroup { .. } => value.mem_reads().union(MemReads::TILE),
-            ReduceKind::Loop { .. } => value
-                .mem_reads()
-                .union(MemReads::TILE)
-                .union(MemReads::LOCAL),
-        },
-        K::Binary { left, right, .. } | K::Compare { left, right, .. } | K::Dot { left, right } => {
-            left.mem_reads().union(right.mem_reads())
-        }
-        K::Select {
-            condition,
-            accept,
-            reject,
-        } => condition
-            .mem_reads()
-            .union(accept.mem_reads())
-            .union(reject.mem_reads()),
-        K::Vec { parts, .. } => parts
-            .iter()
-            .fold(MemReads::NONE, |acc, p| acc.union(p.mem_reads())),
-        K::CoopMma { a, b, c } => a.mem_reads().union(b.mem_reads()).union(c.mem_reads()),
-    }
+        K::Literal(_)
+        | K::Builtin(_)
+        | K::CoopZero { .. }
+        | K::Unary { .. }
+        | K::Binary { .. }
+        | K::Compare { .. }
+        | K::Round { .. }
+        | K::Cast { .. }
+        | K::Bitcast { .. }
+        | K::Select { .. }
+        | K::Vec { .. }
+        | K::VecComponent { .. }
+        | K::Dot { .. }
+        | K::CoopMma { .. } => MemReads::NONE,
+    };
+    let mut reads = direct;
+    kind.visit_children(&mut |child| reads = reads.union(child.mem_reads()));
+    reads
 }
 
 impl PartialEq for TileExpr {
@@ -888,8 +910,8 @@ pub enum Stmt {
     /// from `merge`; both emitters open their arm with it and take the existing
     /// collective path unchanged.
     ///
-    /// `scratch` holds one workgroup tile per lane for the `Workgroup`/`Loop`
-    /// kinds and is empty for `Subgroup`. `kind`'s own scratch is `scratch[0]`,
+    /// `scratch` holds one workgroup tile per lane for the `Workgroup`
+    /// kind and is empty for `Subgroup`. `kind`'s own scratch is `scratch[0]`,
     /// so a one-lane reduction is exactly the node it is today.
     Reduce {
         kind: Box<ReduceKind>,
@@ -1053,9 +1075,6 @@ impl fmt::Display for LowerError {
     }
 }
 impl std::error::Error for LowerError {}
-
-/// Per-target lowering of one [`crate::ir::OpDef`] into Kernel.
-pub type LowerFn = fn(&crate::ir::Node, &crate::ir::launch::SchedPoint) -> Result<KernelIr>;
 
 /// `CoopStore` requires an affine rank-2 destination with a unit stride on
 /// one side; anything else falls back to a per-lane store path.
@@ -1298,6 +1317,22 @@ fn carry_free_add(e: &TileExpr) -> Option<(TileExpr, u32)> {
 /// collapses to one word load per window as a *consequence*; the rewrite
 /// itself never heard of any of them.
 pub fn simplify_index(e: &TileExpr) -> TileExpr {
+    simplify_index_cached(e, &mut rustc_hash::FxHashMap::default())
+}
+
+fn simplify_index_cached(
+    e: &TileExpr,
+    memo: &mut rustc_hash::FxHashMap<TileExpr, TileExpr>,
+) -> TileExpr {
+    if let Some(result) = memo.get(e) {
+        return result.clone();
+    }
+    let result = rewrite_index(e, memo);
+    memo.insert(e.clone(), result.clone());
+    result
+}
+
+fn rewrite_index(e: &TileExpr, memo: &mut rustc_hash::FxHashMap<TileExpr, TileExpr>) -> TileExpr {
     let rebuilt = match e.kind() {
         TileExprKind::Binary {
             op,
@@ -1305,8 +1340,8 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
             right,
             numeric,
         } => {
-            let l = simplify_index(left);
-            let r = simplify_index(right);
+            let l = simplify_index_cached(left, memo);
+            let r = simplify_index_cached(right, memo);
             TileExpr::new(
                 TileExprKind::Binary {
                     op: *op,
@@ -1320,7 +1355,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
         TileExprKind::Unary { op, value, numeric } => TileExpr::new(
             TileExprKind::Unary {
                 op: *op,
-                value: simplify_index(value),
+                value: simplify_index_cached(value, memo),
                 numeric: *numeric,
             },
             e.element(),
@@ -1328,21 +1363,21 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
         TileExprKind::Compare { op, left, right } => TileExpr::new(
             TileExprKind::Compare {
                 op: *op,
-                left: simplify_index(left),
-                right: simplify_index(right),
+                left: simplify_index_cached(left, memo),
+                right: simplify_index_cached(right, memo),
             },
             e.element(),
         ),
         TileExprKind::Cast { value, to } => TileExpr::new(
             TileExprKind::Cast {
-                value: simplify_index(value),
+                value: simplify_index_cached(value, memo),
                 to: *to,
             },
             e.element(),
         ),
         TileExprKind::Bitcast { value, to } => TileExpr::new(
             TileExprKind::Bitcast {
-                value: simplify_index(value),
+                value: simplify_index_cached(value, memo),
                 to: *to,
             },
             e.element(),
@@ -1353,16 +1388,16 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
             reject,
         } => TileExpr::new(
             TileExprKind::Select {
-                condition: simplify_index(condition),
-                accept: simplify_index(accept),
-                reject: simplify_index(reject),
+                condition: simplify_index_cached(condition, memo),
+                accept: simplify_index_cached(accept, memo),
+                reject: simplify_index_cached(reject, memo),
             },
             e.element(),
         ),
         TileExprKind::Round { mode, value } => TileExpr::new(
             TileExprKind::Round {
                 mode: *mode,
-                value: simplify_index(value),
+                value: simplify_index_cached(value, memo),
             },
             e.element(),
         ),
@@ -1378,21 +1413,24 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
             TileExprKind::Vec {
                 scalar: *scalar,
                 lanes: *lanes,
-                parts: parts.iter().map(simplify_index).collect(),
+                parts: parts
+                    .iter()
+                    .map(|part| simplify_index_cached(part, memo))
+                    .collect(),
             },
             e.element(),
         ),
         TileExprKind::VecComponent { vector, component } => TileExpr::new(
             TileExprKind::VecComponent {
-                vector: simplify_index(vector),
+                vector: simplify_index_cached(vector, memo),
                 component: *component,
             },
             e.element(),
         ),
         TileExprKind::Dot { left, right } => TileExpr::new(
             TileExprKind::Dot {
-                left: simplify_index(left),
-                right: simplify_index(right),
+                left: simplify_index_cached(left, memo),
+                right: simplify_index_cached(right, memo),
             },
             e.element(),
         ),
@@ -1403,18 +1441,18 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
             fill,
         } => {
             let addr = match addr.as_ref() {
-                Addr::Linear(i) => Addr::Linear(simplify_index(i)),
+                Addr::Linear(i) => Addr::Linear(simplify_index_cached(i, memo)),
                 Addr::Rc2 { row, col } => Addr::Rc2 {
-                    row: simplify_index(row),
-                    col: simplify_index(col),
+                    row: simplify_index_cached(row, memo),
+                    col: simplify_index_cached(col, memo),
                 },
             };
             TileExpr::new(
                 TileExprKind::Load {
                     src: src.clone(),
                     addr: Box::new(addr),
-                    mask: simplify_index(mask),
-                    fill: simplify_index(fill),
+                    mask: simplify_index_cached(mask, memo),
+                    fill: simplify_index_cached(fill, memo),
                 },
                 e.element(),
             )
@@ -1422,7 +1460,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
         TileExprKind::LoadTile { tile, index } => TileExpr::new(
             TileExprKind::LoadTile {
                 tile: tile.clone(),
-                index: simplify_index(index),
+                index: simplify_index_cached(index, memo),
             },
             e.element(),
         ),
@@ -1512,7 +1550,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
                     right: lit(s),
                     numeric: *numeric,
                 });
-                return simplify_index(&add(shifted, c >> s.min(31)));
+                return simplify_index_cached(&add(shifted, c >> s.min(31)), memo);
             }
             // Mod-interval second chance: the literal is far beyond the
             // base's alignment (a split window's run offset), but the base's
@@ -1528,7 +1566,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
                         right: lit(s),
                         numeric: *numeric,
                     });
-                    return simplify_index(&add(shifted, c >> s));
+                    return simplify_index_cached(&add(shifted, c >> s), memo);
                 }
             }
         }
@@ -1550,7 +1588,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
                     right: lit(m),
                     numeric: *numeric,
                 });
-                return simplify_index(&add(anded, c & m));
+                return simplify_index_cached(&add(anded, c & m), memo);
             }
             // Mod-interval second chance for a low mask: no carry across
             // the mask's top, so the AND distributes over the sum.
@@ -1565,7 +1603,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
                         right: lit(m),
                         numeric: *numeric,
                     });
-                    return simplify_index(&add(anded, c & m));
+                    return simplify_index_cached(&add(anded, c & m), memo);
                 }
             }
         }
@@ -1581,7 +1619,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
                         right: lit(d),
                         numeric: *numeric,
                     });
-                    return simplify_index(&add(divided, c / d));
+                    return simplify_index_cached(&add(divided, c / d), memo);
                 }
             }
             if let (Some((a, c)), Some(d)) = (top_literal_add(left), lit_u32(right))
@@ -1596,7 +1634,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
                         right: lit(d),
                         numeric: *numeric,
                     });
-                    return simplify_index(&add(divided, c / d));
+                    return simplify_index_cached(&add(divided, c / d), memo);
                 }
             }
         }
@@ -1620,7 +1658,7 @@ pub fn simplify_index(e: &TileExpr) -> TileExpr {
                         right: lit(d),
                         numeric: *numeric,
                     });
-                    return simplify_index(&add(reduced, c % d));
+                    return simplify_index_cached(&add(reduced, c % d), memo);
                 }
             }
         }

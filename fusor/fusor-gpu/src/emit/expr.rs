@@ -417,10 +417,8 @@ impl Emitter<'_> {
         view: &StorageView,
         index: Handle<Expression>,
     ) -> Result<Handle<Expression>, EmitError> {
-        let global = self.buffer_global(&view.buffer)?;
-        let base = self.global_var(global);
         let index = self.add_literal_u32(body, index, view.offset);
-        Ok(self.emit_expr(body, Expression::Access { base, index }))
+        self.storage_pointer_absolute(body, view, index)
     }
 
     pub(crate) fn tile_dynamic_pointer(
@@ -550,10 +548,10 @@ impl Emitter<'_> {
         Ok(self.append(Expression::Literal(lit)))
     }
 
-    /// Take the memo cache. Every value it holds is an SSA handle defined in
-    /// the *current* block, so a nested block must start empty and the parent
-    /// must get its entries back on exit.
+    /// Save the enclosing block's memo. Nested blocks may reuse its SSA values,
+    /// except collectives whose active lanes depend on control flow.
     pub(crate) fn push_scope(&mut self) -> Scope {
+        self.memo.retain(|expr, _| !expr.scope_dependent());
         Scope {
             memo: std::mem::take(&mut self.memo),
         }
@@ -1091,8 +1089,7 @@ impl Emitter<'_> {
                 let element = view.buffer.element;
                 if mask.is_constant_true() {
                     let index = self.addr_index(body, view, addr)?;
-                    let ptr = self.storage_dynamic_pointer(body, view, index)?;
-                    return Ok(self.emit_load(body, ptr));
+                    return self.load_storage_value(body, view, index);
                 }
                 let fill_source = fill.element();
                 let fill_h = self.expr(fill, body)?;
@@ -1116,13 +1113,14 @@ impl Emitter<'_> {
                         let index = self.add_literal_u32(body, index, view.offset);
                         let global = self.buffer_global(&view.buffer)?;
                         let base_for_len = self.global_var(global);
-                        let len = self.emit_expr(body, Expression::ArrayLength(base_for_len));
+                        let mut len = self.emit_expr(body, Expression::ArrayLength(base_for_len));
+                        if self.packed_half(&view.buffer) {
+                            len = self.mul_literal_u32(body, len, 2);
+                        }
                         let one = self.u32_lit(1);
                         let last = self.bin(body, BinaryOperator::Subtract, len, one);
                         let index = self.math2(body, MathFunction::Min, index, last);
-                        let base = self.global_var(global);
-                        let ptr = self.emit_expr(body, Expression::Access { base, index });
-                        let loaded = self.emit_load(body, ptr);
+                        let loaded = self.load_storage_absolute(body, view, index)?;
                         let selected = self.emit_expr(
                             body,
                             Expression::Select {
@@ -1147,8 +1145,7 @@ impl Emitter<'_> {
                         let addr = addr.clone();
                         self.masked_value(body, element, fill_h, mask_h, move |em, accept| {
                             let index = em.addr_index(accept, &view, &addr)?;
-                            let ptr = em.storage_dynamic_pointer(accept, &view, index)?;
-                            Ok(em.emit_load(accept, ptr))
+                            em.load_storage_value(accept, &view, index)
                         })
                     }
                 }

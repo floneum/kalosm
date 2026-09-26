@@ -22,18 +22,15 @@
 //!
 //! There is no reader-count check. If a producer is read twice, both readers
 //! may absorb it and the pricing crate charges the recompute once per reader.
-//! `Region` is the same rewrite with `live_outs` non-empty.
 //!
 //! [`MAP_INTO_MAP`] is the same law with a `Map` in the consumer position.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
-use crate::ir::launch::{
-    AccessPlan, ContractSide, IndexSpace, Launch, MapDomain, Operand, ScheduleDomain,
-};
+use crate::ir::launch::{AccessPlan, ContractSide, IndexSpace, Launch, Operand};
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
 use crate::rules::{MapView, access_legal_in, map_view, operand_dtypes, shift_args};
-use crate::scalar::{ScalarExpr, ScalarKind};
+use crate::scalar::ScalarExpr;
 use crate::shape::{AxisGroup, Dim, Layout, MultiFlattenMap};
 use smallvec::SmallVec;
 
@@ -67,14 +64,6 @@ rule!(
     head = OpTag::LaunchMap,
     tag = RuleTag::Additive,
     apply = fold_post_epilogue,
-);
-
-rule!(
-    FORM_KREGION,
-    level = Level::Launch,
-    head = OpTag::LaunchFold,
-    tag = RuleTag::Additive,
-    apply = form_kregion,
 );
 
 /// The result of splicing one elementwise producer into a reader's operand
@@ -146,8 +135,53 @@ fn splice(
             .filter(|(j, _)| *j != slot)
             .map(|(_, o)| o.clone()),
     );
-    new_ops.extend(inner.ops.iter().cloned());
+    for o in &inner.ops {
+        if space == &inner.space {
+            new_ops.push(o.clone());
+        } else {
+            let (o, _) = crate::rules::rebase::effective(b, o, &inner.space);
+            new_ops.push(widen_operand(&o, &inner.space, space, vec_axes)?);
+        }
+    }
     Some(Spliced { ops: new_ops, args })
+}
+
+/// Restate a producer read over a wider iteration space without changing its
+/// address. Promoted and trailing broadcast axes contribute zero stride.
+pub(crate) fn widen_operand(
+    o: &Operand,
+    producer: &IndexSpace,
+    space: &IndexSpace,
+    vec_axes: &[u32],
+) -> Option<Operand> {
+    if matches!(o.access, AccessPlan::Alias) && o.layout.shape() == producer.dims.as_slice() {
+        let mut axis = 0;
+        let strides: Vec<_> = space
+            .dims
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                if vec_axes.contains(&(i as u32)) {
+                    return Some(Dim::Const(0));
+                }
+                let at = axis;
+                axis += 1;
+                match producer.dims.get(at) {
+                    None => Some(Dim::Const(0)),
+                    Some(p) if p.known_eq(Dim::ONE) => Some(Dim::Const(0)),
+                    Some(p) if p.known_eq(*d) => o.layout.strides().get(at).copied(),
+                    _ => None,
+                }
+            })
+            .collect::<Option<_>>()?;
+        return Some(Operand {
+            src: o.src,
+            layout: Layout::from_parts(o.layout.offset(), &space.dims, &strides).ok()?,
+            access: AccessPlan::Alias,
+        });
+    }
+    let groups = widen_groups(&operand_groups(o)?, space, vec_axes)?;
+    operand_from_groups(o, &groups, space)
 }
 
 /// Per-logical-axis groups of an operand's own index map, in the producer's
@@ -256,11 +290,9 @@ pub(crate) fn operand_from_groups(
 /// iteration coordinate — the condition under which the producer's body may be
 /// substituted for `Arg(slot)` unrenumbered.
 ///
-/// Stated as an `AddressMap` equality against [`dense_read_map`], which
-/// derives its divisors from const extents. A `Dim::Sym` axis has no such
-/// map, so the fallback checks the part decidable without extents: a non-zero
-/// offset is a window whatever the extents are. A permuted or strided read
-/// over a symbolic axis is not caught.
+/// Compare concrete address maps when available. Symbolic reads must have
+/// the same coordinate extents and provably dense producer strides, with
+/// zero strides on promoted axes and trailing broadcasts.
 fn reads_producer_densely(
     o: &Operand,
     producer_shape: &[Dim],
@@ -272,7 +304,29 @@ fn reads_producer_densely(
         o.address_map(),
     ) {
         (Some(want), Some(got)) => want == got,
-        _ => o.layout.offset().known_eq(Dim::Const(0)),
+        _ => {
+            if !o.layout.offset().known_eq(Dim::Const(0))
+                || o.layout.shape() != space.dims.as_slice()
+            {
+                return false;
+            }
+            let dense = Layout::row_major_strides(producer_shape);
+            let mut strides = dense.iter();
+            space
+                .dims
+                .iter()
+                .zip(o.layout.strides())
+                .enumerate()
+                .all(|(axis, (extent, stride))| {
+                    let want = if vec_axes.contains(&(axis as u32)) {
+                        Dim::Const(0)
+                    } else {
+                        strides.next().copied().unwrap_or(Dim::Const(0))
+                    };
+                    extent.known_eq(Dim::ONE)
+                        || (want != Dim::Sym(crate::shape::OPAQUE_SYM) && stride.known_eq(want))
+                })
+        }
     }
 }
 
@@ -392,26 +446,7 @@ fn covers_for_substitution(iter: &IndexSpace, inner: &MapView) -> bool {
     if !iter.covers(&inner.space) {
         return false;
     }
-    !reads_index_of(&inner.body) || inner.space.covers(iter)
-}
-
-/// Whether `e` names a loop coordinate anywhere.
-fn reads_index_of(e: &ScalarExpr) -> bool {
-    match e.kind() {
-        ScalarKind::IndexOf(_) => true,
-        ScalarKind::Un { x, .. }
-        | ScalarKind::Cast { x, .. }
-        | ScalarKind::Bitcast { x, .. }
-        | ScalarKind::Round { x, .. }
-        | ScalarKind::Splat { x, .. } => reads_index_of(x),
-        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
-            reads_index_of(a) || reads_index_of(b)
-        }
-        ScalarKind::Select { c, t, f } => {
-            reads_index_of(c) || reads_index_of(t) || reads_index_of(f)
-        }
-        ScalarKind::Arg(_) | ScalarKind::Lit(_) | ScalarKind::Uniform(_) => false,
-    }
+    !inner.body.reads_index_of() || inner.space.covers(iter)
 }
 
 /// The first operand slot of `ops` that can be absorbed, spliced.
@@ -420,13 +455,6 @@ fn reads_index_of(e: &ScalarExpr) -> bool {
 /// [`map_view`] reads elementwise producers only, so a fold-to-fold edge is
 /// left alone by construction.
 ///
-/// KNOWN GAP: the two paths restate the producer's operands differently.
-/// [`splice_through_address_map`] widens each one through [`widen_groups`]
-/// onto the consumer's full `space`; [`splice`] clones them at the producer's
-/// own rank. On a promoted consumer the rank mismatch makes
-/// [`build_absorbed_fold`]'s access check discard the whole fused chain.
-/// Teaching `splice` to widen only pays once `fusor_cost::extract`'s accept
-/// test is the plan's own cost — see the note there.
 fn absorb_step(
     b: &Builder<'_>,
     ops: &[Operand],
@@ -507,6 +535,23 @@ fn build_absorbed_fold(b: &mut Builder<'_>, node: &Node, f: &Facts<'_>) -> Optio
     if !fired {
         return None;
     }
+    let mut distinct = Vec::new();
+    let remap: Vec<_> = cur
+        .iter()
+        .map(|operand| {
+            if let Some(slot) = distinct.iter().position(|other| other == operand) {
+                slot as u32
+            } else {
+                distinct.push(operand.clone());
+                (distinct.len() - 1) as u32
+            }
+        })
+        .collect();
+    lift = lift
+        .iter()
+        .map(|e| crate::carrier::map_args(e, &|i| remap[i as usize]))
+        .collect();
+    let cur = distinct;
     let fused = Launch::Fold {
         space: space.clone(),
         axis: *axis,
@@ -628,6 +673,7 @@ pub fn map_into_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
 /// producer can be absorbed without inventing a third edge.
 pub fn map_into_contract(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Launch(Launch::Contract {
+        output,
         m,
         n,
         k,
@@ -664,6 +710,7 @@ pub fn map_into_contract(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>
     }
     let fused = b
         .add_launch(Launch::Contract {
+            output: output.clone(),
             m: *m,
             n: *n,
             k: *k,
@@ -792,7 +839,7 @@ fn absorb_into_side(
         // producer axis `perm[j]` is operand axis `j`, so the axis names
         // shift by the inverse. This lets a structural causal mask ride into
         // the contraction instead of materializing the masked scores.
-        if reads_index_of(&inner.body) {
+        if inner.body.reads_index_of() {
             let mut inv: SmallVec<[u32; 4]> = smallvec::smallvec![0; perm.len()];
             for (j, &i) in perm.iter().enumerate() {
                 inv[i] = j as u32;
@@ -948,45 +995,4 @@ pub fn fold_post_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_
         })
         .ok()?;
     b.union(id, extended).ok()
-}
-
-/// The linear schedule domain of a composite whose value is `landed`'s.
-///
-/// `verify_launch` recomputes exactly this from the composite's own inferred
-/// facts, so the two cannot drift.
-pub fn linear_domain_of(b: &Builder<'_>, landed: Id) -> ScheduleDomain {
-    ScheduleDomain::Map(MapDomain::linear_over(b.caps(), &b.facts_of(landed).shape))
-}
-
-/// The multi-output form of [`absorb`]: the absorbed producer also escapes,
-/// so the fused chain becomes a `Region` naming it in `live_outs`. Because
-/// the region and the plain absorbed fold are both live, emitting the extra
-/// buffer competes with recomputing it.
-pub fn form_kregion(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::Launch(k @ Launch::Fold { ops, .. }) = &node.op else {
-        return None;
-    };
-    let iter = k.iter_space();
-    let (slot, _) = ops.iter().enumerate().find_map(|(i, o)| {
-        if !matches!(o.access, AccessPlan::Alias) {
-            return None;
-        }
-        let view = map_view(b, o.src)?;
-        covers_for_substitution(&iter, &view).then_some((i, view))
-    })?;
-    let producer = ops[slot].src;
-    let fused = build_absorbed_fold(b, node, f)?;
-    let members: SmallVec<[Id; 8]> = smallvec::smallvec![producer, fused];
-    // `live_outs: [0]` names the producer, so the region lands the producer's
-    // value and that is the index space its schedule domain is derived from —
-    // the same one `verify_launch` recomputes from the region's inferred facts.
-    let sched = linear_domain_of(b, producer);
-    let region = b
-        .add_launch(Launch::Region {
-            members,
-            live_outs: smallvec::smallvec![0],
-            sched,
-        })
-        .ok()?;
-    b.union(id, region).ok()
 }

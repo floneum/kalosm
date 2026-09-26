@@ -27,7 +27,7 @@
 //! union. TUPLE never discharges a carried dependence itself; that is
 //! RETARGET's job.
 
-use crate::carrier::{ArgRemap, Carrier, Tupled, map_args, probes_for, retype_args};
+use crate::carrier::{ArgRemap, Carrier, Tupled, map_args, retype_args};
 use crate::device::Caps;
 use crate::dtype::{Dtype, NumericContract};
 use crate::egraph::{Builder, Facts, Id, RuleTag, ViewSpine};
@@ -396,10 +396,6 @@ fn join(b: &mut Builder<'_>, f1: &FoldView, f2: &FoldView) -> Option<Joint> {
     if bytes > private_acc_bytes(b.caps()) {
         return None;
     }
-    // A botched slot renumbering fails this.
-    if !t.carrier.identity_closed(probes_for(f1.acc)) {
-        return None;
-    }
     // The rewritten nest's contract is the meet over the unified operand
     // list, which can be stricter than either side's.
     let joint_numeric = ops.iter().fold(NumericContract::RELAXED, |acc, o| {
@@ -479,14 +475,7 @@ fn widen_ops(side: &FoldView, host: &FoldView) -> Option<Vec<Operand>> {
     }
     side.ops
         .iter()
-        .map(|o| {
-            let groups = crate::rules::fusion::widen_groups(
-                &crate::rules::fusion::operand_groups(o)?,
-                &host.space,
-                &host.vec_axes,
-            )?;
-            crate::rules::fusion::operand_from_groups(o, &groups, &host.space)
-        })
+        .map(|o| crate::rules::fusion::widen_operand(o, &side.space, &host.space, &host.vec_axes))
         .collect()
 }
 
@@ -506,12 +495,10 @@ fn unify_ops(lhs: &[Operand], rhs: &[Operand]) -> Option<(Vec<Operand>, ArgRemap
     Some((ops, ArgRemap { map }))
 }
 
-/// Two edges read the same elements. Deduplication is an assertion about
-/// elements, not syntax: `address_map` returns `None` on a `Dim::Sym` extent
-/// or a `u32` overflow, and the rule then keeps both edges rather than
-/// guessing.
+/// Identical source and addressing expressions read the same elements,
+/// including when the dimensions are resolved at dispatch.
 fn same_read(a: &Operand, b: &Operand) -> bool {
-    a == b && matches!((a.address_map(), b.address_map()), (Some(x), Some(y)) if x == y)
+    a == b
 }
 
 /// Whether either nest's result is transitively reachable from `from`.

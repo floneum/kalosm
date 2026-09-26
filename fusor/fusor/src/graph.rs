@@ -1,24 +1,21 @@
 //! `Graph` and `Gradients`.
 //!
-//! The backward transform's output is ingested together with the forward as
-//! one graph with one root set, which is what makes gradient checkpointing
-//! the extractor's materialization bit.
+//! Forward and backward share one graph and root set for kernel selection.
 
 use std::sync::{Arc, Weak};
 
-use fusor_autograd::custom::{CustomRegistry, with_backwards as register_custom};
+use fusor_autograd::custom::{CustomBackward, CustomRegistry};
 use fusor_autograd::tape::{GraphTape, splat_of};
 use fusor_ir::autograd::{AdjointFn, Parent};
 use fusor_ir::dtype::{Dtype, QFmt, QLayout};
 use fusor_ir::egraph::{EGraph, Id};
+use fusor_ir::ir::Op;
 use fusor_ir::ir::logical::{BufferId, LeafKind, Logical};
-use fusor_ir::ir::{AttrId, Op};
 use fusor_ir::shape::{Dim, SymId};
 use fusor_ir::target::Buf;
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
-use crate::composite::MacroAttr;
 use crate::session::Session;
 use crate::tensor::Tensor;
 use crate::{Error, Result};
@@ -80,6 +77,7 @@ impl Drop for GraphInner {
 pub(crate) struct GraphInner {
     pub(crate) egraph: Mutex<EGraph>,
     pub(crate) session: Session,
+    pub(crate) extraction_seed: Mutex<Option<Arc<fusor_ir::extract::Plan>>>,
     /// Live `Tensor` handles per value. A value whose last handle drops is
     /// dead to the caller: its device buffer binding is released at the next
     /// resolve, so a loop that reads one batch per step does not pin every
@@ -90,9 +88,6 @@ pub(crate) struct GraphInner {
     /// Dead bound values a live handle still reached at the last reap;
     /// re-examined at the next one.
     zombies: Mutex<Vec<Id>>,
-    /// The `AttrId` side table. Attributes live outside `Op` so `Op` stays
-    /// `Hash + Eq` and the hash-cons memo stays exact.
-    pub(crate) attrs: Mutex<Vec<MacroAttr>>,
     pub(crate) leaves: Mutex<LeafStore>,
     pub(crate) symbols: Mutex<SymbolStore>,
     pub(crate) custom: Mutex<CustomRegistry>,
@@ -188,7 +183,7 @@ impl GraphRef {
         Ok(root)
     }
 
-    /// The `GraphRef`-level spelling of [`Graph::with_backwards`].
+    /// Attach an analytic adjoint to a logical node.
     pub(crate) fn register_backward(
         &self,
         value: Id,
@@ -196,7 +191,13 @@ impl GraphRef {
         rule: AdjointFn,
     ) -> Result<()> {
         let mut reg = self.state.custom.lock();
-        register_custom(&mut reg, value, parents, rule)?;
+        reg.insert(
+            value,
+            CustomBackward {
+                parents: parents.iter().copied().collect(),
+                rule,
+            },
+        );
         Ok(())
     }
 
@@ -240,10 +241,12 @@ impl GraphRef {
     /// live handle is still an input the next resolve of that handle reads
     /// (a `from_slice` leaf consumed into a `stack`, a cut leaf under a
     /// chunk), so it keeps its buffer until the handle above it dies too.
-    /// Only bound values cost anything, so the reachability walk runs only
-    /// when a bound value has died.
+    /// Retained inputs are reconsidered when another value loses its last handle.
     pub(crate) fn reap_dead(&self) {
         let dead: Vec<Id> = std::mem::take(&mut *self.state.dead.lock());
+        if dead.is_empty() {
+            return;
+        }
         let mut candidates: Vec<Id> = std::mem::take(&mut *self.state.zombies.lock());
         {
             let store = self.state.leaves.lock();
@@ -294,17 +297,6 @@ impl GraphRef {
             );
         }
         *self.state.zombies.lock() = zombies;
-    }
-
-    /// Intern a macro attribute blob. Equal attributes share an id, so two
-    /// identically-configured macro ops hash-cons together.
-    pub(crate) fn intern_attrs(&self, attrs: MacroAttr) -> AttrId {
-        let mut table = self.state.attrs.lock();
-        if let Some(i) = table.iter().position(|a| *a == attrs) {
-            return AttrId(i as u32);
-        }
-        table.push(attrs);
-        AttrId((table.len() - 1) as u32)
     }
 
     /// The one `BufferId` allocator. Every leaf name in a graph comes from
@@ -587,6 +579,19 @@ impl GraphRef {
         store.device.insert(id, (buf, None));
     }
 
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    pub(crate) fn bind_prepared_leaf(&self, id: Id, bytes: &Arc<Vec<u8>>, buf: Buf) {
+        let mut store = self.state.leaves.lock();
+        if store
+            .bytes
+            .get(&id)
+            .is_some_and(|current| Arc::ptr_eq(current, bytes))
+            && !store.device.contains_key(&id)
+        {
+            store.device.insert(id, (buf, None));
+        }
+    }
+
     /// Register one buffer under every id of an e-class, in one lock
     /// acquisition.
     pub(crate) fn set_device_buf_class(
@@ -708,13 +713,13 @@ impl Graph {
                 state: Arc::new(GraphInner {
                     egraph: Mutex::new(EGraph::new(session.semantics())),
                     session: session.clone(),
+                    extraction_seed: Mutex::new(None),
                     handles: Mutex::new(FxHashMap::default()),
                     dead: Mutex::new(Vec::new()),
                     zombies: Mutex::new(Vec::new()),
-                    attrs: Mutex::new(Vec::new()),
                     leaves: Mutex::new(LeafStore::default()),
                     symbols: Mutex::new(SymbolStore::default()),
-                    custom: Mutex::new(CustomRegistry::new()),
+                    custom: Mutex::new(CustomRegistry::default()),
                     next_buffer: Mutex::new(0),
                     constants: Mutex::new(FxHashMap::default()),
                     word_leaves: Mutex::new(FxHashMap::default()),
@@ -902,22 +907,14 @@ impl Graph {
                 "backward across two graphs is not a thing".into(),
             ));
         }
-        let caps = self.inner.session().caps();
         let custom = self.inner.state().custom.lock().clone();
         let mut g = self.inner.state().egraph.lock();
-        let grads = fusor_autograd::backward::backward_into_with(
-            &mut g, &caps, loss.id, seed, wrt, &custom,
-        )?;
-        // Forward and backward are one graph with one root set, which makes
-        // "save this activation" versus "recompute it" the extractor's
-        // materialization bit.
+        let grads = fusor_autograd::backward::backward_into(&mut g, loss.id, seed, wrt, &custom)?;
         g.add_root(loss.id);
         let mut entries = FxHashMap::default();
         for (primal, grad) in wrt.iter().zip(&grads) {
-            if let Some(grad) = grad {
-                g.add_root(*grad);
-                entries.insert(*primal, *grad);
-            }
+            g.add_root(*grad);
+            entries.insert(*primal, *grad);
         }
         Ok(Gradients { entries })
     }

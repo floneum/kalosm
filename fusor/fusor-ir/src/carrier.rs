@@ -844,20 +844,10 @@ pub const RETARGET_TABLE: &[RetargetRow] = &[
 
 /// Rewrite every `Arg(i)` in `e` to `Arg(f(i))`, leaving all other nodes alone.
 pub fn map_args(e: &ScalarExpr, f: &dyn Fn(u32) -> u32) -> ScalarExpr {
-    use ScalarKind as K;
-    match e.kind() {
-        K::Arg(i) => ScalarExpr::arg(f(*i), e.dtype()),
-        K::Un { op, x } => ScalarExpr::un(*op, map_args(x, f)),
-        K::Bin { op, a, b } => ScalarExpr::bin(*op, map_args(a, f), map_args(b, f)),
-        K::Cmp { op, a, b } => ScalarExpr::cmp(*op, map_args(a, f), map_args(b, f)),
-        K::Select { c, t, f: fe } => {
-            ScalarExpr::select(map_args(c, f), map_args(t, f), map_args(fe, f))
-        }
-        K::Cast { to, x } => ScalarExpr::cast(*to, map_args(x, f)),
-        K::Bitcast { to, x } => ScalarExpr::bitcast(*to, map_args(x, f)),
-        K::Round { mode, x } => ScalarExpr::round(*mode, map_args(x, f)),
-        _ => e.clone(),
-    }
+    e.rewrite(&mut |e| match e.kind() {
+        ScalarKind::Arg(i) => Some(ScalarExpr::arg(f(*i), e.dtype())),
+        _ => None,
+    })
 }
 
 /// Rewrite every `Arg` leaf's declared dtype, leaving indices alone.
@@ -867,40 +857,16 @@ pub fn map_args(e: &ScalarExpr, f: &dyn Fn(u32) -> u32) -> ScalarExpr {
 /// elements — is retyped on the way into Launch while `merge`, which reads
 /// accumulators, rides through untouched.
 pub fn retype_args(e: &ScalarExpr, dtype: Dtype) -> ScalarExpr {
-    use ScalarKind as K;
-    match e.kind() {
-        K::Arg(i) => ScalarExpr::arg(*i, dtype),
-        K::Un { op, x } => ScalarExpr::un(*op, retype_args(x, dtype)),
-        K::Bin { op, a, b } => ScalarExpr::bin(*op, retype_args(a, dtype), retype_args(b, dtype)),
-        K::Cmp { op, a, b } => ScalarExpr::cmp(*op, retype_args(a, dtype), retype_args(b, dtype)),
-        K::Select { c, t, f } => ScalarExpr::select(
-            retype_args(c, dtype),
-            retype_args(t, dtype),
-            retype_args(f, dtype),
-        ),
-        K::Cast { to, x } => ScalarExpr::cast(*to, retype_args(x, dtype)),
-        K::Bitcast { to, x } => ScalarExpr::bitcast(*to, retype_args(x, dtype)),
-        K::Round { mode, x } => ScalarExpr::round(*mode, retype_args(x, dtype)),
-        _ => e.clone(),
-    }
+    e.rewrite(&mut |e| match e.kind() {
+        ScalarKind::Arg(i) => Some(ScalarExpr::arg(*i, dtype)),
+        _ => None,
+    })
 }
 
 fn reads_index_of(e: &ScalarExpr, axis: u32) -> bool {
-    use ScalarKind as K;
-    match e.kind() {
-        K::IndexOf(a) => *a == axis,
-        K::Un { x, .. } | K::Cast { x, .. } | K::Bitcast { x, .. } | K::Round { x, .. } => {
-            reads_index_of(x, axis)
-        }
-        K::Bin { a, b, .. } | K::Cmp { a, b, .. } | K::Dot { a, b } => {
-            reads_index_of(a, axis) || reads_index_of(b, axis)
-        }
-        K::Select { c, t, f } => {
-            reads_index_of(c, axis) || reads_index_of(t, axis) || reads_index_of(f, axis)
-        }
-        K::Splat { x, .. } => reads_index_of(x, axis),
-        _ => false,
-    }
+    let mut found = false;
+    e.walk(&mut |e| found |= matches!(e.kind(), ScalarKind::IndexOf(a) if *a == axis));
+    found
 }
 
 /// The signature deduplication compares slots on, or `None` when the slot's

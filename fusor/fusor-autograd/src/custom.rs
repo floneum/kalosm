@@ -45,56 +45,8 @@ impl CustomBackward {
     }
 }
 
-/// Side table of user-supplied backwards, keyed by the node they belong to.
-/// Consulted by the reverse walk **before** [`crate::ADJOINTS`].
-#[derive(Clone, Debug, Default)]
-pub struct CustomRegistry {
-    rules: FxHashMap<Val, CustomBackward>,
-}
-
-impl CustomRegistry {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn get(&self, value: Val) -> Option<&CustomBackward> {
-        self.rules.get(&value)
-    }
-
-    pub fn len(&self) -> usize {
-        self.rules.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
-    }
-
-    /// Register `rule` for `value`. Returns the previous entry, if any.
-    pub fn insert(&mut self, value: Val, entry: CustomBackward) -> Option<CustomBackward> {
-        self.rules.insert(value, entry)
-    }
-}
-
-/// Register a user-supplied backward for `value`, declaring its parents.
-///
-/// The rule is a bare `fn`; the gradients it returns are slot-aligned to the
-/// node's operands, exactly as [`crate::ADJOINTS`] rules are. After it runs,
-/// every `Parent { requires_grad: true }` must appear among its targets.
-pub fn with_backwards(
-    registry: &mut CustomRegistry,
-    value: Val,
-    parents: &[Parent],
-    rule: AdjointFn,
-) -> Result<Val> {
-    registry.insert(
-        value,
-        CustomBackward {
-            parents: parents.iter().copied().collect(),
-            rule,
-        },
-    );
-    Ok(value)
-}
+/// User-supplied adjoints, consulted before the built-in adjoint table.
+pub type CustomRegistry = FxHashMap<Val, CustomBackward>;
 
 /// Every requires-grad parent must receive a gradient. A custom rule that
 /// omits one is an error, not a silent zero: the omitted parent's whole

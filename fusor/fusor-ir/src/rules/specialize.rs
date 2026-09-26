@@ -7,7 +7,7 @@ use crate::egraph::{Builder, Facts, Id, RuleTag};
 use crate::ir::launch::Launch;
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
-use crate::shape::Dim;
+use crate::shape::{Dim, OPAQUE_SYM};
 
 rule!(
     SPECIALIZE_DIM,
@@ -25,6 +25,7 @@ rule!(
 /// variants stay live either way.
 pub fn specialize_dim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     let Op::Launch(Launch::Contract {
+        output,
         m,
         n,
         k,
@@ -43,8 +44,22 @@ pub fn specialize_dim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) 
     // stride and access — so the decided extent is readable off either one.
     let a_shape = a.primary().layout.shape();
     let b_shape = rhs.primary().layout.shape();
-    // `a` is `[batch?, m, k]` and `b` is `[batch?, k, n]`, so each field has
-    // exactly one place to read a decided extent from.
+    // Positional substitution requires one axis per matrix dimension.
+    let single_axes = |shape: &[Dim], axes: [Dim; 3]| {
+        let axes = match shape.len() {
+            2 if batch.known_eq(Dim::ONE) => &axes[1..],
+            3 => &axes[..],
+            _ => return false,
+        };
+        shape.iter().zip(axes).all(|(extent, field)| {
+            extent.known_eq(*field)
+                || matches!((field, extent), (Dim::Sym(s), Dim::Const(_))
+                    if !s.is_derived() && *s != OPAQUE_SYM)
+        })
+    };
+    if !single_axes(a_shape, [*batch, *m, *k]) || !single_axes(b_shape, [*batch, *k, *n]) {
+        return None;
+    }
     let from_end = |shape: &[Dim], back: usize| -> Option<Dim> {
         shape.len().checked_sub(back).map(|i| shape[i])
     };
@@ -65,6 +80,7 @@ pub fn specialize_dim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) 
 
     let specialized = b
         .add_launch(Launch::Contract {
+            output: output.clone(),
             m: new_m.unwrap_or(*m),
             n: new_n.unwrap_or(*n),
             k: new_k.unwrap_or(*k),

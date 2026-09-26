@@ -34,16 +34,31 @@ pub fn children_logical(op: &Logical) -> Children {
 /// Operand ids of a Launch node, taken from its `Operand` lists. `Contract`
 /// is its A-side operands followed by its B-side ones — one each in the
 /// two-buffer case that reads `[a.src, b.src]`, more once a multi-edge
-/// producer has been absorbed. A region is its members and a merged wave is
-/// its segments.
+/// producer has been absorbed. A composite names its members directly.
 pub fn children_launch(op: &Launch) -> Children {
     match op {
         Launch::Map { ops, .. }
         | Launch::Fold { ops, .. }
         | Launch::Gather { ops, .. }
-        | Launch::Scatter { ops, .. }
-        | Launch::Ext { ops, .. } => ops.iter().map(|o| o.src).collect(),
+        | Launch::Scatter { ops, .. } => ops.iter().map(|o| o.src).collect(),
         Launch::Contract { a, b, .. } => a.ops.iter().chain(b.ops.iter()).map(|o| o.src).collect(),
-        Launch::Region { members, .. } => members.iter().copied().collect(),
+        Launch::StreamFold {
+            producer,
+            fold,
+            operand,
+            ..
+        } => {
+            let mut children = children_launch(producer);
+            children.extend(
+                children_launch(fold)
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, id)| (i != *operand as usize).then_some(id)),
+            );
+            children
+        }
+        Launch::Slab { members, .. } | Launch::Group { members, .. } => {
+            members.iter().copied().collect()
+        }
     }
 }

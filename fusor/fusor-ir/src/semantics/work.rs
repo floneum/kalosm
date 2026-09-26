@@ -1,6 +1,4 @@
-//! `work()` rows for every op. The verifier rejects a registration whose work
-//! does not vary with shape. `index_ops` is exactly the term the view-fold-vs-gather
-//! tradeoff needs.
+//! Shape-dependent work rows; `index_ops` prices view-fold versus gather.
 //!
 //! Symbolic dims price as `1`. A `Sym` extent is bound at dispatch, so a
 //! shape-family plan is costed at its smallest legal binding and the specialised
@@ -9,18 +7,13 @@
 use crate::contract_spec;
 use crate::facts::{ValueFacts, Work};
 use crate::ir::Op;
-use crate::ir::kernel::ScalarElement;
-use crate::ir::launch::{Family, Launch, SchedPoint, ScheduleDomain};
+use crate::ir::launch::Launch;
 use crate::ir::logical::Logical;
 use crate::scalar::{BinOp, ScalarExpr, ScalarKind};
 use crate::shape::Dim;
 use rustc_hash::FxHashSet;
 
 /// Work one op performs at these shapes.
-///
-/// `Launch::Ext` has no row here — its cost lives in the open registry, which
-/// only [`crate::CoreSemantics`] holds. This function reports the honest
-/// index-op floor for it; [`work_of_with`] uses the registered row.
 pub fn work_of(op: &Op, ins: &[ValueFacts], out: &ValueFacts) -> Work {
     match op {
         Op::Logical(o) => work_l0(o, ins, out),
@@ -28,21 +21,6 @@ pub fn work_of(op: &Op, ins: &[ValueFacts], out: &ValueFacts) -> Work {
         // A union node is a choice, not a computation.
         Op::Union(..) => Work::default(),
     }
-}
-
-/// [`work_of`] with the extension registry, so `Launch::Ext` reports its own row.
-pub fn work_of_with(
-    op: &Op,
-    ins: &[ValueFacts],
-    out: &ValueFacts,
-    registry: &crate::ir::OpDefRegistry,
-) -> Work {
-    if let Op::Launch(Launch::Ext { def, .. }) = op
-        && let Some(d) = registry.get(*def)
-    {
-        return (d.work)(ins, out);
-    }
-    work_of(op, ins, out)
 }
 
 /// `(arith, transcendental, index)` of evaluating every slot's lift once.
@@ -208,24 +186,17 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
         // carrier lanes, so the per-element merge count rises with `lanes()`.
         Launch::Fold {
             carrier,
+            axis,
             post,
             ops,
             space,
             vec_axes,
             ..
         } => {
-            let lanes = carrier.lanes().unwrap_or(carrier.width() as u64);
             // A promoted axis's extent is already counted in `lanes`, so
             // `vec_axes` must be filtered out of the iterated space or the
             // nest is charged `lanes` times its true cost. The filter is a
             // no-op on every unpromoted node.
-            //
-            // A wrong value in `normalization::composed_backward_saturates
-            // [gpu]` that surfaces with this row correct is a defect in the
-            // GPU cooperative-matrix contraction at
-            // `Coop{bm:16,bn:16,bk:8,n_passes:1,subgroups:1,rg:1,cg:1}`,
-            // which this row merely perturbs extraction into selecting —
-            // denying `Caps::coop_supported` makes the case pass.
             let ein = space
                 .dims
                 .iter()
@@ -233,11 +204,21 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
                 .filter(|(i, _)| !vec_axes.contains(&(*i as u32)))
                 .map(|(_, d)| priced(*d))
                 .fold(1u64, |a, b| a.saturating_mul(b));
-            let (lift_a, lift_t, lift_i) = carrier_lift_cost(carrier);
-            let (post_a, post_t, post_i) = post
+            let (lift_a, lift_t, lift_i) = carrier
+                .lift
                 .iter()
-                .map(scalar_expr_cost)
+                .zip(&carrier.slots)
+                .map(|(e, slot)| {
+                    let (a, t, i) = scalar_expr_cost(e);
+                    let n = slot.lanes().unwrap_or(1);
+                    (a * n, t * n, i * n)
+                })
                 .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
+            let (merge_a, merge_t, merge_i) =
+                expression_list_cost(&carrier.merge_lanes().unwrap_or_default());
+            let (post_a, post_t, post_i) =
+                expression_list_cost(&carrier.expand_lanes(post).unwrap_or_default());
+            let rows = ein / priced(space.dims[*axis as usize]).max(1);
             // The inline decode of a quantized operand, once per iterated
             // element — the same schedule-independent floor `Map` and
             // `Contract` price.
@@ -247,18 +228,41 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
                 .fold(0, u64::saturating_add);
             Work {
                 macs: ein
-                    .saturating_mul(lanes.saturating_add(lift_a))
-                    .saturating_add(e.saturating_mul(lanes.saturating_add(post_a))),
+                    .saturating_mul(merge_a.saturating_add(lift_a))
+                    .saturating_add(rows.saturating_mul(post_a)),
                 transcendentals: ein
-                    .saturating_mul(lift_t)
-                    .saturating_add(e.saturating_mul(post_t)),
+                    .saturating_mul(lift_t.saturating_add(merge_t))
+                    .saturating_add(rows.saturating_mul(post_t)),
                 index_ops: ein
-                    .saturating_mul(lift_i)
-                    .saturating_add(e.saturating_mul(post_i))
+                    .saturating_mul(lift_i.saturating_add(merge_i))
+                    .saturating_add(rows.saturating_mul(post_i))
                     .saturating_add(operand_index_ops(ops, ein))
                     .saturating_add(ein.saturating_mul(decode)),
                 wg_bytes: 0,
             }
+        }
+
+        Launch::StreamFold {
+            producer,
+            fold,
+            operand,
+            ..
+        } => {
+            let count = super::children::children_launch(producer).len();
+            let produced = super::infer_launch::infer_launch(producer, &ins[..count])
+                .expect("admitted producer");
+            let mut inputs = ins[count..].to_vec();
+            inputs.insert(*operand as usize, produced.clone());
+            let consumer = work_l1(fold, &inputs, out);
+            let source = work_l1(producer, &ins[..count], &produced);
+            let outputs = elements(&produced).max(1);
+            let evaluations = stream_evaluations(fold, *operand);
+            consumer.add(Work {
+                macs: (source.macs / outputs).saturating_mul(evaluations),
+                transcendentals: (source.transcendentals / outputs).saturating_mul(evaluations),
+                index_ops: (source.index_ops / outputs).saturating_mul(evaluations),
+                wg_bytes: 0,
+            })
         }
 
         Launch::Contract {
@@ -266,12 +270,9 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             n,
             k,
             batch,
-            family,
             a,
             b: rhs,
             post,
-            acc,
-            sched,
             ..
         } => {
             let (b, m, n, k) = (priced(*batch), priced(*m), priced(*n), priced(*k));
@@ -305,9 +306,6 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
                     .saturating_add(elems.saturating_mul(decode_ops_of(f.dtype)));
             }
             w = w.add(epilogue_work(post, b.saturating_mul(m).saturating_mul(n)));
-            if *family == Family::Coop {
-                w.wg_bytes = coop_staged_bytes(sched, element_of(*acc));
-            }
             w
         }
 
@@ -328,23 +326,42 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             }
         }
 
-        // A region's true work is the sum of its members'. `ins` carries only
-        // their *facts*, so this row is the shape-varying floor every member
-        // pays to land its output; `fusor-cost` sums the exact rows on the
-        // realized DAG, where it has the member nodes ([`sum_work`]).
-        Launch::Region { .. } => ins.iter().fold(Work::default(), |acc, f| {
-            acc.add(Work {
-                index_ops: elements(f),
-                ..Work::default()
-            })
-        }),
-
-        // Honest floor without the registry; see [`work_of_with`].
-        Launch::Ext { ops, .. } => Work {
-            index_ops: e.saturating_add(operand_index_ops(ops, e)),
-            ..Work::default()
-        },
+        // Members carry their own work; sequencing adds none.
+        Launch::Slab { .. } | Launch::Group { .. } => Work::default(),
     }
+}
+
+fn expression_list_cost(expressions: &[ScalarExpr]) -> (u64, u64, u64) {
+    let mut seen = FxHashSet::default();
+    let mut cost = (0, 0, 0);
+    for expression in expressions {
+        count(expression, &mut seen, &mut cost);
+    }
+    cost
+}
+
+/// Producer evaluations performed by a streamed Fold. Promoted positions
+/// sharing the generated operand's address reuse one evaluation.
+pub fn stream_evaluations(fold: &Launch, operand: u32) -> u64 {
+    let Launch::Fold {
+        space,
+        vec_axes,
+        ops,
+        ..
+    } = fold
+    else {
+        return 0;
+    };
+    space
+        .dims
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| {
+            !vec_axes.contains(&(*i as u32))
+                || !ops[operand as usize].layout.strides()[*i].known_eq(Dim::Const(0))
+        })
+        .map(|(_, d)| priced(*d))
+        .fold(1, u64::saturating_mul)
 }
 
 /// Arithmetic a backend's block-decode program spends per decoded element.
@@ -386,38 +403,25 @@ pub fn epilogue_work(expr: &ScalarExpr, iterations: u64) -> Work {
     }
 }
 
+/// Index-op equivalents of one scalar load from cache: the load/store port
+/// issues at a fraction of the ALU rate and the value is not there for the
+/// next instruction. Tiled contractions stage their loads and do not pay
+/// this per MAC; a map or a fold does, once per operand per iteration.
+const LOAD_INDEX_OPS: u64 = 4;
+
+/// Index-op equivalents of one integer divide or modulo: a u32 division is
+/// a multi-instruction sequence, not an ALU slot.
+const DIVMOD_INDEX_OPS: u64 = 8;
+
 fn operand_index_ops(ops: &[crate::ir::launch::Operand], iterations: u64) -> u64 {
     ops.iter().fold(0u64, |acc, o| {
-        acc.saturating_add(iterations.saturating_mul(o.access.index_ops()))
+        let per = o
+            .access
+            .index_ops()
+            .saturating_mul(DIVMOD_INDEX_OPS)
+            .saturating_add(LOAD_INDEX_OPS);
+        acc.saturating_add(iterations.saturating_mul(per))
     })
-}
-
-/// Bytes staged through workgroup memory by a cooperative geometry. This is
-/// the **traffic** term (`score_fs`'s T2), not a legality footprint: the
-/// allocation `verify_launch` admits against comes from the injected
-/// `ArenaPlanner` and nowhere else.
-fn coop_staged_bytes(sched: &ScheduleDomain, elem: ScalarElement) -> u64 {
-    if !matches!(sched, ScheduleDomain::Coop(_)) {
-        return 0;
-    }
-    let Some(SchedPoint::Coop { geom, staging, .. }) = sched.point(0) else {
-        return 0;
-    };
-    crate::verify_launch::coop_tiles(geom, elem, staging)
-        .decls
-        .iter()
-        .map(|t| t.layout.element_count() * t.element.byte_size())
-        .sum()
-}
-
-fn element_of(d: crate::dtype::Dtype) -> ScalarElement {
-    match d {
-        crate::dtype::Dtype::F16 => ScalarElement::F16,
-        crate::dtype::Dtype::BF16 => ScalarElement::BF16,
-        crate::dtype::Dtype::U32 => ScalarElement::U32,
-        crate::dtype::Dtype::I32 => ScalarElement::I32,
-        _ => ScalarElement::F32,
-    }
 }
 
 /// Element count, symbolic dims priced as 1.
@@ -433,12 +437,98 @@ fn priced(d: Dim) -> u64 {
     d.as_const().unwrap_or(1)
 }
 
-/// True when `work` varies across two distinct shape bindings — the check
-/// [`crate::ir::Semantics::verify`] applies to an `OpDef` registration.
-pub fn work_is_shape_sensitive(
-    work: fn(&[ValueFacts], &ValueFacts) -> Work,
-    small: (&[ValueFacts], &ValueFacts),
-    large: (&[ValueFacts], &ValueFacts),
-) -> bool {
-    work(small.0, small.1) != work(large.0, large.1)
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::carrier::{ArgRemap, Carrier, RETARGET_TABLE};
+    use crate::dtype::{Dtype, Splat};
+    use crate::egraph::Id;
+    use crate::ir::launch::{AccessPlan, IndexSpace, Operand, ScheduleDomain};
+    use crate::shape::Layout;
+    use smallvec::smallvec;
+
+    #[test]
+    fn streamed_fold_charges_nested_work_and_shared_promoted_reads() {
+        let arg = |i| ScalarExpr::arg(i, Dtype::F32);
+        let sum = Carrier::binop(BinOp::Add, Splat::F32(0.0), Dtype::F32);
+        let source_space = IndexSpace::new([2, 3, 5].map(Dim::Const));
+        let source = Launch::Fold {
+            space: source_space.clone(),
+            axis: 2,
+            vec_axes: smallvec![],
+            carrier: sum.clone(),
+            acc: Dtype::F32,
+            post: smallvec![arg(0)],
+            ops: vec![Operand {
+                src: Id(1),
+                layout: Layout::contiguous(&source_space.dims),
+                access: AccessPlan::Alias,
+            }],
+            sched: ScheduleDomain::Point,
+        };
+        let space = IndexSpace::new([2, 4, 3].map(Dim::Const));
+        let fold = Launch::Fold {
+            space: space.clone(),
+            axis: 2,
+            vec_axes: smallvec![1],
+            carrier: sum
+                .with_lift([ScalarExpr::bin(BinOp::Mul, arg(0), arg(1))])
+                .promote(Dim::Const(4))
+                .unwrap(),
+            acc: Dtype::F32,
+            post: smallvec![arg(0)],
+            ops: vec![
+                Operand {
+                    src: Id(2),
+                    layout: Layout::from_parts(
+                        Dim::Const(0),
+                        &space.dims,
+                        &[3, 0, 1].map(Dim::Const),
+                    )
+                    .unwrap(),
+                    access: AccessPlan::Alias,
+                },
+                Operand {
+                    src: Id(3),
+                    layout: Layout::contiguous(&space.dims),
+                    access: AccessPlan::Alias,
+                },
+            ],
+            sched: ScheduleDomain::Point,
+        };
+        let inputs = [
+            ValueFacts::new(Dtype::F32, source_space.dims),
+            ValueFacts::new(Dtype::F32, space.dims),
+        ];
+        let streamed = Launch::stream_fold(source, fold, 0).unwrap();
+        let out = super::super::infer_launch::infer_launch(&streamed, &inputs).unwrap();
+        let work = work_l1(&streamed, &inputs, &out);
+        // Six source reductions of five additions, plus six consumer steps
+        // carrying four multiply-and-add positions. The source is not repeated four times.
+        assert_eq!(work.macs, 6 * 5 + 6 * 4 * 2);
+
+        let Launch::StreamFold { mut fold, .. } = streamed else {
+            unreachable!()
+        };
+        let Launch::Fold { carrier, post, .. } = fold.as_mut() else {
+            unreachable!()
+        };
+        let maximum = Carrier::binop(BinOp::Max, Splat::F32(f32::NEG_INFINITY), Dtype::F32);
+        let total = Carrier::binop(BinOp::Add, Splat::F32(0.0), Dtype::F32)
+            .with_lift([ScalarExpr::lit(Splat::F32(1.0))]);
+        let body = total.tuple(carrier, &ArgRemap::identity(2)).carrier;
+        *carrier = Carrier::retarget(&maximum, &RETARGET_TABLE[0], &body, 0).unwrap();
+        *post = smallvec![arg(0), arg(1), arg(2)];
+        let ins = [
+            ValueFacts::new(Dtype::F32, [2, 3].map(Dim::Const)),
+            inputs[1].clone(),
+        ];
+        let out = super::super::infer_launch::infer_launch(&fold, &ins).unwrap();
+        let work = work_l1(&fold, &ins, &out);
+        assert_eq!(
+            work.transcendentals,
+            6 * 2,
+            "both rescaling exponentials run at every reduction step"
+        );
+    }
 }

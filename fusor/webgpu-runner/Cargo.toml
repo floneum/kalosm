@@ -18,7 +18,17 @@ fusor = { path = "../fusor", default-features = false, features = ["gpu"] }
 fusor-conformance = { path = "../fusor-conformance", default-features = false, features = ["burn-bench"] }
 web-time = "1"
 
+# Native only: the end-to-end test drives the async model from a blocking
+# test harness. The browser build never awaits anything this way.
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+sha2 = "0.10"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+pollster = "0.4"
+
 [target.'cfg(target_arch = "wasm32")'.dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
 # dioxus-web 0.7.10's history code needs `Location`, which only its
 # `devtools` feature turns on; a minimal build has to ask for it itself.
 web-sys = { version = "0.3", features = ["Window", "Location", "History"] }
@@ -28,7 +38,8 @@ getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] 
 # Patch tables only apply from the build root, so the workspace's naga fork
 # is repeated here; see ../Cargo.toml.
 [patch.crates-io]
-naga = { git = "https://github.com/ealmloff/wgpu", rev = "c4f55cabaadc22b942c1dd8894bf85f17f2718dc" }
+wgpu = { git = "https://github.com/ealmloff/wgpu", rev = "24a7d3577213fc147637fe7fb20e0e845a74df8a" }
+naga = { git = "https://github.com/ealmloff/wgpu", rev = "24a7d3577213fc147637fe7fb20e0e845a74df8a" }
 
 # CI builds: the conformance sweep runs the planner and every raced kernel
 # body on the host, and unoptimized planner code is most of its wall time.
@@ -43,3 +54,7 @@ debug = "line-tables-only"
 # emits ("compile unit size was incorrect"), so release strips debuginfo.
 [profile.release]
 strip = "debuginfo"
+
+# Opt-in browser regression/benchmark exports, omitted from published builds.
+[features]
+training-checks = ["fusor-conformance/compiler-tests"]

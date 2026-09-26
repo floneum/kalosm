@@ -12,9 +12,9 @@ use std::sync::{Arc, OnceLock};
 use fusor_ir::Result;
 use fusor_ir::device::Caps;
 use fusor_ir::ir::kernel::{
-    Addr, ArenaMode, ArenaPlan, ArenaPlanner, BarrierSuggestion, Buffer, CoopSrc, ElementType,
-    KernelIr, Local, MergeBody, QuantizedView, ReduceKind, ScalarElement, Source, Stmt,
-    StorageView, Tile, TileExpr, TileExprKind, TileLiteral, Tiles,
+    Addr, ArenaMode, ArenaPlan, ArenaPlanner, BarrierSuggestion, Buffer, ElementType, KernelIr,
+    Local, MergeBody, QuantizedView, ReduceKind, ScalarElement, Source, Stmt, StorageView, Tile,
+    TileExpr, TileExprKind, TileLiteral, Tiles,
 };
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHasher};
@@ -22,7 +22,7 @@ use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 
 use crate::arena;
-use crate::liveness::{LivenessInfo, analyze, for_each_addr_expr, for_each_child};
+use crate::liveness::{LivenessInfo, analyze, for_each_addr_expr};
 
 /// Memo key: everything `arena_plan`'s result depends on.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -236,22 +236,11 @@ impl BodyHasher {
                 self.tile(scratch, h);
                 group_size.hash(h);
             }
-            ReduceKind::Loop {
-                iterations,
-                index,
-                scratch,
-                group_size,
-            } => {
-                iterations.hash(h);
-                self.local(index, h);
-                self.tile(scratch, h);
-                group_size.hash(h);
-            }
         }
     }
 
     /// The per-node payload: everything that is neither a child expression
-    /// (walked by `for_each_child`) nor an identity already folded in above.
+    /// (walked by `TileExprKind::visit_children`) nor an identity already folded in above.
     /// Fold `e`'s identity into `h`, computing it once per distinct node.
     fn expr(&mut self, e: &TileExpr, h: &mut FxHasher) {
         let ptr = e.node_ptr();
@@ -319,23 +308,15 @@ impl BodyHasher {
                 scalar.hash(h);
                 rows.hash(h);
                 cols.hash(h);
-                std::mem::discriminant(src.as_ref()).hash(h);
-                match src.as_ref() {
-                    CoopSrc::TileRegion {
-                        tile, transposed, ..
-                    } => {
-                        self.tile(tile, h);
-                        transposed.hash(h);
-                    }
-                    CoopSrc::BroadcastCol { src, .. } => self.view(src, h),
-                }
+                self.tile(&src.tile, h);
+                src.transposed.hash(h);
             }
             // No payload beyond the children.
             TileExprKind::Select { .. }
             | TileExprKind::Dot { .. }
             | TileExprKind::CoopMma { .. } => {}
         }
-        for_each_child(kind, &mut |c| self.expr(c, h));
+        kind.visit_children(&mut |c| self.expr(c, h));
     }
 
     fn merge(&mut self, m: &MergeBody, h: &mut FxHasher) {

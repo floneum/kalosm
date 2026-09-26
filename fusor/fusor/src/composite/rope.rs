@@ -17,7 +17,7 @@ use fusor_ir::shape::{Dim, StrideSpec};
 use fusor_ir::{Error, Result};
 use smallvec::SmallVec;
 
-use crate::composite::{MacroAttr, MacroOp, const_dim, index_leaf, index_run, macro_op};
+use crate::composite::{const_dim, core_op, index_leaf, index_run};
 use crate::graph::GraphRef;
 use crate::tensor::Tensor;
 
@@ -158,19 +158,19 @@ fn broadcast_table(t: &mut GraphTape<'_>, table: Val, like: Val) -> Result<Val> 
 
 /// The `[L, Dh]` slice of one table this call uses.
 fn table_rows(t: &mut GraphTape<'_>, table: Val, ops: &RopeOperands) -> Result<Val> {
-    let expanded = t.gather(1, table, ops.expand)?;
-    match ops.rows {
-        Rows::Offset(0) if t.shape_of(expanded)[0].known_eq(ops.seq) => Ok(expanded),
+    let rows = match ops.rows {
+        Rows::Offset(0) if t.shape_of(table)[0].known_eq(ops.seq) => table,
         Rows::Offset(off) => {
-            let shape = t.shape_of(expanded);
+            let shape = t.shape_of(table);
             let specs: SmallVec<[StrideSpec; 6]> = smallvec::smallvec![
                 StrideSpec::dim(0, ops.seq).with_offset(Dim::Const(off)),
                 StrideSpec::dim(1, shape[1]),
             ];
-            t.restride(&specs, expanded)
+            t.restride(&specs, table)?
         }
-        Rows::Positions(p) => t.gather(0, expanded, p),
-    }
+        Rows::Positions(p) => t.gather(0, table, p)?,
+    };
+    t.gather(1, rows, ops.expand)
 }
 
 /// `x * cos + rot(x) * sin`.
@@ -211,21 +211,7 @@ fn rope_with(
     let graph = &x.graph;
     let ops = prepare(graph, x, cos, pairing, rows)?;
     let (xi, ci, si) = (x.id, cos.id, sin.id);
-    let mut operands = vec![xi, ci, si, ops.perm, ops.signs, ops.expand];
-    if let Rows::Positions(p) = ops.rows {
-        operands.push(p);
-    }
-    macro_op(
-        graph,
-        MacroOp::Rope,
-        MacroAttr::Rope {
-            interleaved: matches!(pairing, Pairing::Interleaved),
-            paired: false,
-            with_position: matches!(ops.rows, Rows::Positions(_)),
-        },
-        &operands,
-        move |t| rope_defn(t, xi, ci, si, &ops),
-    )
+    core_op(graph, move |t| rope_defn(t, xi, ci, si, &ops))
 }
 
 /// Non-interleaved rope: pairs `(i, i + Dh/2)`.
@@ -301,32 +287,16 @@ fn rope_pair_with(
     let lower = index_run(graph, 0, hq)?;
     let upper = index_run(graph, hq, hk)?;
     let (qi, ki, ci, si) = (q.id, k.id, cos.id, sin.id);
-    let mut operands = vec![
-        qi, ki, ci, si, ops.perm, ops.signs, ops.expand, lower, upper,
-    ];
-    if let Rows::Positions(p) = ops.rows {
-        operands.push(p);
-    }
 
-    let joined = macro_op(
-        graph,
-        MacroOp::Rope,
-        MacroAttr::Rope {
-            interleaved: matches!(pairing, Pairing::Interleaved),
-            paired: true,
-            with_position: matches!(ops.rows, Rows::Positions(_)),
-        },
-        &operands,
-        move |t| {
-            let dtype = t.dtype_of(qi);
-            let mut shape = t.shape_of(qi);
-            shape[1] = Dim::Const(hq + hk);
-            let base = t.zeros_shaped(dtype, &shape)?;
-            let base = t.scatter_set(1, base, lower, qi, true)?;
-            let both = t.scatter_set(1, base, upper, ki, true)?;
-            rope_defn(t, both, ci, si, &ops)
-        },
-    )?;
+    let joined = core_op(graph, move |t| {
+        let dtype = t.dtype_of(qi);
+        let mut shape = t.shape_of(qi);
+        shape[1] = Dim::Const(hq + hk);
+        let base = t.zeros_shaped(dtype, &shape)?;
+        let base = t.scatter_set(1, base, lower, qi, true)?;
+        let both = t.scatter_set(1, base, upper, ki, true)?;
+        rope_defn(t, both, ci, si, &ops)
+    })?;
 
     Ok((
         narrow_heads(&joined, 0, hq)?,
@@ -439,4 +409,52 @@ pub fn rope_interleaved_with_position(
         Pairing::Interleaved,
         Rows::Positions(positions.id),
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fusor_ir::dtype::Dtype;
+    use fusor_ir::egraph::EGraph;
+    use std::sync::Arc;
+
+    #[test]
+    fn rope_table_work_is_bounded_by_requested_rows() -> Result<()> {
+        let mut graph = EGraph::new(fusor_ir::CoreSemantics::new(Arc::new(
+            fusor_tile::Planner::new(),
+        )));
+        let mut tape = GraphTape::new(&mut graph);
+        let table = tape.zeros_shaped(Dtype::F32, &[Dim::Const(131072), Dim::Const(64)])?;
+        let expand = tape.zeros_shaped(Dtype::U32, &[Dim::Const(128)])?;
+        let positions = tape.zeros_shaped(Dtype::U32, &[Dim::Const(3)])?;
+        for rows in [Rows::Offset(0), Rows::Offset(7), Rows::Positions(positions)] {
+            let first = tape.graph().len();
+            let result = table_rows(
+                &mut tape,
+                table,
+                &RopeOperands {
+                    perm: expand,
+                    signs: table,
+                    expand,
+                    rows,
+                    seq: Dim::Const(3),
+                },
+            )?;
+            assert_eq!(
+                tape.shape_of(result).as_slice(),
+                &[Dim::Const(3), Dim::Const(128)]
+            );
+            for i in first..tape.graph().len() {
+                let elements: u64 = tape
+                    .graph()
+                    .facts(Id(i as u32))
+                    .shape
+                    .iter()
+                    .map(|d| d.as_const().unwrap())
+                    .product();
+                assert!(elements <= 3 * 128, "RoPE materializes unused context rows");
+            }
+        }
+        Ok(())
+    }
 }

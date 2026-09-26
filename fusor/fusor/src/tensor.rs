@@ -230,9 +230,22 @@ impl Tensor {
         let buf = from.graph.device_buf(from.id).ok_or_else(|| {
             Error::Plan("adopt_buffer needs a resolved source; resolve it first".into())
         })?;
-        let layout = from.graph.device_layout(from.id).map(std::sync::Arc::new);
+        // An external leaf carries no `BufferPlan`, so nothing downstream can
+        // correct a read of it for the padding a `Coop` output holds its value
+        // under. Refuse rather than hand the next resolve a buffer it will
+        // read as if the padding were data.
+        let layout = from.graph.device_layout(from.id);
+        if let Some(l) = &layout
+            && (!l.offset().known_eq(fusor_ir::shape::Dim::Const(0))
+                || l.strides() != &fusor_ir::shape::Layout::row_major_strides(l.shape())[..])
+        {
+            return Err(Error::Plan(format!(
+                "adopt_buffer needs a densely laid out source; {} is padded to {l:?}",
+                from.id
+            )));
+        }
         self.graph
-            .set_device_buf_class(&[self.id], &buf, layout.as_ref());
+            .set_device_buf_class(&[self.id], &buf, layout.map(std::sync::Arc::new).as_ref());
         Ok(())
     }
 

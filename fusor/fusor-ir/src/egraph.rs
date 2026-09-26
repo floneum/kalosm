@@ -51,6 +51,8 @@ pub struct NodeKey {
     pub children: Children,
 }
 
+type ReaderClasses = FxHashMap<ClassId, Arc<FxHashSet<ClassId>>>;
+
 /// The e-graph: one node arena, one memo, one facts table, no union-find.
 pub struct EGraph {
     nodes: Vec<Node>,
@@ -61,31 +63,19 @@ pub struct EGraph {
     /// populated memo.
     memo: Arc<FxHashMap<NodeKey, Id>>,
     parent: Vec<Option<Id>>,
-    defns: FixedBitSet,
     roots: Vec<Id>,
     next_sym: u32,
     sem: Arc<dyn Semantics>,
-    /// Nodes below this index have already had every rule offered to them in
-    /// a fully-saturated earlier pass. A rule's applicability is a function
-    /// of `(node, child facts, caps)` — all immutable once minted — so
-    /// re-offering below the frontier can only re-mint. Advanced by the
-    /// saturation driver only when a pass finishes unbudgeted.
-    pub saturation_frontier: usize,
-    /// Nodes that have been offered every rule, by id. Saturation is scoped
-    /// to the roots' reachable closure, so this — not a prefix of the arena
-    /// — is what says a node needs no further offering: a node reachable
-    /// only from a later root set is offered then, and a node no root ever
-    /// reaches again is never re-lowered.
+    /// Nodes covered by a completed bounded search and its lowering floor.
+    /// A node reached only by a later root remains eligible for search.
     offered: FixedBitSet,
     /// The current dim bindings, as a hint for costing: extraction and the
     /// tuner's work gate price a symbolic extent at its bound value rather
     /// than a nominal one, so a symbolic plan is tuned like a concrete one.
     /// Set by the session before it plans; never read by a rule.
     pub dim_hints: FxHashMap<SymId, u64>,
-    /// Root sets whose reachable closure has been offered every rule. The
-    /// arena is append-only and an offered node is never re-fired, so a
-    /// closure once saturated stays saturated whatever is appended later:
-    /// a root set seen here needs no walk at all. Bounded by clearing.
+    /// Root sets whose reachable closure has completed bounded search.
+    /// A root set seen here needs no walk at all. Bounded by clearing.
     pub saturated_root_sets: FxHashSet<Vec<Id>>,
     /// The node count as of the last completed saturation on this graph.
     /// `add` is the only structural mutation, so `saturated_at_len ==
@@ -106,16 +96,24 @@ pub struct EGraph {
     /// when a node is appended, so the arena length is an exact validity
     /// stamp.
     class_ids_memo: (usize, FxHashMap<ClassId, Arc<[Id]>>),
+    /// Per node, the nodes that read it as a child, by the id they wrote.
+    /// Nodes never move, so the index is append-only with `nodes`.
+    readers: Vec<SmallVec<[Id; 4]>>,
+    /// The classes reading each class, computed at a node count and valid
+    /// until the next node: a rule application asks about the same chain's
+    /// members many times while it mints nothing.
+    reader_classes_memo: std::sync::Mutex<(usize, ReaderClasses)>,
 }
 
 impl EGraph {
     pub fn new(sem: Arc<dyn Semantics>) -> Self {
         Self {
             nodes: Vec::new(),
+            readers: Vec::new(),
+            reader_classes_memo: std::sync::Mutex::new((usize::MAX, FxHashMap::default())),
             facts: Vec::new(),
             memo: Arc::new(FxHashMap::default()),
             parent: Vec::new(),
-            defns: FixedBitSet::new(),
             roots: Vec::new(),
             next_sym: 0,
             sem,
@@ -124,7 +122,6 @@ impl EGraph {
                 NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
             },
             class_ids_memo: (usize::MAX, FxHashMap::default()),
-            saturation_frontier: 0,
             offered: FixedBitSet::new(),
             dim_hints: FxHashMap::default(),
             saturated_root_sets: FxHashSet::default(),
@@ -142,7 +139,7 @@ impl EGraph {
         }
     }
 
-    /// Whether `id` has been offered every rule by an earlier saturation.
+    /// Whether `id` was covered by an earlier bounded search.
     pub fn is_offered(&self, id: Id) -> bool {
         self.offered.contains(id.index())
     }
@@ -210,17 +207,6 @@ impl EGraph {
     pub fn clear_roots(&mut self) {
         self.roots.clear();
     }
-    /// Mark an id as a macro op's definitional expansion. Sugar and its
-    /// `defn` are unioned at construction, so there is nothing to
-    /// recognize; a `defn` node is never evicted.
-    pub fn mark_defn(&mut self, id: Id) {
-        self.defns.grow(self.nodes.len());
-        self.defns.insert(id.index());
-    }
-    pub fn is_defn(&self, id: Id) -> bool {
-        self.defns.contains(id.index())
-    }
-
     pub fn fresh_sym(&mut self) -> SymId {
         let s = SymId(self.next_sym);
         self.next_sym += 1;
@@ -258,11 +244,16 @@ impl EGraph {
             Op::Union(a, _) => self.nodes[a.index()].level,
             other => other.level().expect("non-union ops carry a level"),
         };
+        self.index_readers_to(next.index());
+        for c in &children {
+            self.readers[c.index()].push(next);
+        }
         self.nodes.push(Node {
             op,
             level,
             children,
         });
+        self.readers.push(SmallVec::new());
         self.facts.push(facts);
         self.parent.push(None);
         // Copy-on-write: a no-op clone unless a `SaturationDelta` still holds
@@ -302,12 +293,79 @@ impl EGraph {
         self.members(self.class_of(id))
     }
 
-    /// Every id that resolves to `class`, including the `Union` spine.
-    ///
-    /// A `Union` id is still a name a caller holds: `macro_op` returns the id
-    /// `union(defn, sugar)` produced, so the `Tensor` the user reads back is
-    /// the spine node. Anything keyed on "this value" rather than "this
-    /// candidate" has to use this.
+    /// Brings the readers index up to `len` nodes: every node added by a
+    /// path other than [`Self::add`] — a replayed delta — is indexed here.
+    fn index_readers_to(&mut self, len: usize) {
+        while self.readers.len() < len {
+            let id = Id(self.readers.len() as u32);
+            self.readers.push(SmallVec::new());
+            for c in self.nodes[id.index()].children.clone().iter() {
+                self.readers[c.index()].push(id);
+            }
+        }
+    }
+
+    /// Every non-`Union` node that reads any id of `class`, deduplicated.
+    /// The `Union` spine is not a reader: it is the class itself.
+    pub fn readers(&self, class: ClassId) -> Vec<Id> {
+        let mut out: Vec<Id> = Vec::new();
+        let mut seen: FxHashSet<Id> = FxHashSet::default();
+        self.for_each_reader(class, |r| {
+            if seen.insert(r) {
+                out.push(r);
+            }
+            false
+        });
+        out
+    }
+
+    /// Whether some non-`Union` reader of `class` satisfies `pred`; stops
+    /// at the first.
+    pub fn any_reader(&self, class: ClassId, pred: impl FnMut(Id) -> bool) -> bool {
+        self.for_each_reader(class, pred)
+    }
+
+    /// The classes whose nodes read `class`, memoized at the current node
+    /// count.
+    pub fn reader_classes(&self, class: ClassId) -> Arc<FxHashSet<ClassId>> {
+        let mut memo = self
+            .reader_classes_memo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if memo.0 != self.nodes.len() {
+            *memo = (self.nodes.len(), FxHashMap::default());
+        }
+        if let Some(hit) = memo.1.get(&class) {
+            return Arc::clone(hit);
+        }
+        let mut out: FxHashSet<ClassId> = FxHashSet::default();
+        self.for_each_reader(class, |r| {
+            out.insert(self.class_of(r));
+            false
+        });
+        let out = Arc::new(out);
+        memo.1.insert(class, Arc::clone(&out));
+        out
+    }
+
+    /// Visits the readers of `class` until `f` answers true.
+    fn for_each_reader(&self, class: ClassId, mut f: impl FnMut(Id) -> bool) -> bool {
+        for id in self.class_ids(class) {
+            let Some(readers) = self.readers.get(id.index()) else {
+                continue;
+            };
+            for r in readers {
+                if r.index() < self.nodes.len()
+                    && !matches!(self.nodes[r.index()].op, Op::Union(..))
+                    && f(*r)
+                {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
     pub fn class_ids(&self, class: ClassId) -> Vec<Id> {
         let mut out = Vec::new();
         // The spine is a DAG; a set membership test keeps this linear.
@@ -376,12 +434,11 @@ impl EGraph {
     /// Capture everything saturation may overwrite rather than append.
     ///
     /// `nodes` and `facts` are push-only, so they are captured at record time
-    /// instead; `parent`, `defns`, `roots` and `next_sym` are captured here.
+    /// instead; `parent`, `offered`, `roots` and `next_sym` are captured here.
     pub fn pre_saturation(&self) -> PreSaturation {
         PreSaturation {
             len: self.nodes.len(),
             parent: self.parent.clone(),
-            defns: self.defns.ones().map(|i| i as u32).collect(),
             offered: self.offered.ones().map(|i| i as u32).collect(),
             roots: self.roots.clone(),
             next_sym: self.next_sym,
@@ -401,7 +458,6 @@ impl EGraph {
             // Kept whole: re-inserting the tail would rehash every `NodeKey`.
             memo: Arc::clone(&self.memo),
             parent: self.parent.clone(),
-            defns: self.defns.clone(),
             offered: self.offered.clone(),
             roots: self.roots.clone(),
             next_sym: self.next_sym,
@@ -413,7 +469,7 @@ impl EGraph {
     /// not the one the delta was recorded against.
     ///
     /// The validity check is exact, not a fingerprint: every pre-existing
-    /// node, every parent link, the `defn` set, the root set and the symbol
+    /// node, every parent link, the offered set, the root set and the symbol
     /// counter are compared by value. `len` and `next_sym` reject a mismatch
     /// before any node is looked at.
     pub fn replay_saturation(&mut self, delta: &SaturationDelta) -> bool {
@@ -423,14 +479,6 @@ impl EGraph {
             || self.roots != pre.roots
             || self.parent != pre.parent
             || self.nodes[..] != delta.nodes[..pre.len]
-        {
-            return false;
-        }
-        if !self
-            .defns
-            .ones()
-            .map(|i| i as u32)
-            .eq(pre.defns.iter().copied())
         {
             return false;
         }
@@ -447,13 +495,12 @@ impl EGraph {
         }
         self.nodes.extend_from_slice(&delta.nodes[pre.len..]);
         self.facts.extend_from_slice(&delta.facts[pre.len..]);
+        self.index_readers_to(self.nodes.len());
         self.memo = Arc::clone(&delta.memo);
         self.parent.clone_from(&delta.parent);
-        self.defns.clone_from(&delta.defns);
         self.offered.clone_from(&delta.offered);
         self.roots.clone_from(&delta.roots);
         self.next_sym = delta.next_sym;
-        self.saturation_frontier = self.nodes.len();
         true
     }
 
@@ -493,6 +540,43 @@ impl<'a> Builder<'a> {
     pub fn caps(&self) -> &Caps {
         self.caps
     }
+    /// The class `id` belongs to.
+    pub fn class_of(&self, id: Id) -> ClassId {
+        self.graph.class_of(id)
+    }
+    /// Every node in `id`'s class. A rule that composes launches needs the
+    /// launch spelling of a value it was handed by its logical id.
+    pub fn class_members(&self, id: Id) -> Vec<Id> {
+        self.graph.members(self.graph.class_of(id))
+    }
+    /// Whether some node outside `classes` reads `id`'s class.
+    /// Every id `id`'s class holds, spine included.
+    pub fn class_ids(&self, id: Id) -> Vec<Id> {
+        self.graph.class_ids(self.graph.class_of(id))
+    }
+    /// The graph's roots: every value a caller reads back.
+    pub fn roots(&self) -> &[Id] {
+        self.graph.roots()
+    }
+    pub fn len(&self) -> usize {
+        self.graph.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.graph.is_empty()
+    }
+    pub fn arena_id(&self) -> u64 {
+        self.graph.arena_id()
+    }
+    /// Every node reading `id`'s class.
+    pub fn readers_of(&self, id: Id) -> Vec<Id> {
+        self.graph.readers(self.graph.class_of(id))
+    }
+    pub fn read_outside(&self, id: Id, classes: &FxHashSet<ClassId>) -> bool {
+        self.graph
+            .reader_classes(self.graph.class_of(id))
+            .iter()
+            .any(|c| !classes.contains(c))
+    }
     pub fn node(&self, id: Id) -> &Node {
         self.graph.node(id)
     }
@@ -518,10 +602,6 @@ impl<'a> Builder<'a> {
     pub fn fresh_sym(&mut self) -> SymId {
         self.graph.fresh_sym()
     }
-    pub fn mark_defn(&mut self, id: Id) {
-        self.graph.mark_defn(id);
-    }
-
     /// Walk a chain of pure `Restride` views down to their base.
     pub fn trace_pure_views(&self, mut v: Id) -> ViewSpine {
         let mut views: SmallVec<[Id; 4]> = SmallVec::new();
@@ -630,18 +710,22 @@ impl fmt::Debug for Rule {
 /// depend on how loaded the machine was.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SaturationBudget {
-    /// `MAX_NODES = node_slope * initial + node_slack`.
+    /// Retain existing nodes and allow `node_slope * new_nodes + node_slack`
+    /// for nodes reached by this search that have not been offered before.
     pub node_slope: u32,
     pub node_slack: u32,
     pub max_rounds: u32,
     /// Rule bodies invoked; keeps a pathological graph's compile time bounded
     /// without reading a clock.
     pub max_applications: u32,
+    /// Raise the application limit to at least this many invocations per
+    /// newly offered reachable node. Zero keeps `max_applications` fixed.
+    pub application_slope: u32,
 }
 
 impl Default for SaturationBudget {
-    /// The shipped budget: `8 * initial + 4096` nodes, 10 rounds, 200k rule
-    /// applications.
+    /// The shipped budget: eight nodes per newly offered node plus 4096,
+    /// retaining existing history; 10 rounds and 200k rule applications.
     ///
     /// A round count bounds chain depth; the deepest chain in the suite is
     /// attention, whose slowest member first saturates at 9 rounds, so 10 is
@@ -656,6 +740,7 @@ impl Default for SaturationBudget {
             node_slack: 4096,
             max_rounds: 10,
             max_applications: 200_000,
+            application_slope: 0,
         }
     }
 }
@@ -684,7 +769,6 @@ pub struct SaturationReport {
 pub struct PreSaturation {
     len: usize,
     parent: Vec<Option<Id>>,
-    defns: Vec<u32>,
     offered: Vec<u32>,
     roots: Vec<Id>,
     next_sym: u32,
@@ -715,7 +799,6 @@ pub struct SaturationDelta {
     facts: Vec<ValueFacts>,
     memo: Arc<FxHashMap<NodeKey, Id>>,
     parent: Vec<Option<Id>>,
-    defns: FixedBitSet,
     offered: FixedBitSet,
     roots: Vec<Id>,
     next_sym: u32,

@@ -34,19 +34,13 @@ rule!(
     apply = fold_views_into_fold_index,
 );
 
-/// `f(view(x)) == view(f(x))` when `view` is pure: a single-operand `Map`
-/// reading a contraction through a chain of restrides also equals that
-/// contraction with a longer `post`, re-viewed.
-///
-/// The only guard is numeric: the epilogue must not round the accumulator
-/// ahead of the chain, so its element type must be the accumulator's, or the
-/// F16-accumulator/F32-epilogue widening pair. That is legality — whether
-/// sinking pays is priced elsewhere.
+/// Compose a coordinate-independent map into a contraction's epilogue,
+/// preserving accumulator precision and reapplying any pure views.
 pub fn sink_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     let Op::Launch(Launch::Map { body, ops, .. }) = &node.op else {
         return None;
     };
-    if ops.len() != 1 || !matches!(ops[0].access, AccessPlan::Alias) {
+    if ops.len() != 1 || !matches!(ops[0].access, AccessPlan::Alias) || body.reads_index_of() {
         return None;
     }
     let spine = b.trace_pure_views(ops[0].src);
@@ -54,6 +48,7 @@ pub fn sink_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -
 
     let sunk = match base {
         Op::Launch(Launch::Contract {
+            output,
             m,
             n,
             k,
@@ -69,6 +64,7 @@ pub fn sink_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -
                 return None;
             }
             b.add_launch(Launch::Contract {
+                output,
                 m,
                 n,
                 k,

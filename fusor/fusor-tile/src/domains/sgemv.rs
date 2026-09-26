@@ -111,7 +111,11 @@ pub fn legal(m: Dim, n: Dim, k: Dim, dtype: Dtype, caps: &Caps) -> SgemvDomain {
 /// ordered by `(seed_rank, sgemv_order)`.
 pub fn sgemv_domain(cx: &DomainCtx<'_>) -> SgemvDomain {
     let width = cx.caps.subgroup_width();
-    let max_lanes = cx.caps.limits.max_compute_invocations_per_workgroup;
+    let max_lanes = cx
+        .caps
+        .limits
+        .max_compute_invocations_per_workgroup
+        .min(cx.caps.limits.max_compute_workgroup_size[0]);
     // The subgroup-per-column structure indexes lanes by `subgroup_id` and
     // reduces within one subgroup, which is only a static schedule when the
     // device pins its subgroup width.

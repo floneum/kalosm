@@ -209,57 +209,34 @@ pub(crate) fn byte_arena(live: &LivenessInfo) -> Option<ArenaPlan> {
     if !all_packable(live) {
         return None;
     }
-    struct Placed {
-        start: u32,
-        end: u32,
-        position: usize,
-    }
-    let mut placed: Vec<Placed> = Vec::new();
-    let mut placements: SmallVec<[Placement; 8]> = SmallVec::new();
-    let mut arena_end = 0u32;
-
-    for (position, &key) in live.order.iter().enumerate() {
-        let tile = &live.tiles[&key];
-        // Stride doubles as alignment: every supported element's array stride
-        // is a power of two at least as large as its alignment (vec3 is
-        // already padded to the vec4 stride).
-        let align = element_stride(tile.element);
-        let extent = tile_bytes(tile);
-        let align_up = |value: u32| value.div_ceil(align.max(1)) * align.max(1);
-        let mut candidates: Vec<u32> = std::iter::once(0)
-            .chain(placed.iter().map(|entry| align_up(entry.end)))
-            .collect();
-        candidates.sort_unstable();
-        candidates.dedup();
-        let offset = candidates
-            .into_iter()
-            .find(|&offset| {
-                // Full history, not just the most recent occupant.
-                placed
-                    .iter()
-                    .filter(|entry| entry.start < offset + extent && entry.end > offset)
-                    .all(|entry| {
-                        live.can_follow_tiles(&live.tiles[&live.order[entry.position]], tile)
-                    })
-            })
-            .expect("the offset past every placement always fits");
-        let end = offset + extent;
-        placed.push(Placed {
-            start: offset,
-            end,
-            position,
-        });
-        arena_end = arena_end.max(end);
-        placements.push(Placement {
+    let requests: Vec<_> = live
+        .iter()
+        .map(|tile| {
+            (
+                u64::from(tile_bytes(tile)),
+                u64::from(element_stride(tile.element)),
+            )
+        })
+        .collect();
+    let (extent, offsets) =
+        fusor_ir::packing::pack_interference(&requests, fusor_ir::packing::Fit::First, |a, b| {
+            !live.can_follow_tiles(&live.tiles[&live.order[b]], &live.tiles[&live.order[a]])
+        })
+        .ok()?;
+    let total_bytes = u32::try_from(extent.div_ceil(16) * 16).ok()?;
+    let placements = live
+        .iter()
+        .zip(offsets)
+        .map(|(tile, offset)| Placement {
             tile: tile.tile.clone(),
-            byte_offset: offset,
-            byte_len: extent,
-        });
-    }
+            byte_offset: offset as u32,
+            byte_len: tile_bytes(tile),
+        })
+        .collect();
 
     Some(ArenaPlan {
         mode: ArenaMode::ByteArena,
-        total_bytes: arena_end.div_ceil(16) * 16,
+        total_bytes,
         placements,
         barriers_inserted: SmallVec::new(),
     })

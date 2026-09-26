@@ -202,15 +202,7 @@ impl Emitter<'_> {
         let v = self.expr(value, out)?;
         if mask.is_constant_true() {
             let index = self.addr_index(out, dst, addr)?;
-            let ptr = self.storage_dynamic_pointer(out, dst, index)?;
-            out.push(
-                Statement::Store {
-                    pointer: ptr,
-                    value: v,
-                },
-                Span::default(),
-            );
-            return Ok(());
+            return self.store_storage_value(out, dst, index, v);
         }
         let mask_ty = mask.element();
         let m = self.expr(mask, out)?;
@@ -219,15 +211,7 @@ impl Emitter<'_> {
         let addr = addr.clone();
         let (accept, ()) = self.nested(|em, accept| {
             let index = em.addr_index(accept, &dst, &addr)?;
-            let ptr = em.storage_dynamic_pointer(accept, &dst, index)?;
-            accept.push(
-                Statement::Store {
-                    pointer: ptr,
-                    value: v,
-                },
-                Span::default(),
-            );
-            Ok(())
+            em.store_storage_value(accept, &dst, index, v)
         })?;
         out.push(
             Statement::If {
@@ -268,6 +252,12 @@ impl Emitter<'_> {
             let ptr = em.storage_dynamic_pointer(block, &dst_c, index)?;
             match element {
                 ElementType::Scalar(ScalarElement::U32 | ScalarElement::I32) => {
+                    let physical = em.buffer_element(&dst_c.buffer);
+                    let v = if physical == element {
+                        v
+                    } else {
+                        em.cast_as(block, v, super::expr::element_scalar(physical)?.kind, None)
+                    };
                     block.push(
                         Statement::Atomic {
                             pointer: ptr,
@@ -540,8 +530,7 @@ impl Emitter<'_> {
                     let load = |em: &mut Self, block: &mut Block| -> Result<_, EmitError> {
                         let index =
                             em.storage_index_from_coords(block, &view, &[global_row, global_col])?;
-                        let ptr = em.storage_dynamic_pointer(block, &view, index)?;
-                        let v = em.emit_load(block, ptr);
+                        let v = em.load_storage_value(block, &view, index)?;
                         em.cast_tile_value(block, v, view.buffer.element, dst.element)
                     };
                     em.guarded_tile_store(accept, &dst, tile_ptr, in_bounds, load)
@@ -637,8 +626,7 @@ impl Emitter<'_> {
             let mut values = Vec::with_capacity(VEC as usize);
             for i in 0..VEC {
                 let index = em.add_literal_u32(accept, storage_base, i);
-                let ptr = em.storage_dynamic_pointer(accept, &view, index)?;
-                let loaded = em.emit_load(accept, ptr);
+                let loaded = em.load_storage_value(accept, &view, index)?;
                 values.push(em.cast_tile_value(
                     accept,
                     loaded,

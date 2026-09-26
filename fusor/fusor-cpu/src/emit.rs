@@ -12,7 +12,6 @@
 pub(crate) mod access;
 pub(crate) mod expr;
 pub(crate) mod quantized;
-pub(crate) mod reduce;
 pub(crate) mod stmt;
 
 use fusor_ir::Result;
@@ -23,16 +22,15 @@ use fusor_ir::ir::kernel::{
     ScalarElement, Source, Stmt, Tile, TileDecl, TileExpr, TileExprKind, TileLayout, TileLiteral,
 };
 use fusor_ir::scalar::BinOp;
-use fusor_ir::shape::MultiFlattenMap;
 use fusor_ir::target::{Buf, EmitError, Uniforms};
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
-use expr::{Instr, NumTy, RKind, Slot, UniformSrc};
+use expr::{Instr, NumTy, Slot, UniformSrc};
 use stmt::{CAcc, CStmt, LaneLoop};
 
 /// One workgroup tile's placement in the thread-local scratch arena.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileInfo {
     pub elem: ScalarElement,
     pub elements: u32,
@@ -41,7 +39,7 @@ pub struct TileInfo {
 }
 
 /// A compiled kernel body.
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Program {
     /// The SSA tape: one instruction per distinct expression node, referenced
     /// by half-open ranges from the statements.
@@ -52,7 +50,6 @@ pub struct Program {
     pub regs: usize,
     pub locals: usize,
     pub tiles: Vec<TileInfo>,
-    pub maps: Vec<MultiFlattenMap>,
     pub buffer_elements: Vec<ScalarElement>,
     pub arena_bytes: u32,
     pub block: u32,
@@ -128,10 +125,9 @@ pub fn emit(ir: &KernelIr, caps: &Caps) -> Result<CpuKernel, EmitError> {
 
 /// Compile one `KernelIr`.
 ///
-/// When a planner is supplied its `verify_uniformity` and `verify_arena` run
-/// **before** compilation and a failure is `EmitError::Validation`, never a
-/// alternate execution path. Without one the arena uses sequential packing,
-/// which is always legal on CPU because thread-local scratch aliases freely.
+/// The supplied planner constructs the arena. Compiler tests independently
+/// check uniformity and arena invariants before compilation. Without a planner
+/// the arena uses sequential packing; CPU thread-local scratch aliases freely.
 pub(crate) fn compile(
     ir: &KernelIr,
     caps: &Caps,
@@ -141,11 +137,13 @@ pub(crate) fn compile(
 
     let arena = match planner {
         Some(p) => {
+            #[cfg(any(test, feature = "compiler-tests"))]
             p.verify_uniformity(ir)
                 .map_err(|e| EmitError::Validation(e.to_string()))?;
             let plan = p
                 .arena_plan(ir, caps)
                 .map_err(|e| EmitError::Validation(e.to_string()))?;
+            #[cfg(any(test, feature = "compiler-tests"))]
             p.verify_arena(ir, &plan)
                 .map_err(|e| EmitError::Validation(e.to_string()))?;
             Some(plan)
@@ -160,13 +158,12 @@ pub(crate) fn compile(
     let body = c.compile_stmts(&ir.body)?;
     let segments = stmt::block(&body, ir.block.max(1), width)?;
 
-    let prog = Program {
+    let prog = Arc::new(Program {
         tape: c.tape,
         segments,
         regs: c.regs as usize,
         locals: c.locals.len(),
         tiles: c.tiles,
-        maps: c.maps,
         buffer_elements: ir
             .buffers
             .iter()
@@ -176,20 +173,16 @@ pub(crate) fn compile(
         block: ir.block.max(1),
         width,
         has_atomic: c.has_atomic,
-    };
+    });
 
     let contract = crate::gemm::ContractSpec::parse(ir.name);
     let jit = if contract.is_none() {
-        Some(
-            crate::jit::compile(&prog)
-                .map_err(EmitError::Unsupported)?
-                .ok_or_else(|| EmitError::Unsupported(crate::jit::unsupported_reason(&prog)))?,
-        )
+        Some(crate::jit::compile(&prog).map_err(EmitError::Unsupported)?)
     } else {
         None
     };
     Ok(CpuArtifact {
-        prog: Arc::new(prog),
+        prog,
         contract,
         jit,
         grid: ir.grid,
@@ -237,7 +230,6 @@ struct Compiler<'a> {
     tile_index: FxHashMap<usize, u16>,
     locals: Vec<Arc<LocalDecl>>,
     local_index: FxHashMap<usize, u16>,
-    maps: Vec<MultiFlattenMap>,
     arena_bytes: u32,
     has_atomic: bool,
     /// Collective statements hoisted in front of the statement being compiled.
@@ -257,7 +249,6 @@ impl<'a> Compiler<'a> {
             tile_index: FxHashMap::default(),
             locals: Vec::new(),
             local_index: FxHashMap::default(),
-            maps: Vec::new(),
             arena_bytes: 0,
             has_atomic: false,
             pre: Vec::new(),
@@ -359,14 +350,6 @@ impl<'a> Compiler<'a> {
         idx
     }
 
-    fn map_of(&mut self, m: &MultiFlattenMap) -> u16 {
-        if let Some(i) = self.maps.iter().position(|x| x == m) {
-            return i as u16;
-        }
-        self.maps.push(m.clone());
-        (self.maps.len() - 1) as u16
-    }
-
     fn push(&mut self, i: Instr) -> Slot {
         let out = i.out();
         self.tape.push(i);
@@ -409,7 +392,7 @@ impl<'a> Compiler<'a> {
                 let buf = self.buffer_of(&dst.buffer)?;
                 let elem = scalar_of(dst.buffer.element)?;
                 let prep = self.begin();
-                let index = self.compile_addr(&dst.layout, dst.offset, addr)?;
+                let index = self.compile_addr(dst.offset, addr)?;
                 let v = self.compile_expr(value)?;
                 let v = self.coerce_store(v, value, elem)?;
                 let m = self.compile_mask(mask)?;
@@ -563,14 +546,6 @@ impl<'a> Compiler<'a> {
                                 .into(),
                         ));
                     }
-                    fusor_ir::ir::kernel::ReduceKind::Loop { .. } => {
-                        return Err(EmitError::Unsupported(
-                            "a multi-lane loop reduction seeds from the carrier's identities, \
-                             which the lowering carries: build the per-lane loop with Stmt::Loop \
-                             and close with ReduceKind::Workgroup"
-                                .into(),
-                        ));
-                    }
                 };
                 let block = self.ir.block.max(1);
                 if group == 0
@@ -624,7 +599,7 @@ impl<'a> Compiler<'a> {
         })
     }
 
-    /// Hoist every `Reduce{Workgroup|Loop}` reachable from a statement into a
+    /// Hoist every collective reduction reachable from a statement into a
     /// collective staging pass in front of it, and record the tile read that
     /// replaces it.
     fn stage_reduces_in(&mut self, s: &Stmt) -> std::result::Result<(), EmitError> {
@@ -644,32 +619,11 @@ impl<'a> Compiler<'a> {
         let TileExprKind::Reduce { op, kind, value } = e.kind() else {
             return Ok(());
         };
-        let (tile, scratch, group, iterations, index) = match &**kind {
+        let (tile, scratch, group) = match &**kind {
             fusor_ir::ir::kernel::ReduceKind::Workgroup {
                 scratch,
                 group_size,
-            } => (
-                self.tile_of(scratch),
-                Arc::clone(scratch),
-                *group_size,
-                None,
-                None,
-            ),
-            fusor_ir::ir::kernel::ReduceKind::Loop {
-                iterations,
-                index,
-                scratch,
-                group_size,
-            } => {
-                let li = self.local_of(index);
-                (
-                    self.tile_of(scratch),
-                    Arc::clone(scratch),
-                    *group_size,
-                    Some(*iterations),
-                    Some(li),
-                )
-            }
+            } => (self.tile_of(scratch), Arc::clone(scratch), *group_size),
             fusor_ir::ir::kernel::ReduceKind::Subgroup => {
                 let scratch = Arc::new(TileDecl::new(
                     e.element(),
@@ -680,8 +634,6 @@ impl<'a> Compiler<'a> {
                     self.tile_of(&scratch),
                     scratch,
                     self.width.min(self.ir.block.max(1)),
-                    None,
-                    None,
                 )
             }
         };
@@ -689,23 +641,12 @@ impl<'a> Compiler<'a> {
         let v = self.compile_expr(value)?;
         let prep = start..self.end();
         let group = group.max(1);
-        self.pre.push(match (iterations, index) {
-            (Some(iterations), Some(index)) => CStmt::LoopTree {
-                prep,
-                tile,
-                value: v,
-                op: *op,
-                group,
-                iterations,
-                index,
-            },
-            _ => CStmt::StageTree {
-                prep,
-                tile,
-                value: v,
-                op: *op,
-                group,
-            },
+        self.pre.push(CStmt::StageTree {
+            prep,
+            tile,
+            value: v,
+            op: *op,
+            group,
         });
         // The replacement read: `tile[(lane / group) * group]`.
         let u32_ty = ElementType::Scalar(ScalarElement::U32);
@@ -728,27 +669,11 @@ impl<'a> Compiler<'a> {
         Ok(())
     }
 
-    fn compile_addr(
-        &mut self,
-        layout: &fusor_ir::ir::kernel::TileLayout,
-        offset: u32,
-        addr: &Addr,
-    ) -> std::result::Result<Slot, EmitError> {
+    fn compile_addr(&mut self, offset: u32, addr: &Addr) -> std::result::Result<Slot, EmitError> {
         let base = match addr {
             Addr::Linear(e) => self.compile_expr(e)?,
-            Addr::Rc2 { row, col } => {
-                // A rank-2 address runs both coordinates through the declared
-                // divmod chain; nothing else does.
-                let r = self.compile_expr(row)?;
-                let c = self.compile_expr(col)?;
-                let map = self.map_of(&layout.indexing);
-                let out = self.slot();
-                self.push(Instr::Rc2Index {
-                    out,
-                    row: r,
-                    col: c,
-                    map,
-                })
+            Addr::Rc2 { .. } => {
+                return Err(EmitError::Unsupported("CPU rank-2 address".into()));
             }
         };
         if offset == 0 {
@@ -892,7 +817,7 @@ impl<'a> Compiler<'a> {
                     let elem = scalar_of(view.buffer.element)?;
                     let form = access::form_of(&view.layout, addr);
                     access::note_form(form);
-                    let index = self.compile_addr(&view.layout, view.offset, addr)?;
+                    let index = self.compile_addr(view.offset, addr)?;
                     let m = self.compile_mask(mask)?;
                     let f = self.compile_value(fill)?;
                     let out = self.slot();
@@ -1084,34 +1009,14 @@ impl<'a> Compiler<'a> {
                     component: *component,
                 })
             }
-            K::Dot { left, right } => {
-                let a = self.compile_expr(left)?;
-                let b = self.compile_expr(right)?;
-                let lanes = match left.element() {
-                    ElementType::Vector { lanes, .. } => lanes,
-                    _ => 1,
-                };
-                let out = self.slot();
-                self.push(Instr::Dot { out, a, b, lanes })
+            K::Dot { .. } => {
+                return Err(EmitError::Unsupported("CPU vector dot expression".into()));
             }
-            K::Reduce { op, kind, value } => match &**kind {
-                fusor_ir::ir::kernel::ReduceKind::Subgroup => {
-                    let x = self.compile_value(value)?;
-                    let out = self.slot();
-                    self.push(Instr::Reduce {
-                        out,
-                        op: *op,
-                        x,
-                        kind: RKind::Subgroup,
-                        group_base: 0,
-                    })
-                }
-                _ => {
-                    return Err(EmitError::Validation(
-                        "a workgroup reduce was not staged before its consumer".into(),
-                    ));
-                }
-            },
+            K::Reduce { .. } => {
+                return Err(EmitError::Validation(
+                    "a reduce was not staged before its consumer".into(),
+                ));
+            }
             K::CoopLoad { .. } | K::CoopMma { .. } | K::CoopZero { .. } => {
                 return Err(EmitError::MissingCapability(
                     "cooperative matrix: the CPU target reports no coop config",
@@ -1192,46 +1097,10 @@ fn collect_group_reduces(
     }
     // Children first: a reduce nested inside another reduce's value must be
     // staged before it.
-    for c in children_of(e) {
-        collect_group_reduces(&c, out, seen);
-    }
+    e.kind()
+        .visit_children(&mut |child| collect_group_reduces(child, out, seen));
     if matches!(e.kind(), TileExprKind::Reduce { .. }) && !out.contains(e) {
         out.push(e.clone());
-    }
-}
-
-fn children_of(e: &TileExpr) -> Vec<TileExpr> {
-    use TileExprKind as K;
-    match e.kind() {
-        K::Literal(_) | K::Builtin(_) | K::LoadLocal(_) => vec![],
-        K::Load {
-            addr, mask, fill, ..
-        } => {
-            let mut v = match &**addr {
-                Addr::Linear(e) => vec![e.clone()],
-                Addr::Rc2 { row, col } => vec![row.clone(), col.clone()],
-            };
-            v.push(mask.clone());
-            v.push(fill.clone());
-            v
-        }
-        K::LoadTile { index, .. } => vec![index.clone()],
-        K::Unary { value, .. }
-        | K::Round { value, .. }
-        | K::Cast { value, .. }
-        | K::Bitcast { value, .. } => vec![value.clone()],
-        K::Binary { left, right, .. } | K::Compare { left, right, .. } | K::Dot { left, right } => {
-            vec![left.clone(), right.clone()]
-        }
-        K::Select {
-            condition,
-            accept,
-            reject,
-        } => vec![condition.clone(), accept.clone(), reject.clone()],
-        K::Vec { parts, .. } => parts.clone(),
-        K::VecComponent { vector, .. } => vec![vector.clone()],
-        K::Reduce { value, .. } => vec![value.clone()],
-        K::CoopLoad { .. } | K::CoopMma { .. } | K::CoopZero { .. } => vec![],
     }
 }
 

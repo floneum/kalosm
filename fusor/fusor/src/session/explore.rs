@@ -15,7 +15,7 @@
 //! changed launches are timed together and their sum is judged against the
 //! sum of the incumbent's per-launch windows at its changed launches.
 //!
-//! Every arm is a `verify_plan`-checked plan over members of the same
+//! Every arm is a plan constructed over equivalent members of the same
 //! e-classes, so selection is pure performance. A substitution is safe on an
 //! impure plan (the decode step's KV append): the arm runs once, instead of
 //! the incumbent, so the plan's one write happens exactly once either way.
@@ -111,6 +111,26 @@ pub(super) struct ExploreState {
     keys: FxHashMap<ReplayKey, KeyState>,
     /// Insertion order, for FIFO eviction.
     order: Vec<ReplayKey>,
+    #[cfg(not(target_arch = "wasm32"))]
+    preparation: Option<Preparation>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+struct Preparation {
+    arena: u64,
+    incumbent: fusor_ir::extract::PlanHash,
+    candidate: fusor_ir::extract::PlanHash,
+    uploads: Vec<(Id, Arc<Vec<u8>>)>,
+    job: std::thread::JoinHandle<fusor_ir::Result<Vec<fusor_ir::target::Buf>>>,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+impl Drop for ExploreState {
+    fn drop(&mut self) {
+        if let Some(preparation) = self.preparation.take() {
+            let _ = preparation.job.join();
+        }
+    }
 }
 
 #[derive(Default)]
@@ -143,11 +163,8 @@ struct ArmSet {
     pending: Vec<usize>,
     /// The incumbent's step-transient bytes: the memory bar arms are held to.
     step_bytes: u64,
-    /// Per label, the smallest step-transient total any plan realizing it has
-    /// come out at against this incumbent. A label is skipped only when even
-    /// its cheapest realization is over budget, so a label that has ever fit
-    /// is never skipped.
-    over_budget: FxHashMap<String, u64>,
+    /// Smallest observed transient allocation per launch and candidate label.
+    over_budget: FxHashMap<(usize, String), u64>,
     /// Arms of the launch currently being explored, one launch at a time.
     arms: Vec<Arm>,
 }
@@ -179,6 +196,8 @@ enum Gran {
 struct Arm {
     ix: usize,
     label: String,
+    #[cfg(not(target_arch = "wasm32"))]
+    prepared: bool,
     /// The candidate itself, built by [`Session::materialize_arm`] on the
     /// step this arm is first run, and `None` until then.
     plan: Option<Arc<Plan>>,
@@ -259,7 +278,7 @@ impl ArmSet {
         };
         if self
             .over_budget
-            .get(label)
+            .get(&(ix, label.to_owned()))
             .is_some_and(|&b| b > self.step_bytes.saturating_add(ARM_EXTRA_BYTES))
         {
             return false;
@@ -363,6 +382,24 @@ impl ExploreRun {
 }
 
 impl Session {
+    pub(super) fn explore_prior(
+        &self,
+        graph: &GraphRef,
+        roots: &[Id],
+        key: ReplayKey,
+        incumbent: Arc<Plan>,
+    ) -> Arc<Plan> {
+        if epsilon() == 0 || verify_members() || self.inner.tune.is_empty() {
+            return incumbent;
+        }
+        let mut set = ArmSet::metadata(graph, &incumbent);
+        let plan = self
+            .adopt_persisted(graph, roots, &incumbent, &mut set)
+            .unwrap_or(incumbent);
+        self.inner.explore.lock().key_mut(key).arms = Some(set);
+        plan
+    }
+
     /// Decide what this replay-hit resolve runs. `None` on most resolves —
     /// not an epsilon step, or the explorer is off.
     pub(super) fn explore_step(
@@ -379,17 +416,16 @@ impl Session {
         let mut state = self.inner.explore.lock();
         let ks = state.key_mut(key);
         ks.counter += 1;
-        // First replay hit of this key in this process: turn the persisted
-        // windows into adoptions in one pass, before any sequential
-        // exploration. Every swap clears the same bar `maybe_adopt` enforces.
-        if ks.counter == 1 && self.adopt_persisted(graph, roots, key, incumbent) {
-            // The next resolve replays the adopted plan; exploring the
-            // displaced incumbent now would file arms against dead labels.
-            return None;
-        }
         if !ks.counter.is_multiple_of(eps) {
             return None;
         }
+        let ExploreState {
+            keys,
+            #[cfg(not(target_arch = "wasm32"))]
+            preparation,
+            ..
+        } = &mut *state;
+        let ks = keys.get_mut(&key).expect("ensured above");
 
         // The arms must describe the plan that is actually incumbent.
         if ks
@@ -455,6 +491,7 @@ impl Session {
                 // The window ranks a label this incumbent cannot realize.
                 None => {
                     set.arms.remove(i);
+                    return None;
                 }
             }
         }
@@ -475,18 +512,22 @@ impl Session {
                     let g = graph.state().egraph.lock();
                     self.inner.extractor.launch_variant_labels(
                         &g,
+                        roots,
                         incumbent,
                         ix,
+                        self.inner.cost.as_ref(),
                         autotune_min_macs(),
                     )
                 };
                 let tune = &self.inner.tune;
                 let worth: Vec<Arm> = labels
                     .into_iter()
-                    .filter(|label| set.worth_building(tune, ix, label))
-                    .map(|label| Arm {
+                    .filter(|(label, _)| set.worth_building(tune, ix, label))
+                    .map(|(label, _)| Arm {
                         ix,
                         label,
+                        #[cfg(not(target_arch = "wasm32"))]
+                        prepared: false,
                         plan: None,
                         gran: None,
                     })
@@ -498,32 +539,27 @@ impl Session {
             }
         }
 
-        // Least-observed arm first; ties break by label so a run is
-        // reproducible. The chosen arm is built here and nowhere else; a
-        // label that cannot be realized is dropped and the
-        // next-least-observed label takes the step.
-        let arm_ix = loop {
-            let Some(i) = set
-                .arms
-                .iter()
-                .enumerate()
-                .min_by_key(|(_, a)| {
-                    let (f, l) = set.arm_field(a);
-                    (self.inner.tune.observations(f, l), a.label.clone())
-                })
-                .map(|(i, _)| i)
-            else {
-                break None;
-            };
-            if set.arms[i].plan.is_some() {
-                break Some(i);
-            }
-            if self.materialize_arm(graph, roots, incumbent, set, i, whole) {
-                break Some(i);
-            }
+        // One new candidate per epsilon step, least observed then cheapest.
+        let arm_ix = set
+            .arms
+            .iter()
+            .enumerate()
+            .min_by_key(|(i, a)| {
+                let (f, l) = set.arm_field(a);
+                (self.inner.tune.observations(f, l), *i)
+            })
+            .map(|(i, _)| i);
+        if let Some(i) = arm_ix
+            && set.arms[i].plan.is_none()
+            && !self.materialize_arm(graph, roots, incumbent, set, i, whole)
+        {
             set.arms.remove(i);
-        };
+            return None;
+        }
         let counter = ks.counter;
+        #[cfg(not(target_arch = "wasm32"))]
+        let preparing = arm_ix
+            .is_some_and(|i| !self.prepare_arm(graph, incumbent, &mut set.arms[i], preparation));
         let (run, focus) = match arm_ix {
             Some(i) => {
                 let arm = &set.arms[i];
@@ -548,6 +584,10 @@ impl Session {
                         focus,
                     )
                 } else {
+                    #[cfg(not(target_arch = "wasm32"))]
+                    if preparing {
+                        return None;
+                    }
                     let focus = match arm.gran() {
                         Gran::Diff { cand, .. } => cand.clone(),
                         _ => vec![arm.ix],
@@ -598,6 +638,86 @@ impl Session {
         Some(run)
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn prepare_arm(
+        &self,
+        graph: &GraphRef,
+        incumbent: &Plan,
+        arm: &mut Arm,
+        preparation: &mut Option<Preparation>,
+    ) -> bool {
+        let plan = arm.plan.as_ref().expect("materialized before preparation");
+        let arena = graph.state().egraph.lock().arena_id();
+        if preparation.as_ref().is_some_and(|p| p.job.is_finished()) {
+            let prepared = preparation.take().unwrap();
+            let matches = prepared.arena == arena
+                && prepared.incumbent == incumbent.hash
+                && prepared.candidate == plan.hash;
+            if let Ok(Ok(buffers)) = prepared.job.join()
+                && matches
+            {
+                for ((id, bytes), buffer) in prepared.uploads.into_iter().zip(buffers) {
+                    graph.bind_prepared_leaf(id, &bytes, buffer);
+                }
+            }
+            if matches {
+                // Failed or stale uploads fall back to ordinary leaf resolution.
+                arm.prepared = true;
+                return true;
+            }
+        }
+        if arm.prepared || matches!(arm.gran(), Gran::Whole) {
+            return true;
+        }
+        if preparation.is_some() {
+            return false;
+        }
+        let changed = match arm.gran() {
+            Gran::Diff { cand, .. } => cand.as_slice(),
+            _ => std::slice::from_ref(&arm.ix),
+        };
+        let mut ids = changed
+            .iter()
+            .flat_map(|&ix| plan.launches[ix].bindings.iter().map(|b| b.value))
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        let uploads: Vec<_> = graph
+            .external_leaf_buffers(&ids)
+            .into_iter()
+            .filter(|(_, buffer)| buffer.is_none())
+            .filter_map(|(id, _)| graph.leaf_bytes_shared(id).map(|bytes| (id, bytes)))
+            .collect();
+        let dims = graph.dim_bindings();
+        let job = match &self.inner.device {
+            Backend::Gpu(target) => target.prepare_resources(
+                plan,
+                &graph.state().egraph.lock(),
+                &dims,
+                changed,
+                uploads.iter().map(|(_, bytes)| Arc::clone(bytes)).collect(),
+            ),
+            #[cfg(feature = "cpu")]
+            Backend::Cpu(_) => unreachable!(),
+        };
+        match job {
+            Ok(Some(job)) => {
+                *preparation = Some(Preparation {
+                    arena,
+                    incumbent: incumbent.hash,
+                    candidate: plan.hash,
+                    uploads,
+                    job,
+                });
+                false
+            }
+            _ => {
+                arm.prepared = true;
+                true
+            }
+        }
+    }
+
     /// Build the candidate one arm names and classify how it is measured.
     /// `false` when the label realizes no plan this step may run — an
     /// illegal selection, a plan that fails to build or verify, a working
@@ -626,8 +746,15 @@ impl Session {
             )
         };
         let Some(plan) = plan else { return false };
+        if tune_log() {
+            eprintln!(
+                "[tune] candidate L{ix} `{label}`: modeled {:.1} us vs incumbent {:.1} us",
+                plan.cost.0 as f64 / 1e6,
+                incumbent.cost.0 as f64 / 1e6,
+            );
+        }
         let bytes = plan_step_bytes(&plan);
-        let entry = set.over_budget.entry(label.clone()).or_insert(bytes);
+        let entry = set.over_budget.entry((ix, label.clone())).or_insert(bytes);
         *entry = (*entry).min(bytes);
         if bytes > set.step_bytes.saturating_add(ARM_EXTRA_BYTES) {
             return false;
@@ -796,35 +923,22 @@ impl Session {
     }
 
     /// Adopt every launch whose persisted windows already hold a qualifying
-    /// winner, in one sequential pass. Returns whether the replay memo was
-    /// updated.
+    /// winner before the first production execution of a newly extracted plan.
     ///
     /// Each swap clears exactly the bar [`Self::maybe_adopt`] enforces, but
     /// runs off windows written by past processes, so a prior becomes a plan
-    /// at the first replay hit. Later launches replan against the
+    /// before it is compiled. Later launches replan against the
     /// already-adopted earlier swaps.
     fn adopt_persisted(
         &self,
         graph: &GraphRef,
         roots: &[Id],
-        key: ReplayKey,
         incumbent: &Arc<Plan>,
-    ) -> bool {
+        set: &mut ArmSet,
+    ) -> Option<Arc<Plan>> {
         let tune = &self.inner.tune;
-        let (sigs, mut labels) = {
-            let g = graph.state().egraph.lock();
-            let sigs: Vec<String> = incumbent
-                .launches
-                .iter()
-                .map(|l| launch_signature(&g, l))
-                .collect();
-            let labels: Vec<String> = (0..incumbent.launches.len())
-                .map(|ix| {
-                    incumbent_signature(&g, incumbent, ix).unwrap_or_else(|| "base".to_string())
-                })
-                .collect();
-            (sigs, labels)
-        };
+        let sigs = &set.launch_sigs;
+        let labels = &set.incumbent_labels;
         let mut current = Arc::clone(incumbent);
         let mut adopted = 0usize;
         // The qualifying winners, from window lookups alone: same window-min
@@ -874,9 +988,6 @@ impl Session {
                     }
                 }
                 adopted = winners.len();
-                for (j, name) in &winners {
-                    labels[*j] = name.clone();
-                }
                 current = Arc::new(plan);
             }
         }
@@ -900,7 +1011,7 @@ impl Session {
                         autotune_min_macs(),
                     )
                 };
-                let Some((label, plan)) = variants
+                let Some((_, plan)) = variants
                     .into_iter()
                     .find(|(l, p)| *l == best_name && plans_align(p, &current, j))
                 else {
@@ -914,7 +1025,6 @@ impl Session {
                     );
                 }
                 current = Arc::new(plan);
-                labels[j] = label;
                 adopted += 1;
             }
         }
@@ -922,29 +1032,13 @@ impl Session {
         // raced at diff granularity (see `Gran::Diff`) off the persisted
         // windows.
         let mut rounds = 0usize;
-        'diff: while rounds < DIFF_SCAN_TOP_K {
+        if adopted > 0 {
+            *set = ArmSet::metadata(graph, &current);
+        }
+        'diff: while rounds < DIFF_SCAN_TOP_K && tune.has_observations_with_prefix("diff:", MIN_OBS)
+        {
             rounds += 1;
-            let (sigs, labels, works) = {
-                let g = graph.state().egraph.lock();
-                let sigs: Vec<String> = current
-                    .launches
-                    .iter()
-                    .map(|l| launch_signature(&g, l))
-                    .collect();
-                let labels: Vec<String> = (0..current.launches.len())
-                    .map(|ix| {
-                        incumbent_signature(&g, &current, ix).unwrap_or_else(|| "base".to_string())
-                    })
-                    .collect();
-                let works: Vec<u64> = (0..current.launches.len())
-                    .map(|ix| launch_work(&g, &current, ix))
-                    .collect();
-                (sigs, labels, works)
-            };
-            let plan_field = plan_key(&sigs.join(";"));
-            let mut order: Vec<usize> = (0..works.len()).collect();
-            order.sort_by_key(|&j| (std::cmp::Reverse(works[j]), j));
-            for &j in order.iter().take(DIFF_SCAN_TOP_K) {
+            for &j in set.pending.iter().rev().take(DIFF_SCAN_TOP_K) {
                 let variants = {
                     let g = graph.state().egraph.lock();
                     self.inner.extractor.launch_variants(
@@ -971,7 +1065,7 @@ impl Session {
                     if cand.is_empty() || inc.is_empty() {
                         continue;
                     }
-                    let field = diff_field(&plan_field, &sigs, &inc);
+                    let field = diff_field(&set.plan_field, &set.launch_sigs, &inc);
                     if tune.observations(&field, &label) < MIN_OBS {
                         continue;
                     }
@@ -980,7 +1074,7 @@ impl Session {
                     };
                     let Some(b) = inc
                         .iter()
-                        .map(|&t| tune.window_min(&sigs[t], &labels[t]))
+                        .map(|&t| tune.window_min(&set.launch_sigs[t], &set.incumbent_labels[t]))
                         .sum::<Option<u64>>()
                     else {
                         continue;
@@ -994,6 +1088,7 @@ impl Session {
                         }
                         current = Arc::new(plan);
                         adopted += 1;
+                        *set = ArmSet::metadata(graph, &current);
                         continue 'diff;
                     }
                 }
@@ -1001,13 +1096,12 @@ impl Session {
             break;
         }
         if adopted == 0 {
-            return false;
+            return None;
         }
         if tune_log() {
             eprintln!("[tune] adopted {adopted} launch(es) from the persisted prior");
         }
-        self.inner.replay.insert(key, (*current).clone());
-        true
+        Some(current)
     }
 
     /// Adopt the just-run arm if its window minimum beats the incumbent's by

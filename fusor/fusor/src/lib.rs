@@ -20,9 +20,8 @@
 //! [`autograd`] is the differentiable const-rank tensor on top of all of it,
 //! with the tape, `with_backwards` and the gradient map.
 //!
-//! Every op is a thin builder that mints Logical nodes. Macro ops union the
-//! sugar node with its `defn` expansion in the same call; how many kernels an
-//! op launches is the extractor's answer, not the caller's.
+//! Operations build Logical nodes. Composite operations expand into the same
+//! graph, where extraction chooses fusion and materialization together.
 
 #![warn(missing_docs, unreachable_pub)]
 
@@ -38,21 +37,12 @@ pub mod graph;
 pub mod layers;
 pub(crate) mod ops;
 pub mod optim;
+#[cfg(feature = "gpu")]
+pub mod program;
 pub mod quantized;
 pub mod sampling;
 pub mod session;
 pub mod tensor;
-
-/// The intended public surface, restated as `use` lines, so it cannot
-/// silently drift. Test-only: it defines no public item.
-#[cfg(test)]
-mod api_surface;
-
-/// The trainer's API surface, restated so a regression is a compile error
-/// here. Test-only: it defines no public item. The trainer selects between
-/// both backends, so the restatement needs both.
-#[cfg(all(test, feature = "cpu", feature = "gpu"))]
-mod trainer_surface;
 
 pub use device::Device;
 pub use tensor::typed::{Axis, Element, Minus1, Minus2, Tensor, cat, stack};

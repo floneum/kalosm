@@ -5,7 +5,7 @@
 
 use std::collections::HashMap;
 use std::mem;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cranelift_codegen::ir::{
     AbiParam, FuncRef, InstBuilder, MemFlags, StackSlotData, StackSlotKind, UserFuncName, Value,
@@ -448,362 +448,26 @@ impl NativeModule {
     }
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct MapKey {
-    tape: Vec<Instr>,
-    block: u32,
-    width: u32,
-    regs: usize,
-    stores: Vec<StoreKey>,
-}
-
-#[derive(Clone, PartialEq, Eq, Hash)]
-struct StoreKey {
-    prep: std::ops::Range<u32>,
-    buf: u16,
-    elem: ScalarElement,
-    index: u32,
-    value: u32,
-    mask: u32,
-}
-
-impl MapKey {
-    fn of(prog: &Program) -> Option<Self> {
-        let [segment] = prog.segments.as_slice() else {
-            return None;
-        };
-        if segment.stmts.is_empty() {
-            return None;
-        }
-        let stores = segment
-            .stmts
-            .iter()
-            .map(|stmt| {
-                let CStmt::Store {
-                    prep,
-                    buf,
-                    elem,
-                    index,
-                    value,
-                    mask,
-                } = stmt
-                else {
-                    return None;
-                };
-                Some(StoreKey {
-                    prep: prep.clone(),
-                    buf: *buf,
-                    elem: *elem,
-                    index: *index,
-                    value: *value,
-                    mask: *mask,
-                })
-            })
-            .collect::<Option<Vec<_>>>()?;
-        let tape_end = stores.iter().map(|store| store.prep.end).max()? as usize;
-        if prog.locals != 0 || !prog.tiles.is_empty() || tape_end > prog.tape.len() {
-            return None;
-        }
-        Some(Self {
-            tape: prog.tape[..tape_end].to_vec(),
-            block: prog.block,
-            width: prog.width,
-            regs: prog.regs,
-            stores,
-        })
-    }
-}
-
-pub(crate) fn compile(prog: &Program) -> Result<Option<JitKernel>, String> {
-    static CACHE: OnceLock<Mutex<HashMap<MapKey, JitKernel>>> = OnceLock::new();
-    if let Some(key) = MapKey::of(prog) {
-        let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
-        if let Some(hit) = cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(&key)
-            .copied()
-        {
-            return Ok(Some(hit));
-        }
-        if let Some(kernel) = compile_uncached(&key)? {
-            cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(key, kernel);
-            return Ok(Some(kernel));
-        }
-    }
-    compile_fold_cached(prog)
-}
-
-pub(crate) fn unsupported_reason(prog: &Program) -> String {
-    fn stmt_reason(stmt: &CStmt) -> Option<String> {
-        match stmt {
-            CStmt::Store { .. } | CStmt::StoreLocal { .. } | CStmt::StoreTile { .. } => None,
-            CStmt::If { accept, reject, .. } => accept.iter().chain(reject).find_map(stmt_reason),
-            CStmt::Loop {
-                count: Some(_),
-                body,
-                ..
-            } => body.iter().find_map(stmt_reason),
-            CStmt::Loop { count: None, .. } => Some("unbounded loop".into()),
-            CStmt::StageTree { group, .. } if *group > 0 && group.is_power_of_two() => None,
-            CStmt::CarrierTree {
-                tiles,
-                values,
-                lhs,
-                rhs,
-                merged,
-                outs,
-                group,
-                ..
-            } if *group > 0
-                && group.is_power_of_two()
-                && tiles.len() == values.len()
-                && tiles.len() == lhs.len()
-                && tiles.len() == rhs.len()
-                && tiles.len() == merged.len()
-                && tiles.len() == outs.len() =>
-            {
-                None
-            }
-            CStmt::CarrierTree {
-                tiles,
-                values,
-                lhs,
-                rhs,
-                merged,
-                outs,
-                group,
-                ..
-            } => Some(format!(
-                "invalid carrier tree group={group}, arities={}/{}/{}/{}/{}/{}",
-                tiles.len(),
-                values.len(),
-                lhs.len(),
-                rhs.len(),
-                merged.len(),
-                outs.len()
-            )),
-            other => Some(format!("unsupported statement {other:?}")),
-        }
-    }
-
-    if let Some(tile) = prog
-        .tiles
-        .iter()
-        .find(|tile| tile.elem != ScalarElement::F32)
-    {
-        return format!("fold scratch is {:?}, not F32", tile.elem);
-    }
-    if let Some(reason) = prog
-        .segments
-        .iter()
-        .flat_map(|segment| &segment.stmts)
-        .find_map(stmt_reason)
-    {
-        return reason;
-    }
-    if let Some(instr) = prog.tape.iter().find(|instr| {
-        matches!(
-            instr,
-            Instr::Dot { .. } | Instr::Reduce { .. } | Instr::Rc2Index { .. }
-        )
-    }) {
-        return format!("unsupported fold instruction {instr:?}");
-    }
-    "program did not match a native map or fold form".into()
-}
-
-fn compile_uncached(key: &MapKey) -> Result<Option<JitKernel>, String> {
-    if key.tape.iter().any(unsupported) {
-        return Ok(None);
-    }
-
-    let mut module = NativeModule::new()?;
-    let ptr_ty = module.ptr_ty;
-    let (id, mut ctx, helpers) = module.function("fusor2_map", 0)?;
-    let mut func_ctx = FunctionBuilderContext::new();
-    {
-        let mut b = FunctionBuilder::new(&mut ctx.func, &mut func_ctx);
-        let entry = b.create_block();
-        let head = b.create_block();
-        let body = b.create_block();
-        let done = b.create_block();
-        b.append_block_params_for_function_params(entry);
-        b.append_block_param(head, types::I32);
-        b.switch_to_block(entry);
-        let params = b.block_params(entry).to_vec();
-        let zero = b.ins().iconst(types::I32, 0);
-        b.ins().jump(head, &[zero.into()]);
-
-        b.switch_to_block(head);
-        let lane_base = b.block_params(head)[0];
-        let limit = b.ins().iconst(types::I32, key.block as i64);
-        let more = b.ins().icmp(IntCC::UnsignedLessThan, lane_base, limit);
-        b.ins().brif(more, body, &[], done, &[]);
-
-        b.switch_to_block(body);
-        // Cranelift intentionally has no loop vectorizer. Unrolling four
-        // independent lanes exposes their address arithmetic and scalar math
-        // to its scheduler while deleting three quarters of the loop control.
-        // CPU blocks are normally powers of two; retain the scalar loop for a
-        // non-divisible custom block so no tail mask has to be invented.
-        let unroll = if key.block >= 4 && key.block.is_multiple_of(4) {
-            4
-        } else {
-            1
-        };
-        for offset in 0..unroll {
-            let lane = if offset == 0 {
-                lane_base
-            } else {
-                b.ins().iadd_imm(lane_base, offset as i64)
-            };
-            let mut regs = vec![None; key.regs.max(1)];
-            let env = Env {
-                bufs: params[0],
-                gid: [params[1], params[2], params[3]],
-                grid: [params[4], params[5], params[6]],
-                lane,
-                block: key.block,
-                width: key.width,
-                ptr_ty,
-            };
-            for store in &key.stores {
-                for instr in &key.tape[store.prep.start as usize..store.prep.end as usize] {
-                    emit_instr(&mut b, instr, &mut regs, &env, &helpers)?;
-                }
-                let (dst_ptr, dst_bytes) = raw_buf(&mut b, params[0], store.buf, ptr_ty);
-                if matches!(
-                    store.elem,
-                    ScalarElement::F32
-                        | ScalarElement::U32
-                        | ScalarElement::I32
-                        | ScalarElement::Bool
-                ) {
-                    let write = b.create_block();
-                    let next_store = b.create_block();
-                    let (valid, address) = direct_u32_address(
-                        &mut b,
-                        dst_ptr,
-                        dst_bytes,
-                        reg(&regs, store.index)?,
-                        reg(&regs, store.mask)?,
-                        ptr_ty,
-                    );
-                    b.ins().brif(valid, write, &[], next_store, &[]);
-                    b.switch_to_block(write);
-                    b.ins()
-                        .store(memory(), reg(&regs, store.value)?, address, 0);
-                    b.ins().jump(next_store, &[]);
-                    b.switch_to_block(next_store);
-                } else {
-                    let elem_code = b.ins().iconst(types::I32, elem_code(store.elem) as i64);
-                    b.ins().call(
-                        helpers.write,
-                        &[
-                            dst_ptr,
-                            dst_bytes,
-                            reg(&regs, store.index)?,
-                            reg(&regs, store.value)?,
-                            reg(&regs, store.mask)?,
-                            elem_code,
-                        ],
-                    );
-                }
-            }
-        }
-        let next = b.ins().iadd_imm(lane_base, unroll as i64);
-        b.ins().jump(head, &[next.into()]);
-
-        b.switch_to_block(done);
-        b.ins().return_(&[]);
-        b.seal_all_blocks();
-        b.finalize();
-    }
-    Ok(Some(module.finish(id, ctx)?))
-}
-
-fn compile_fold_cached(prog: &Program) -> Result<Option<JitKernel>, String> {
-    if !fold_supported(prog) {
-        return Ok(None);
-    }
-    static CACHE: OnceLock<Mutex<HashMap<String, JitKernel>>> = OnceLock::new();
-    let key = format!("{prog:?}");
+pub(crate) fn compile(prog: &Arc<Program>) -> Result<JitKernel, String> {
+    static CACHE: OnceLock<Mutex<HashMap<Arc<Program>, JitKernel>>> = OnceLock::new();
     let cache = CACHE.get_or_init(|| Mutex::new(HashMap::new()));
     if let Some(hit) = cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .get(&key)
+        .get(prog)
         .copied()
     {
-        return Ok(Some(hit));
+        return Ok(hit);
     }
-    let kernel = compile_fold_uncached(prog)?;
+    let kernel = compile_uncached(prog)?;
     cache
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .insert(key, kernel);
-    Ok(Some(kernel))
+        .insert(Arc::clone(prog), kernel);
+    Ok(kernel)
 }
 
-fn fold_supported(prog: &Program) -> bool {
-    fn stmt(stmt: &CStmt) -> bool {
-        match stmt {
-            CStmt::Store { .. } | CStmt::StoreLocal { .. } | CStmt::StoreTile { .. } => true,
-            CStmt::If { accept, reject, .. } => {
-                accept.iter().chain(reject).all(fold_stmt_supported)
-            }
-            CStmt::StageTree { group, .. } => *group > 0 && group.is_power_of_two(),
-            CStmt::Loop {
-                count: Some(_),
-                body,
-                ..
-            } => body.iter().all(fold_stmt_supported),
-            CStmt::CarrierTree {
-                tiles,
-                values,
-                lhs,
-                rhs,
-                merged,
-                outs,
-                group,
-                ..
-            } => {
-                *group > 0
-                    && group.is_power_of_two()
-                    && tiles.len() == values.len()
-                    && tiles.len() == lhs.len()
-                    && tiles.len() == rhs.len()
-                    && tiles.len() == merged.len()
-                    && tiles.len() == outs.len()
-            }
-            _ => false,
-        }
-    }
-
-    fn fold_stmt_supported(value: &CStmt) -> bool {
-        stmt(value)
-    }
-
-    prog.tiles
-        .iter()
-        .all(|tile| tile.elem == ScalarElement::F32)
-        && prog
-            .segments
-            .iter()
-            .all(|segment| segment.stmts.iter().all(stmt))
-        && prog.tape.iter().all(|instr| {
-            !matches!(
-                instr,
-                Instr::Dot { .. } | Instr::Reduce { .. } | Instr::Rc2Index { .. }
-            )
-        })
-}
-
-fn compile_fold_uncached(prog: &Program) -> Result<JitKernel, String> {
+fn compile_uncached(prog: &Program) -> Result<JitKernel, String> {
     let mut module = NativeModule::new()?;
     let ptr_ty = module.ptr_ty;
     let (id, mut ctx, helpers) = module.function("fusor2_fold", 1)?;
@@ -875,9 +539,27 @@ fn emit_fold_lanes(
     stmts: &[CStmt],
     fold: &FoldEnv<'_>,
 ) -> Result<(), String> {
-    emit_const_loop(b, fold.prog.block, |b, lane| {
-        for stmt in stmts {
-            emit_fold_stmt(b, stmt, lane, fold)?;
+    // Independent map lanes retain four-way unrolling; collective and
+    // loop-carried computations preserve their existing execution order.
+    let unroll = if fold.prog.block.is_multiple_of(4)
+        && stmts.iter().all(|stmt| matches!(stmt, CStmt::Store { .. }))
+        && fold.prog.locals == 0
+        && fold.prog.tiles.is_empty()
+    {
+        4
+    } else {
+        1
+    };
+    emit_const_loop(b, fold.prog.block, unroll, |b, base| {
+        for offset in 0..unroll {
+            let lane = if offset == 0 {
+                base
+            } else {
+                b.ins().iadd_imm(base, offset as i64)
+            };
+            for stmt in stmts {
+                emit_fold_stmt(b, stmt, lane, fold)?;
+            }
         }
         Ok(())
     })
@@ -886,6 +568,7 @@ fn emit_fold_lanes(
 fn emit_const_loop(
     b: &mut FunctionBuilder<'_>,
     limit: u32,
+    step: u32,
     body_fn: impl FnOnce(&mut FunctionBuilder<'_>, Value) -> Result<(), String>,
 ) -> Result<(), String> {
     let head = b.create_block();
@@ -902,7 +585,7 @@ fn emit_const_loop(
     b.ins().brif(more, body, &[], done, &[]);
     b.switch_to_block(body);
     body_fn(b, index)?;
-    let next = b.ins().iadd_imm(index, 1);
+    let next = b.ins().iadd_imm(index, step as i64);
     b.ins().jump(head, &[next.into()]);
     b.switch_to_block(done);
     Ok(())
@@ -928,15 +611,15 @@ fn emit_fold_stmt(
                 b,
                 *buf,
                 *elem,
-                fold_reg(&regs, *index)?,
-                fold_reg(&regs, *value)?,
-                fold_reg(&regs, *mask)?,
+                reg(&regs, *index)?,
+                reg(&regs, *value)?,
+                reg(&regs, *mask)?,
                 fold,
             )?;
         }
         CStmt::StoreLocal { prep, local, value } => {
             let regs = emit_fold_range(b, prep, lane, fold)?;
-            store_local(b, *local, lane, fold_reg(&regs, *value)?, fold);
+            store_local(b, *local, lane, reg(&regs, *value)?, fold);
         }
         CStmt::StoreTile {
             prep,
@@ -946,13 +629,7 @@ fn emit_fold_stmt(
             value,
         } => {
             let regs = emit_fold_range(b, prep, lane, fold)?;
-            store_tile_f32(
-                b,
-                *tile,
-                fold_reg(&regs, *index)?,
-                fold_reg(&regs, *value)?,
-                fold,
-            );
+            store_tile_f32(b, *tile, reg(&regs, *index)?, reg(&regs, *value)?, fold);
         }
         CStmt::If {
             prep,
@@ -962,9 +639,7 @@ fn emit_fold_stmt(
             ..
         } => {
             let regs = emit_fold_range(b, prep, lane, fold)?;
-            let condition = b
-                .ins()
-                .icmp_imm(IntCC::NotEqual, fold_reg(&regs, *cond)?, 0);
+            let condition = b.ins().icmp_imm(IntCC::NotEqual, reg(&regs, *cond)?, 0);
             let accept_block = b.create_block();
             let reject_block = b.create_block();
             let done = b.create_block();
@@ -991,11 +666,11 @@ fn emit_fold_stmt(
         } => {
             let mut prep_regs = vec![None; fold.prog.regs.max(1)];
             emit_fold_range_into(b, prep, lane, fold, &mut prep_regs)?;
-            let count = fold_reg(&prep_regs, *count)?;
+            let count = reg(&prep_regs, *count)?;
             let mut initial = Vec::with_capacity(accs.len());
             for acc in accs {
                 emit_fold_range_into(b, &acc.init_prep, lane, fold, &mut prep_regs)?;
-                initial.push(fold_reg(&prep_regs, acc.init)?);
+                initial.push(reg(&prep_regs, acc.init)?);
             }
             for (acc, value) in accs.iter().zip(initial) {
                 store_local(b, acc.local, lane, value, fold);
@@ -1024,7 +699,7 @@ fn emit_fold_stmt(
             let mut update_regs = prep_regs.clone();
             for acc in accs {
                 emit_fold_range_into(b, &acc.update_prep, lane, fold, &mut update_regs)?;
-                updated.push(fold_reg(&update_regs, acc.update)?);
+                updated.push(reg(&update_regs, acc.update)?);
             }
             for (acc, value) in accs.iter().zip(updated) {
                 store_local(b, acc.local, lane, value, fold);
@@ -1068,10 +743,17 @@ fn emit_fold_stmt(
             outs,
             group,
             fast,
-        } => emit_carrier_tree(
-            b, prep, tiles, values, lhs, rhs, merge_prep, merged, outs, *group, *fast, fold,
-        )?,
-        _ => return Err("unsupported native fold statement".into()),
+        } if tiles.len() == values.len()
+            && tiles.len() == lhs.len()
+            && tiles.len() == rhs.len()
+            && tiles.len() == merged.len()
+            && tiles.len() == outs.len() =>
+        {
+            emit_carrier_tree(
+                b, prep, tiles, values, lhs, rhs, merge_prep, merged, outs, *group, *fast, fold,
+            )?
+        }
+        _ => return Err(format!("unsupported native statement {stmt:?}")),
     }
     Ok(())
 }
@@ -1091,11 +773,18 @@ fn emit_carrier_tree(
     fast: Option<TileReduceOp>,
     fold: &FoldEnv<'_>,
 ) -> Result<(), String> {
+    if !group.is_power_of_two()
+        || tiles
+            .iter()
+            .any(|tile| fold.prog.tiles[*tile as usize].elem != ScalarElement::F32)
+    {
+        return Err("native reduction requires F32 scratch and a power-of-two group".into());
+    }
     // Stage one partial per logical lane.
-    emit_const_loop(b, fold.prog.block, |b, lane| {
+    emit_const_loop(b, fold.prog.block, 1, |b, lane| {
         let regs = emit_fold_range(b, prep, lane, fold)?;
         for (tile, value) in tiles.iter().zip(values) {
-            store_tile_f32(b, *tile, lane, fold_reg(&regs, *value)?, fold);
+            store_tile_f32(b, *tile, lane, reg(&regs, *value)?, fold);
         }
         Ok(())
     })?;
@@ -1164,7 +853,7 @@ fn emit_carrier_tree(
         let regs = emit_fold_range(b, merge_prep, merge_lane, fold)?;
         merged
             .iter()
-            .map(|slot| fold_reg(&regs, *slot))
+            .map(|slot| reg(&regs, *slot))
             .collect::<Result<Vec<_>, _>>()?
     };
     for (tile, value) in tiles.iter().zip(results) {
@@ -1183,7 +872,7 @@ fn emit_carrier_tree(
 
     // Materialize the group result into the output locals expected by the
     // post-reduction store expressions.
-    emit_const_loop(b, fold.prog.block, |b, lane| {
+    emit_const_loop(b, fold.prog.block, 1, |b, lane| {
         let group_base = if group == 1 {
             lane
         } else {
@@ -1239,7 +928,7 @@ fn emit_fold_range_into(
                 elem,
                 index,
             } if *elem == ScalarElement::F32 => {
-                let index = fold_reg(regs, *index)?;
+                let index = reg(regs, *index)?;
                 regs[*out as usize] = Some(load_tile_f32(b, *tile, index, fold));
             }
             _ => emit_instr(b, instr, regs, &env, fold.helpers)?,
@@ -1348,10 +1037,6 @@ fn emit_fold_fast(
     helpers: &Helpers,
 ) -> Value {
     emit_bin(b, op.binary(), NumTy::F32, left, right, helpers)
-}
-
-fn fold_reg(regs: &[Option<Value>], slot: u32) -> Result<Value, String> {
-    reg(regs, slot)
 }
 
 struct Env {
@@ -1511,7 +1196,7 @@ fn emit_instr(
             }
             return Ok(());
         }
-        _ => return Err("unsupported Cranelift map instruction".into()),
+        _ => return Err(format!("unsupported Cranelift instruction {instr:?}")),
     };
     regs[out] = Some(value);
     Ok(())
@@ -1907,16 +1592,6 @@ fn mask_value(b: &mut FunctionBuilder<'_>, c: Value) -> Value {
     b.ins().select(c, t, f)
 }
 
-fn unsupported(i: &Instr) -> bool {
-    matches!(
-        i,
-        Instr::LoadLocal { .. }
-            | Instr::LoadTile { .. }
-            | Instr::Dot { .. }
-            | Instr::Reduce { .. }
-            | Instr::Rc2Index { .. }
-    )
-}
 fn ty_code(v: NumTy) -> u32 {
     match v {
         NumTy::F32 => 0,

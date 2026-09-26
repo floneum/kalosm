@@ -66,8 +66,7 @@ async fn run_fold(
 }
 
 fn fold(x: &Tensor, carrier: Carrier) -> Result<Tensor, CaseError> {
-    x.fold_carrier(carrier, 1)
-        .map_err(|e| -> CaseError { e.to_string().into() })
+    x.fold_carrier(carrier, 1).map_err(Into::into)
 }
 
 /// The `(running max, sum of exp(element - running max))` carrier against a

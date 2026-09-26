@@ -4,35 +4,37 @@
 use crate::dtype::{Dtype, NumericContract, Persistence};
 use crate::error::{Error, Result};
 use crate::facts::ValueFacts;
-use crate::ir::OpDefRegistry;
 use crate::ir::launch::Launch;
-use crate::shape::{Dim, Dims};
+use crate::shape::Dims;
 
 /// Infer the result facts of a Launch node from its operands' facts.
-///
-/// `Launch::Ext` is the one variant this cannot answer alone — its row lives in
-/// the open [`OpDefRegistry`], which only [`crate::CoreSemantics`] holds. Use
-/// [`infer_launch_with`] when you have the registry; this function reports a
-/// typed error rather than guessing.
 pub fn infer_launch(op: &Launch, ins: &[ValueFacts]) -> Result<ValueFacts> {
-    infer_launch_inner(op, ins, None)
-}
-
-/// [`infer_launch`] with the extension registry, so `Launch::Ext` resolves.
-pub fn infer_launch_with(
-    op: &Launch,
-    ins: &[ValueFacts],
-    registry: &OpDefRegistry,
-) -> Result<ValueFacts> {
-    infer_launch_inner(op, ins, Some(registry))
-}
-
-fn infer_launch_inner(
-    op: &Launch,
-    ins: &[ValueFacts],
-    registry: Option<&OpDefRegistry>,
-) -> Result<ValueFacts> {
     match op {
+        Launch::StreamFold {
+            producer,
+            fold,
+            operand,
+            ..
+        } => {
+            if !op.stream_compatible() {
+                return Err(Error::Legality(
+                    "streamed Fold recipes or generated read are incompatible".into(),
+                ));
+            }
+            let count = super::children::children_launch(producer).len();
+            if count > ins.len()
+                || *operand as usize > ins.len() - count
+                || count + super::children::children_launch(fold).len() != ins.len() + 1
+            {
+                return Err(Error::Shape(
+                    "streamed Fold operand facts are incomplete".into(),
+                ));
+            }
+            let produced = infer_launch(producer, &ins[..count])?;
+            let mut inputs = ins[count..].to_vec();
+            inputs.insert(*operand as usize, produced);
+            infer_launch(fold, &inputs)
+        }
         Launch::Map { space, body, .. } => Ok(ValueFacts {
             dtype: body.dtype(),
             shape: space.dims.clone(),
@@ -82,11 +84,13 @@ fn infer_launch_inner(
             })
         }
 
-        // A quantized contraction has no batch axis: its weight side is a
-        // single `[n, k]` matrix.
-        Launch::Contract {
-            m, n, batch, post, ..
-        } => Ok(contract_facts(*m, *n, *batch, post, ins)),
+        Launch::Contract { output, post, .. } => Ok(ValueFacts {
+            dtype: post.dtype(),
+            shape: output.dims.clone(),
+            numeric: meet(ins),
+            persistence: Persistence::Step,
+            outs: 1,
+        }),
         // `QuantizedRows` reads the quantized leaf but *decodes* every
         // element it gathers, so its value is float-typed and step-lived —
         // inheriting the leaf's `Q(fmt)` dtype is exactly the double-decode
@@ -135,61 +139,19 @@ fn infer_launch_inner(
             }),
         },
 
-        Launch::Region {
-            members, live_outs, ..
-        } => {
-            let first = *live_outs.first().ok_or_else(|| {
-                Error::Shape("a Region must declare at least one live output".into())
-            })? as usize;
-            if first >= members.len() {
-                return Err(Error::Shape(format!(
-                    "Region live_out {first} names no member (there are {})",
-                    members.len()
-                )));
+        // A slab is its last member's value; the children are the members in
+        // order, so that is the last of `ins`.
+        Launch::Slab { members, .. } | Launch::Group { members, .. } => {
+            if members.len() < 2 {
+                return Err(Error::Shape("a Slab needs at least two members".into()));
             }
-            let facts = ins.get(first).ok_or_else(|| {
-                Error::Shape(format!("Region member {first} has no inferred facts"))
-            })?;
+            let facts = ins
+                .last()
+                .ok_or_else(|| Error::Shape("a Slab's last member has no inferred facts".into()))?;
             let mut out = facts.clone();
-            out.outs = live_outs.len() as u8;
+            out.outs = 1;
             Ok(out)
         }
-
-        Launch::Ext { def, .. } => {
-            let registry = registry.ok_or_else(|| {
-                Error::Shape(
-                    "Launch::Ext inference needs the OpDefRegistry; call infer_launch_with".into(),
-                )
-            })?;
-            let d = registry
-                .get(*def)
-                .ok_or_else(|| Error::Shape(format!("no OpDef registered as {def:?}")))?;
-            (d.infer)(ins)
-        }
-    }
-}
-
-/// `[batch, m, n]`, dropping a unit batch so a plain `[m, n]` matmul does not
-/// grow a leading axis nothing reads.
-fn contract_facts(
-    m: Dim,
-    n: Dim,
-    batch: Dim,
-    post: &crate::scalar::ScalarExpr,
-    ins: &[ValueFacts],
-) -> ValueFacts {
-    let mut shape: Dims = Dims::new();
-    if !batch.known_eq(Dim::Const(1)) {
-        shape.push(batch);
-    }
-    shape.push(m);
-    shape.push(n);
-    ValueFacts {
-        dtype: post.dtype(),
-        shape,
-        numeric: meet(ins),
-        persistence: Persistence::Step,
-        outs: 1,
     }
 }
 

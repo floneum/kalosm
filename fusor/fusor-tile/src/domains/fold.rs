@@ -48,7 +48,10 @@ pub fn fold_domain(k: Dim, cx: &DomainCtx<'_>) -> FoldDomain {
 /// slow. A wide enough carrier can empty the domain.
 pub fn fold_domain_for(k: Dim, lanes: u64, acc_bytes: u64, cx: &DomainCtx<'_>) -> FoldDomain {
     let caps = cx.caps;
-    let max_block = caps.limits.max_compute_invocations_per_workgroup;
+    let max_block = caps
+        .limits
+        .max_compute_invocations_per_workgroup
+        .min(caps.limits.max_compute_workgroup_size[0]);
     let max_storage = u64::from(caps.limits.max_compute_workgroup_storage_size);
     let fixed_width = caps.subgroups.filter(|s| s.is_fixed()).map(|s| s.assumed());
 

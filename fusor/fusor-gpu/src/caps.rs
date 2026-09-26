@@ -44,46 +44,25 @@ pub(crate) fn baseline_limits() -> wgpu::Limits {
     }
 }
 
-/// Per-field ceilings a caller *proves* it needs. Every field is optional;
-/// `None` leaves the baseline alone.
-#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
-pub(crate) struct LimitWiden {
-    pub max_compute_invocations_per_workgroup: Option<u32>,
-    pub max_compute_workgroup_size_x: Option<u32>,
-    pub max_compute_workgroup_size_y: Option<u32>,
-    pub max_compute_workgroup_size_z: Option<u32>,
-    pub max_compute_workgroups_per_dimension: Option<u32>,
-    pub max_compute_workgroup_storage_size: Option<u32>,
-    pub max_storage_buffers_per_shader_stage: Option<u32>,
-    pub max_storage_buffer_binding_size: Option<u64>,
-    pub max_buffer_size: Option<u64>,
-}
-
-/// Raise only the named fields of `base`, refusing a widening the adapter
-/// cannot supply. A request *below* the baseline is a no-op: the baseline is a
-/// floor, so a plan legal on one device stays legal on another.
+/// Widen the compiler's limits while retaining the baseline as a floor.
+/// Requests beyond the adapter's capability are rejected.
 pub(crate) fn widen_limits(
-    base: wgpu::Limits,
-    widen: LimitWiden,
+    mut base: wgpu::Limits,
+    extra: Option<wgpu::Limits>,
     adapter: &wgpu::Limits,
 ) -> Result<wgpu::Limits> {
-    let mut out = base;
-    // (name, requested, current slot, adapter ceiling)
+    let Some(extra) = extra else { return Ok(base) };
     macro_rules! raise {
         ($field:ident) => {
-            if let Some(want) = widen.$field {
-                if want > adapter.$field {
-                    return Err(Error::Device(format!(
-                        "adapter cannot supply {} = {} (reports {})",
-                        stringify!($field),
-                        want,
-                        adapter.$field
-                    )));
-                }
-                if want > out.$field {
-                    out.$field = want;
-                }
+            if extra.$field > adapter.$field {
+                return Err(Error::Device(format!(
+                    "adapter cannot supply {} = {} (reports {})",
+                    stringify!($field),
+                    extra.$field,
+                    adapter.$field
+                )));
             }
+            base.$field = base.$field.max(extra.$field);
         };
     }
     raise!(max_compute_invocations_per_workgroup);
@@ -95,15 +74,14 @@ pub(crate) fn widen_limits(
     raise!(max_storage_buffers_per_shader_stage);
     raise!(max_storage_buffer_binding_size);
     raise!(max_buffer_size);
-    Ok(out)
+    Ok(base)
 }
 
 /// The wgpu features to request, given what the adapter supports. Each is
 /// optional and independently fallback-covered.
 ///
-/// `TIMESTAMP_QUERY` is requested whenever available: profiling is read
-/// through [`Caps::timestamp_query`], and a device that never resolves a query
-/// set pays nothing for holding the feature bit.
+/// Native `TIMESTAMP_QUERY` supports the synchronous tuner. Browser timing
+/// remains disabled until that tuner can resolve queries asynchronously.
 pub(crate) fn requested_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     let available = adapter.features();
     let mut wanted = wgpu::Features::empty();
@@ -112,9 +90,7 @@ pub(crate) fn requested_features(adapter: &wgpu::Adapter) -> wgpu::Features {
             wanted |= f;
         }
     };
-    // wasm32 never requests SUBGROUP: the browser's WebGPU surface does not
-    // expose it, and the `WgTree` fold is the working fallback.
-    #[cfg(not(target_arch = "wasm32"))]
+    // Subgroups are optional on both native and browser adapters.
     want(wgpu::Features::SUBGROUP);
     want(wgpu::Features::SHADER_F16);
     want(wgpu::Features::PIPELINE_CACHE);
@@ -131,8 +107,7 @@ pub(crate) fn requested_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     }
     // Cooperative matrices are experimental: requesting the bit additionally
     // needs `unsafe ExperimentalFeatures::enabled()` on the descriptor, which
-    // `device::request_device` supplies. wasm32 requests neither.
-    #[cfg(not(target_arch = "wasm32"))]
+    // `device::request_device` supplies. The web backend maps Dawn's extension.
     want(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
     // The second experimental bit, EXPERIMENTAL_WORKGROUP_MEMORY_ALIAS, exists
     // only on the wgpu fork; released wgpu 29 does not define it. The

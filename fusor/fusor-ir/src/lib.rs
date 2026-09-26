@@ -19,6 +19,7 @@ pub mod scalar;
 pub mod shape;
 
 pub mod ir;
+pub mod packing;
 
 pub mod autograd;
 pub mod cost;

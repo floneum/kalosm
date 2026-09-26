@@ -4,13 +4,10 @@
 use crate::device::Caps;
 use crate::dtype::Dtype;
 use crate::egraph::Id;
-use crate::extract::{Extraction, PlanHash};
 use crate::facts::{ValueFacts, Work};
 use crate::ir::Node;
 use crate::ir::launch::SchedPoint;
-use crate::shape::Dims;
 use rustc_hash::{FxHashMap, FxHasher};
-use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 
 /// Modelled time in picoseconds. One scalar, not a lexicographic tuple.
@@ -99,10 +96,16 @@ pub struct DeviceFacts {
     pub store_ps_per_element: u64,
     pub saturation_lanes: u32,
     pub single_buffered_traffic_pct: u32,
-    pub compile_ps_per_kernel: u64,
     /// Cost of waking the CPU worker pool for one parallel region.
     /// Replaces `PARALLEL_THRESHOLD = 16_777_216`.
     pub thread_wake_ps: u64,
+    /// One dependent step of a tiled contraction's k loop — a staged load,
+    /// a barrier and a fragment multiply — as latency a workgroup cannot
+    /// hide from itself. A launch is at least its longest chain of these.
+    pub coop_step_ps: u64,
+    /// One dependent step of a per-lane loop — a load and an accumulate —
+    /// the same way.
+    pub lane_step_ps: u64,
     pub caps: Caps,
 }
 
@@ -134,6 +137,14 @@ pub struct LaunchPlan<'a> {
     pub work: Work,
     pub resident_lanes: u64,
     pub wg_bytes: u64,
+    /// Cache-line traffic beyond the useful bytes: a read whose adjacent
+    /// lanes are not adjacent in memory pulls a whole line per element.
+    pub line_bytes: u64,
+    /// The longest dependent chain one workgroup runs: k steps of a tiled
+    /// contraction, and per-lane loop iterations, priced at the device's
+    /// step latencies. Occupancy cannot shorten it.
+    pub coop_steps: u64,
+    pub lane_steps: u64,
     pub grid: [u32; 3],
 }
 
@@ -161,45 +172,7 @@ pub trait CostModel: Send + Sync {
     /// not a strict `>` cliff.
     fn traffic(&self, bytes: u64, rereads: u32) -> Picoseconds;
 
-    /// `compile_ps_per_kernel / expected_reuse(plan, binding)`.
-    fn compile_amortized(&self, plan: PlanHash, expected_reuse: u32) -> Picoseconds;
-
     /// Total cost of a realized extraction. The accept test for every
     /// local-search move is this, never a local delta heuristic.
-    fn total(&self, extraction: &Extraction, launches: &[LaunchPlan<'_>]) -> Picoseconds;
-}
-
-/// Bounded per-process record of which dim bindings a plan has been seen
-/// at, so specialization is a decision recorded in the key rather than an
-/// accident of shape. On first sighting the generic symbolic variant wins
-/// outright — nothing compiles per length bucket.
-#[derive(Default, Debug, Clone)]
-pub struct ShapeStats {
-    seen: FxHashMap<PlanHash, SmallVec<[(Dims, u32); 8]>>,
-}
-
-impl ShapeStats {
-    pub fn new() -> Self {
-        Self::default()
-    }
-
-    pub fn observe(&mut self, plan: PlanHash, binding: &[crate::shape::Dim]) -> u32 {
-        let entry = self.seen.entry(plan).or_default();
-        if let Some(slot) = entry.iter_mut().find(|(d, _)| d.as_slice() == binding) {
-            slot.1 += 1;
-            return slot.1;
-        }
-        if entry.len() < 8 {
-            entry.push((binding.iter().copied().collect(), 1));
-        }
-        1
-    }
-
-    /// `1` on first sighting, so nothing compiles speculatively.
-    pub fn expected_reuse(&self, plan: PlanHash, binding: &[crate::shape::Dim]) -> u32 {
-        self.seen
-            .get(&plan)
-            .and_then(|e| e.iter().find(|(d, _)| d.as_slice() == binding))
-            .map_or(1, |(_, n)| *n)
-    }
+    fn total(&self, launches: &[LaunchPlan<'_>]) -> Picoseconds;
 }

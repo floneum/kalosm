@@ -11,8 +11,9 @@
 
 pub(crate) mod contract;
 pub(crate) mod gather_scatter;
+pub(crate) mod group;
 pub(crate) mod map_fold;
-pub(crate) mod region;
+pub(crate) mod slab;
 
 use fusor_cost::realize::distribute_workgroups;
 use fusor_ir::Result;
@@ -39,12 +40,19 @@ use crate::uniforms::UniformPack;
 /// Binding index of the always-present uniform block.
 pub(crate) const UNIFORM_BINDING: u32 = 0;
 
-/// One staged input of a contraction side: a memory source, or a `Const`
-/// leaf already folded to its literal.
+/// A contraction input, with general indexing for non-affine padded views.
 #[derive(Clone)]
 pub(crate) enum StagedSource {
     Mem(Source),
     Const(TileExpr),
+    Indexed {
+        operand: Box<Operand>,
+        cols: Dim,
+        elements: u64,
+        // Proven axis boundaries of the independent batch, row and column coordinates.
+        axes: Option<(usize, usize)>,
+        rows_per_batch: Dim,
+    },
 }
 pub(crate) fn bound_layout(cx: &LowerCtx<'_>, value: Id) -> (Layout, Dtype) {
     let value = cx.selected(value);
@@ -96,7 +104,7 @@ pub(crate) struct DimBinding {
     values: FxHashMap<SymId, u64>,
     consulted: std::sync::Arc<parking_lot::Mutex<rustc_hash::FxHashSet<SymId>>>,
     /// Symbols read *only* to fold the dispatch grid, and the
-    /// `(space, block)` pairs those reads served. The grid is not the body:
+    /// `(space, block, inner_tile)` grids those reads served. The grid is not the body:
     /// a symbol that moved only the workgroup count leaves the emitted
     /// module byte-identical, so it must not force a rebuild. Recording the
     /// derivation lets the artifact cache recompute the grid at the new
@@ -108,13 +116,13 @@ pub(crate) struct DimBinding {
 #[derive(Clone, Debug, Default)]
 struct GridReads {
     symbols: rustc_hash::FxHashSet<SymId>,
-    /// Every distinct `(space, block)` [`grid_for`] was called with. More
+    /// Every distinct dispatch grid requested by the lowering. More
     /// than one and the lowering's committed grid is ambiguous from here, so
     /// nothing is replayable and the reads fall back to `consulted`.
     specs: Vec<GridSpec>,
 }
 
-/// The index space and workgroup width one [`grid_for`] call folded.
+/// The index space, innermost-axis tile and workgroup width of a dispatch.
 ///
 /// This is the whole of a dispatch grid's dependence on the binding: replaying
 /// it at another binding is exactly what re-lowering would have computed.
@@ -122,6 +130,7 @@ struct GridReads {
 pub(crate) struct GridSpec {
     pub space: IndexSpace,
     pub block: u32,
+    pub inner_tile: u32,
 }
 
 impl DimBinding {
@@ -195,7 +204,7 @@ impl DimBinding {
             }
             first
         };
-        (grid_from(&spec.space, spec.block, self, limits).ok()? == grid).then_some(spec)
+        (spec.grid(self, limits).ok()? == grid).then_some(spec)
     }
 
     /// Every symbol whose value the emitted module can depend on.
@@ -221,36 +230,45 @@ pub(crate) fn grid_for(
     binding: &DimBinding,
     limits: &Limits,
 ) -> Result<[u32; 3]> {
-    binding.grid.lock().specs.push(GridSpec {
-        space: space.clone(),
-        block,
-    });
-    grid_from(space, block, binding, limits)
+    tiled_grid_for(space, block, 1, binding, limits)
 }
 
-/// Fold a grid without recording the fold. [`grid_for`] is this plus the
-/// record the artifact cache replays; a caller that already *holds* a
-/// [`GridSpec`] is evaluating that record, not making a new one.
-pub(crate) fn grid_from(
+pub(crate) fn tiled_grid_for(
     space: &IndexSpace,
     block: u32,
+    inner_tile: u32,
     binding: &DimBinding,
     limits: &Limits,
 ) -> Result<[u32; 3]> {
-    let mut elements: u64 = 1;
-    for dim in &space.dims {
-        elements = elements
-            .checked_mul(binding.require_for_grid(*dim)?)
-            .ok_or_else(|| Error::Plan("index space overflows a u64".into()))?;
+    let spec = GridSpec {
+        space: space.clone(),
+        block,
+        inner_tile,
+    };
+    binding.grid.lock().specs.push(spec.clone());
+    spec.grid(binding, limits)
+}
+
+impl GridSpec {
+    pub(crate) fn grid(&self, binding: &DimBinding, limits: &Limits) -> Result<[u32; 3]> {
+        let mut elements: u64 = 1;
+        for (axis, dim) in self.space.dims.iter().enumerate() {
+            let mut extent = binding.require_for_grid(*dim)?;
+            if axis + 1 == self.space.rank() {
+                extent = extent.div_ceil(u64::from(self.inner_tile.max(1)));
+            }
+            elements = elements
+                .checked_mul(extent)
+                .ok_or_else(|| Error::Plan("index space overflows a u64".into()))?;
+        }
+        let groups = elements.div_ceil(u64::from(self.block.max(1)));
+        let groups = u32::try_from(groups)
+            .map_err(|_| Error::Plan(format!("{groups} workgroups exceeds a u32")))?;
+        Ok(distribute_workgroups(
+            groups,
+            limits.max_compute_workgroups_per_dimension,
+        ))
     }
-    let block = u64::from(block.max(1));
-    let groups = elements.div_ceil(block);
-    let groups = u32::try_from(groups)
-        .map_err(|_| Error::Plan(format!("{groups} workgroups exceeds a u32")))?;
-    Ok(distribute_workgroups(
-        groups,
-        limits.max_compute_workgroups_per_dimension,
-    ))
 }
 
 /// An N-D strided operand seen as a 2-D matrix.
@@ -294,17 +312,8 @@ pub(crate) fn flatten_matrix_layout_split(
         shape.push(binding.require(*d)?);
     }
     let mut strides = SmallVec::<[u64; 6]>::new();
-    for (axis, s) in layout.strides().iter().enumerate() {
-        // A `row_major_strides` placeholder means the plan carried a stride it
-        // never derived. Recompute it from the (now concrete) shape rather
-        // than emitting the placeholder.
-        let v = match s {
-            Dim::Sym(sym) if *sym == crate::uniforms::DERIVED_STRIDE => {
-                shape.iter().skip(axis + 1).product::<u64>()
-            }
-            other => binding.require(*other)?,
-        };
-        strides.push(v);
+    for stride in layout.strides() {
+        strides.push(binding.require(*stride)?);
     }
 
     let rows: u64 = shape[..row_dims].iter().product();
@@ -861,7 +870,15 @@ pub(crate) struct Ctx<'a> {
     pub buffers: Vec<Buffer>,
     /// `Plan` value -> index into [`Self::buffers`].
     slot_of: FxHashMap<Id, usize>,
-    pack: std::sync::Arc<UniformPack>,
+    /// Element offset of each arena value within the arena binding.
+    arena_offset: FxHashMap<Id, u32>,
+    pub(crate) pack: std::sync::Arc<UniformPack>,
+    /// A group member's linear workgroup index within its own range, in
+    /// place of the dispatch's builtins.
+    pub workgroup: Option<TileExpr>,
+    /// The fewest lanes a member may lower at: a group runs every member at
+    /// its widest member's block.
+    pub block_floor: u32,
 }
 
 impl<'a> Ctx<'a> {
@@ -880,6 +897,17 @@ impl<'a> Ctx<'a> {
         // same launch mints the same ids, so the pipeline cache's body-hash
         // dedup actually hits.
         fusor_ir::ir::kernel::reset_decl_ids();
+        Self::with_pack_in(caps, cx, binding, pack)
+    }
+
+    /// [`Self::with_pack`] without restarting decl numbering: a group
+    /// member's decls must not collide with its siblings'.
+    pub(crate) fn with_pack_in(
+        caps: &'a Caps,
+        cx: &'a LowerCtx<'a>,
+        binding: DimBinding,
+        pack: std::sync::Arc<UniformPack>,
+    ) -> Result<Self> {
         let uniform_words = (pack.byte_len() / 4).max(1) as u32;
         let mut buffers: Vec<Buffer> = vec![Arc::new(BufferDecl {
             binding: UNIFORM_BINDING,
@@ -892,8 +920,47 @@ impl<'a> Ctx<'a> {
         ordered.sort_by_key(|b| b.binding);
 
         let mut slot_of = FxHashMap::default();
-        for (position, plan_binding) in ordered.iter().enumerate() {
+        let mut arena_offset: FxHashMap<Id, u32> = FxHashMap::default();
+        let mut arena_views = FxHashMap::default();
+        for plan_binding in ordered.iter() {
             let (layout, dtype) = bound_layout(cx, plan_binding.value);
+            let class = cx.graph.class_of(plan_binding.value);
+            // Typed views share one physical arena binding. The emitter
+            // declares it once and reinterprets mixed types at each access.
+            if plan_binding.arena {
+                let bytes = cx
+                    .plan
+                    .buffers
+                    .iter()
+                    .find(|b| b.value == plan_binding.value)
+                    .and_then(|b| b.arena)
+                    .ok_or_else(|| {
+                        Error::Plan(format!("arena value {} has no offset", plan_binding.value))
+                    })?;
+                let elem = dtype.byte_size().max(1);
+                let off = u32::try_from(bytes / elem)
+                    .map_err(|_| Error::Plan("arena offset exceeds a u32".into()))?;
+                let slot = if let Some(slot) = arena_views.get(&dtype) {
+                    *slot
+                } else {
+                    let extent = u32::try_from(cx.plan.arena_bytes / elem)
+                        .map_err(|_| Error::Plan("arena element count exceeds a u32".into()))?;
+                    buffers.push(Arc::new(BufferDecl {
+                        binding: plan_binding.binding,
+                        element: ElementType::Scalar(scalar_element(dtype)),
+                        layout: TileLayout::contiguous(MemoryLevel::Storage, &[extent.max(1)]),
+                        access: BufferAccess::ReadWrite,
+                    }));
+                    let slot = buffers.len() - 1;
+                    arena_views.insert(dtype, slot);
+                    slot
+                };
+                for member in cx.graph.class_ids(class) {
+                    slot_of.insert(member, slot);
+                    arena_offset.insert(member, off);
+                }
+                continue;
+            }
             let elements = decl_elements(&layout);
             // A quantized buffer holds blocks, not elements: it binds as the
             // `u32` word stream the decode program addresses.
@@ -914,12 +981,11 @@ impl<'a> Ctx<'a> {
             // selected one: an `Operand::src` names whichever id the rule
             // author wrote, and they all denote the same buffer. `class_ids`
             // includes the `Union` spine, which macro ops hand their callers.
-            let class = cx.graph.class_of(plan_binding.value);
             for member in cx.graph.class_ids(class) {
                 slot_of.insert(member, buffers.len());
             }
             buffers.push(Arc::new(BufferDecl {
-                binding: 1 + position as u32,
+                binding: plan_binding.binding,
                 element: ElementType::Scalar(scalar_element(dtype)),
                 layout: TileLayout::contiguous(MemoryLevel::Storage, &[extent.max(1)]),
                 access,
@@ -933,24 +999,53 @@ impl<'a> Ctx<'a> {
             binding,
             buffers,
             slot_of,
+            arena_offset,
             pack,
+            workgroup: None,
+            block_floor: 0,
         })
     }
 
+    /// Element offset of a value inside its binding: its arena slot, or 0.
+    pub(crate) fn offset_of(&self, value: Id) -> u32 {
+        self.arena_offset.get(&value).copied().unwrap_or(0)
+    }
+
+    /// This workgroup's linear index against the dispatch grid — or, for a
+    /// group member, within the member's own range.
+    pub(crate) fn linear_workgroup(&mut self) -> TileExpr {
+        use fusor_ir::ir::kernel::WorkgroupAxis;
+        if let Some(w) = &self.workgroup {
+            return w.clone();
+        }
+        let gx = self.b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
+        let gy = self.b.builtin(Builtin::ProgramId(WorkgroupAxis::Y));
+        let gz = self.b.builtin(Builtin::ProgramId(WorkgroupAxis::Z));
+        // group = gx + gy*X + gz*X*Y, exactly as the grid fold laid it out —
+        // with X and Y read from `@builtin(num_workgroups)`, never baked, so
+        // the extents never enter the body.
+        let x_e = self.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::X));
+        let y_e = self.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::Y));
+        let xy_e = self.b.mul(x_e.clone(), y_e);
+        let yx = self.b.mul(gy, x_e);
+        let zxy = self.b.mul(gz, xy_e);
+        let group = self.b.add(gx, yx);
+        self.b.add(group, zxy)
+    }
+
     /// The bound buffer for a plan value.
+    /// Whether this launch binds a buffer for `value`. A slab member kept in
+    /// workgroup memory has none.
+    pub(crate) fn has_buffer(&self, value: Id) -> bool {
+        self.slot_of.contains_key(&value)
+    }
+
     pub(crate) fn buffer(&self, value: Id) -> Result<Buffer> {
         let slot = self
             .slot_of
             .get(&value)
             .ok_or_else(|| Error::Plan(format!("value {value} is not bound by this launch")))?;
         Ok(self.buffers[*slot].clone())
-    }
-
-    /// The `BufferPlan` layout for a value. **Never re-derived** where the
-    /// plan has one — that is the padded stride set the extractor committed
-    /// to. See [`bound_layout`] for the leaf case.
-    pub(crate) fn plan_layout(&self, value: Id) -> Result<Layout> {
-        Ok(bound_layout(self.cx, value).0)
     }
 
     pub(crate) fn plan_dtype(&self, value: Id) -> Result<Dtype> {
@@ -963,7 +1058,7 @@ impl<'a> Ctx<'a> {
         let layout = buffer.layout.clone();
         Ok(fusor_ir::ir::kernel::StorageView {
             buffer,
-            offset: 0,
+            offset: self.offset_of(value),
             layout,
         })
     }
@@ -974,115 +1069,71 @@ impl<'a> Ctx<'a> {
         &self,
         operand: &Operand,
         row_dims: usize,
-    ) -> Result<fusor_ir::ir::kernel::StorageView> {
-        let layout = self.repad_operand_layout(operand)?;
+    ) -> Result<Option<fusor_ir::ir::kernel::StorageView>> {
+        let Some(layout) = self.repad_operand_layout(operand)? else {
+            return Ok(None);
+        };
         let view = flatten_matrix_layout_split(&layout, row_dims, &self.binding)?;
         let buffer = self.buffer(operand.src)?;
-        Ok(fusor_ir::ir::kernel::StorageView {
+        Ok(Some(fusor_ir::ir::kernel::StorageView {
             buffer,
-            offset: view.offset,
+            offset: view.offset + self.offset_of(operand.src),
             layout: view.layout,
-        })
+        }))
     }
 
-    /// An operand's layout restated over the producer's *plan* buffer.
-    ///
-    /// The operand's strides address the producer's logical dense element
-    /// space; the buffer holds whatever the plan laid out, and those differ
-    /// exactly when the producer's schedule point padded it. This is
-    /// [`Ctx::repad_index`]'s statement for the contraction path, which loads
-    /// through strided views rather than a flat index: every operand axis
-    /// must walk exactly one producer axis — its stride is that axis's dense
-    /// row-major stride — and the restatement substitutes the padded stride
-    /// for the dense one, axis for axis. A transposed or batch-permuted edge
-    /// (`permuted_alias`, an absorbed producer) satisfies that by
-    /// construction; an operand whose stride is no producer axis's own is an
-    /// error, never a silent dense read.
-    fn repad_operand_layout(&self, operand: &Operand) -> Result<Layout> {
+    /// Restate an affine operand over its producer's padded allocation. An
+    /// axis spanning padding needs the general logical-index mapping instead.
+    fn repad_operand_layout(&self, operand: &Operand) -> Result<Option<Layout>> {
         let selected = self.cx.selected(operand.src);
         let Some(plan) = self.cx.plan.buffers.iter().find(|b| b.value == selected) else {
-            return Ok(operand.layout.clone());
+            return Ok(Some(operand.layout.clone()));
         };
-        let logical = self.cx.graph.facts(selected).shape.clone();
-        if plan.layout.rank() != logical.len() || logical.is_empty() {
-            return Ok(operand.layout.clone());
+        let logical = &self.cx.graph.facts(selected).shape;
+        let dense = Layout::row_major_strides(logical);
+        if plan.layout == Layout::contiguous(logical) || logical.is_empty() {
+            return Ok(Some(operand.layout.clone()));
         }
-        let dense = Layout::row_major_strides(&logical);
-        let unpadded = plan.layout.offset().known_eq(Dim::Const(0))
-            && plan
-                .layout
-                .shape()
-                .iter()
-                .zip(&logical)
-                .all(|(p, l)| p.known_eq(*l))
-            && plan
-                .layout
-                .strides()
-                .iter()
-                .zip(&dense)
-                .all(|(s, w)| s.known_eq(*w));
-        if unpadded {
-            return Ok(operand.layout.clone());
+        if !plan.layout.offset().known_eq(Dim::Const(0))
+            || !operand.layout.offset().known_eq(Dim::Const(0))
+        {
+            return Ok(None);
         }
-        if !plan.layout.offset().known_eq(Dim::Const(0)) {
-            return Err(Error::Plan(format!(
-                "operand {} reads a buffer at offset {}; the contraction path \
-                 cannot restate an offset layout",
-                operand.src,
-                plan.layout.offset()
-            )));
-        }
-        // The operand may be a *reshaped* spelling of the producer — a
-        // `[2, 2, 3, 4]` read of a `[4, 3, 4]` contract — so an operand axis
-        // walks `k` steps of one producer axis rather than exactly one: its
-        // stride is `k * dense[i]`, and it stays inside that axis
-        // (`k * (ext - 1) < logical[i]`). Substituting `k * padded[i]`
-        // restates it, because a within-axis walk scales linearly with the
-        // axis's own stride whatever the padding did to the axes outside it.
-        let padded = plan.layout.strides();
-        let remap = |ext: Dim, s: Dim| -> Result<Dim> {
-            // Unobservable axes keep whatever they said.
-            if ext.known_eq(Dim::Const(1)) || s.known_eq(Dim::Const(0)) {
-                return Ok(s);
+        let mut strides = Vec::with_capacity(operand.layout.rank());
+        for (&extent, &stride) in operand.layout.shape().iter().zip(operand.layout.strides()) {
+            if extent.as_const().is_some_and(|e| e <= 1) || stride.known_eq(Dim::Const(0)) {
+                strides.push(stride);
+                continue;
             }
-            let (Some(sv), Some(ev)) = (s.as_const(), ext.as_const()) else {
-                return Err(Error::Plan(format!(
-                    "operand {} reads a padded buffer through symbolic stride {s}",
-                    operand.src
-                )));
-            };
-            for (i, d) in dense.iter().enumerate() {
-                let (Some(dv), Some(lv)) = (d.as_const(), logical[i].as_const()) else {
+            let mut mapped = None;
+            for (axis, &dense_stride) in dense.iter().enumerate() {
+                if stride.known_eq(dense_stride) && extent.known_eq(logical[axis]) {
+                    mapped = Some(plan.layout.strides()[axis]);
+                    break;
+                }
+                let (Some(stride), Some(extent), Some(dense_stride), Some(logical_extent)) = (
+                    stride.as_const(),
+                    extent.as_const(),
+                    dense_stride.as_const(),
+                    logical[axis].as_const(),
+                ) else {
                     continue;
                 };
-                if dv == 0 || sv % dv != 0 {
+                if dense_stride == 0 || stride % dense_stride != 0 {
                     continue;
                 }
-                let k = sv / dv;
-                if k >= 1 && k.saturating_mul(ev - 1) < lv {
-                    let pv = padded[i].as_const().ok_or_else(|| {
-                        Error::Plan(format!(
-                            "operand {} reads a buffer with symbolic padded stride",
-                            operand.src
-                        ))
-                    })?;
-                    return Ok(Dim::Const(k * pv));
+                let step = stride / dense_stride;
+                if step >= 1 && step.saturating_mul(extent - 1) < logical_extent {
+                    mapped = Some(Dim::Const(step) * plan.layout.strides()[axis]);
+                    break;
                 }
             }
-            Err(Error::Plan(format!(
-                "operand {} reads a padded buffer through stride {s}, which walks \
-                 no single axis of the producer's dense layout {dense:?}",
-                operand.src
-            )))
-        };
-        let strides: Vec<Dim> = operand
-            .layout
-            .shape()
-            .iter()
-            .zip(operand.layout.strides())
-            .map(|(ext, s)| remap(*ext, *s))
-            .collect::<Result<_>>()?;
-        Layout::from_parts(operand.layout.offset(), operand.layout.shape(), &strides)
+            let Some(mapped) = mapped else {
+                return Ok(None);
+            };
+            strides.push(mapped);
+        }
+        Layout::from_parts(operand.layout.offset(), operand.layout.shape(), &strides).map(Some)
     }
 
     /// The [`Source`] a contraction stages one operand from.
@@ -1121,9 +1172,11 @@ impl<'a> Ctx<'a> {
     pub(crate) fn contract_side_sources(
         &mut self,
         side: &ContractSide,
-        rows: u32,
-        cols: u32,
+        batch: u32,
+        rows_per_batch: Dim,
+        cols: Dim,
     ) -> Result<Vec<StagedSource>> {
+        let rows = Dim::Const(u64::from(batch)) * rows_per_batch;
         side.ops
             .iter()
             .map(|o| {
@@ -1133,8 +1186,57 @@ impl<'a> Ctx<'a> {
                 if let Some(lit) = self.const_operand(o.src) {
                     return Ok(StagedSource::Const(lit));
                 }
-                let view = self.contract_operand_view(o, rows, cols)?;
-                Ok(StagedSource::Mem(self.contract_stage_source(o, &view)?))
+                let view = match (rows.as_const(), cols.as_const()) {
+                    (Some(rows), Some(cols))
+                        if o.layout.shape().iter().all(|d| d.as_const().is_some())
+                            && o.layout.strides().iter().all(|d| d.as_const().is_some())
+                            && o.layout.offset().as_const().is_some() =>
+                    {
+                        let extent = |value| {
+                            u32::try_from(value).map_err(|_| {
+                                Error::Plan("contraction matrix extent exceeds a u32".into())
+                            })
+                        };
+                        self.contract_operand_view(o, extent(rows)?, extent(cols)?)?
+                    }
+                    _ => None,
+                };
+                match view {
+                    Some(view) => Ok(StagedSource::Mem(self.contract_stage_source(o, &view)?)),
+                    None => Ok(StagedSource::Indexed {
+                        operand: Box::new(o.clone()),
+                        cols,
+                        rows_per_batch,
+                        axes: if matches!(o.access, fusor_ir::ir::launch::AccessPlan::Unflatten(_))
+                        {
+                            None
+                        } else {
+                            let shape = o.layout.shape();
+                            let product = |dims: &[Dim]| {
+                                let value = dims.iter().copied().fold(Dim::ONE, |a, b| a * b);
+                                (value != Dim::Sym(fusor_ir::shape::OPAQUE_SYM)).then_some(value)
+                            };
+                            (0..=shape.len()).rev().find_map(|column| {
+                                if product(&shape[column..]) != Some(cols) {
+                                    return None;
+                                }
+                                (0..=column)
+                                    .rev()
+                                    .find(|&row| {
+                                        product(&shape[..row]) == Some(Dim::Const(u64::from(batch)))
+                                            && product(&shape[row..column]) == Some(rows_per_batch)
+                                    })
+                                    .map(|row| (row, column))
+                            })
+                        },
+                        elements: o
+                            .layout
+                            .shape()
+                            .iter()
+                            .try_fold(1u64, |n, d| n.checked_mul(d.as_const()?))
+                            .unwrap_or(u64::MAX),
+                    }),
+                }
             })
             .collect()
     }
@@ -1144,7 +1246,7 @@ impl<'a> Ctx<'a> {
         operand: &Operand,
         rows: u32,
         cols: u32,
-    ) -> Result<fusor_ir::ir::kernel::StorageView> {
+    ) -> Result<Option<fusor_ir::ir::kernel::StorageView>> {
         let split = matrix_split_for(
             &operand.layout,
             &self.binding,
@@ -1213,23 +1315,10 @@ impl<'a> Ctx<'a> {
     /// the tail of the output untouched — silently, for any launch over the
     /// per-dimension limit.
     pub(crate) fn global_index(&mut self, block: u32, grid: [u32; 3]) -> TileExpr {
-        use fusor_ir::ir::kernel::WorkgroupAxis;
         let lane = self.b.builtin(Builtin::Lane);
-        let gx = self.b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
-        let gy = self.b.builtin(Builtin::ProgramId(WorkgroupAxis::Y));
-        let gz = self.b.builtin(Builtin::ProgramId(WorkgroupAxis::Z));
-        // group = gx + gy*X + gz*X*Y, exactly as the grid fold laid it out —
-        // with X and Y read from `@builtin(num_workgroups)`, never baked, so
-        // the extents never enter the body. `grid` still names the dispatch
-        // this lowering derived.
+        // `grid` still names the dispatch this lowering derived.
         let _ = grid;
-        let x_e = self.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::X));
-        let y_e = self.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::Y));
-        let xy_e = self.b.mul(x_e.clone(), y_e);
-        let yx = self.b.mul(gy, x_e);
-        let zxy = self.b.mul(gz, xy_e);
-        let group = self.b.add(gx, yx);
-        let group = self.b.add(group, zxy);
+        let group = self.linear_workgroup();
         let block_e = self.b.u32(block);
         let base = self.b.mul(group, block_e);
         self.b.add(base, lane)
@@ -1315,6 +1404,9 @@ impl<'a> Ctx<'a> {
                 fusor_ir::dtype::Splat::U32(v) => self.b.u32(v),
                 fusor_ir::dtype::Splat::I32(v) => self.b.i32(v),
             },
+            K::Uniform(sym) if expr.dtype() == Dtype::U32 && self.pack.dim_slot(*sym).is_some() => {
+                self.dim_expr(Dim::Sym(*sym))?
+            }
             K::Uniform(sym) => self.scalar_expr(*sym)?,
             K::IndexOf(axis) => {
                 let c = coords.get(*axis as usize).cloned().ok_or_else(|| {
@@ -1469,9 +1561,7 @@ impl<'a> Ctx<'a> {
     ///
     /// Emits `offset + Σ_axis ((flat / Π extents-right-of-axis) % extent) *
     /// stride` with every symbolic quantity read from binding 0 via
-    /// [`Ctx::dim_expr`]. The `row_major_strides` placeholder
-    /// (`DERIVED_STRIDE`) is the running right-product itself, which the walk
-    /// already carries. Axes with stride 0 (broadcast) or extent 1 contribute
+    /// [`Ctx::dim_expr`]. Axes with stride 0 (broadcast) or extent 1 contribute
     /// no term but still advance the divisor. The most significant axis skips
     /// its `%`: `flat` is masked below the space total by the caller, so the
     /// quotient is already in range.
@@ -1485,25 +1575,30 @@ impl<'a> Ctx<'a> {
                 operand.src, operand.layout
             )));
         }
-        let layout = operand.layout.clone();
-        // A contiguous offset-0 layout is the identity over its own space —
-        // the dense read every elementwise kernel does.
-        if layout.is_contiguous() && layout.offset().known_eq(Dim::Const(0)) {
+        let layout = &operand.layout;
+        let offset = self.dim_expr(layout.offset())?;
+        let relative = self.strided_address(flat, layout.shape(), layout.strides())?;
+        Ok(self.b.add(offset, relative))
+    }
+
+    fn strided_address(
+        &mut self,
+        flat: TileExpr,
+        shape: &[Dim],
+        strides: &[Dim],
+    ) -> Result<TileExpr> {
+        if shape.iter().all(|extent| extent.known_eq(Dim::ONE)) {
+            return Ok(self.b.u32(0));
+        }
+        if strides == Layout::row_major_strides(shape).as_slice() {
             return Ok(flat);
         }
-        let shape: Vec<Dim> = layout.shape().to_vec();
-        let strides: Vec<Dim> = layout.strides().to_vec();
-        let mut acc: Option<TileExpr> = match layout.offset() {
-            Dim::Const(0) => None,
-            d => Some(self.dim_expr(d)?),
-        };
-        // Product of extents right of the current axis, as an expression;
-        // `None` is 1.
+        let mut acc: Option<TileExpr> = None;
         let mut div: Option<TileExpr> = None;
         for axis in (0..shape.len()).rev() {
             let extent = shape[axis];
             let stride = strides[axis];
-            let contributes = !stride.known_eq(Dim::Const(0)) && !extent.known_eq(Dim::Const(1));
+            let contributes = !stride.known_eq(Dim::Const(0)) && !extent.known_eq(Dim::ONE);
             if contributes {
                 let mut e = flat.clone();
                 if let Some(d) = &div {
@@ -1517,14 +1612,7 @@ impl<'a> Ctx<'a> {
                         .b
                         .binary(TileBinaryOp::Rem, e, m, NumericContract::RELAXED);
                 }
-                let is_derived =
-                    matches!(stride, Dim::Sym(s) if s == crate::uniforms::DERIVED_STRIDE);
-                if is_derived {
-                    // Row-major placeholder: stride == the running product.
-                    if let Some(d) = &div {
-                        e = self.b.mul(e, d.clone());
-                    }
-                } else if !stride.known_eq(Dim::Const(1)) {
+                if !stride.known_eq(Dim::ONE) {
                     let s = self.dim_expr(stride)?;
                     e = self.b.mul(e, s);
                 }
@@ -1533,7 +1621,7 @@ impl<'a> Ctx<'a> {
                     None => e,
                 });
             }
-            if !extent.known_eq(Dim::Const(1)) {
+            if !extent.known_eq(Dim::ONE) {
                 let m = self.dim_expr(extent)?;
                 div = Some(match div {
                     Some(d) => self.b.mul(d, m),
@@ -1541,10 +1629,7 @@ impl<'a> Ctx<'a> {
                 });
             }
         }
-        Ok(match acc {
-            Some(a) => a,
-            None => self.b.u32(0),
-        })
+        Ok(acc.unwrap_or_else(|| self.b.u32(0)))
     }
 
     /// Re-address a **logical** dense element index of `src` into the buffer
@@ -1584,60 +1669,34 @@ impl<'a> Ctx<'a> {
         if unpadded {
             return Ok(index);
         }
-        // Every extent has to be decidable to state the delinearize; when one
-        // is not, the previous dense address is still what the rest of the
-        // launch agreed on, so leave it alone rather than mint a wrong one.
-        let Ok(extents) = logical
-            .iter()
-            .map(|d| self.binding.require(*d))
-            .collect::<Result<Vec<u64>>>()
-        else {
-            return Ok(index);
+        let offset = plan.layout.offset();
+        let mut acc = if offset.known_eq(Dim::Const(0)) {
+            None
+        } else {
+            Some(self.dim_expr(offset)?)
         };
-        let Ok(logical_strides) = dense
-            .iter()
-            .map(|d| self.binding.require(*d))
-            .collect::<Result<Vec<u64>>>()
-        else {
-            return Ok(index);
-        };
-        let Ok(padded_strides) = strides
-            .iter()
-            .map(|d| self.binding.require(*d))
-            .collect::<Result<Vec<u64>>>()
-        else {
-            return Ok(index);
-        };
-        let offset = self.binding.require(plan.layout.offset())?;
-
-        let mut acc: Option<TileExpr> = (offset != 0).then(|| {
-            let o = u32::try_from(offset).unwrap_or(u32::MAX);
-            self.b.u32(o)
-        });
         for axis in 0..logical.len() {
-            let extent = extents[axis];
-            let stride = padded_strides[axis];
-            if extent <= 1 || stride == 0 {
+            let extent = logical[axis];
+            let stride = strides[axis];
+            if extent.as_const().is_some_and(|e| e <= 1) || stride.known_eq(Dim::Const(0)) {
                 continue;
             }
             let mut e = index.clone();
-            let div = logical_strides[axis];
-            if div > 1 {
-                let d = self.b.u32(u32::try_from(div).unwrap_or(u32::MAX));
+            let div = dense[axis];
+            if !div.known_eq(Dim::Const(1)) {
+                let d = self.dim_expr(div)?;
                 e = self
                     .b
                     .binary(TileBinaryOp::Div, e, d, NumericContract::RELAXED);
             }
-            // The most significant axis needs no `%`: `flat` is already below
-            // its bound for every live lane, and an overhang lane is masked.
             if axis > 0 {
-                let m = self.b.u32(u32::try_from(extent).unwrap_or(u32::MAX));
+                let m = self.dim_expr(extent)?;
                 e = self
                     .b
                     .binary(TileBinaryOp::Rem, e, m, NumericContract::RELAXED);
             }
-            if stride != 1 {
-                let s = self.b.u32(u32::try_from(stride).unwrap_or(u32::MAX));
+            if !stride.known_eq(Dim::Const(1)) {
+                let s = self.dim_expr(stride)?;
                 e = self.b.mul(e, s);
             }
             acc = Some(match acc {
@@ -1693,7 +1752,7 @@ impl<'a> Ctx<'a> {
             let view = fusor_ir::ir::kernel::QuantizedView {
                 data: fusor_ir::ir::kernel::StorageView {
                     buffer,
-                    offset: 0,
+                    offset: self.offset_of(operand.src),
                     layout,
                 },
                 fmt,
@@ -1711,15 +1770,13 @@ impl<'a> Ctx<'a> {
         let layout = buffer.layout.clone();
         let view = fusor_ir::ir::kernel::StorageView {
             buffer,
-            offset: 0,
+            offset: self.offset_of(operand.src),
             layout,
         };
         // The buffer's extent is not the shape product: padding lives in the
         // strides, so the shape product undercounts a padded buffer. For the
         // row-major layouts the plan emits (offset 0), the extent is
-        // `shape[0] * strides[0]`; a `DERIVED_STRIDE` placeholder implies no
-        // padding and resolves as the product of the remaining logical
-        // extents.
+        // `shape[0] * strides[0]`.
         let (plan_layout, _) = bound_layout(self.cx, operand.src);
         let bound = match (plan_layout.shape().first(), plan_layout.strides().first()) {
             (Some(&outer), Some(&stride0)) => {
@@ -1729,20 +1786,6 @@ impl<'a> Ctx<'a> {
                     Some(self.dim_expr(outer)?)
                 };
                 let stride_e = match stride0 {
-                    Dim::Sym(s) if s == crate::uniforms::DERIVED_STRIDE => {
-                        let mut acc: Option<TileExpr> = None;
-                        for d in plan_layout.shape().iter().skip(1).copied() {
-                            if d.known_eq(Dim::Const(1)) {
-                                continue;
-                            }
-                            let e = self.dim_expr(d)?;
-                            acc = Some(match acc {
-                                Some(a) => self.b.mul(a, e),
-                                None => e,
-                            });
-                        }
-                        acc
-                    }
                     s if s.known_eq(Dim::Const(1)) || s.known_eq(Dim::Const(0)) => None,
                     s => Some(self.dim_expr(s)?),
                 };
@@ -1825,65 +1868,57 @@ pub(crate) fn lower_node(
     let ctx = Ctx::with_pack(caps, cx, binding, pack)?;
     match op {
         Launch::Map { .. } => map_fold::lower_kmap(ctx, op, theta).map(|k| vec![k]),
-        Launch::Fold { .. } => map_fold::lower_kfold(ctx, op, theta).map(|k| vec![k]),
+        Launch::Fold { .. } | Launch::StreamFold { .. } => {
+            map_fold::lower_kfold(ctx, op, theta).map(|k| vec![k])
+        }
         Launch::Contract { family, .. } => contract::lower_contract(ctx, op, *family, theta),
         Launch::Gather { .. } => gather_scatter::lower_kgather(ctx, op, theta).map(|k| vec![k]),
         Launch::Scatter { .. } => gather_scatter::lower_kscatter(ctx, op, theta),
-        Launch::Region { .. } => region::lower_kregion(ctx, op, theta).map(|k| vec![k]),
-        Launch::Ext { def, .. } => ext::lower(*def, node, theta).map(|k| vec![k]),
+        Launch::Slab { .. } => slab::lower_kslab(ctx, op, theta).map(|k| vec![k]),
+        Launch::Group { .. } => group::lower_kgroup(ctx, op, theta).map(|k| vec![k]),
     }
 }
 
-/// `Launch::Ext` lowering: the one escape hatch out of the closed `Logical`/`Launch` enums.
-pub(crate) mod ext {
-    use super::*;
-    use fusor_ir::ir::{OpDefId, OpDefRegistry};
-    use std::sync::RwLock;
-
-    /// The registry `Launch::Ext` lowering resolves `OpDefId` against.
-    ///
-    /// [`LowerCtx`] does not carry the [`OpDefRegistry`] the graph was built
-    /// with, so until it grows the field the embedder installs the same
-    /// registry here that it installed on the e-graph's semantics.
-    /// Registration order is id order and must match.
-    static DEFS: RwLock<Option<OpDefRegistry>> = RwLock::new(None);
-
-    /// The installed registry, if the embedder installed one.
-    pub(crate) fn installed() -> Option<OpDefRegistry> {
-        DEFS.read()
-            .expect("the OpDef registry lock is poisoned")
-            .clone()
-    }
-
-    /// Lower one registered extension op through its `"gpu"` row.
-    pub(crate) fn lower(def: OpDefId, node: &Node, theta: SchedPoint) -> Result<KernelIr> {
-        let registry = installed().ok_or_else(|| {
-            Error::Plan(format!(
-                "{def:?} is an extension op, but no OpDefRegistry is installed on the \
-                 GPU target; call fusor_gpu::lower::ext::install"
-            ))
-        })?;
-        let entry = registry
-            .get(def)
-            .ok_or_else(|| Error::Plan(format!("no OpDef is registered as {def:?}")))?;
-        let lower = entry
-            .lower_per_target
-            .iter()
-            .find(|(target, _)| *target == "gpu")
-            .map(|(_, f)| *f)
-            .ok_or_else(|| {
-                Error::Plan(format!(
-                    "OpDef \"{}\" declares no \"gpu\" lowering; its \
-                     lower_per_target names {:?}",
-                    entry.name,
-                    entry
-                        .lower_per_target
-                        .iter()
-                        .map(|(t, _)| *t)
-                        .collect::<Vec<_>>()
-                ))
-            })?;
-        lower(node, &theta)
+/// [`lower_node`] for one member of a group: decl numbering continues from
+/// the siblings', the workgroup index is `workgroup`, and the body runs at
+/// no fewer than `block_floor` lanes.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn lower_member(
+    caps: &Caps,
+    node: &Node,
+    theta: SchedPoint,
+    cx: &LowerCtx<'_>,
+    binding: DimBinding,
+    pack: std::sync::Arc<UniformPack>,
+    workgroup: TileExpr,
+    block_floor: u32,
+    buffers: &[Buffer],
+) -> Result<KernelIr> {
+    let Op::Launch(op) = &node.op else {
+        return Err(Error::Plan("a group member is not a Launch node".into()));
+    };
+    let mut ctx = Ctx::with_pack_in(caps, cx, binding, pack)?;
+    // One buffer table for the whole kernel: a member's own decls would
+    // bind the same slots a second time.
+    ctx.buffers = buffers.to_vec();
+    ctx.workgroup = Some(workgroup);
+    ctx.block_floor = block_floor;
+    match op {
+        Launch::Map { .. } => map_fold::lower_kmap(ctx, op, theta),
+        Launch::Fold { .. } | Launch::StreamFold { .. } => map_fold::lower_kfold(ctx, op, theta),
+        Launch::Slab { .. } => slab::lower_kslab(ctx, op, theta),
+        Launch::Gather { .. } => gather_scatter::lower_kgather(ctx, op, theta),
+        Launch::Contract { family, .. } => {
+            let mut k = contract::lower_contract(ctx, op, *family, theta)?;
+            if k.len() != 1 {
+                return Err(Error::Plan("a group member lowers to one kernel".into()));
+            }
+            Ok(k.remove(0))
+        }
+        other => Err(Error::Plan(format!(
+            "a {:?} cannot be a group member",
+            other.tag()
+        ))),
     }
 }
 

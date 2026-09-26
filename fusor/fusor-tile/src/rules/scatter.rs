@@ -71,7 +71,7 @@ fn mint(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>, mode: ScatterMo
         mode,
         combine: p.combine,
         ops: vec![alias(p.base, base), alias(p.idx, idx), alias(p.upd, upd)],
-        sched: ScheduleDomain::Map(map_domain(&upd.shape, &accesses, &cx)),
+        sched: ScheduleDomain::Map(map_domain(&upd.shape, &accesses, &cx).into()),
     };
     let new = b.add_launch(op).ok()?;
     b.union(id, new).ok()?;

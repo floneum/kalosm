@@ -385,6 +385,8 @@ debug = "line-tables-only"
 
 # Fusor's kernels use Naga from the ealmloff/wgpu fork, including the
 # `CooperativeLoad` correctness fix in `bake_ref_count`. Patch tables only apply
-# from the build root, so the same revision is named in Fusor's own workspace.
+# from the build root. This revision also supplies browser matrix WGSL.
+# All build roots use the same source.
 [patch.crates-io]
-naga = { git = "https://github.com/ealmloff/wgpu", rev = "c4f55cabaadc22b942c1dd8894bf85f17f2718dc" }
+wgpu = { git = "https://github.com/ealmloff/wgpu", rev = "24a7d3577213fc147637fe7fb20e0e845a74df8a" }
+naga = { git = "https://github.com/ealmloff/wgpu", rev = "24a7d3577213fc147637fe7fb20e0e845a74df8a" }

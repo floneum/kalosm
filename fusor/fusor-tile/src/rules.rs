@@ -92,7 +92,7 @@ pub fn tile_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opt
 
     let mut rebuilt = l1.clone();
     if let Launch::Fold { sched, .. } = &mut rebuilt {
-        *sched = ScheduleDomain::Fold(dom);
+        *sched = ScheduleDomain::Fold(dom.into());
     }
     let new = b.add_launch(rebuilt).ok()?;
     b.union(id, new).ok()?;
@@ -139,7 +139,7 @@ pub fn tile_gather(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> O
     }
     let mut rebuilt = l1.clone();
     if let Launch::Gather { sched, .. } = &mut rebuilt {
-        *sched = ScheduleDomain::Map(dom);
+        *sched = ScheduleDomain::Map(dom.into());
     }
     let new = b.add_launch(rebuilt).ok()?;
     b.union(id, new).ok()?;
@@ -174,7 +174,7 @@ pub fn tile_scatter(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
     }
     let mut rebuilt = l1.clone();
     if let Launch::Scatter { sched, .. } = &mut rebuilt {
-        *sched = ScheduleDomain::Map(dom);
+        *sched = ScheduleDomain::Map(dom.into());
     }
     let new = b.add_launch(rebuilt).ok()?;
     b.union(id, new).ok()?;

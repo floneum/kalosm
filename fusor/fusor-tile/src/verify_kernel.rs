@@ -22,15 +22,15 @@ use fusor_ir::Result;
 use fusor_ir::device::Caps;
 use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
-    Accumulator, Addr, ArenaPlanner, CoopMatrixRole, CoopSrc, ElementType, KernelIr, Local,
-    LowerError, ScalarElement, Source, Stmt, TileExpr, TileExprKind, TileLiteral,
+    Accumulator, Addr, ArenaPlanner, CoopMatrixRole, ElementType, KernelIr, Local, LowerError,
+    ScalarElement, Source, Stmt, TileExpr, TileExprKind, TileLiteral,
     cooperative_store_layout_supported,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
 use crate::arena::scalar_of;
-use crate::liveness::{for_each_addr_expr, for_each_child};
+use crate::liveness::for_each_addr_expr;
 
 fn invalid(msg: impl Into<String>) -> Error {
     Error::Lower(LowerError::Validation(msg.into()))
@@ -103,14 +103,11 @@ fn for_each_element(ir: &KernelIr, f: &mut dyn FnMut(ElementType)) {
                 TileExprKind::LoadLocal(local) => f(local.element),
                 TileExprKind::Reduce { kind, .. } => match kind.as_ref() {
                     fusor_ir::ir::kernel::ReduceKind::Subgroup => {}
-                    fusor_ir::ir::kernel::ReduceKind::Workgroup { scratch, .. }
-                    | fusor_ir::ir::kernel::ReduceKind::Loop { scratch, .. } => f(scratch.element),
-                },
-                TileExprKind::CoopLoad { src, .. } => {
-                    if let CoopSrc::TileRegion { tile, .. } = src.as_ref() {
-                        f(tile.element);
+                    fusor_ir::ir::kernel::ReduceKind::Workgroup { scratch, .. } => {
+                        f(scratch.element)
                     }
-                }
+                },
+                TileExprKind::CoopLoad { src, .. } => f(src.tile.element),
                 _ => {}
             }
         });
@@ -310,7 +307,8 @@ fn check_expr(expr: &TileExpr, seen: &mut FxHashSet<u64>) -> Result<()> {
         return Ok(());
     }
     let mut children: Vec<TileExpr> = Vec::new();
-    for_each_child(expr.kind(), &mut |child| children.push(child.clone()));
+    expr.kind()
+        .visit_children(&mut |child| children.push(child.clone()));
     for child in &children {
         check_expr(child, seen)?;
     }
@@ -892,7 +890,7 @@ fn check_one_reduce(
                 return Err(invalid("a subgroup reduction declares scratch tiles"));
             }
         }
-        ReduceKind::Workgroup { scratch: head, .. } | ReduceKind::Loop { scratch: head, .. } => {
+        ReduceKind::Workgroup { scratch: head, .. } => {
             if scratch.len() != n {
                 return Err(invalid(format!(
                     "a {n}-lane reduction declares {} scratch tiles",
@@ -1143,7 +1141,8 @@ pub(crate) fn visit_unique(
         return;
     }
     let mut children: Vec<TileExpr> = Vec::new();
-    for_each_child(expr.kind(), &mut |child| children.push(child.clone()));
+    expr.kind()
+        .visit_children(&mut |child| children.push(child.clone()));
     for child in &children {
         visit_unique(child, seen, f);
     }

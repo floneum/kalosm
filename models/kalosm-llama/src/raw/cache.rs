@@ -6,29 +6,20 @@ use super::LlamaConfig;
 /// The dimension along which the attention cache grows for new tokens.
 const CONCAT_DIMENSION: u32 = 2;
 
-/// Initial per-layer capacity (tokens) for an unwindowed cache. Grows by
-/// doubling — a new shape family — when a generation exceeds it.
+/// Initial per-layer capacity (tokens), doubled as needed.
 const INITIAL_CAPACITY: usize = 512;
 
-/// A cache for llama inference. Fixed-capacity device buffers with a
-/// `Dim::Sym` logical length: every decode step reuses one graph and one
-/// plan, only the length binding and a few leaf bytes change.
+/// Device buffers with symbolic lengths and capacities. Decode replays one
+/// graph while input bytes and dimension bindings change.
 #[derive(Clone)]
 pub struct LlamaCache {
     pub(crate) tokens: Vec<u32>,
+    /// A sampled token that has not yet been forwarded into the KV cache.
+    pub(crate) pending_token: Option<u32>,
     /// KV cache blocks, one per layer.
     pub(crate) blocks: Vec<KvCache>,
-    /// The logits root of the decode graph, once one has been built against
-    /// *these* blocks' store leaves.
-    ///
-    /// Every decode step used to re-run the whole model builder, and every node
-    /// it minted hash-consed onto one already in the e-graph — 46,978 nodes in,
-    /// 46,978 nodes out, identical ids, for ~2.5 ms of pure rediscovery per
-    /// token. The graph is built once and this holds its root; a step is then a
-    /// leaf write, a `replay_append` per block, and the resolve.
-    ///
-    /// Held here and not on the `Model` because the graph names this cache's
-    /// store leaves: two caches against one model are two graphs.
+    /// Token-step logits for these cache stores. Replay updates input leaves
+    /// and write indices without rebuilding the graph.
     pub(crate) decode_graph: Option<Tensor<2>>,
     /// The same memo for the embedding-row step an image prompt runs: its
     /// input is a `[1, 1, hidden]` embedding leaf and explicit rope rows,
@@ -61,10 +52,22 @@ impl LlamaCache {
         }
         Self {
             tokens: Vec::new(),
+            pending_token: None,
             blocks,
             decode_graph: None,
             embed_graph: None,
             rope_position: 0,
+        }
+    }
+
+    pub(crate) fn input_tokens<'a>(&self, tokens: &'a [u32]) -> std::borrow::Cow<'a, [u32]> {
+        match self.pending_token {
+            Some(token) => std::borrow::Cow::Owned(
+                std::iter::once(token)
+                    .chain(tokens.iter().copied())
+                    .collect(),
+            ),
+            None => std::borrow::Cow::Borrowed(tokens),
         }
     }
 
@@ -73,9 +76,6 @@ impl LlamaCache {
         for block in &mut self.blocks {
             block.reset()
         }
-        // A reset block has no armed append, so the next step rebuilds anyway;
-        // dropping the root here is what keeps that from being an invariant
-        // spread across two files.
         self.decode_graph = None;
         self.embed_graph = None;
         self.rope_position = 0;

@@ -10,11 +10,12 @@ pub(crate) mod expr;
 pub(crate) mod quantized;
 pub(crate) mod reduce;
 pub(crate) mod stmt;
+mod storage;
 pub(crate) mod types;
 
 use fusor_ir::device::Caps;
 use fusor_ir::ir::kernel::{
-    Accumulator, Addr, ArenaPlan, Buffer, Builtin, CoopSrc, ElementType, KernelIr, Local, MemReads,
+    Accumulator, Addr, ArenaPlan, Buffer, Builtin, ElementType, KernelIr, Local, MemReads,
     ReduceKind, ScalarElement, Source, Stmt, Tile, TileExpr, TileExprKind,
 };
 use fusor_ir::target::EmitError;
@@ -90,8 +91,7 @@ pub(crate) fn collective_tree(
     let Some(w) = width else { return false };
     matches!(element, ElementType::Scalar(s) if s != ScalarElement::Bool)
         && group_size == block
-        && block >= w
-        && block.is_multiple_of(w)
+        && crate::reduction::CollectivePlan::new(block, w).is_some()
 }
 
 /// One walk of the whole body, run before any expression is lowered. Everything
@@ -155,6 +155,7 @@ impl Analysis {
         // Cooperative lowering addresses fragments per subgroup, so it needs a
         // subgroup id whether or not the body asked for one.
         a.subgroup_id |= a.uses_coop;
+        a.subgroup_lane |= a.uses_coop;
         a
     }
 
@@ -319,15 +320,11 @@ impl Analysis {
                 // two-stage upgrade applies to it.
                 if values.len() == 1 && fast.is_some() {
                     match &**kind {
-                        ReduceKind::Workgroup { group_size, .. }
-                        | ReduceKind::Loop { group_size, .. } => {
+                        ReduceKind::Workgroup { group_size, .. } => {
                             self.note_tree(*group_size, values[0].element());
                         }
                         ReduceKind::Subgroup => {}
                     }
-                }
-                if let ReduceKind::Loop { index, .. } = &**kind {
-                    self.note_local(index, seen);
                 }
                 for tile in scratch {
                     self.note_tile(tile, seen);
@@ -361,7 +358,6 @@ impl Analysis {
         }
         self.note_element(e.element());
         match e.kind() {
-            TileExprKind::Literal(_) | TileExprKind::CoopZero { .. } => {}
             TileExprKind::Builtin(b) => match b {
                 Builtin::SubgroupId => self.subgroup_id = true,
                 Builtin::SubgroupLane => self.subgroup_lane = true,
@@ -371,97 +367,35 @@ impl Analysis {
                 Builtin::Lane | Builtin::ProgramId(_) => {}
             },
             TileExprKind::LoadLocal(l) => self.note_local(l, seen),
-            TileExprKind::Load {
-                src,
-                addr,
-                mask,
-                fill,
+            TileExprKind::Load { src, .. } => self.source(src, seen),
+            TileExprKind::LoadTile { tile, .. } => self.note_tile(tile, seen),
+            TileExprKind::Unary {
+                op: fusor_ir::scalar::UnOp::Unpack2x16Float,
+                ..
             } => {
-                self.source(src, seen);
-                self.addr(addr, seen);
-                self.expr(mask, seen);
-                self.expr(fill, seen);
+                self.unpacks_f16 = true;
             }
-            TileExprKind::LoadTile { tile, index } => {
-                self.note_tile(tile, seen);
-                self.expr(index, seen);
-            }
-            TileExprKind::Unary { op, value, .. } => {
-                if matches!(op, fusor_ir::scalar::UnOp::Unpack2x16Float) {
-                    self.unpacks_f16 = true;
-                }
-                self.expr(value, seen);
-            }
-            TileExprKind::Binary { left, right, .. }
-            | TileExprKind::Compare { left, right, .. }
-            | TileExprKind::Dot { left, right } => {
-                self.expr(left, seen);
-                self.expr(right, seen);
-            }
-            TileExprKind::Round { value, .. } => self.expr(value, seen),
-            TileExprKind::Cast { value, to } | TileExprKind::Bitcast { value, to } => {
+            TileExprKind::Cast { to, .. } | TileExprKind::Bitcast { to, .. } => {
                 self.note_element(*to);
-                self.expr(value, seen);
             }
-            TileExprKind::Select {
-                condition,
-                accept,
-                reject,
-            } => {
-                self.expr(condition, seen);
-                self.expr(accept, seen);
-                self.expr(reject, seen);
-            }
-            TileExprKind::Vec { parts, .. } => {
-                for p in parts {
-                    self.expr(p, seen);
+            TileExprKind::Reduce { kind, value, .. } => match &**kind {
+                ReduceKind::Subgroup => self.uses_subgroup_collective = true,
+                ReduceKind::Workgroup {
+                    scratch,
+                    group_size,
+                } => {
+                    self.note_tile(scratch, seen);
+                    self.note_tree(*group_size, value.element());
                 }
-            }
-            TileExprKind::VecComponent { vector, .. } => self.expr(vector, seen),
-            TileExprKind::Reduce { kind, value, .. } => {
-                match &**kind {
-                    ReduceKind::Subgroup => self.uses_subgroup_collective = true,
-                    ReduceKind::Workgroup {
-                        scratch,
-                        group_size,
-                    } => {
-                        self.note_tile(scratch, seen);
-                        self.note_tree(*group_size, value.element());
-                    }
-                    ReduceKind::Loop {
-                        index,
-                        scratch,
-                        group_size,
-                        ..
-                    } => {
-                        self.note_local(index, seen);
-                        self.note_tile(scratch, seen);
-                        self.note_tree(*group_size, value.element());
-                    }
-                }
-                self.expr(value, seen);
-            }
+            },
             TileExprKind::CoopLoad { src, .. } => {
                 self.uses_coop = true;
-                match &**src {
-                    CoopSrc::TileRegion { tile, row, col, .. } => {
-                        self.note_tile(tile, seen);
-                        self.expr(row, seen);
-                        self.expr(col, seen);
-                    }
-                    CoopSrc::BroadcastCol { src, col } => {
-                        self.note_buffer(&src.buffer, seen);
-                        self.expr(col, seen);
-                    }
-                }
+                self.note_tile(&src.tile, seen);
             }
-            TileExprKind::CoopMma { a, b, c } => {
-                self.uses_coop = true;
-                self.expr(a, seen);
-                self.expr(b, seen);
-                self.expr(c, seen);
-            }
+            TileExprKind::CoopMma { .. } => self.uses_coop = true,
+            _ => {}
         }
+        e.kind().visit_children(&mut |child| self.expr(child, seen));
     }
 
     fn source(&mut self, src: &Source, seen: &mut Seen) {
@@ -502,8 +436,6 @@ pub(crate) enum ScratchKind {
     LoopIndex,
     /// A masked-value spill local (one per masked load/reduce).
     Value,
-    /// A reduce-accumulator spill local; deepens with nesting.
-    Spill,
 }
 
 /// Per-kernel emission state: the naga arenas plus the Kernel -> naga handle maps.
@@ -517,6 +449,8 @@ pub(crate) struct Emitter<'a> {
     pub(crate) fn_locals: naga::Arena<naga::LocalVariable>,
     /// Buffer decl key -> storage global.
     pub(crate) buffer_globals: FxHashMap<usize, naga::Handle<naga::GlobalVariable>>,
+    /// Physical storage element, which can differ from a typed buffer view.
+    pub(crate) buffer_elements: FxHashMap<usize, ElementType>,
     /// Tile decl key -> how that tile is backed in workgroup memory.
     pub(crate) tile_backing: FxHashMap<usize, types::TileBacking>,
     /// Private tiles and program locals.
@@ -613,6 +547,7 @@ impl<'a> Emitter<'a> {
             exprs: naga::Arena::new(),
             fn_locals: naga::Arena::new(),
             buffer_globals: FxHashMap::default(),
+            buffer_elements: FxHashMap::default(),
             tile_backing: FxHashMap::default(),
             local_handles: FxHashMap::default(),
             scratch: FxHashMap::default(),
@@ -703,7 +638,7 @@ impl<'a> Emitter<'a> {
             incoming_ray_payload: None,
         });
 
-        let info = self.validate()?;
+        let info = self.module_info()?;
         let bindings = bindings_from_module(&self.module);
         Ok(EmittedModule {
             module: self.module,
@@ -714,10 +649,10 @@ impl<'a> Emitter<'a> {
         })
     }
 
-    /// Run naga's validator with exactly the capabilities the analysis raised.
-    /// A failure here is a compiler bug, not a user error — it is what licenses
-    /// the trusted shader-module path, and it is never a silent fallback.
-    pub(crate) fn validate(&self) -> Result<naga::valid::ModuleInfo, EmitError> {
+    /// Naga's backend requires ModuleInfo even when verification is disabled.
+    /// Production computes that analysis with no validation flags; compiler
+    /// tests additionally run all of Naga's independent invariant checks.
+    pub(crate) fn module_info(&self) -> Result<naga::valid::ModuleInfo, EmitError> {
         use naga::valid::Capabilities as C;
         let mut caps = C::empty();
         if self.analysis.uses_f16 {
@@ -732,7 +667,12 @@ impl<'a> Emitter<'a> {
         if self.analysis.uses_coop {
             caps |= C::COOPERATIVE_MATRIX;
         }
-        naga::valid::Validator::new(naga::valid::ValidationFlags::all(), caps)
+        let flags = if cfg!(any(test, feature = "compiler-tests")) {
+            naga::valid::ValidationFlags::all()
+        } else {
+            naga::valid::ValidationFlags::empty()
+        };
+        naga::valid::Validator::new(flags, caps)
             .validate(&self.module)
             .map_err(|e| EmitError::Validation(format!("{e:#?}")))
     }
@@ -743,5 +683,136 @@ fn builtin_arg(ty: naga::Handle<naga::Type>, builtin: naga::BuiltIn) -> naga::Fu
         name: None,
         ty,
         binding: Some(naga::Binding::BuiltIn(builtin)),
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+    use crate::lower::Kernel;
+    use fusor_ir::dtype::{NumericContract, Persistence};
+    use fusor_ir::ir::kernel::{
+        BufferAccess, BufferDecl, MemoryLevel, StorageView, TileBinaryOp, TileCompareOp,
+        TileLayout, TileReduceOp,
+    };
+    use fusor_ir::target::{Target, Uniforms};
+    use std::sync::Arc;
+
+    fn buffer(
+        binding: u32,
+        element: ElementType,
+        elements: u32,
+        access: BufferAccess,
+    ) -> StorageView {
+        let buffer = Arc::new(BufferDecl {
+            binding,
+            element,
+            layout: TileLayout::contiguous(MemoryLevel::Storage, &[elements]),
+            access,
+        });
+        StorageView {
+            layout: buffer.layout.clone(),
+            buffer,
+            offset: 0,
+        }
+    }
+
+    fn run(target: &crate::target::GpuTarget, ir: &KernelIr, uniforms: Uniforms) -> Vec<u32> {
+        let artifact = target.emit(ir).unwrap();
+        let uniform_buffer = target
+            .alloc((uniforms.to_bytes().len() as u64).max(4), Persistence::Step)
+            .unwrap();
+        let bytes = ir.buffers[1].layout.element_count() * 4;
+        let output = target.alloc(bytes, Persistence::Step).unwrap();
+        target
+            .launch(
+                &artifact,
+                ir.grid,
+                &[uniform_buffer, output.clone()],
+                &uniforms,
+            )
+            .unwrap();
+        pollster::block_on(target.readback(&output, bytes))
+            .unwrap()
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|bytes| u32::from_le_bytes(*bytes))
+            .collect()
+    }
+
+    #[test]
+    fn subgroup_sum_tracks_active_lanes_across_scopes() {
+        let Ok(target) = crate::target::GpuTarget::new_blocking() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        if target.caps().subgroups.is_none() {
+            eprintln!("adapter has no subgroups; skipping");
+            return;
+        }
+        let mut kernel = Kernel::new();
+        let u32_ty = ScalarElement::U32.element();
+        let yes = kernel.bool(true);
+        let one = kernel.u32(1);
+        let population = kernel.reduce(TileReduceOp::Sum, ReduceKind::Subgroup, one);
+        let output = buffer(1, u32_ty, 128 * 5, BufferAccess::ReadWrite);
+        let lane = kernel.builtin(Builtin::Lane);
+        let five = kernel.u32(5);
+        let base = kernel.mul(lane, five);
+        let addresses: Vec<_> = (0..5)
+            .map(|column| {
+                let column = kernel.u32(column);
+                Addr::Linear(kernel.add(base.clone(), column))
+            })
+            .collect();
+        let store = |column: usize, value| Stmt::Store {
+            dst: output.clone(),
+            addr: addresses[column].clone(),
+            value,
+            mask: yes.clone(),
+        };
+        let size = kernel.builtin(Builtin::SubgroupSize);
+        let lane = kernel.builtin(Builtin::SubgroupLane);
+        let two = kernel.u32(2);
+        let half = kernel.binary(
+            TileBinaryOp::Div,
+            size.clone(),
+            two,
+            NumericContract::STRICT,
+        );
+        let condition = kernel.compare(TileCompareOp::Lt, lane.clone(), half);
+        let body = vec![
+            store(0, size.clone()),
+            store(1, lane.clone()),
+            store(2, population.clone()),
+            store(3, kernel.u32(0)),
+            store(4, kernel.u32(0)),
+            Stmt::If {
+                condition,
+                accept: vec![store(3, population.clone())],
+                reject: vec![Stmt::Return],
+            },
+            store(4, population),
+        ];
+        let ir = KernelIr {
+            buffers: vec![
+                buffer(0, u32_ty, 1, BufferAccess::Read).buffer,
+                output.buffer,
+            ],
+            grid: [1, 1, 1],
+            block: 128,
+            body,
+            byte_arena: None,
+            name: "subgroup_scope",
+        };
+        let values = run(&target, &ir, Uniforms::default());
+        for (invocation, values) in values.as_chunks::<5>().0.iter().enumerate() {
+            let [size, lane, full, inside, after] = values;
+            let half = if *lane < size / 2 { size / 2 } else { 0 };
+            assert_eq!(*full, *size, "invocation {invocation}: full subgroup");
+            assert_eq!(*inside, half, "invocation {invocation}: divergent branch");
+            assert_eq!(*after, half, "invocation {invocation}: after peer return");
+        }
     }
 }

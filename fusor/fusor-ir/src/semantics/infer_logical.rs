@@ -286,6 +286,22 @@ fn infer_fold(carrier: &Carrier, axis: u32, acc: Dtype, ins: &[ValueFacts]) -> R
             )));
         }
     }
+    let mut unbound = None;
+    for lift in &carrier.lift {
+        lift.walk(&mut |expr| {
+            if let ScalarKind::Arg(index) = expr.kind()
+                && *index as usize >= ins.len()
+            {
+                unbound = Some(*index);
+            }
+        });
+    }
+    if let Some(index) = unbound {
+        return Err(Error::Shape(format!(
+            "Fold lift reads Arg({index}) but only {} operands were supplied",
+            ins.len()
+        )));
+    }
     crate::verify_l0::check_carrier(carrier, acc)?;
 
     let mut shape: Dims = x.shape.clone();
@@ -490,27 +506,7 @@ fn expr_is_closed(expr: &ScalarExpr) -> bool {
 /// revisited; callers that must count once memoize on
 /// [`ScalarExpr::structural_hash`].
 pub(crate) fn walk_expr(e: &ScalarExpr, f: &mut impl FnMut(&ScalarExpr)) {
-    f(e);
-    match e.kind() {
-        ScalarKind::Arg(_)
-        | ScalarKind::Lit(_)
-        | ScalarKind::Uniform(_)
-        | ScalarKind::IndexOf(_) => {}
-        ScalarKind::Un { x, .. }
-        | ScalarKind::Cast { x, .. }
-        | ScalarKind::Bitcast { x, .. }
-        | ScalarKind::Round { x, .. }
-        | ScalarKind::Splat { x, .. } => walk_expr(x, f),
-        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
-            walk_expr(a, f);
-            walk_expr(b, f);
-        }
-        ScalarKind::Select { c, t, f: e_f } => {
-            walk_expr(c, f);
-            walk_expr(t, f);
-            walk_expr(e_f, f);
-        }
-    }
+    e.walk(f);
 }
 
 // ---------------------------------------------------------------------------

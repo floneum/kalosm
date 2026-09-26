@@ -12,8 +12,7 @@
 //! 4. A fold dim may not appear with nonzero stride in the write map.
 //! 5. Every operand's `AccessPlan` satisfies that operand's access
 //!    predicate. A failed access analysis disqualifies **this rewrite only**.
-//! 6. A composite node carries the linear schedule domain its members'
-//!    shared index space implies, rather than an unsearchable point.
+//! 6. A composite sequences at least two independently scheduled members.
 //! 7. Every node carries an `Effect`.
 //! 8. Allocation is *not* described at Launch; a node claiming a buffer is an
 //!    error.
@@ -22,60 +21,12 @@ use crate::carrier::SlotTy;
 use crate::device::Caps;
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
-use crate::ir::kernel::{
-    ArenaPlanner, ElementType, MemoryLevel, ScalarElement, TileDecl, TileLayout, Tiles,
-};
-use crate::ir::launch::{
-    AccessPlan, CoopGeom, Effect, IndexSpace, Launch, Operand, ScheduleDomain,
-};
+use crate::ir::kernel::{ArenaPlanner, ScalarElement};
+use crate::ir::launch::{AccessPlan, Effect, IndexSpace, Launch, Operand, ScheduleDomain};
 use crate::ir::logical::ScatterCombine;
 use crate::ir::{Op, VerifyCtx};
 use crate::semantics::effect_of;
 use crate::shape::{Dim, Layout};
-use std::sync::Arc;
-
-/// Workgroup tiles a cooperative geometry declares, before packing.
-///
-/// A-tile `[bm, bk]` and B-tile `[bk, bn / n_passes]`, each replicated
-/// `staging` times, plus one accumulator staging tile `[bm, bn / n_passes]`
-/// when the store element is not `F32` (an f32 accumulator written into
-/// narrower memory needs the staging pass unless the device supports a
-/// mixed-precision cooperative store).
-///
-/// **This is the single source of coop tile shapes.** `verify_launch` and
-/// `fusor-tile`'s `domains::coop` both call it, so an admitted geometry and
-/// a planned one cannot disagree.
-pub fn coop_tiles(geom: CoopGeom, elem: ScalarElement, staging: u8) -> Tiles {
-    let mut tiles = Tiles::default();
-    let n_passes = geom.n_passes.max(1);
-    let bn_pass = geom.bn / n_passes;
-    let element = ElementType::Scalar(elem);
-    let depth = staging.max(1);
-
-    // One decl per staging depth, and they are `depth` distinct tiles:
-    // `TileDecl` is identity-bearing, so `staging: 2` is two `coop_a`
-    // allocations the arena places separately rather than one name used twice.
-    for _ in 0..depth {
-        tiles.decls.push(Arc::new(TileDecl::new(
-            element,
-            TileLayout::contiguous(MemoryLevel::Workgroup, &[geom.bm, geom.bk]),
-            "coop_a",
-        )));
-        tiles.decls.push(Arc::new(TileDecl::new(
-            element,
-            TileLayout::contiguous(MemoryLevel::Workgroup, &[geom.bk, bn_pass]),
-            "coop_b",
-        )));
-    }
-    if elem != ScalarElement::F32 {
-        tiles.decls.push(Arc::new(TileDecl::new(
-            ElementType::Scalar(ScalarElement::F32),
-            TileLayout::contiguous(MemoryLevel::Workgroup, &[geom.bm, bn_pass]),
-            "coop_acc",
-        )));
-    }
-    tiles
-}
 
 /// Verify one Launch node against `caps` and the exact arena plan.
 pub fn verify_launch(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<()> {
@@ -86,6 +37,47 @@ pub fn verify_launch(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<(
             "verify_launch applied to a node that is not Launch",
         ));
     };
+
+    if let Launch::StreamFold {
+        producer,
+        fold,
+        operand,
+        sched,
+    } = op
+    {
+        if !op.stream_compatible() || !cx.result.numeric.reassoc {
+            return Err(relabel(
+                cx,
+                "a streamed Fold needs a bounded scalar producer and reassociation".into(),
+            ));
+        }
+        let count = crate::semantics::children::children_launch(producer).len();
+        let produced =
+            crate::semantics::infer_launch::infer_launch(producer, &cx.operands[..count])?;
+        let mut inputs = cx.operands[count..].to_vec();
+        inputs.insert(*operand as usize, produced.clone());
+        for (recipe, operands, result) in [
+            (producer.as_ref(), &cx.operands[..count], &produced),
+            (fold.as_ref(), inputs.as_slice(), cx.result),
+        ] {
+            let node = crate::ir::Node {
+                op: Op::Launch(recipe.clone()),
+                level: crate::ir::Level::Launch,
+                children: crate::semantics::children::children_launch(recipe),
+            };
+            verify_launch(
+                &VerifyCtx {
+                    node: &node,
+                    id: cx.id,
+                    operands,
+                    result,
+                    caps: cx.caps,
+                },
+                planner,
+            )?;
+        }
+        return check_schedule_domain(fold, sched, cx.caps, planner);
+    }
 
     // 1 + 2.
     if let Some(sched) = op.schedule() {
@@ -103,7 +95,7 @@ pub fn verify_launch(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<(
     check_operand_access(op).map_err(|e| relabel(cx, format!("{e}")))?;
 
     // 6.
-    check_composite_domain(cx, op).map_err(|e| relabel(cx, format!("{e}")))?;
+    check_composite_domain(op).map_err(|e| relabel(cx, format!("{e}")))?;
 
     // 7.
     let declared = effect_of(&cx.node.op);
@@ -128,71 +120,31 @@ pub fn verify_launch(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<(
         }
     }
 
-    // The `verify_l0` constant-work tripwire, applied to the one Launch variant
-    // whose row comes from outside the crate. An `OpDef` registering
-    // `Work { macs: 1, .. }` is exactly the reference's
-    // `Attention { work: 1 }` placeholder wearing an extension hat.
-    if let Launch::Ext { def, .. } = op
-        && let Some(d) = cx.registry.get(*def)
-    {
-        let small = (d.work)(cx.operands, cx.result);
-        let doubled_ins: Vec<crate::facts::ValueFacts> = cx.operands.iter().map(doubled).collect();
-        let doubled_out = doubled(cx.result);
-        let large = (d.work)(&doubled_ins, &doubled_out);
-        let has_const = cx
-            .operands
-            .iter()
-            .chain(std::iter::once(cx.result))
-            .flat_map(|f| f.shape.iter())
-            .any(|dim| dim.as_const().is_some());
-        if has_const && small == large && small != crate::facts::Work::default() {
-            return Err(relabel(
-                cx,
-                format!("OpDef `{}`: work() does not vary with shape", d.name),
-            ));
-        }
-    }
-
     Ok(())
 }
 
-/// Every `Const` dim doubled — the second binding the work tripwire prices.
-fn doubled(f: &crate::facts::ValueFacts) -> crate::facts::ValueFacts {
-    let mut out = f.clone();
-    for d in out.shape.iter_mut() {
-        if let Dim::Const(v) = *d {
-            *d = Dim::Const(v.saturating_mul(2));
+/// Composite members keep their own schedules.
+fn check_composite_domain(op: &Launch) -> Result<()> {
+    let (sched, members) = match op {
+        Launch::Slab {
+            sched,
+            slabs,
+            members,
+        } => {
+            if *slabs < 2 {
+                return Err(Error::Legality(format!(
+                    "a Slab needs at least two slabs, got {slabs}"
+                )));
+            }
+            (sched, members)
         }
-    }
-    out
-}
-
-/// Invariant 6: a composite node's schedule domain is the one its members'
-/// shared index space implies.
-///
-/// A `Region` is a list of Launch nodes run in one dispatch over one linearized
-/// index to both backends, so its geometry is
-/// [`crate::ir::launch::MapDomain::linear_over`] of the value they land, and
-/// nothing else. Checking it against the *node's own inferred shape* rather
-/// than against whatever the minting rule felt like is what makes the domain
-/// a property of the node instead of a field a rule may drift.
-///
-/// The clause is exact rather than a bound: the mint site calls the same
-/// generator on the same facts, so an inequality is a rule that stopped
-/// deriving the domain, not a legal variation.
-fn check_composite_domain(cx: &VerifyCtx<'_>, op: &Launch) -> Result<()> {
-    let sched = match op {
-        Launch::Region { sched, .. } => sched,
+        Launch::Group { sched, members } => (sched, members),
         _ => return Ok(()),
     };
-    let want = ScheduleDomain::Map(crate::ir::launch::MapDomain::linear_over(
-        cx.caps,
-        &cx.result.shape,
-    ));
-    if *sched != want {
+    if members.len() < 2 || *sched != ScheduleDomain::Point {
         return Err(Error::Legality(format!(
-            "a composite node's schedule domain is the linear map domain of its \
-             members' shared index space; got {sched:?}, want {want:?}"
+            "a composite needs at least two members and a Point domain, got {} and {sched:?}",
+            members.len()
         )));
     }
     Ok(())
@@ -231,33 +183,30 @@ pub fn check_schedule_domain(
         )));
     }
 
-    let elem = element_of(store_dtype(op));
+    let elem = element_of(match op {
+        Launch::Contract { a, .. } => a.pre.dtype(),
+        _ => store_dtype(op),
+    });
     let subgroup_width = caps.subgroup_width();
     let max_lanes = caps.limits.max_compute_invocations_per_workgroup;
     let max_storage = caps.limits.max_compute_workgroup_storage_size;
 
     match sched {
         ScheduleDomain::Coop(domain) => {
-            for &geom in &domain.geoms {
-                if !geom.legal(subgroup_width, max_lanes) {
+            for point in &domain.schedules {
+                let (geom, staging) = (point.geom, point.staging);
+                if !geom.legal(subgroup_width, max_lanes) || !(1..=2).contains(&staging) {
                     return Err(Error::Legality(format!(
-                        "coop geometry {geom:?} is illegal at subgroup width {subgroup_width} \
-                         and {max_lanes} lanes"
+                        "illegal cooperative schedule {point:?}"
                     )));
                 }
-                for &staging in &domain.staging {
-                    // The exact planner value, never an estimator.
-                    let bytes = planner.workgroup_bytes(&coop_tiles(geom, elem, staging), caps)?;
-                    if bytes > max_storage {
-                        return Err(Error::Legality(format!(
-                            "coop geometry {geom:?} at staging {staging} needs {bytes} \
-                             workgroup bytes, over the {max_storage} limit"
-                        )));
-                    }
+                let bytes = planner
+                    .workgroup_bytes(&crate::ir::launch::coop_tiles(geom, elem, staging), caps)?;
+                if bytes > max_storage {
+                    return Err(Error::Legality(format!(
+                        "coop {point:?} needs {bytes} workgroup bytes, limit {max_storage}"
+                    )));
                 }
-            }
-            if domain.splits.contains(&0) {
-                return Err(Error::Legality("a split-K count of 0 is illegal".into()));
             }
         }
         ScheduleDomain::Sgemm(domain) => {
@@ -782,10 +731,24 @@ fn operands_of(op: &Launch) -> Vec<Operand> {
         Launch::Map { ops, .. }
         | Launch::Fold { ops, .. }
         | Launch::Gather { ops, .. }
-        | Launch::Scatter { ops, .. }
-        | Launch::Ext { ops, .. } => ops.clone(),
+        | Launch::Scatter { ops, .. } => ops.clone(),
         Launch::Contract { a, b, .. } => a.ops.iter().chain(b.ops.iter()).cloned().collect(),
-        Launch::Region { .. } => Vec::new(),
+        Launch::StreamFold {
+            producer,
+            fold,
+            operand,
+            ..
+        } => {
+            let mut ops = operands_of(producer);
+            ops.extend(
+                operands_of(fold)
+                    .into_iter()
+                    .enumerate()
+                    .filter_map(|(i, op)| (i != *operand as usize).then_some(op)),
+            );
+            ops
+        }
+        Launch::Slab { .. } | Launch::Group { .. } => Vec::new(),
     }
 }
 

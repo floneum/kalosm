@@ -1,4 +1,4 @@
-//! The cooperative-matrix schedule domain: `geoms x splits x staging`,
+//! The cooperative-matrix schedule domain: supported `(geometry, staging)` pairs,
 //! carried whole on the node and resolved by extraction.
 //!
 //! Every `(bm, bn, bk, subgroups, n_passes)` whose closed-form subgroup
@@ -7,13 +7,12 @@
 
 use fusor_ir::device::Caps;
 use fusor_ir::dtype::Dtype;
-use fusor_ir::ir::kernel::{ElementType, MemoryLevel, ScalarElement, TileDecl, TileLayout, Tiles};
-use fusor_ir::ir::launch::{CoopDomain, CoopGeom};
+use fusor_ir::ir::kernel::ScalarElement;
+use fusor_ir::ir::launch::{CoopDomain, CoopGeom, CoopSchedule};
 use fusor_ir::shape::Dim;
 use smallvec::SmallVec;
-use std::sync::Arc;
 
-use crate::domains::{DomainCtx, MAX_SPLITS};
+use crate::domains::DomainCtx;
 
 /// Block-M sides worth generating.
 const BM_CHOICES: [u32; 6] = [16, 32, 64, 128, 256, 512];
@@ -34,14 +33,13 @@ pub fn legal(m: Dim, n: Dim, k: Dim, operand: Dtype, acc: Dtype, caps: &Caps) ->
     coop_domain(m, n, k, Dim::Const(1), operand, acc, &cx)
 }
 
-/// Every legal `(geom, splits, staging)` for this contraction on this
-/// device. Empty when the device reports no usable cooperative
-/// configuration, which simply makes the `Coop` alternative unselectable —
-/// never an error.
+/// Every supported `(geom, staging)` for this contraction on this
+/// device. Empty when the device reports no usable cooperative configuration;
+/// callers then decline to construct the `Coop` alternative.
 pub fn coop_domain(
     m: Dim,
     n: Dim,
-    k: Dim,
+    _k: Dim,
     batch: Dim,
     operand: Dtype,
     acc: Dtype,
@@ -60,87 +58,52 @@ pub fn coop_domain(
         return CoopDomain::default();
     }
 
-    if cx.caps.coop_for(operand, acc).is_none() {
+    if !cx.caps.coop_supported()
+        || !cx.caps.coop.iter().any(|c| {
+            c.operand == operand
+                && c.acc == acc
+                && c.m == CoopGeom::COOP_DIM
+                && c.n == CoopGeom::COOP_DIM
+                && c.k == CoopGeom::COOP_DIM
+        })
+    {
         return CoopDomain::default();
     }
-
-    let geoms = candidate_geoms_for(operand, cx);
-    if geoms.is_empty() {
-        return CoopDomain::default();
-    }
-
-    // Splits are a domain-level list while `bk` is per-geometry, so the
-    // candidate set is the union over the surviving depths: a split count
-    // is a candidate when *some* surviving geometry admits it. A pair whose
-    // spans do not partition K exactly still runs — the split kernel bounds
-    // its K span — so the union is sound, and cost rejects the rest.
-    let mut splits: SmallVec<[u32; 8]> = SmallVec::new();
-    let mut depths: SmallVec<[u32; 3]> = SmallVec::new();
-    for g in &geoms {
-        if !depths.contains(&g.bk) {
-            depths.push(g.bk);
-        }
-    }
-    depths.sort_unstable();
-    for bk in depths {
-        for d in split_candidates(k, bk) {
-            if !splits.contains(&d) {
-                splits.push(d);
-            }
-        }
-    }
-    splits.sort_unstable();
-
-    // Two staged pairs overlap the next K tile's fill with the current
-    // tile's MMAs; one pair halves the footprint so a core holds more
-    // workgroups. A split grid already exists to raise occupancy, so the
-    // partials body is one pair outright.
-    let staging: SmallVec<[u8; 2]> = if splits.as_slice() == [1] {
-        SmallVec::from_slice(&[1, 2])
-    } else {
-        SmallVec::from_slice(&[1])
-    };
 
     CoopDomain {
-        geoms,
-        splits,
-        staging,
+        schedules: candidate_schedules_for(operand, cx),
     }
 }
 
-/// `(caps, staged element, planner identity) -> geometries`. The grid below
-/// is ~7,000 candidates each costing an exact arena query, and none of it
-/// depends on the contraction — only on the device.
+/// Geometry and staging depend only on the device and staged element type.
 static GEOM_MEMO: crate::domains::DomainMemo<
     (Caps, ScalarElement, usize),
-    SmallVec<[CoopGeom; 16]>,
+    SmallVec<[CoopSchedule; 16]>,
 > = crate::domains::DomainMemo::new();
 
-/// Every one of the ~5,700 points this domain carries is generated as a candidate.
-/// The optimum is shape-dependent.
-fn candidate_geoms_for(operand: Dtype, cx: &DomainCtx<'_>) -> SmallVec<[CoopGeom; 16]> {
+fn candidate_schedules_for(operand: Dtype, cx: &DomainCtx<'_>) -> SmallVec<[CoopSchedule; 16]> {
     let key = (
         cx.caps.clone(),
         stage_element(operand),
         crate::domains::planner_id(cx.planner),
     );
-    GEOM_MEMO.get_or_insert(&key, || generate_geoms(operand, cx))
+    GEOM_MEMO.get_or_insert(&key, || generate_schedules(operand, cx))
 }
 
-fn generate_geoms(operand: Dtype, cx: &DomainCtx<'_>) -> SmallVec<[CoopGeom; 16]> {
+fn generate_schedules(operand: Dtype, cx: &DomainCtx<'_>) -> SmallVec<[CoopSchedule; 16]> {
     let caps = cx.caps;
     let width = caps.subgroup_width();
-    let max_lanes = caps.limits.max_compute_invocations_per_workgroup;
+    let max_lanes = caps
+        .limits
+        .max_compute_invocations_per_workgroup
+        .min(caps.limits.max_compute_workgroup_size[0]);
     let max_bytes = caps.limits.max_compute_workgroup_storage_size;
     let stage = stage_element(operand);
-
-    // `FUSOR_PIN_COOP="bm,bn,bk"` restricts the domain to one geometry, for
-    // measurement. Ordinary runs never set it.
-    let pin: Option<(u32, u32, u32)> = std::env::var("FUSOR_PIN_COOP").ok().and_then(|v| {
+    let pin: Option<Vec<u32>> = std::env::var("FUSOR_PIN_COOP").ok().and_then(|v| {
         let p: Vec<u32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-        (p.len() == 3).then(|| (p[0], p[1], p[2]))
+        (p.len() >= 3).then_some(p)
     });
-    let mut out: SmallVec<[CoopGeom; 16]> = SmallVec::new();
+    let mut out = SmallVec::new();
     for bm in BM_CHOICES {
         for bn in BN_CHOICES {
             for bk in BK_CHOICES {
@@ -149,15 +112,23 @@ fn generate_geoms(operand: Dtype, cx: &DomainCtx<'_>) -> SmallVec<[CoopGeom; 16]
                     while n_passes <= bn / MIN_PASS_COLS {
                         if let Some(geom) = geom_of(bm, bn, bk, n_passes, subgroups)
                             && geom.legal(width, max_lanes)
-                            && cx
-                                .planner
-                                .workgroup_bytes(&coop_tiles(geom, stage), caps)
-                                .is_ok_and(|bytes| bytes <= max_bytes)
-                            && pin.is_none_or(|(pm, pn, pk)| {
-                                geom.bm == pm && geom.bn == pn && geom.bk == pk
+                            && pin.as_ref().is_none_or(|p| {
+                                geom.bm == p[0]
+                                    && geom.bn == p[1]
+                                    && geom.bk == p[2]
+                                    && p.get(3).is_none_or(|sg| geom.subgroups == *sg)
+                                    && p.get(4).is_none_or(|np| geom.n_passes == *np)
                             })
                         {
-                            out.push(geom);
+                            for staging in [1, 2] {
+                                if cx
+                                    .planner
+                                    .workgroup_bytes(&coop_tiles(geom, stage, staging), caps)
+                                    .is_ok_and(|bytes| bytes <= max_bytes)
+                                {
+                                    out.push(CoopSchedule { geom, staging });
+                                }
+                            }
                         }
                         n_passes *= 2;
                     }
@@ -193,44 +164,5 @@ pub const fn stage_element(operand: Dtype) -> ScalarElement {
     }
 }
 
-/// The workgroup tiles one staged operand pair declares: a `bm x (bk + 1)`
-/// A tile and a `bk x (bn / n_passes + 1)` B tile, each less the pad after
-/// its final row, which is never addressed. The `+1` is the shared-memory
-/// bank-conflict pad.
-pub fn coop_tiles(geom: CoopGeom, stage: ScalarElement) -> Tiles {
-    let bn_pass = geom.bn / geom.n_passes.max(1);
-    let a_elems = geom.bm * (geom.bk + 1) - 1;
-    let b_elems = geom.bk * (bn_pass + 1) - 1;
-    let element = ElementType::Scalar(stage);
-    Tiles {
-        decls: SmallVec::from_vec(vec![
-            Arc::new(TileDecl::new(
-                element,
-                TileLayout::contiguous(MemoryLevel::Workgroup, &[a_elems]),
-                "coop_a",
-            )),
-            Arc::new(TileDecl::new(
-                element,
-                TileLayout::contiguous(MemoryLevel::Workgroup, &[b_elems]),
-                "coop_b",
-            )),
-        ]),
-    }
-}
-
-/// Never-split, plus every divisor of the K loop leaving at least two
-/// iterations per workgroup, capped at [`MAX_SPLITS`].
-///
-/// A symbolic `k` cannot be divided at compile time, so it emits `[1]`.
-pub fn split_candidates(k: Dim, bk: u32) -> Vec<u32> {
-    let Some(k) = k.as_const() else {
-        return vec![1];
-    };
-    let bk = u64::from(bk.max(1));
-    let iterations = k.div_ceil(bk);
-    let limit = (iterations / 2).min(u64::from(MAX_SPLITS)).max(1);
-    (1..=limit)
-        .filter(|d| *d == 1 || iterations % d == 0)
-        .map(|d| d as u32)
-        .collect()
-}
+/// Shared scratch declarations for cooperative schedules.
+pub use fusor_ir::ir::launch::coop_tiles;

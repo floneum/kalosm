@@ -176,6 +176,11 @@ pub(crate) fn floor_fold(
     post: SmallVec<[ScalarExpr; 4]>,
     ops: Vec<Operand>,
 ) -> Option<Id> {
+    if space.iterations().is_some_and(|n| n > u64::from(u32::MAX)) {
+        return None;
+    }
+    let sched =
+        ScheduleDomain::Point.with_fold_carrier(carrier.lanes()?, acc.byte_size(), b.caps())?;
     b.add_launch(Launch::Fold {
         space,
         axis,
@@ -184,7 +189,7 @@ pub(crate) fn floor_fold(
         acc,
         post,
         ops,
-        sched: floor_sched(),
+        sched,
     })
     .ok()
 }
@@ -237,23 +242,20 @@ pub fn lower_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Op
         .iter()
         .map(|e| crate::carrier::retype_args(e, dtype))
         .collect();
-    let k = b
-        .add_launch(Launch::Fold {
-            space: IndexSpace::new(in_shape.iter().copied()),
-            axis: *axis,
-            vec_axes: SmallVec::new(),
-            carrier: carrier.clone().with_lift(lift),
-            acc: *acc,
-            post: (0..carrier.width())
-                .map(|i| ScalarExpr::arg(i as u32, *acc))
-                .collect(),
-            ops: ins
-                .iter()
-                .map(|x| alias_operand_of(*x, &in_shape))
-                .collect(),
-            sched: ScheduleDomain::Point,
-        })
-        .ok()?;
+    let k = floor_fold(
+        b,
+        IndexSpace::new(in_shape.iter().copied()),
+        *axis,
+        SmallVec::new(),
+        carrier.clone().with_lift(lift),
+        *acc,
+        (0..carrier.width())
+            .map(|i| ScalarExpr::arg(i as u32, *acc))
+            .collect(),
+        ins.iter()
+            .map(|x| alias_operand_of(*x, &in_shape))
+            .collect(),
+    )?;
     b.union(id, k).ok()
 }
 
@@ -268,6 +270,13 @@ pub fn lower_contract_generic(
     node: &Node,
     f: &Facts<'_>,
 ) -> Option<Id> {
+    let fold = b.add_launch(contract_fold(node, f)?).ok()?;
+    b.union(id, fold).ok()
+}
+
+/// Construct the generic contraction once. Schedule rules may derive new
+/// domains from this value, without restating its shape or address mapping.
+pub fn contract_fold(node: &Node, f: &Facts<'_>) -> Option<Launch> {
     let Op::Logical(Logical::Contract {
         spec,
         acc,
@@ -322,20 +331,24 @@ pub fn lower_contract_generic(
             &b_shape,
         )?,
     ];
-    let kf = b
-        .add_launch(Launch::Fold {
-            space: IndexSpace::new(space),
-            axis,
-            vec_axes: SmallVec::new(),
-            carrier: Carrier::binop(BinOp::Add, Carrier::binop_identity(BinOp::Add, *acc)?, *acc)
-                .with_lift([pre]),
-            acc: *acc,
-            post: smallvec::smallvec![ident_expr(*acc)],
-            ops,
-            sched: ScheduleDomain::Point,
-        })
-        .ok()?;
-    b.union(id, kf).ok()
+    let space = IndexSpace::new(space);
+    if space.iterations().is_some_and(|n| n > u64::from(u32::MAX)) {
+        return None;
+    }
+    let carrier = Carrier::binop(BinOp::Add, Carrier::binop_identity(BinOp::Add, *acc)?, *acc)
+        .with_lift([pre]);
+    let sched =
+        ScheduleDomain::Point.with_fold_carrier(carrier.lanes()?, acc.byte_size(), f.caps())?;
+    Some(Launch::Fold {
+        space,
+        axis,
+        vec_axes: SmallVec::new(),
+        carrier,
+        acc: *acc,
+        post: smallvec::smallvec![ident_expr(*acc)],
+        ops,
+        sched,
+    })
 }
 
 /// One contraction operand read over the fold's `[out..., k]` index space.
@@ -360,6 +373,24 @@ fn contract_operand(
     b_shape: &[Dim],
 ) -> Option<Operand> {
     let strides = Layout::row_major_strides(shape);
+    if contracted.len() <= 1 {
+        let stride = |label: Label| {
+            labels
+                .iter()
+                .zip(&strides)
+                .filter(|(l, _)| **l == label)
+                .fold(Dim::Const(0), |sum, (_, s)| sum + *s)
+        };
+        let mut dims: SmallVec<[Dim; 6]> = out_shape.iter().copied().collect();
+        dims.push(fold_extent(contracted, spec, a_shape, b_shape)?);
+        let mut mapped: SmallVec<[Dim; 6]> = spec.out.iter().map(|l| stride(*l)).collect();
+        mapped.push(contracted.first().map_or(Dim::Const(0), |l| stride(*l)));
+        return Some(Operand {
+            src,
+            layout: Layout::from_parts(Dim::Const(0), &dims, &mapped).ok()?,
+            access: AccessPlan::Alias,
+        });
+    }
     // A label repeated within one operand is a diagonal read: its strides add.
     let stride_of = |l: Label| -> Option<u32> {
         let mut acc: u64 = 0;

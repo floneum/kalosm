@@ -47,9 +47,10 @@ const fn tag_index(tag: OpTag) -> usize {
         OpTag::LaunchContract => 12,
         OpTag::LaunchGather => 13,
         OpTag::LaunchScatter => 14,
-        OpTag::LaunchRegion => 15,
-        OpTag::Ext => 16,
-        OpTag::Union => 17,
+        OpTag::Union => 15,
+        OpTag::LaunchSlab => 16,
+        OpTag::LaunchGroup => 17,
+        OpTag::LaunchStreamFold => 18,
     }
 }
 
@@ -76,7 +77,6 @@ impl Saturate for CoreSaturate {
     ) -> Result<SaturationReport> {
         let start = Instant::now();
         let initial = graph.len();
-        let max_nodes = budget.node_slope as usize * initial + budget.node_slack as usize;
 
         let by_head = head_table(rules);
         let mut fired_counts = vec![0u32; rules.len()];
@@ -84,34 +84,36 @@ impl Saturate for CoreSaturate {
         let mut saturated = true;
         let mut rounds = 0u32;
         let mut applications = 0u32;
-        // Where a hard budget (nodes / applications) stopped the walk, if it
-        // did. Everything *before* this creation index was offered.
-        let mut budget_break: Option<usize> = None;
-
-        // One rule fires at most once per node. The stride is fixed for the
-        // whole call so a bit's index never moves; the set itself grows with
-        // the graph.
-        let stride = max_nodes.max(initial).saturating_add(4096).max(64);
-        let mut fired = FixedBitSet::with_capacity(rules.len().saturating_mul(64));
 
         // Creation order is already a topological order: children are
         // strictly smaller ids. Only what the roots reach is offered: a
         // node no root reaches is never selected, and offering it would
         // mint alternatives for it without bound as the arena accumulates
-        // the terms of earlier resolves. A node offered every rule by an
-        // earlier pass is marked, and a rule's applicability depends only
-        // on the node and its (immutable) child facts, so it is not
-        // re-offered — re-offering id-minting rules re-expands an already-
-        // saturated region.
+        // the terms of earlier resolves. Earlier bounded searches mark the
+        // region they covered, including candidates left at budget exhaustion.
+        // A new root must not restart that region's optimization search.
         let reachable = graph.reachable_from_roots();
         let mut work: VecDeque<Id> = reachable
             .ones()
             .map(|i| Id(i as u32))
             .filter(|id| !graph.is_offered(*id))
             .collect();
+        let new_nodes = work.len();
+        let max_nodes = (initial - new_nodes)
+            .saturating_add((budget.node_slope as usize).saturating_mul(new_nodes))
+            .saturating_add(budget.node_slack as usize);
+        let max_applications = budget.max_applications.max(
+            budget
+                .application_slope
+                .saturating_mul(new_nodes.min(u32::MAX as usize) as u32),
+        );
+        // One rule fires at most once per node. The stride is fixed for the
+        // whole call so a bit's index never moves; the set itself grows with
+        // the graph.
+        let stride = max_nodes.max(initial).saturating_add(4096).max(64);
+        let mut fired = FixedBitSet::with_capacity(rules.len().saturating_mul(64));
+
         let mut next: Vec<Id> = Vec::new();
-        // Every node popped and offered its whole candidate list.
-        let mut done: Vec<Id> = Vec::new();
 
         'rounds: while rounds < budget.max_rounds && !work.is_empty() {
             rounds += 1;
@@ -122,15 +124,13 @@ impl Saturate for CoreSaturate {
                 }
                 let candidates = &by_head[tag_index(graph.node(id).op.tag())];
                 if candidates.is_empty() {
-                    done.push(id);
                     continue;
                 }
                 let node = graph.node(id).clone();
                 let facts = graph.facts_view(id, caps);
                 for &rid in candidates.iter() {
-                    if graph.len() >= max_nodes || applications >= budget.max_applications {
+                    if graph.len() >= max_nodes || applications >= max_applications {
                         saturated = false;
-                        budget_break = Some(id.index());
                         let class = graph.class_of(id).0;
                         if !truncated.contains(&class) {
                             truncated.push(class);
@@ -157,7 +157,6 @@ impl Saturate for CoreSaturate {
                         }
                     }
                 }
-                done.push(id);
             }
             work.extend(next.drain(..));
             if fired_this_round == 0 {
@@ -178,18 +177,12 @@ impl Saturate for CoreSaturate {
             applications +=
                 lower_everything(graph, caps, rules, &by_head, &mut fired_counts, &reachable);
         }
-        for id in done {
-            graph.mark_offered(id);
+        // The lowering floor makes the whole reached region runnable, even
+        // where optimization stopped. Keep unrelated existing nodes eligible
+        // for a later root, but do not expand this region's leftovers again.
+        for i in reachable.ones().chain(initial..graph.len()) {
+            graph.mark_offered(Id(i as u32));
         }
-
-        // Advance the frontier: nodes below it have been offered every rule.
-        // A full drain or round exhaustion covers the whole graph; a hard
-        // budget break covers exactly the prefix walked. Without this, every
-        // resolve of a long-lived graph re-offers every historical node and
-        // the id-minting rules re-mint their results each time.
-        graph.saturation_frontier = budget_break
-            .unwrap_or_else(|| graph.len())
-            .max(graph.saturation_frontier);
 
         let fired_report: Vec<(&'static str, u32)> = rules
             .iter()

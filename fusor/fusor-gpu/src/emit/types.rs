@@ -302,10 +302,51 @@ pub(crate) fn workgroup_global(
 pub(crate) fn create_storage_globals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
     let mut buffers = em.analysis.buffers.clone();
     buffers.sort_by_key(|b| b.binding);
-    for buffer in &buffers {
-        let atomic = em.analysis.atomic_buffers.contains(&buffer.binding);
-        let global = storage_global_with(&mut em.module, buffer, atomic)?;
-        em.buffer_globals.insert(key(buffer), global);
+    for views in buffers.chunk_by(|a, b| a.binding == b.binding) {
+        let first = &views[0];
+        let mixed = views.iter().any(|b| b.element != first.element);
+        let packed_half = mixed
+            && views
+                .iter()
+                .any(|b| b.element == ElementType::Scalar(ScalarElement::F16));
+        let atomic = em.analysis.atomic_buffers.contains(&first.binding) || packed_half;
+        let mut decl = (**first).clone();
+        if mixed {
+            if views.iter().any(|b| {
+                !matches!(
+                    b.element,
+                    ElementType::Scalar(
+                        ScalarElement::F32
+                            | ScalarElement::I32
+                            | ScalarElement::U32
+                            | ScalarElement::F16
+                    )
+                )
+            }) {
+                return Err(EmitError::Unsupported(
+                    "mixed storage views require scalar numeric elements".into(),
+                ));
+            }
+            decl.element = ElementType::Scalar(ScalarElement::U32);
+        }
+        if views.iter().any(|b| b.access == BufferAccess::ReadWrite) {
+            decl.access = BufferAccess::ReadWrite;
+        }
+        // Neighboring f16 elements share a word. A compare-exchange store
+        // preserves the other half even when different lanes write it.
+        if atomic {
+            em.analysis.atomic_buffers.insert(first.binding);
+        }
+        let global = storage_global_with(&mut em.module, &decl, atomic)?;
+        let physical = if atomic && decl.element == ElementType::Scalar(ScalarElement::F32) {
+            ElementType::Scalar(ScalarElement::U32)
+        } else {
+            decl.element
+        };
+        for buffer in views {
+            em.buffer_globals.insert(key(buffer), global);
+            em.buffer_elements.insert(key(buffer), physical);
+        }
     }
     Ok(())
 }
@@ -327,12 +368,18 @@ pub(crate) fn create_storage_globals(em: &mut Emitter<'_>) -> Result<(), EmitErr
 /// is therefore always emittable, just larger.
 pub(crate) fn create_workgroup_globals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
     let tiles = em.analysis.tiles.clone();
-    let placements: FxHashMap<usize, (u32, u32)> = em
-        .plan
-        .placements
-        .iter()
-        .map(|p| (key(&p.tile), (p.byte_offset, p.byte_len)))
-        .collect();
+    // `FUSOR_NO_TILE_ALIAS` gives every tile its own allocation: the
+    // bisection aid for a suspected aliasing miscompile.
+    let placements: FxHashMap<usize, (u32, u32)> =
+        if std::env::var_os("FUSOR_NO_TILE_ALIAS").is_some() {
+            FxHashMap::default()
+        } else {
+            em.plan
+                .placements
+                .iter()
+                .map(|p| (key(&p.tile), (p.byte_offset, p.byte_len)))
+                .collect()
+        };
 
     match em.plan.mode {
         ArenaMode::ByteArena if !placements.is_empty() => {

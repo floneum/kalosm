@@ -51,6 +51,8 @@ fn seed_facts(caps: &Caps) -> DeviceFacts {
     // ~3 GHz x lanes x 2 (fma) per core.
     let fma = 3_000 * lanes * 2 * threads;
     DeviceFacts {
+        coop_step_ps: 0,
+        lane_step_ps: 0,
         // The generic CPU runner lowers, binds, and dispatches each selected
         // launch. BERT's one-workgroup maps measure in the 10--20 us range,
         // so pricing them as a 1 us function call causes the extractor to
@@ -68,7 +70,6 @@ fn seed_facts(caps: &Caps) -> DeviceFacts {
         store_ps_per_element: 300,
         saturation_lanes: (threads * lanes * 4) as u32,
         single_buffered_traffic_pct: 100,
-        compile_ps_per_kernel: 200_000_000,
         // Measured order of magnitude for waking a parked worker and joining.
         thread_wake_ps: 2_000_000,
         caps: caps.clone(),

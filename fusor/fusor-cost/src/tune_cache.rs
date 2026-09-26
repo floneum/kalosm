@@ -1,15 +1,10 @@
 //! The per-machine tuning cache: what this device has already learned about
 //! which kernels are cheap.
 //!
-//! The tuner writes down what it measured, keyed by device, and the next
-//! process starts from it. A variant already timed is never timed again; a
-//! variant caught computing a different function can never be the incumbent
-//! ([`Verdict::Wrong`]); untried variants are explored a few per resolve.
-//!
-//! It never selects a plan on its own — it orders candidates and skips
-//! re-timing; plans are still built by the extractor and value-checked against
-//! the base before adoption. A stale, wrong or corrupt entry costs a worse
-//! starting order or a missed candidate, never a wrong answer.
+//! Records only timing observations. Candidate equivalence is established by
+//! construction and tested by conformance; this cache has no correctness
+//! verdicts or blacklist. Stale timings can affect performance, never which
+//! computations the compiler considers equivalent.
 //!
 //! Keyed by `Caps::fingerprint()`: a different device reads a different file;
 //! an unknown device reads nothing and tunes normally.
@@ -43,53 +38,13 @@ pub const WINDOW: usize = 8;
 /// the combination that actually wins.
 pub const RERACE_PER_RESOLVE: usize = usize::MAX;
 
-/// What this device learned about one `(launch, variant)` pair.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Verdict {
-    /// Reproduced the base plan's values, in the unit the stored record documents.
-    Ran(u64),
-    /// Measured, and its outputs disagreed with the base plan's.
-    ///
-    /// Not stored as a time: a member that computes a different function skips
-    /// work, so it is usually the fastest thing in the e-class. Filed as a
-    /// duration it would become [`TuneCache::best`] and prune the correct
-    /// candidates.
-    Wrong,
-}
-
-/// One learned `(launch, variant)` pair: its observation window.
-///
-/// `window` is `None` for a variant that disagreed with the base — see
-/// [`Verdict`] — and otherwise holds up to [`WINDOW`] samples, oldest first.
-/// On a device that can time kernels a sample is the launch's GPU span in
-/// absolute nanoseconds; on a device with no kernel timer (the CPU target) it
-/// is parts-per-million of the base plan's time in the pass that measured it.
-/// The two units never share a file ([`FORMAT`]).
+/// A candidate's last up-to-[`WINDOW`] timing observations, oldest first.
+/// GPU samples are launch nanoseconds; CPU samples are ppm of the base plan.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Record {
     launch: String,
     variant: String,
-    /// `None` for a variant that disagreed with the base; see [`Verdict`].
-    window: Option<Vec<u64>>,
-}
-
-/// What is held in memory for one `(launch, variant)` pair.
-#[derive(Clone, Debug, PartialEq, Eq)]
-enum Learned {
-    /// This device caught the variant computing a different function.
-    /// Absorbing within a process — see [`TuneCache::record`].
-    Wrong,
-    /// The last up-to-[`WINDOW`] observations, oldest first. Never empty.
-    Window(Vec<u64>),
-}
-
-impl Learned {
-    fn verdict(&self) -> Verdict {
-        match self {
-            Learned::Wrong => Verdict::Wrong,
-            Learned::Window(w) => Verdict::Ran(w.iter().copied().min().unwrap_or(u64::MAX)),
-        }
-    }
+    window: Vec<u64>,
 }
 
 /// A whole-plan outcome: the per-launch variants that were fastest when
@@ -109,7 +64,7 @@ struct Combo {
 
 /// The on-disk format version. A file at a different format is read as an
 /// empty cache: mismatch is never a wrong ordering, only a re-tuning pass.
-pub const FORMAT: u32 = 6;
+pub const FORMAT: u32 = 7;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct Disk {
@@ -133,31 +88,27 @@ impl Disk {
     }
 }
 
-/// Per-signature learned verdicts, keyed by candidate label.
-type LearnedTable = FxHashMap<String, FxHashMap<String, Learned>>;
+/// Per-signature timing windows, keyed by candidate label.
+type LearnedTable = FxHashMap<String, FxHashMap<String, Vec<u64>>>;
 /// Per-plan-signature adopted combination and its measured nanoseconds.
 type ComboTable = FxHashMap<String, (Vec<Option<String>>, u64)>;
 
 /// Fold a file at `path` into the in-memory tables.
 fn read_tables(path: &Path) -> (LearnedTable, ComboTable) {
-    let mut seen: FxHashMap<String, FxHashMap<String, Learned>> = FxHashMap::default();
+    let mut seen: FxHashMap<String, FxHashMap<String, Vec<u64>>> = FxHashMap::default();
     let mut combos: FxHashMap<String, (Vec<Option<String>>, u64)> = FxHashMap::default();
     if let Ok(body) = std::fs::read_to_string(path)
         && let Ok(disk) = serde_json::from_str::<Disk>(&body)
     {
         let (records, stored) = disk.accept();
         for r in records {
-            let learned = match r.window {
-                Some(w) if !w.is_empty() => {
-                    let start = w.len().saturating_sub(WINDOW);
-                    Learned::Window(w[start..].to_vec())
-                }
-                // An empty window is not a thing `save` writes; read it as
-                // unmeasured rather than inventing a sample.
-                Some(_) => continue,
-                None => Learned::Wrong,
-            };
-            seen.entry(r.launch).or_default().insert(r.variant, learned);
+            if r.window.is_empty() {
+                continue;
+            }
+            let start = r.window.len().saturating_sub(WINDOW);
+            seen.entry(r.launch)
+                .or_default()
+                .insert(r.variant, r.window[start..].to_vec());
         }
         for c in stored {
             combos.insert(c.plan, (c.picks, c.score));
@@ -228,73 +179,54 @@ impl TuneCache {
         self.len() == 0
     }
 
-    /// What this device learned about one candidate, if it has ever been
-    /// measured here. A `Ran` carries the window minimum.
-    pub fn known(&self, launch: &str, variant: &str) -> Option<Verdict> {
-        Some(self.seen.lock().get(launch)?.get(variant)?.verdict())
-    }
-
     /// The minimum over the last [`WINDOW`] observations of one candidate.
-    /// `None` for a never-measured or wrong-valued variant.
     pub fn window_min(&self, launch: &str, variant: &str) -> Option<u64> {
-        match self.seen.lock().get(launch)?.get(variant)? {
-            Learned::Window(w) => w.iter().copied().min(),
-            Learned::Wrong => None,
-        }
-    }
-
-    /// How many observations one candidate's window currently holds. What the
-    /// explorer's "least-observed arm first" policy reads.
-    pub fn observations(&self, launch: &str, variant: &str) -> usize {
-        match self.seen.lock().get(launch).and_then(|e| e.get(variant)) {
-            Some(Learned::Window(w)) => w.len(),
-            _ => 0,
-        }
-    }
-
-    /// The fastest variant recorded for this launch **that reproduced the
-    /// base's values**, and its window-min time. A wrong answer has no time,
-    /// so it can never be the incumbent.
-    pub fn best(&self, launch: &str) -> Option<(String, u64)> {
-        let seen = self.seen.lock();
-        seen.get(launch)?
+        self.seen
+            .lock()
+            .get(launch)?
+            .get(variant)?
             .iter()
-            .filter_map(|(name, l)| match l {
-                Learned::Window(w) => Some((name.clone(), w.iter().copied().min()?)),
-                Learned::Wrong => None,
-            })
+            .copied()
+            .min()
+    }
+
+    /// Observations available for the explorer's least-observed-first policy.
+    pub fn observations(&self, launch: &str, variant: &str) -> usize {
+        self.seen
+            .lock()
+            .get(launch)
+            .and_then(|e| e.get(variant))
+            .map_or(0, Vec::len)
+    }
+
+    /// Whether a family of timing fields contains enough samples to compare.
+    pub fn has_observations_with_prefix(&self, prefix: &str, minimum: usize) -> bool {
+        self.seen.lock().iter().any(|(field, variants)| {
+            field.starts_with(prefix) && variants.values().any(|window| window.len() >= minimum)
+        })
+    }
+
+    /// The fastest observed variant and its window-min time.
+    pub fn best(&self, launch: &str) -> Option<(String, u64)> {
+        self.seen
+            .lock()
+            .get(launch)?
+            .iter()
+            .filter_map(|(name, w)| Some((name.clone(), w.iter().copied().min()?)))
             .min_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(&b.0)))
     }
 
-    /// Push one production observation into the candidate's window.
+    /// Push one timing observation; old minima age out of the bounded window.
     pub fn observe(&self, launch: &str, variant: &str, nanos: u64) {
-        self.record(launch, variant, Verdict::Ran(nanos));
-    }
-
-    pub fn record(&self, launch: &str, variant: &str, verdict: Verdict) {
         let mut seen = self.seen.lock();
-        let entry = seen.entry(launch.to_string()).or_default();
-        match (entry.get_mut(variant), verdict) {
-            // `Wrong` is absorbing within a process: once this device has seen
-            // a variant disagree, no later timing of it means anything. Across
-            // processes it re-races as unmeasured — see `plan_candidates`.
-            (Some(slot), Verdict::Wrong) => *slot = Learned::Wrong,
-            (Some(Learned::Wrong), Verdict::Ran(_)) => {}
-            // The window keeps the most recent `WINDOW` observations; a fast
-            // sample that `WINDOW` newer runs never reproduce ages out.
-            (Some(Learned::Window(w)), Verdict::Ran(ns)) => {
-                w.push(ns);
-                if w.len() > WINDOW {
-                    let excess = w.len() - WINDOW;
-                    w.drain(..excess);
-                }
-            }
-            (None, Verdict::Wrong) => {
-                entry.insert(variant.to_string(), Learned::Wrong);
-            }
-            (None, Verdict::Ran(ns)) => {
-                entry.insert(variant.to_string(), Learned::Window(vec![ns]));
-            }
+        let w = seen
+            .entry(launch.to_string())
+            .or_default()
+            .entry(variant.to_string())
+            .or_default();
+        w.push(nanos);
+        if w.len() > WINDOW {
+            w.drain(..w.len() - WINDOW);
         }
         *self.dirty.lock() = true;
     }
@@ -316,8 +248,7 @@ impl TuneCache {
     }
 
     /// Whether every candidate offered for this launch has already been
-    /// measured here, so there is nothing left to learn. A variant proven to
-    /// compute the wrong function counts.
+    /// measured here, so there is nothing left to learn.
     ///
     /// Once there is nothing new to try, the accumulated minimum over every
     /// past run is a better estimate than one fresh noisy sample, so the tuner
@@ -352,13 +283,7 @@ impl TuneCache {
 
         for (c, prior) in candidates {
             match entry.and_then(|e| e.get(c.as_str())) {
-                // A recorded `Wrong` can only be a fossil of an older build —
-                // production halts on divergence before any verdict is written
-                // (see `Session::autotune`) — so the entry is treated as
-                // unmeasured rather than pinning the repaired kernel out of
-                // selection forever.
-                Some(Learned::Wrong) => fresh.push((c, *prior)),
-                Some(Learned::Window(w)) => {
+                Some(w) => {
                     let ns = w.iter().copied().min().unwrap_or(u64::MAX);
                     let hopeless = best.is_some_and(|b| ns as f64 > b as f64 * SKIP_RATIO);
                     if hopeless {
@@ -402,10 +327,7 @@ impl TuneCache {
                     vs.iter().map(move |(v, learned)| Record {
                         launch: l.clone(),
                         variant: v.clone(),
-                        window: match learned {
-                            Learned::Window(w) => Some(w.clone()),
-                            Learned::Wrong => None,
-                        },
+                        window: learned.clone(),
                     })
                 })
                 .collect();
@@ -458,5 +380,58 @@ pub fn at_path(path: &Path) -> TuneCache {
         seen: Mutex::new(seen),
         combos: Mutex::new(combos),
         dirty: Mutex::new(false),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn observations_age_out_and_only_rank_existing_candidates() {
+        let cache = TuneCache::default();
+        cache.observe("launch", "a", 1);
+        for _ in 0..WINDOW {
+            cache.observe("launch", "a", 100);
+        }
+        cache.observe("launch", "b", 50);
+        cache.observe("launch", "not-in-graph", 0);
+        assert_eq!(cache.window_min("launch", "a"), Some(100));
+        assert_eq!(cache.observations("launch", "a"), WINDOW);
+        let candidates = vec![("a".into(), 0), ("b".into(), 1000)];
+        let (ranked, _) = cache.plan_candidates("launch", &candidates);
+        assert_eq!(ranked, vec![&candidates[1].0, &candidates[0].0]);
+    }
+
+    #[test]
+    fn persisted_timings_require_a_matching_format() {
+        let path =
+            std::env::temp_dir().join(format!("fusor-timing-test-{}.json", std::process::id()));
+        let cache = TuneCache {
+            path: Some(path.clone()),
+            ..TuneCache::default()
+        };
+        cache.observe("launch", "a", 40);
+        cache.observe("launch", "a", 50);
+        cache.record_combo("plan", vec![Some("a".into())], 12);
+        cache.observe("diff:plan", "candidate", 30);
+        assert!(!cache.has_observations_with_prefix("diff:", 2));
+        cache.observe("diff:plan", "candidate", 40);
+        cache.save();
+        let restored = at_path(&path);
+        assert_eq!(restored.window_min("launch", "a"), Some(40));
+        assert_eq!(restored.observations("launch", "a"), 2);
+        assert_eq!(restored.combo("plan"), Some(vec![Some("a".into())]));
+        assert!(restored.has_observations_with_prefix("diff:", 2));
+        assert!(!restored.has_observations_with_prefix("other:", 2));
+        let mut disk: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        disk["format"] = (FORMAT + 1).into();
+        std::fs::write(&path, serde_json::to_string(&disk).unwrap()).unwrap();
+        let obsolete = at_path(&path);
+        assert!(obsolete.is_empty());
+        assert!(!obsolete.has_observations_with_prefix("diff:", 2));
+        assert_eq!(obsolete.combo("plan"), None);
+        std::fs::remove_file(path).unwrap();
     }
 }

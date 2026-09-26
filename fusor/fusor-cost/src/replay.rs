@@ -3,13 +3,13 @@
 
 use fixedbitset::FixedBitSet;
 use fusor_ir::Result;
-use fusor_ir::egraph::{EGraph, Id};
+use fusor_ir::egraph::{ClassId, EGraph, Id};
 use fusor_ir::extract::{Plan, PlanHash, ReplayKey};
 use fusor_ir::ir::Op;
 use fusor_ir::ir::logical::{LeafKind, Logical};
 use fusor_ir::shape::Dim;
 use parking_lot::Mutex;
-use rustc_hash::FxHasher;
+use rustc_hash::{FxHashMap, FxHasher};
 use std::hash::{Hash, Hasher};
 use std::sync::Arc;
 
@@ -35,14 +35,8 @@ struct Lru {
     plans: Vec<(ReplayKey, Entry)>,
 }
 
-/// One key's plan, and whether *that* plan has passed `verify_plan` against
-/// the graph term the key names.
 struct Entry {
     plan: Arc<Plan>,
-    /// The plan hash last verified under this key. Carried per entry so
-    /// evicting the plan evicts the record, and a replacement plan never
-    /// inherits its predecessor's clearance.
-    verified: Option<PlanHash>,
 }
 
 impl Lru {
@@ -66,18 +60,9 @@ impl Lru {
     fn insert(&mut self, key: ReplayKey, plan: Arc<Plan>) {
         match self.plans.iter_mut().find(|(k, _)| *k == key) {
             Some(slot) => {
-                if slot.1.verified != Some(plan.hash) {
-                    slot.1.verified = None;
-                }
                 slot.1.plan = plan;
             }
-            None => self.plans.push((
-                key,
-                Entry {
-                    plan,
-                    verified: None,
-                },
-            )),
+            None => self.plans.push((key, Entry { plan })),
         }
         self.touch(key);
         while self.plans.len() > CAPACITY {
@@ -105,13 +90,30 @@ impl ReplayCache {
     /// The returned flag is `plan_unchanged`: `true` when the entry was
     /// already present, or when a re-extraction produced the same
     /// [`PlanHash`] — either way nothing recompiles.
+    ///
+    /// `graph` is what the plan has to be a selection *of*. A [`ReplayKey`]
+    /// identifies the term under the roots, which is stable, but
+    /// [`Extraction::sigma`] is keyed by class **representative**, and a
+    /// union anywhere in the graph moves one. A hit whose keys have only
+    /// moved is rekeyed; one whose classes have merged is no longer a
+    /// selection of this graph and is re-extracted.
     pub fn get_or_extract(
         &self,
         key: ReplayKey,
+        graph: &EGraph,
         f: impl FnOnce() -> Result<Plan>,
     ) -> Result<(Arc<Plan>, bool)> {
         if let Some(hit) = self.get(key) {
-            return Ok((hit, true));
+            match recanonicalize(graph, &hit) {
+                Canonical::Current => return Ok((hit, true)),
+                Canonical::Moved(plan) => {
+                    let plan = Arc::new(*plan);
+                    self.entries.lock().insert(key, Arc::clone(&plan));
+                    return Ok((plan, true));
+                }
+                // Fall through to a fresh extraction, which replaces the entry.
+                Canonical::Merged => {}
+            }
         }
         let fresh = f()?;
         let previous = self.newest_hash();
@@ -119,31 +121,6 @@ impl ReplayCache {
         let plan = Arc::new(fresh);
         self.entries.lock().insert(key, Arc::clone(&plan));
         Ok((plan, unchanged))
-    }
-
-    /// Whether `hash` is the plan this key already put through `verify_plan`.
-    ///
-    /// `verify_plan` is a pure function of the plan and the graph term it was
-    /// extracted from, and a [`ReplayKey`] is that term's identity. The plan
-    /// hash is carried too, so a replaced entry never inherits the verdict of
-    /// the plan it displaced.
-    pub fn is_verified(&self, key: ReplayKey, hash: PlanHash) -> bool {
-        self.entries
-            .lock()
-            .plans
-            .iter()
-            .any(|(k, e)| *k == key && e.verified == Some(hash))
-    }
-
-    /// Record that `hash` passed `verify_plan` under `key`. A no-op when the
-    /// entry has since been replaced or evicted.
-    pub fn mark_verified(&self, key: ReplayKey, hash: PlanHash) {
-        let mut entries = self.entries.lock();
-        if let Some((_, e)) = entries.plans.iter_mut().find(|(k, _)| *k == key)
-            && e.plan.hash == hash
-        {
-            e.verified = Some(hash);
-        }
     }
 
     pub fn clear(&self) {
@@ -266,5 +243,111 @@ fn hash_shape<H: Hasher>(h: &mut H, shape: &[Dim]) {
                 h.write_u32(s.0);
             }
         }
+    }
+}
+
+/// What [`ReplayCache::get_or_extract`] found a memoized plan to be, against
+/// the graph as it stands now.
+enum Canonical {
+    /// Every class key is still its class's representative.
+    Current,
+    /// Representatives moved; here is the same plan rekeyed.
+    Moved(Box<Plan>),
+    /// Two selected classes have since merged, so the plan names two members
+    /// of one class. Not a selection any more.
+    Merged,
+}
+
+fn recanonicalize(graph: &EGraph, plan: &Plan) -> Canonical {
+    match recanonicalize_sigma(&plan.extraction.sigma, |id| graph.class_of(id)) {
+        None => Canonical::Current,
+        Some(None) => Canonical::Merged,
+        Some(Some(sigma)) => {
+            let mut rekeyed = plan.clone();
+            rekeyed.extraction.sigma = sigma;
+            Canonical::Moved(Box::new(rekeyed))
+        }
+    }
+}
+
+/// `sigma` under `class_of` as it stands now.
+///
+/// `None` when every key is already its class's representative. `Some(None)`
+/// when two keys canonicalize together onto different members — the classes
+/// merged, and no rekeying makes one selection out of two. Otherwise the
+/// rekeyed map.
+fn recanonicalize_sigma(
+    sigma: &FxHashMap<ClassId, Id>,
+    class_of: impl Fn(Id) -> ClassId,
+) -> Option<Option<FxHashMap<ClassId, Id>>> {
+    if sigma.keys().all(|c| class_of(c.0) == *c) {
+        return None;
+    }
+    let mut out = FxHashMap::with_capacity_and_hasher(sigma.len(), Default::default());
+    for (class, member) in sigma {
+        if let Some(other) = out.insert(class_of(class.0), *member)
+            && other != *member
+        {
+            return Some(None);
+        }
+    }
+    Some(Some(out))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sigma(pairs: &[(u32, u32)]) -> FxHashMap<ClassId, Id> {
+        pairs
+            .iter()
+            .map(|(c, m)| (ClassId(Id(*c)), Id(*m)))
+            .collect()
+    }
+
+    /// The common case: nothing has moved, and the map is left alone.
+    #[test]
+    fn a_selection_whose_classes_have_not_moved_is_left_alone() {
+        let s = sigma(&[(1, 1), (2, 2)]);
+        assert!(recanonicalize_sigma(&s, ClassId).is_none());
+    }
+
+    /// A union after the plan was memoized moves a class's representative.
+    /// The selection is still one member per class; only the key changed.
+    #[test]
+    fn a_moved_representative_is_rekeyed() {
+        // Class {1, 7} is now represented by 7.
+        let moved = |id: Id| ClassId(if id.index() == 1 { Id(7) } else { id });
+        let s = sigma(&[(1, 1), (2, 2)]);
+        let out = recanonicalize_sigma(&s, moved)
+            .expect("keys moved")
+            .expect("no merge");
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[&ClassId(Id(7))], Id(1));
+        assert_eq!(out[&ClassId(Id(2))], Id(2));
+    }
+
+    /// Two classes the plan selected separately have merged. The plan names
+    /// two members of what is now one class, which no rekeying repairs — the
+    /// caller has to extract again.
+    #[test]
+    fn merged_classes_cannot_be_rekeyed() {
+        let merged = |_: Id| ClassId(Id(9));
+        assert_eq!(
+            recanonicalize_sigma(&sigma(&[(1, 1), (2, 2)]), merged),
+            Some(None)
+        );
+    }
+
+    /// Two keys that merged onto the *same* member are not a conflict: one
+    /// class, one selection, said twice.
+    #[test]
+    fn merged_classes_agreeing_on_a_member_are_rekeyed() {
+        let merged = |_: Id| ClassId(Id(9));
+        let out = recanonicalize_sigma(&sigma(&[(1, 5), (2, 5)]), merged)
+            .expect("keys moved")
+            .expect("no conflict");
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[&ClassId(Id(9))], Id(5));
     }
 }

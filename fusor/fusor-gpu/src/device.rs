@@ -8,7 +8,7 @@ use fusor_ir::cost::DeviceFacts;
 use fusor_ir::device::{Caps, DeviceKind};
 use fusor_ir::error::Error;
 
-use crate::caps::{self, LimitWiden};
+use crate::caps;
 
 /// Whether the wgpu device has been lost, and why.
 ///
@@ -36,18 +36,6 @@ impl LostFlag {
     }
 }
 
-/// How to acquire a device. `widen` carries the per-field ceilings a caller
-/// has *proved* it needs; everything else stays at the WebGPU baseline.
-#[derive(Clone, Debug, Default)]
-pub(crate) struct DeviceOptions {
-    pub widen: LimitWiden,
-    /// Case-insensitive substring match against the adapter name, for
-    /// reproducing a bug on a specific GPU. `None` takes the preferred
-    /// adapter.
-    pub adapter_name: Option<String>,
-    pub power_preference: Option<wgpu::PowerPreference>,
-}
-
 /// A live wgpu device plus everything the compiler reads about it.
 pub struct GpuDevice {
     device: wgpu::Device,
@@ -58,6 +46,7 @@ pub struct GpuDevice {
     limits_used: wgpu::Limits,
     features: wgpu::Features,
     adapter_info: wgpu::AdapterInfo,
+    matrix_fallback: Option<String>,
     lost: LostFlag,
 }
 
@@ -65,27 +54,7 @@ impl GpuDevice {
     /// Probe an adapter, request a device at baseline limits widened by
     /// `extra`, then seed (or load cached) facts.
     pub async fn request(extra: Option<wgpu::Limits>) -> Result<Self> {
-        let mut opts = DeviceOptions::default();
-        if let Some(extra) = extra {
-            opts.widen = LimitWiden {
-                max_compute_invocations_per_workgroup: Some(
-                    extra.max_compute_invocations_per_workgroup,
-                ),
-                max_compute_workgroup_size_x: Some(extra.max_compute_workgroup_size_x),
-                max_compute_workgroup_size_y: Some(extra.max_compute_workgroup_size_y),
-                max_compute_workgroup_size_z: Some(extra.max_compute_workgroup_size_z),
-                max_compute_workgroups_per_dimension: Some(
-                    extra.max_compute_workgroups_per_dimension,
-                ),
-                max_compute_workgroup_storage_size: Some(extra.max_compute_workgroup_storage_size),
-                max_storage_buffers_per_shader_stage: Some(
-                    extra.max_storage_buffers_per_shader_stage,
-                ),
-                max_storage_buffer_binding_size: Some(extra.max_storage_buffer_binding_size),
-                max_buffer_size: Some(extra.max_buffer_size),
-            };
-        }
-        request_device(&opts).await
+        request_device(extra).await
     }
 
     pub fn device(&self) -> &wgpu::Device {
@@ -103,7 +72,7 @@ impl GpuDevice {
     pub fn facts(&self) -> &DeviceFacts {
         &self.facts
     }
-    /// The limits actually requested, which the plan-cache salt includes.
+    /// The limits actually requested from the adapter.
     pub fn limits_used(&self) -> &wgpu::Limits {
         &self.limits_used
     }
@@ -115,29 +84,50 @@ impl GpuDevice {
     pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
         &self.adapter_info
     }
+    pub(crate) fn matrix_fallback(&self) -> Option<&str> {
+        self.matrix_fallback.as_deref()
+    }
     /// Set once the driver reports the device lost; see [`LostFlag`].
     pub fn lost(&self) -> &LostFlag {
         &self.lost
     }
 }
 
-/// Pick an adapter, request a device at `baseline ∪ opts.widen`, probe caps.
+/// Pick an adapter, request its device, and probe compiler capabilities.
 ///
 /// `required_limits` is **never** `adapter.limits()`, so plan legality
 /// means the same thing on every device.
-pub(crate) async fn request_device(opts: &DeviceOptions) -> Result<GpuDevice> {
+async fn request_device(extra: Option<wgpu::Limits>) -> Result<GpuDevice> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
-    let adapter = pick_adapter(&instance, opts).await?;
+    let adapter = instance
+        .request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        })
+        .await
+        .map_err(|e| Error::Device(format!("request_adapter: {e}")))?;
     let adapter_info = adapter.get_info();
 
     let features = caps::requested_features(&adapter);
     let adapter_limits = adapter.limits();
-    let mut limits = caps::widen_limits(caps::baseline_limits(), opts.widen, &adapter_limits)?;
+    let mut limits = caps::widen_limits(caps::baseline_limits(), extra, &adapter_limits)?;
     // The two buffer-size ceilings are memory *capacity*, not occupancy
     // legality, and 7B+ models have single weights past the WebGPU baseline's
     // 256 MiB. Take the adapter's capacity; the workgroup/occupancy limits
     // stay at the baseline so plan legality means the same thing everywhere.
     limits.max_buffer_size = limits.max_buffer_size.max(adapter_limits.max_buffer_size);
+    // Bindings per stage bound how many values one kernel can read and
+    // write, which is what caps a slab's stage count; the baseline eight is
+    // a quarter of what Metal and D3D12 give.
+    // One slot short of the adapter's count: wgpu binds its buffer-sizes
+    // table in the same argument table, and Metal loses the device with
+    // an out-of-memory report when a kernel fills all 31.
+    limits.max_storage_buffers_per_shader_stage = limits.max_storage_buffers_per_shader_stage.max(
+        adapter_limits
+            .max_storage_buffers_per_shader_stage
+            .saturating_sub(1),
+    );
     limits.max_storage_buffer_binding_size = limits
         .max_storage_buffer_binding_size
         .max(adapter_limits.max_storage_buffer_binding_size);
@@ -190,6 +180,10 @@ pub(crate) async fn request_device(opts: &DeviceOptions) -> Result<GpuDevice> {
         &coop_props,
         DeviceKind::Gpu,
     );
+    #[cfg(target_arch = "wasm32")]
+    let (caps, matrix_fallback) = probe_browser_matrices(&device, caps).await?;
+    #[cfg(not(target_arch = "wasm32"))]
+    let matrix_fallback = None;
     // Rates are calibrated (or loaded from the on-disk cache) by fusor-cost;
     // capabilities are always re-probed, so a stale capability set cannot
     // outlive a driver update.
@@ -204,43 +198,70 @@ pub(crate) async fn request_device(opts: &DeviceOptions) -> Result<GpuDevice> {
         limits_used: limits,
         features: granted,
         adapter_info,
+        matrix_fallback,
         lost,
     })
 }
 
-/// Rank adapters: discrete, then integrated, then
-/// virtual, then CPU, then unknown.
-fn adapter_preference_rank(kind: wgpu::DeviceType) -> u8 {
-    match kind {
-        wgpu::DeviceType::DiscreteGpu => 0,
-        wgpu::DeviceType::IntegratedGpu => 1,
-        wgpu::DeviceType::VirtualGpu => 2,
-        wgpu::DeviceType::Cpu => 3,
-        wgpu::DeviceType::Other => 4,
+/// The experimental dialect can change independently of the advertised feature.
+/// Probe once, before Session's synchronous compiler admits matrix candidates.
+/// Use the same Naga serialization path as real kernels, including typed stores.
+#[cfg(target_arch = "wasm32")]
+async fn probe_browser_matrices(
+    device: &wgpu::Device,
+    mut caps: Caps,
+) -> Result<(Caps, Option<String>)> {
+    let mut fallback = None;
+    if !caps.subgroups.is_some_and(|w| w.min == 32 && w.max == 32) {
+        return Ok((caps, fallback));
     }
-}
-
-async fn pick_adapter(instance: &wgpu::Instance, opts: &DeviceOptions) -> Result<wgpu::Adapter> {
-    if let Some(wanted) = &opts.adapter_name {
-        let wanted = wanted.to_lowercase();
-        let mut all = instance.enumerate_adapters(wgpu::Backends::all()).await;
-        all.retain(|a| a.get_info().name.to_lowercase().contains(&wanted));
-        all.sort_by_key(|a| adapter_preference_rank(a.get_info().device_type));
-        return all
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Device(format!("no adapter matching {wanted:?}")));
+    let mut supported = smallvec::SmallVec::new();
+    for kind in &caps.coop {
+        let scalar = if kind.operand == fusor_ir::dtype::Dtype::F16 {
+            "f16"
+        } else {
+            "f32"
+        };
+        let enable = if scalar == "f16" { "enable f16;" } else { "" };
+        let source = format!(
+            r#"
+enable wgpu_cooperative_matrix;
+{enable}
+var<workgroup> tile: array<{scalar},64>;
+@group(0) @binding(0) var<storage,read_write> output: array<{scalar}>;
+@compute @workgroup_size(32)
+fn main() {{
+    let a = coopLoad<coop_mat8x8<{scalar},A>>(&tile[0],8u);
+    let b = coopLoad<coop_mat8x8<{scalar},B>>(&tile[0],8u);
+    let c = coopLoad<coop_mat8x8<{scalar},C>>(&tile[0],8u);
+    let result = coopMultiplyAdd(a,b,c);
+    coopStore(result,&output[0],8u);
+}}
+"#
+        );
+        let module = naga::front::wgsl::parse_str(&source)
+            .map_err(|e| Error::Plan(e.emit_to_string(&source)))?;
+        let scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
+        let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("fusor browser matrix capability probe"),
+            source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
+        });
+        let _pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+            label: Some("fusor browser matrix capability probe"),
+            layout: None,
+            module: &shader,
+            entry_point: Some("main"),
+            compilation_options: Default::default(),
+            cache: None,
+        });
+        if let Some(error) = scope.pop().await {
+            fallback = Some(format!("browser {scalar} matrix probe: {error}"));
+        } else {
+            supported.push(*kind);
+        }
     }
-    instance
-        .request_adapter(&wgpu::RequestAdapterOptions {
-            power_preference: opts
-                .power_preference
-                .unwrap_or(wgpu::PowerPreference::HighPerformance),
-            force_fallback_adapter: false,
-            compatible_surface: None,
-        })
-        .await
-        .map_err(|e| Error::Device(format!("request_adapter: {e}")))
+    caps.coop = supported;
+    Ok((caps, fallback))
 }
 
 // Explicit auto-trait impls; see the note on `GpuTarget`.

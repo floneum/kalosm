@@ -11,23 +11,20 @@
 use crate::realize::{self, Component, Realized};
 use fusor_ir::Result;
 use fusor_ir::cost::DeviceFacts;
+use fusor_ir::dtype::Persistence;
 use fusor_ir::egraph::{EGraph, Id};
+use fusor_ir::error::Error;
 use fusor_ir::extract::{BindKind, BindingPlan, BufferPlan, Dispatch, Extraction, Plan, PlanHash};
 use fusor_ir::facts::ValueFacts;
 use fusor_ir::ir::Op;
-use fusor_ir::ir::launch::{AccessPlan, Effect, IndexSpace, Launch, Operand, SchedPoint};
+use fusor_ir::ir::launch::{Effect, Launch, SchedPoint, ScheduleDomain};
 use fusor_ir::ir::logical::{LeafKind, Logical};
+use fusor_ir::ir::visit::VisitMut;
 use fusor_ir::scalar::{ScalarExpr, ScalarKind};
-use fusor_ir::shape::{Dim, Dims, Layout, SymId};
+use fusor_ir::shape::{Dim, Dims, Layout, OPAQUE_SYM, SymId};
 use rustc_hash::FxHasher;
-use smallvec::SmallVec;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::hash::{Hash, Hasher};
-
-/// `SymId(u32::MAX)` is the crate-wide "symbolic, not statically known"
-/// sentinel — `Layout::row_major_strides` already mints it for a stride past
-/// a symbolic axis. A `BufferPlan::elements` of this value means the runtime
-/// derives the extent from `layout` plus the bound symbols.
-pub const UNKNOWN_SYM: SymId = SymId(u32::MAX);
 
 /// Everything derived from one realized extraction: buffers, launches,
 /// symbols, hash and cost.
@@ -39,12 +36,36 @@ pub fn derive_plan(
     cost: fusor_ir::cost::Picoseconds,
 ) -> Result<Plan> {
     let buffers = derive_buffers(graph, extraction, realized)?;
-    let (dims, scalar_symbols) = classified_symbols_of(graph, realized);
+    let (mut dims, scalar_symbols) = classified_symbols_of(graph, realized);
+    for buffer in &buffers {
+        collect_layout(
+            &Layout::contiguous(&graph.facts(buffer.value).shape),
+            &mut dims,
+        );
+        collect_layout(&buffer.layout, &mut dims);
+        collect_dims(&[buffer.elements], &mut dims);
+    }
+    dims.retain(|s| *s != OPAQUE_SYM);
+    dims.sort_unstable();
+    dims.dedup();
     let mut symbols = dims;
     symbols.extend(scalar_symbols.iter().copied());
 
     let mut launches = Vec::with_capacity(realized.components.len());
+    let private: FxHashSet<Id> = realized
+        .components
+        .iter()
+        .flat_map(|c| c.private.iter().copied())
+        .collect();
     for c in &realized.components {
+        // A slab member kept in workgroup memory is read by nothing outside
+        // that slab; a launch binding one would read a buffer nothing wrote.
+        if let Some(r) = c.external.iter().find(|r| private.contains(r)) {
+            return Err(Error::Plan(format!(
+                "launch {} reads {r}, a slab member kept in workgroup memory",
+                c.root
+            )));
+        }
         launches.push(Dispatch {
             root: c.root,
             members: c.members.iter().copied().collect(),
@@ -54,16 +75,116 @@ pub fn derive_plan(
         });
     }
 
-    let hash = plan_hash(graph, extraction, &launches, &symbols, facts);
+    let mut buffers = buffers;
+    let arena_bytes = if facts.caps.kind == fusor_ir::device::DeviceKind::Gpu {
+        pack_arena(
+            &mut buffers,
+            &mut launches,
+            realized,
+            facts.caps.limits.max_storage_buffer_binding_size,
+        )?
+    } else {
+        0
+    };
+    let hash = plan_hash(graph, extraction, &launches, &buffers, &symbols, facts);
     Ok(Plan {
         extraction: extraction.clone(),
         launches,
         buffers,
+        arena_bytes,
         symbols,
         scalar_symbols,
         hash,
         cost,
     })
+}
+
+/// Interval-color the step-local intermediates into one arena: each is
+/// live from the first launch binding it to the last, and two whose ranges
+/// are disjoint take the same bytes. A launch binds the arena once; typed
+/// views reinterpret values through that binding. Returns the arena's size.
+fn pack_arena(
+    buffers: &mut [BufferPlan],
+    launches: &mut [Dispatch],
+    realized: &Realized,
+    max_binding: u64,
+) -> Result<u64> {
+    const ALIGN: u64 = 256;
+    let mut first: FxHashMap<Id, usize> = FxHashMap::default();
+    let mut last: FxHashMap<Id, usize> = FxHashMap::default();
+    for (ix, l) in launches.iter().enumerate() {
+        for b in &l.bindings {
+            first.entry(b.value).or_insert(ix);
+            last.insert(b.value, ix);
+        }
+    }
+    // Candidates: step-local, constant extent, not read back by the caller.
+    let mut items: Vec<(usize, usize, u64, usize)> = Vec::new();
+    for (i, b) in buffers.iter().enumerate() {
+        if b.persistence != Persistence::Step || realized.is_root(b.value) {
+            continue;
+        }
+        let Some(elements) = b.elements.as_const() else {
+            continue;
+        };
+        let (Some(s), Some(e)) = (first.get(&b.value), last.get(&b.value)) else {
+            continue;
+        };
+        let bytes = elements
+            .saturating_mul(b.dtype.byte_size())
+            .max(4)
+            .div_ceil(ALIGN)
+            * ALIGN;
+        items.push((*s, *e, bytes, i));
+    }
+    items.sort_unstable_by_key(|(s, e, bytes, i)| (*s, *e, std::cmp::Reverse(*bytes), *i));
+    // A launch binds the whole arena, so it must fit one storage binding:
+    // the largest values leave it (as their own buffers) until it does.
+    let (top, offsets) = loop {
+        let sizes: Vec<_> = items
+            .iter()
+            .map(|(_, _, bytes, _)| (*bytes, ALIGN))
+            .collect();
+        let (top, offsets) =
+            fusor_ir::packing::pack_interference(&sizes, fusor_ir::packing::Fit::Best, |i, j| {
+                items[i].0 <= items[j].1 && items[j].0 <= items[i].1
+            })?;
+        if top <= max_binding || items.is_empty() {
+            break (top, offsets);
+        }
+        let largest = (0..items.len()).max_by_key(|i| items[*i].2).unwrap();
+        items.remove(largest);
+    };
+    for ((_, _, _, i), offset) in items.iter().zip(offsets) {
+        buffers[*i].arena = Some(offset);
+    }
+    let in_arena: FxHashSet<Id> = buffers
+        .iter()
+        .filter(|b| b.arena.is_some())
+        .map(|b| b.value)
+        .collect();
+    // One binding per physical buffer. Multiple writable bindings spanning
+    // the same arena are invalid in WebGPU, even for different element types.
+    for l in launches.iter_mut() {
+        let mut arena_binding = None;
+        let mut next = 1u32;
+        for b in &mut l.bindings {
+            b.arena = in_arena.contains(&b.value);
+            b.binding = if b.arena {
+                b.kind = BindKind::ReadWrite;
+                *arena_binding.get_or_insert_with(|| {
+                    let n = next;
+                    next += 1;
+                    n
+                })
+            } else {
+                let n = next;
+                next += 1;
+                n
+            };
+        }
+    }
+    Ok(top)
 }
 
 /// One [`BufferPlan`] per node in `m ∪ roots`, in realized order. Leaves are
@@ -74,23 +195,29 @@ pub fn derive_buffers(
     extraction: &Extraction,
     realized: &Realized,
 ) -> Result<Vec<BufferPlan>> {
+    let private: FxHashSet<Id> = realized
+        .components
+        .iter()
+        .flat_map(|c| c.private.iter().copied())
+        .collect();
     let mut out = Vec::new();
     for id in &realized.order {
         if realize::leaf_role(graph, *id) != realize::LeafRole::NotLeaf {
             continue;
         }
-        if !extraction.is_materialized(*id) && !realized.is_root(*id) {
+        if !extraction.is_materialized(*id) && !realized.is_root(*id) || private.contains(id) {
             continue;
         }
         let facts = graph.facts(*id);
         let theta = extraction.theta.get(id).copied();
-        let (layout, elements) = buffer_layout_for(facts, theta)?;
+        let (layout, elements) = buffer_layout_for(facts, &graph.node(*id).op, theta)?;
         out.push(BufferPlan {
             value: *id,
             elements,
             layout,
             dtype: facts.dtype,
             persistence: facts.persistence,
+            arena: None,
         });
     }
     Ok(out)
@@ -109,7 +236,10 @@ pub fn derive_bindings(
         .members
         .iter()
         .copied()
-        .filter(|m| extraction.is_materialized(*m) || realized.is_root(*m))
+        .filter(|m| {
+            (extraction.is_materialized(*m) || realized.is_root(*m))
+                && !component.private.contains(m)
+        })
         .collect();
     writes.sort_unstable();
     writes.dedup();
@@ -128,6 +258,7 @@ pub fn derive_bindings(
             binding,
             value,
             kind: BindKind::Read,
+            arena: false,
         });
         binding += 1;
     }
@@ -140,137 +271,67 @@ pub fn derive_bindings(
             binding,
             value,
             kind,
+            arena: false,
         });
         binding += 1;
     }
     Ok(out)
 }
 
-/// The layout one materialized value needs under one schedule point, plus
-/// the buffer's allocation extent in elements.
-///
-/// **Padding lives in the strides, never in the shape.** The returned
-/// layout's shape is always the value's logical shape; a `Coop` point pads
-/// `m` to a multiple of `geom.bm` and `n` to `geom.bn` *in the strides*
-/// (row-major over the padded extents). A rank-2 padded matrix loses
-/// `m_pad` from `(shape, strides)` alone, which is why the padded element
-/// count is returned alongside — allocation cannot rederive it.
-///
-/// - default: `Layout::contiguous(shape)`, elements = product(shape);
-/// - `Coop { geom, splits, .. }`: logical shape over padded row-major
-///   strides, and when `splits > 1` a prepended axis of extent `splits`
-///   whose stride is one whole padded output — the split-K scratch slice;
-///   elements = `splits * product(padded)`;
-/// - `Sgemm` / `Sgemv` / `Fold` / `Map` / `Point`: contiguous.
-///
-/// Elements is `Dim::Sym(UNKNOWN_SYM)` when a symbolic extent keeps the
-/// count from being a constant; the runtime then derives it from the layout
-/// (`shape[0] * strides[0]` for these row-major layouts), never from the
-/// shape product, which undercounts a padded buffer.
-///
-/// `Sgemm` pads nothing. Padding exists so a kernel may write a whole block
-/// without a bounds test, and only the cooperative store does that: the SGEMM
-/// body masks every store with `row < batch * m && col < n`. Padding here
-/// acts on the output's last two axes, which are the `m` and `n` axes only
-/// when each occupies exactly one — a contraction with `n = 1` has none, so
-/// padding it would pad batch axes instead.
-pub fn buffer_layout_for(facts: &ValueFacts, theta: Option<SchedPoint>) -> Result<(Layout, Dim)> {
+/// Logical strides and allocation extent for a selected node. Cooperative
+/// stores pad matrix groups, while retaining each group's logical axes.
+pub fn buffer_layout_for(
+    facts: &ValueFacts,
+    op: &Op,
+    theta: Option<SchedPoint>,
+) -> Result<(Layout, Dim)> {
     let shape = &facts.shape;
-    let (bm, bn, splits) = match theta {
-        Some(SchedPoint::Coop { geom, splits, .. }) => (geom.bm, geom.bn, splits),
-        _ => {
-            let l = Layout::contiguous(shape);
-            let e = layout_elements(shape);
-            return Ok((l, e));
-        }
+    let (Op::Launch(Launch::Contract { m, n, batch, .. }), Some(SchedPoint::Coop { geom, .. })) =
+        (op, theta)
+    else {
+        return Ok((Layout::contiguous(shape), layout_elements(shape)));
     };
-    if shape.len() < 2 {
-        let l = Layout::contiguous(shape);
-        let e = layout_elements(shape);
-        return Ok((l, e));
-    }
-
-    let mut padded: Dims = shape.clone();
-    let last = padded.len() - 1;
-    padded[last - 1] = pad_to(padded[last - 1], bm);
-    padded[last] = pad_to(padded[last], bn);
-
-    let strides = Layout::row_major_strides(&padded);
-    // A `row_major_strides` placeholder is resolved at dispatch from the
-    // *shape* — which is now logical — so a placeholder in a padded stride
-    // set would silently resolve to the unpadded product. That combination
-    // (a symbolic batch axis to the right of another batch axis, under a
-    // padding point) cannot be stated under this convention; fail loudly
-    // rather than under-address.
-    if padded != *shape
-        && strides
-            .iter()
-            .any(|s| matches!(s, Dim::Sym(x) if *x == UNKNOWN_SYM))
-    {
-        return Err(fusor_ir::Error::Plan(format!(
-            "a padded layout over {shape:?} needs a derived stride, which would \
-             resolve from the logical shape and lose the padding"
-        )));
-    }
-    let padded_elements = {
-        let mut acc: Option<u64> = Some(u64::from(splits.max(1)));
-        for d in &padded {
-            acc = match (acc, d.as_const()) {
-                (Some(a), Some(v)) => Some(a.saturating_mul(v)),
-                _ => None,
-            };
-        }
-        match acc {
-            Some(v) => Dim::Const(v),
-            None => Dim::Sym(UNKNOWN_SYM),
-        }
+    let constant = |dim: Dim| {
+        dim.as_const()
+            .ok_or_else(|| Error::Plan("cooperative matrix groups require concrete extents".into()))
     };
-
-    if splits <= 1 {
-        let l = Layout::from_parts(Dim::Const(0), shape, &strides)?;
-        return Ok((l, padded_elements));
+    let (m, n) = (constant(*m)?, constant(*n)?);
+    let m_padded = m.max(1).div_ceil(u64::from(geom.bm)) * u64::from(geom.bm);
+    let n_padded = n.max(1).div_ceil(u64::from(geom.bn)) * u64::from(geom.bn);
+    let elements = *batch * Dim::Const(m_padded) * Dim::Const(n_padded);
+    if m == 0 || n == 0 {
+        return Ok((Layout::contiguous(shape), elements));
     }
-
-    // Split-K scratch: one whole padded output per partial, so the combine
-    // pass reads slice `s` one *whole output* in.
-    //
-    // That distance is the product of every padded extent, batch axes
-    // included — it is exactly the row-major stride a prepended axis gets,
-    // `strides[0] * padded[0]`. One batch element (`padded_m * padded_n`)
-    // would not do: with any leading batch axis,
-    // partial `s` would begin inside partial `s-1` and every batch past the
-    // first would alias.
-    let slice = match (
-        strides.first().and_then(|s| s.as_const()),
-        padded.first().and_then(|d| d.as_const()),
-    ) {
-        (Some(outer_stride), Some(outer_extent)) => Dim::Const(outer_stride * outer_extent),
-        _ => Dim::Sym(UNKNOWN_SYM),
-    };
-    let mut shape_out: Dims = smallvec::smallvec![Dim::Const(splits as u64)];
-    shape_out.extend(shape.iter().copied());
-    let mut strides_out: SmallVec<[Dim; 6]> = smallvec::smallvec![slice];
-    strides_out.extend(strides.iter().copied());
-    let l = Layout::from_parts(Dim::Const(0), &shape_out, &strides_out)?;
-    Ok((l, padded_elements))
-}
-
-const fn pad_to(d: Dim, multiple: u32) -> Dim {
-    match (d.as_const(), multiple) {
-        (Some(v), m) if m > 1 => Dim::Const(v.div_ceil(m as u64) * m as u64),
-        _ => d,
+    let mut strides: Dims = shape.clone();
+    let mut axis = shape.len();
+    for (extent, stride) in [(n, 1), (m, n_padded)] {
+        let mut covered = 1;
+        while covered < extent {
+            axis = axis.checked_sub(1).ok_or_else(|| {
+                Error::Plan("matrix group exceeds its logical output rank".into())
+            })?;
+            strides[axis] = Dim::Const(stride * covered);
+            covered *= constant(shape[axis])?;
+        }
+        if covered != extent {
+            return Err(Error::Plan(
+                "matrix group cuts through a logical output axis".into(),
+            ));
+        }
     }
+    let mut stride = Dim::Const(m_padded * n_padded);
+    for axis in (0..axis).rev() {
+        strides[axis] = stride;
+        stride = stride * shape[axis];
+    }
+    Ok((
+        Layout::from_parts(Dim::Const(0), shape, &strides)?,
+        elements,
+    ))
 }
 
 fn layout_elements(shape: &[Dim]) -> Dim {
-    let mut acc: u64 = 1;
-    for d in shape {
-        match d.as_const() {
-            Some(v) => acc = acc.saturating_mul(v),
-            None => return Dim::Sym(UNKNOWN_SYM),
-        }
-    }
-    Dim::Const(acc)
+    shape.iter().copied().fold(Dim::ONE, |a, b| a * b)
 }
 
 /// Every `SymId` the uniform block must carry, in binding order: dims
@@ -284,19 +345,37 @@ pub fn symbols_of(graph: &EGraph, realized: &Realized) -> Vec<SymId> {
 /// [`symbols_of`] split into `(dims, scalars)`: the extents, offsets and
 /// strides the kernels index by, and the runtime scalars they read.
 pub fn classified_symbols_of(graph: &EGraph, realized: &Realized) -> (Vec<SymId>, Vec<SymId>) {
-    let mut dims: Vec<SymId> = Vec::new();
-    let mut scalars: Vec<SymId> = Vec::new();
-
+    let mut visitor = Symbols::default();
     for id in &realized.order {
-        collect_dims(&graph.facts(*id).shape, &mut dims);
-        let op = &graph.node(*id).op;
-        collect_op(op, &mut dims, &mut scalars);
+        collect_dims(&graph.facts(*id).shape, &mut visitor.dims);
+        graph.node(*id).op.clone().visit_mut(&mut visitor);
     }
+    let Symbols {
+        mut dims,
+        mut scalars,
+        ..
+    } = visitor;
 
-    dims.retain(|s| *s != UNKNOWN_SYM);
-    scalars.retain(|s| *s != UNKNOWN_SYM);
+    dims.retain(|s| *s != OPAQUE_SYM);
+    scalars.retain(|s| *s != OPAQUE_SYM);
     dims.sort_unstable();
     dims.dedup();
+    let mut index = 0;
+    while index < dims.len() {
+        if let Some(fusor_ir::shape::DimExpr::Add(a, b) | fusor_ir::shape::DimExpr::Mul(a, b)) =
+            dims[index].derived_expr()
+        {
+            for dim in [a, b] {
+                if let Dim::Sym(sym) = dim
+                    && !dims.contains(&sym)
+                {
+                    dims.push(sym);
+                }
+            }
+        }
+        index += 1;
+    }
+    dims.sort_unstable();
     scalars.sort_unstable();
     scalars.dedup();
     // A symbol used as an extent is bound as a dim; it must not also be
@@ -315,619 +394,165 @@ pub fn plan_hash(
     graph: &EGraph,
     extraction: &Extraction,
     launches: &[Dispatch],
+    buffers: &[BufferPlan],
     symbols: &[SymId],
     facts: &DeviceFacts,
 ) -> PlanHash {
     let mut lanes = [FxHasher::default(), FxHasher::default()];
-    let sm = SymMap::new(symbols);
-    for (seed, h) in lanes.iter_mut().enumerate() {
-        h.write_u64(seed as u64);
-        for launch in launches {
-            h.write_u32(launch.root.0);
-            h.write_u32(launch.grid[0]);
-            h.write_u32(launch.grid[1]);
-            h.write_u32(launch.grid[2]);
-            h.write_u32(launch.block);
-            for b in &launch.bindings {
-                h.write_u32(b.binding);
-                h.write_u32(b.value.0);
-                (b.kind as u8).hash(h);
-            }
-            for member in &launch.members {
-                h.write_u32(member.0);
-                hash_op(h, &sm, &graph.node(*member).op);
-                // Leaf operands are never launch members, so their kind
-                // would otherwise never reach the hash. Their name stays out:
-                // buffer identity is absent from the key, which lets a
-                // bufferless template rebind positionally.
-                for child in graph.node(*member).children.iter() {
-                    if let Op::Logical(Logical::Leaf(kind)) = &graph.node(*child).op {
-                        hash_leaf_ref(h, &sm, kind);
-                    }
-                }
-                h.write_u8(u8::from(extraction.is_materialized(*member)));
-                match extraction.theta.get(member) {
-                    Some(t) => {
-                        h.write_u8(1);
-                        t.hash(h);
-                    }
-                    None => h.write_u8(0),
-                }
-            }
-        }
-        h.write_u64(facts.fingerprint());
+    for (seed, lane) in lanes.iter_mut().enumerate() {
+        lane.write_u64(seed as u64);
     }
+    let mut normalize = Normalize {
+        symbols,
+        scalars: FxHashMap::default(),
+    };
+    for b in buffers {
+        let mut layout = b.layout.clone();
+        layout.visit_dims_mut(&mut |d| normalize.dim(d));
+        let mut elements = b.elements;
+        normalize.dim(&mut elements);
+        hash_both(&mut lanes, &(b.value, layout, elements, b.arena));
+    }
+    for launch in launches {
+        hash_both(&mut lanes, &(launch.root, launch.grid, launch.block));
+        for b in &launch.bindings {
+            hash_both(&mut lanes, &(b.binding, b.value, b.kind as u8));
+        }
+        for member in &launch.members {
+            let mut op = without_schedule(&graph.node(*member).op);
+            op.visit_mut(&mut normalize);
+            hash_both(&mut lanes, &(*member, op));
+            // External buffer names do not affect a positionally rebound kernel.
+            for child in graph.node(*member).children.iter() {
+                if let Op::Logical(Logical::Leaf(kind)) = &graph.node(*child).op {
+                    let mut leaf = Op::Logical(Logical::Leaf(kind.clone()));
+                    leaf.visit_mut(&mut normalize);
+                    hash_both(&mut lanes, &leaf);
+                }
+            }
+            hash_both(
+                &mut lanes,
+                &(
+                    extraction.is_materialized(*member),
+                    extraction.theta.get(member),
+                ),
+            );
+        }
+    }
+    hash_both(&mut lanes, &facts.fingerprint());
     PlanHash(((lanes[0].finish() as u128) << 64) | lanes[1].finish() as u128)
 }
 
-struct SymMap<'a> {
+fn hash_both(lanes: &mut [FxHasher; 2], value: &impl Hash) {
+    for lane in lanes {
+        value.hash(lane);
+    }
+}
+
+/// Candidate domains do not enter the key; the selected schedule does.
+pub(crate) fn without_schedule(op: &Op) -> Op {
+    let mut op = op.clone();
+    if let Op::Launch(
+        Launch::Map { sched, .. }
+        | Launch::Fold { sched, .. }
+        | Launch::StreamFold { sched, .. }
+        | Launch::Contract { sched, .. }
+        | Launch::Gather { sched, .. }
+        | Launch::Scatter { sched, .. }
+        | Launch::Slab { sched, .. }
+        | Launch::Group { sched, .. },
+    ) = &mut op
+    {
+        *sched = ScheduleDomain::Point;
+    }
+    op
+}
+
+struct Normalize<'a> {
     symbols: &'a [SymId],
-    /// Symbol-remapped digest per `ScalarExpr::structural_hash`. Repeated
-    /// transformer layers and a 3,000-node conv step share a handful of
-    /// distinct bodies, so this collapses the walk to one per body.
-    memo: std::cell::RefCell<rustc_hash::FxHashMap<u64, u64>>,
+    scalars: FxHashMap<u64, ScalarExpr>,
 }
 
-impl<'a> SymMap<'a> {
-    fn new(symbols: &'a [SymId]) -> Self {
-        Self {
-            symbols,
-            memo: std::cell::RefCell::new(rustc_hash::FxHashMap::default()),
-        }
+impl Normalize<'_> {
+    fn symbol(&self, sym: SymId) -> SymId {
+        SymId(
+            self.symbols
+                .iter()
+                .position(|s| *s == sym)
+                .map_or(u32::MAX, |i| i as u32),
+        )
     }
 
-    /// The symbol's *index*, so two bindings of the same family collide and
-    /// two structurally different plans do not.
-    fn idx(&self, s: SymId) -> u32 {
-        self.symbols
-            .iter()
-            .position(|x| *x == s)
-            .map_or(u32::MAX, |i| i as u32)
-    }
-
-    fn scalar_digest(&self, e: &ScalarExpr) -> u64 {
-        let key = e.structural_hash();
-        if let Some(hit) = self.memo.borrow().get(&key) {
-            return *hit;
+    fn expression(&mut self, expr: &ScalarExpr) -> ScalarExpr {
+        let key = expr.structural_hash();
+        if let Some(hit) = self.scalars.get(&key) {
+            return hit.clone();
         }
-        let mut h = FxHasher::default();
-        hash_scalar_uncached(&mut h, self, e);
-        let v = h.finish();
-        self.memo.borrow_mut().insert(key, v);
-        v
+        let normalized = match expr.kind() {
+            ScalarKind::Uniform(sym) => ScalarExpr::uniform(self.symbol(*sym), expr.dtype()),
+            _ => expr.map_children(&mut |child| self.expression(child)),
+        };
+        self.scalars.insert(key, normalized.clone());
+        normalized
     }
 }
 
-/// A leaf as an *operand*: everything that changes the kernel body, and
-/// nothing that only names a buffer.
-fn hash_leaf_ref<H: Hasher>(h: &mut H, sm: &SymMap<'_>, kind: &LeafKind) {
-    std::mem::discriminant(kind).hash(h);
-    match kind {
-        LeafKind::Buffer { dtype, shape, .. } | LeafKind::Param { dtype, shape, .. } => {
-            dtype.hash(h);
-            hash_dims(h, sm, shape);
+impl VisitMut for Normalize<'_> {
+    fn dim(&mut self, dim: &mut Dim) {
+        if let Dim::Sym(sym) = dim {
+            *sym = self.symbol(*sym);
         }
-        LeafKind::Const { value, shape } => {
-            value.hash(h);
-            hash_dims(h, sm, shape);
-        }
-        LeafKind::Uniform { sym, dtype } => {
-            h.write_u32(sm.idx(*sym));
-            dtype.hash(h);
-        }
-        LeafKind::Quantized {
-            fmt, layout, shape, ..
-        } => {
-            fmt.hash(h);
-            layout.hash(h);
-            hash_dims(h, sm, shape);
+    }
+    fn scalar(&mut self, expr: &mut ScalarExpr) {
+        *expr = self.expression(expr);
+    }
+    fn leaf(&mut self, leaf: &mut LeafKind) {
+        match leaf {
+            LeafKind::Uniform { sym, .. } => *sym = self.symbol(*sym),
+            LeafKind::Buffer { name, .. }
+            | LeafKind::Param { name, .. }
+            | LeafKind::Quantized { name, .. } => name.0 = 0,
+            _ => {}
         }
     }
 }
 
-fn hash_dim<H: Hasher>(h: &mut H, sm: &SymMap<'_>, d: Dim) {
-    match d {
-        Dim::Const(v) => {
-            h.write_u8(0);
-            h.write_u64(v);
-        }
-        Dim::Sym(s) => {
-            h.write_u8(1);
-            h.write_u32(sm.idx(s));
-        }
-    }
+#[derive(Default)]
+struct Symbols {
+    dims: Vec<SymId>,
+    scalars: Vec<SymId>,
+    bodies: FxHashSet<u64>,
 }
 
-fn hash_dims<H: Hasher>(h: &mut H, sm: &SymMap<'_>, ds: &[Dim]) {
-    h.write_usize(ds.len());
-    for d in ds {
-        hash_dim(h, sm, *d);
+impl VisitMut for Symbols {
+    fn dim(&mut self, dim: &mut Dim) {
+        collect_dims(&[*dim], &mut self.dims);
     }
-}
-
-fn hash_layout<H: Hasher>(h: &mut H, sm: &SymMap<'_>, l: &Layout) {
-    hash_dim(h, sm, l.offset());
-    hash_dims(h, sm, l.shape());
-    hash_dims(h, sm, l.strides());
-}
-
-fn hash_space<H: Hasher>(h: &mut H, sm: &SymMap<'_>, s: &IndexSpace) {
-    hash_dims(h, sm, &s.dims);
-}
-
-fn hash_scalar<H: Hasher>(h: &mut H, sm: &SymMap<'_>, e: &ScalarExpr) {
-    h.write_u64(sm.scalar_digest(e));
-}
-
-fn hash_scalar_uncached<H: Hasher>(h: &mut H, sm: &SymMap<'_>, e: &ScalarExpr) {
-    e.dtype().hash(h);
-    match e.kind() {
-        ScalarKind::Arg(i) => {
-            h.write_u8(0);
-            h.write_u32(*i);
-        }
-        ScalarKind::Lit(l) => {
-            h.write_u8(1);
-            l.hash(h);
-        }
-        ScalarKind::Uniform(s) => {
-            h.write_u8(2);
-            h.write_u32(sm.idx(*s));
-        }
-        ScalarKind::IndexOf(a) => {
-            h.write_u8(3);
-            h.write_u32(*a);
-        }
-        ScalarKind::Un { op, x } => {
-            h.write_u8(4);
-            op.hash(h);
-            hash_scalar(h, sm, x);
-        }
-        ScalarKind::Bin { op, a, b } => {
-            h.write_u8(5);
-            op.hash(h);
-            hash_scalar(h, sm, a);
-            hash_scalar(h, sm, b);
-        }
-        ScalarKind::Cmp { op, a, b } => {
-            h.write_u8(6);
-            op.hash(h);
-            hash_scalar(h, sm, a);
-            hash_scalar(h, sm, b);
-        }
-        ScalarKind::Select { c, t, f } => {
-            h.write_u8(7);
-            hash_scalar(h, sm, c);
-            hash_scalar(h, sm, t);
-            hash_scalar(h, sm, f);
-        }
-        ScalarKind::Cast { to, x } => {
-            h.write_u8(8);
-            to.hash(h);
-            hash_scalar(h, sm, x);
-        }
-        ScalarKind::Bitcast { to, x } => {
-            h.write_u8(9);
-            to.hash(h);
-            hash_scalar(h, sm, x);
-        }
-        ScalarKind::Round { mode, x } => {
-            h.write_u8(10);
-            mode.hash(h);
-            hash_scalar(h, sm, x);
-        }
-        ScalarKind::Dot { a, b } => {
-            h.write_u8(11);
-            hash_scalar(h, sm, a);
-            hash_scalar(h, sm, b);
-        }
-        ScalarKind::Splat { lanes, x } => {
-            h.write_u8(12);
-            h.write_u32(*lanes);
-            hash_scalar(h, sm, x);
+    fn scalar(&mut self, expr: &mut ScalarExpr) {
+        if self.bodies.insert(expr.structural_hash()) {
+            expr.walk(&mut |e| {
+                if let ScalarKind::Uniform(sym) = e.kind() {
+                    self.scalars.push(*sym);
+                }
+            });
         }
     }
-}
-
-fn hash_operand<H: Hasher>(h: &mut H, sm: &SymMap<'_>, o: &Operand) {
-    h.write_u32(o.src.0);
-    hash_layout(h, sm, &o.layout);
-    match &o.access {
-        AccessPlan::Alias => h.write_u8(0),
-        AccessPlan::Gather => h.write_u8(1),
-        AccessPlan::Pack { into } => {
-            h.write_u8(2);
-            hash_layout(h, sm, into);
-        }
-        AccessPlan::Unflatten(map) => {
-            h.write_u8(3);
-            map.hash(h);
-        }
-    }
-}
-
-fn hash_operands<H: Hasher>(h: &mut H, sm: &SymMap<'_>, ops: &[Operand]) {
-    h.write_usize(ops.len());
-    for o in ops {
-        hash_operand(h, sm, o);
-    }
-}
-
-fn hash_op<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &Op) {
-    op.tag().hash(h);
-    match op {
-        Op::Union(a, b) => {
-            h.write_u32(a.0);
-            h.write_u32(b.0);
-        }
-        Op::Logical(l0) => hash_l0(h, sm, l0),
-        Op::Launch(l1) => hash_l1(h, sm, l1),
-    }
-}
-
-fn hash_l0<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &Logical) {
-    match op {
-        Logical::Leaf(k) => match k {
-            LeafKind::Buffer { name, dtype, shape } | LeafKind::Param { name, dtype, shape } => {
-                name.hash(h);
-                dtype.hash(h);
-                hash_dims(h, sm, shape);
-            }
-            LeafKind::Const { value, shape } => {
-                value.hash(h);
-                hash_dims(h, sm, shape);
-            }
-            // The bound value never appears in the IR and never enters the
-            // hash: only the symbol's slot in the uniform block does.
-            LeafKind::Uniform { sym, dtype } => {
-                h.write_u32(sm.idx(*sym));
-                dtype.hash(h);
-            }
-            LeafKind::Quantized {
-                name,
-                fmt,
-                layout,
-                shape,
-            } => {
-                name.hash(h);
-                fmt.hash(h);
-                layout.hash(h);
-                hash_dims(h, sm, shape);
-            }
-        },
-        Logical::Map { expr, ins, outs } => {
-            hash_scalar(h, sm, expr);
-            for i in ins {
-                h.write_u32(i.0);
-            }
-            h.write_u8(*outs);
-        }
-        Logical::Fold {
-            carrier,
-            axis,
-            acc,
-            ins,
-        } => {
-            hash_carrier(h, sm, carrier);
-            h.write_u32(*axis);
-            acc.hash(h);
-            for i in ins {
-                h.write_u32(i.0);
-            }
-        }
-        Logical::Contract {
-            spec,
-            acc,
-            a,
-            b,
-            outs,
-        } => {
-            spec.hash(h);
-            acc.hash(h);
-            h.write_u32(a.0);
-            h.write_u32(b.0);
-            h.write_u8(*outs);
-        }
-        Logical::Restride { specs, bounds, x } => {
-            h.write_usize(specs.len());
-            for s in specs {
-                h.write_u32(s.input_dim);
-                h.write_u32(s.multiplier);
-                hash_dim(h, sm, s.size);
-                hash_dim(h, sm, s.offset);
-            }
-            bounds.hash(h);
-            h.write_u32(x.0);
-        }
-        Logical::Window { specs, x } => {
-            specs.hash(h);
-            h.write_u32(x.0);
-        }
-        Logical::Gather { axis, x, idx } => {
-            h.write_u32(*axis);
-            h.write_u32(x.0);
-            h.write_u32(idx.0);
-        }
-        Logical::Scatter {
-            axis,
-            combine,
-            base,
-            idx,
-            upd,
-            unique,
-        } => {
-            h.write_u32(*axis);
-            combine.hash(h);
-            h.write_u32(base.0);
-            h.write_u32(idx.0);
-            h.write_u32(upd.0);
-            h.write_u8(u8::from(*unique));
-        }
-        Logical::Dequant { fmt, layout, x } => {
-            fmt.hash(h);
-            layout.hash(h);
-            h.write_u32(x.0);
-        }
-        Logical::Project { slot, x } => {
-            h.write_u8(*slot);
-            h.write_u32(x.0);
-        }
-    }
-}
-
-/// A carrier enters the plan hash as data: slot shapes, identities, and both
-/// expression vectors. Two folds that differ only in their merge are
-/// different kernels.
-fn hash_carrier<H: Hasher>(h: &mut H, sm: &SymMap<'_>, c: &fusor_ir::carrier::Carrier) {
-    h.write_usize(c.slots.len());
-    for s in &c.slots {
-        match s {
-            fusor_ir::carrier::SlotTy::Scalar => h.write_u8(0),
-            fusor_ir::carrier::SlotTy::Vector(d) => {
-                h.write_u8(1);
-                hash_dim(h, sm, *d);
-            }
-        }
-    }
-    for i in &c.identity {
-        i.hash(h);
-    }
-    for e in c.lift.iter().chain(&c.merge) {
-        hash_scalar(h, sm, e);
-    }
-    c.associative.hash(h);
-    c.tie.hash(h);
-}
-
-fn collect_carrier(
-    c: &fusor_ir::carrier::Carrier,
-    dims: &mut Vec<SymId>,
-    scalars: &mut Vec<SymId>,
-) {
-    for s in &c.slots {
-        if let fusor_ir::carrier::SlotTy::Vector(d) = s {
-            collect_dims(&[*d], dims);
-        }
-    }
-    for e in c.lift.iter().chain(&c.merge) {
-        collect_scalar(e, scalars);
-    }
-}
-
-fn hash_l1<H: Hasher>(h: &mut H, sm: &SymMap<'_>, op: &Launch) {
-    match op {
-        Launch::Map {
-            space, body, ops, ..
-        } => {
-            hash_space(h, sm, space);
-            hash_scalar(h, sm, body);
-            hash_operands(h, sm, ops);
-        }
-        Launch::Fold {
-            space,
-            axis,
-            vec_axes,
-            carrier,
-            acc,
-            post,
-            ops,
-            ..
-        } => {
-            hash_space(h, sm, space);
-            h.write_u32(*axis);
-            for a in vec_axes {
-                h.write_u32(*a);
-            }
-            hash_carrier(h, sm, carrier);
-            acc.hash(h);
-            for p in post {
-                hash_scalar(h, sm, p);
-            }
-            hash_operands(h, sm, ops);
-        }
-        Launch::Contract {
-            m,
-            n,
-            k,
-            batch,
-            family,
-            post,
-            acc,
-            a,
-            b,
-            ..
-        } => {
-            hash_dim(h, sm, *m);
-            hash_dim(h, sm, *n);
-            hash_dim(h, sm, *k);
-            hash_dim(h, sm, *batch);
-            family.hash(h);
-            hash_scalar(h, sm, &a.pre);
-            hash_scalar(h, sm, &b.pre);
-            hash_scalar(h, sm, post);
-            acc.hash(h);
-            // Arity first: a kernel keyed only on the operands it happens to
-            // list would collide a two-buffer contraction with a wider one
-            // whose extra edges hash the same way.
-            h.write_usize(a.len());
-            h.write_usize(b.len());
-            for o in a.ops.iter().chain(b.ops.iter()) {
-                hash_operand(h, sm, o);
-            }
-        }
-        Launch::Gather {
-            space,
-            axis,
-            mode,
-            ops,
-            ..
-        } => {
-            hash_space(h, sm, space);
-            h.write_u32(*axis);
-            mode.hash(h);
-            hash_operands(h, sm, ops);
-        }
-        Launch::Scatter {
-            space,
-            axis,
-            mode,
-            combine,
-            ops,
-            ..
-        } => {
-            hash_space(h, sm, space);
-            h.write_u32(*axis);
-            mode.hash(h);
-            combine.hash(h);
-            hash_operands(h, sm, ops);
-        }
-        Launch::Region {
-            members, live_outs, ..
-        } => {
-            for m in members {
-                h.write_u32(m.0);
-            }
-            live_outs.hash(h);
-        }
-        Launch::Ext { def, ops, attrs } => {
-            def.hash(h);
-            hash_operands(h, sm, ops);
-            attrs.hash(h);
+    fn leaf(&mut self, leaf: &mut LeafKind) {
+        if let LeafKind::Uniform { sym, .. } = leaf {
+            self.scalars.push(*sym);
         }
     }
 }
 
 fn collect_dims(dims: &[Dim], out: &mut Vec<SymId>) {
-    for d in dims {
-        if let Dim::Sym(s) = d {
-            out.push(*s);
-        }
-    }
+    out.extend(dims.iter().filter_map(|d| match d {
+        Dim::Sym(s) => Some(*s),
+        _ => None,
+    }));
 }
 
-fn collect_layout(l: &Layout, out: &mut Vec<SymId>) {
-    collect_dims(&[l.offset()], out);
-    collect_dims(l.shape(), out);
-    collect_dims(l.strides(), out);
-}
-
-fn collect_scalar(e: &ScalarExpr, scalars: &mut Vec<SymId>) {
-    match e.kind() {
-        ScalarKind::Uniform(s) => scalars.push(*s),
-        ScalarKind::Arg(_) | ScalarKind::Lit(_) | ScalarKind::IndexOf(_) => {}
-        ScalarKind::Un { x, .. }
-        | ScalarKind::Cast { x, .. }
-        | ScalarKind::Bitcast { x, .. }
-        | ScalarKind::Round { x, .. }
-        | ScalarKind::Splat { x, .. } => collect_scalar(x, scalars),
-        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
-            collect_scalar(a, scalars);
-            collect_scalar(b, scalars);
-        }
-        ScalarKind::Select { c, t, f } => {
-            collect_scalar(c, scalars);
-            collect_scalar(t, scalars);
-            collect_scalar(f, scalars);
-        }
-    }
-}
-
-fn collect_ops(ops: &[Operand], dims: &mut Vec<SymId>) {
-    for o in ops {
-        collect_layout(&o.layout, dims);
-        if let AccessPlan::Pack { into } = &o.access {
-            collect_layout(into, dims);
-        }
-    }
-}
-
-fn collect_op(op: &Op, dims: &mut Vec<SymId>, scalars: &mut Vec<SymId>) {
-    match op {
-        Op::Union(..) => {}
-        Op::Logical(l0) => match l0 {
-            Logical::Leaf(LeafKind::Uniform { sym, .. }) => scalars.push(*sym),
-            Logical::Leaf(
-                LeafKind::Buffer { shape, .. }
-                | LeafKind::Param { shape, .. }
-                | LeafKind::Const { shape, .. },
-            ) => collect_dims(shape, dims),
-            Logical::Leaf(LeafKind::Quantized { shape, .. }) => collect_dims(shape, dims),
-            Logical::Map { expr, .. } => collect_scalar(expr, scalars),
-            Logical::Fold { carrier, .. } => {
-                collect_carrier(carrier, dims, scalars);
-            }
-            Logical::Restride { specs, .. } => {
-                for s in specs {
-                    collect_dims(&[s.size, s.offset], dims);
-                }
-            }
-            _ => {}
-        },
-        Op::Launch(l1) => match l1 {
-            Launch::Map {
-                space, body, ops, ..
-            } => {
-                collect_dims(&space.dims, dims);
-                collect_scalar(body, scalars);
-                collect_ops(ops, dims);
-            }
-            Launch::Fold {
-                space,
-                carrier,
-                post,
-                ops,
-                ..
-            } => {
-                collect_dims(&space.dims, dims);
-                collect_carrier(carrier, dims, scalars);
-                for p in post {
-                    collect_scalar(p, scalars);
-                }
-                collect_ops(ops, dims);
-            }
-            Launch::Contract {
-                m,
-                n,
-                k,
-                batch,
-                post,
-                a,
-                b,
-                ..
-            } => {
-                collect_dims(&[*m, *n, *k, *batch], dims);
-                collect_scalar(&a.pre, scalars);
-                collect_scalar(&b.pre, scalars);
-                collect_scalar(post, scalars);
-                collect_ops(&a.ops, dims);
-                collect_ops(&b.ops, dims);
-            }
-            Launch::Gather { space, ops, .. } | Launch::Scatter { space, ops, .. } => {
-                collect_dims(&space.dims, dims);
-                collect_ops(ops, dims);
-            }
-            Launch::Ext { ops, .. } => collect_ops(ops, dims),
-            Launch::Region { .. } => {}
-        },
-    }
+fn collect_layout(layout: &Layout, out: &mut Vec<SymId>) {
+    collect_dims(&[layout.offset()], out);
+    collect_dims(layout.shape(), out);
+    collect_dims(layout.strides(), out);
 }

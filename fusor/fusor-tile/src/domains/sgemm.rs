@@ -86,7 +86,11 @@ static PARAM_MEMO: crate::domains::DomainMemo<(Caps, u32, usize), SgemmDomain> =
 
 fn generate_params(elem_bytes: u32, cx: &DomainCtx<'_>) -> SgemmDomain {
     let max_storage = cx.caps.limits.max_compute_workgroup_storage_size;
-    let max_lanes = cx.caps.limits.max_compute_invocations_per_workgroup;
+    let max_lanes = cx
+        .caps
+        .limits
+        .max_compute_invocations_per_workgroup
+        .min(cx.caps.limits.max_compute_workgroup_size[0]);
     let elem_bytes = elem_bytes.max(1);
 
     let mut all: Vec<SgemmParams> = Vec::new();

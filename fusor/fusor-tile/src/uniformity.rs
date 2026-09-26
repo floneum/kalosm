@@ -4,18 +4,17 @@
 //! [`LowerError::NonUniformBarrier`][fusor_ir::ir::kernel::LowerError::NonUniformBarrier].
 //!
 //! The classification is conservative in the direction that fails lowering
-//! rather than racing: anything read from memory, any lane-indexed builtin,
-//! any subgroup collective and any cooperative fragment is `NonUniform`.
+//! rather than racing: mutable or lane-indexed memory reads, lane-indexed
+//! builtins, subgroup collectives and cooperative fragments are `NonUniform`.
 
 use fusor_ir::Result;
 use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
-    Accumulator, Builtin, KernelIr, Local, LowerError, ReduceKind, Stmt, TileExpr, TileExprKind,
+    Accumulator, BufferAccess, Builtin, KernelIr, Local, LowerError, ReduceKind, Source, Stmt,
+    TileExpr, TileExprKind,
 };
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
-
-use crate::liveness::for_each_child;
 
 /// Whether a value is provably identical across every invocation of the
 /// group. Unknown is treated as `NonUniform`.
@@ -46,6 +45,7 @@ fn local_key(local: &Local) -> LocalKey {
 struct Ctx {
     locals: FxHashMap<LocalKey, Uniformity>,
     memo: FxHashMap<u64, Uniformity>,
+    writable_bindings: FxHashSet<u32>,
 }
 
 impl Ctx {
@@ -84,30 +84,45 @@ impl Ctx {
                 }
             },
             K::LoadLocal(local) => self.local(local),
+            K::Load {
+                src: Source::Storage(view),
+                ..
+            } if view.buffer.access == BufferAccess::Read
+                && !self.writable_bindings.contains(&view.buffer.binding) =>
+            {
+                self.classify_children(expr)
+            }
             K::Load { .. } | K::LoadTile { .. } | K::CoopLoad { .. } | K::CoopMma { .. } => {
                 Uniformity::NonUniform
             }
             K::Reduce { kind, value, .. } => match kind.as_ref() {
                 ReduceKind::Subgroup => Uniformity::NonUniform,
-                ReduceKind::Workgroup { .. } | ReduceKind::Loop { .. } => self.classify(value),
+                ReduceKind::Workgroup { .. } => self.classify(value),
             },
-            _ => {
-                let mut children: Vec<TileExpr> = Vec::new();
-                for_each_child(expr.kind(), &mut |child| children.push(child.clone()));
-                let mut result = Uniformity::Uniform;
-                for child in &children {
-                    result = result.meet(self.classify(child));
-                }
-                result
-            }
+            _ => self.classify_children(expr),
         }
+    }
+
+    fn classify_children(&mut self, expr: &TileExpr) -> Uniformity {
+        let mut result = Uniformity::Uniform;
+        expr.kind()
+            .visit_children(&mut |child| result = result.meet(self.classify(child)));
+        result
     }
 }
 
 /// A `Barrier` may not appear under an `If` whose predicate is non-uniform
 /// over the group.
 pub(crate) fn verify_uniformity(ir: &KernelIr) -> Result<()> {
-    let mut ctx = Ctx::default();
+    let mut ctx = Ctx {
+        writable_bindings: ir
+            .buffers
+            .iter()
+            .filter(|buffer| buffer.access == BufferAccess::ReadWrite)
+            .map(|buffer| buffer.binding)
+            .collect(),
+        ..Ctx::default()
+    };
     classify_locals(&ir.body, &mut ctx);
     let mut path: Vec<u32> = Vec::new();
     walk(&ir.body, Uniformity::Uniform, &mut ctx, &mut path)
@@ -152,30 +167,6 @@ fn collect_assignments(
     }
 }
 
-/// `ReduceKind::Loop` carries its own counter local, which is uniform for the
-/// same reason a counted loop's index is.
-fn collect_reduce_counters(body: &[Stmt], counters: &mut Vec<LocalKey>) {
-    let mut seen = rustc_hash::FxHashSet::default();
-    crate::verify_kernel::for_each_root_expr(body, &mut |expr| {
-        crate::verify_kernel::visit_unique(expr, &mut seen, &mut |node| {
-            if let TileExprKind::Reduce { kind, .. } = node.kind()
-                && let ReduceKind::Loop { index, .. } = kind.as_ref()
-            {
-                counters.push(local_key(index));
-            }
-        });
-    });
-    // The N-ary form carries its kind on the statement, not inside an
-    // expression, so the expression walk above cannot see its counter.
-    crate::verify_kernel::for_each_stmt(body, &mut |stmt| {
-        if let Stmt::Reduce { kind, .. } = stmt
-            && let ReduceKind::Loop { index, .. } = kind.as_ref()
-        {
-            counters.push(local_key(index));
-        }
-    });
-}
-
 /// Fixpoint: start every assigned local `Uniform` and downgrade it the moment
 /// any assignment is non-uniform. Monotone, so it terminates; a loop-carried
 /// local settles after at most one extra pass per dependency edge.
@@ -183,7 +174,6 @@ fn classify_locals(body: &[Stmt], ctx: &mut Ctx) {
     let mut assignments = Vec::new();
     let mut counters = Vec::new();
     collect_assignments(body, &mut assignments, &mut counters);
-    collect_reduce_counters(body, &mut counters);
     for (key, _) in &assignments {
         ctx.locals.entry(*key).or_insert(Uniformity::Uniform);
     }
@@ -230,14 +220,12 @@ fn walk_stmt(stmt: &Stmt, enclosing: Uniformity, ctx: &mut Ctx, path: &mut Vec<u
             }
             Ok(())
         }
-        // A workgroup or loop reduction lowers to a staged tree with a barrier
+        // A workgroup reduction lowers to a staged tree with a barrier
         // between every level. Those barriers are emitted, not written, so they
         // are checked here at the statement that produces them.
         Stmt::Reduce { kind, .. } => {
-            if matches!(
-                kind.as_ref(),
-                ReduceKind::Workgroup { .. } | ReduceKind::Loop { .. }
-            ) && enclosing == Uniformity::NonUniform
+            if matches!(kind.as_ref(), ReduceKind::Workgroup { .. })
+                && enclosing == Uniformity::NonUniform
             {
                 return Err(Error::Lower(LowerError::NonUniformBarrier(format!(
                     "the staged reduction at {} is under a non-uniform predicate",
@@ -277,4 +265,78 @@ fn render_path(path: &[u32]) -> String {
         out.push_str(&step.to_string());
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fusor_ir::ir::kernel::{
+        Addr, BufferDecl, ElementType, MemoryLevel, ScalarElement, StorageView, TileLayout,
+        TileLiteral,
+    };
+
+    #[test]
+    fn barrier_loops_require_uniform_immutable_counts() {
+        let u32_type = ElementType::Scalar(ScalarElement::U32);
+        let zero = TileExpr::new(TileExprKind::Literal(TileLiteral::U32(0)), u32_type);
+        let mask = TileExpr::new(
+            TileExprKind::Literal(TileLiteral::Bool(true)),
+            ElementType::Scalar(ScalarElement::Bool),
+        );
+        for (access, lane_index, writable_alias) in [
+            (BufferAccess::Read, false, false),
+            (BufferAccess::Read, true, false),
+            (BufferAccess::ReadWrite, false, false),
+            (BufferAccess::Read, false, true),
+        ] {
+            let buffer = Arc::new(BufferDecl {
+                binding: 0,
+                element: u32_type,
+                layout: TileLayout::contiguous(MemoryLevel::Storage, &[32]),
+                access,
+            });
+            let mut buffers = vec![buffer.clone()];
+            if writable_alias {
+                buffers.push(Arc::new(BufferDecl {
+                    access: BufferAccess::ReadWrite,
+                    ..(*buffer).clone()
+                }));
+            }
+            let index = if lane_index {
+                TileExpr::new(TileExprKind::Builtin(Builtin::Lane), u32_type)
+            } else {
+                zero.clone()
+            };
+            let count = TileExpr::new(
+                TileExprKind::Load {
+                    src: Source::Storage(StorageView {
+                        buffer: buffer.clone(),
+                        offset: 0,
+                        layout: buffer.layout.clone(),
+                    }),
+                    addr: Box::new(Addr::Linear(index)),
+                    mask: mask.clone(),
+                    fill: zero.clone(),
+                },
+                u32_type,
+            );
+            let ir = KernelIr {
+                buffers,
+                grid: [1, 1, 1],
+                block: 32,
+                body: vec![Stmt::Loop {
+                    count: Some(count),
+                    index: None,
+                    accumulators: Vec::new(),
+                    body: vec![Stmt::Barrier],
+                }],
+                byte_arena: None,
+                name: "uniform_count",
+            };
+            assert_eq!(
+                verify_uniformity(&ir).is_ok(),
+                access == BufferAccess::Read && !lane_index && !writable_alias
+            );
+        }
+    }
 }
