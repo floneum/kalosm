@@ -434,3 +434,25 @@ impl Program {
         Ok(bytes)
     }
 }
+
+// Explicit auto-trait impls; see the note on `GpuTarget`.
+//
+// SAFETY: `program_fields_are_send_sync` asserts `Send + Sync` for every
+// field type, which is exactly what the auto impls would require.
+unsafe impl Send for Program {}
+unsafe impl Sync for Program {}
+
+#[allow(dead_code)]
+fn program_fields_are_send_sync() {
+    fn assert<T: Send + Sync>() {}
+    assert::<Arc<GpuTarget>>();
+    assert::<Plan>();
+    assert::<Buf>();
+    assert::<Vec<(wgpu::ComputePipeline, wgpu::BindGroup)>>();
+    assert::<Vec<u32>>();
+    assert::<Vec<u8>>();
+    assert::<rustc_hash::FxHashSet<Id>>();
+    assert::<AtomicUsize>();
+    assert::<super::ProgramAcceleration>();
+    assert::<Option<String>>();
+}

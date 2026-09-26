@@ -60,9 +60,8 @@ impl Expr {
                 terms.iter().find_map(|(high, c_high)| {
                     let (x2, d2, m2) = digit(high)?;
                     let amount = (*c_low).min(c_high / m);
-                    (x2 == x && d2 == d * m && amount > 0).then(|| {
-                        (low.clone(), high.clone(), x.clone(), d, m, m2, amount)
-                    })
+                    (x2 == x && d2 == d * m && amount > 0)
+                        .then(|| (low.clone(), high.clone(), x.clone(), d, m, m2, amount))
                 })
             });
             let Some((low, high, x, d, m, m2, amount)) = pair else {
@@ -73,7 +72,11 @@ impl Expr {
             terms.retain(|_, k| *k != 0);
             let quotient = if d == 1 { x } else { Self::Div(Box::new(x), d) };
             match m2 {
-                Some(m2) => *terms.entry(Self::Mod(Box::new(quotient), m * m2)).or_default() += amount,
+                Some(m2) => {
+                    *terms
+                        .entry(Self::Mod(Box::new(quotient), m * m2))
+                        .or_default() += amount
+                }
                 None => match quotient {
                     Self::Const(v) => constant += v * amount,
                     Self::Sum(inner) => {
@@ -240,7 +243,7 @@ impl Expr {
                 Self::Const(v) => v * c,
                 _ => *c,
             })
-            .filter(|g| *g > 1 && n % g == 0)
+            .filter(|g| *g > 1 && n.is_multiple_of(*g))
             .collect();
         candidates.sort_unstable_by(|a, b| b.cmp(a));
         candidates.dedup();
@@ -295,9 +298,9 @@ impl Expr {
             split.insert(lo(*v), bounds[v].min(d - 1));
         }
         let expanded = self.map_vars(&|x| match x {
-            Self::Var(v) => divisors.get(v).map(|d| {
-                Self::weighted([(Self::Var(hi(*v)), *d), (Self::Var(lo(*v)), 1)])
-            }),
+            Self::Var(v) => divisors
+                .get(v)
+                .map(|d| Self::weighted([(Self::Var(hi(*v)), *d), (Self::Var(lo(*v)), 1)])),
             Self::Div(y, e) | Self::Mod(y, e) => match y.as_ref() {
                 Self::Var(v) if divisors.get(v) == Some(e) => Some(if matches!(x, Self::Div(..)) {
                     Self::Var(hi(*v))
@@ -384,7 +387,11 @@ mod tests {
             ]);
             let owner = stat.clone().div(rows);
             let simplified = owner.simplify(&bounds);
-            assert_eq!(simplified, Expr::var(GROUP), "{batch}x{heads}x{rows}x{cols}");
+            assert_eq!(
+                simplified,
+                Expr::var(GROUP),
+                "{batch}x{heads}x{rows}x{cols}"
+            );
             for group in 0..groups {
                 for local in 0..share {
                     let vars = |v| if v == GROUP { group } else { local };
@@ -410,7 +417,9 @@ mod tests {
             x.clone().div(6144).scale(6144),
             row().modulo(64),
             ka().modulo(24).scale(64),
-            Expr::sum([row().div(64).scale(3), inner.div(1536)]).modulo(4).scale(1536),
+            Expr::sum([row().div(64).scale(3), inner.div(1536)])
+                .modulo(4)
+                .scale(1536),
         ]);
         let simplified = address.simplify_digits(&bounds);
         let expected = Expr::sum([
@@ -471,14 +480,24 @@ mod tests {
         for e in &exprs {
             for n in [2, 3, 4, 6, 8, 12, 24, 48] {
                 for (op, simplified) in [
-                    (Expr::Div(Box::new(e.clone()), n), Expr::Div(Box::new(e.clone()), n).simplify(&bounds)),
-                    (Expr::Mod(Box::new(e.clone()), n), Expr::Mod(Box::new(e.clone()), n).simplify(&bounds)),
+                    (
+                        Expr::Div(Box::new(e.clone()), n),
+                        Expr::Div(Box::new(e.clone()), n).simplify(&bounds),
+                    ),
+                    (
+                        Expr::Mod(Box::new(e.clone()), n),
+                        Expr::Mod(Box::new(e.clone()), n).simplify(&bounds),
+                    ),
                 ] {
                     for a in 0..=9 {
                         for b in 0..=5 {
                             for c in 0..=3 {
                                 let vars = |v| [a, b, c][v];
-                                assert_eq!(op.eval(&vars), simplified.eval(&vars), "{op:?} -> {simplified:?}");
+                                assert_eq!(
+                                    op.eval(&vars),
+                                    simplified.eval(&vars),
+                                    "{op:?} -> {simplified:?}"
+                                );
                             }
                         }
                     }

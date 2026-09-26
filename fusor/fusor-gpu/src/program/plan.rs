@@ -667,7 +667,11 @@ impl Plan {
                 let v = self.value(*id);
                 let tag = format!("{:?}", v.op);
                 let tag: String = tag.chars().take_while(|c| c.is_alphanumeric()).collect();
-                out.push_str(&format!(" {tag}{:?}{}", v.shape, if v.materialized() { "" } else { "*" }));
+                out.push_str(&format!(
+                    " {tag}{:?}{}",
+                    v.shape,
+                    if v.materialized() { "" } else { "*" }
+                ));
             }
         }
         out

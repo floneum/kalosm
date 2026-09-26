@@ -310,7 +310,7 @@ fn lower_fold_carrier(
                         let invariant = o.layout.rank() == space.rank()
                             && vec_axes.iter().all(|axis| {
                                 o.layout.strides()[*axis as usize]
-                                .known_eq(fusor_ir::shape::Dim::Const(0))
+                                    .known_eq(fusor_ir::shape::Dim::Const(0))
                             });
                         let flat = if invariant {
                             first.clone()

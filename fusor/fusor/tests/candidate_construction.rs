@@ -264,9 +264,11 @@ fn symbolic_contractions_expose_their_reduction_and_address_maps() {
             &facts,
         )
         .expect("a dynamic contraction must remain visible as a reduction");
-        let folded = graph.members(graph.class_of(id)).into_iter().find(|member|
-            matches!(graph.node(*member).op, Op::Launch(Launch::Fold { .. }))
-        ).unwrap();
+        let folded = graph
+            .members(graph.class_of(id))
+            .into_iter()
+            .find(|member| matches!(graph.node(*member).op, Op::Launch(Launch::Fold { .. })))
+            .unwrap();
         let Op::Launch(Launch::Fold { ops, .. }) = &graph.node(folded).op else {
             panic!("the contraction floor must expose a Fold");
         };

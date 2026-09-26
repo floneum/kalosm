@@ -14,11 +14,18 @@ fn main() {
     let device = target.device().device();
     let queue = target.device().queue();
     let source = std::fs::read_to_string(path).unwrap();
-    let module = naga::front::wgsl::parse_str(&source).unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
+    let module = naga::front::wgsl::parse_str(&source)
+        .unwrap_or_else(|e| panic!("{}", e.emit_to_string(&source)));
     let shader = unsafe {
         device.create_shader_module_trusted(
-            wgpu::ShaderModuleDescriptor { label: None, source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)) },
-            wgpu::ShaderRuntimeChecks { force_loop_bounding: false, ..wgpu::ShaderRuntimeChecks::checked() },
+            wgpu::ShaderModuleDescriptor {
+                label: None,
+                source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
+            },
+            wgpu::ShaderRuntimeChecks {
+                force_loop_bounding: false,
+                ..wgpu::ShaderRuntimeChecks::checked()
+            },
         )
     };
     let pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
@@ -26,7 +33,10 @@ fn main() {
         layout: None,
         module: &shader,
         entry_point: Some("main"),
-        compilation_options: wgpu::PipelineCompilationOptions { zero_initialize_workgroup_memory: false, ..Default::default() },
+        compilation_options: wgpu::PipelineCompilationOptions {
+            zero_initialize_workgroup_memory: false,
+            ..Default::default()
+        },
         cache: None,
     });
     let arena = device.create_buffer(&wgpu::BufferDescriptor {
@@ -37,13 +47,20 @@ fn main() {
     });
     // Small finite values everywhere: indices read as tiny integers.
     let fill: Vec<u8> = (0..arena_bytes.div_ceil(4))
-        .flat_map(|i| ((((i * 2654435761) % 1000) as f32) / 4000.0).to_bits().to_le_bytes())
+        .flat_map(|i| {
+            ((((i * 2654435761) % 1000) as f32) / 4000.0)
+                .to_bits()
+                .to_le_bytes()
+        })
         .collect();
     queue.write_buffer(&arena, 0, &fill);
     let bind = device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: None,
         layout: &pipeline.get_bind_group_layout(0),
-        entries: &[wgpu::BindGroupEntry { binding: 0, resource: arena.as_entire_binding() }],
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: arena.as_entire_binding(),
+        }],
     });
     let run = |count: u32| {
         let mut encoder = device.create_command_encoder(&Default::default());

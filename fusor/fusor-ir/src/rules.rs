@@ -17,9 +17,9 @@ pub mod rebase;
 pub mod scatter_fold;
 pub mod sink;
 pub mod slab;
-pub mod stream;
 pub mod specialize;
 pub mod split_k;
+pub mod stream;
 pub mod tuple;
 
 use crate::dtype::Dtype;

@@ -1749,10 +1749,22 @@ impl Session {
             target.launch(&launch.artifact, launch.grid, &binds, &uniforms)?;
             if std::env::var_os("FUSOR_DEBUG_CPU_NAN").is_some() {
                 let root = plan.launches[launch_ix].root;
-                if let Some(buffer) = supplied.get(&root).and_then(|buffer| buffer.downcast_ref::<fusor_cpu::AlignedBuf>()) {
-                    let values: Vec<f32> = buffer.as_slice().chunks_exact(4).map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap())).collect();
+                if let Some(buffer) = supplied
+                    .get(&root)
+                    .and_then(|buffer| buffer.downcast_ref::<fusor_cpu::AlignedBuf>())
+                {
+                    let values: Vec<f32> = buffer
+                        .as_slice()
+                        .chunks_exact(4)
+                        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+                        .collect();
                     eprintln!("[DEBUG-cpu-nan] launch={launch_ix} root={root} values={values:?}");
-                    if values.iter().any(|v| v.is_nan()) { eprintln!("[DEBUG-cpu-nan] OP {:?}", graph.state().egraph.lock().node(root).op); }
+                    if values.iter().any(|v| v.is_nan()) {
+                        eprintln!(
+                            "[DEBUG-cpu-nan] OP {:?}",
+                            graph.state().egraph.lock().node(root).op
+                        );
+                    }
                 }
             }
             launched += 1;
@@ -3004,9 +3016,13 @@ mod tests {
 
         let backend = if std::env::var_os("FUSOR_CONFORMANCE_REQUIRE_GPU").is_some() {
             #[cfg(feature = "gpu")]
-            { Backend::gpu_blocking().expect("GPU backend required") }
+            {
+                Backend::gpu_blocking().expect("GPU backend required")
+            }
             #[cfg(not(feature = "gpu"))]
-            { panic!("GPU feature required") }
+            {
+                panic!("GPU feature required")
+            }
         } else {
             Backend::cpu().unwrap()
         };
@@ -3015,48 +3031,123 @@ mod tests {
         let h = graph.handle();
         let seq = h.fresh_sym();
         h.bind_dim(seq, 7);
-        let q = graph.leaf("q", &[Dim::Const(2), Dim::Const(4)], crate::Dtype::F32).unwrap();
-        let k = graph.leaf("k", &[Dim::Sym(seq), Dim::Const(4)], crate::Dtype::F32).unwrap();
-        let v = graph.leaf("v", &[Dim::Sym(seq), Dim::Const(4)], crate::Dtype::F32).unwrap();
-        let out = q.matmul_t(&k).unwrap().softmax_last_dim().unwrap().matmul(&v).unwrap();
+        let q = graph
+            .leaf("q", &[Dim::Const(2), Dim::Const(4)], crate::Dtype::F32)
+            .unwrap();
+        let k = graph
+            .leaf("k", &[Dim::Sym(seq), Dim::Const(4)], crate::Dtype::F32)
+            .unwrap();
+        let v = graph
+            .leaf("v", &[Dim::Sym(seq), Dim::Const(4)], crate::Dtype::F32)
+            .unwrap();
+        let out = q
+            .matmul_t(&k)
+            .unwrap()
+            .softmax_last_dim()
+            .unwrap()
+            .matmul(&v)
+            .unwrap();
         let (stream, plan) = {
             let mut g = h.state().egraph.lock();
             g.add_root(out.id);
-            Driver::new().saturate(&mut g, &session.caps(), &session.inner.rules, Default::default()).unwrap();
+            Driver::new()
+                .saturate(
+                    &mut g,
+                    &session.caps(),
+                    &session.inner.rules,
+                    Default::default(),
+                )
+                .unwrap();
             let reachable = g.reachable_from_roots();
-            let stream = reachable.ones().map(|i| Id(i as u32)).find(|id| {
-                let Op::Launch(Launch::StreamFold { producer, fold, .. }) = &g.node(*id).op else { return false };
-                let Launch::Fold { carrier, .. } = fold.as_ref() else { return false };
-                let Launch::Fold { ops, .. } = producer.as_ref() else { return false };
-                carrier.slots.as_slice() == [SlotTy::Scalar, SlotTy::Scalar, SlotTy::Vector(Dim::Const(4))]
-                    && ops.iter().any(|o| o.src == q.id) && ops.iter().any(|o| o.src == k.id)
-                    && g.node(*id).children.iter().copied().collect::<FxHashSet<_>>() == [q.id, k.id, v.id].into_iter().collect()
-            }).expect("ordinary QK, softmax and PV must derive a single streamed weighted reduction");
+            let stream = reachable
+                .ones()
+                .map(|i| Id(i as u32))
+                .find(|id| {
+                    let Op::Launch(Launch::StreamFold { producer, fold, .. }) = &g.node(*id).op
+                    else {
+                        return false;
+                    };
+                    let Launch::Fold { carrier, .. } = fold.as_ref() else {
+                        return false;
+                    };
+                    let Launch::Fold { ops, .. } = producer.as_ref() else {
+                        return false;
+                    };
+                    carrier.slots.as_slice()
+                        == [
+                            SlotTy::Scalar,
+                            SlotTy::Scalar,
+                            SlotTy::Vector(Dim::Const(4)),
+                        ]
+                        && ops.iter().any(|o| o.src == q.id)
+                        && ops.iter().any(|o| o.src == k.id)
+                        && g.node(*id)
+                            .children
+                            .iter()
+                            .copied()
+                            .collect::<FxHashSet<_>>()
+                            == [q.id, k.id, v.id].into_iter().collect()
+                })
+                .expect(
+                    "ordinary QK, softmax and PV must derive a single streamed weighted reduction",
+                );
             g.clear_roots();
             g.add_root(stream);
             let mut extraction = Extraction::default();
-            for input in [q.id, k.id, v.id, stream] { extraction.sigma.insert(g.class_of(input), input); }
-            let Op::Launch(op) = &g.node(stream).op else { unreachable!() };
-            extraction.theta.insert(stream, op.schedule().unwrap().iter().next().unwrap());
-            let plan = LocalSearch::new(Arc::new(Planner::new()), session.caps()).replan(
-                &g, &[stream], &mut extraction, session.inner.cost.as_ref(), &mut NodeCache::new(g.len()),
-            ).unwrap();
+            for input in [q.id, k.id, v.id, stream] {
+                extraction.sigma.insert(g.class_of(input), input);
+            }
+            let Op::Launch(op) = &g.node(stream).op else {
+                unreachable!()
+            };
+            extraction
+                .theta
+                .insert(stream, op.schedule().unwrap().iter().next().unwrap());
+            let plan = LocalSearch::new(Arc::new(Planner::new()), session.caps())
+                .replan(
+                    &g,
+                    &[stream],
+                    &mut extraction,
+                    session.inner.cost.as_ref(),
+                    &mut NodeCache::new(g.len()),
+                )
+                .unwrap();
             (stream, plan)
         };
         assert_eq!(plan.launches.len(), 1);
         let state = h.tensor(stream);
         let queries = [1.0f32, 0.25, 0.5, 0.75, 0.5, 0.75, 0.25, 1.0];
-        q.set_bytes(bytemuck::cast_slice(&queries).to_vec()).unwrap();
+        q.set_bytes(bytemuck::cast_slice(&queries).to_vec())
+            .unwrap();
         let resolving = h.state().resolve_lock.lock();
-        for (length, nonfinite) in [(7, 0), (7, 1), (7, 2), (7, 3), (7, 4), (1, 0), (0, 0), (9, 0)] {
+        for (length, nonfinite) in [
+            (7, 0),
+            (7, 1),
+            (7, 2),
+            (7, 3),
+            (7, 4),
+            (1, 0),
+            (0, 0),
+            (9, 0),
+        ] {
             h.bind_dim(seq, length);
-            let mut keys: Vec<f32> = (0..length * 4).map(|i| (i * 11 % 19) as f32 / 13.0 - 0.5).collect();
-            let values: Vec<f32> = (0..length * 4).map(|i| (i * 7 % 23) as f32 / 11.0 - 0.75).collect();
+            let mut keys: Vec<f32> = (0..length * 4)
+                .map(|i| (i * 11 % 19) as f32 / 13.0 - 0.5)
+                .collect();
+            let values: Vec<f32> = (0..length * 4)
+                .map(|i| (i * 7 % 23) as f32 / 11.0 - 0.75)
+                .collect();
             for row in 0..length as usize {
-                if nonfinite == 2 || nonfinite == 1 && row % 2 == 0 { keys[row * 4] = f32::NEG_INFINITY; }
+                if nonfinite == 2 || nonfinite == 1 && row % 2 == 0 {
+                    keys[row * 4] = f32::NEG_INFINITY;
+                }
             }
-            if nonfinite == 3 { keys[0] = f32::INFINITY; }
-            if nonfinite == 4 { keys[0] = f32::NAN; }
+            if nonfinite == 3 {
+                keys[0] = f32::INFINITY;
+            }
+            if nonfinite == 4 {
+                keys[0] = f32::NAN;
+            }
             k.set_bytes(bytemuck::cast_slice(&keys).to_vec()).unwrap();
             v.set_bytes(bytemuck::cast_slice(&values).to_vec()).unwrap();
             session.run(h, &plan, std::slice::from_ref(&state)).unwrap();
@@ -3064,18 +3155,34 @@ mod tests {
             let actual = bytemuck::cast_slice::<u8, f32>(&bytes);
             assert_eq!(actual.len(), 12);
             for row in 0..2 {
-                let scores: Vec<f64> = keys.chunks_exact(4).map(|key| (0..4).map(|d| f64::from(queries[row * 4 + d]) * f64::from(key[d])).sum()).collect();
+                let scores: Vec<f64> = keys
+                    .chunks_exact(4)
+                    .map(|key| {
+                        (0..4)
+                            .map(|d| f64::from(queries[row * 4 + d]) * f64::from(key[d]))
+                            .sum()
+                    })
+                    .collect();
                 let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                 let weights: Vec<_> = scores.iter().map(|s| (s - max).exp()).collect();
                 let sum: f64 = weights.iter().sum();
                 for d in 0..4 {
-                    let expected: f64 = weights.iter().enumerate().map(|(i, w)| w / sum * f64::from(values[i * 4 + d])).sum();
+                    let expected: f64 = weights
+                        .iter()
+                        .enumerate()
+                        .map(|(i, w)| w / sum * f64::from(values[i * 4 + d]))
+                        .sum();
                     let got = if length == 0 {
                         assert_eq!(actual[row * 6 + 1], 0.0);
                         actual[row * 6 + 2 + d]
-                    } else { actual[row * 6 + 2 + d] / actual[row * 6 + 1] };
-                    assert!(expected.is_nan() && got.is_nan() || (f64::from(got) - expected).abs() < 3e-5 * expected.abs().max(1.0),
-                        "length={length} nonfinite={nonfinite} row={row} d={d}: {got} != {expected}");
+                    } else {
+                        actual[row * 6 + 2 + d] / actual[row * 6 + 1]
+                    };
+                    assert!(
+                        expected.is_nan() && got.is_nan()
+                            || (f64::from(got) - expected).abs() < 3e-5 * expected.abs().max(1.0),
+                        "length={length} nonfinite={nonfinite} row={row} d={d}: {got} != {expected}"
+                    );
                 }
             }
         }
@@ -3900,4 +4007,3 @@ mod tests {
         a_fresh_step_leaf_reuses_the_plan(Session::new(backend).unwrap());
     }
 }
-

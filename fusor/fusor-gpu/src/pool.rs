@@ -716,6 +716,34 @@ fn hw_memsize() -> Option<u64> {
     }
 }
 
+// Explicit auto-trait impls; see the note on `GpuTarget`. Without them the
+// auto-trait walk recurses through wgpu_core's resource graph and overflows
+// (E0275) in downstream crates whose `Send` futures reach a pool or buffer.
+//
+// SAFETY: the `*_fields_are_send_sync` functions assert `Send + Sync` for
+// every field type, which is exactly what the auto impls would require.
+unsafe impl Send for BufferPool {}
+unsafe impl Sync for BufferPool {}
+unsafe impl Send for GpuBuffer {}
+unsafe impl Sync for GpuBuffer {}
+
+#[allow(dead_code)]
+fn pool_fields_are_send_sync() {
+    fn assert<T: Send + Sync>() {}
+    assert::<Arc<wgpu::Device>>();
+    assert::<Arc<wgpu::Queue>>();
+    assert::<Mutex<FxHashMap<PoolKey, Bucket>>>();
+    assert::<Mutex<BufferPoolCounters>>();
+    assert::<Mutex<u64>>();
+    assert::<bool>();
+    assert::<Mutex<Vec<StagingChunk>>>();
+    assert::<AtomicBool>();
+    assert::<crate::device::LostFlag>();
+    assert::<wgpu::Buffer>();
+    assert::<u64>();
+    assert::<wgpu::BufferUsages>();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

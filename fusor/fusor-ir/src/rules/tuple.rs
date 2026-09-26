@@ -475,14 +475,7 @@ fn widen_ops(side: &FoldView, host: &FoldView) -> Option<Vec<Operand>> {
     }
     side.ops
         .iter()
-        .map(|o| {
-            crate::rules::fusion::widen_operand(
-                o,
-                &side.space,
-                &host.space,
-                &host.vec_axes,
-            )
-        })
+        .map(|o| crate::rules::fusion::widen_operand(o, &side.space, &host.space, &host.vec_axes))
         .collect()
 }
 

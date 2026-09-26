@@ -313,7 +313,10 @@ pub(crate) fn shader(
     }
     // A fixed-size arena: its bounds checks clamp against a constant rather
     // than the runtime buffer length, and binding validates the size once.
-    let mut out = format!("@group(0) @binding(0) var<storage,read_write> arena: array<u32,{}>;\n", p.stats().arena_bytes / 4) + "var<workgroup> tile_a:array<f32,512>;\nvar<workgroup> tile_b:array<f32,256>;\nvar<workgroup> reduce_scratch:array<u32,256>;\nfn f32_bits(bits:u32)->f32{return bitcast<f32>(bits);}\n";
+    let mut out = format!(
+        "@group(0) @binding(0) var<storage,read_write> arena: array<u32,{}>;\n",
+        p.stats().arena_bytes / 4
+    ) + "var<workgroup> tile_a:array<f32,512>;\nvar<workgroup> tile_b:array<f32,256>;\nvar<workgroup> reduce_scratch:array<u32,256>;\nfn f32_bits(bits:u32)->f32{return bitcast<f32>(bits);}\n";
     if cooperative {
         out.insert_str(
             0,
@@ -712,7 +715,10 @@ fn contraction(
         writeln!(
             out,
             "var va2=0.0;if({}){{va2={};}}tile_a[lane+256u]=va2;",
-            guard(&[(m_tail, format!("row+16u<{m}u")), (k_tail, format!("ka<{k}u"))]),
+            guard(&[
+                (m_tail, format!("row+16u<{m}u")),
+                (k_tail, format!("ka<{k}u"))
+            ]),
             matrix_load(a, &spec.a, &av.shape, "row+16u", "0u", "ka")?
         )
         .unwrap();
@@ -959,7 +965,13 @@ fn bucketed_scatter(out: &mut String, p: &Plan, id: Id, groups: u32) -> Result<(
     out.push_str("if(hit){positions[total+before+rank]=k;}total+=count;workgroupBarrier();}\n");
     // Matches are summed in their original order; eight loads issue ahead of
     // their adds so a frequent bucket's long run is not one load at a time.
-    let update = |picked: &str| load(p, *upd, &format!("(row/{width}u)*{}u+({picked})*{inner}u+col", count * inner));
+    let update = |picked: &str| {
+        load(
+            p,
+            *upd,
+            &format!("(row/{width}u)*{}u+({picked})*{inner}u+col", count * inner),
+        )
+    };
     writeln!(out,"for(var col=lane;col<{inner}u;col+=256u){{let at=row*{inner}u+col;var acc={};var i=0u;for(;i+8u<=total;i+=8u){{",load(p,*base,"at")?).unwrap();
     for j in 0..8 {
         writeln!(out, "let u{j}={};", update(&format!("positions[i+{j}u]"))?).unwrap();
@@ -967,7 +979,12 @@ fn bucketed_scatter(out: &mut String, p: &Plan, id: Id, groups: u32) -> Result<(
     for j in 0..8 {
         writeln!(out, "acc+=u{j};").unwrap();
     }
-    writeln!(out, "}}for(;i<total;i+=1u){{acc+={};}}", update("positions[i]")?).unwrap();
+    writeln!(
+        out,
+        "}}for(;i<total;i+=1u){{acc+={};}}",
+        update("positions[i]")?
+    )
+    .unwrap();
     store(out, p, id, "at", "acc");
     out.push_str("}workgroupBarrier();}}storageBarrier();\n");
     Ok(())
