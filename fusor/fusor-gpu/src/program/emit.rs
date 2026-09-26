@@ -497,7 +497,32 @@ pub(crate) fn shader(
                     let inner = stride(&v.shape, axis);
                     let width = v.shape[axis];
                     let count = p.value(*idx).len();
-                    writeln!(out,"var acc={};\nfor(var k=0u;k<{count}u;k+=1u){{\nif(u32({})==(at/{inner}u)%{width}u){{",load(p,*base,"at")?,load(p,*idx,"k")?).unwrap();
+                    // Base-16 nested loops: llvmpipe's LLVM crashes compiling any
+                    // single constant-trip loop of 64 or more iterations.
+                    let mut step = 1;
+                    while step * 16 < count {
+                        step *= 16;
+                    }
+                    let exact = count.is_multiple_of(step);
+                    let mut loops =
+                        format!("for(var k{step}=0u;k{step}<{count}u;k{step}+={step}u){{\n");
+                    let mut closers = "}\n".to_string();
+                    while step > 1 {
+                        let lo = step / 16;
+                        writeln!(
+                            loops,
+                            "for(var k{lo}=k{step};k{lo}<k{step}+{step}u;k{lo}+={lo}u){{"
+                        )
+                        .unwrap();
+                        closers.push_str("}\n");
+                        step = lo;
+                    }
+                    let guard = if exact {
+                        String::new()
+                    } else {
+                        format!("k<{count}u&&")
+                    };
+                    writeln!(out,"var acc={};\n{loops}let k=k1;\nif({guard}u32({})==(at/{inner}u)%{width}u){{",load(p,*base,"at")?,load(p,*idx,"k")?).unwrap();
                     let index = format!(
                         "(at/{}u)*{}u+k*{inner}u+at%{inner}u",
                         inner * width,
@@ -506,7 +531,7 @@ pub(crate) fn shader(
                     let update = load(p, *upd, &index)?;
                     writeln!(
                         out,
-                        "acc={};\n}}\n}}",
+                        "acc={};\n}}\n{closers}",
                         if *combine == ScatterCombine::Add {
                             format!("acc+{update}")
                         } else {
