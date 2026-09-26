@@ -284,9 +284,11 @@ impl Expr {
         if divisors.is_empty() {
             return self.simplify(bounds);
         }
-        // Fresh ids below GROUP/LOCAL and far from any caller's variables.
-        let hi = |v: usize| (1 << 40) + 2 * v;
-        let lo = |v: usize| (1 << 40) + 2 * v + 1;
+        // Fresh ids far from callers' small variable ids and below GROUP/LOCAL,
+        // at any pointer width (wasm32 included).
+        const DIGITS: usize = usize::MAX / 4;
+        let hi = |v: usize| DIGITS + 2 * v;
+        let lo = |v: usize| DIGITS + 2 * v + 1;
         let mut split = bounds.clone();
         for (v, d) in &divisors {
             split.insert(hi(*v), bounds[v] / d);
