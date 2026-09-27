@@ -243,17 +243,11 @@ fn count(expr: &TileExpr, seen: &mut FxHashSet<TileExpr>, work: &mut (u64, u64))
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fusor_ir::device::{Caps, DeviceKind, Limits, SubgroupWidths};
-    use fusor_ir::dtype::Dtype;
-    use fusor_ir::egraph::EGraph;
+    use crate::realize::tests::{buffer, caps, contract, new_graph, selecting, sgemv, side};
     use fusor_ir::extract::Extraction;
     use fusor_ir::ir::Op;
-    use fusor_ir::ir::launch::{
-        AccessPlan, ContractSide, Family, IndexSpace, Launch, Operand, SchedPoint, ScheduleDomain,
-        SgemvDomain,
-    };
+    use fusor_ir::ir::launch::{AccessPlan, Family, Launch, SchedPoint};
     use fusor_ir::ir::logical::{BufferId, LeafKind, Logical};
-    use fusor_ir::scalar::ScalarExpr;
     use fusor_ir::shape::{Dim, Layout};
 
     #[test]
@@ -315,30 +309,11 @@ mod tests {
             assert_eq!(av.map(f32::to_bits), bv.map(f32::to_bits));
         }
 
-        let caps = Caps {
-            kind: DeviceKind::Gpu,
-            name: "quantized layout pricing".into(),
-            limits: Limits::default(),
-            subgroups: Some(SubgroupWidths { min: 32, max: 32 }),
-            f16: false,
-            bf16: false,
-            coop: Default::default(),
-            atomic_f32: false,
-            workgroup_alias: false,
-            mixed_precision_coop_store: false,
-            pipeline_cache: false,
-            timestamp_query: false,
-            simd_widths: Default::default(),
-            threads: 1,
-        };
+        let caps = caps();
         let arena = Arc::new(fusor_tile::Planner::new());
-        let mut graph = EGraph::new(fusor_ir::CoreSemantics::new(arena.clone()));
+        let mut graph = new_graph(&arena);
         let (n, k) = (Dim::Const(n.into()), Dim::Const(k.into()));
-        let x = graph.add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
-            name: BufferId(0),
-            dtype: Dtype::F32,
-            shape: [Dim::ONE, k].into_iter().collect(),
-        })))?;
+        let x = buffer(&mut graph, 0, &[Dim::ONE, k]);
         let mut variants = Vec::new();
         for params in [
             params,
@@ -360,56 +335,23 @@ mod tests {
                         layout,
                         shape: [n, k].into_iter().collect(),
                     })))?;
-                    let side = |src, layout| {
-                        ContractSide::one(
-                            ScalarExpr::arg(0, Dtype::F32),
-                            Operand {
-                                src,
-                                layout,
-                                access: AccessPlan::Alias,
-                            },
-                        )
-                    };
-                    let root = graph.add(Op::Launch(Launch::Contract {
-                        output: IndexSpace::new(if split == 1 {
-                            vec![Dim::ONE, n]
-                        } else {
-                            vec![batch, Dim::ONE, n]
-                        }),
-                        m: Dim::ONE,
-                        n,
-                        k: chunk,
-                        batch,
-                        family: Family::Sgemv,
-                        a: side(
-                            x,
-                            if split == 1 {
-                                Layout::contiguous(&[Dim::ONE, chunk])
-                            } else {
-                                Layout::contiguous(&[batch, Dim::ONE, chunk])
-                            },
-                        ),
-                        b: side(
+                    // An unsplit contraction drops the leading batch axis.
+                    let s = usize::from(split == 1);
+                    let root = graph.add(contract(
+                        &[batch, Dim::ONE, n][s..],
+                        [Dim::ONE, n, chunk, batch],
+                        Family::Sgemv,
+                        side(x, Layout::contiguous(&[batch, Dim::ONE, chunk][s..])),
+                        side(
                             weight,
-                            if split == 1 {
-                                Layout::from_parts(Dim::Const(0), &[chunk, n], &[Dim::ONE, k])?
-                            } else {
-                                Layout::from_parts(
-                                    Dim::Const(0),
-                                    &[batch, chunk, n],
-                                    &[chunk, Dim::ONE, k],
-                                )?
-                            },
+                            Layout::from_parts(
+                                Dim::Const(0),
+                                &[batch, chunk, n][s..],
+                                &[chunk, Dim::ONE, k][s..],
+                            )?,
                         ),
-                        acc: Dtype::F32,
-                        post: ScalarExpr::arg(0, Dtype::F32),
-                        sched: ScheduleDomain::Sgemv(
-                            SgemvDomain {
-                                params: [params].into_iter().collect(),
-                            }
-                            .into(),
-                        ),
-                    }))?;
+                        sgemv(params),
+                    ))?;
                     let mut packed = graph.node(root).op.clone();
                     let Op::Launch(Launch::Contract { b, .. }) = &mut packed else {
                         unreachable!()
@@ -434,10 +376,7 @@ mod tests {
                 let (weight, roots) = pair[index];
                 let root = roots[access];
                 let mut ex = Extraction {
-                    sigma: [x, weight, root]
-                        .into_iter()
-                        .map(|id| (graph.class_of(id), id))
-                        .collect(),
+                    sigma: selecting(&graph, [x, weight, root]),
                     m: Default::default(),
                     theta: [(root, SchedPoint::Sgemv(params))].into_iter().collect(),
                 };

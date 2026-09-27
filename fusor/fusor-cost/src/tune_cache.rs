@@ -1,41 +1,22 @@
-//! The per-machine tuning cache: what this device has already learned about
-//! which kernels are cheap.
-//!
-//! Records only timing observations. Candidate equivalence is established by
-//! construction and tested by conformance; this cache has no correctness
-//! verdicts or blacklist. Stale timings can affect performance, never which
-//! computations the compiler considers equivalent.
-//!
-//! Keyed by `Caps::fingerprint()`: a different device reads a different file;
-//! an unknown device reads nothing and tunes normally.
+//! The per-machine tuning cache: timing observations only, never correctness
+//! verdicts, keyed by `Caps::fingerprint()`.
 
 use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Candidates whose recorded score is worse than `best * SKIP_RATIO` are not
-/// rebuilt on later resolves.
-///
-/// Unbounded: a launch's candidate field cannot be narrowed on that launch's
-/// own score, because the plan optimum is not the per-launch argmin —
-/// multi-launch plans have interdependent choices.
+/// Candidates scored worse than `best * SKIP_RATIO` are not rebuilt.
+/// Unbounded: the plan optimum is not the per-launch argmin.
 pub const SKIP_RATIO: f64 = f64::INFINITY;
 
-/// How many never-measured variants one tuning race will spend time on: the
-/// top-K of the cost model's ordering. The rest of the field is explored later
-/// from production samples via the session's epsilon explorer.
+/// Never-measured variants one race times: the model's top K.
 pub const RACE_TOP_K: usize = 3;
 
-/// Observations one `(launch, variant)` window holds. Every decision reads the
-/// minimum over the window — timings are noisy upward, so the min is the
-/// kernel — and a stale minimum ages out after `WINDOW` fresh observations.
+/// Observations one `(launch, variant)` window holds; decisions read its min.
 pub const WINDOW: usize = 8;
 
-/// How many already-known variants one resolve re-races, best-scored first.
-///
-/// Unbounded: narrowing each launch's field independently denies the descent
-/// the combination that actually wins.
+/// Known variants one resolve re-races, best first. Unbounded.
 pub const RERACE_PER_RESOLVE: usize = usize::MAX;
 
 /// A candidate's last up-to-[`WINDOW`] timing observations, oldest first.
@@ -47,23 +28,17 @@ struct Record {
     window: Vec<u64>,
 }
 
-/// A whole-plan outcome: the per-launch variants that were fastest when
-/// measured together.
-///
-/// Per-launch minima do not compose — each `Record` is scored in whatever
-/// context the coordinate descent was in when its turn came — so the winning
-/// combination is stored whole.
+/// The per-launch variants fastest when measured together; per-launch
+/// minima do not compose.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 struct Combo {
     plan: String,
-    /// One entry per launch, in launch order. `None` means "the base plan's
-    /// own choice", which is not a variant and has no label.
+    /// One per launch; `None` is the base plan's own choice.
     picks: Vec<Option<String>>,
     score: u64,
 }
 
-/// The on-disk format version. A file at a different format is read as an
-/// empty cache: mismatch is never a wrong ordering, only a re-tuning pass.
+/// The on-disk format version; any other reads as empty.
 pub const FORMAT: u32 = 7;
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -74,18 +49,6 @@ struct Disk {
     records: Vec<Record>,
     #[serde(default)]
     combos: Vec<Combo>,
-}
-
-impl Disk {
-    /// Split a parsed file into `(records, combos)`, empty unless it was
-    /// written in the unit this build reads.
-    fn accept(self) -> (Vec<Record>, Vec<Combo>) {
-        if self.format == FORMAT {
-            (self.records, self.combos)
-        } else {
-            (Vec::new(), Vec::new())
-        }
-    }
 }
 
 /// Per-signature timing windows, keyed by candidate label.
@@ -99,9 +62,9 @@ fn read_tables(path: &Path) -> (LearnedTable, ComboTable) {
     let mut combos: FxHashMap<String, (Vec<Option<String>>, u64)> = FxHashMap::default();
     if let Ok(body) = std::fs::read_to_string(path)
         && let Ok(disk) = serde_json::from_str::<Disk>(&body)
+        && disk.format == FORMAT
     {
-        let (records, stored) = disk.accept();
-        for r in records {
+        for r in disk.records {
             if r.window.is_empty() {
                 continue;
             }
@@ -110,15 +73,14 @@ fn read_tables(path: &Path) -> (LearnedTable, ComboTable) {
                 .or_default()
                 .insert(r.variant, r.window[start..].to_vec());
         }
-        for c in stored {
+        for c in disk.combos {
             combos.insert(c.plan, (c.picks, c.score));
         }
     }
     (seen, combos)
 }
 
-/// What this device has learned. All mutation is behind one lock because a
-/// resolve is already serialized.
+/// What this device has learned.
 #[derive(Debug, Default)]
 pub struct TuneCache {
     path: Option<PathBuf>,
@@ -153,9 +115,7 @@ pub fn cache_path(caps_fingerprint: u64) -> Option<PathBuf> {
 }
 
 impl TuneCache {
-    /// Read this device's file, or start empty. A malformed or unreadable file
-    /// is an empty cache, never an error: the worst it can cost is a tuning
-    /// pass this process would have done anyway.
+    /// Read this device's file; anything unreadable is an empty cache.
     pub fn load(caps_fingerprint: u64) -> Self {
         Self::at(cache_path(caps_fingerprint))
     }
@@ -251,13 +211,8 @@ impl TuneCache {
         *self.dirty.lock() = true;
     }
 
-    /// Split candidates into what to race and what to skip, best prior first.
-    ///
-    /// Each candidate arrives with the cost model's prior for the plan it
-    /// denotes, in picoseconds. Returns `(to_measure, skipped)`. Ordering:
-    /// measured variants by their window minimum (re-confirm the incumbent
-    /// first), then never-measured ones by the model's prior, capped at
-    /// [`RACE_TOP_K`]. Ties break by name so a run is reproducible.
+    /// Split `(candidate, prior)`s into `(to_measure, skipped)`: measured
+    /// ones by window min, then the top [`RACE_TOP_K`] fresh ones by prior.
     pub fn plan_candidates<'a>(
         &self,
         launch: &str,
@@ -286,9 +241,7 @@ impl TuneCache {
             }
         }
         known.sort_by(|a, b| a.1.cmp(&b.1).then_with(|| a.0.cmp(b.0)));
-        // Stable by prior only: candidates arrive in the enumerator's offer
-        // order (round-robin over belief-ordered schedule domains), so a tie
-        // keeps the domain's believed-best cell first.
+        // Stable: a tie keeps the enumerator's believed-best first.
         fresh.sort_by_key(|a| a.1);
 
         let mut out: Vec<&'a String> = known
@@ -302,8 +255,7 @@ impl TuneCache {
         (out, skipped)
     }
 
-    /// Persist, atomically, if anything changed. Best-effort: a cache that
-    /// cannot be written is still a correct cache for this process.
+    /// Persist atomically, best-effort, if anything changed.
     pub fn save(&self) {
         if !*self.dirty.lock() {
             return;
@@ -321,7 +273,6 @@ impl TuneCache {
                     })
                 })
                 .collect();
-            // Sorted so the file is stable across runs and diffable by hand.
             records.sort_by(|a, b| {
                 a.launch
                     .cmp(&b.launch)
@@ -350,8 +301,7 @@ impl TuneCache {
         if let Some(dir) = path.parent() {
             let _ = std::fs::create_dir_all(dir);
         }
-        // Write-then-rename: a crash mid-write leaves the old cache, not a
-        // truncated one that would parse as empty and silently re-tune.
+        // Write-then-rename, so a crash leaves the old cache.
         let tmp = path.with_extension("json.tmp");
         if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, path).is_ok() {
             *self.dirty.lock() = false;

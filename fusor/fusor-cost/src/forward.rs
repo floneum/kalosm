@@ -1,11 +1,6 @@
-//! Post-extraction view forwarding. A selected identity copy of a strided
-//! view is a dispatch and a round trip through memory; every selected reader
-//! of it reads the view's source through the composed strides instead, and
-//! the copy, read by nothing, drops out of the realized DAG.
-//!
-//! Saturation cannot carry this: minting a forwarded spelling for every
-//! reader of every copy multiplies heads and extraction never settles. Here
-//! one spelling is minted per selected reader of a selected copy.
+//! Post-extraction view forwarding: a selected reader of a selected identity
+//! copy reads the copy's source through composed strides instead. Done here,
+//! not in saturation, which would mint a spelling per reader of every copy.
 
 use crate::nodes::is_view_copy;
 use fusor_ir::device::Caps;
@@ -14,8 +9,8 @@ use fusor_ir::extract::{Extraction, Plan};
 use fusor_ir::rules::absorb_view::forward_views;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-/// Rewrite `plan`'s selection into `ex` so no launch reads a view copy that
-/// is not a root. Returns whether anything changed; the caller then replans.
+/// Rewrite `plan`'s selection into `ex` so no launch reads a non-root view
+/// copy. Returns whether anything changed.
 pub fn forward_selected_views(
     graph: &mut EGraph,
     caps: &Caps,

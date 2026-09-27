@@ -27,54 +27,47 @@ pub struct ReplayCache {
 /// The architecture document's name for the same type.
 pub type ReplayMemo = ReplayCache;
 
+/// Entries, most recently used last.
 #[derive(Default)]
-struct Lru {
-    /// Most recently used last.
-    order: Vec<ReplayKey>,
-    plans: Vec<(ReplayKey, Entry)>,
-}
+struct Lru(Vec<(ReplayKey, Entry)>);
 
-/// The `(arena, unions)` stamp a replayed plan was last checked against.
+/// The `(arena, unions)` stamp a replayed plan was last checked against: a
+/// hit on the same graph with no union since needs no recanonicalization.
 type Checked = Option<(u64, u64)>;
 
 struct Entry {
     plan: Arc<Plan>,
-    /// The `(arena, unions)` the plan was last checked against: a hit on the
-    /// same graph with no union since needs no recanonicalization.
     checked: Checked,
 }
 
 impl Lru {
-    fn touch(&mut self, key: ReplayKey) {
-        if let Some(i) = self.order.iter().position(|k| *k == key) {
-            self.order.remove(i);
-        }
-        self.order.push(key);
+    /// Move `key`'s entry to most recent and return it.
+    fn touch(&mut self, key: ReplayKey) -> Option<&mut Entry> {
+        let i = self.0.iter().position(|(k, _)| *k == key)?;
+        let entry = self.0.remove(i);
+        self.0.push(entry);
+        self.0.last_mut().map(|(_, e)| e)
     }
 
     fn get(&mut self, key: ReplayKey) -> Option<(Arc<Plan>, Checked)> {
-        let hit = self
-            .plans
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, e)| (Arc::clone(&e.plan), e.checked))?;
-        self.touch(key);
-        Some(hit)
+        self.touch(key).map(|e| (Arc::clone(&e.plan), e.checked))
     }
 
     fn mark_checked(&mut self, key: ReplayKey, token: (u64, u64)) {
-        if let Some((_, e)) = self.plans.iter_mut().find(|(k, _)| *k == key) {
+        if let Some((_, e)) = self.0.iter_mut().find(|(k, _)| *k == key) {
             e.checked = Some(token);
         }
     }
 
     fn insert(&mut self, key: ReplayKey, plan: Arc<Plan>) {
-        match self.plans.iter_mut().find(|(k, _)| *k == key) {
-            Some(slot) => {
-                slot.1.plan = plan;
-                slot.1.checked = None;
+        match self.touch(key) {
+            Some(e) => {
+                *e = Entry {
+                    plan,
+                    checked: None,
+                }
             }
-            None => self.plans.push((
+            None => self.0.push((
                 key,
                 Entry {
                     plan,
@@ -82,10 +75,8 @@ impl Lru {
                 },
             )),
         }
-        self.touch(key);
-        while self.plans.len() > CAPACITY {
-            let evict = self.order.remove(0);
-            self.plans.retain(|(k, _)| *k != evict);
+        if self.0.len() > CAPACITY {
+            self.0.remove(0);
         }
     }
 }
@@ -103,18 +94,9 @@ impl ReplayCache {
         self.entries.lock().insert(key, Arc::new(plan));
     }
 
-    /// Look up `key`, extracting through `f` on a miss.
-    ///
-    /// The returned flag is `plan_unchanged`: `true` when the entry was
-    /// already present, or when a re-extraction produced the same
-    /// [`PlanHash`] — either way nothing recompiles.
-    ///
-    /// `graph` is what the plan has to be a selection *of*. A [`ReplayKey`]
-    /// identifies the term under the roots, which is stable, but
-    /// [`Extraction::sigma`] is keyed by class **representative**, and a
-    /// union anywhere in the graph moves one. A hit whose keys have only
-    /// moved is rekeyed; one whose classes have merged is no longer a
-    /// selection of this graph and is re-extracted.
+    /// Look up `key`, extracting through `f` on a miss; the flag is `true`
+    /// when nothing recompiles. A hit whose class keys moved under a union is
+    /// rekeyed; one whose classes merged is re-extracted.
     pub fn get_or_extract(
         &self,
         key: ReplayKey,
@@ -152,13 +134,11 @@ impl ReplayCache {
     }
 
     pub fn clear(&self) {
-        let mut e = self.entries.lock();
-        e.plans.clear();
-        e.order.clear();
+        self.entries.lock().0.clear();
     }
 
     pub fn len(&self) -> usize {
-        self.entries.lock().plans.len()
+        self.entries.lock().0.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -166,36 +146,20 @@ impl ReplayCache {
     }
 
     fn newest_hash(&self) -> Option<PlanHash> {
-        let e = self.entries.lock();
-        let key = *e.order.last()?;
-        e.plans
-            .iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, e)| e.plan.hash)
+        self.entries.lock().0.last().map(|(_, e)| e.plan.hash)
     }
 }
 
-/// Structural fingerprint of the term a plan was extracted from, **with
-/// symbols as symbols**: two dispatches of one shape family produce the same
-/// value, so the key discriminates on the binding rather than on the shape.
-///
-/// A leaf contributes its dtype and its shape, and a `Const` its value; it
-/// does not contribute its `BufferId`, so a re-upload into a fresh buffer
-/// replays. The key must be injective over everything a cached plan's `Id`s
-/// refer to: every member of every class the roots reach, *with its id* —
-/// ids are meaningful only in the arena they index, and an arena is
-/// append-only, so equal ids holding equal nodes is the same term. Nodes the
-/// roots never reach are not hashed: a graph that keeps growing elsewhere
-/// (another model, a readback's own small term) leaves this plan valid.
+/// Structural fingerprint of the term under `roots`, symbols as symbols and
+/// leaves without their buffer names: every id of every reachable class,
+/// with its node, so a plan's ids all lie in what it hashes.
 pub fn l0_term_hash(graph: &EGraph, roots: &[Id]) -> u64 {
     let mut h = FxHasher::default();
     h.write_usize(roots.len());
     for r in roots {
         h.write_u32(r.0);
     }
-    // Every id of every class reachable from the roots, in id order so the
-    // hash does not depend on traversal order. A class's members are what
-    // the extractor chooses among, so a plan's ids all lie in this set.
+    // In id order, independent of traversal.
     let (_, seen) = crate::realize::reachable_unsorted(graph, roots);
     // `Hash for ScalarExpr` writes a cached digest, so this stays O(nodes).
     for i in seen.ones() {
@@ -216,8 +180,7 @@ pub fn l0_term_hash(graph: &EGraph, roots: &[Id]) -> u64 {
 }
 
 /// Everything about a leaf that changes the plan, and nothing that only names
-/// a buffer: the uniform's *slot* rather than its bound value, and the
-/// buffer's dtype and shape rather than its `BufferId`.
+/// a buffer.
 fn hash_leaf<H: Hasher>(h: &mut H, kind: &LeafKind) {
     std::mem::discriminant(kind).hash(h);
     match kind {
@@ -252,8 +215,6 @@ fn hash_shape<H: Hasher>(h: &mut H, shape: &[Dim]) {
                 h.write_u8(0);
                 h.write_u64(*v);
             }
-            // A symbolic extent stays symbolic: one plan serves the family and
-            // the dispatch binds it through the uniform block.
             Dim::Sym(s) => {
                 h.write_u8(1);
                 h.write_u32(s.0);
@@ -262,23 +223,20 @@ fn hash_shape<H: Hasher>(h: &mut H, shape: &[Dim]) {
     }
 }
 
-/// What [`ReplayCache::get_or_extract`] found a memoized plan to be, against
-/// the graph as it stands now.
+/// A memoized plan against the graph as it stands now.
 enum Canonical {
     /// Every class key is still its class's representative.
     Current,
     /// Representatives moved; here is the same plan rekeyed.
     Moved(Box<Plan>),
-    /// Two selected classes have since merged, so the plan names two members
-    /// of one class. Not a selection any more.
+    /// Two selected classes have merged: not a selection any more.
     Merged,
 }
 
 fn recanonicalize(graph: &EGraph, plan: &Plan) -> Canonical {
     let sigma = &plan.extraction.sigma;
     let len = graph.len();
-    // One pass: a node this graph never minted (post-extraction forwarding
-    // ran on another graph) means extracting again here.
+    // A node this graph never minted means extracting again here.
     let mut moved = false;
     for (class, member) in sigma {
         if class.0.index() >= len || member.index() >= len {
@@ -300,12 +258,8 @@ fn recanonicalize(graph: &EGraph, plan: &Plan) -> Canonical {
     }
 }
 
-/// `sigma` under `class_of` as it stands now.
-///
-/// `None` when every key is already its class's representative. `Some(None)`
-/// when two keys canonicalize together onto different members — the classes
-/// merged, and no rekeying makes one selection out of two. Otherwise the
-/// rekeyed map.
+/// `sigma` under `class_of` now: `None` when unmoved, `Some(None)` when two
+/// keys merged onto different members, else the rekeyed map.
 fn recanonicalize_sigma(
     sigma: &FxHashMap<ClassId, Id>,
     class_of: impl Fn(Id) -> ClassId,

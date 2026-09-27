@@ -1,11 +1,6 @@
-//! Environment-driven diagnostics, parsed once per process.
-//!
-//! `FUSOR_DUMP_PLAN` / `FUSOR_DUMP_EDGES` / `FUSOR_DUMP_CLASSES` dump each
-//! extracted plan, `FUSOR_CYCLE_LOG` traces seed cycle repair,
-//! `FUSOR_SEED_DEBUG=<class>` and `FUSOR_SIGMA_DEBUG=<class>` follow one
-//! class's seed keys and selection changes, `FUSOR_TUNE_DEBUG` names every
-//! dropped tuning variant. `FUSOR_NO_PRIVATE` and `FUSOR_NO_SEED_FLOOR`
-//! disable a pricing feature for bisecting.
+//! Environment-driven diagnostics, parsed once per process: plan dumps,
+//! cycle repair, one class's seed and selection trace, tuning drops, and two
+//! pricing features to disable for bisecting.
 
 use crate::nodes::{is_view_copy, resolved_children};
 use crate::realize::{self, Realized};

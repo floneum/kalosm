@@ -69,16 +69,8 @@ fn bounds_over(graph: &EGraph, cost: Option<&dyn CostModel>, ids: &[Id]) -> Boun
     bounds
 }
 
-/// The cheapest **selectable** member of `class`, picosecond ties broken by
-/// own dispatch count, then by smaller [`Id`]. Used for cycle repair and
-/// classes without an ordinary lowering.
-///
-/// Selectable, not just cheapest: the floor lowerings tie with the `Logical` node
-/// they replace on math, so an unrestricted `min_by_key` would return the
-/// un-lowered original every time. See [`crate::realize::selectable`].
-///
-/// Dependencies are deliberately absent from this ordering estimate. Their
-/// complete shared DAG is priced when the candidate selection is realized.
+/// The cheapest selectable member of `class`, ties by dispatch count then
+/// id; dependencies are priced when the selection is realized.
 pub(crate) fn argmin_member(
     graph: &EGraph,
     lb: &[Picoseconds],
@@ -96,9 +88,7 @@ pub(crate) fn argmin_member(
     chosen
 }
 
-/// [`argmin_member`] over the members `banned` does not name. Returns `None`
-/// when every candidate is banned, which is what makes the seed's cycle-repair
-/// loop terminate.
+/// [`argmin_member`] over the members `banned` does not name.
 pub(crate) fn argmin_member_excluding(
     graph: &EGraph,
     lb: &[Picoseconds],
@@ -127,8 +117,7 @@ fn node_math_table(graph: &EGraph, cost: &dyn CostModel, ids: &[Id]) -> Vec<Pico
             continue;
         }
         let slot = &mut out[id.index()];
-        // Hashing operand facts costs about two `node_math` calls, so only a
-        // domain wide enough to pay for it gets a memo entry.
+        // Hashing facts costs about two `node_math` calls.
         if domain_of(graph, id).map_or(1, |d| d.len()) <= MEMO_THRESHOLD {
             *slot = best_math(graph, cost, id);
             continue;
@@ -197,10 +186,8 @@ pub(crate) fn ranked_points(
     points.into_iter().map(|(_, _, theta)| theta).collect()
 }
 
-/// Every point of `domain` in order with its `node_math`. `node_math`
-/// depends on the point only through the MAC unit, the padded tile, the
-/// k-step floor and a fold's lane group, so it runs once per math-distinct
-/// point.
+/// Every point of `domain` in order with its `node_math`, computed once per
+/// math-distinct point.
 fn priced_points(
     node: &Node,
     ins: &[ValueFacts],
