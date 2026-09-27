@@ -1265,20 +1265,20 @@ pub fn launch_signature(graph: &EGraph, launch: &Dispatch) -> String {
     };
     let op = &graph.node(root).op;
     let tag = tag_of(op);
-    let extra = match op {
-        Op::Launch(Launch::Contract { .. }) => {
-            let c = Mnkb::of(op, |d| d.as_const().unwrap_or(0)).expect("a contraction");
-            format!("mnkb={},{},{},{}", c.m, c.n, c.k, c.batch)
-        }
+    let extra = match (op, Mnkb::of(op, |d| d.as_const().unwrap_or(0))) {
+        (_, Some(c)) => format!("mnkb={},{},{},{}", c.m, c.n, c.k, c.batch),
         // `space` is the *iteration* domain and carries the reduced extent;
         // the output shape above does not.
-        Op::Launch(Launch::Fold {
-            space,
-            axis,
-            vec_axes,
-            carrier,
-            ..
-        }) => format!(
+        (
+            Op::Launch(Launch::Fold {
+                space,
+                axis,
+                vec_axes,
+                carrier,
+                ..
+            }),
+            _,
+        ) => format!(
             "space=[{}] axis={axis} vec={vec_axes:?} slots={}",
             extents(&space.dims),
             carrier.slots.len()

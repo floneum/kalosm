@@ -298,8 +298,8 @@ pub fn buffer_layout_for(
             .ok_or_else(|| Error::Plan("cooperative matrix groups require concrete extents".into()))
     };
     let (m, n) = (constant(*m)?, constant(*n)?);
-    let m_padded = m.max(1).div_ceil(u64::from(geom.bm)) * u64::from(geom.bm);
-    let n_padded = n.max(1).div_ceil(u64::from(geom.bn)) * u64::from(geom.bn);
+    let tiling = crate::nodes::Tiling::new(m.max(1), n.max(1), geom.bm, geom.bn);
+    let (m_padded, n_padded) = (tiling.padded_m(), tiling.padded_n());
     let elements = *batch * Dim::Const(m_padded) * Dim::Const(n_padded);
     if m == 0 || n == 0 {
         return Ok((Layout::contiguous(shape), elements));
