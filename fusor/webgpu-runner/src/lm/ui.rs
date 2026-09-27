@@ -298,11 +298,6 @@ fn Training(corpus: Rc<Corpus>) -> Element {
                                 running.set(false);
                                 return;
                             }
-                            if let Err(error) = built.compile_training(Default::default()).await {
-                                status.set(error.to_string());
-                                running.set(false);
-                                return;
-                            }
                             parked.model = Some(built);
                         }
                         Err(error) => {

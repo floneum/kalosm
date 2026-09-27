@@ -17,7 +17,6 @@ mod flags;
 pub mod launch;
 mod lower;
 pub mod pool;
-pub mod program;
 pub mod reduction;
 mod rules;
 pub mod target;

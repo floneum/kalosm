@@ -27,7 +27,7 @@ const { chromium } = require('playwright');
       const diagnostics = await page.evaluate(async () => {
         const script = [...document.scripts].find(s => s.type === 'module' && s.src.includes('fusor-webgpu-runner'));
         const module = await import(script.src);
-        return ['checkTraining', 'checkProgram', 'checkConformance', 'checkBenchmarks'].filter(n => n in module);
+        return ['checkTraining', 'checkConformance', 'checkBenchmarks'].filter(n => n in module);
       });
       assert.deepEqual(diagnostics, []);
     }

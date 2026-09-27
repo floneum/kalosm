@@ -46,7 +46,6 @@ pub struct GpuDevice {
     limits_used: wgpu::Limits,
     features: wgpu::Features,
     adapter_info: wgpu::AdapterInfo,
-    matrix_fallback: Option<String>,
     lost: LostFlag,
 }
 
@@ -83,9 +82,6 @@ impl GpuDevice {
     }
     pub fn adapter_info(&self) -> &wgpu::AdapterInfo {
         &self.adapter_info
-    }
-    pub(crate) fn matrix_fallback(&self) -> Option<&str> {
-        self.matrix_fallback.as_deref()
     }
     /// Set once the driver reports the device lost; see [`LostFlag`].
     pub fn lost(&self) -> &LostFlag {
@@ -181,9 +177,7 @@ async fn request_device(extra: Option<wgpu::Limits>) -> Result<GpuDevice> {
         DeviceKind::Gpu,
     );
     #[cfg(target_arch = "wasm32")]
-    let (caps, matrix_fallback) = probe_browser_matrices(&device, caps).await?;
-    #[cfg(not(target_arch = "wasm32"))]
-    let matrix_fallback = None;
+    let caps = probe_browser_matrices(&device, caps).await?;
     // Rates are calibrated (or loaded from the on-disk cache) by fusor-cost;
     // capabilities are always re-probed, so a stale capability set cannot
     // outlive a driver update.
@@ -198,7 +192,6 @@ async fn request_device(extra: Option<wgpu::Limits>) -> Result<GpuDevice> {
         limits_used: limits,
         features: granted,
         adapter_info,
-        matrix_fallback,
         lost,
     })
 }
@@ -207,13 +200,9 @@ async fn request_device(extra: Option<wgpu::Limits>) -> Result<GpuDevice> {
 /// Probe once, before Session's synchronous compiler admits matrix candidates.
 /// Use the same Naga serialization path as real kernels, including typed stores.
 #[cfg(target_arch = "wasm32")]
-async fn probe_browser_matrices(
-    device: &wgpu::Device,
-    mut caps: Caps,
-) -> Result<(Caps, Option<String>)> {
-    let mut fallback = None;
+async fn probe_browser_matrices(device: &wgpu::Device, mut caps: Caps) -> Result<Caps> {
     if !caps.subgroups.is_some_and(|w| w.min == 32 && w.max == 32) {
-        return Ok((caps, fallback));
+        return Ok(caps);
     }
     let mut supported = smallvec::SmallVec::new();
     for kind in &caps.coop {
@@ -254,14 +243,12 @@ fn main() {{
             compilation_options: Default::default(),
             cache: None,
         });
-        if let Some(error) = scope.pop().await {
-            fallback = Some(format!("browser {scalar} matrix probe: {error}"));
-        } else {
+        if scope.pop().await.is_none() {
             supported.push(*kind);
         }
     }
     caps.coop = supported;
-    Ok((caps, fallback))
+    Ok(caps)
 }
 
 // Explicit auto-trait impls; see the note on `GpuTarget`.

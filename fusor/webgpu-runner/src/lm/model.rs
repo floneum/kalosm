@@ -1,4 +1,4 @@
-//! Character-level transformer with reusable training and observation programs.
+//! Character-level transformer trained and observed through `Session`.
 //! Inputs change between steps; parameters and Adam moments remain on the GPU.
 //! Session execution is available as a numerical reference and benchmark.
 
@@ -87,8 +87,6 @@ struct Weights {
 
 /// The batch-of-one graph the generator and the interpretability panels run.
 struct Single {
-    /// An observation program snapshots parameters at this optimizer step.
-    compiled: Option<(u64, fusor::program::TrainingProgram)>,
     /// `[1, context]` token ids, left-aligned by the caller.
     tokens: Tensor<2, u32>,
     /// `[1, context, vocab]`, through the same fused attention the training
@@ -105,8 +103,6 @@ struct Single {
 
 /// The model, its optimizer state, and the graphs that read it.
 pub struct Lm {
-    compiled: Option<fusor::program::TrainingProgram>,
-    published_step: Option<u64>,
     device: Device,
     vocab: usize,
     config: ModelConfig,
@@ -300,8 +296,6 @@ impl Lm {
         }
 
         Ok(Self {
-            compiled: None,
-            published_step: None,
             device,
             vocab,
             config,
@@ -323,45 +317,6 @@ impl Lm {
         })
     }
 
-    /// Opt into a compiled logical training step. The ordinary compiler stays
-    /// available so callers can compare full-step performance on their device.
-    #[allow(dead_code)] // Optional executor; also used by the headless benchmark.
-    pub async fn compile_training(
-        &mut self,
-        options: fusor::program::ProgramOptions,
-    ) -> Result<()> {
-        if let Some(program) = &self.compiled {
-            let state: Vec<_> = self
-                .feedback
-                .iter()
-                .map(|(state, _)| state.clone())
-                .collect();
-            program.export(&state)?;
-        }
-        let program = fusor::program::TrainingProgram::compile_with_options(
-            &self.roots,
-            &self.feedback,
-            options,
-        )
-        .await?;
-        self.compiled = Some(program);
-        self.published_step = None;
-        Ok(())
-    }
-    #[allow(dead_code)] // Diagnostics for callers selecting the optional executor.
-    pub fn program_stats(&self) -> Option<&fusor::program::ProgramStats> {
-        self.compiled.as_ref().map(|p| p.stats())
-    }
-    fn publish_parameters(&mut self) -> Result<()> {
-        if self.published_step != Some(self.step) {
-            if let Some(program) = &self.compiled {
-                program.export(&self.weights.parameters())?;
-            }
-            self.published_step = Some(self.step);
-        }
-        Ok(())
-    }
-
     /// Completed optimizer steps.
     pub fn step_count(&self) -> u64 {
         self.step
@@ -369,10 +324,7 @@ impl Lm {
 
     /// GPU dispatches issued since device creation.
     pub fn dispatch_count(&self) -> u64 {
-        self.compiled.as_ref().map_or_else(
-            || self.device.session().launch_count(),
-            |p| p.dispatch_count(),
-        )
+        self.device.session().launch_count()
     }
 
     /// Queue `steps` optimizer steps, then read the final loss and step size.
@@ -382,14 +334,7 @@ impl Lm {
         for _ in 0..steps.max(1) {
             rate = self.dispatch(corpus).await?;
         }
-        let loss = if let Some(program) = &self.compiled {
-            let bytes = program.read(self.loss.as_dyn()).await?;
-            vec![f32::from_le_bytes(bytes.try_into().map_err(|_| {
-                fusor::Error::Shape("loss must be scalar f32".into())
-            })?)]
-        } else {
-            self.loss.to_vec_f32_async().await?
-        };
+        let loss = self.loss.to_vec_f32_async().await?;
         Ok(StepStats {
             step: self.step,
             loss: loss.first().copied().unwrap_or(f32::NAN),
@@ -413,15 +358,6 @@ impl Lm {
         // `alpha = lr * sqrt(1 - beta2^t) / (1 - beta1^t)`, the Keras form.
         let alpha = rate * (1.0 - BETA2.powi(t)).sqrt() / (1.0 - BETA1.powi(t));
 
-        if let Some(program) = &mut self.compiled {
-            let token_bytes: Vec<_> = tokens.iter().flat_map(|x| x.to_le_bytes()).collect();
-            let label_bytes: Vec<_> = labels.iter().flat_map(|x| x.to_le_bytes()).collect();
-            program.write(self.tokens.as_dyn(), &token_bytes)?;
-            program.write(self.labels.as_dyn(), &label_bytes)?;
-            program.write(self.alpha.as_dyn(), &alpha.to_le_bytes())?;
-            program.run_async().await?;
-            return Ok(rate);
-        }
         self.tokens.set_elements(&tokens);
         self.labels.set_elements(&labels);
         self.alpha.set_elements(&[alpha]);
@@ -445,41 +381,10 @@ impl Lm {
     /// Score held-out batches without updating parameters or optimizer state.
     pub async fn evaluate(&mut self, corpus: &Corpus, batches: usize) -> Result<Evaluation> {
         self.validate_corpus(corpus)?;
-        self.publish_parameters()?;
-        // Use the selected executor for observations as well as updates. This
-        // program has no feedback, so held-out inputs cannot train the model.
-        let mut compiled = if self.compiled.is_some() {
-            Some(
-                fusor::program::TrainingProgram::compile(
-                    std::slice::from_ref(self.scored.as_dyn()),
-                    &[],
-                )
-                .await?,
-            )
-        } else {
-            None
-        };
         let (mut loss, mut accuracy) = (0.0f32, 0.0f32);
         let runs = batches.max(1);
         for _ in 0..runs {
             let (tokens, labels) = self.draw(corpus, Split::Test);
-            if let Some(program) = &mut compiled {
-                let token_bytes: Vec<_> = tokens.iter().flat_map(|x| x.to_le_bytes()).collect();
-                let label_bytes: Vec<_> = labels.iter().flat_map(|x| x.to_le_bytes()).collect();
-                program.write(self.tokens.as_dyn(), &token_bytes)?;
-                program.write(self.labels.as_dyn(), &label_bytes)?;
-                program.run_async().await?;
-                let bytes = program.read(self.scored.as_dyn()).await?;
-                let read: Vec<_> = bytes
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|x| f32::from_le_bytes(*x))
-                    .collect();
-                loss += read[0];
-                accuracy += read[1];
-                continue;
-            }
             self.tokens.set_elements(&tokens);
             self.labels.set_elements(&labels);
             for value in self.chain.iter().chain(&self.roots) {
@@ -586,7 +491,6 @@ impl Lm {
 
     /// Pairwise cosine similarity between token embeddings.
     pub async fn embedding_similarity(&mut self) -> Result<Vec<f32>> {
-        self.publish_parameters()?;
         self.weights.embed.as_dyn().clear_device_buf();
         let rows = self.weights.embed.to_vec_f32_async().await?;
         let v = self.vocab;
@@ -616,7 +520,6 @@ impl Lm {
 
     /// Run the batch-of-one graph over `row`, building it on first use.
     async fn single_forward(&mut self, row: &[u32]) -> Result<()> {
-        self.publish_parameters()?;
         if self.single.is_none() {
             self.single = Some(self.build_single()?);
         }
@@ -632,20 +535,6 @@ impl Lm {
             single.lens_logits.as_dyn().clone(),
         ];
         roots.extend(single.attention.iter().map(|a| a.as_dyn().clone()));
-        if self.compiled.is_some() {
-            if single.compiled.as_ref().map(|(step, _)| *step) != Some(self.step) {
-                single.compiled = Some((
-                    self.step,
-                    fusor::program::TrainingProgram::compile(&roots, &[]).await?,
-                ));
-            }
-            let program = &mut single.compiled.as_mut().unwrap().1;
-            let token_bytes: Vec<_> = row.iter().flat_map(|x| x.to_le_bytes()).collect();
-            program.write(single.tokens.as_dyn(), &token_bytes)?;
-            program.run_async().await?;
-            program.export(&roots)?;
-            return Ok(());
-        }
         self.device.session().resolve(&roots)?;
         Ok(())
     }
@@ -672,7 +561,6 @@ impl Lm {
                 .forward(&tokens, self.config, &mut chain, Some(&mut attention));
 
         Ok(Single {
-            compiled: None,
             tokens,
             logits,
             lens_logits,
@@ -847,122 +735,6 @@ fn soften(logits: &[f32], temperature: f32) -> Vec<f32> {
 #[cfg(all(test, not(target_arch = "wasm32")))]
 mod tests {
     use super::*;
-
-    #[test]
-    fn compiled_training_matches_reference_state_and_observations() {
-        pollster::block_on(async {
-            for config in [
-                ModelConfig::TINY,
-                ModelConfig::default(),
-                ModelConfig {
-                    blocks: 2,
-                    dim: 42,
-                    heads: 3,
-                    mlp: 75,
-                    context: 19,
-                    batch: 3,
-                },
-            ] {
-                eprintln!("checking {config:?}");
-                let corpus = if config == ModelConfig::TINY {
-                    Corpus::benchmark().await.unwrap()
-                } else {
-                    Corpus::load().await.unwrap()
-                };
-                let mut reference = Lm::new(corpus.vocab_size(), 0x51ed_c0de, config)
-                    .await
-                    .unwrap();
-                let mut compiled = Lm::new(corpus.vocab_size(), 0x51ed_c0de, config)
-                    .await
-                    .unwrap();
-                compiled.compile_training(Default::default()).await.unwrap();
-                let allocated: usize = compiled
-                    .weights
-                    .parameters()
-                    .iter()
-                    .map(|s| s.elem_count().unwrap() as usize)
-                    .sum();
-                assert_eq!(allocated, config.parameters(corpus.vocab_size()));
-                for _ in 0..3 {
-                    let a = reference.train(&corpus, 8).await.unwrap();
-                    let b = compiled.train(&corpus, 8).await.unwrap();
-                    assert!((a.loss - b.loss).abs() < 2e-4, "{} vs {}", a.loss, b.loss);
-                }
-                let state: Vec<_> = compiled
-                    .feedback
-                    .iter()
-                    .map(|(state, _)| state.clone())
-                    .collect();
-                compiled.compiled.as_ref().unwrap().export(&state).unwrap();
-                let expected: Vec<_> = reference
-                    .feedback
-                    .iter()
-                    .map(|(state, _)| state.clone())
-                    .collect();
-                for (index, (a, b)) in expected.iter().zip(&state).enumerate() {
-                    let a = a.to_bytes_async().await.unwrap();
-                    let b = b.to_bytes_async().await.unwrap();
-                    for (a, b) in a.as_chunks::<4>().0.iter().zip(b.as_chunks::<4>().0.iter()) {
-                        let a = f32::from_le_bytes(*a);
-                        let b = f32::from_le_bytes(*b);
-                        assert!(
-                            (a - b).abs() <= 2e-5 + 1e-3 * a.abs(),
-                            "state {index}: {a} vs {b}"
-                        );
-                    }
-                }
-                let a = reference.evaluate(&corpus, 1).await.unwrap();
-                let b = compiled.evaluate(&corpus, 1).await.unwrap();
-                assert!((a.loss - b.loss).abs() < 2e-4);
-                assert!((a.accuracy - b.accuracy).abs() < 1e-4);
-                let a = reference.next_char(&[0, 1, 2, 3], 1.).await.unwrap();
-                let b = compiled.next_char(&[0, 1, 2, 3], 1.).await.unwrap();
-                for (a, b) in a.iter().zip(b) {
-                    assert!((a - b).abs() < 2e-4);
-                }
-                let probe =
-                    corpus.encode_all("Once upon a time, there was a little girl named Lily.");
-                let lens = compiled.attention(&probe).await.unwrap();
-                assert_eq!(lens.context, config.context);
-                assert_eq!(lens.filled, config.context.min(probe.len()));
-                assert_eq!(lens.maps.len(), config.blocks);
-                assert!(lens.disagreement < 1e-2, "{}", lens.disagreement);
-                for heads in &lens.maps {
-                    assert_eq!(heads.len(), config.heads);
-                    for map in heads {
-                        assert_eq!(map.len(), config.context * config.context);
-                        for q in 0..lens.filled {
-                            let row = &map[q * config.context..(q + 1) * config.context];
-                            assert!((row.iter().sum::<f32>() - 1.).abs() < 1e-4);
-                            assert!(row[q + 1..].iter().all(|p| p.abs() < 1e-6));
-                        }
-                    }
-                }
-                // Four tokens, each at least one character.
-                assert!(
-                    compiled
-                        .generate(&corpus, &probe, 4, 0.8)
-                        .await
-                        .unwrap()
-                        .chars()
-                        .count()
-                        >= 4
-                );
-                assert_eq!(
-                    compiled.embedding_similarity().await.unwrap().len(),
-                    corpus.vocab_size().pow(2)
-                );
-                if config == ModelConfig::TINY {
-                    let trained = compiled.train(&corpus, 376).await.unwrap();
-                    assert!(
-                        trained.loss.is_finite() && trained.loss < 2.5,
-                        "loss after 400 steps: {}",
-                        trained.loss
-                    );
-                }
-            }
-        });
-    }
 
     #[test]
     fn training_improves_held_out_loss_and_preserves_causal_attention() {
