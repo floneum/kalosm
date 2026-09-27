@@ -194,7 +194,7 @@ fn promote_once(
     vec_axes.push(d as u32);
     vec_axes.extend(state.vec_axes.iter().copied());
 
-    let shift = |x: &ScalarExpr| shift_index_of(x, d as u32, -1);
+    let shift = |x: &ScalarExpr| drop_index_axis(x, d as u32);
     Some(Promoted {
         vec_axes,
         carrier: Carrier {
@@ -354,14 +354,11 @@ fn apply_view(b: &mut Builder<'_>, fold: Id, view: &Recovery) -> Option<Id> {
     crate::rules::lower_floor::floor_alias_map(b, fold, layout, &out, dtype)
 }
 
-/// Renumber `IndexOf(j)` to `IndexOf(j + by)` for every `j > from` (shifting
-/// down, `by < 0`) or `j >= from` (shifting up). Every other node rides
-/// through untouched.
-fn shift_index_of(e: &ScalarExpr, from: u32, by: i32) -> ScalarExpr {
+/// Renumber `IndexOf(j)` to `IndexOf(j - 1)` for every `j > from`. Every
+/// other node rides through untouched.
+fn drop_index_axis(e: &ScalarExpr, from: u32) -> ScalarExpr {
     e.rewrite(&mut |e| match e.kind() {
-        ScalarKind::IndexOf(a) if *a > from || *a == from && by >= 0 => {
-            Some(ScalarExpr::index_of(a.wrapping_add_signed(by)))
-        }
+        ScalarKind::IndexOf(a) if *a > from => Some(ScalarExpr::index_of(a - 1)),
         ScalarKind::Dot { .. } | ScalarKind::Splat { .. } => Some(e.clone()),
         _ => None,
     })

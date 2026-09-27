@@ -216,9 +216,7 @@ pub(crate) struct FoldView {
 impl FoldView {
     /// The domain this nest's own expressions are written against.
     pub(crate) fn iter_space(&self) -> IndexSpace {
-        IndexSpace {
-            dims: self.space.iter_dims(&self.vec_axes),
-        }
+        self.space.iterated(&self.vec_axes)
     }
 
     /// The reduced axis's index in [`Self::iter_space`]: `vec_axes` is the

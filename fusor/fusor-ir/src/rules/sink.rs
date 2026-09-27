@@ -7,7 +7,7 @@ use crate::ir::launch::{AccessPlan, Launch, Operand};
 use crate::ir::logical::Logical;
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
-use crate::shape::{AxisGroup, Dim, Layout, MultiFlattenMap, SubAxis};
+use crate::shape::{AxisGroup, Dim, Layout, MultiFlattenMap};
 use smallvec::SmallVec;
 
 rule!(
@@ -205,9 +205,7 @@ fn unflatten_of(
         } else {
             u32::try_from(base.checked_mul(u64::from(s.multiplier))?).ok()?
         };
-        groups.push(AxisGroup {
-            sub_axes: smallvec::smallvec![SubAxis { extent, stride }],
-        });
+        groups.push(AxisGroup::affine(extent, stride));
     }
     Some((MultiFlattenMap { groups }, offset))
 }

@@ -517,12 +517,7 @@ fn window_map(
             (w.axis as usize, 1)
         };
         let base = u32::try_from(in_strides.get(src_axis)?.as_const()?).ok()?;
-        groups.push(AxisGroup {
-            sub_axes: smallvec::smallvec![SubAxis {
-                extent,
-                stride: base.checked_mul(step)?,
-            }],
-        });
+        groups.push(AxisGroup::affine(extent, base.checked_mul(step)?));
     }
     Some(MultiFlattenMap { groups })
 }

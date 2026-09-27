@@ -174,7 +174,8 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             // nest is charged `lanes` times its true cost. The filter is a
             // no-op on every unpromoted node.
             let ein = space
-                .iter_dims(vec_axes)
+                .iterated(vec_axes)
+                .dims
                 .iter()
                 .map(|d| priced(*d))
                 .fold(1u64, |a, b| a.saturating_mul(b));

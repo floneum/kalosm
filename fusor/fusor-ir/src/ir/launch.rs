@@ -323,9 +323,7 @@ impl Launch {
             Self::StreamFold { fold, .. } => fold.iter_space(),
             Self::Fold {
                 space, vec_axes, ..
-            } if !vec_axes.is_empty() => IndexSpace {
-                dims: space.iter_dims(vec_axes),
-            },
+            } if !vec_axes.is_empty() => space.iterated(vec_axes),
             _ => self.space().cloned().unwrap_or_default(),
         }
     }
@@ -380,8 +378,8 @@ impl Launch {
             .map(|(_, o)| o)
     }
 
-    /// [`Self::operand_lists`], mutably and flattened: the operands a rule
-    /// may re-spell in place.
+    /// The operands a rule may re-spell in place: `ops`, or a contraction's A
+    /// side then its B side.
     pub fn operands_mut(&mut self) -> impl Iterator<Item = &mut Operand> {
         let [a, b]: [&mut [Operand]; 2] = match self {
             Self::Map { ops, .. }
@@ -440,9 +438,11 @@ impl IndexSpace {
         crate::shape::const_elements(&self.dims)
     }
 
-    /// A fold's iteration dims: this space minus its promoted axes.
-    pub fn iter_dims(&self, vec_axes: &[u32]) -> Dims {
-        self.dims_except(|i| vec_axes.contains(&i))
+    /// A fold's iteration domain: this space minus its promoted axes.
+    pub fn iterated(&self, vec_axes: &[u32]) -> IndexSpace {
+        IndexSpace {
+            dims: self.dims_except(|i| vec_axes.contains(&i)),
+        }
     }
 
     /// A fold's output dims before its carrier axis: this space minus the

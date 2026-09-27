@@ -975,9 +975,7 @@ pub fn retarget(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opti
     // the space this node states its operand maps against, so the two operand
     // lists are comparable only after projection. With no promoted axis
     // `iter == space`, `iter_axis == axis` and `proj == reads`.
-    let iter = IndexSpace {
-        dims: space.iter_dims(vec_axes),
-    };
+    let iter = space.iterated(vec_axes);
     let iter_axis = *axis - vec_axes.len() as u32;
     let reads: Vec<(Operand, Id)> = ops.iter().map(|o| effective(b, o, space)).collect();
     let proj: Vec<(Operand, Id)> = reads

@@ -575,9 +575,10 @@ pub fn map_into_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
             splice(b, cur, i, &view, space, space, &[])
         })
     })?;
+    let [body] = body;
     let mut fused = op.clone();
     if let Launch::Map { body: b0, ops, .. } = &mut fused {
-        (*b0, *ops) = (body[0].clone(), cur);
+        (*b0, *ops) = (body, cur);
     }
     crate::verify_launch::check_operand_access(&fused).ok()?;
     let fused = b.add_launch(fused).ok()?;
