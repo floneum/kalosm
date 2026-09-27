@@ -1,22 +1,14 @@
 //! `verify_launch` — the eight Launch invariants.
 //!
 //! 1. `Geom::legal(caps)`: lane limits and whole-fragment divisibility.
-//! 2. Workgroup footprint checked against the **exact** `arena_plan` value —
-//!    the same pure memoized function the Kernel emitter uses, so there is no
-//!    estimator and therefore no Launch/Kernel admission mismatch.
-//! 3. A nest's write map must be injective unless the nest declares an
-//!    associative `combine`. One invariant, three jobs: scatter-add
-//!    legality, separating the four `Scatter{Add}` lowerings from an illegal
-//!    in-place write, and proving a non-overlapping pool's adjoint is an
-//!    elementwise mask.
+//! 2. Workgroup footprint against the exact `arena_plan` the emitter uses.
+//! 3. The write map is injective unless the nest declares an associative
+//!    `combine`.
 //! 4. A fold dim may not appear with nonzero stride in the write map.
-//! 5. Every operand's `AccessPlan` satisfies that operand's access
-//!    predicate. A failed access analysis disqualifies **this rewrite only**.
+//! 5. Every operand's `AccessPlan` satisfies its access predicate.
 //! 6. A composite sequences at least two independently scheduled members.
-//! 7. Every node carries an `Effect`: `semantics::effect_of` derives it from
-//!    the op, so there is nothing stored to disagree with.
-//! 8. Allocation is *not* described at Launch; a node claiming a buffer is an
-//!    error.
+//! 7. Every node's `Effect` is derived by `semantics::effect_of`.
+//! 8. Allocation is not described at Launch; an operand offset is an error.
 
 use crate::carrier::SlotTy;
 use crate::device::Caps;
@@ -138,10 +130,8 @@ fn check_composite_domain(op: &Launch) -> Result<()> {
 }
 
 /// Invariant 1+2: every point of `sched` is structurally legal and fits the
-/// exact workgroup footprint. An empty resulting domain makes the node
-/// unselectable, which extraction treats as "this alternative lost", never
-/// as an error — but a domain *declared* empty on a node already in the
-/// graph is a legality failure, because nothing could ever select it.
+/// exact workgroup footprint. A declared-empty domain is unselectable, so it
+/// fails.
 pub fn check_schedule_domain(
     op: &Launch,
     sched: &ScheduleDomain,
@@ -154,14 +144,8 @@ pub fn check_schedule_domain(
         ));
     }
 
-    // Every lowering indexes the flattened iteration space in `u32` — flat
-    // workgroup ids, `Addr::Linear`, loop counters. A space past `u32::MAX`
-    // is therefore *unaddressable*, not merely slow: the fold spelling of a
-    // 2048-cube matmul carries `[2048, 2048, 2048]` = 2^33 iterations, its
-    // flat index wraps, and the member sweep caught it summing garbage while
-    // every small shape stayed green. This is an addressing-capacity bound
-    // exactly like `max_storage_buffers_per_shader_stage`, refused here so
-    // extraction loses the member instead of the dispatch computing wrong.
+    // Lowerings index the flat iteration space in `u32`; past `u32::MAX` it
+    // wraps and computes garbage, so the member is refused here.
     if let Some(iters) = op.iter_space().iterations()
         && iters > u64::from(u32::MAX)
     {
@@ -213,9 +197,7 @@ pub fn check_schedule_domain(
                         "sgemv params {p:?} have a zero term"
                     )));
                 }
-                // A multi-column workgroup hands each subgroup an equal,
-                // whole number of columns; a remainder would leave columns
-                // no subgroup owns.
+                // A remainder would leave columns no subgroup owns.
                 if p.cols > 1 && p.cols % p.subgroups != 0 {
                     return Err(Error::Legality(format!(
                         "sgemv params {p:?} spread {} columns over {} subgroups unevenly",
@@ -228,10 +210,8 @@ pub fn check_schedule_domain(
                         p.subgroups.saturating_mul(subgroup_width)
                     )));
                 }
-                // A split lane window re-tiles the subgroup's pass; the
-                // arithmetic below is exactly what makes that a bijection
-                // onto the same `width * vector` consecutive elements, so a
-                // violation is a wrong-answer kernel, not a slow one.
+                // A split window must biject onto the pass's `width * vector`
+                // elements, or the kernel is wrong.
                 if p.parts <= 1 {
                     if p.gap != 0 {
                         return Err(Error::Legality(format!(
@@ -256,18 +236,8 @@ pub fn check_schedule_domain(
             }
         }
         ScheduleDomain::Fold(domain) => {
-            // A fold's accumulator lanes and width are on the node, so its
-            // scratch footprint is decidable here even though the block is a
-            // schedule choice: `fold_scratch_bytes` is a pure function of the
-            // strategy and `caps`. Without this clause the lane-group check
-            // below is the *only* admission test a fold domain faces, and a
-            // promoted carrier — one whose accumulator holds a free axis, so
-            // `lanes` is that axis's extent rather than 1 — slips a strategy
-            // needing `lanes * block * acc_bytes` bytes past it. The domain
-            // generator already filters on exactly this, so a domain built
-            // there cannot fail here; what this catches is a domain minted
-            // anywhere else, which §4.2 would otherwise turn into a
-            // `verify_plan` crash at extraction rather than a lost alternative.
+            // Scratch is decidable from the carrier's lanes; a promoted
+            // carrier needs `lanes * block * acc_bytes`.
             let carrier_lanes = fold_carrier_lanes(op);
             for s in &domain.strategies {
                 let group = s.lane_group(subgroup_width);
@@ -305,13 +275,8 @@ pub fn check_schedule_domain(
     Ok(())
 }
 
-/// Invariant 3: the write map is injective, or the nest declares an
-/// associative combine.
-///
-/// The write map is the operand-0 layout for a scatter (which writes through
-/// its base) and the result's contiguous layout otherwise. Injectivity is
-/// "every surviving output-axis stride is nonzero and distinct" after
-/// dropping `Const(1)` axes, which cannot alias whatever their stride.
+/// Invariant 3: the write map is injective (every non-unit axis stride nonzero
+/// and distinct), or the nest declares an associative combine.
 pub fn check_write_injective(cx: &VerifyCtx<'_>) -> Result<()> {
     let Op::Launch(op) = &cx.node.op else {
         return Ok(());
@@ -342,9 +307,8 @@ pub fn check_write_injective(cx: &VerifyCtx<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Invariant 4: a `Fold`'s reduced axis must be absent from the write map.
-/// A fold dim indexing the output is a scatter, not a reduction, so the
-/// result rank has to be the space rank minus one, plus the carrier's axis.
+/// Invariant 4: a `Fold`'s reduced axis is absent from the write map, so the
+/// result rank is the space rank minus one, plus the carrier's axis.
 fn check_fold_axis_not_written(cx: &VerifyCtx<'_>, op: &Launch) -> Result<()> {
     let Launch::Fold {
         space,
@@ -395,13 +359,9 @@ fn check_fold_axis_not_written(cx: &VerifyCtx<'_>, op: &Launch) -> Result<()> {
     Ok(())
 }
 
-/// Invariant 5: each operand's `AccessPlan` satisfies its own predicate. A
-/// failure names the operand, so it disqualifies only the rewrite that
-/// produced it.
+/// Invariant 5: each operand's `AccessPlan` satisfies its own predicate.
 pub fn check_operand_access(op: &Launch) -> Result<()> {
-    // A contraction side holds a list, and an empty one would make its `pre`
-    // a constant — a `Map`, not a contraction, and a node the lowerings would
-    // read `ops[0]` off. `ContractSide::primary` is written against this.
+    // `ContractSide::primary` reads `ops[0]`.
     if let Launch::Contract { a, b, .. } = op {
         for (side, which) in [(a, "a"), (b, "b")] {
             if side.is_empty() {
@@ -423,8 +383,7 @@ pub fn check_operand_access(op: &Launch) -> Result<()> {
                 }
             }
             AccessPlan::Unflatten(map) => {
-                // A contraction declares no index space; the map must then at
-                // least match the operand's own layout rank.
+                // A contraction has no space: match the layout rank instead.
                 let rank = space.map_or_else(|| o.layout.rank(), IndexSpace::rank);
                 if map.rank() != rank {
                     return Err(fail(format!(
@@ -457,19 +416,9 @@ pub fn check_operand_access(op: &Launch) -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// The promoted-axis invariants: `vec_axes` is a contiguous block immediately
-/// before `axis`, every promoted extent is accounted for in the carrier's lane
-/// count, and no expression on the node reads the coordinate of an axis that
-/// no longer exists in the iteration domain.
-///
-/// The last clause is the one that catches a botched renumbering. A promoted
-/// axis is gone from `iter_space`, so an `IndexOf` naming it would silently
-/// read a *different* axis's coordinate — which is how an ALiBi or rope term
-/// gets detached from its coordinate and the answer comes back nearly right.
+/// The promoted-axis invariants: `vec_axes` is the contiguous block before
+/// `axis`, every `Vector` slot spans the promoted extent, and no expression
+/// reads a coordinate outside the iteration domain (a botched renumbering).
 fn check_vec_axes(
     cx: &VerifyCtx<'_>,
     space: &IndexSpace,
@@ -500,13 +449,7 @@ fn check_vec_axes(
     carrier
         .lanes()
         .ok_or_else(|| relabel(cx, "a promoted carrier has a symbolic lane count".into()))?;
-    // Every **Vector** slot spans the promoted extent. A `Scalar` slot rides
-    // through untouched: `Carrier::lanes` is the sum over slots, so a joint
-    // carrier of `[Scalar rho, Vector(d) body]` legitimately has `1 + d` lanes.
-    // Demanding `lanes == promoted * width` instead would require every slot to
-    // be a Vector and would reject exactly the mixed accumulator a running
-    // statistic beside a module-valued one produces — which is the shape the
-    // retargeting law mints on a promoted nest.
+    // Every `Vector` slot spans the promoted extent; `Scalar` slots may mix in.
     for (i, s) in carrier.slots.iter().enumerate() {
         let SlotTy::Vector(d) = s else { continue };
         let extent = d
@@ -521,15 +464,8 @@ fn check_vec_axes(
             ));
         }
     }
-    // **A `Scalar` slot is one accumulator, not one per promoted position.**
-    //
-    // It is updated once per iteration step, so its `lift` is evaluated at a
-    // single promoted position. An operand that varies along a promoted axis
-    // read there would contribute position 0's value at every position — a
-    // wrong number, not a slow one, and invisible in any test whose promoted
-    // extent is 1. A `Vector` slot has a register per position and may read
-    // anything. This is the clause that makes a mixed `[Scalar, Vector]`
-    // accumulator safe to mint at all.
+    // A `Scalar` slot is one accumulator, so its lift may not read an operand
+    // varying along a promoted axis: it would see only one position.
     if let Op::Launch(o) = &cx.node.op {
         let varies: Vec<bool> = o
             .operands()
@@ -561,16 +497,8 @@ fn check_vec_axes(
         }
     }
 
-    // No expression may name a coordinate outside the ITERATION domain.
-    //
-    // Every `ScalarExpr` on a `Fold` is written against `iter_space()`, so the
-    // legal indices are `0..iter_rank` and a promoted axis is simply not
-    // nameable — that is the content of the rebinding. Asking instead whether
-    // an expression reads `IndexOf(a)` for `a` a **space** index is one
-    // renumbering behind: after one promotion the reduced axis's iteration
-    // index equals the promoted axis's space index, so that spelling rejects
-    // precisely the nests whose lift reads the reduction coordinate — a
-    // max-pool's index slot, and a causal `select(IndexOf(lk) <= ..)`.
+    // Expressions are written against `iter_space()`: legal indices are
+    // `0..iter_rank` (not space indices, which are one renumbering behind).
     let iter_rank = space.rank() - vec_axes.len();
     for a in iter_rank..space.rank() {
         let a = a as u32;
@@ -600,8 +528,6 @@ fn relabel(cx: &VerifyCtx<'_>, msg: String) -> Error {
 
 fn declares_associative_combine(op: &Launch) -> bool {
     match op {
-        // Associativity is declared on the carrier, not derived from a name:
-        // a non-associative carrier is legal but may not be tree-reduced.
         Launch::Fold { carrier, .. } => carrier.associative,
         Launch::Scatter { combine, .. } => matches!(combine, ScatterCombine::Add),
         _ => false,
@@ -619,13 +545,8 @@ fn write_layout(op: &Launch, cx: &VerifyCtx<'_>) -> Layout {
     }
 }
 
-/// The element a node stores, which is what a staged coop tile holds.
 /// A `Fold`'s `(accumulator lanes, bytes per lane)`, or `None` when the node
-/// is not a fold or its carrier's lane count is symbolic.
-///
-/// A symbolic `Vector` slot extent is allocatable on neither backend, and
-/// `verify_l0` clause 3 already rejects one, so `None` here means "not a
-/// fold" in every graph that got this far.
+/// is not a fold or its lane count is symbolic (rejected by `verify_l0`).
 fn fold_carrier_lanes(op: &Launch) -> Option<(u64, u64)> {
     match op {
         Launch::Fold { carrier, acc, .. } => Some((carrier.lanes()?, acc.byte_size())),

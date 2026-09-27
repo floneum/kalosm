@@ -1,6 +1,5 @@
-//! Logical `tensor` — ten nodes of whole-tensor algebra. No index space, no loop,
-//! no device. Only Logical can express adjoint generation, contraction
-//! reassociation, the fold-splitting law, and gradient checkpointing.
+//! Logical `tensor` — ten nodes of whole-tensor algebra: no index space, no
+//! loop, no device.
 
 use crate::carrier::Carrier;
 use crate::dtype::{Dtype, QFmt, QLayout, Splat};
@@ -10,27 +9,21 @@ use crate::scalar::ScalarExpr;
 use crate::shape::{BoundsProof, Dim, SlidingWindow, StrideSpec, SymId};
 use smallvec::SmallVec;
 
-/// The ten Logical nodes. Every elementwise unary, comparison, and activation
-/// is one `Map` with a different [`ScalarExpr`].
+/// The ten Logical nodes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Logical {
     Leaf(LeafKind),
 
-    /// Elementwise map. **No implicit broadcasting**: every operand has the
-    /// output shape; the frontend emits `Restride { multiplier: 0 }`.
-    /// `outs > 1` produces a tuple read back through [`Logical::Project`].
+    /// Elementwise map; every operand has the output shape. `outs > 1` is a
+    /// tuple read back through [`Logical::Project`].
     Map {
         expr: ScalarExpr,
         ins: SmallVec<[Id; 4]>,
         outs: u8,
     },
 
-    /// Reduce `axis` with a [`Carrier`] — an N-slot accumulator carrying its
-    /// own identities, lift and merge. There is no named combine: `Add`,
-    /// `Mul`, `Max` and `Min` are [`Carrier::binop`] values, and Welford
-    /// `(n, mean, m2)`, online softmax `(max, sum)` and attention's `sum p*v`
-    /// are carriers a *rule* constructs. `ins` is the operand list the lift
-    /// reads as `Arg(0..n)`.
+    /// Reduce `axis` with a [`Carrier`], an N-slot accumulator with its own
+    /// identities, lift and merge; the lift reads `ins` as `Arg(0..n)`.
     Fold {
         carrier: Carrier,
         axis: u32,
@@ -38,9 +31,7 @@ pub enum Logical {
         ins: SmallVec<[Id; 4]>,
     },
 
-    /// Einstein-summation contraction. `matmul`, `mat_mul_transposed_rhs`
-    /// and every batched form are one node with a different [`EinSpec`] —
-    /// transposed-rhs is a spec, not an op.
+    /// Einstein-summation contraction; every matmul form is an [`EinSpec`].
     Contract {
         spec: EinSpec,
         acc: Dtype,
@@ -56,26 +47,21 @@ pub enum Logical {
         x: Id,
     },
 
-    /// Sliding windows. Survives as a core op rather than collapsing into
-    /// [`Logical::Restride`] because its adjoint is decided by two integers.
+    /// Sliding windows, kept apart from [`Logical::Restride`] for its adjoint.
     Window {
         specs: SmallVec<[SlidingWindow; 3]>,
         x: Id,
     },
 
-    /// Gather rows along `axis`. `index_select`, `embedding`,
-    /// `gather_last` and `i()` are this.
+    /// Gather rows along `axis`.
     Gather {
         axis: u32,
         x: Id,
         idx: Id,
     },
 
-    /// Scatter into `base`. `cat`/`stack`/`pad_axis`/`repeat`/
-    /// `slice_assign` are `Scatter{Set}` into a const leaf; the adjoint of
-    /// [`Logical::Gather`] is `Scatter{Add}`. `unique` is caller-proved index
-    /// uniqueness: `verify_l0` rejects `Set` without it, while `Add` is
-    /// always legal and duplicates accumulate (normative).
+    /// Scatter into `base`. `unique` is caller-proved index uniqueness, which
+    /// `Set` requires; `Add` accumulates duplicates.
     Scatter {
         axis: u32,
         combine: ScatterCombine,
@@ -115,10 +101,8 @@ impl Logical {
     }
 }
 
-/// What a leaf is. `Param` is distinguished from `Buffer` so `Persistence`
-/// is inferred, not annotated; `Uniform` is a runtime scalar read from
-/// binding 0 (learning rate, bias correction, loss scale, clip norm) and
-/// never enters a kernel key.
+/// What a leaf is. `Param` infers persistence; `Uniform` is a runtime scalar
+/// from binding 0 that never enters a kernel key.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum LeafKind {
     Buffer {
@@ -151,9 +135,8 @@ pub enum LeafKind {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct BufferId(pub u32);
 
-/// How an extremum reduction splits its gradient among tied elements.
-/// Carried on [`Carrier::tie`] and read only by `fold_adjoint`: an autograd
-/// attribute, never a compiler decision.
+/// How an extremum reduction splits its gradient among tied elements; read
+/// only by `fold_adjoint`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TiePolicy {
     SplitEvenly,
@@ -171,9 +154,8 @@ pub enum ScatterCombine {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Label(pub u8);
 
-/// Index labels for a contraction. `verify_l0` requires every label to
-/// appear in >= 2 of {a, b, out} and contracted extents to agree. A label
-/// in a and b but not out is summed; one in all three is a batch axis.
+/// Index labels for a contraction: a label in a and b but not out is summed;
+/// one in all three is a batch axis.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct EinSpec {
     pub a: SmallVec<[Label; 6]>,

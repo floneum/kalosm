@@ -1,7 +1,5 @@
 //! R7 — `specialize_dim` substitutes a symbolic extent for the concrete one
-//! its operands already carry. Priced by compile amortization: on first
-//! sighting of a shape family the generic symbolic variant wins outright.
-//! After a binding recurs, this variant wins where specialization pays.
+//! its operands already carry; cost decides whether specializing pays.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
 use crate::ir::launch::Launch;
@@ -19,10 +17,6 @@ rule!(
 
 /// Mint the variant in which a `Dim::Sym` on the node is replaced by the
 /// `Dim::Const` an operand's own layout already proves it to be.
-///
-/// Legality-only substitution: the symbol and the constant denote the same
-/// extent. Whether specializing pays is decided by the pricing crate, and both
-/// variants stay live either way.
 pub fn specialize_dim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     let Op::Launch(
         op @ Launch::Contract {
@@ -38,8 +32,6 @@ pub fn specialize_dim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) 
     else {
         return None;
     };
-    // Every operand of a side agrees on shape — they differ only in buffer,
-    // stride and access — so the decided extent is readable off either one.
     let a_shape = a.primary().layout.shape();
     let b_shape = rhs.primary().layout.shape();
     // Positional substitution requires one axis per matrix dimension.

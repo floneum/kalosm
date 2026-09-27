@@ -1,10 +1,6 @@
 //! Every level-generic rewrite rule, and the one table the driver is handed.
-//!
-//! Guards may read only [`crate::egraph::Facts`] — legality, never
-//! profitability.
-//!
-//! Rule order carries no semantics; the fixed order below exists only for
-//! reproducibility.
+//! Guards encode legality, never profitability; the fixed order exists only
+//! for reproducibility.
 
 pub mod absorb_view;
 pub mod algebra;
@@ -32,14 +28,12 @@ use crate::scalar::ScalarExpr;
 use crate::shape::{Dim, Dims, Layout, StrideSpec};
 use smallvec::SmallVec;
 
-/// Position of a rule in whatever slice was handed to the driver. `RuleId`
-/// is positional, not global: a target concatenates [`CORE_RULES`] with its
-/// own `Target::rules()` and the driver indexes the concatenation.
+/// Position of a rule in the slice handed to the driver ([`CORE_RULES`]
+/// followed by the target's own rules).
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct RuleId(pub u16);
 
-/// Every rule `fusor-ir` owns, in a fixed order. A target's `rules()` is
-/// concatenated onto this; nothing here mentions lane or subgroup geometry.
+/// Every rule `fusor-ir` owns, in a fixed order.
 pub static CORE_RULES: &[Rule] = &[
     // Logical algebra
     algebra::STRIP,
@@ -54,22 +48,17 @@ pub static CORE_RULES: &[Rule] = &[
     fusion::MAP_INTO_CONTRACT,
     fusion::MAP_INTO_MAP,
     fusion::FOLD_POST_EPILOGUE,
-    slab::FORM_SLAB_MAP,
-    slab::FORM_SLAB_FOLD,
+    slab::FORM_SLAB,
     stream::STREAM_FOLD,
-    // Launch fold algebra — the carrier laws. `HOIST` and `RETARGET` are two
-    // entries sharing one dependence query: the driver's fired set is per
-    // `(RuleId, Id)`, so one merged rule could fire at most once per node
-    // and the second answer would be unreachable.
+    // Launch fold algebra. `HOIST` and `RETARGET` stay two entries: the
+    // fired set is per `(RuleId, Id)`, so one rule would answer only once.
     promote::PROMOTE,
     rebase::HOIST,
     rebase::RETARGET,
     tuple::TUPLE,
-    tuple::TUPLE_SIBLING,
     // Launch sinking
     sink::SINK_EPILOGUE,
     sink::FOLD_VIEWS_INTO_INDEX,
-    sink::FOLD_VIEWS_INTO_FOLD_INDEX,
     // Launch operand access
     layout::OPERAND_ALIAS,
     layout::OPERAND_GATHER,
@@ -89,20 +78,13 @@ pub static CORE_RULES: &[Rule] = &[
     specialize::SPECIALIZE_DIM,
     split_k::SPLIT_K,
     absorb_view::ABSORB_VIEW_INTO_CONTRACT,
-    absorb_view::ABSORB_BROADCAST_INTO_MAP,
-    absorb_view::ABSORB_BROADCAST_INTO_FOLD,
-    group::FORM_GROUP_MAP,
-    group::FORM_GROUP_FOLD,
-    group::FORM_GROUP_CONTRACT,
-    group::FORM_GROUP_SLAB,
+    absorb_view::ABSORB_BROADCAST,
+    group::FORM_GROUP,
     scatter_fold::SCATTER_ADD_AS_FOLD,
 ];
 
-/// Bytes of private accumulator one invocation may hold: 256 (64 `f32`
-/// lanes, the widest shipped tile) for a carrier `PROMOTE` widens, 1024 for
-/// a `TUPLE` joint. `Caps` has no portable register-budget fact, so both are
-/// conservative policy; over budget a rule declines rather than minting a
-/// node no backend can lower.
+/// Bytes of private accumulator one invocation may hold: 256 for a carrier
+/// `PROMOTE` widens, 1024 for a `TUPLE` joint (conservative policy).
 pub(crate) fn private_acc_bytes(_caps: &crate::device::Caps, promoted: bool) -> u64 {
     if promoted { 256 } else { 1024 }
 }
@@ -121,9 +103,7 @@ pub(crate) fn ident_expr(dtype: Dtype) -> ScalarExpr {
     ScalarExpr::arg(0, dtype)
 }
 
-/// The access predicate `map_into_fold` and `map_into_contract` guard on:
-/// `Alias`, `Unflatten` and `Gather` are legal in any space; a `Pack` is
-/// legal only when the packed layout has the consuming space's rank.
+/// Whether an access is legal in `space`: a `Pack` needs the space's rank.
 pub(crate) fn access_legal_in(a: &AccessPlan, space: &IndexSpace) -> bool {
     match a {
         AccessPlan::Alias | AccessPlan::Unflatten(_) | AccessPlan::Gather => true,
@@ -131,12 +111,8 @@ pub(crate) fn access_legal_in(a: &AccessPlan, space: &IndexSpace) -> bool {
     }
 }
 
-/// The elementwise producer shape a fusion rule inlines.
-///
-/// Equality in this e-graph is **not congruent**, so an `Logical::Map` and the
-/// `Launch::Map` it was lowered to are one class but the consuming Launch node's
-/// operand still names whichever id the frontend built. Both spellings
-/// denote the same value, so both are inlinable; this normalizes them.
+/// The elementwise producer a fusion rule inlines, normalized from either a
+/// `Logical::Map` or a `Launch::Map` (equality is not congruent).
 pub(crate) struct MapView {
     pub space: IndexSpace,
     pub body: ScalarExpr,
@@ -165,10 +141,9 @@ pub(crate) fn map_view(b: &Builder<'_>, id: Id) -> Option<MapView> {
     }
 }
 
-/// Splice `inner`'s body in for `Arg(slot)` of a reader of `ops`: the
-/// reader's other operands keep their order and low indices, the producer's
-/// are appended by the caller. Returns the retained operands and the
-/// substitution renumbering the reader's `Arg`s onto them.
+/// Splice `inner`'s body in for `Arg(slot)` of a reader of `ops`. Returns
+/// the retained operands and the `Arg` substitution; the caller appends the
+/// producer's operands.
 pub(crate) fn splice_args(
     b: &Builder<'_>,
     ops: &[Operand],
@@ -196,9 +171,8 @@ pub(crate) fn splice_args(
     (retained, args)
 }
 
-/// A reduction nest, normalized out of whichever spelling the operand named
-/// as [`map_view`] normalizes a map: a `Logical::Fold` reads as the
-/// `Launch::Fold` fields `lower_fold` would mint, its lift as written.
+/// A reduction nest normalized from either spelling, as [`map_view`] does
+/// for maps.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FoldView {
     /// The id the operand named.
@@ -219,8 +193,7 @@ impl FoldView {
         self.space.iterated(&self.vec_axes)
     }
 
-    /// The reduced axis's index in [`Self::iter_space`]: `vec_axes` is the
-    /// contiguous block immediately before `axis`.
+    /// The reduced axis's index in [`Self::iter_space`].
     pub(crate) fn reduced_iter_axis(&self) -> Option<u32> {
         self.axis
             .checked_sub(u32::try_from(self.vec_axes.len()).ok()?)
@@ -284,8 +257,6 @@ pub(crate) fn fold_view(b: &Builder<'_>, id: Id) -> Option<FoldView> {
 }
 
 /// Re-apply a chain of pure views over a rewritten base, innermost first.
-/// Rebuilding the nodes rather than composing their specs keeps every relative
-/// stride exactly as it was written.
 pub(crate) fn rebuild_spine(b: &mut Builder<'_>, spine: &ViewSpine, base: Id) -> Option<Id> {
     let mut cur = base;
     for &v in &spine.views {
@@ -319,13 +290,8 @@ pub(crate) fn operand_dtypes(b: &Builder<'_>, ops: &[Operand]) -> Vec<Dtype> {
     ops.iter().map(|o| b.facts_of(o.src).dtype).collect()
 }
 
-/// Apply a relative restride spec vector to a dense row-major input shape.
-///
-/// A symbolic offset or stride composes into a derived symbol
-/// (`Dim + Dim`, `Dim * Dim`) the backends evaluate at dispatch. Returns
-/// `None` only when a stride or offset is genuinely opaque (a row-major
-/// stride past a symbolic axis, or overflow): a view of those cannot be
-/// stated as one layout, and a rule must decline rather than invent one.
+/// Apply a relative restride spec vector to a dense row-major input shape,
+/// or `None` when a stride or offset is opaque.
 pub(crate) fn composed_layout(specs: &[StrideSpec], in_shape: &[Dim]) -> Option<Layout> {
     use crate::shape::OPAQUE_SYM;
     let in_strides = Layout::row_major_strides(in_shape);
@@ -335,15 +301,13 @@ pub(crate) fn composed_layout(specs: &[StrideSpec], in_shape: &[Dim]) -> Option<
     let mut offset = Dim::Const(0);
     for s in specs {
         shape.push(s.size);
-        // A broadcast axis at offset 0 names no input axis at all: a scalar
-        // widened to a vector has none to name.
+        // A broadcast axis at offset 0 names no input axis.
         if s.multiplier == 0 && s.offset.known_eq(Dim::Const(0)) {
             strides.push(Dim::Const(0));
             continue;
         }
         let base = *in_strides.get(s.input_dim as usize)?;
-        // Accumulated for every spec, including a stride-0 one: an axis being
-        // broadcast says nothing about where in the input it starts.
+        // Accumulated for every spec, including a stride-0 one.
         if !s.offset.known_eq(Dim::Const(0)) {
             offset = offset + s.offset * base;
             if opaque(offset) {
@@ -364,18 +328,8 @@ pub(crate) fn composed_layout(specs: &[StrideSpec], in_shape: &[Dim]) -> Option<
 }
 
 /// The plain affine layout a whole view spine denotes over its base, or
-/// `None` when the composition is not expressible as one stride vector.
-///
-/// Composing a chain substitutes each stage's strides into the next, so a
-/// narrow → reshape → transpose spine collapses to
-/// `offset + Σ stride_j · i_j` over the base buffer. Everything must be
-/// const-decidable and every stage's bounds proof [`BoundsProof::Static`]:
-/// a `RuntimeMask` view masks reads the composed layout could not, and
-/// dropping a mask is a wrong value.
-///
-/// A spec that walks past its input axis's extent (an axis-merging reshape)
-/// is only affine when the stage it reads is dense row-major from that axis
-/// inward, so the composition declines elsewhere.
+/// `None` when not const-decidable, not statically bounded (dropping a
+/// runtime mask is a wrong value), or not one stride vector.
 pub(crate) fn composed_spine_layout(
     b: &Builder<'_>,
     spine: &crate::egraph::ViewSpine,
@@ -398,15 +352,12 @@ pub(crate) fn composed_spine_layout(
         if *bounds != crate::shape::BoundsProof::Static {
             return None;
         }
-        // Whether the *current* stage is one dense row-major block, which is
-        // the only stage an axis-overrunning spec addresses correctly: there
-        // the stage is a flat window and `k · multiplier · in_stride` is flat
-        // addressing, whatever axis boundaries the walk crosses.
+        // Only a dense row-major stage is addressed correctly by a spec
+        // overrunning its axis (an axis-merging reshape).
         let dense = {
             let mut want = 1u64;
             let mut ok = true;
             for i in (0..shape.len()).rev() {
-                // An extent-1 axis is unobservable whatever its stride says.
                 if shape[i] <= 1 {
                     continue;
                 }

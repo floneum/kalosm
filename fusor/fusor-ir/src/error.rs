@@ -7,12 +7,10 @@ use std::fmt;
 /// The one `Result` alias every fusor crate uses.
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-/// Every way a fusor compilation can fail. Flat and `Clone`: errors cross
-/// thread boundaries (parallel kernel build) and are compared in goldens.
+/// Every way a fusor compilation can fail; flat and `Clone`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
-    /// A level verifier rejected a node. A rule or the frontend built
-    /// something illegal; never recoverable.
+    /// A level verifier rejected a node; never recoverable.
     Verify {
         level: Level,
         node: Option<Id>,
@@ -24,8 +22,7 @@ pub enum Error {
     Numeric(String),
     /// A lowering was structurally illegal on this device.
     Legality(String),
-    /// Saturation/extraction hit a budget the caller asked to be told
-    /// about. The default driver degrades instead of producing this.
+    /// Saturation/extraction hit a budget the caller asked to be told about.
     Budget(String),
     /// `verify_plan` rejected an extraction. A hard conformance assert.
     Plan(String),

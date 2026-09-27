@@ -12,11 +12,8 @@ use crate::shape::{Dim, Dims, Layout, StrideSpec};
 use smallvec::SmallVec;
 
 /// Infer the result facts of a Logical node from its operands' facts.
-///
-/// `numeric` is the meet of the operands' contracts, never wider: the
-/// monotonicity that makes `fold_split` sound is established here.
-/// `persistence` is `Persistent` only for a `Param`/`Quantized` leaf and for
-/// pure views over one.
+/// `numeric` is the meet of the operands' contracts, never wider, which is
+/// what makes `fold_split` sound.
 pub fn infer_logical(op: &Logical, ins: &[ValueFacts]) -> Result<ValueFacts> {
     match op {
         Logical::Leaf(kind) => infer_leaf(kind),
@@ -131,10 +128,6 @@ fn check_indices(what: &str, idx: &ValueFacts, axis: u32, rank: usize) -> Result
     Ok(axis)
 }
 
-// ---------------------------------------------------------------------------
-// Per-node rules
-// ---------------------------------------------------------------------------
-
 fn infer_leaf(kind: &LeafKind) -> Result<ValueFacts> {
     let persistent = |f: ValueFacts| ValueFacts {
         persistence: Persistence::Persistent,
@@ -156,8 +149,7 @@ fn infer_leaf(kind: &LeafKind) -> Result<ValueFacts> {
 }
 
 fn infer_map(expr: &ScalarExpr, ins: &[ValueFacts], outs: u8) -> Result<ValueFacts> {
-    // **No implicit broadcasting**: every operand carries the output shape.
-    // The frontend emits `Restride { multiplier: 0 }` instead.
+    // No implicit broadcasting: every operand carries the output shape.
     if let Some(first) = ins.first() {
         for other in &ins[1..] {
             if other.shape != first.shape {
@@ -183,13 +175,9 @@ fn infer_map(expr: &ScalarExpr, ins: &[ValueFacts], outs: u8) -> Result<ValueFac
     })
 }
 
-/// A fold's result: the operand shape minus the reduced axis, with the
-/// carrier's lane count appended when it is more than one. That appended axis
-/// is how a multi-slot accumulator is read back — slot `i` is an ordinary
-/// `Restride` of it, so no new node kind appears.
-///
-/// Every operand must have the same shape: the lift reads them all at one
-/// coordinate, exactly as a `Map` body does.
+/// A fold's result: the operand shape minus the reduced axis, plus the
+/// carrier's lane axis when wider than one (slots are read back by
+/// `Restride`). Every operand has the same shape, as for a `Map`.
 fn infer_fold(carrier: &Carrier, axis: u32, acc: Dtype, ins: &[ValueFacts]) -> Result<ValueFacts> {
     let x = ins
         .first()
@@ -238,14 +226,8 @@ fn infer_fold(carrier: &Carrier, axis: u32, acc: Dtype, ins: &[ValueFacts]) -> R
     Ok(ValueFacts::step(acc, shape, ins))
 }
 
-// ---------------------------------------------------------------------------
-// Restride
-// ---------------------------------------------------------------------------
-
-/// A spec references its `input_dim` when it is not a pure stride-0 axis at
-/// offset 0. The reference's `Layout::restride` reads `strides[input_dim]`
-/// for the offset term regardless of `multiplier`, so a broadcast spec with
-/// a nonzero offset still names an input dim.
+/// A spec references its `input_dim` unless it is a stride-0 axis at offset
+/// 0: the offset term reads `strides[input_dim]` whatever the multiplier.
 pub fn spec_reads_input_dim(s: &StrideSpec) -> bool {
     s.multiplier != 0 || !s.offset.known_eq(Dim::Const(0))
 }
@@ -262,16 +244,9 @@ fn check_restride_specs(specs: &[StrideSpec], in_rank: usize) -> Result<()> {
     Ok(())
 }
 
-/// The reference's `types/src/layout.rs::Layout::restride`, lifted to
-/// [`Dim`]: `out_shape[i] = spec.size`,
-/// `out_stride[i] = if multiplier == 0 { 0 } else { in_stride[input_dim] *
-/// multiplier }`, and the offset gains `sum(offset * in_stride[input_dim])`.
-/// Composition is **relative to the current strides**, which is what makes a
-/// view survive an upstream layout rewrite.
-///
-/// A product or sum over a symbolic dim becomes a derived symbol
-/// (`Dim + Dim`, `Dim * Dim`), evaluated from the bindings at dispatch;
-/// only overflow falls to the opaque placeholder.
+/// `Layout::restride` lifted to [`Dim`]. Composition is relative to the
+/// current strides, so a view survives an upstream layout rewrite; symbolic
+/// terms become derived symbols evaluated at dispatch.
 pub fn restride_layout(input: &Layout, specs: &[StrideSpec]) -> Result<Layout> {
     check_restride_specs(specs, input.rank())?;
     let in_strides = input.strides();
@@ -288,8 +263,6 @@ pub fn restride_layout(input: &Layout, specs: &[StrideSpec]) -> Result<Layout> {
         })
         .collect();
 
-    // A symbolic offset or stride stays exact as a derived symbol (see
-    // `Dim::add`), so a view at a runtime offset reads the right element.
     let mut offset = input.offset();
     for s in specs {
         if s.offset.known_eq(Dim::Const(0)) {
@@ -301,17 +274,9 @@ pub fn restride_layout(input: &Layout, specs: &[StrideSpec]) -> Result<Layout> {
     Layout::from_parts(offset, &shape, &strides)
 }
 
-// ---------------------------------------------------------------------------
-// Window
-// ---------------------------------------------------------------------------
-
-/// `types/src/layout.rs::Layout::sliding_window`, lifted to [`Dim`].
-///
-/// Returns the output shape plus `true` when any windowed axis was symbolic.
-/// A symbolic axis does **not** mint a fresh extent: the output dim stays the
-/// input `Sym` (refined at dispatch) and the node carries a
-/// `BoundsProof::RuntimeMask` obligation, which is what keeps a symbolic
-/// sequence length from forcing a recompile.
+/// `Layout::sliding_window` lifted to [`Dim`], plus `true` when a windowed
+/// axis is symbolic: it keeps the input `Sym` under a runtime mask rather
+/// than minting a fresh extent, so it never forces a recompile.
 pub fn window_shape(
     specs: &[crate::shape::SlidingWindow],
     in_shape: &[Dim],
@@ -367,10 +332,6 @@ pub fn window_shape(
     Ok((shape, runtime_mask))
 }
 
-// ---------------------------------------------------------------------------
-// Scalar-expression helpers
-// ---------------------------------------------------------------------------
-
 /// Every `Arg(i)` in `expr` names an operand whose dtype matches the leaf's.
 fn check_arg_dtypes(expr: &ScalarExpr, ins: &[ValueFacts]) -> Result<()> {
     let mut err = None;
@@ -403,8 +364,7 @@ fn check_arg_dtypes(expr: &ScalarExpr, ins: &[ValueFacts]) -> Result<()> {
     }
 }
 
-/// True when `expr` reads nothing outside `Lit`/`Uniform` — the only case in
-/// which a zero-operand `Map` is meaningful.
+/// True when `expr` reads nothing outside `Lit`/`Uniform`.
 fn expr_is_closed(expr: &ScalarExpr) -> bool {
     let mut closed = true;
     expr.walk(&mut |e| {
@@ -414,10 +374,6 @@ fn expr_is_closed(expr: &ScalarExpr) -> bool {
     });
     closed
 }
-
-// ---------------------------------------------------------------------------
-// Arity helpers — every access is length-checked, so inference is total.
-// ---------------------------------------------------------------------------
 
 fn one<'a>(ins: &'a [ValueFacts], what: &str) -> Result<&'a ValueFacts> {
     ins.first()

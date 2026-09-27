@@ -21,15 +21,7 @@ rule!(
 rule!(
     FOLD_VIEWS_INTO_INDEX,
     level = Level::Launch,
-    head = OpTag::LaunchMap,
-    tag = RuleTag::Additive,
-    apply = fold_views_into_index,
-);
-
-rule!(
-    FOLD_VIEWS_INTO_FOLD_INDEX,
-    level = Level::Launch,
-    head = OpTag::LaunchFold,
+    heads = [OpTag::LaunchMap, OpTag::LaunchFold],
     tag = RuleTag::Additive,
     apply = fold_views_into_index,
 );
@@ -59,22 +51,16 @@ pub fn sink_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -
     b.union(id, cursor).ok()
 }
 
-/// The accumulator must not be rounded ahead of the chain: an epilogue is
-/// admissible when it preserves the accumulator's element type, or when it
-/// is the F16-store / F32-compute widening pair.
+/// An epilogue must not round the accumulator: it keeps its dtype or widens
+/// a half accumulator to F32.
 fn epilogue_preserves_accum(epilogue: Dtype, acc: Dtype) -> bool {
     epilogue == acc
         || (acc == Dtype::F16 && epilogue == Dtype::F32)
         || (acc == Dtype::BF16 && epilogue == Dtype::F32)
 }
 
-/// Read a view through the operand's index map instead of through a
-/// materialized copy. `MultiFlattenMap::divmod_ops` is the term the pricing
-/// crate charges for the divmod chain, so this stays ungated here.
-///
-/// A `Fold`'s operands are indexed over `space` exactly as a `Map`'s are, so
-/// it is the same rewrite. `vec_axes` needs no special case: it renumbers
-/// nothing, and `check_vec_axes` refuses an illegal spelling at `add_launch`.
+/// Read a view through the operand's index map instead of a materialized
+/// copy; the divmod chain is priced by the cost model, not gated here.
 pub fn fold_views_into_index(
     b: &mut Builder<'_>,
     id: Id,
@@ -95,9 +81,8 @@ pub fn fold_views_into_index(
     b.union(id, alt).ok()
 }
 
-/// Every operand whose source is a single pure view, restated as an index map
-/// over the view's base. `None` when no slot moved, so the caller mints
-/// nothing.
+/// Every operand whose source is a pure view, restated over the view's base;
+/// `None` when no slot moved.
 fn fold_operand_views(
     b: &Builder<'_>,
     ops: &[Operand],
@@ -109,10 +94,7 @@ fn fold_operand_views(
         if !matches!(slot.access, AccessPlan::Alias) {
             continue;
         }
-        // The rewrite replaces the operand's layout outright, which is sound
-        // only when that layout was the dense read of the consuming space. A
-        // permuted, broadcast or offset alias says something else, and every
-        // one of those spellings reaches here.
+        // Replacing the layout is sound only over a dense read of the space.
         if !slot.layout.is_contiguous() || slot.layout.shape() != space.dims.as_slice() {
             continue;
         }
@@ -121,11 +103,8 @@ fn fold_operand_views(
             continue;
         }
         if spine.views.len() > 1 {
-            // A multi-node spine composes to one stride vector when every
-            // stage is const, statically bounded and affine over the stage
-            // below — `composed_spine_layout` states the conditions. This is
-            // the narrow → reshape → transpose chain every rope operand and
-            // attention head split arrives as.
+            // A multi-node spine composes to one stride vector when
+            // `composed_spine_layout` can state it.
             let Some(layout) = crate::rules::composed_spine_layout(b, &spine) else {
                 continue;
             };
@@ -143,10 +122,7 @@ fn fold_operand_views(
         let Op::Logical(Logical::Restride { specs, .. }) = b.node(spine.views[0]).op.clone() else {
             continue;
         };
-        // The view must span the consuming index space: a `[rows, 1]` view
-        // read over `[rows, cols]` has its layout doing work the map cannot
-        // express, and adopting the map reads `flat % rows` where
-        // `flat / cols` belongs.
+        // The view must span the consuming index space exactly.
         if specs.len() != space.dims.len()
             || !specs
                 .iter()
@@ -159,10 +135,7 @@ fn fold_operand_views(
         let Some((map, offset)) = unflatten_of(&specs, &base_shape) else {
             continue;
         };
-        // `MultiFlattenMap` has nowhere to put a base offset, so
-        // `Operand::address_map` takes it from the layout. Offset 0 here
-        // silently turns a narrowed view (`table[2..]`) back into the whole
-        // table.
+        // `MultiFlattenMap` has no base offset; the layout carries it.
         let layout = Layout::from_parts(
             Dim::Const(offset),
             &base_shape,
@@ -179,14 +152,9 @@ fn fold_operand_views(
     changed.then_some(new_ops)
 }
 
-/// The index map a relative spec vector induces over a dense base, and the
-/// base offset it starts from. Declines when an extent, stride or offset is
-/// not decidable — there is no contiguous fallback here, only the alternative
-/// not being minted.
-///
-/// The offset is returned separately because `MultiFlattenMap` is a sum of
-/// stride terms with no constant slot; the caller must put it on the
-/// operand's layout, which is where [`Operand::address_map`] reads it from.
+/// The index map a spec vector induces over a dense base, and its base
+/// offset (for the layout, where [`Operand::address_map`] reads it).
+/// Declines on anything undecidable.
 fn unflatten_of(
     specs: &[crate::shape::StrideSpec],
     base_shape: &[Dim],
@@ -197,8 +165,7 @@ fn unflatten_of(
     for s in specs {
         let extent = u32::try_from(s.size.as_const()?).ok()?;
         let base = base_strides.get(s.input_dim as usize)?.as_const()?;
-        // A spec's offset is in units of its own input axis, so it scales by
-        // that axis's stride whether or not the axis is broadcast.
+        // The offset scales by the input axis's stride even when broadcast.
         offset = offset.checked_add(s.offset.as_const()?.checked_mul(base)?)?;
         let stride = if s.multiplier == 0 {
             0

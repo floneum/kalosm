@@ -1,13 +1,6 @@
-//! `fusor-ir` — the shared contracts every other fusor crate is written
-//! against. Three levels (Logical `tensor`, Launch `nest`, Kernel `tile`), one acyclic
-//! append-only e-graph spanning Logical/Launch, one scalar picosecond cost model, one
-//! extraction. Almost nothing here decides anything: every type is either a
-//! *description* or a *contract* a downstream crate implements.
-//!
-//! The two things only the IR can own — total inference/verification for the
-//! closed `Logical`/`Launch` enums, and the shared rewrite-rule set with its saturation
-//! driver — live in [`semantics`], [`verify_l0()`], [`verify_launch()`], [`saturate`]
-//! and [`rules`].
+//! `fusor-ir` — the shared contracts every fusor crate is written against:
+//! three levels (Logical, Launch, Kernel), one acyclic append-only e-graph,
+//! one picosecond cost model, one extraction, and the shared rewrite rules.
 
 #![warn(unreachable_pub)]
 

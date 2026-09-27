@@ -75,36 +75,27 @@ impl RateDtype {
     pub const COUNT: usize = 5;
 }
 
-/// The device rates the cost model prices its terms in, built by
-/// `fusor-cost::facts::seed_facts` from the [`Caps`] a backend reports.
-/// The table is per device *class* and physically dimensioned, which is what
-/// keeps it portable: the reference picked five integers fitted on one M2 Max
-/// by an adapter-name string test and shared them with every other GPU on
-/// earth.
+/// The device rates the cost model prices its terms in, per device class and
+/// physically dimensioned, built by `fusor-cost::facts::seed_facts`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DeviceFacts {
     pub launch_ps: u64,
     pub dram_bytes_per_us: u64,
-    /// Feeds the continuous LLC reread term *and* the grid swizzle term —
-    /// one source, no private constants.
+    /// Feeds both the LLC reread term and the grid swizzle term.
     pub llc_bytes: u64,
     pub wg_bytes_per_us: u64,
     pub mac_per_us: [[u64; RateDtype::COUNT]; 3],
     pub trans_ps: u64,
-    /// Accumulator zeroing, fragment shuffles and the store, per padded
-    /// output element per emitting subgroup. `score_fs`'s T3.
+    /// Accumulator zeroing, shuffles and store, per padded output element
+    /// per emitting subgroup.
     pub store_ps_per_element: u64,
     pub saturation_lanes: u32,
     pub single_buffered_traffic_pct: u32,
     /// Cost of waking the CPU worker pool for one parallel region.
-    /// Replaces `PARALLEL_THRESHOLD = 16_777_216`.
     pub thread_wake_ps: u64,
-    /// One dependent step of a tiled contraction's k loop — a staged load,
-    /// a barrier and a fragment multiply — as latency a workgroup cannot
-    /// hide from itself. A launch is at least its longest chain of these.
+    /// Latency of one dependent step of a tiled contraction's k loop.
     pub coop_step_ps: u64,
-    /// One dependent step of a per-lane loop — a load and an accumulate —
-    /// the same way.
+    /// Latency of one dependent step of a per-lane loop.
     pub lane_step_ps: u64,
     pub caps: Caps,
 }
@@ -115,7 +106,6 @@ impl DeviceFacts {
     }
 
     /// Digest folded into `PlanHash` and the calibration cache key.
-    /// Includes `max_compute_workgroup_storage_size` via [`Caps`].
     pub fn fingerprint(&self) -> u64 {
         let mut h = FxHasher::default();
         self.hash(&mut h);
@@ -123,10 +113,8 @@ impl DeviceFacts {
     }
 }
 
-/// One launch in the realized DAG: a connected component cut at
-/// materialization boundaries, index-space mismatches and merged waves.
-/// `reads` is `(bytes, reread_factor)` per distinct operand; `wg_bytes`
-/// comes from the exact `ArenaPlan::total_bytes`.
+/// One launch in the realized DAG. `reads` is `(bytes, reread_factor)` per
+/// distinct operand.
 #[derive(Clone, Debug)]
 pub struct LaunchPlan<'a> {
     pub members: &'a [Id],
@@ -137,21 +125,17 @@ pub struct LaunchPlan<'a> {
     pub work: Work,
     pub resident_lanes: u64,
     pub wg_bytes: u64,
-    /// Cache-line traffic beyond the useful bytes: a read whose adjacent
-    /// lanes are not adjacent in memory pulls a whole line per element.
+    /// Cache-line traffic beyond the useful bytes of uncoalesced reads.
     pub line_bytes: u64,
-    /// The longest dependent chain one workgroup runs: k steps of a tiled
-    /// contraction, and per-lane loop iterations, priced at the device's
-    /// step latencies. Occupancy cannot shorten it.
+    /// The longest dependent chain one workgroup runs, which occupancy
+    /// cannot shorten.
     pub coop_steps: u64,
     pub lane_steps: u64,
     pub grid: [u32; 3],
 }
 
-/// The cost model. Object-safe: extraction holds it as `&dyn CostModel`.
-/// Every method returns picoseconds so terms are commensurable. Precision
-/// is **not** a cost term — it is a verifier property
-/// (`NumericContract`), because a time-only model eliminates f32 everywhere.
+/// The cost model, object-safe, in picoseconds. Precision is a verifier
+/// property (`NumericContract`), never a cost term.
 pub trait CostModel: Send + Sync {
     fn facts(&self) -> &DeviceFacts;
 
@@ -159,7 +143,6 @@ pub trait CostModel: Send + Sync {
     fn launch_cost(&self, launch: &LaunchPlan<'_>) -> Picoseconds;
 
     /// Arithmetic cost of one node at one schedule point, ignoring traffic.
-    /// The admissible lower bound is built from this.
     fn node_math(
         &self,
         node: &Node,
@@ -168,11 +151,9 @@ pub trait CostModel: Send + Sync {
         theta: Option<SchedPoint>,
     ) -> Picoseconds;
 
-    /// Traffic for `bytes` read `rereads` times. Continuous in `llc_bytes`,
-    /// not a strict `>` cliff.
+    /// Traffic for `bytes` read `rereads` times, continuous in `llc_bytes`.
     fn traffic(&self, bytes: u64, rereads: u32) -> Picoseconds;
 
-    /// Total cost of a realized extraction. The accept test for every
-    /// local-search move is this, never a local delta heuristic.
+    /// Total cost of a realized extraction: every search move's accept test.
     fn total(&self, launches: &[LaunchPlan<'_>]) -> Picoseconds;
 }

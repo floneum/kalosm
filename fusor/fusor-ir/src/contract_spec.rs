@@ -1,8 +1,5 @@
-//! `EinSpec` algebra: which labels are contracted, which are batch, and the
-//! `(m, n, k, batch)` a `Contract` lowering reads off a spec plus two shapes.
-//!
-//! `matmul`, `mat_mul_transposed_rhs` and every batched form differ only in
-//! the spec.
+//! `EinSpec` algebra: label roles and the `(m, n, k, batch)` a `Contract`
+//! lowering reads off a spec plus two shapes.
 
 use crate::error::{Error, Result};
 use crate::ir::logical::{EinSpec, Label};
@@ -23,9 +20,7 @@ pub enum LabelRole {
     K,
 }
 
-/// Labels grouped by role, each group in the order the spec writes them
-/// (`out` order for `Batch`/`M`/`N`, `a` order for `K`), so `out_shape` and
-/// the `mnkb` products agree with the node's declared layout.
+/// Labels grouped by role: `out` order for `Batch`/`M`/`N`, `a` order for `K`.
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct EinPartition {
     pub batch: SmallVec<[Label; 4]>,
@@ -47,8 +42,7 @@ impl EinPartition {
     }
 }
 
-/// Role of one label. A label appearing in fewer than two of `{a, b, out}`
-/// has no contraction meaning and is `Error::Shape`.
+/// Role of one label; one in fewer than two of `{a, b, out}` is an error.
 pub fn role(spec: &EinSpec, l: Label) -> Result<LabelRole> {
     let in_a = spec.a.contains(&l);
     let in_b = spec.b.contains(&l);
@@ -67,9 +61,8 @@ pub fn role(spec: &EinSpec, l: Label) -> Result<LabelRole> {
     })
 }
 
-/// Partition every label of `spec` by role. A repeated label inside one
-/// operand list (a diagonal, which no contraction kernel expresses) is
-/// `Error::Shape`.
+/// Partition every label of `spec` by role. A label repeated inside one
+/// operand list (a diagonal) is an error.
 pub fn partition(spec: &EinSpec) -> Result<EinPartition> {
     for (name, list) in [("a", &spec.a), ("b", &spec.b), ("out", &spec.out)] {
         for (i, l) in list.iter().enumerate() {
@@ -111,10 +104,8 @@ pub fn partition(spec: &EinSpec) -> Result<EinPartition> {
     Ok(part)
 }
 
-/// Bind every label to an extent by zipping each operand list positionally
-/// with that operand's shape. A label bound twice must be [`Dim::known_eq`]
-/// both times — a symbolic and a constant extent are not decidably equal
-/// and are rejected.
+/// Bind every label to an extent from the operand shapes; a label bound
+/// twice must be [`Dim::known_eq`] both times.
 pub fn extents(spec: &EinSpec, a: &[Dim], b: &[Dim]) -> Result<FxHashMap<Label, Dim>> {
     let mut map: FxHashMap<Label, Dim> = FxHashMap::default();
     for (name, labels, shape) in [("a", &spec.a, a), ("b", &spec.b, b)] {
@@ -163,11 +154,8 @@ pub fn out_shape(spec: &EinSpec, extents: &FxHashMap<Label, Dim>) -> Result<Dims
         .collect()
 }
 
-/// `[m, n, k, batch]`, each the collapsed product of its label group.
-///
-/// Product rule: drop `Const(1)`; all-`Const` ⇒ `Const(product)`; exactly one
-/// surviving `Sym` and nothing else ⇒ that `Sym`; empty group ⇒ `Const(1)`;
-/// two or more non-collapsible survivors ⇒ `Error::Shape`.
+/// `[m, n, k, batch]`, each the product of its label group: constant, or a
+/// lone `Sym` beside unit extents; anything else is an error.
 pub fn mnkb(spec: &EinSpec, extents: &FxHashMap<Label, Dim>) -> Result<[Dim; 4]> {
     let part = partition(spec)?;
     Ok([
@@ -212,9 +200,8 @@ fn collapse(group: &[Label], extents: &FxHashMap<Label, Dim>, name: &str) -> Res
     }
 }
 
-/// Assert both adjoint specs of `spec` are themselves well-formed
-/// contractions, and that `d_lhs` really maps `out x b -> a` with the
-/// original's contracted set becoming `a`'s free set.
+/// Assert both adjoint specs of `spec` are well-formed contractions whose
+/// free axes are the original's contracted set.
 pub fn check_adjoint_specs(spec: &EinSpec) -> Result<()> {
     let original = partition(spec)?;
 
@@ -231,8 +218,7 @@ pub fn check_adjoint_specs(spec: &EinSpec) -> Result<()> {
         ))
     })?;
 
-    // `d_lhs` is `out x b -> a`. Every label the original summed is free in
-    // `a` and read from `b`, i.e. an N label of the adjoint.
+    // `d_lhs` is `out x b -> a`: every summed label is an N label of it.
     for &l in &original.k {
         let r = role(&d_lhs, l)?;
         if r != LabelRole::N {

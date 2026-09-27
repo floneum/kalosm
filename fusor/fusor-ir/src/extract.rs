@@ -39,30 +39,19 @@ pub enum Move {
     Reschedule(Id),
 }
 
-/// Extraction limits. Deterministic: ties break by node id, the full
-/// schedule domain stays reachable, and the accept test is always the exact
-/// global cost.
-///
-/// No term is a clock: the plan is the cache key and the cache is
-/// cross-process, so a deadline would produce a different `PlanHash` on a
-/// loaded machine than on an idle one. Search effort is bounded in realized
-/// node visits via [`Self::max_move_work`].
+/// Extraction limits, deterministic and clock-free: the plan is a
+/// cross-process cache key, so effort is bounded in realized node visits.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct ExtractBudget {
     pub moves_per_chain: u32,
-    /// Realized node visits the local search may spend: it stops after
-    /// `max_move_work / graph.len()` moves, whichever of that and
-    /// `moves_per_chain * chains` is smaller.
+    /// Realized node visits the local search may spend.
     pub max_move_work: u64,
 }
 
 impl Default for ExtractBudget {
     /// `64 * |chains|` moves, 90k realized node visits.
-    ///
-    /// Limits additional local-search work after the complete seed sweep.
     fn default() -> Self {
-        // `FUSOR_MOVE_WORK` overrides the visit budget, for measuring what
-        // a longer search buys on a given graph.
+        // `FUSOR_MOVE_WORK` overrides the visit budget.
         let max_move_work = std::env::var("FUSOR_MOVE_WORK")
             .ok()
             .and_then(|v| v.parse().ok())
@@ -75,9 +64,7 @@ impl Default for ExtractBudget {
 }
 
 impl ExtractBudget {
-    /// The move ceiling this budget implies on a graph of `nodes` nodes and
-    /// `chains` classes. A pure function of the budget and the graph, so two
-    /// runs of one graph search exactly as far as each other.
+    /// The move ceiling on a graph of `nodes` nodes and `chains` classes.
     pub fn move_cap(&self, nodes: usize, chains: u32) -> u32 {
         let by_work = (self.max_move_work / (nodes.max(1) as u64)).min(u32::MAX as u64) as u32;
         let by_chain = self.moves_per_chain.saturating_mul(chains.max(1));
@@ -85,10 +72,8 @@ impl ExtractBudget {
     }
 }
 
-/// The extracted plan's identity. The plan is the cache key:
-/// `hash(realized DAG term + M + theta + DeviceFacts::fingerprint)`.
-/// `Dim::Sym` and `Leaf::Uniform` hash as symbols, not values, so one plan
-/// serves a whole shape family.
+/// The extracted plan's identity: `hash(realized term + M + theta + device)`.
+/// Symbols hash as symbols, so one plan serves a whole shape family.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Default)]
 pub struct PlanHash(pub u128);
 
@@ -106,14 +91,11 @@ pub struct BindingPlan {
     pub binding: u32,
     pub value: Id,
     pub kind: BindKind,
-    /// The value lives in the plan's step arena: all arena values in a
-    /// launch share one binding, with typed views at their own offsets.
+    /// The value lives in the step arena; arena values share one binding.
     pub arena: bool,
 }
 
-/// One buffer the plan allocates. Allocation is derived from the plan:
-/// the layout carries the padded strides the selected geometry needs,
-/// including split-K scratch slices.
+/// One buffer the plan allocates, with the padded strides its geometry needs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BufferPlan {
     pub value: Id,
@@ -121,13 +103,11 @@ pub struct BufferPlan {
     pub elements: Dim,
     pub dtype: crate::dtype::Dtype,
     pub persistence: crate::dtype::Persistence,
-    /// Byte offset in the step arena, for a step-local intermediate whose
-    /// live range was packed there; `None` allocates its own buffer.
+    /// Byte offset in the step arena; `None` allocates its own buffer.
     pub arena: Option<u64>,
 }
 
-/// One dispatch in the extracted plan. `grid` is after the 3-D fold against
-/// `max_compute_workgroups_per_dimension`.
+/// One dispatch in the extracted plan; `grid` is already folded to 3-D.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Dispatch {
     pub root: Id,
@@ -144,25 +124,19 @@ pub struct Plan {
     pub extraction: Extraction,
     pub launches: Vec<Dispatch>,
     pub buffers: Vec<BufferPlan>,
-    /// Bytes of the step arena: intermediates with disjoint live ranges
-    /// share it, interval-colored at derivation.
+    /// Bytes of the interval-colored step arena.
     pub arena_bytes: u64,
     pub symbols: Vec<crate::shape::SymId>,
-    /// The subset of `symbols` that are runtime scalars (`Leaf::Uniform`),
-    /// carried as `f32` words. Every other symbol is an extent, offset or
-    /// stride: a `u32` word, whether or not a buffer layout mentions it.
+    /// The `symbols` that are runtime scalars (`f32` words); the rest are
+    /// `u32` extents, offsets or strides.
     pub scalar_symbols: Vec<crate::shape::SymId>,
     pub hash: PlanHash,
     pub cost: Picoseconds,
 }
 
-/// The extraction interface. Object-safe. One implementation is the shipped
-/// local search; `fusor-conformance` ships a debug ILP oracle behind the
-/// same trait that must agree with it on small graphs.
+/// The extraction interface. Object-safe.
 pub trait Extractor: Send + Sync {
     /// Per-node arithmetic floor, indexed by node id, for candidate ordering.
-    /// It is not a dependency-DAG cost: selection compares complete realized
-    /// plans so every shared producer and every distinct branch is counted.
     fn lower_bound(&self, graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds>;
 
     /// Seed, realize, cost exactly, then local-search under `budget`.
@@ -174,8 +148,7 @@ pub trait Extractor: Send + Sync {
         budget: ExtractBudget,
     ) -> Result<Plan>;
 
-    /// Extend a previous selection from this graph to the requested roots.
-    /// The seed is a search hint; its buffers and cost must be constructed again.
+    /// Extend a previous selection (a search hint) to the requested roots.
     fn extract_seeded(
         &self,
         graph: &EGraph,
@@ -188,15 +161,12 @@ pub trait Extractor: Send + Sync {
         self.extract(graph, roots, cost, budget)
     }
 
-    /// Hard conformance assert on the winner: every selected non-leaf is
-    /// Launch; every geometry legal against the exact `ArenaPlan`; every
-    /// operand access satisfiable; every buffer stride derivable; no
-    /// `InPlace` node inlined. A failure is an error, never a fallback.
+    /// Hard conformance assert on the winner; a failure is an error, never a
+    /// fallback.
     #[cfg(feature = "compiler-tests")]
     fn verify_plan(&self, graph: &EGraph, plan: &Plan) -> Result<()>;
 
-    /// Test-only member sweep. Coverage is independent of tuning budgets,
-    /// cost thresholds and the timing cache.
+    /// Test-only member sweep, independent of tuning budgets and caches.
     #[cfg(feature = "compiler-tests")]
     fn test_launch_variants(
         &self,
@@ -208,12 +178,8 @@ pub trait Extractor: Send + Sync {
     ) -> Vec<(String, Plan)>;
 
     /// Alternative plans for one launch of `base`: every `(class member,
-    /// schedule point)` pair the launch root's class offers, each re-planned
-    /// whole. Family and geometry vary together — see the
-    /// `candidate_schedules_for` doc in `fusor-tile`.
-    ///
-    /// Contractions below `min_macs` return nothing. The default is "no
-    /// alternatives".
+    /// schedule point)` pair its class offers, each re-planned whole.
+    /// Contractions below `min_macs` return nothing.
     fn launch_variants(
         &self,
         graph: &EGraph,
@@ -227,14 +193,9 @@ pub trait Extractor: Send + Sync {
         Vec::new()
     }
 
-    /// Candidate labels and their complete realized costs, without deriving
-    /// buffers, bindings or plan hashes. Lower costs come first; a label that
-    /// cannot realize keeps its place in the offering with the maximum cost.
-    ///
-    /// The list is a superset of what `launch_variants` returns — a label
-    /// here may still fail to realize — and is exactly the label space
-    /// [`Self::replan_with_variants`] resolves against, so a name from here
-    /// always names the same `(member, schedule point)` there.
+    /// Candidate labels and their realized costs, cheapest first; the label
+    /// space [`Self::replan_with_variants`] resolves against. An unrealizable
+    /// label keeps its place at the maximum cost.
     fn launch_variant_labels(
         &self,
         graph: &EGraph,
@@ -248,13 +209,6 @@ pub trait Extractor: Send + Sync {
         Vec::new()
     }
 
-    /// Replan `base` with the named variant applied at each launch of
-    /// `swaps`, composed into one extraction and re-planned (and so
-    /// verified) once. Labels are the strings `launch_variants` returns; a
-    /// launch whose label matches no member point, or whose selection move
-    /// is illegal, contributes nothing. `None` when nothing applied or the
-    /// composed plan failed to build — the caller falls back to sequential
-    /// adoption. The default is "no batch".
     /// Construct the plan of a completed selection without searching.
     fn replan_extraction(
         &self,
@@ -269,6 +223,8 @@ pub trait Extractor: Send + Sync {
         ))
     }
 
+    /// Replan `base` with the named variant applied at each launch of
+    /// `swaps`, verified once; `None` when nothing applied or the plan failed.
     fn replan_with_variants(
         &self,
         graph: &EGraph,
@@ -283,10 +239,8 @@ pub trait Extractor: Send + Sync {
     }
 }
 
-/// The replay memo, keyed on the extraction inputs. Validity is "the inputs
-/// are identical": the root closure's term (symbols as symbols, so one plan
-/// serves a whole shape family and the values reach the dispatch through the
-/// uniform block) and the device.
+/// The replay memo key: the root closure's term (symbols as symbols) and the
+/// device.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ReplayKey {
     pub l0_term: u64,

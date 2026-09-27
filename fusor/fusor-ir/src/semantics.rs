@@ -1,6 +1,5 @@
-//! [`CoreSemantics`]: the single [`Semantics`] implementation covering the
-//! closed `Logical`/`Launch` enums. Total inference,
-//! work rows, effects and the two level verifiers hang off this type.
+//! [`CoreSemantics`]: the single [`Semantics`] implementation over the
+//! closed `Logical`/`Launch` enums.
 
 pub mod children;
 pub mod infer_launch;
@@ -15,17 +14,14 @@ use crate::ir::logical::ScatterCombine;
 use crate::ir::{Children, Op, Semantics, VerifyCtx};
 use std::sync::Arc;
 
-/// The core semantics. Holds the [`ArenaPlanner`] because `verify_launch` admits
-/// a geometry against the *exact* `arena_plan` bytes — the same pure
-/// memoized function the Kernel emitter lays out with, so there is no Launch/Kernel
-/// admission mismatch.
+/// The core semantics. Holds the [`ArenaPlanner`] so `verify_launch` admits
+/// against the exact bytes the Kernel emitter lays out.
 pub struct CoreSemantics {
     planner: Arc<dyn ArenaPlanner>,
 }
 
 impl CoreSemantics {
     /// Build the shared semantics object the e-graph is constructed with.
-    /// Returns `Arc<dyn Semantics>`: the e-graph only ever holds the trait object.
     #[allow(clippy::new_ret_no_self)]
     pub fn new(planner: Arc<dyn ArenaPlanner>) -> Arc<dyn Semantics> {
         Arc::new(Self { planner })
@@ -45,8 +41,7 @@ impl Semantics for CoreSemantics {
         match op {
             Op::Logical(o) => infer_logical::infer_logical(o, ins),
             Op::Launch(o) => infer_launch::infer_launch(o, ins),
-            // A union stands for alternatives that infer identically by
-            // construction; pass the first through.
+            // Alternatives infer identically; pass the first through.
             Op::Union(..) => ins
                 .first()
                 .cloned()
@@ -62,8 +57,6 @@ impl Semantics for CoreSemantics {
         match cx.node.op {
             Op::Logical(_) => crate::verify_l0::verify_l0(cx),
             Op::Launch(_) => crate::verify_launch::verify_launch(cx, self.planner.as_ref()),
-            // A union carries no semantics of its own; its operands are
-            // verified as their own nodes.
             Op::Union(..) => Ok(()),
         }
     }
@@ -73,14 +66,8 @@ impl Semantics for CoreSemantics {
     }
 }
 
-/// Purity of one operator.
-///
-/// `Scatter` writing through operand 0 with atomics or a `Set` combine
-/// mutates state and is therefore **pinned in the materialized set**:
-/// without that, toggling a two-consumer atomic scatter out of `M` inlines it
-/// into both consumers' kernels and the atomics apply twice, doubling the
-/// embedding gradient. Everything else is pure — a Logical node describes a
-/// value, not a write.
+/// Purity of one operator. An atomic or `Set` scatter writes through operand
+/// 0 and is pinned materialized, so its writes never apply twice.
 pub fn effect_of(op: &Op) -> Effect {
     match op {
         Op::Launch(Launch::Scatter { mode, combine, .. })

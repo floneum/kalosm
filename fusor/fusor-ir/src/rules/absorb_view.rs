@@ -1,8 +1,6 @@
 //! `ABSORB_VIEW_INTO_CONTRACT`: a contraction operand that is a copy of a
-//! view — a head split, a transpose, a flatten spelled as an identity map —
-//! reads the view's source through the view's own strides instead. The
-//! tiled loaders address a non-affine row group per element, so the copy
-//! buys nothing but a dispatch and a round trip through memory.
+//! view (head split, transpose, flatten) reads the view's source through the
+//! view's strides instead, saving the copy's dispatch and round trip.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
 use crate::ir::launch::{AccessPlan, Launch, Operand};
@@ -21,27 +19,16 @@ rule!(
 );
 
 rule!(
-    ABSORB_BROADCAST_INTO_MAP,
+    ABSORB_BROADCAST,
     level = Level::Launch,
-    head = OpTag::LaunchMap,
+    heads = [OpTag::LaunchMap, OpTag::LaunchFold],
     tag = RuleTag::Additive,
     apply = absorb_broadcast,
 );
 
-rule!(
-    ABSORB_BROADCAST_INTO_FOLD,
-    level = Level::Launch,
-    head = OpTag::LaunchFold,
-    tag = RuleTag::Additive,
-    apply = absorb_broadcast,
-);
-
-/// A map or fold reading a *broadcast* copy — one whose own read has no
-/// varying axis, a scalar spread over a weight's shape — reads the source
-/// with the broadcast strides instead. Restricted to broadcasts: absorbing
-/// every view here minted a head per reader and saturation took minutes,
-/// and a broadcast copy is what every optimizer chain shares, so it made
-/// every chain's slab overlap every other's.
+/// A map or fold reading a broadcast copy reads the source with the
+/// broadcast strides instead. Broadcasts only: absorbing every view mints a
+/// head per reader and blows up saturation.
 pub fn absorb_broadcast(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     absorb(b, id, node, true)
 }
@@ -70,18 +57,15 @@ fn absorb(b: &mut Builder<'_>, id: Id, node: &Node, broadcast_only: bool) -> Opt
         }
     }
     let minted = b.add_launch(absorbed).ok()?;
-    // Reading a copy of one's own class through it changes nothing, and a
-    // rule that keeps answering is a pass that never ends.
+    // Reading a copy of one's own class through it changes nothing.
     if b.class_of(minted) == b.class_of(id) {
         return None;
     }
     b.union(id, minted).ok()
 }
 
-/// `o` read through the copy that produces it. A copy whose own read is
-/// dense is a reshape: its output's flat index is its source's, so `o`
-/// keeps its layout over the source. Otherwise, when `o` reads the copy
-/// densely in the copy's shape, `o` takes the copy's read layout.
+/// `o` read through the copy that produces it: over a dense (reshape) copy
+/// `o` keeps its layout; a dense or permuted read takes the copy's strides.
 fn through_copy(b: &Builder<'_>, o: &Operand, broadcast_only: bool) -> Option<Operand> {
     let own = b.class_of(o.src);
     if !matches!(o.access, AccessPlan::Alias | AccessPlan::Pack { .. }) {
@@ -124,9 +108,7 @@ fn through_copy(b: &Builder<'_>, o: &Operand, broadcast_only: bool) -> Option<Op
                 access: o.access.clone(),
             });
         }
-        // `o` permutes the copy's axes (a transposed read of a head split):
-        // each of its axes is one copy axis at that axis's row-major stride,
-        // and takes that axis's stride in the copy's own read.
+        // `o` permutes the copy's axes (a transposed read of a head split).
         if let Some(layout) = permute_through(&o.layout, &out_shape, &src.layout) {
             return Some(Operand {
                 src: src.src,
@@ -138,10 +120,9 @@ fn through_copy(b: &Builder<'_>, o: &Operand, broadcast_only: bool) -> Option<Op
     None
 }
 
-/// `outer` stated over the copy's row-major output `shape`, composed with
-/// the copy's read `inner` over its source: defined when every `outer` axis
-/// is a broadcast, one `shape` axis, or a run of adjacent `shape` axes
-/// merged — which splits back into those axes at the copy's strides.
+/// `outer` over the copy's row-major output `shape`, composed with the
+/// copy's read `inner`: each `outer` axis must be a broadcast or a run of
+/// adjacent `shape` axes.
 fn permute_through(outer: &Layout, shape: &[Dim], inner: &Layout) -> Option<Layout> {
     if inner.shape().len() != shape.len() || !matches!(outer.offset(), Dim::Const(0)) {
         return None;
@@ -155,8 +136,6 @@ fn permute_through(outer: &Layout, shape: &[Dim], inner: &Layout) -> Option<Layo
             strides.push(Dim::Const(0));
             continue;
         }
-        // The innermost axis of the run has the outer stride; the run
-        // extends outward while its extents multiply up to `d`.
         let j = (0..shape.len()).find(|k| rs[*k] == *st)?;
         let want = d.as_const()?;
         let mut k = j;
@@ -177,10 +156,8 @@ fn permute_through(outer: &Layout, shape: &[Dim], inner: &Layout) -> Option<Layo
 }
 
 /// Post-extraction forwarding: `id` with every operand whose class `copy`
-/// accepts read through that copy's view instead, slab and group members
-/// rewritten in place. Every `(old, new)` pair minted lands in `minted`,
-/// `id`'s own last. Unlike the rules above this runs once over a chosen
-/// selection, so it mints one spelling per reader and never cascades.
+/// accepts read through that copy's view, composite members rewritten in
+/// place. Each `(old, new)` pair lands in `minted`, `id`'s own last.
 pub fn forward_views(
     b: &mut Builder<'_>,
     id: Id,
@@ -219,10 +196,8 @@ pub fn forward_views(
     }
     let before = b.len();
     let new = b.add_launch(rewritten).ok()?;
-    // An existing node elsewhere would merge two selected classes, and one
-    // reading `id`'s own class would be its own producer.
-    // A slab or group lists its members among its children; each member was
-    // checked when it was minted.
+    // Reject merging two selected classes, or a self-reading node (composite
+    // members were checked when minted).
     let own = b.class_of(id);
     let composite = matches!(
         b.node(new).op,

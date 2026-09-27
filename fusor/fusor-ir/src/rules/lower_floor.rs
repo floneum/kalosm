@@ -1,16 +1,6 @@
 //! The [`crate::egraph::RuleTag::StrictlyLowering`] floor: one trivial,
-//! always-legal Logical -> Launch lowering per Logical op. These are what the driver falls
-//! back to when a saturation budget is exhausted.
-//!
-//! Every one emits [`ScheduleDomain::Point`]: the floor depends on no
-//! schedule generator. Every one is trivially correct and trivially slow. `Leaf` needs no
-//! rule.
-//!
-//! # This module is the only place `ScheduleDomain::Point` is minted
-//!
-//! `Point` is the marker the schedule rules match on. A rule that needs to mint a
-//! nest carrying no schedule of its own calls `floor_map`,
-//! `floor_alias_map` or `floor_fold`.
+//! always-legal Logical -> Launch lowering per Logical op, the driver's
+//! fallback on budget exhaustion. Each emits [`ScheduleDomain::Point`].
 
 use crate::carrier::Carrier;
 use crate::dtype::Dtype;
@@ -103,9 +93,6 @@ fn space_of(f: &Facts<'_>) -> IndexSpace {
 }
 
 /// A `Map` minted with no schedule of its own.
-///
-/// The schedule rules expand it exactly as they expand a `lower_map` output:
-/// a rule that restates a value does not decide how it is scheduled.
 pub(crate) fn floor_map(
     b: &mut Builder<'_>,
     space: IndexSpace,
@@ -121,13 +108,8 @@ pub(crate) fn floor_map(
     .ok()
 }
 
-/// The identity-body alias `Map` that re-expresses `src` at `shape` through
-/// `layout`.
-///
-/// This is the readback spelling: a slot view of a multi-slot carrier, a
-/// recovery view of a promoted fold's flattened carrier axis. It computes
-/// nothing — the body is `Arg(0)` and the access is [`AccessPlan::Alias`] —
-/// so it carries no schedule decision at all.
+/// The identity alias `Map` re-expressing `src` at `shape` through `layout`:
+/// the readback spelling of a carrier slot or promoted axis.
 pub(crate) fn floor_alias_map(
     b: &mut Builder<'_>,
     src: Id,
@@ -147,13 +129,8 @@ pub(crate) fn floor_alias_map(
     )
 }
 
-/// A `Fold` minted with no schedule of its own — the nest [`lower_fold`]
-/// would have minted, given these fields.
-///
-/// TUPLE's joint carrier is the case: the joint takes neither side's schedule,
-/// because a schedule domain is not a value and a joint that inherited one
-/// would be a function of which spelling the consumer's operand happened to
-/// name.
+/// A `Fold` minted with no schedule of its own, as [`lower_fold`] would
+/// (TUPLE's joint inherits neither side's schedule).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn floor_fold(
     b: &mut Builder<'_>,
@@ -226,14 +203,8 @@ pub fn lower_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Op
     };
     let in_shape = f.operand(0)?.shape.clone();
     let dtype = f.dtype(0)?;
-    // The nest reads its operands at the operand dtype and accumulates at
-    // `acc`, so the lift is retyped while the merge rides through untouched.
-    //
-    // Retyped, **not replaced**. A per-slot `Arg(0)` is right only for a
-    // single-slot binop carrier, whose lift already is `Arg(0)`; Welford's
-    // `(1, x, 0)` and a shift-stabilized `(x, 1)` would be silently rewritten
-    // into "every slot folds the element", which reduces `n` and `m2` over the
-    // data instead of over the constants they are.
+    // Retype (never replace) the lift to the operand dtype: multi-slot lifts
+    // like Welford's `(1, x, 0)` fold constants, not the element.
     let lift: SmallVec<[ScalarExpr; 4]> = carrier
         .lift
         .iter()
@@ -256,11 +227,8 @@ pub fn lower_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Op
     b.union(id, k).ok()
 }
 
-/// `Logical::Contract` -> `Fold { combine: Add, pre: mul(Arg0, Arg1) }`.
-///
-/// This is the family-free floor: no lane geometry, no tile, no split. The
-/// four order-free family rules ride in a target's own rule table and are
-/// appended to the core set by the driver's caller.
+/// `Logical::Contract` -> `Fold { combine: Add, pre: mul(Arg0, Arg1) }`: the
+/// family-free floor. Tiled families live in a target's rule table.
 pub fn lower_contract_generic(
     b: &mut Builder<'_>,
     id: Id,
@@ -342,16 +310,9 @@ pub fn contract_fold(node: &Node, f: &Facts<'_>) -> Option<Launch> {
     )
 }
 
-/// One contraction operand read over the fold's `[out..., k]` index space.
-///
-/// The fold walks the output plus one merged contraction axis; the operand's
-/// own axes are in `spec` order, which in general is neither. Aliasing the
-/// operand's dense layout says "axis `i` of the space is axis `i` of the
-/// operand", which is true only for a left operand of a canonical matmul.
-/// So each space axis gets an explicit stride: the operand's stride for that label,
-/// or 0 where the operand does not carry it, and the merged `k` axis
-/// decomposes into one sub-axis per contracted label, most significant
-/// first, which is the order `fold_extent` multiplied them in.
+/// One contraction operand read over the fold's `[out..., k]` space: each
+/// axis takes the operand's stride for its label (0 if absent), and a merged
+/// `k` splits into one sub-axis per contracted label, most significant first.
 #[allow(clippy::too_many_arguments)]
 fn contract_operand(
     src: Id,
@@ -454,9 +415,7 @@ fn label_dim(l: Label, spec: &crate::ir::logical::EinSpec, a: &[Dim], b: &[Dim])
 }
 
 /// `Logical::Restride` -> a copying `Map` whose operand carries the composed
-/// view. When the composition is not expressible as one layout the rule
-/// declines: an operand over the source's own contiguous layout would read
-/// the wrong elements, and nothing downstream reconstructs the specs.
+/// view; declines when that is not one layout.
 pub fn lower_restride(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Logical(Logical::Restride { specs, x, .. }) = &node.op else {
         return None;
@@ -543,9 +502,8 @@ pub fn lower_gather(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
     b.union(id, k).ok()
 }
 
-/// `Logical::Scatter` -> `Scatter { mode: SortSegment }`. Atomics and the
-/// workgroup-private merge are target rules guarded on capabilities; the
-/// sorted segmented reduce needs neither and is therefore the floor.
+/// `Logical::Scatter` -> `Scatter { mode: SortSegment }`, which needs no
+/// device capability.
 pub fn lower_scatter(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Logical(Logical::Scatter {
         axis,
@@ -575,9 +533,8 @@ pub fn lower_scatter(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
     b.union(id, k).ok()
 }
 
-/// `Logical::Dequant` -> a `Map` reading a quantized operand. The block program
-/// itself lives in the format table, keyed by `(fmt, layout)`; the nest only
-/// has to say that this operand decodes.
+/// `Logical::Dequant` -> a `Map` reading a quantized operand; the decode
+/// program lives in the format table.
 pub fn lower_dequant(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Logical(Logical::Dequant { x, .. }) = &node.op else {
         return None;

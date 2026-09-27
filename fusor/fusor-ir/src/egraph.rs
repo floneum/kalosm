@@ -14,10 +14,8 @@ use smallvec::SmallVec;
 use std::fmt;
 use std::sync::Arc;
 
-/// An e-graph node id. Ids are dense and monotone: `children` may only hold
-/// ids strictly smaller than the node's own, and `union(a, b)` allocates an
-/// id greater than both — so acyclicity is a property of this allocator and
-/// no rule author can violate it.
+/// An e-graph node id. Children hold strictly smaller ids and `union`
+/// allocates above both, so acyclicity is a property of the allocator.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct Id(pub u32);
 
@@ -34,17 +32,11 @@ impl fmt::Display for Id {
 }
 
 /// An e-class handle: the id of the topmost `Op::Union` node containing a
-/// value, or the value's own id when it has no alternatives.
-///
-/// Equality is not congruent — unioning `a` and `b` does not union `f(a)`
-/// and `f(b)`. Alternatives are minted by rules at the consumer, and
-/// patterns may match a spine ([`Builder::trace_pure_views`]).
+/// value, or the value's own id. Equality is not congruent.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClassId(pub Id);
 
-/// Hash-cons key: the operator plus its canonicalized children. Commutative
-/// ops sort children by [`Id`] at construction, so associativity and
-/// commutativity are a canonical form, not a rule family.
+/// Hash-cons key: the operator plus its canonicalized children.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NodeKey {
     pub op: Op,
@@ -55,15 +47,11 @@ pub struct NodeKey {
 pub struct EGraph {
     nodes: Vec<Node>,
     facts: Vec<ValueFacts>,
-    /// Shared with every [`SaturationDelta`] recorded off this graph. `add`
-    /// is the only writer and takes it back by `Arc::make_mut`, so a graph
-    /// that keeps growing after a replay still hash-conses against a fully
-    /// populated memo.
+    /// Shared with every [`SaturationDelta`] recorded off this graph; `add`
+    /// writes through `Arc::make_mut`.
     memo: Arc<FxHashMap<NodeKey, Id>>,
     parent: Vec<Option<Id>>,
-    /// Unions that merged two classes. Only a union moves a class
-    /// representative, so a selection checked at one count is still keyed
-    /// by representatives at that count.
+    /// Unions that merged two classes: only a union moves a representative.
     unions: u64,
     roots: Vec<Id>,
     next_sym: u32,
@@ -71,35 +59,24 @@ pub struct EGraph {
     /// Nodes covered by a completed bounded search and its lowering floor.
     /// A node reached only by a later root remains eligible for search.
     offered: FixedBitSet,
-    /// The current dim bindings, as a hint for costing: extraction and the
-    /// tuner's work gate price a symbolic extent at its bound value rather
-    /// than a nominal one, so a symbolic plan is tuned like a concrete one.
-    /// Set by the session before it plans; never read by a rule.
+    /// The current dim bindings, a costing hint so a symbolic extent is priced
+    /// at its bound value. Set by the session; never read by a rule.
     pub dim_hints: FxHashMap<SymId, u64>,
     /// Root sets whose reachable closure has completed bounded search.
-    /// A root set seen here needs no walk at all. Bounded by clearing.
     pub saturated_root_sets: FxHashSet<Vec<Id>>,
-    /// The node count as of the last completed saturation on this graph.
-    /// `add` is the only structural mutation, so `saturated_at_len ==
-    /// Some(len())` means the graph is exactly the one saturation last ran
-    /// on — a decode step that rebuilt only memo hits skips saturation. The
-    /// session owns setting it.
+    /// The node count as of the last completed saturation; equal to `len()`
+    /// means saturation can be skipped. Set by the session.
     pub saturated_at_len: Option<usize>,
-    /// Memo for the replay key's root-closure hash, per root set. A hash
-    /// covers exactly what its roots reach, which an append cannot change,
-    /// so an entry stays valid for the life of the graph. Bounded by
-    /// clearing.
+    /// Memo for the replay key's root-closure hash, per root set; valid for
+    /// the life of the graph since an append cannot change what roots reach.
     pub l0_term_memo: FxHashMap<Vec<Id>, u64>,
-    /// Process-unique identity of this arena. An [`Id`] names a node only
-    /// together with the graph it indexes, so anything that caches per-node
-    /// work keyed on ids across graphs has to carry this.
+    /// Process-unique identity of this arena, for caches keyed on ids
+    /// across graphs.
     arena: u64,
-    /// `(arena length, class root -> its id set)`. A class's ids change only
-    /// when a node is appended, so the arena length is an exact validity
-    /// stamp.
+    /// `(arena length, class root -> its id set)`; the length is an exact
+    /// validity stamp.
     class_ids_memo: (usize, FxHashMap<ClassId, Arc<[Id]>>),
     /// Per node, the nodes that read it as a child, by the id they wrote.
-    /// Nodes never move, so the index is append-only with `nodes`.
     readers: Vec<SmallVec<[Id; 4]>>,
 }
 
@@ -137,9 +114,8 @@ impl EGraph {
         self.offered.grow_and_insert(id.index());
     }
 
-    /// Every id of every class the current roots reach: the nodes an
-    /// extraction over those roots can select, and so the nodes saturation
-    /// has to offer rules to. Closed under class membership and children.
+    /// Every id of every class the current roots reach, closed under class
+    /// membership and children.
     pub fn reachable_from_roots(&self) -> FixedBitSet {
         let mut seen = FixedBitSet::with_capacity(self.nodes.len());
         let mut stack: Vec<Id> = self.roots.clone();
@@ -188,11 +164,8 @@ impl EGraph {
             self.roots.push(id);
         }
     }
-    /// Drop the accumulated root set. A resolve plans for the values that
-    /// call requested; roots left over from earlier resolves are already
-    /// buffered (or are views over something buffered) and re-verifying them
-    /// against a plan that deliberately does not cover them is a false
-    /// failure.
+    /// Drop the accumulated root set; earlier resolves' roots are already
+    /// buffered.
     pub fn clear_roots(&mut self) {
         self.roots.clear();
     }
@@ -251,9 +224,8 @@ impl EGraph {
         Ok(next)
     }
 
-    /// Assert `a` and `b` are equal by allocating a `Union` above the
-    /// *roots* of both chains. Rooting keeps a class complete: unioning `a`
-    /// with `b` and later `a` with `d` must leave one class `{a, b, d}`.
+    /// Assert `a` and `b` are equal by allocating a `Union` above the roots
+    /// of both chains, which keeps a class complete.
     pub fn union(&mut self, a: Id, b: Id) -> Result<Id> {
         let (ra, rb) = (self.root_of(a), self.root_of(b));
         if ra == rb {
@@ -284,8 +256,8 @@ impl EGraph {
         cur
     }
 
-    /// Brings the readers index up to `len` nodes: every node added by a
-    /// path other than [`Self::add`] — a replayed delta — is indexed here.
+    /// Brings the readers index up to `len` nodes (a replayed delta adds
+    /// nodes without [`Self::add`]).
     fn index_readers_to(&mut self, len: usize) {
         while self.readers.len() < len {
             let id = Id(self.readers.len() as u32);
@@ -336,8 +308,7 @@ impl EGraph {
         out
     }
 
-    /// Visit every id of `class` once, spine first-seen first. The spine is a
-    /// DAG; a set membership test keeps this linear.
+    /// Visit every id of `class` once, spine first-seen first.
     fn walk_class(&self, class: ClassId, mut f: impl FnMut(Id, bool)) {
         let mut seen: FxHashSet<Id> = FxHashSet::default();
         let mut stack = vec![class.0];
@@ -384,18 +355,13 @@ impl EGraph {
         Builder { graph: self, caps }
     }
 
-    /// The next symbol this graph will mint. Part of a
-    /// [`SaturationDelta`]'s validity condition: two graphs with identical
-    /// nodes but a different `next_sym` saturate to different `fold_split`
-    /// block symbols.
+    /// The next symbol this graph will mint; part of a [`SaturationDelta`]'s
+    /// validity condition.
     pub fn next_sym_counter(&self) -> u32 {
         self.next_sym
     }
 
     /// Capture everything saturation may overwrite rather than append.
-    ///
-    /// `nodes` and `facts` are push-only, so they are captured at record time
-    /// instead; `parent`, `offered`, `roots` and `next_sym` are captured here.
     pub fn pre_saturation(&self) -> PreSaturation {
         PreSaturation {
             len: self.nodes.len(),
@@ -406,11 +372,8 @@ impl EGraph {
         }
     }
 
-    /// Record everything a saturation appended above `pre`.
-    ///
-    /// Saturation is a pure function of `(graph, caps, rules, budget)`, so a
-    /// graph in exactly the state `pre` describes saturates to exactly these
-    /// nodes at exactly these ids: replaying the recording is the same graph.
+    /// Record everything a saturation appended above `pre`. Saturation is a
+    /// pure function of `(graph, caps, rules, budget)`, so replay is exact.
     pub fn record_saturation(&self, pre: PreSaturation) -> SaturationDelta {
         debug_assert!(pre.len <= self.nodes.len());
         SaturationDelta {
@@ -427,12 +390,7 @@ impl EGraph {
     }
 
     /// Re-append a recorded saturation, or report `false` when this graph is
-    /// not the one the delta was recorded against.
-    ///
-    /// The validity check is exact, not a fingerprint: every pre-existing
-    /// node, every parent link, the offered set, the root set and the symbol
-    /// counter are compared by value. `len` and `next_sym` reject a mismatch
-    /// before any node is looked at.
+    /// not exactly (by value) the one the delta was recorded against.
     pub fn replay_saturation(&mut self, delta: &SaturationDelta) -> bool {
         let pre = &delta.pre;
         if self.nodes.len() != pre.len
@@ -443,9 +401,6 @@ impl EGraph {
         {
             return false;
         }
-        // The prefix is already equal, so only the tail is copied. The
-        // recording's memo is the post-saturation table by construction; the
-        // graph adopts it and `Arc::make_mut` forks it if later grown.
         if !self
             .offered
             .ones()
@@ -465,9 +420,7 @@ impl EGraph {
         true
     }
 
-    /// The read-only legality view of `id`, as handed to a rule. The
-    /// returned [`Facts`] borrows only `caps`, never the graph, so a driver
-    /// can build it and then hand out a `&mut Builder` over the same graph.
+    /// The read-only legality view of `id`, as handed to a rule.
     pub fn facts_view<'c>(&self, id: Id, caps: &'c Caps) -> Facts<'c> {
         let node = &self.nodes[id.index()];
         Facts {
@@ -489,9 +442,7 @@ fn canonicalize(op: &Op, children: &mut Children) {
     }
 }
 
-/// The write side of the e-graph, handed to a rule. Exposes no consumer
-/// counts, liveness, cost or extraction state: guards can only encode
-/// legality; profitability lives in the cost model.
+/// The write side of the e-graph, handed to a rule.
 pub struct Builder<'a> {
     graph: &'a mut EGraph,
     caps: &'a Caps,
@@ -505,8 +456,7 @@ impl<'a> Builder<'a> {
     pub fn class_of(&self, id: Id) -> ClassId {
         self.graph.class_of(id)
     }
-    /// Every node in `id`'s class. A rule that composes launches needs the
-    /// launch spelling of a value it was handed by its logical id.
+    /// Every node in `id`'s class.
     pub fn class_members(&self, id: Id) -> Vec<Id> {
         self.graph.members(self.graph.class_of(id))
     }
@@ -578,10 +528,8 @@ impl ViewSpine {
     }
 }
 
-/// The read-only capability token a rule's guards see. Borrows only
-/// [`Caps`], never the graph, so a rule can hold it across a `&mut Builder`
-/// call. Exposes types, shapes, numerics and device caps; never consumer
-/// counts, liveness, cost or extraction state.
+/// The read-only facts a rule's guards see; borrows only [`Caps`], so a rule
+/// can hold it across a `&mut Builder` call.
 pub struct Facts<'a> {
     caps: &'a Caps,
     level: Level,
@@ -616,28 +564,24 @@ impl<'a> Facts<'a> {
     }
 }
 
-/// Whether a rule adds an alternative or is guaranteed to descend a level.
-/// On budget exhaustion the driver offers only `StrictlyLowering` rules, so
-/// every chain still reaches a runnable plan — a degraded-but-valid plan,
-/// never a hard error.
+/// Whether a rule adds an alternative or is guaranteed to descend a level;
+/// on budget exhaustion only `StrictlyLowering` rules run.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RuleTag {
     Additive,
     StrictlyLowering,
 }
 
-/// A rewrite rule's body. The driver clones the node and builds [`Facts`]
-/// before calling, so the four parameters do not alias. `Some(id)` reports
-/// the id the rule unioned into the chain; `None` means it did not apply.
+/// A rewrite rule's body: `Some(id)` reports the id unioned into the chain,
+/// `None` that it did not apply.
 pub type RuleFn = fn(&mut Builder<'_>, Id, &Node, &Facts<'_>) -> Option<Id>;
 
-/// One rewrite rule. Rule order carries no semantics; the fixed order in a
-/// `RULES: &[Rule]` exists only for reproducibility.
+/// One rewrite rule, offered every node whose tag is one of `heads`.
 #[derive(Copy, Clone)]
 pub struct Rule {
     pub name: &'static str,
     pub level: Level,
-    pub head: OpTag,
+    pub heads: &'static [OpTag],
     pub tag: RuleTag,
     pub apply: RuleFn,
 }
@@ -647,18 +591,15 @@ impl fmt::Debug for Rule {
         f.debug_struct("Rule")
             .field("name", &self.name)
             .field("level", &self.level)
-            .field("head", &self.head)
+            .field("heads", &self.heads)
             .field("tag", &self.tag)
             .finish()
     }
 }
 
-/// Saturation limits. Exhausting any of them degrades to
-/// [`RuleTag::StrictlyLowering`]; it is never an error.
-///
-/// Every term is a count, never a clock: a wall-clock cutoff makes the set
-/// of alternatives — and therefore the extracted plan and its `PlanHash` —
-/// depend on how loaded the machine was.
+/// Saturation limits. Exhausting any degrades to
+/// [`RuleTag::StrictlyLowering`]. Counts, never a clock, so plans are
+/// deterministic.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct SaturationBudget {
     /// Retain existing nodes and allow `node_slope * new_nodes + node_slack`
@@ -666,8 +607,7 @@ pub struct SaturationBudget {
     pub node_slope: u32,
     pub node_slack: u32,
     pub max_rounds: u32,
-    /// Rule bodies invoked; keeps a pathological graph's compile time bounded
-    /// without reading a clock.
+    /// Rule bodies invoked.
     pub max_applications: u32,
     /// Raise the application limit to at least this many invocations per
     /// newly offered reachable node. Zero keeps `max_applications` fixed.
@@ -675,16 +615,8 @@ pub struct SaturationBudget {
 }
 
 impl Default for SaturationBudget {
-    /// The shipped budget: eight nodes per newly offered node plus 4096,
-    /// retaining existing history; 10 rounds and 200k rule applications.
-    ///
-    /// A round count bounds chain depth; the deepest chain in the suite is
-    /// attention, whose slowest member first saturates at 9 rounds, so 10 is
-    /// the tightest value that clears all four variants with headroom.
-    ///
-    /// Raising any of these moves extraction across the whole suite and
-    /// `PlanHash` is a golden, so it is not a knob to turn without re-running
-    /// both `fusor-conformance` and `cargo test --workspace`.
+    /// The shipped budget. 10 rounds clears attention (the deepest chain,
+    /// 9 rounds); changing any term moves every golden plan.
     fn default() -> Self {
         Self {
             node_slope: 8,
@@ -707,15 +639,13 @@ pub struct SaturationReport {
     /// Rule bodies invoked, against `SaturationBudget::max_applications`.
     pub applications: u32,
     pub saturated: bool,
-    /// Chains that stopped receiving additive alternatives because a budget
-    /// was hit. Reported to conformance.
+    /// Chains that stopped receiving additive alternatives at a budget.
     pub truncated: Vec<Id>,
     pub fired: Vec<(&'static str, u32)>,
 }
 
-/// The overwritable part of a graph's state immediately before saturation.
-/// Captured by [`EGraph::pre_saturation`]; carried inside a
-/// [`SaturationDelta`] as the exact condition its replay is valid under.
+/// The overwritable part of a graph's state immediately before saturation:
+/// the exact condition a [`SaturationDelta`]'s replay is valid under.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct PreSaturation {
     len: usize,
@@ -735,17 +665,12 @@ impl PreSaturation {
 }
 
 /// Everything one saturation appended to a graph, replayable onto any graph
-/// in the identical pre-state.
-///
-/// Holds no [`Caps`], no rule table and no [`SaturationBudget`]: it is a
-/// recording of an outcome, and the caller guarantees the other three inputs
-/// are the ones that produced it (a `Session` fixes all three for its life).
+/// in the identical pre-state; the caller guarantees caps, rules and budget.
 #[derive(Clone, Debug)]
 pub struct SaturationDelta {
     pre: PreSaturation,
-    /// The whole post-saturation state. `nodes[..pre.len]` doubles as the
-    /// recording's validity condition — `nodes` is append-only, so those
-    /// entries are exactly the term saturation was handed.
+    /// The whole post-saturation state; `nodes[..pre.len]` doubles as the
+    /// validity condition.
     nodes: Vec<Node>,
     facts: Vec<ValueFacts>,
     memo: Arc<FxHashMap<NodeKey, Id>>,
@@ -764,15 +689,13 @@ impl SaturationDelta {
     pub fn added(&self) -> usize {
         self.nodes.len() - self.pre.len
     }
-    /// O(1) rejection, so a memo scan does not compare node lists it is
-    /// already known to differ from.
+    /// O(1) rejection before comparing node lists.
     pub fn could_apply_to(&self, graph: &EGraph) -> bool {
         graph.len() == self.pre.len && graph.next_sym_counter() == self.pre.next_sym
     }
 }
 
-/// The saturation driver. Object-safe. Implemented once in `fusor-ir`;
-/// targets contribute rules, never a driver.
+/// The saturation driver; targets contribute rules, never a driver.
 pub trait Saturate: Send + Sync {
     fn saturate(
         &self,

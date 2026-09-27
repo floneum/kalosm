@@ -1,31 +1,9 @@
-//! TUPLE — two reduction nests over the same iteration space and the same
-//! reduction axis are ONE nest over the concatenated carrier.
-//!
-//! ```text
-//! < Fold{C1, a, ops1}, Fold{C2, a, ops2} >
-//!   ==  slot views of  Fold{ C1 (x) C2, a, ops1 u ops2 }
-//! ```
-//!
-//! `(x)` is [`Carrier::tuple`], whose slot deduplication happens inside the
-//! constructor, so joining `(m,l)` with `(m,o)` yields three slots and not
-//! four by construction.
-//!
-//! Exactly value-preserving: every slot folds in precisely the order it folded
-//! alone, so this law needs no `reassoc` guard and is legal on an f16
-//! accumulator and under [`NumericContract::STRICT`].
-//!
-//! Rooting is consumer-rooted: the rule fires at a node that already reads
-//! both nests.
-//!
-//! * [`TUPLE`] roots at a `Map` consumer.
-//! * [`TUPLE_SIBLING`] roots at a `Fold` consumer — a reducing nest that
-//!   itself reads two reducing nests.
-//!
-//! Acyclicity: neither nest's operand closure may transitively reach the
-//! other's result, checked through `Op::Union` chains as well as `children`,
-//! because the acyclic id allocator does not see a cycle that runs through a
-//! union. TUPLE never discharges a carried dependence itself; that is
-//! RETARGET's job.
+//! TUPLE — two reduction nests over the same iteration space and reduction
+//! axis are one nest over the concatenated carrier ([`Carrier::tuple`], which
+//! dedups slots). Order-preserving per slot, so legal under
+//! [`NumericContract::STRICT`]. Fires at a consumer reading both nests:
+//! [`TUPLE`] at a `Map` or a `Fold`. Neither nest's
+//! operand closure may reach the other's result.
 
 use crate::carrier::{ArgRemap, Carrier, Tupled, map_args, retype_args};
 use crate::dtype::NumericContract;
@@ -43,23 +21,13 @@ use smallvec::SmallVec;
 rule!(
     TUPLE,
     level = Level::Launch,
-    head = OpTag::LaunchMap,
+    heads = [OpTag::LaunchMap, OpTag::LaunchFold],
     tag = RuleTag::Additive,
     apply = tuple_at,
 );
 
-rule!(
-    TUPLE_SIBLING,
-    level = Level::Launch,
-    head = OpTag::LaunchFold,
-    tag = RuleTag::Additive,
-    apply = tuple_at,
-);
-
-/// The same nest, whichever id spells it. Ignores `id`: that is the
-/// Logical-versus-Launch spelling the acyclicity walk must not miss. Also
-/// ignores `sched`: a schedule domain is not a value, so a tiled spelling of
-/// a nest is that nest.
+/// The same nest, whichever id spells it; ignores `id` (Logical vs Launch
+/// spelling) and `sched` (not a value).
 fn same_nest(a: &FoldView, b: &FoldView) -> bool {
     a.space == b.space
         && a.axis == b.axis
@@ -70,14 +38,10 @@ fn same_nest(a: &FoldView, b: &FoldView) -> bool {
         && a.ops == b.ops
 }
 
-/// Read `id` as a reduction nest, in either spelling.
-///
-/// This does not look through a `post` epilogue.
+/// Read `id` as a reduction nest whose facts match its `acc` output, which
+/// the joint's readback view must reproduce.
 fn fold_view(b: &Builder<'_>, id: Id) -> Option<FoldView> {
     let v = bare_fold_view(b, id)?;
-    // The readback the join unions against is a strided view of the joint,
-    // typed `acc` and shaped like the nest's output. A spelling whose facts
-    // disagree is not a value this law may redirect.
     let f = b.facts_of(id);
     let want = v.space.fold_shape(v.axis, &v.vec_axes, &v.carrier)?;
     if f.dtype != v.acc || f.shape != want {
@@ -86,9 +50,8 @@ fn fold_view(b: &Builder<'_>, id: Id) -> Option<FoldView> {
     Some(v)
 }
 
-/// The nest itself, in either spelling. A `Logical::Fold`'s lift is retyped
-/// to the operand dtype as `lower_fold` does, so the two spellings produce
-/// one hash-consed joint node.
+/// The nest in either spelling, a `Logical::Fold`'s lift retyped as
+/// `lower_fold` does so both hash-cons to one joint.
 fn bare_fold_view(b: &Builder<'_>, id: Id) -> Option<FoldView> {
     let mut v = crate::rules::fold_view(b, id)?;
     if let Op::Logical(_) = b.node(id).op {
@@ -114,8 +77,6 @@ struct Joint {
     rhs_read: Id,
 }
 
-/// [`TUPLE`] roots at a `Map` consumer, [`TUPLE_SIBLING`] at a `Fold` — a
-/// reducing nest that reads two reducing nests.
 pub fn tuple_at(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     let Op::Launch(op @ (Launch::Map { .. } | Launch::Fold { .. })) = &node.op else {
         return None;
@@ -130,9 +91,8 @@ pub fn tuple_at(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Opt
     b.union(id, rebuilt).ok()
 }
 
-/// The first pair of operand slots reading joinable nests, in a deterministic
-/// scan. One firing joins one pair; the rewritten consumer is a fresh node
-/// the driver re-queues, so `F` nests cost `F-1` firings.
+/// Join the first pair of operand slots reading joinable nests; the rewritten
+/// consumer is re-queued, so `F` nests cost `F-1` firings.
 fn join_pair(b: &mut Builder<'_>, ops: &[Id]) -> Option<Rewire> {
     for i in 0..ops.len() {
         let si = b.trace_pure_views(ops[i]);
@@ -144,8 +104,7 @@ fn join_pair(b: &mut Builder<'_>, ops: &[Id]) -> Option<Rewire> {
             let Some(vj) = fold_view(b, sj.base) else {
                 continue;
             };
-            // Deterministic join order: the smaller id is the left carrier,
-            // so operand order cannot change the slot order or the `PlanHash`.
+            // The smaller id is the left carrier, so slot order is stable.
             let swapped = vj.id.0 < vi.id.0;
             let (lhs, rhs) = if swapped { (&vj, &vi) } else { (&vi, &vj) };
             let Some(joint) = join(b, lhs, rhs) else {
@@ -166,28 +125,10 @@ fn join_pair(b: &mut Builder<'_>, ops: &[Id]) -> Option<Rewire> {
     None
 }
 
-/// The law proper. Every legality check and every derived value is computed
-/// before the first `add`, so a declined join leaves no orphan nodes.
-///
-/// `axis` is the wrong number to compare: it indexes `space`, which a
-/// promoted nest has widened with its carrier axes, so the same logical
-/// reduction is `axis = 3` unpromoted and `axis = 4` with one carrier axis
-/// ahead of it. The number both sides agree on is `axis - vec_axes.len()`,
-/// the reduced axis's index in [`FoldView::iter_space`].
-///
-/// `vec_axes` equality is a real requirement only between two nests that are
-/// both promoted: two different promotions are two different carrier
-/// geometries. Between a promoted nest and an unpromoted one the joint takes
-/// the promoted side's `space`, `axis` and `vec_axes`, and the unpromoted
-/// side's operands are restated onto that wider space by [`widen_ops`] with
-/// stride 0 at each carrier axis. Stride 0 is what makes the mixed carrier
-/// legal: `check_vec_axes` refuses a `Scalar` slot whose lift reads an
-/// operand that varies along a promoted axis, and a stride-0 widening
-/// provably does not.
-///
-/// The cross-promotion clause is presently latent — the shipped rule table
-/// never presents a promoted nest as one of a pair —
-/// `tuple_joins_a_promoted_nest_with_an_unpromoted_one` is what exercises it.
+/// The law proper; every check precedes the first `add`, so a declined join
+/// leaves no orphans. Axes compare in [`FoldView::iter_space`], since
+/// promotion shifts `axis`; a promoted host widens the other side's operands
+/// with stride 0 at its carrier axes ([`widen_ops`]).
 fn join(b: &mut Builder<'_>, f1: &FoldView, f2: &FoldView) -> Option<Joint> {
     if f1.id == f2.id || f1.acc != f2.acc {
         return None;
@@ -209,18 +150,11 @@ fn join(b: &mut Builder<'_>, f1: &FoldView, f2: &FoldView) -> Option<Joint> {
         return None;
     }
     let host = promotion_host(f1, f2)?;
-    // Fusing two nests forces one accumulator contract: choosing the narrower
-    // lowers `min_accum_bits` and choosing the wider silently rewrites the
-    // other nest's rounding.
+    // One accumulator contract, or one side's rounding silently changes.
     if b.facts_of(f1.id).numeric != b.facts_of(f2.id).numeric {
         return None;
     }
-    // No guard on `sched`: a schedule domain is not a value; the joint is
-    // minted at the floor and the schedule rules expand it as any other nest.
-
-    // Acyclicity: the joint reads both operand lists and is unioned into both
-    // classes, so a realized DAG has a cycle exactly when some unified
-    // operand reaches either result.
+    // The joint joins both classes: a cycle iff an operand reaches either.
     let (ops, remap) = unify_ops(&widen_ops(f1, host)?, &widen_ops(f2, host)?)?;
     let srcs: Vec<Id> = ops.iter().map(|o| o.src).collect();
     if reaches_either(b, &srcs, f1, f2) {
@@ -228,15 +162,13 @@ fn join(b: &mut Builder<'_>, f1: &FoldView, f2: &FoldView) -> Option<Joint> {
     }
 
     let t: Tupled = f1.carrier.tuple(&f2.carrier, &remap);
-    // Every `Vector` extent must be `Dim::Const`: a symbolic private-array
-    // extent is allocatable on neither backend.
+    // Symbolic private-array extents are allocatable on neither backend.
     let lanes = t.carrier.lanes()?;
     let bytes = lanes.checked_mul(f1.acc.byte_size())?;
     if bytes > crate::rules::private_acc_bytes(b.caps(), false) {
         return None;
     }
-    // The rewritten nest's contract is the meet over the unified operand
-    // list, which can be stricter than either side's.
+    // The meet over the unified list can be stricter than either side's.
     let joint_numeric = ops.iter().fold(NumericContract::RELAXED, |acc, o| {
         acc.meet(b.facts_of(o.src).numeric)
     });
@@ -245,12 +177,9 @@ fn join(b: &mut Builder<'_>, f1: &FoldView, f2: &FoldView) -> Option<Joint> {
     }
     let post = joint_post(f1, f2, &t)?;
 
-    // Each side's slots must occupy one contiguous lane range of the joint
-    // carrier axis, or its value is not a strided view of the joint.
+    // Each side must be one contiguous lane range to be a view of the joint.
     let lhs_range = lane_range(&t.carrier, &t.lhs)?;
     let rhs_range = lane_range(&t.carrier, &t.rhs)?;
-    // The readbacks are views of the joint, so they are spelled with the dims
-    // the joint was minted at — the host's.
     let base = host.base_dims();
     let joint_axis = t.carrier.out_dim()?;
     let l_out = f1.carrier.out_dim()?;
@@ -274,16 +203,10 @@ fn join(b: &mut Builder<'_>, f1: &FoldView, f2: &FoldView) -> Option<Joint> {
     Some(Joint { lhs_read, rhs_read })
 }
 
-/// Which side's carrier geometry the joint is minted in, or `None` when there
-/// is no single nest holding both.
-///
-/// Equal `vec_axes` (both unpromoted included) takes the left side. Exactly
-/// one promoted side hosts. Two different promotions decline: the joint would
-/// have to hold two carrier geometries at once.
+/// The side whose carrier geometry the joint takes: the left on equal
+/// promotions (extents included), else the only promoted one.
 fn promotion_host<'v>(f1: &'v FoldView, f2: &'v FoldView) -> Option<&'v FoldView> {
     if f1.vec_axes == f2.vec_axes {
-        // The promoted extents must also agree, or the two carriers span
-        // different numbers of positions.
         for &v in &f1.vec_axes {
             let (d1, d2) = (
                 f1.space.dims.get(v as usize)?,
@@ -302,12 +225,8 @@ fn promotion_host<'v>(f1: &'v FoldView, f2: &'v FoldView) -> Option<&'v FoldView
     }
 }
 
-/// One side's operands restated over the host's space.
-///
-/// The host's own ride through untouched. A guest that is not promoted gets
-/// stride 0 at every carrier axis the host added, which is both true (the
-/// guest never had the axis) and the condition
-/// `verify_launch::check_vec_axes` demands of a `Scalar` slot's operands.
+/// One side's operands restated over the host's space: stride 0 at each
+/// carrier axis, as `check_vec_axes` demands of a `Scalar` slot's operands.
 fn widen_ops(side: &FoldView, host: &FoldView) -> Option<Vec<Operand>> {
     if side.vec_axes == host.vec_axes {
         return Some(side.ops.clone());
@@ -323,8 +242,6 @@ fn unify_ops(lhs: &[Operand], rhs: &[Operand]) -> Option<(Vec<Operand>, ArgRemap
     let mut ops = lhs.to_vec();
     let mut map: SmallVec<[u32; 4]> = SmallVec::new();
     for o in rhs {
-        // Identical source and addressing expressions read the same elements,
-        // including when the dimensions are resolved at dispatch.
         match ops.iter().position(|p| p == o) {
             Some(k) => map.push(u32::try_from(k).ok()?),
             None => {
@@ -342,16 +259,14 @@ fn reaches_either(b: &Builder<'_>, from: &[Id], f1: &FoldView, f2: &FoldView) ->
     let mut seen: FxHashSet<Id> = FxHashSet::default();
     let mut stack: Vec<Id> = from.to_vec();
     while let Some(cur) = stack.pop() {
-        // Every edge points at a strictly smaller id, so nothing below the
-        // lower of the two nests can reach either.
+        // Edges point to smaller ids: nothing below the floor reaches either.
         if cur.0 < floor || !seen.insert(cur) {
             continue;
         }
         if cur == f1.id || cur == f2.id {
             return true;
         }
-        // The Logical and Launch spellings of one nest are two ids in one
-        // class; compare the normalized nest, not the id.
+        // Compare the normalized nest: its other spelling has another id.
         if matches!(b.node(cur).op.tag(), OpTag::Fold | OpTag::LaunchFold)
             && let Some(v) = fold_view(b, cur)
             && (same_nest(&v, f1) || same_nest(&v, f2))
@@ -363,10 +278,7 @@ fn reaches_either(b: &Builder<'_>, from: &[Id], f1: &FoldView, f2: &FoldView) ->
     false
 }
 
-/// One post expression per joint slot.
-///
-/// A deduplicated slot carries one post, so the two sides have to agree on it:
-/// they are two spellings of one value, and if their posts differ they are not.
+/// One post expression per joint slot; a deduplicated slot's posts must agree.
 fn joint_post(f1: &FoldView, f2: &FoldView, t: &Tupled) -> Option<SmallVec<[ScalarExpr; 4]>> {
     let w = t.carrier.width();
     let ns = f1.carrier.width();
@@ -415,9 +327,8 @@ fn lane_range(c: &Carrier, slots: &[u8]) -> Option<(u64, u64)> {
     Some((start, cur - start))
 }
 
-/// One side's readback: a `Restride` narrowing the joint carrier axis to that
-/// side's lanes, plus — for a side that had no carrier axis of its own — the
-/// unit-axis `Restride` that drops it.
+/// One side's readback: the joint carrier axis narrowed to its lanes, then
+/// dropped if the side had no carrier axis.
 fn slot_view(
     b: &mut Builder<'_>,
     joint: Id,
@@ -428,8 +339,7 @@ fn slot_view(
 ) -> Option<Id> {
     let (start, len) = range;
     let Some(joint_lanes) = joint_axis else {
-        // The joint carrier is one scalar slot, so it appended no axis and
-        // the side has to be that same slot.
+        // A one-scalar joint appended no axis; the side is that slot.
         return (side_axis.is_none() && range == (0, 1)).then_some(joint);
     };
     if side_axis == joint_axis && start == 0 && joint_lanes.known_eq(Dim::Const(len)) {

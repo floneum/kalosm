@@ -27,11 +27,8 @@ pub fn infer_launch(op: &Launch, ins: &[ValueFacts]) -> Result<ValueFacts> {
             Ok(ValueFacts::step(body.dtype(), space.dims.clone(), ins))
         }
 
-        // The reduced axis leaves the shape and the carrier's lane count is
-        // appended when it exceeds one — the convention slot readback is an
-        // ordinary `Restride` of. Promoted axes leave the *iteration* domain
-        // but stay in the output shape as carrier lanes, which is exactly why
-        // `PROMOTE` does not change a node's `ValueFacts` at all.
+        // Promoted axes stay in the output shape as carrier lanes, so
+        // `PROMOTE` never changes a node's `ValueFacts`.
         Launch::Fold {
             space,
             axis,
@@ -55,11 +52,8 @@ pub fn infer_launch(op: &Launch, ins: &[ValueFacts]) -> Result<ValueFacts> {
         Launch::Contract { output, post, .. } => {
             Ok(ValueFacts::step(post.dtype(), output.dims.clone(), ins))
         }
-        // `QuantizedRows` reads the quantized leaf but *decodes* every
-        // element it gathers, so its value is float-typed and step-lived —
-        // inheriting the leaf's `Q(fmt)` dtype is exactly the double-decode
-        // this mode exists to avoid, and inheriting the leaf's persistence
-        // would cache a value that changes with every step's indices.
+        // `QuantizedRows` decodes what it gathers: float-typed and step-lived,
+        // never the leaf's `Q(fmt)` dtype or persistence.
         Launch::Gather {
             space,
             mode: crate::ir::launch::GatherMode::QuantizedRows,
@@ -71,13 +65,8 @@ pub fn infer_launch(op: &Launch, ins: &[ValueFacts]) -> Result<ValueFacts> {
             ..ValueFacts::step(Dtype::F32, space.dims.clone(), ins)
         }),
 
-        // A scatter's value is its **base** with the updates applied, so its
-        // shape comes from operand 0 — never from `space`. The two disagree:
-        // `fusor_tile::rules::scatter` mints the *update* iteration domain
-        // (`[index_count, ...]`), so reading the shape off `space` sized a
-        // 1024-row table's buffer at the 300 tokens that wrote into it, and
-        // every element past the update count came back undefined. `infer_logical`
-        // already says `Scatter` returns the base facts; this has to agree.
+        // A scatter's value is its base, so its shape comes from operand 0,
+        // never from `space` (which may be the update domain).
         Launch::Scatter { space, .. } => match ins.first() {
             Some(base) => Ok(ValueFacts {
                 numeric: ValueFacts::meet(ins),
@@ -86,8 +75,7 @@ pub fn infer_launch(op: &Launch, ins: &[ValueFacts]) -> Result<ValueFacts> {
             None => Ok(ValueFacts::step(Dtype::F32, space.dims.clone(), ins)),
         },
 
-        // A slab is its last member's value; the children are the members in
-        // order, so that is the last of `ins`.
+        // A composite is its last member's value, the last of `ins`.
         Launch::Slab { members, .. } | Launch::Group { members, .. } => {
             if members.len() < 2 {
                 return Err(Error::Shape("a Slab needs at least two members".into()));

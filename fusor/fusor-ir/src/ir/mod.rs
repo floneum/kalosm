@@ -31,11 +31,8 @@ impl fmt::Display for Level {
     }
 }
 
-/// A node's operator. `Union` is a *node*, not a union-find edge: it keeps
-/// every alternative alive simultaneously without a rebuild, and is
-/// allocated at an id strictly greater than both operands, so acyclicity is
-/// a property of the id allocator.
-// Inherits `Launch`'s size; see the note on that enum.
+/// A node's operator. `Union` is a node above both operands, so every
+/// alternative stays alive without a rebuild and the graph stays acyclic.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Op {
@@ -67,9 +64,7 @@ impl Op {
 /// Children of one node, inline up to 4.
 pub type Children = SmallVec<[Id; 4]>;
 
-/// One hash-consed e-graph node. **Acyclicity is structural, not checked**:
-/// `children` may only contain ids strictly smaller than the node's own,
-/// and the only id allocator is `EGraph::add`.
+/// One hash-consed e-graph node; `children` are strictly smaller ids.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Node {
     pub op: Op,
@@ -133,9 +128,7 @@ pub struct VerifyCtx<'a> {
 }
 
 /// Type inference, cost accounting, verification and effects for one
-/// operator. One implementation ([`crate::CoreSemantics`]) covers the
-/// closed `Logical`/`Launch` enums.
-/// Object-safe: the e-graph stores it as `Arc<dyn Semantics>`.
+/// operator; implemented once by [`crate::CoreSemantics`].
 pub trait Semantics: Send + Sync {
     /// Operand ids of `op`, in the order every other method expects.
     fn children(&self, op: &Op) -> Children;

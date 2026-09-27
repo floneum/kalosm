@@ -1,8 +1,6 @@
-//! The saturation driver: a worklist in creation order over a
-//! `(RuleId, Id)` bitset, bounded by [`SaturationBudget`]. On exhaustion it
-//! offers only [`RuleTag::StrictlyLowering`] rules, guaranteeing every chain
-//! provably reaches a runnable Launch form — budget exhaustion yields a
-//! degraded-but-valid plan, never a hard error. Truncation is never silent.
+//! The saturation driver: a creation-order worklist over a `(RuleId, Id)`
+//! bitset, bounded by [`SaturationBudget`]. On exhaustion only
+//! [`RuleTag::StrictlyLowering`] rules run, so the plan degrades but stays valid.
 
 use crate::device::Caps;
 use crate::egraph::{EGraph, Id, Rule, RuleTag, Saturate, SaturationBudget, SaturationReport};
@@ -27,42 +25,15 @@ impl CoreSaturate {
     }
 }
 
-/// Dense index of an [`OpTag`], for the O(1) head-dispatch table.
-const TAG_COUNT: usize = 19;
-
-const fn tag_index(tag: OpTag) -> usize {
-    match tag {
-        OpTag::Leaf => 0,
-        OpTag::Map => 1,
-        OpTag::Fold => 2,
-        OpTag::Contract => 3,
-        OpTag::Restride => 4,
-        OpTag::Window => 5,
-        OpTag::Gather => 6,
-        OpTag::Scatter => 7,
-        OpTag::Dequant => 8,
-        OpTag::Project => 9,
-        OpTag::LaunchMap => 10,
-        OpTag::LaunchFold => 11,
-        OpTag::LaunchContract => 12,
-        OpTag::LaunchGather => 13,
-        OpTag::LaunchScatter => 14,
-        OpTag::Union => 15,
-        OpTag::LaunchSlab => 16,
-        OpTag::LaunchGroup => 17,
-        OpTag::LaunchStreamFold => 18,
-    }
-}
-
-/// `by_head[tag_index(rule.head)]` — built once per call, positions into the
-/// `rules` slice, so `RuleId` is positional within whatever slice the caller
-/// concatenated.
-type HeadTable = [SmallVec<[RuleId; 8]>; TAG_COUNT];
+/// `by_head[tag as usize]`: positions into the caller's `rules` slice.
+type HeadTable = [SmallVec<[RuleId; 8]>; OpTag::Union as usize + 1];
 
 fn head_table(rules: &[Rule]) -> HeadTable {
     let mut table: HeadTable = std::array::from_fn(|_| SmallVec::new());
     for (i, r) in rules.iter().enumerate() {
-        table[tag_index(r.head)].push(RuleId(i as u16));
+        for &head in r.heads {
+            table[head as usize].push(RuleId(i as u16));
+        }
     }
     table
 }
@@ -85,13 +56,9 @@ impl Saturate for CoreSaturate {
         let mut rounds = 0u32;
         let mut applications = 0u32;
 
-        // Creation order is already a topological order: children are
-        // strictly smaller ids. Only what the roots reach is offered: a
-        // node no root reaches is never selected, and offering it would
-        // mint alternatives for it without bound as the arena accumulates
-        // the terms of earlier resolves. Earlier bounded searches mark the
-        // region they covered, including candidates left at budget exhaustion.
-        // A new root must not restart that region's optimization search.
+        // Creation order is topological. Only root-reachable nodes not
+        // covered by an earlier bounded search are offered, so the arena's
+        // old terms never grow alternatives without bound.
         let reachable = graph.reachable_from_roots();
         let mut work: VecDeque<Id> = reachable
             .ones()
@@ -107,9 +74,7 @@ impl Saturate for CoreSaturate {
                 .application_slope
                 .saturating_mul(new_nodes.min(u32::MAX as usize) as u32),
         );
-        // One rule fires at most once per node. The stride is fixed for the
-        // whole call so a bit's index never moves; the set itself grows with
-        // the graph.
+        // One rule fires at most once per node; the stride is fixed per call.
         let stride = max_nodes.max(initial).saturating_add(4096).max(64);
         let mut fired = FixedBitSet::with_capacity(rules.len().saturating_mul(64));
 
@@ -122,7 +87,7 @@ impl Saturate for CoreSaturate {
                 if id.index() >= graph.len() {
                     continue;
                 }
-                let candidates = &by_head[tag_index(graph.node(id).op.tag())];
+                let candidates = &by_head[graph.node(id).op.tag() as usize];
                 if candidates.is_empty() {
                     continue;
                 }
@@ -168,18 +133,14 @@ impl Saturate for CoreSaturate {
             saturated = false;
         }
 
-        // The degraded pass. Runs when a budget was hit, and unconditionally
-        // as a final sweep whenever some chain has no Launch member. A
-        // `StrictlyLowering` rule is idempotent by hash-consing, so
-        // re-offering one is a memo hit; that is what lets this ignore the
-        // fired set and the node ceiling entirely.
+        // The degraded pass, when a budget was hit or a chain has no Launch
+        // member. Lowering is idempotent by hash-consing, so it ignores the
+        // fired set and the node ceiling.
         if !saturated || missing_l1(graph, &reachable) {
             applications +=
                 lower_everything(graph, caps, rules, &by_head, &mut fired_counts, &reachable);
         }
-        // The lowering floor makes the whole reached region runnable, even
-        // where optimization stopped. Keep unrelated existing nodes eligible
-        // for a later root, but do not expand this region's leftovers again.
+        // Mark this region searched; unrelated nodes stay eligible.
         for i in reachable.ones().chain(initial..graph.len()) {
             graph.mark_offered(Id(i as u32));
         }
@@ -204,12 +165,10 @@ impl Saturate for CoreSaturate {
     }
 }
 
-/// Whether any non-leaf Logical value still has no Launch spelling. This is the
-/// extractor's only contract with saturation, so it is checked rather than
-/// assumed.
+/// Whether any non-leaf Logical value still has no Launch spelling, the
+/// extractor's only contract with saturation.
 fn missing_l1(graph: &EGraph, reachable: &FixedBitSet) -> bool {
-    // Nodes minted during this pass sit past the reachable set's bound and
-    // are reachable by construction.
+    // Nodes minted during this pass are reachable by construction.
     let minted = reachable.len()..graph.len();
     reachable.ones().chain(minted).any(|i| {
         let id = Id(i as u32);
@@ -235,9 +194,7 @@ fn lower_everything(
     reachable: &FixedBitSet,
 ) -> u32 {
     let mut applications = 0u32;
-    // The reachable set, then every id minted past it as the pass runs;
-    // walking to the current length keeps the floor total without a second
-    // sweep.
+    // The reachable set, then every id minted past it as the pass runs.
     let bound = reachable.len();
     let mut pending: Vec<Id> = reachable.ones().map(|i| Id(i as u32)).collect();
     pending.reverse();
@@ -255,7 +212,7 @@ fn lower_everything(
         if graph.node(id).level != Level::Logical {
             continue;
         }
-        let candidates = &by_head[tag_index(graph.node(id).op.tag())];
+        let candidates = &by_head[graph.node(id).op.tag() as usize];
         if candidates.is_empty() {
             continue;
         }
@@ -270,8 +227,7 @@ fn lower_everything(
             let mut builder = graph.builder(caps);
             applications += 1;
             let applied = (rule.apply)(&mut builder, id, &node, &facts);
-            // Only a pass that actually grew the graph counts as a firing;
-            // a memo hit on an already-lowered node is not news.
+            // A memo hit is not a firing.
             if applied.is_some() && graph.len() > before {
                 fired_counts[rid.0 as usize] += 1;
             }

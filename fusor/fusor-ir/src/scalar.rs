@@ -1,6 +1,4 @@
-//! The closed scalar vocabulary. One `Map` with a different [`ScalarExpr`] is
-//! every elementwise unary, every comparison, `where_cond`, `clamp`, `relu`,
-//! `sigmoid`, `silu`, `gelu` and `tanh_exact`.
+//! The closed scalar vocabulary every elementwise `Map` body is written in.
 
 use crate::dtype::{Dtype, RoundMode, Splat};
 use crate::shape::SymId;
@@ -12,9 +10,8 @@ use std::sync::Arc;
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum UnOp {
     Exp,
-    /// `exp` under a relaxed accuracy contract. A **distinct node**, not sugar
-    /// for [`UnOp::Exp`]. The contract is a *permission* to substitute a
-    /// cheaper sequence, and no backend currently takes it.
+    /// `exp` under a relaxed accuracy contract: a distinct node permitting a
+    /// cheaper sequence.
     ApproximateExp,
     /// Medium-accuracy `exp`. See [`UnOp::ApproximateExp`].
     LessApproximateExp,
@@ -37,8 +34,7 @@ pub enum UnOp {
     Atanh,
     Abs,
     Neg,
-    /// Unpack a `u32` of two packed f16s into a 2-lane f32 vector — how
-    /// native-layout GGUF f16 scales are read without `SHADER_F16`.
+    /// Unpack a `u32` of two packed f16s into a 2-lane f32 vector.
     Unpack2x16Float,
 }
 
@@ -70,8 +66,7 @@ pub enum BinOp {
 }
 
 impl BinOp {
-    /// Commutative children are sorted by `Id` at construction, so
-    /// commutativity is a canonical form rather than a rule family.
+    /// Commutative children are sorted by `Id` at construction.
     pub const fn is_commutative(self) -> bool {
         matches!(
             self,
@@ -105,8 +100,7 @@ impl BinOp {
     }
 }
 
-/// The 6 comparisons. Results are 1.0/0.0 in the operand dtype — there is
-/// no boolean dtype at Logical.
+/// The 6 comparisons, yielding 1.0/0.0 in the operand dtype.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum CmpOp {
     Lt,
@@ -121,9 +115,8 @@ pub enum CmpOp {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Lit(pub Splat);
 
-/// A hash-consed scalar expression tree. `Clone` is a refcount bump;
-/// `PartialEq` compares the cached hash first. `Arc`, not `Rc`: kernel
-/// building runs on worker threads.
+/// A hash-consed scalar expression tree; `Clone` is a refcount bump and
+/// `PartialEq` compares the cached hash first.
 #[derive(Clone, Debug)]
 pub struct ScalarExpr(Arc<ScalarNode>);
 
@@ -135,8 +128,7 @@ pub struct ScalarNode {
     pub hash: u64,
 }
 
-/// The closed scalar vocabulary. `Hash` is bottom-up: children contribute
-/// their cached `structural_hash`, so hashing is O(1) per node.
+/// The closed scalar vocabulary; `Hash` is O(1) per node via cached child hashes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ScalarKind {
     /// Operand `i` of the enclosing `Map`/`Map` body.
@@ -166,8 +158,7 @@ pub enum ScalarKind {
         t: ScalarExpr,
         f: ScalarExpr,
     },
-    /// Numeric conversion, differentiable both directions with no special
-    /// case in `map_adjoint`.
+    /// Numeric conversion.
     Cast {
         to: Dtype,
         x: ScalarExpr,
@@ -248,8 +239,7 @@ impl ScalarExpr {
         Self::new(ScalarKind::Round { mode, x }, dtype)
     }
 
-    /// Replace an expression before descending into its children. Returning
-    /// `None` preserves the node and recursively rewrites its operands.
+    /// Replace an expression before descending; `None` rewrites its operands.
     pub fn rewrite(&self, f: &mut impl FnMut(&Self) -> Option<Self>) -> Self {
         if let Some(replacement) = f(self) {
             return replacement;
@@ -330,8 +320,7 @@ impl ScalarExpr {
         found
     }
 
-    /// Append every `Arg` index the body reads to `out`, first use first,
-    /// skipping any already there.
+    /// Append every new `Arg` index the body reads to `out`, first use first.
     pub fn collect_args(&self, out: &mut Vec<u32>) {
         self.walk(&mut |e| {
             if let ScalarKind::Arg(i) = e.kind()

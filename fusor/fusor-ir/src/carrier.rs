@@ -1,33 +1,8 @@
 //! The generic fold algebra: an N-slot accumulator with a lift and an
-//! associative merge, both ordinary [`ScalarExpr`]s.
+//! associative merge, both ordinary [`ScalarExpr`]s. Tupling, promotion and
+//! retargeting are the laws that derive the softmax, Welford and flash carriers.
 //!
-//! A carrier is data: slot shapes, per-slot identities, and two expressions.
-//! Online softmax, Welford, log-sum-exp, split-K and plain reductions are all
-//! values a rewrite rule constructs; `Add`, `Mul`, `Max` and `Min` are
-//! [`Carrier::binop`] values.
-//!
-//! # The laws that produce the interesting carriers
-//!
-//! **Tupling** ([`Carrier::tuple`]). Two folds over the same axis of the same
-//! input are one fold over the concatenated accumulator, with structurally
-//! identical slots deduplicated as canonicalization. Exactly value-preserving:
-//! every slot folds in precisely the order it folded alone, so this needs no
-//! `reassoc` permission.
-//!
-//! **Promotion** ([`Carrier::promote`]). A free axis of the nest moves into the
-//! accumulator's data space: `Scalar -> Vector(d)`. Register tiling, the CPU
-//! lane tile and flash's output accumulator are one law.
-//!
-//! **Retargeting** ([`Carrier::retarget`]). A reduction-carried dependence on
-//! another reduction over the same axis is discharged by carrying the reference
-//! alongside and rescaling by `T(rho_s - rho)`. At `h = exp` and a scalar
-//! module this is online softmax; at a `Vector(Dh)` module it is flash's output
-//! accumulator, with the *same* expression, because `(R^Dh, +)` is a monoid.
-//!
-//! Every carrier, however minted, owes [`Carrier::identity_closed`]:
-//! `merge(identity, identity) == identity`. A rescale spelled without
-//! [`Carrier::safe_delta`] computes `0 * exp((-inf) - (-inf)) = NaN`, and
-//! every workgroup-tree and subgroup schedule merges padded identity lanes.
+//! Every carrier owes [`Carrier::identity_closed`]: schedules merge padded identity lanes.
 
 use crate::dtype::{Dtype, Splat};
 use crate::ir::logical::TiePolicy;
@@ -35,16 +10,8 @@ use crate::scalar::{BinOp, CmpOp, ScalarExpr, ScalarKind, UnOp};
 use crate::shape::Dim;
 use smallvec::{SmallVec, smallvec};
 
-/// The shape of one accumulator slot.
-///
-/// [`SlotTy::Vector`] carries one value per position of a dim appended to the
-/// output shape — attention's `sum p*v` accumulator, which has to be rescaled
-/// by the same factor as the running sum and therefore has to be a slot of the
-/// *same* carrier rather than a separate fold.
-///
-/// A `Vector` extent should be [`Dim::Const`]: a symbolic private-array extent
-/// is allocatable on neither backend. [`Carrier::lanes`] returns `None` on a
-/// symbolic extent and every guard that reads it declines.
+/// The shape of one accumulator slot. A `Vector` slot holds one value per position of a
+/// dim appended to the output (attention's `sum p*v`); a symbolic extent is unallocatable.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SlotTy {
     Scalar,
@@ -60,33 +27,18 @@ impl SlotTy {
     }
 }
 
-/// A fold algebra: per-slot identities, a lift from an element into the
-/// accumulator, and an associative merge of two accumulators.
-///
-/// * `lift[k]` is an expression over `Arg(0..n_ops)` — the fold's **operands**.
-///   This is the one place an element expression lives; `Fold` carries no
-///   separate `pre`.
-/// * `merge[k]` is an expression over `Arg(0..w)` (the left accumulator) and
-///   `Arg(w..2w)` (the right one), `w = slots.len()`. Cross-*slot* reads are
-///   legal and required — flash's `l` and `o` both read `m`. A `Vector` slot's
-///   merge is positionwise: no merge may read another position.
-///
-/// The element-absorption form used by a sequential inner loop is
-/// `merge(acc, lift(x))`; a tree reduction uses `merge` directly on partial
-/// accumulators.
+/// A fold algebra: per-slot identities, `lift` over the fold's operands, and an associative
+/// `merge` over `Arg(0..w)` (left) and `Arg(w..2w)` (right). Cross-slot reads are legal;
+/// a `Vector` slot's merge is positionwise.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Carrier {
     pub slots: SmallVec<[SlotTy; 4]>,
     pub identity: SmallVec<[Splat; 4]>,
     pub lift: SmallVec<[ScalarExpr; 4]>,
     pub merge: SmallVec<[ScalarExpr; 4]>,
-    /// Declared associativity. A non-associative carrier is legal but may not
-    /// be split or tree-reduced; `fold_split` and every collective strategy
-    /// guard on it.
+    /// Declared associativity; splits and collective strategies guard on it.
     pub associative: bool,
-    /// How an extremum reduction splits its gradient among tied elements. Read
-    /// **only** by `fold_adjoint`: an autograd attribute, never a compiler
-    /// decision.
+    /// How an extremum splits its gradient among ties; read only by `fold_adjoint`.
     pub tie: Option<TiePolicy>,
 }
 
@@ -156,10 +108,7 @@ impl Carrier {
         }
     }
 
-    /// Single-slot binop recognition — the only thing Kernel's hardware fast
-    /// path reads. `Some(op)` exactly when this carrier is one scalar slot
-    /// merged by `op`, whatever its lift does, so a fold with a fused `pre`
-    /// still emits `subgroupAdd`.
+    /// Single-slot binop recognition for the hardware fast path, whatever the lift does.
     pub fn kind(&self) -> Option<BinOp> {
         if self.slots.len() != 1 || !matches!(self.slots[0], SlotTy::Scalar) {
             return None;
@@ -173,11 +122,8 @@ impl Carrier {
         (forward || (swapped && op.is_commutative())).then_some(*op)
     }
 
-    /// The single-slot case: a plain binary reduction.
-    ///
-    /// An extremum defaults to `TiePolicy::SplitEvenly` so that every spelling
-    /// of `max` in the frontend hash-conses to one node; `with_tie` overrides
-    /// it where parity with a reference trainer demands `FirstWins`.
+    /// A plain binary reduction. Extrema default to `TiePolicy::SplitEvenly` so every
+    /// spelling of `max` hash-conses to one node.
     pub fn binop(op: BinOp, identity: Splat, dtype: Dtype) -> Self {
         Self {
             slots: smallvec![SlotTy::Scalar],
@@ -193,9 +139,7 @@ impl Carrier {
         }
     }
 
-    /// The per-dtype identity of a scalar binop reduction, or `None` for a
-    /// quantized dtype (a quantized value is never an accumulator) or an op
-    /// with no identity in the vocabulary.
+    /// The identity of a scalar binop reduction; `None` for a quantized dtype.
     pub fn binop_identity(op: BinOp, dtype: Dtype) -> Option<Splat> {
         let of = |f: f32, u: u32, i: i32| -> Option<Splat> {
             Some(match dtype {
@@ -231,8 +175,7 @@ impl Carrier {
         self
     }
 
-    /// Does any `lift`, `merge` expression read `IndexOf(axis)`? The guard that
-    /// correctly refuses to promote an axis a positional term depends on.
+    /// Whether any `lift` or `merge` reads `IndexOf(axis)`.
     pub fn reads_index_of(&self, axis: u32) -> bool {
         self.lift
             .iter()
@@ -240,20 +183,9 @@ impl Carrier {
             .any(|e| e.reads_axis(axis))
     }
 
-    /// The tupling law, with slot deduplication as canonicalization.
-    ///
-    /// Two folds over the same axis of the same input are one fold over the
-    /// concatenated accumulator. Slots equal in `(SlotTy, identity, lift,
-    /// merge modulo slot renumbering and modulo commutation)` collapse to one,
-    /// so joining `(m, l)` with `(m, o)` yields three slots.
-    ///
-    /// `remap` renumbers `other`'s lift onto the unified operand list. Merge
-    /// expressions are renumbered by slot position and never see it.
-    ///
-    /// Deduplication is restricted to slots whose merge reads only their own
-    /// position: such a slot's value is a function of its own history alone, so
-    /// two structurally identical ones are equal at every point. A slot whose
-    /// merge reads a *sibling* is left alone.
+    /// The tupling law: two folds over one axis and input become one fold over the
+    /// concatenated accumulator. Identical self-contained slots (merge reads only their own
+    /// position) deduplicate; `remap` renumbers `other`'s lift onto the unified operands.
     pub fn tuple(&self, other: &Carrier, remap: &ArgRemap) -> Tupled {
         let ns = self.width();
         let other_lift: SmallVec<[ScalarExpr; 4]> = other
@@ -331,13 +263,8 @@ impl Carrier {
         }
     }
 
-    /// The same algebra reading partial accumulators instead of elements:
-    /// `lift[k] = Arg(k)`.
-    ///
-    /// The outer level of a split must use this: reusing the inner carrier
-    /// applies `lift` to a partial max and silently computes a wrong value.
-    /// The resulting fold takes ONE operand carrying the inner fold's
-    /// trailing carrier axis, never `width` operands.
+    /// The same algebra reading partial accumulators (`lift[k] = Arg(k)`): the outer level
+    /// of a split must use it, reading ONE operand that carries the inner carrier axis.
     pub fn as_merge(&self) -> Carrier {
         Carrier {
             slots: self.slots.clone(),
@@ -351,14 +278,8 @@ impl Carrier {
         }
     }
 
-    /// Promotion: every `Scalar` slot becomes `Vector(extent)`; an existing
-    /// `Vector(d)` becomes `Vector(d * extent)`, row-major over the promoted
-    /// axes. Repeated promotion coalesces, so `TM x TN` register tiling is two
-    /// firings.
-    ///
-    /// `None` when `extent` is not [`Dim::Const`]: a symbolic private-array
-    /// extent is allocatable on neither backend. The caller checks the
-    /// positionwise condition with [`Carrier::reads_index_of`].
+    /// Promotion: every slot widens by `extent`, row-major over the promoted axes, so
+    /// repeated promotion coalesces. `None` on a symbolic extent.
     pub fn promote(&self, extent: Dim) -> Option<Carrier> {
         let e = extent.as_const()?;
         let slots = self
@@ -377,12 +298,8 @@ impl Carrier {
         })
     }
 
-    /// `Delta = select(a == b, identity, a - b)`.
-    ///
-    /// Without it `merge(identity, identity)` on a shifted carrier is
-    /// `0 * exp((-inf) - (-inf)) = NaN`, and merging `(-inf, NaN)` against a
-    /// real partial propagates it. Every workgroup-tree and subgroup schedule
-    /// merges padded identity lanes, and a fully-masked causal row hits it too.
+    /// `Delta = select(a == b, identity, a - b)`: without it merging two identity lanes
+    /// computes `0 * exp((-inf) - (-inf)) = NaN`.
     pub fn safe_delta(a: ScalarExpr, b: ScalarExpr, e: Splat) -> ScalarExpr {
         ScalarExpr::select(
             ScalarExpr::cmp(CmpOp::Eq, a.clone(), b.clone()),
@@ -391,25 +308,9 @@ impl Carrier {
         )
     }
 
-    /// Retargeting: carry the reference `rho` alongside the body and
-    /// rescale by `T(rho_s - rho)`.
-    ///
-    /// ```text
-    /// slots    = stat.slots ++ body.slots
-    /// identity = stat.identity ++ body.identity
-    /// lift     = stat.lift    ++ body.lift
-    /// merge    = ( stat.merge,
-    ///              T(D_a).V_a  (+)  T(D_b).V_b ),  D_s = safe_delta(rho_s, rho)
-    /// ```
-    ///
-    /// `ref_slot` names the slot of `stat` holding `rho`. One table row covers
-    /// every retargeted slot: a `Vector(Dh)` slot gets the same factor as a
-    /// `Scalar` one. `None` when `ref_slot` is out of range or the row's
-    /// accumulation binop has no identity in `dtype`.
-    ///
-    /// The caller supplies `body.lift` already written at `rho := u`, which is
-    /// legal because `h(e) = id`: an element enters as `h(u - u) . w = w`, so
-    /// the first element needs no special case.
+    /// Retargeting: carry the reference `rho` (slot `ref_slot` of `stat`) alongside `body`
+    /// and rescale each body slot by `T(safe_delta(rho_s, rho))`. `body.lift` is written at
+    /// `rho := u`, legal because `h(e) = id`.
     pub fn retarget(
         stat: &Carrier,
         row: &RetargetRow,
@@ -467,14 +368,9 @@ impl Carrier {
         })
     }
 
-    /// The carrier obligation:
-    ///
-    /// * `merge(identity, identity) == identity`;
-    /// * `merge(identity, lift(x)) == lift(x)` over the probes;
-    /// * `merge` is associative when `associative` is declared.
-    ///
-    /// An expression the host evaluator does not cover reports "unknown", and
-    /// unknown passes.
+    /// The carrier obligation: `merge(identity, identity) == identity`,
+    /// `merge(identity, lift(x)) == lift(x)` over the probes, and associativity when
+    /// declared. An expression the evaluator does not cover passes.
     pub fn identity_closed(&self, probes: &[f32]) -> bool {
         let w = self.width();
         if self.identity.len() != w || self.lift.len() != w || self.merge.len() != w || w == 0 {
@@ -518,11 +414,8 @@ impl Carrier {
         true
     }
 
-    /// The `(slot, position)` each accumulator lane belongs to, in lane
-    /// order. A `Scalar` slot is one lane; a `Vector(d)` slot is `d`.
-    ///
-    /// This is the coordinate system Kernel reduces in: `Stmt::Reduce` carries
-    /// one value, one `merge` expression and one output `Local` per lane.
+    /// The `(slot, position)` of each accumulator lane, in lane order: the coordinates
+    /// Kernel reduces in.
     pub fn lane_slots(&self) -> Option<Vec<(usize, u64)>> {
         let mut out = Vec::new();
         for (k, s) in self.slots.iter().enumerate() {
@@ -543,31 +436,14 @@ impl Carrier {
         )
     }
 
-    /// `merge`, expanded from one expression per **slot** to one per **lane**.
-    ///
-    /// In the result, lane `i` of the left accumulator is `Arg(i)` and lane `i`
-    /// of the right is `Arg(lanes + i)`, so a lowering evaluates each expression
-    /// against `lhs_loads ++ rhs_loads` with no further renumbering.
-    ///
-    /// A `Vector` slot's merge is positionwise: at position `p` a read of
-    /// another `Vector` slot resolves to that slot's position `p`, and a read
-    /// of a `Scalar` slot to its single lane. `None` when a `Vector` extent is
-    /// symbolic, when an `Arg` is out of range, or when two `Vector` slots
-    /// that read each other disagree in extent, because clamping a position
-    /// would silently compute the wrong element.
+    /// `merge` expanded to one expression per lane: left lane `i` is `Arg(i)`, right is
+    /// `Arg(lanes + i)`. `None` on a symbolic extent, a bad `Arg`, or mismatched
+    /// cross-slot extents.
     pub fn merge_lanes(&self) -> Option<Vec<ScalarExpr>> {
         self.resolve_lanes(&self.merge, 2)
     }
 
-    /// One expression per **slot**, reading `Arg(0..width)`, expanded to one per
-    /// **lane**, reading `Arg(0..lanes)`.
-    ///
-    /// This is [`Carrier::merge_lanes`]'s resolution over a single accumulator
-    /// instead of a pair: `post[k]` is written against slot values, while a
-    /// lowering holds one register per lane. At lane `(k, p)` a read of
-    /// another `Vector` slot resolves to that slot's position `p` and a read
-    /// of a `Scalar` slot to its single lane. `None` on the same
-    /// disagreements `merge_lanes` refuses.
+    /// Per-slot expressions over one accumulator (a fold's `post`) expanded to one per lane.
     pub fn expand_lanes(&self, per_slot: &[ScalarExpr]) -> Option<Vec<ScalarExpr>> {
         if per_slot.len() != self.width() {
             return None;
@@ -623,11 +499,9 @@ impl Carrier {
     }
 }
 
-/// The probe set every carrier is checked against. Float-shaped; integer
-/// accumulators use [`INT_PROBES`], whose `Max` identity is `0`.
+/// Float probes every carrier is checked against.
 pub const PROBES: [f32; 6] = [-3.5, -1.0, 0.0, 0.5, 2.25, 900.0];
-/// Probes for an integer accumulator, where `Max`'s identity is `0` and a
-/// negative probe would (correctly) fail `merge(identity, lift(x)) == lift(x)`.
+/// Integer probes: `Max`'s identity is `0`, so none is negative.
 pub const INT_PROBES: [f32; 5] = [0.0, 1.0, 2.0, 7.0, 13.0];
 
 /// The probe set appropriate to an accumulator dtype.
@@ -659,18 +533,12 @@ pub struct HomRow {
     pub h: HomShape,
     pub from: BinOp,
     pub to: BinOp,
-    /// Bit-exact under round-to-nearest, so the row fires with no reassoc
-    /// permission, even where `NumericContract::STRICT` holds.
+    /// Bit-exact under round-to-nearest, so no reassoc permission is needed.
     pub exact_in_float: bool,
 }
 
-/// The homomorphism rows.
-///
-/// Absent, because `ValueFacts` carries no sign or range lattice:
-/// `Log : Mul -> Add` (false whenever any `x_i <= 0`), and the general
-/// monotone/antitone rows over partial unaries (`Sqrt`, `Log`, `Log2`,
-/// `Asin`, `Acos`, `Atanh`) — a row over a partial unary can turn a number
-/// into a NaN. `Neg` is the only total unary in the vocabulary today.
+/// The homomorphism rows. Rows over partial unaries (`Log`, `Sqrt`, ...) are absent:
+/// without a sign lattice they could turn a number into a NaN.
 pub const HOM_TABLE: &[HomRow] = &[
     HomRow {
         h: HomShape::MulByLit,
@@ -728,11 +596,7 @@ pub const fn is_total_on(op: UnOp, d: Dtype) -> bool {
     }
 }
 
-/// One row of the retargeting law: how `T(delta)` acts on one slot of the
-/// module, and which binop accumulates it.
-///
-/// `retarget` takes one call per slot and the same expression serves a
-/// `Scalar` and a `Vector` slot.
+/// One row of the retargeting law: `T(delta)` on one slot, and its accumulating binop.
 #[derive(Copy, Clone)]
 pub struct RetargetRow {
     pub name: &'static str,
@@ -740,8 +604,7 @@ pub struct RetargetRow {
     pub stat: fn(Dtype) -> Carrier,
     /// `T(delta)` applied to one slot.
     pub retarget: fn(&ScalarExpr, &ScalarExpr, Dtype) -> ScalarExpr,
-    /// The binop that accumulates the module. A row may not retarget a carrier
-    /// whose accumulation binop differs.
+    /// The binop that accumulates the module.
     pub accum: BinOp,
 }
 
@@ -776,16 +639,8 @@ macro_rules! shift_row {
     };
 }
 
-/// The retargeting rows.
-///
-/// The four shift rows differ only in which exponential the emitter is
-/// permitted to use — at `h = exp` the derived carrier is online softmax.
-/// `max-plus` is the same law over the `(R, max)` monoid.
-///
-/// The raw-moment row (whose `T` reads the two counts `n_a`, `n_b`, not the
-/// delta alone) and the Goertzel rotation row (whose `T` mixes two slots)
-/// need a wider `retarget` signature than one-slot-at-a-time, so they are
-/// absent.
+/// The retargeting rows: shift rows differ only in the permitted exponential (`exp` is
+/// online softmax); `max-plus` is the same law over `(R, max)`.
 pub const RETARGET_TABLE: &[RetargetRow] = &[
     shift_row!("shift-exp", UnOp::Exp),
     shift_row!("shift-exp2", UnOp::Exp2),
@@ -807,12 +662,7 @@ pub fn map_args(e: &ScalarExpr, f: &dyn Fn(u32) -> u32) -> ScalarExpr {
     })
 }
 
-/// Rewrite every `Arg` leaf's declared dtype, leaving indices alone.
-///
-/// The floor lowering reads a fold's operands at the **operand** dtype and
-/// accumulates at `acc`, so a carrier's `lift` — the one expression that touches
-/// elements — is retyped on the way into Launch while `merge`, which reads
-/// accumulators, rides through untouched.
+/// Rewrite every `Arg` leaf's dtype, leaving indices alone (a `lift` retyped on lowering).
 pub fn retype_args(e: &ScalarExpr, dtype: Dtype) -> ScalarExpr {
     e.rewrite(&mut |e| match e.kind() {
         ScalarKind::Arg(i) => Some(ScalarExpr::arg(*i, dtype)),
@@ -846,10 +696,7 @@ fn self_contained_signature(
     ))
 }
 
-/// Sort a commutative binop's children into a canonical order so that
-/// `Add(a, b)` and `Add(b, a)` compare equal. `ScalarExpr` does not canonicalize
-/// on construction, so a guard spelled `merge[k] == Add(Arg(k), Arg(n+k))`
-/// would otherwise silently stop firing on half the graphs.
+/// Sort commutative binop children canonically, so `Add(a, b) == Add(b, a)` in guards.
 pub(crate) fn commute_canon(e: &ScalarExpr) -> ScalarExpr {
     use ScalarKind as K;
     match e.kind() {
@@ -893,9 +740,7 @@ fn close(a: &[f32], b: &[f32]) -> bool {
         })
 }
 
-/// A host evaluator over f32, enough to run a carrier's expressions. `None`
-/// means "this node is outside the evaluator", which every caller treats as
-/// unknown rather than as a failure.
+/// A host f32 evaluator for carrier expressions; `None` means unknown, not failure.
 pub fn eval(e: &ScalarExpr, args: &[f32]) -> Option<f32> {
     use ScalarKind as K;
     Some(match e.kind() {
@@ -957,18 +802,12 @@ pub fn eval(e: &ScalarExpr, args: &[f32]) -> Option<f32> {
 
 #[doc(hidden)]
 pub mod oracle {
-    //! Two hand-written algorithms kept as test fixtures: the carriers the
-    //! laws derive must match them term for term.
-    //!
-    //! Nothing in the compiler may call these. They are `pub` only so that
-    //! `fusor-conformance` can run the same two carriers on real hardware.
+    //! Hand-written carriers the derived laws must match: test fixtures only, `pub` so
+    //! `fusor-conformance` can run them.
 
     use super::*;
 
-    /// `(running max, sum of h(element - running max))` in one pass — online
-    /// softmax at `h = exp`. Spelled with [`Carrier::safe_delta`], because the
-    /// unguarded form computes `0 * exp((-inf) - (-inf)) = NaN` at
-    /// `merge(identity, identity)`.
+    /// Online softmax at `h = exp`: `(running max, sum of h(x - max))`, via `safe_delta`.
     pub fn shift_stabilized_sum(h: UnOp, dtype: Dtype) -> Carrier {
         let e = Carrier::binop_identity(BinOp::Add, dtype).unwrap();
         let (m_a, l_a) = (ScalarExpr::arg(0, dtype), ScalarExpr::arg(1, dtype));

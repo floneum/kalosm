@@ -13,8 +13,7 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
-/// A backend-owned compiled artifact (shader module + pipeline, or a
-/// specialized CPU loop nest). Opaque above the backend.
+/// A backend-owned compiled artifact, opaque above the backend.
 #[derive(Clone)]
 pub struct Artifact(Arc<dyn Any + Send + Sync>);
 
@@ -33,9 +32,8 @@ impl fmt::Debug for Artifact {
     }
 }
 
-/// A backend-owned buffer handle. Opaque and `Arc`-shared so [`Target`]
-/// stays object-safe and the pooled allocator's `strong_count == 1` reuse
-/// test still works.
+/// A backend-owned buffer handle, `Arc`-shared so the pool's
+/// `strong_count == 1` reuse test works.
 #[derive(Clone)]
 pub struct Buf(Arc<dyn Any + Send + Sync>);
 
@@ -46,8 +44,7 @@ impl Buf {
     pub fn downcast_ref<T: Any + Send + Sync>(&self) -> Option<&T> {
         self.0.downcast_ref::<T>()
     }
-    /// Pointer identity, for the aliasing-pattern check a replayed plan
-    /// requires.
+    /// Pointer identity, for a replayed plan's aliasing check.
     pub fn addr(&self) -> usize {
         Arc::as_ptr(&self.0) as *const () as usize
     }
@@ -55,9 +52,7 @@ impl Buf {
     pub fn refcount(&self) -> usize {
         Arc::strong_count(&self.0)
     }
-    /// A non-owning handle. Holding one does **not** hold the buffer: the
-    /// pool's `strong_count == 1` reuse test still sees the buffer as free,
-    /// which lets caches witness pointer identity without pinning storage.
+    /// A non-owning handle: witnesses pointer identity without pinning.
     pub fn downgrade(&self) -> WeakBuf {
         WeakBuf(Arc::downgrade(&self.0))
     }
@@ -85,10 +80,8 @@ impl fmt::Debug for Buf {
     }
 }
 
-/// The contents of binding 0. Always a storage buffer, holding
-/// `[u32 symbolic dims..., f32 uniform scalars...]`. A uniform-address-space
-/// block would break the derived-bind-group mechanism, which walks storage
-/// globals.
+/// The contents of binding 0, a storage buffer holding
+/// `[u32 symbolic dims..., f32 uniform scalars...]`.
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Uniforms {
     pub dims: Vec<u32>,
@@ -136,20 +129,15 @@ pub struct LowerCtx<'a> {
     pub launch: &'a Dispatch,
     pub graph: &'a crate::egraph::EGraph,
     pub symbols: &'a [SymId],
-    /// Concrete extent bindings for this dispatch. CPU native artifacts are
-    /// cached under the binding values, so their lowering may specialize
-    /// symbolic shapes without weakening executable-cache identity.
+    /// Concrete extent bindings for this dispatch, which CPU lowering may
+    /// specialize on (its artifacts are cached under them).
     pub dim_bindings: &'a [(SymId, u64)],
 }
 
 impl LowerCtx<'_> {
-    /// The class member the extraction selected for `id`.
-    ///
-    /// An `Operand::src` names the node the *rule author* wrote. That is a
-    /// member of the operand's e-class, but generally not the member the
-    /// extractor selected, and the plan names buffers and bindings by the
-    /// selected member. Every buffer lookup has to go through here or it
-    /// looks its key up in a map the key was never inserted into.
+    /// The class member the extraction selected for `id`. Buffers are keyed
+    /// by the selected member, not the one an `Operand::src` names, so every
+    /// buffer lookup goes through here.
     pub fn selected(&self, id: crate::egraph::Id) -> crate::egraph::Id {
         let class = self.graph.class_of(id);
         self.plan.extraction.selected(class).unwrap_or(id)
@@ -167,8 +155,7 @@ pub trait Target: Send + Sync {
     /// Calibrated rates. Everything the cost model reads.
     fn facts(&self) -> &DeviceFacts;
 
-    /// Target-exclusive lowering rules (lane/subgroup geometry). Every Logical
-    /// rule is inherited.
+    /// Target-exclusive lowering rules (lane/subgroup geometry).
     fn rules(&self) -> &'static [Rule];
 
     /// Lower one selected Launch node at one schedule point into Kernel.
@@ -176,9 +163,8 @@ pub trait Target: Send + Sync {
 
     fn emit(&self, ir: &KernelIr) -> std::result::Result<Artifact, EmitError>;
 
-    /// Run one dispatch. `binds` is positional against the emitted module's
-    /// storage globals sorted by binding, so binding order and codegen
-    /// cannot drift.
+    /// Run one dispatch; `binds` is positional against the emitted module's
+    /// storage globals sorted by binding.
     fn launch(
         &self,
         artifact: &Artifact,
@@ -189,12 +175,9 @@ pub trait Target: Send + Sync {
 
     fn alloc(&self, bytes: u64, persistence: crate::dtype::Persistence) -> Result<Buf>;
 
-    /// A fresh buffer holding a byte-for-byte copy of `src`, made on the
-    /// device: what a detached value's leaf is built on, with no host round
-    /// trip, so it is the one form a browser can use.
+    /// A fresh device-side copy of `src`, with no host round trip.
     fn copy(&self, src: &Buf) -> Result<Buf>;
 
-    /// Block until every submitted dispatch has retired. The only host
-    /// syncs are this, explicit readback, and the allocator's cap retry.
+    /// Block until every submitted dispatch has retired.
     fn wait(&self) -> Result<()>;
 }

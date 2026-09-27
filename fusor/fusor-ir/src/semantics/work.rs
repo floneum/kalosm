@@ -1,8 +1,5 @@
-//! Shape-dependent work rows; `index_ops` prices view-fold versus gather.
-//!
-//! Symbolic dims price as `1`. A `Sym` extent is bound at dispatch, so a
-//! shape-family plan is costed at its smallest legal binding and the specialised
-//! variant — which knows the real extent — is the one that can out-price it.
+//! Shape-dependent work rows. Symbolic dims price as `1`, so a specialised
+//! variant that knows the real extent can out-price a shape-family plan.
 
 use crate::contract_spec;
 use crate::facts::{ValueFacts, Work};
@@ -23,10 +20,8 @@ pub fn work_of(op: &Op, ins: &[ValueFacts], out: &ValueFacts) -> Work {
     }
 }
 
-/// `(arith, transcendental, index)` of evaluating `exprs` once each.
-/// Shared subexpressions are counted once, matching what a structurally-CSE'd
-/// emitter issues. `UnOp::is_transcendental()` and `BinOp::Pow` are
-/// transcendental; `IndexOf` is an index op; everything else is arithmetic.
+/// `(arith, transcendental, index)` of evaluating `exprs` once each, shared
+/// subexpressions counted once as a CSE'd emitter issues them.
 pub fn expr_cost<'a>(exprs: impl IntoIterator<Item = &'a ScalarExpr>) -> (u64, u64, u64) {
     let mut seen: FxHashSet<u64> = FxHashSet::default();
     let mut acc = (0u64, 0u64, 0u64);
@@ -84,8 +79,7 @@ fn count(e: &ScalarExpr, seen: &mut FxHashSet<u64>, acc: &mut (u64, u64, u64)) {
 pub fn work_l0(op: &Logical, ins: &[ValueFacts], out: &ValueFacts) -> Work {
     let e = elements(out);
     match op {
-        // The two documented constant-work exemptions: a leaf reads a buffer
-        // the plan already accounts for, and a projection is a relabelling.
+        // A leaf's buffer is accounted by the plan; a projection relabels.
         Logical::Leaf(_) | Logical::Project { .. } => Work::default(),
 
         Logical::Map { expr, .. } => epilogue_work(expr, e),
@@ -158,8 +152,6 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             w
         }
 
-        // A promoted axis leaves the iteration domain and reappears as
-        // carrier lanes, so the per-element merge count rises with `lanes()`.
         Launch::Fold {
             carrier,
             axis,
@@ -169,10 +161,7 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             vec_axes,
             ..
         } => {
-            // A promoted axis's extent is already counted in `lanes`, so
-            // `vec_axes` must be filtered out of the iterated space or the
-            // nest is charged `lanes` times its true cost. The filter is a
-            // no-op on every unpromoted node.
+            // A promoted axis is counted in carrier `lanes`, not the space.
             let ein = space
                 .iterated(vec_axes)
                 .dims
@@ -193,9 +182,7 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             let (post_a, post_t, post_i) =
                 expr_cost(&carrier.expand_lanes(post).unwrap_or_default());
             let rows = ein / priced(space.dims[*axis as usize]).max(1);
-            // The inline decode of a quantized operand, once per iterated
-            // element — the same schedule-independent floor `Map` and
-            // `Contract` price.
+            // Quantized operand decode, once per iterated element.
             let decode = decode_ops(ins);
             Work {
                 macs: ein
@@ -249,25 +236,19 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
                 macs: b.saturating_mul(m).saturating_mul(n).saturating_mul(k),
                 ..Work::default()
             };
-            // A side's `pre` runs once per loaded element of that side.
-            // Operand index arithmetic is not priced here: a contraction's
-            // traffic term dominates it, and `fusor_cost::realize` counts
-            // the bytes per operand.
+            // A side's `pre` runs once per loaded element; operand traffic is
+            // `fusor_cost::realize`'s to price.
             w = w.add(epilogue_work(&a.pre, b.saturating_mul(m).saturating_mul(k)));
             w = w.add(epilogue_work(
                 &rhs.pre,
                 b.saturating_mul(k).saturating_mul(n),
             ));
-            // The staged decode of a quantized operand, once per element —
-            // the schedule-independent floor. The per-tile re-execution is
-            // schedule knowledge and lives in `fusor_cost::realize`.
+            // Quantized decode once per element, as `index_ops`: it is scalar
+            // ALU work, invisible at the MMA rate `macs` is priced at.
             let (a_elems, b_elems) = (
                 b.saturating_mul(m).saturating_mul(k),
                 b.saturating_mul(k).saturating_mul(n),
             );
-            // Decode arithmetic is shifts and masks on the scalar ALU —
-            // `index_ops` is the field priced at that rate; `macs` would run
-            // it at the MMA rate and make it invisible.
             for (i, f) in ins.iter().enumerate() {
                 let elems = if i < a.len() { a_elems } else { b_elems };
                 w.index_ops = w
@@ -324,15 +305,8 @@ pub fn stream_evaluations(fold: &Launch, operand: u32) -> u64 {
         .fold(1, u64::saturating_mul)
 }
 
-/// Arithmetic a backend's block-decode program spends per decoded element.
-///
-/// The decode is invisible to the IR on two paths — `Source::Quantized` in a
-/// contraction's staging fill, and the identity `Map` a materializing
-/// `Logical::Dequant` lowers to, where the format program rides in the operand
-/// read — so it has to be priced from the format alone. Counts are the
-/// per-element share of each format's unpack: shift/mask the quant, decode
-/// the block scale (and minimum, and 6-bit group scales for the K formats),
-/// one fma.
+/// Arithmetic a block-decode program spends per decoded element. The decode
+/// rides in operand reads the IR does not spell, so it is priced by format.
 pub fn quant_decode_ops(fmt: crate::dtype::QFmt) -> u64 {
     use crate::dtype::QFmt;
     match fmt {
@@ -370,14 +344,11 @@ pub fn epilogue_work(expr: &ScalarExpr, iterations: u64) -> Work {
     }
 }
 
-/// Index-op equivalents of one scalar load from cache: the load/store port
-/// issues at a fraction of the ALU rate and the value is not there for the
-/// next instruction. Tiled contractions stage their loads and do not pay
-/// this per MAC; a map or a fold does, once per operand per iteration.
+/// Index-op equivalents of one scalar load from cache, paid by a map or fold
+/// once per operand per iteration.
 const LOAD_INDEX_OPS: u64 = 4;
 
-/// Index-op equivalents of one integer divide or modulo: a u32 division is
-/// a multi-instruction sequence, not an ALU slot.
+/// Index-op equivalents of one u32 divide or modulo.
 const DIVMOD_INDEX_OPS: u64 = 8;
 
 fn operand_index_ops(ops: &[crate::ir::launch::Operand], iterations: u64) -> u64 {
@@ -470,8 +441,8 @@ mod tests {
         let streamed = Launch::stream_fold(source, fold, 0).unwrap();
         let out = super::super::infer_launch::infer_launch(&streamed, &inputs).unwrap();
         let work = work_l1(&streamed, &inputs, &out);
-        // Six source reductions of five additions, plus six consumer steps
-        // carrying four multiply-and-add positions. The source is not repeated four times.
+        // Six source reductions of five adds, six consumer steps of four
+        // multiply-adds; the source is not repeated per promoted lane.
         assert_eq!(work.macs, 6 * 5 + 6 * 4 * 2);
 
         let Launch::StreamFold { mut fold, .. } = streamed else {

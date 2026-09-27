@@ -1,10 +1,6 @@
 //! `SPLIT_K`: a contraction over a long reduced axis as a batched
-//! contraction over chunks of it — one batch element per chunk, so the grid
-//! is `splits` times wider and each workgroup's k loop `splits` times
-//! shorter — and a fold summing the chunks, with the epilogue moved after
-//! the sum. A weight gradient is a few output tiles reducing over every
-//! token: unsplit it is a handful of workgroups each walking the whole
-//! axis. Both spellings stay live; cost decides.
+//! contraction over chunks of it plus a fold summing the chunks (epilogue
+//! after the sum), widening the grid. Both spellings stay live; cost decides.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
 use crate::ir::launch::{AccessPlan, ContractSide, Launch, Operand, ScheduleDomain};
@@ -23,8 +19,7 @@ rule!(
     apply = split_k,
 );
 
-/// Shortest reduced axis worth splitting, and the shortest chunk: a chunk
-/// still has to feed a tile's k loop a few times.
+/// Shortest reduced axis worth splitting, and the shortest chunk.
 const MIN_K: u64 = 256;
 const MIN_CHUNK: u64 = 32;
 const SPLITS: [u64; 4] = [4, 8, 16, 32];
@@ -62,14 +57,12 @@ pub fn split_k(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Opti
     if batch_elements != batch_c {
         return None;
     }
-    // `a` is `[batch.., m.., k]` and `b` is `[batch.., k, n..]`, k a single
-    // axis on each: the split threads a chunk axis in front of the row
-    // group and a chunk stride through k.
+    // `a` is `[batch.., m.., k]` and `b` is `[batch.., k, n..]`: a chunk axis
+    // goes in front of the row group, a chunk stride through k.
     let a_k = k_axis(a.primary().layout.shape(), batch_c, mc, kc, false);
     let b_k = k_axis(rhs.primary().layout.shape(), batch_c, nc, kc, true);
     let (a_k, b_k) = (a_k?, b_k?);
-    // An `Alias` or a `Pack` reads the operand's own layout; a gather or an
-    // unflatten carries its own map, which the chunk stride cannot thread.
+    // A gather or unflatten carries its own map the chunk cannot thread.
     if a.ops
         .iter()
         .chain(rhs.ops.iter())
