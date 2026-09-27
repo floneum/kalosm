@@ -958,7 +958,7 @@ fn cycle_group(graph: &EGraph, ex: &Extraction, v: Id) -> Option<(ClassId, Id)> 
     while let Some(x) = stack.pop() {
         for (c, n) in resolved_children(graph, ex, x) {
             let n = n.unwrap_or(c);
-            if matches!(graph.node(n).op, Op::Launch(Launch::Group { .. })) {
+            if is_group(graph, n) {
                 return Some((graph.class_of(n), n));
             }
             if seen.insert(n) {

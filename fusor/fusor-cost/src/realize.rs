@@ -1967,18 +1967,13 @@ fn cached_bindings_fit(
 /// outside inputs, a member slab's stages as its layout says. Memoized
 /// like [`slab_bindings_fit`].
 pub(crate) fn group_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
-    if !matches!(graph.node(id).op, Op::Launch(Launch::Group { .. })) {
-        return true;
-    }
-    cached_bindings_fit(graph, id, caps, || {
-        group_bindings_fit_uncached(graph, id, caps)
-    })
-}
-
-fn group_bindings_fit_uncached(graph: &EGraph, id: Id, caps: &Caps) -> bool {
     let Op::Launch(Launch::Group { members, .. }) = &graph.node(id).op else {
         return true;
     };
+    cached_bindings_fit(graph, id, caps, || group_members_fit(graph, members, caps))
+}
+
+fn group_members_fit(graph: &EGraph, members: &[Id], caps: &Caps) -> bool {
     let mut inputs: rustc_hash::FxHashSet<ClassId> = rustc_hash::FxHashSet::default();
     for m in members.iter() {
         let Op::Launch(Launch::Slab { members: sm, .. }) = &graph.node(*m).op else {
@@ -2130,31 +2125,16 @@ pub(crate) fn slab_layout(
     Ok((private, used))
 }
 
+/// The members of `class` a selection may take: acyclic, then runnable, then
+/// able to bind, each filter dropped when it would leave nothing.
 pub(crate) fn selectable(graph: &EGraph, class: ClassId, caps: &Caps) -> Vec<Id> {
-    let members = graph.members(class);
-    let acyclic: Vec<Id> = members
-        .iter()
-        .copied()
-        .filter(|m| !is_self_referential(graph, *m))
-        .collect();
-    let pool = if acyclic.is_empty() { members } else { acyclic };
-    let runnable: Vec<Id> = pool
-        .iter()
-        .copied()
-        .filter(|m| is_runnable(graph, *m))
-        .collect();
-    let pool = if runnable.is_empty() { pool } else { runnable };
-    // Account for composites whose externally visible members need buffers.
-    let schedulable: Vec<Id> = pool
-        .iter()
-        .copied()
-        .filter(|m| composite_bindings_fit(graph, *m, caps))
-        .collect();
-    if schedulable.is_empty() {
-        pool
-    } else {
-        schedulable
+    fn narrow(pool: Vec<Id>, keep: impl Fn(Id) -> bool) -> Vec<Id> {
+        let kept: Vec<Id> = pool.iter().copied().filter(|m| keep(*m)).collect();
+        if kept.is_empty() { pool } else { kept }
     }
+    let pool = narrow(graph.members(class), |m| !is_self_referential(graph, m));
+    let pool = narrow(pool, |m| is_runnable(graph, m));
+    narrow(pool, |m| composite_bindings_fit(graph, m, caps))
 }
 
 /// The classes reachable from `roots`, ascending, plus a node mask covering
