@@ -9,10 +9,9 @@ use fusor::composite::{
 };
 use fusor::{Dim, Dtype, Session};
 
-use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
-use crate::harness::{CaseResult, Cases, FuzzDim, dims, fuzz_case};
+use crate::harness::{CaseResult, Cases, FuzzDim, dims};
 use crate::suite::support::{
-    Domain, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss, upload,
+    Domain, check_gradient, expect_values, gradient_of, graph_of, read, upload,
 };
 
 // Spatial extents start at 3 so they never fall under the kernel extent
@@ -69,52 +68,26 @@ const UPSAMPLE_SPEC: &[FuzzDim] = &[
 ];
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
-    cases.push_case(fuzz_case("conv_pool", "conv1d", CONV1D_SPEC, conv1d));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "conv2d_strided",
-        CONV2D_SPEC,
-        conv2d_strided,
-    ));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "grouped_conv",
-        GROUPED_CONV_SPEC,
-        grouped_conv,
-    ));
-    cases.push_case(fuzz_case(
-        "conv_pool",
+    let mut cases = Cases::new("conv_pool");
+    cases.fuzz("conv1d", CONV1D_SPEC, conv1d);
+    cases.fuzz("conv2d_strided", CONV2D_SPEC, conv2d_strided);
+    cases.fuzz("grouped_conv", GROUPED_CONV_SPEC, grouped_conv);
+    cases.fuzz(
         "conv2d_overlapping_input_gradient",
         OVERLAP_GRAD_SPEC,
         conv2d_overlapping_input_gradient,
-    ));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "pool",
-        POOL_SPEC,
-        async move |s: &Session, sh: &[u64], seed: u32| pool_case(s, Pool::Avg, sh, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "pool_max",
-        POOL_SPEC,
-        async move |s: &Session, sh: &[u64], seed: u32| pool_case(s, Pool::Max, sh, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "pool_min",
-        POOL_SPEC,
-        async move |s: &Session, sh: &[u64], seed: u32| pool_case(s, Pool::Min, sh, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "upsample_nearest2d",
-        UPSAMPLE_SPEC,
-        upsample_nearest2d,
-    ));
+    );
+    cases.fuzz("pool", POOL_SPEC, async move |s, sh, seed| {
+        pool_case(s, Pool::Avg, sh, seed).await
+    });
+    cases.fuzz("pool_max", POOL_SPEC, async move |s, sh, seed| {
+        pool_case(s, Pool::Max, sh, seed).await
+    });
+    cases.fuzz("pool_min", POOL_SPEC, async move |s, sh, seed| {
+        pool_case(s, Pool::Min, sh, seed).await
+    });
+    cases.fuzz("upsample_nearest2d", UPSAMPLE_SPEC, upsample_nearest2d);
     cases.push(
-        "conv_pool",
         "pool_max_non_overlapping_adjoint_is_mask",
         non_overlapping_adjoint_is_mask,
     );
@@ -170,18 +143,13 @@ async fn conv1d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let w_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, out_ch * in_ch * k);
     let b_data = Domain::Wide.sample(seed.wrapping_add(1), out_ch);
 
+    let x_shape = dims(&[batch as u64, in_ch as u64, len as u64]);
+    let w_shape = dims(&[out_ch as u64, in_ch as u64, k as u64]);
+    let b_shape = dims(&[out_ch as u64]);
     let graph = graph_of(session);
-    let x = upload(
-        graph.handle(),
-        &dims(&[batch as u64, in_ch as u64, len as u64]),
-        &x_data,
-    )?;
-    let w = upload(
-        graph.handle(),
-        &dims(&[out_ch as u64, in_ch as u64, k as u64]),
-        &w_data,
-    )?;
-    let b = upload(graph.handle(), &dims(&[out_ch as u64]), &b_data)?;
+    let x = upload(graph.handle(), &x_shape, &x_data)?;
+    let w = upload(graph.handle(), &w_shape, &w_data)?;
+    let b = upload(graph.handle(), &b_shape, &b_data)?;
 
     let y = conv(&x, &w, Some(&b), &[1], &[k as u32 / 2], &[1])?;
 
@@ -216,33 +184,15 @@ async fn conv1d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     }
 
     let d_w = gradient_of(&graph, &y, &w).await?;
-    let probe_graph = graph_of(session);
-    let probe_x = upload(
-        probe_graph.handle(),
-        &dims(&[batch as u64, in_ch as u64, len as u64]),
-        &x_data,
-    )?;
-    let probe_w = upload(
-        probe_graph.handle(),
-        &dims(&[out_ch as u64, in_ch as u64, k as u64]),
-        &w_data,
-    )?;
-    let probe_b = upload(probe_graph.handle(), &dims(&[out_ch as u64]), &b_data)?;
-    let probe_y = conv(
-        &probe_x,
-        &probe_w,
-        Some(&probe_b),
-        &[1],
-        &[k as u32 / 2],
-        &[1],
-    )?;
-    let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[out_ch * in_ch * k], &w_data, |probe| {
-        read_probe_loss(&probe_w, &probe_loss, probe)
+    let inputs = [
+        (&x_shape[..], &x_data[..]),
+        (&w_shape, &w_data),
+        (&b_shape, &b_data),
+    ];
+    check_gradient(session, &inputs, 1, &d_w, |t| {
+        conv(&t[0], &t[1], Some(&t[2]), &[1], &[k as u32 / 2], &[1])
     })
-    .await?;
-    assert_gradient_matches_finite_difference(&d_w, &numeric)?;
-    Ok(())
+    .await
 }
 
 async fn conv2d_strided(session: &Session, shape: &[u64], seed: u32) -> CaseResult {

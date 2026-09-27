@@ -139,51 +139,70 @@ impl std::fmt::Debug for Case {
     }
 }
 
-/// A list of cases. Every `suite::<area>::cases()` returns one.
-#[derive(Default)]
-pub struct Cases(Vec<Case>);
+/// A list of cases. Every `suite::<area>::cases()` returns one, each case
+/// named under the list's area.
+pub struct Cases {
+    area: &'static str,
+    cases: Vec<Case>,
+}
 
 impl Cases {
-    pub fn new() -> Self {
-        Self(Vec::new())
+    pub fn new(area: &'static str) -> Self {
+        Self {
+            area,
+            cases: Vec::new(),
+        }
+    }
+
+    /// The area new cases are named under.
+    pub fn area(&self) -> &'static str {
+        self.area
     }
 
     pub fn push(
         &mut self,
-        area: &'static str,
         name: impl Into<String>,
         run: impl AsyncFn(&Session) -> CaseResult + Send + Sync + 'static,
     ) -> &mut Self {
-        self.0.push(Case::new(area, name, run));
-        self
+        self.push_case(Case::new(self.area, name, run))
+    }
+
+    /// Push a [`fuzz_case`] under this area.
+    pub fn fuzz(
+        &mut self,
+        name: &'static str,
+        spec: &'static [FuzzDim],
+        body: impl AsyncFn(&Session, &[u64], u32) -> CaseResult + Send + Sync + 'static,
+    ) -> &mut Self {
+        self.push_case(fuzz_case(self.area, name, spec, body))
     }
 
     /// Push an already-built [`Case`], for tables that produce one directly.
     pub fn push_case(&mut self, case: Case) -> &mut Self {
-        self.0.push(case);
+        self.cases.push(case);
         self
     }
 
     pub fn extend(&mut self, other: Cases) -> &mut Self {
-        self.0.extend(other.0);
+        self.cases.extend(other.cases);
         self
     }
 
     pub fn len(&self) -> usize {
-        self.0.len()
+        self.cases.len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.0.is_empty()
+        self.cases.is_empty()
     }
 
     pub fn iter(&self) -> std::slice::Iter<'_, Case> {
-        self.0.iter()
+        self.cases.iter()
     }
 
     /// The names, in registration order.
     pub fn names(&self) -> Vec<&str> {
-        self.0.iter().map(|c| c.name.as_str()).collect()
+        self.cases.iter().map(|c| c.name.as_str()).collect()
     }
 }
 
@@ -191,7 +210,7 @@ impl IntoIterator for Cases {
     type Item = Case;
     type IntoIter = std::vec::IntoIter<Case>;
     fn into_iter(self) -> Self::IntoIter {
-        self.0.into_iter()
+        self.cases.into_iter()
     }
 }
 

@@ -7,10 +7,9 @@
 use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
 
-use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fuzz_case};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims};
 use crate::suite::support::{
-    Domain, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss, upload,
+    Domain, check_gradient, expect_values, gradient_of, graph_of, read, upload,
 };
 
 /// `[rows, width]` for the finite-difference-backed cases. The ceiling stays
@@ -118,38 +117,27 @@ fn layer_norm_bare(x: &Tensor, width: u64, remove_mean: bool) -> fusor::Result<T
 }
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
+    let mut cases = Cases::new("normalization");
 
     for (name, build, reference) in plain_rows() {
-        cases.push_case(fuzz_case(
-            "normalization",
-            name,
-            FD_SPEC,
-            async move |s: &Session, shape: &[u64], seed: u32| {
-                row_case(s, shape, seed, name, build, reference).await
-            },
-        ));
+        cases.fuzz(name, FD_SPEC, async move |s, shape, seed| {
+            row_case(s, shape, seed, name, build, reference).await
+        });
     }
 
     // The weighted spellings. Each is checked against `normalized * w (+ b)`
     // with a *non-constant* weight, so a lowering that drops the affine is a
     // value failure rather than a no-op.
-    cases.push_case(fuzz_case(
-        "normalization",
-        "rms_norm",
-        FD_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            weighted_case(s, shape, seed, "rms_norm", host_rms, false, |x, w, _| {
-                x.rms_norm(w, EPS)
-            })
-            .await
-        },
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
+    cases.fuzz("rms_norm", FD_SPEC, async move |s, shape, seed| {
+        weighted_case(s, shape, seed, "rms_norm", host_rms, false, |x, w, _| {
+            x.rms_norm(w, EPS)
+        })
+        .await
+    });
+    cases.fuzz(
         "rms_norm_with_bias",
         FD_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
+        async move |s, shape, seed| {
             weighted_case(
                 s,
                 shape,
@@ -161,29 +149,23 @@ pub fn cases() -> Cases {
             )
             .await
         },
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
-        "layer_norm_fused",
-        FD_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            weighted_case(
-                s,
-                shape,
-                seed,
-                "layer_norm_fused",
-                host_layer_centered,
-                true,
-                |x, w, b| x.layer_norm(w, b, EPS, true),
-            )
-            .await
-        },
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
+    );
+    cases.fuzz("layer_norm_fused", FD_SPEC, async move |s, shape, seed| {
+        weighted_case(
+            s,
+            shape,
+            seed,
+            "layer_norm_fused",
+            host_layer_centered,
+            true,
+            |x, w, b| x.layer_norm(w, b, EPS, true),
+        )
+        .await
+    });
+    cases.fuzz(
         "layer_norm_no_bias",
         FD_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
+        async move |s, shape, seed| {
             weighted_case(
                 s,
                 shape,
@@ -195,55 +177,31 @@ pub fn cases() -> Cases {
             )
             .await
         },
-    ));
+    );
 
-    cases.push_case(fuzz_case(
-        "normalization",
-        "rms_norm_residual",
-        BWD_SPEC,
-        residual_case,
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
-        "variance_last",
-        FD_SPEC,
-        variance_case,
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
-        "softmax_rows_sum_to_one",
-        FWD_SPEC,
-        rows_sum_to_one,
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
-        "softmax_is_shift_invariant",
-        FWD_SPEC,
-        shift_invariance,
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
+    cases.fuzz("rms_norm_residual", BWD_SPEC, residual_case);
+    cases.fuzz("variance_last", FD_SPEC, variance_case);
+    cases.fuzz("softmax_rows_sum_to_one", FWD_SPEC, rows_sum_to_one);
+    cases.fuzz("softmax_is_shift_invariant", FWD_SPEC, shift_invariance);
+    cases.fuzz(
         "softmax_backward_is_the_analytic_jacobian",
         BWD_SPEC,
         softmax_backward,
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
+    );
+    cases.fuzz(
         "welford_agrees_with_the_two_pass_variance",
         WELFORD_SPEC,
         welford_carrier,
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
+    );
+    cases.fuzz(
         "layer_norm_sum_gradient_is_zero",
         BWD_SPEC,
         layer_norm_sum_gradient_is_zero,
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
+    );
+    cases.fuzz(
         "layer_norm_wide_rows",
         &[FuzzDim::Fixed(128), FuzzDim::Fixed(512)],
-        async |session: &Session, shape: &[u64], seed: u32| {
+        async |session, shape, seed| {
             // Match the benchmark's wide rows, including its split statistics
             // and private intermediates, against independent host arithmetic.
             let graph = graph_of(session);
@@ -254,7 +212,7 @@ pub fn cases() -> Cases {
             let expected = by_row(&data, shape[1] as usize, host_layer_centered);
             expect_values(session, shape, Dtype::F32, &actual, &expected).await
         },
-    ));
+    );
     cases
 }
 
@@ -315,16 +273,10 @@ async fn row_case(
     expect_values(session, shape, Dtype::F32, &actual, &expected).await?;
 
     let analytic = gradient_of(&graph, &y, &x).await?;
-    let probe_graph = graph_of(session);
-    let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
-    let probe_y = build(&probe_x, width as u64)?;
-    let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[rows, width], &data, |probe| {
-        read_probe_loss(&probe_x, &probe_loss, probe)
+    check_gradient(session, &[(&dimv, &data)], 0, &analytic, |t| {
+        build(&t[0], width as u64)
     })
-    .await?;
-    assert_gradient_matches_finite_difference(&analytic, &numeric)?;
-    Ok(())
+    .await
 }
 
 /// A norm with a learned weight and optional bias. All three gradients are
@@ -362,19 +314,11 @@ async fn weighted_case(
     expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await?;
 
     let d_x = gradient_of(&graph, &y, &x).await?;
-    let probe_graph = graph_of(session);
-    let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
-    let probe_w = upload(probe_graph.handle(), &wdim, &weight)?;
-    let probe_b = with_bias
-        .then(|| upload(probe_graph.handle(), &wdim, &bias))
-        .transpose()?;
-    let probe_y = build(&probe_x, &probe_w, probe_b.as_ref())?;
-    let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[rows, width], &data, |probe| {
-        read_probe_loss(&probe_x, &probe_loss, probe)
-    })
-    .await?;
-    assert_gradient_matches_finite_difference(&d_x, &numeric)?;
+    let mut inputs = vec![(&dimv[..], &data[..]), (&wdim, &weight)];
+    if with_bias {
+        inputs.push((&wdim, &bias));
+    }
+    check_gradient(session, &inputs, 0, &d_x, |t| build(&t[0], &t[1], t.get(2))).await?;
 
     // d_weight[j] = sum over rows of normalized[r, j] — the stride-0 axis's
     // adjoint is a sum, and it is over the *rows*, not the columns.
@@ -459,16 +403,10 @@ async fn variance_case(session: &Session, shape: &[u64], seed: u32) -> CaseResul
     .await?;
 
     let analytic = gradient_of(&graph, &y, &x).await?;
-    let probe_graph = graph_of(session);
-    let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
-    let probe_y = probe_x.variance_last()?;
-    let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[rows, width], &data, |probe| {
-        read_probe_loss(&probe_x, &probe_loss, probe)
+    check_gradient(session, &[(&dimv, &data)], 0, &analytic, |t| {
+        t[0].variance_last()
     })
-    .await?;
-    assert_gradient_matches_finite_difference(&analytic, &numeric)?;
-    Ok(())
+    .await
 }
 
 /// Every softmax row sums to exactly 1 within tolerance. Cheap, but it is the

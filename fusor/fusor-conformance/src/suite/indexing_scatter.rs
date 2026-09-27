@@ -11,7 +11,7 @@
 
 use fusor::{Dtype, Session};
 
-use crate::harness::{CaseResult, Cases, FuzzDim, Rng, dims, fill_indices, from_u32, fuzz_case};
+use crate::harness::{CaseResult, Cases, FuzzDim, Rng, dims, fill_indices, from_u32};
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
 
 /// The `[vocab, width]` table the gather/scatter cases read from.
@@ -43,29 +43,22 @@ fn dup_indices(seed: u32, count: usize, rows: u64) -> Vec<u32> {
 }
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
+    let mut cases = Cases::new("indexing_scatter");
+    cases.fuzz(
         "index_select_dim0",
         TABLE_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            index_select_case(s, shape, seed, 0).await
-        },
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
+        async move |s, shape, seed| index_select_case(s, shape, seed, 0).await,
+    );
+    cases.fuzz(
         "index_select_dim1",
         TABLE_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            index_select_case(s, shape, seed, 1).await
-        },
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
+        async move |s, shape, seed| index_select_case(s, shape, seed, 1).await,
+    );
+    cases.fuzz(
         "index_select_duplicate_gradients_accumulate",
         TABLE_SPEC,
         dup_grad_case,
-    ));
+    );
     // [vocab, width, batch, tokens].
     const EMBED_SPEC: &[FuzzDim] = &[
         FuzzDim::Range(2, 8),
@@ -73,12 +66,7 @@ pub fn cases() -> Cases {
         FuzzDim::Range(1, 3),
         FuzzDim::Range(1, 3),
     ];
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "embedding",
-        EMBED_SPEC,
-        embedding_case,
-    ));
+    cases.fuzz("embedding", EMBED_SPEC, embedding_case);
     // `batch * tokens >= 2` so a duplicate can exist.
     const EMBED_DUP_SPEC: &[FuzzDim] = &[
         FuzzDim::Range(2, 8),
@@ -86,50 +74,22 @@ pub fn cases() -> Cases {
         FuzzDim::Range(1, 3),
         FuzzDim::Range(2, 3),
     ];
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
+    cases.fuzz(
         "embedding_backward_is_scatter_add",
         EMBED_DUP_SPEC,
         embedding_backward,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "gather_last",
-        TABLE_SPEC,
-        gather_last_case,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "gather_last_backward",
-        TABLE_SPEC,
-        gather_last_backward,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "scatter_add",
-        TABLE_SPEC,
-        scatter_add_case,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
+    );
+    cases.fuzz("gather_last", TABLE_SPEC, gather_last_case);
+    cases.fuzz("gather_last_backward", TABLE_SPEC, gather_last_backward);
+    cases.fuzz("scatter_add", TABLE_SPEC, scatter_add_case);
+    cases.fuzz(
         "scatter_add_duplicates_accumulate",
         TABLE_SPEC,
         scatter_add_dups,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "scatter_add_backward",
-        TABLE_SPEC,
-        scatter_add_backward,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "scatter_set_unique",
-        TABLE_SPEC,
-        scatter_set_case,
-    ));
+    );
+    cases.fuzz("scatter_add_backward", TABLE_SPEC, scatter_add_backward);
+    cases.fuzz("scatter_set_unique", TABLE_SPEC, scatter_set_case);
     cases.push(
-        "indexing_scatter",
         "scatter_set_refuses_an_unproven_index",
         scatter_set_unproven,
     );
@@ -145,37 +105,16 @@ pub fn cases() -> Cases {
         FuzzDim::Range(1, 4),
         FuzzDim::Range(2, 4),
     ];
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "i_rank2",
-        R2_SPEC,
-        index_rank2,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "i_rank3",
-        R3_SPEC,
-        index_rank3,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "i_rank4",
-        R4_SPEC,
-        index_rank4,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "i_with_a_nonzero_pick",
-        R3_SPEC,
-        index_nonzero_pick,
-    ));
+    cases.fuzz("i_rank2", R2_SPEC, index_rank2);
+    cases.fuzz("i_rank3", R3_SPEC, index_rank3);
+    cases.fuzz("i_rank4", R4_SPEC, index_rank4);
+    cases.fuzz("i_with_a_nonzero_pick", R3_SPEC, index_nonzero_pick);
     const BACKWARD_SPEC: &[FuzzDim] = &[FuzzDim::Range(2, 5), FuzzDim::Range(2, 6)];
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
+    cases.fuzz(
         "i_backward_zeroes_the_unselected_region",
         BACKWARD_SPEC,
         index_backward,
-    ));
+    );
     cases
 }
 

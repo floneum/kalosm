@@ -1,11 +1,50 @@
 use super::*;
 use crate::graph::Graph;
+use fusor_ir::ir::launch::SchedPoint;
+
+/// Plan `roots` selecting exactly `members`, with `launch` at `point` or, by
+/// default, its first schedule point.
+fn replan_with(
+    session: &Session,
+    g: &EGraph,
+    roots: &[Id],
+    members: &[Id],
+    launch: Id,
+    point: Option<SchedPoint>,
+) -> Plan {
+    let mut extraction = fusor_ir::extract::Extraction::default();
+    for &id in members {
+        extraction.sigma.insert(g.class_of(id), id);
+    }
+    let point = point.unwrap_or_else(|| {
+        let Op::Launch(op) = &g.node(launch).op else {
+            unreachable!()
+        };
+        op.schedule().unwrap().iter().next().unwrap()
+    });
+    extraction.theta.insert(launch, point);
+    LocalSearch::new(Arc::new(Planner::new()), session.caps())
+        .replan(
+            g,
+            roots,
+            &mut extraction,
+            session.inner.cost.as_ref(),
+            &mut fusor_cost::realize::NodeCache::new(g.len()),
+        )
+        .unwrap()
+}
+
+/// Run `plan` and read `out` back as f32.
+fn run_f32(session: &Session, h: &GraphRef, plan: &Plan, out: &Tensor) -> Vec<f32> {
+    let resolving = h.state().resolve_lock.lock();
+    session.run(h, plan, std::slice::from_ref(out)).unwrap();
+    let bytes = session.read_bytes_locked(&resolving, h, out.id).unwrap();
+    bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+}
 
 #[test]
 #[cfg(all(feature = "cpu", not(target_arch = "wasm32")))]
 fn streamed_reductions_execute_without_the_producer_buffer() {
-    use fusor_cost::realize::NodeCache;
-    use fusor_ir::extract::Extraction;
     use fusor_ir::ir::launch::Launch;
 
     let backend = test_backend();
@@ -53,27 +92,9 @@ fn streamed_reductions_execute_without_the_producer_buffer() {
                         && g.node(*id).children.iter().all(|child| *child == input.id)
                 })
                 .expect("ordinary nested reductions must offer a streaming candidate");
-            let mut extraction = Extraction::default();
-            extraction.sigma.insert(g.class_of(input.id), input.id);
-            extraction.sigma.insert(g.class_of(out.id), stream);
-            let Op::Launch(op) = &g.node(stream).op else {
-                unreachable!()
-            };
-            extraction
-                .theta
-                .insert(stream, op.schedule().unwrap().iter().next().unwrap());
-            LocalSearch::new(Arc::new(Planner::new()), session.caps())
-                .replan(
-                    &g,
-                    &[out.id],
-                    &mut extraction,
-                    session.inner.cost.as_ref(),
-                    &mut NodeCache::new(g.len()),
-                )
-                .unwrap()
+            replan_with(&session, &g, &[out.id], &[input.id, stream], stream, None)
         };
         assert_eq!(plan.launches.len(), 1);
-        let resolving = h.state().resolve_lock.lock();
         for (step, [rows, columns, width]) in [[2, 1, 17], [3, 17, 1], [2, 65, 33], [1, 17, 65]]
             .into_iter()
             .enumerate()
@@ -87,9 +108,7 @@ fn streamed_reductions_execute_without_the_producer_buffer() {
             input
                 .set_bytes(bytemuck::cast_slice(&values).to_vec())
                 .unwrap();
-            session.run(h, &plan, std::slice::from_ref(&out)).unwrap();
-            let bytes = session.read_bytes_locked(&resolving, h, out.id).unwrap();
-            let actual = bytemuck::cast_slice::<u8, f32>(&bytes);
+            let actual = run_f32(&session, h, &plan, &out);
             assert_eq!(actual.len(), rows as usize);
             for (row, got) in actual.iter().enumerate() {
                 let expected: f64 = (0..columns)
@@ -121,9 +140,7 @@ fn streamed_reductions_execute_without_the_producer_buffer() {
 #[test]
 #[cfg(all(feature = "cpu", not(target_arch = "wasm32")))]
 fn ordinary_attention_discovers_and_executes_a_streamed_weighted_reduction() {
-    use fusor_cost::realize::NodeCache;
     use fusor_ir::carrier::SlotTy;
-    use fusor_ir::extract::Extraction;
     use fusor_ir::ir::launch::Launch;
 
     let backend = test_backend();
@@ -191,25 +208,8 @@ fn ordinary_attention_discovers_and_executes_a_streamed_weighted_reduction() {
             .expect("ordinary QK, softmax and PV must derive a single streamed weighted reduction");
         g.clear_roots();
         g.add_root(stream);
-        let mut extraction = Extraction::default();
-        for input in [q.id, k.id, v.id, stream] {
-            extraction.sigma.insert(g.class_of(input), input);
-        }
-        let Op::Launch(op) = &g.node(stream).op else {
-            unreachable!()
-        };
-        extraction
-            .theta
-            .insert(stream, op.schedule().unwrap().iter().next().unwrap());
-        let plan = LocalSearch::new(Arc::new(Planner::new()), session.caps())
-            .replan(
-                &g,
-                &[stream],
-                &mut extraction,
-                session.inner.cost.as_ref(),
-                &mut NodeCache::new(g.len()),
-            )
-            .unwrap();
+        let members = [q.id, k.id, v.id, stream];
+        let plan = replan_with(&session, &g, &[stream], &members, stream, None);
         (stream, plan)
     };
     assert_eq!(plan.launches.len(), 1);
@@ -217,7 +217,6 @@ fn ordinary_attention_discovers_and_executes_a_streamed_weighted_reduction() {
     let queries = [1.0f32, 0.25, 0.5, 0.75, 0.5, 0.75, 0.25, 1.0];
     q.set_bytes(bytemuck::cast_slice(&queries).to_vec())
         .unwrap();
-    let resolving = h.state().resolve_lock.lock();
     for (length, nonfinite) in [
         (7, 0),
         (7, 1),
@@ -248,9 +247,7 @@ fn ordinary_attention_discovers_and_executes_a_streamed_weighted_reduction() {
         }
         k.set_bytes(bytemuck::cast_slice(&keys).to_vec()).unwrap();
         v.set_bytes(bytemuck::cast_slice(&values).to_vec()).unwrap();
-        session.run(h, &plan, std::slice::from_ref(&state)).unwrap();
-        let bytes = session.read_bytes_locked(&resolving, h, stream).unwrap();
-        let actual = bytemuck::cast_slice::<u8, f32>(&bytes);
+        let actual = run_f32(&session, h, &plan, &state);
         assert_eq!(actual.len(), 12);
         for row in 0..2 {
             let scores: Vec<f64> = keys
@@ -341,10 +338,8 @@ fn dead_input_buffers_live_until_their_last_reader_drops() {
 #[test]
 #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 fn symbolic_contractions_reuse_pipelines_across_tile_boundaries() {
-    use fusor_cost::realize::NodeCache;
     use fusor_ir::dtype::Dtype;
-    use fusor_ir::extract::Extraction;
-    use fusor_ir::ir::launch::{Family, Launch, SchedPoint};
+    use fusor_ir::ir::launch::{Family, Launch};
     use fusor_tile::rules::contract::{lower_coop, lower_sgemm, lower_sgemv};
 
     let backend = match Backend::gpu_blocking() {
@@ -498,20 +493,8 @@ fn symbolic_contractions_reuse_pipelines_across_tile_boundaries() {
                     _ => true,
                 })
                 .unwrap();
-            let mut extraction = Extraction::default();
-            for id in [a.id, b.id, variant] {
-                extraction.sigma.insert(g.class_of(id), id);
-            }
-            extraction.theta.insert(variant, point);
-            LocalSearch::new(Arc::new(Planner::new()), session.caps())
-                .replan(
-                    &g,
-                    &[out.id],
-                    &mut extraction,
-                    session.inner.cost.as_ref(),
-                    &mut NodeCache::new(g.len()),
-                )
-                .unwrap()
+            let members = [a.id, b.id, variant];
+            replan_with(&session, &g, &[out.id], &members, variant, Some(point))
         };
         assert_eq!(plan.launches.len(), 1);
         let resolving = h.state().resolve_lock.lock();
@@ -641,27 +624,15 @@ fn symbolic_contractions_reuse_pipelines_across_tile_boundaries() {
         let node = g.node(out.id).clone();
         let facts = g.facts_view(out.id, &caps);
         let variant = lower_sgemv(&mut g.builder(&caps), out.id, &node, &facts).unwrap();
-        let Op::Launch(Launch::Contract { sched, .. }) = &g.node(variant).op else {
-            unreachable!()
-        };
-        let mut extraction = Extraction::default();
-        for id in [a.id, b.id, variant] {
-            extraction.sigma.insert(g.class_of(id), id);
-        }
-        extraction
-            .theta
-            .insert(variant, sched.iter().next().unwrap());
-        let base = Arc::new(
-            LocalSearch::new(Arc::new(Planner::new()), caps.clone())
-                .replan(
-                    &g,
-                    &[out.id],
-                    &mut extraction,
-                    session.inner.cost.as_ref(),
-                    &mut NodeCache::new(g.len()),
-                )
-                .unwrap(),
-        );
+        let members = [a.id, b.id, variant];
+        let base = Arc::new(replan_with(
+            &session,
+            &g,
+            &[out.id],
+            &members,
+            variant,
+            None,
+        ));
         let field = launch_signature(&g, &base.launches[0]);
         let label = incumbent_signature(&g, &base, 0).unwrap();
         let winner = session
@@ -696,14 +667,58 @@ fn symbolic_contractions_reuse_pipelines_across_tile_boundaries() {
         fusor_cost::extract::incumbent_signature(&h.state().egraph.lock(), &selected, 0),
         Some(winner)
     );
-    let resolving = h.state().resolve_lock.lock();
-    session
-        .run(h, &selected, std::slice::from_ref(&out))
-        .unwrap();
-    let bytes = session.read_bytes_locked(&resolving, h, out.id).unwrap();
-    assert_eq!(bytemuck::cast_slice::<u8, f32>(&bytes), &[16.28125; 1009]);
+    assert_eq!(run_f32(&session, h, &selected, &out), [16.28125; 1009]);
     assert_eq!(target.launcher().pipeline_compiles(), before + 1);
     eprintln!("verified persisted winner executes with one pipeline compile");
+}
+
+/// `sum(a @ b + 1, 1)` over fixed `[2, 3]` and `[3, 2]` operands, which is
+/// `[124, 295]`. Returns `(a, out)`.
+#[cfg(feature = "cpu")]
+fn matmul_row_sums(h: &GraphRef) -> (Tensor, Tensor) {
+    let a = Tensor::from_elements(
+        h,
+        &[Dim::Const(2), Dim::Const(3)],
+        &[1.0f32, 2., 3., 4., 5., 6.],
+    )
+    .unwrap();
+    let b = Tensor::from_elements(
+        h,
+        &[Dim::Const(3), Dim::Const(2)],
+        &[7.0f32, 8., 9., 10., 11., 12.],
+    )
+    .unwrap();
+    let out = a.matmul(&b).unwrap().add_scalar(1.0).unwrap();
+    (a, out.sum(1).unwrap())
+}
+
+/// Saturate `out`'s closure alone under `budget`, which must stop short of
+/// saturation, then extract a plan from what it reached.
+#[cfg(feature = "cpu")]
+fn plan_under_budget(
+    session: &Session,
+    h: &GraphRef,
+    out: &Tensor,
+    budget: SaturationBudget,
+) -> (fusor_ir::egraph::SaturationReport, Plan) {
+    let mut g = h.state().egraph.lock();
+    g.clear_roots();
+    g.add_root(out.id);
+    let report = Driver::new()
+        .saturate(&mut g, &session.caps(), &session.inner.rules, budget)
+        .unwrap();
+    assert!(!report.saturated);
+    let plan = session
+        .inner
+        .extractor
+        .extract(
+            &g,
+            &[out.id],
+            session.inner.cost.as_ref(),
+            ExtractBudget::default(),
+        )
+        .unwrap();
+    (report, plan)
 }
 
 #[test]
@@ -750,52 +765,13 @@ fn saturation_budget_ignores_completed_graph_history() {
                     )
                     .unwrap();
             }
-            let a = Tensor::from_elements(
-                h,
-                &[Dim::Const(2), Dim::Const(3)],
-                &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
-            )
-            .unwrap();
-            let b = Tensor::from_elements(
-                h,
-                &[Dim::Const(3), Dim::Const(2)],
-                &[7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0],
-            )
-            .unwrap();
-            let out = a
-                .matmul(&b)
-                .unwrap()
-                .add_scalar(1.0)
-                .unwrap()
-                .sum(1)
-                .unwrap();
-            let resolving = h.state().resolve_lock.lock();
-            let plan = {
-                let mut g = h.state().egraph.lock();
-                g.clear_roots();
-                g.add_root(out.id);
-                let report = Driver::new()
-                    .saturate(&mut g, &session.caps(), &session.inner.rules, budget)
-                    .unwrap();
-                assert!(!report.saturated);
-                expansions.push((
-                    report.final_nodes - report.initial_nodes,
-                    report.applications,
-                ));
-                session
-                    .inner
-                    .extractor
-                    .extract(
-                        &g,
-                        &[out.id],
-                        session.inner.cost.as_ref(),
-                        ExtractBudget::default(),
-                    )
-                    .unwrap()
-            };
-            session.run(h, &plan, std::slice::from_ref(&out)).unwrap();
-            let bytes = session.read_bytes_locked(&resolving, h, out.id).unwrap();
-            assert_eq!(bytemuck::cast_slice::<u8, f32>(&bytes), [124.0, 295.0]);
+            let (_, out) = matmul_row_sums(h);
+            let (report, plan) = plan_under_budget(&session, h, &out, budget);
+            expansions.push((
+                report.final_nodes - report.initial_nodes,
+                report.applications,
+            ));
+            assert_eq!(run_f32(&session, h, &plan, &out), [124.0, 295.0]);
         }
         assert_eq!(expansions[0], expansions[1]);
         applications.push(expansions[0].1);
@@ -809,58 +785,15 @@ fn exhausted_saturation_still_executes_the_lowering_floor() {
     let session = Session::new(Backend::cpu().unwrap()).unwrap();
     let graph = Graph::new(&session);
     let h = graph.handle();
-    let a = Tensor::from_elements(
-        h,
-        &[Dim::Const(2), Dim::Const(3)],
-        &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
-    )
-    .unwrap();
-    let b = Tensor::from_elements(
-        h,
-        &[Dim::Const(3), Dim::Const(2)],
-        &[7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0],
-    )
-    .unwrap();
-    let out = a
-        .matmul(&b)
-        .unwrap()
-        .add_scalar(1.0)
-        .unwrap()
-        .sum(1)
-        .unwrap();
+    let (a, out) = matmul_row_sums(h);
     let unrelated = a.add_scalar(5.0).unwrap();
-    let resolving = h.state().resolve_lock.lock();
     let execute_floor = |out: &Tensor| {
-        let plan = {
-            let mut g = h.state().egraph.lock();
-            g.clear_roots();
-            g.add_root(out.id);
-            let report = Driver::new()
-                .saturate(
-                    &mut g,
-                    &session.caps(),
-                    &session.inner.rules,
-                    SaturationBudget {
-                        max_applications: 0,
-                        ..SaturationBudget::default()
-                    },
-                )
-                .unwrap();
-            assert!(!report.saturated);
-            session
-                .inner
-                .extractor
-                .extract(
-                    &g,
-                    &[out.id],
-                    session.inner.cost.as_ref(),
-                    ExtractBudget::default(),
-                )
-                .unwrap()
+        let budget = SaturationBudget {
+            max_applications: 0,
+            ..SaturationBudget::default()
         };
-        session.run(h, &plan, std::slice::from_ref(out)).unwrap();
-        let bytes = session.read_bytes_locked(&resolving, h, out.id).unwrap();
-        bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+        let (_, plan) = plan_under_budget(&session, h, out, budget);
+        run_f32(&session, h, &plan, out)
     };
     assert_eq!(execute_floor(&out), [124.0, 295.0]);
     {

@@ -4,7 +4,7 @@
 
 use fusor::{Dtype, Session};
 
-use crate::harness::{Case, CaseResult, Cases, FuzzDim, dims, fuzz_case};
+use crate::harness::{CaseResult, Cases, FuzzDim, dims};
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
 
 // Gradients here are analytic (all-ones seed row/column sums), not finite
@@ -55,50 +55,34 @@ const QMATMUL_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 8), FuzzDim::Range(1, 4)];
 const QMATMUL_RANK1_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 8), FuzzDim::Fixed(1)];
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
-    cases.push_case(fuzz_case("matmul", "matmul", MATMUL_SPEC, batched));
-    cases.push_case(fuzz_case(
-        "matmul",
-        "mat_mul_rank3",
-        MATMUL_RANK3_SPEC,
-        batched,
-    ));
-    cases.push_case(fuzz_case(
-        "matmul",
-        "mat_mul_rank4",
-        MATMUL_RANK4_SPEC,
-        batched,
-    ));
-    cases.push_case(fuzz_case(
-        "matmul",
+    let mut cases = Cases::new("matmul");
+    cases.fuzz("matmul", MATMUL_SPEC, batched);
+    cases.fuzz("mat_mul_rank3", MATMUL_RANK3_SPEC, batched);
+    cases.fuzz("mat_mul_rank4", MATMUL_RANK4_SPEC, batched);
+    cases.fuzz(
         "mat_mul_transposed_rhs",
         TRANSPOSED_RHS_SPEC,
         transposed_rhs,
-    ));
-    cases.push_case(fuzz_case(
-        "matmul",
+    );
+    cases.fuzz(
         "matmul_with_broadcast_bias",
         BROADCAST_BIAS_SPEC,
         broadcast_bias,
-    ));
-    cases.push_case(fuzz_case(
-        "matmul",
-        "q_mat_mul",
-        QMATMUL_SPEC,
-        async move |s: &Session, sh: &[u64], seed: u32| quantized_matmul(s, 2, sh, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "matmul",
+    );
+    cases.fuzz("q_mat_mul", QMATMUL_SPEC, async move |s, sh, seed| {
+        quantized_matmul(s, 2, sh, seed).await
+    });
+    cases.fuzz(
         "q_mat_mul_rank1",
         QMATMUL_RANK1_SPEC,
-        async move |s: &Session, sh: &[u64], seed: u32| quantized_matmul(s, 1, sh, seed).await,
-    ));
+        async move |s, sh, seed| quantized_matmul(s, 1, sh, seed).await,
+    );
     for (name, dtype, batch) in [
         ("q_mat_mul_rank1_gradient", Dtype::F32, 1),
         ("q_mat_mul_rank1_gradient_f16", Dtype::F16, 1),
         ("q_mat_mul_gradient_f16", Dtype::F16, 16),
     ] {
-        cases.push_case(Case::new("matmul", name, async move |session: &Session| {
+        cases.push(name, async move |session: &Session| {
             use fusor_ir::dtype::{QFmt, QLayout};
             if dtype == Dtype::F16 && !session.caps().f16 {
                 return Err(crate::harness::skip("device has no f16 support"));
@@ -133,33 +117,23 @@ pub fn cases() -> Cases {
                 .map(|i| 8. * ((i % 32) as f32 - 16.))
                 .collect();
             expect_values(session, &shape, dtype, &gradient, &expected).await
-        }));
+        });
     }
     // Split-K at the extents the trainer and this suite actually use. The
     // shipped `extent.at_least(4096)` gate refuses every one of them, so
     // whether the reduction runs split or unsplit is a schedule decision
     // these four cases must not be able to tell apart.
     for k in SPLIT_K_EXTENTS {
-        cases.push_case(fuzz_case(
-            "matmul",
+        cases.fuzz(
             split_k_name(k),
             SPLIT_K_MN_SPEC,
-            async move |s: &Session, sh: &[u64], seed: u32| split_k(s, k, sh, seed).await,
-        ));
+            async move |s, sh, seed| split_k(s, k, sh, seed).await,
+        );
     }
-    cases.push_case(Case::new("matmul", "split_k_multi_axis", async |s| {
-        multi_axis(s, false).await
-    }));
-    cases.push_case(Case::new("matmul", "grouped_reshape_chain", async |s| {
-        multi_axis(s, true).await
-    }));
-    cases.push_case(fuzz_case("matmul", "wide_n_columns", WIDE_N_SPEC, wide_n));
-    cases.push_case(fuzz_case(
-        "matmul",
-        "qkv_projection_triple",
-        QKV_SPEC,
-        qkv_triple,
-    ));
+    cases.push("split_k_multi_axis", async |s| multi_axis(s, false).await);
+    cases.push("grouped_reshape_chain", async |s| multi_axis(s, true).await);
+    cases.fuzz("wide_n_columns", WIDE_N_SPEC, wide_n);
+    cases.fuzz("qkv_projection_triple", QKV_SPEC, qkv_triple);
     cases
 }
 

@@ -14,9 +14,7 @@ use fusor::layers::{Embedding, LayerNorm, LayerNormNd, Linear, RmsNorm};
 use fusor::optim::{AdamW, clip_global_norm, cosine_decay};
 use fusor::{Dtype, Session};
 
-use crate::harness::{
-    CaseError, CaseResult, Cases, FuzzDim, dims, fill_indices, from_u32, fuzz_case,
-};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fill_indices, from_u32};
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
 
 /// A runtime-rank value as the const-rank one the layers take.
@@ -76,25 +74,20 @@ fn host_linear(
 }
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
-    cases.push_case(fuzz_case(
-        "layers",
-        "linear_with_bias",
-        LINEAR_SPEC,
-        async move |s: &Session, sh: &[u64], seed: u32| linear_case(s, true, sh, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "layers",
+    let mut cases = Cases::new("layers");
+    cases.fuzz("linear_with_bias", LINEAR_SPEC, async move |s, sh, seed| {
+        linear_case(s, true, sh, seed).await
+    });
+    cases.fuzz(
         "linear_without_bias",
         LINEAR_SPEC,
-        async move |s: &Session, sh: &[u64], seed: u32| linear_case(s, false, sh, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "layers",
+        async move |s, sh, seed| linear_case(s, false, sh, seed).await,
+    );
+    cases.fuzz(
         "linear_gradients_reach_every_parameter",
         LINEAR_GRAD_SPEC,
         linear_grads,
-    ));
+    );
     // [vocab, emb, t0, t1]: tokens are a [t0, t1] index tensor into the table.
     // t0 >= 2 keeps room for the forced repeat the backward case relies on.
     const EMBEDDING_SPEC: &[FuzzDim] = &[
@@ -103,42 +96,21 @@ pub fn cases() -> Cases {
         FuzzDim::Range(2, 4),
         FuzzDim::Range(1, 4),
     ];
-    cases.push_case(fuzz_case(
-        "layers",
-        "embedding_layer",
-        EMBEDDING_SPEC,
-        embedding_layer,
-    ));
-    cases.push_case(fuzz_case(
-        "layers",
+    cases.fuzz("embedding_layer", EMBEDDING_SPEC, embedding_layer);
+    cases.fuzz(
         "embedding_layer_backward",
         EMBEDDING_SPEC,
         embedding_layer_backward,
-    ));
+    );
     const NORM_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(1, 16)];
-    cases.push_case(fuzz_case(
-        "layers",
-        "layer_norm_layer",
-        NORM_SPEC,
-        layer_norm_layer,
-    ));
+    cases.fuzz("layer_norm_layer", NORM_SPEC, layer_norm_layer);
     const NORM_ND_SPEC: &[FuzzDim] = &[
         FuzzDim::Range(1, 4),
         FuzzDim::Range(1, 4),
         FuzzDim::Range(1, 6),
     ];
-    cases.push_case(fuzz_case(
-        "layers",
-        "layer_norm_nd_over_two_axes",
-        NORM_ND_SPEC,
-        layer_norm_nd,
-    ));
-    cases.push_case(fuzz_case(
-        "layers",
-        "rms_norm_layer",
-        NORM_SPEC,
-        rms_norm_layer,
-    ));
+    cases.fuzz("layer_norm_nd_over_two_axes", NORM_ND_SPEC, layer_norm_nd);
+    cases.fuzz("rms_norm_layer", NORM_SPEC, rms_norm_layer);
     // [batch, in_ch, out_ch, k, extra]: the spatial extent is k + extra, so it
     // is always >= the kernel extent.
     const CONV_SPEC: &[FuzzDim] = &[
@@ -148,67 +120,31 @@ pub fn cases() -> Cases {
         FuzzDim::Range(1, 3),
         FuzzDim::Range(0, 5),
     ];
-    cases.push_case(fuzz_case("layers", "conv_nd_layer", CONV_SPEC, conv_layer));
+    cases.fuzz("conv_nd_layer", CONV_SPEC, conv_layer);
     const MLP_SPEC: &[FuzzDim] = &[
         FuzzDim::Range(1, 4),
         FuzzDim::Range(2, 6),
         FuzzDim::Range(2, 6),
     ];
-    cases.push_case(fuzz_case(
-        "layers",
-        "a_two_layer_mlp_trains_downhill",
-        MLP_SPEC,
-        mlp_step,
-    ));
+    cases.fuzz("a_two_layer_mlp_trains_downhill", MLP_SPEC, mlp_step);
     // [rows, classes]; softmax over one class is constant, so classes >= 2.
     const LOSS_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(2, 8)];
-    cases.push_case(fuzz_case(
-        "layers",
-        "softmax_cross_entropy",
-        LOSS_SPEC,
-        cross_entropy_case,
-    ));
-    cases.push_case(fuzz_case(
-        "layers",
+    cases.fuzz("softmax_cross_entropy", LOSS_SPEC, cross_entropy_case);
+    cases.fuzz(
         "softmax_cross_entropy_gradient_is_p_minus_onehot",
         LOSS_SPEC,
         cross_entropy_grad,
-    ));
-    cases.push_case(fuzz_case(
-        "layers",
-        "binary_cross_entropy_with_logits",
-        LOSS_SPEC,
-        bce_case,
-    ));
-    cases.push_case(fuzz_case(
-        "layers",
-        "distillation_loss",
-        LOSS_SPEC,
-        distillation_case,
-    ));
-    cases.push_case(fuzz_case("layers", "mse", LOSS_SPEC, mse_case));
+    );
+    cases.fuzz("binary_cross_entropy_with_logits", LOSS_SPEC, bce_case);
+    cases.fuzz("distillation_loss", LOSS_SPEC, distillation_case);
+    cases.fuzz("mse", LOSS_SPEC, mse_case);
     const PARAM_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 16)];
-    cases.push_case(fuzz_case(
-        "layers",
-        "adamw_step_moves_downhill",
-        PARAM_SPEC,
-        adamw_case,
-    ));
+    cases.fuzz("adamw_step_moves_downhill", PARAM_SPEC, adamw_case);
     const CLIP_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 8), FuzzDim::Range(1, 8)];
-    cases.push_case(fuzz_case(
-        "layers",
-        "clip_global_norm",
-        CLIP_SPEC,
-        clip_case,
-    ));
+    cases.fuzz("clip_global_norm", CLIP_SPEC, clip_case);
     // [warmup, extra]: the total is warmup + extra, so warmup < total always.
     const COSINE_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 20), FuzzDim::Range(10, 190)];
-    cases.push_case(fuzz_case(
-        "layers",
-        "cosine_decay_schedule",
-        COSINE_SPEC,
-        cosine_case,
-    ));
+    cases.fuzz("cosine_decay_schedule", COSINE_SPEC, cosine_case);
     cases
 }
 

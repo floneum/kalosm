@@ -12,10 +12,9 @@
 use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
 
-use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fuzz_case};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims};
 use crate::suite::support::{
-    Domain, ELEMENTWISE_SPEC, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss,
+    Domain, ELEMENTWISE_SPEC, check_gradient, expect_values, gradient_of, graph_of, loss_of, read,
     upload,
 };
 
@@ -36,10 +35,6 @@ fn backend_of(session: &Session) -> &'static str {
 
 fn len_of(shape: &[u64]) -> usize {
     shape.iter().product::<u64>() as usize
-}
-
-fn usize_shape(shape: &[u64]) -> Vec<usize> {
-    shape.iter().map(|n| *n as usize).collect()
 }
 
 /// The build receives the sampled shape so shape-dependent chains
@@ -98,117 +93,74 @@ fn comparisons() -> Vec<(&'static str, Build)> {
 }
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
+    let mut cases = Cases::new("backward");
 
     for (name, build, domain) in chains() {
-        cases.push_case(fuzz_case(
-            "backward",
-            name,
-            ELEMENTWISE_SPEC,
-            async move |s: &Session, shape: &[u64], seed: u32| {
-                chain_case(s, name, build, domain, shape, seed).await
-            },
-        ));
+        cases.fuzz(name, ELEMENTWISE_SPEC, async move |s, shape, seed| {
+            chain_case(s, name, build, domain, shape, seed).await
+        });
     }
     for (name, build) in comparisons() {
         let case: &'static str =
             Box::leak(format!("{name}_differentiates_to_zero").into_boxed_str());
-        cases.push_case(fuzz_case(
-            "backward",
-            case,
-            FORWARD_SPEC,
-            async move |s: &Session, shape: &[u64], seed: u32| {
-                zero_grad_case(s, name, build, shape, seed).await
-            },
-        ));
+        cases.fuzz(case, FORWARD_SPEC, async move |s, shape, seed| {
+            zero_grad_case(s, name, build, shape, seed).await
+        });
     }
 
     // The clamp data must straddle both bounds, so its width floor keeps at
     // least the three forced elements.
     const CLAMP_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(3, 16)];
-    cases.push_case(fuzz_case(
-        "backward",
-        "clamp_masks_both_ends",
-        CLAMP_SPEC,
-        clamp_case,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
+    cases.fuzz("clamp_masks_both_ends", CLAMP_SPEC, clamp_case);
+    cases.fuzz(
         "where_cond_splits_the_gradient",
         FORWARD_SPEC,
         where_cond_case,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
+    );
+    cases.fuzz(
         "where_cond_gives_the_condition_zeros",
         FORWARD_SPEC,
         where_cond_zero,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
-        "pow_tensor_tensor",
-        ANALYTIC_SPEC,
-        pow_tensor_case,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
+    );
+    cases.fuzz("pow_tensor_tensor", ANALYTIC_SPEC, pow_tensor_case);
+    cases.fuzz(
         "broadcast_add_sums_over_the_stride_zero_axis",
         ANALYTIC_SPEC,
         broadcast_case,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
-        "broadcast_mul_backward",
-        ANALYTIC_SPEC,
-        broadcast_mul_case,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
+    );
+    cases.fuzz("broadcast_mul_backward", ANALYTIC_SPEC, broadcast_mul_case);
+    cases.fuzz(
         "gelu_matches_its_analytic_derivative",
         ANALYTIC_SPEC,
         gelu_analytic,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
+    );
+    cases.fuzz(
         "relu_is_subgradient_zero_at_the_kink",
         ANALYTIC_SPEC,
         relu_kink,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
+    );
+    cases.fuzz(
         "straight_through_fake_quant",
         ANALYTIC_SPEC,
         straight_through_case,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
-        "detach_cuts_the_tape",
-        ANALYTIC_SPEC,
-        detach_case,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
+    );
+    cases.fuzz("detach_cuts_the_tape", ANALYTIC_SPEC, detach_case);
+    cases.fuzz(
         "an_accumulated_adjoint_fires_once",
         ANALYTIC_SPEC,
         diamond_case,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
+    );
+    cases.fuzz(
         "backward_seeded_scales_the_whole_gradient",
         ANALYTIC_SPEC,
         seeded_case,
-    ));
-    cases.push(
-        "backward",
-        "backward_across_two_graphs_is_refused",
-        cross_graph,
     );
-    cases.push_case(fuzz_case(
-        "backward",
+    cases.push("backward_across_two_graphs_is_refused", cross_graph);
+    cases.fuzz(
         "a_gradient_reaches_every_requires_grad_parent",
         ANALYTIC_SPEC,
         every_parent,
-    ));
+    );
     cases
 }
 
@@ -229,17 +181,11 @@ async fn chain_case(
     let y = build(&x, shape).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
     let analytic = gradient_of(&graph, &y, &x).await?;
-    let probe_graph = graph_of(session);
-    let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
-    let probe_y = build(&probe_x, shape)?;
-    let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&usize_shape(shape), &data, |probe| {
-        read_probe_loss(&probe_x, &probe_loss, probe)
+    check_gradient(session, &[(&dimv, &data)], 0, &analytic, |t| {
+        build(&t[0], shape)
     })
-    .await?;
-    assert_gradient_matches_finite_difference(&analytic, &numeric)
-        .map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
-    Ok(())
+    .await
+    .map_err(|e| -> CaseError { format!("{name}: {e}").into() })
 }
 
 /// A comparison's gradient must be **present and zero**. `gradient_of`

@@ -14,7 +14,7 @@ use fusor::{Dtype, Session};
 use fusor_ir::carrier::{Carrier, oracle};
 use fusor_ir::scalar::UnOp;
 
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fuzz_case};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims};
 use crate::suite::support::{Domain, expect_values, graph_of, read, upload};
 
 /// `[rows, axis]`, axis at most one pass of the lane group: the one-pass body
@@ -30,24 +30,20 @@ const SHORT_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(1, 64)];
 const LONG_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(300, 2000)];
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
+    let mut cases = Cases::new("multi_slot");
     for (name, spec) in [
         ("shift_stabilized_sum", SHORT_SPEC),
         ("shift_stabilized_sum_long", LONG_SPEC),
     ] {
-        cases.push_case(fuzz_case("multi_slot", name, spec, shift_stabilized_case));
+        cases.fuzz(name, spec, shift_stabilized_case);
     }
     for (name, spec) in [("welford", SHORT_SPEC), ("welford_long", LONG_SPEC)] {
-        cases.push_case(fuzz_case("multi_slot", name, spec, welford_case));
+        cases.fuzz(name, spec, welford_case);
     }
     // The obligation every carrier owes, exercised on a real launch: a lane
     // group that is not a multiple of the extent merges padded identity lanes,
     // and an unguarded rescale computes `0 * exp((-inf) - (-inf)) = NaN` there.
-    cases.push(
-        "multi_slot",
-        "identity_lanes_do_not_poison_the_merge",
-        identity_lane_case,
-    );
+    cases.push("identity_lanes_do_not_poison_the_merge", identity_lane_case);
     cases
 }
 
