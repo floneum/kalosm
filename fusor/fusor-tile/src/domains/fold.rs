@@ -1,7 +1,6 @@
 //! The reduction schedule domain. Workgroup width, lane-group width and
 //! staging depth are coupled, so they are enumerated and scored together.
 
-use fusor_ir::device::Caps;
 use fusor_ir::ir::launch::{FoldDomain, FoldStrat};
 use fusor_ir::shape::Dim;
 use smallvec::SmallVec;
@@ -17,14 +16,6 @@ pub const MAX_STRATEGIES: usize = 32;
 /// The workgroup width both emitters allocate scratch over; `verify_launch`
 /// admits strategies against the same number.
 pub use fusor_ir::ir::launch::{emitted_block, fold_scratch_bytes};
-
-/// Compatibility entry point for the scaffold's `domains::fold_legal`
-/// re-export. `rows` prices the domain; it never filters it.
-pub fn legal(axis_extent: Dim, rows: Dim, caps: &Caps) -> FoldDomain {
-    let _ = rows;
-    let cx = DomainCtx::new(caps, crate::domains::default_planner());
-    fold_domain(axis_extent, &cx)
-}
 
 /// Every legal reduction strategy for an axis of extent `k` on this device,
 /// for a single-lane f32 accumulator.

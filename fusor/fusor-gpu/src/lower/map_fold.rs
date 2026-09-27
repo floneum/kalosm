@@ -2,17 +2,18 @@
 //! Both read their geometry off `theta`.
 
 use fusor_ir::Result;
-use fusor_ir::carrier::SlotTy;
-use fusor_ir::dtype::NumericContract;
-use fusor_ir::dtype::Splat;
 use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
-    Accumulator, Addr, ElementType, KernelIr, ReduceKind, ScalarElement, Stmt, TileBinaryOp,
-    TileCompareOp, TileExpr,
+    Accumulator, Addr, ElementType, KernelIr, ReduceKind, ScalarElement, Stmt, TileExpr,
 };
-use fusor_ir::ir::launch::{FoldStrat, Launch, MapTiling, SchedPoint};
+use fusor_ir::ir::launch::{
+    AccessPlan, FoldStrat, IndexSpace, Launch, MapTiling, Operand, SchedPoint,
+};
+use fusor_ir::scalar::ScalarExpr;
+use fusor_ir::shape::Dim;
+use fusor_tile::build::FoldLanes;
 
-use crate::lower::{Ctx, DimBinding, grid_for, scalar_element};
+use crate::lower::{Ctx, grid_for, scalar_element};
 use fusor_tile::domains::emitted_block;
 
 /// Lower a `Map` at a [`MapTiling`].
@@ -21,7 +22,7 @@ use fusor_tile::domains::emitted_block;
 /// computes `tm` outputs along `dim` and every operand that does *not* vary
 /// with `dim` is hoisted into a `Local` before the loop, so it is read once
 /// per lane instead of `tm` times.
-pub(crate) fn lower_kmap(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Result<KernelIr> {
+pub(crate) fn lower_kmap(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Result<KernelIr> {
     let Launch::Map {
         space, body, ops, ..
     } = op
@@ -42,41 +43,40 @@ pub(crate) fn lower_kmap(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Re
         }
     };
 
-    let out = ctx.output()?;
-    let out_view = ctx.linear_view(out)?;
-    let out_elem = out_view.buffer.element;
-    let block = emitted_block(1, ctx.caps).max(ctx.block_floor);
-    let limits = ctx.caps.limits;
-
-    let mut body_stmts: Vec<Stmt> = Vec::new();
-    let total = space_extent_expr(&mut ctx, space)?;
+    let b = &ctx.b;
+    let out = ctx.linear_view(ctx.output()?)?;
+    let block = ctx.block(emitted_block(1, ctx.caps));
+    let total = ctx.extent_product(&space.dims)?;
     let space_total = space.iterations().unwrap_or(0);
-
-    // The dispatch grid, computed before the body so `global_index`
-    // linearizes against the grid this kernel is actually launched with.
     let tm = tiling.tm.max(1);
-    let grid = tiled_grid(space, block, tm, &ctx.binding, &limits)?;
+    let grid = grid_for(
+        space,
+        block.saturating_mul(tm),
+        &ctx.binding,
+        &ctx.caps.limits,
+    )?;
+    let store = |at: TileExpr, args: Vec<TileExpr>| -> Result<Stmt> {
+        let coords = ctx.coords_from_linear(at.clone(), space)?;
+        let value = b.cast(ctx.eval_scalar(body, &args, &coords)?, out.buffer.element);
+        Ok(Stmt::Store {
+            dst: out.clone(),
+            addr: Addr::Linear(at.clone()),
+            value,
+            mask: b.lt(at, total.clone()),
+        })
+    };
 
+    let mut stmts: Vec<Stmt> = Vec::new();
     match tiling.dim {
         None => {
-            let index = ctx.global_index(block, grid);
-            let mask = ctx.b.compare(TileCompareOp::Lt, index.clone(), total);
-            let coords = ctx.coords_from_linear(index.clone(), space)?;
-            let mut args = Vec::with_capacity(ops.len());
-            for operand in ops {
-                args.push(ctx.load_mapped(operand, index.clone(), space_total)?);
-            }
-            let value = ctx.eval_scalar(body, &args, &coords)?;
-            let value = ctx.b.cast(value, out_elem);
-            body_stmts.push(Stmt::Store {
-                dst: out_view,
-                addr: Addr::Linear(index),
-                value,
-                mask,
-            });
+            let index = ctx.global_index(block);
+            let args = ops
+                .iter()
+                .map(|o| ctx.load_mapped(o, index.clone(), space_total))
+                .collect::<Result<_>>()?;
+            stmts.push(store(index, args)?);
         }
         Some(dim) => {
-            let tm = tiling.tm.max(1);
             let axis = dim as usize;
             if axis >= space.rank() {
                 return Err(Error::Plan(format!(
@@ -91,127 +91,55 @@ pub(crate) fn lower_kmap(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Re
                     "map tiling on the innermost axis destroys store coalescing".into(),
                 ));
             }
-
-            let base = ctx.global_index(block, grid);
-            let stride = inner_extent_expr(&mut ctx, op, axis)?;
-            let tm_e = ctx.b.u32(tm);
-            let step = ctx.b.mul(stride.clone(), tm_e);
-            let tile_base = {
-                let outer = ctx.b.binary(
-                    TileBinaryOp::Div,
-                    base.clone(),
-                    stride.clone(),
-                    NumericContract::RELAXED,
-                );
-                let inner = ctx.b.binary(
-                    TileBinaryOp::Rem,
-                    base,
-                    stride.clone(),
-                    NumericContract::RELAXED,
-                );
-                let scaled = ctx.b.mul(outer, step);
-                ctx.b.add(scaled, inner)
-            };
+            let stride = ctx.extent_product(&space.dims[axis + 1..])?;
+            let tile_base = b.tile_origin(ctx.global_index(block), stride.clone(), tm);
 
             // Hoist every operand whose access does not vary along `dim`.
             let mut hoisted: Vec<Option<TileExpr>> = Vec::with_capacity(ops.len());
             for operand in ops {
-                if operand_is_invariant(operand, axis) {
+                hoisted.push(if operand_is_invariant(operand, axis) {
                     let v = ctx.load_mapped(operand, tile_base.clone(), space_total)?;
-                    let local = ctx.b.local(v.element());
-                    body_stmts.push(Stmt::StoreLocal {
+                    let local = b.local(v.element());
+                    stmts.push(Stmt::StoreLocal {
                         dst: local.clone(),
                         value: v,
                     });
-                    hoisted.push(Some(ctx.b.load_local(local)));
+                    Some(b.load_local(local))
                 } else {
-                    hoisted.push(None);
-                }
-            }
-
-            for t in 0..tm {
-                let off = {
-                    let t_e = ctx.b.u32(t);
-                    let scaled = ctx.b.mul(stride.clone(), t_e);
-                    ctx.b.add(tile_base.clone(), scaled)
-                };
-                let mask = ctx.b.compare(TileCompareOp::Lt, off.clone(), total.clone());
-                let coords = ctx.coords_from_linear(off.clone(), space)?;
-                let mut args = Vec::with_capacity(ops.len());
-                for (operand, cached) in ops.iter().zip(&hoisted) {
-                    match cached {
-                        Some(v) => args.push(v.clone()),
-                        None => args.push(ctx.load_mapped(operand, off.clone(), space_total)?),
-                    }
-                }
-                let value = ctx.eval_scalar(body, &args, &coords)?;
-                let value = ctx.b.cast(value, out_elem);
-                body_stmts.push(Stmt::Store {
-                    dst: out_view.clone(),
-                    addr: Addr::Linear(off),
-                    value,
-                    mask,
+                    None
                 });
+            }
+            for t in 0..tm {
+                let off = b.at(tile_base.clone(), stride.clone(), b.u32(t));
+                let args = ops
+                    .iter()
+                    .zip(&hoisted)
+                    .map(|(operand, cached)| match cached {
+                        Some(v) => Ok(v.clone()),
+                        None => ctx.load_mapped(operand, off.clone(), space_total),
+                    })
+                    .collect::<Result<_>>()?;
+                stmts.push(store(off, args)?);
             }
         }
     }
-
-    Ok(ctx.finish("kmap", grid, block, body_stmts))
+    Ok(ctx.finish("kmap", grid, block, stmts))
 }
 
 /// An operand is loop-invariant along `axis` when its layout gives that axis
 /// stride 0 or extent 1 — `layout_index` drops both, so the address does not
 /// move as the tiled coordinate advances.
-fn operand_is_invariant(operand: &fusor_ir::ir::launch::Operand, axis: usize) -> bool {
+fn operand_is_invariant(operand: &Operand, axis: usize) -> bool {
     let layout = &operand.layout;
-    if axis >= layout.rank() {
-        return true;
-    }
-    layout.strides()[axis].known_eq(fusor_ir::shape::Dim::Const(0))
-        || layout.shape()[axis].known_eq(fusor_ir::shape::Dim::Const(1))
-}
-
-fn space_extent_expr(
-    ctx: &mut Ctx<'_>,
-    space: &fusor_ir::ir::launch::IndexSpace,
-) -> Result<TileExpr> {
-    let mut acc = ctx.b.u32(1);
-    for dim in &space.dims {
-        let e = ctx.dim_expr(*dim)?;
-        acc = ctx.b.mul(acc, e);
-    }
-    Ok(acc)
-}
-
-/// Product of the extents strictly inside `axis` — the element distance one
-/// step along `axis` covers in the flattened index space.
-fn inner_extent_expr(ctx: &mut Ctx<'_>, op: &Launch, axis: usize) -> Result<TileExpr> {
-    let Launch::Map { space, .. } = op else {
-        return Err(Error::Plan("inner_extent_expr on a non-Map node".into()));
-    };
-    let mut acc = ctx.b.u32(1);
-    for dim in space.dims.iter().skip(axis + 1) {
-        let e = ctx.dim_expr(*dim)?;
-        acc = ctx.b.mul(acc, e);
-    }
-    Ok(acc)
-}
-
-fn tiled_grid(
-    space: &fusor_ir::ir::launch::IndexSpace,
-    block: u32,
-    tm: u32,
-    binding: &DimBinding,
-    limits: &fusor_ir::device::Limits,
-) -> Result<[u32; 3]> {
-    let full = grid_for(space, block.saturating_mul(tm.max(1)), binding, limits)?;
-    Ok(full)
+    axis >= layout.rank()
+        || layout.strides()[axis].known_eq(Dim::Const(0))
+        || layout.shape()[axis].known_eq(Dim::Const(1))
 }
 
 /// Lower every carrier through one row/axis loop nest. A single scalar
 /// hardware operator closes with a collective; wider carriers use their
 /// expanded merge expressions in the workgroup tree.
-pub(crate) fn lower_kfold(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Result<KernelIr> {
+pub(crate) fn lower_kfold(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Result<KernelIr> {
     let (op, producer) = match op {
         Launch::StreamFold {
             producer,
@@ -238,59 +166,24 @@ pub(crate) fn lower_kfold(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> R
         .is_empty()
         .then(|| fusor_ir::ir::kernel::fast_reduce_op(carrier))
         .flatten();
-    let merges = carrier.merge_lanes().ok_or_else(|| {
-        Error::Plan("this carrier's merge does not expand to one expression per lane".into())
-    })?;
-    let lanes = merges.len();
-    let posts = carrier.expand_lanes(post).ok_or_else(|| {
-        Error::Plan(format!(
-            "a {}-slot carrier carries {} post expressions, or a slot's post reads \
-             a sibling of a different width",
-            carrier.width(),
-            post.len()
-        ))
-    })?;
-
     let axis = *axis as usize;
-    if axis >= space.rank() {
-        return Err(Error::Plan(format!(
-            "fold axis {axis} is outside a rank-{} space",
-            space.rank()
-        )));
-    }
+    let lanes = FoldLanes::of(carrier, post, space.rank(), axis, vec_axes, Error::Plan)?;
     // A promoted nest: the accumulator-resident axes are a contiguous block
-    // immediately before the reduced axis, so `space` is `free.. ++ vec.. ++
-    // [reduced]` and one output row spans `vec_extent * axis_extent`
-    // consecutive elements. `verify_launch` establishes the block property.
+    // immediately before the reduced axis, so one output row spans
+    // `vec_extent * axis_extent` consecutive elements.
     let vec_extent: u64 = vec_axes
         .iter()
         .map(|i| space.dims[*i as usize].as_const())
         .try_fold(1u64, |a, d| Some(a * d?))
         .ok_or_else(|| Error::Plan("a promoted axis has a symbolic extent".into()))?;
-    if !vec_axes.is_empty() && axis + 1 != space.rank() {
-        return Err(Error::Plan(
-            "a promoted Fold whose reduced axis is not last is not lowered".into(),
-        ));
-    }
-    if vec_axes.is_empty() && carrier.slots.iter().any(|s| *s != SlotTy::Scalar) {
-        return Err(Error::Plan(
-            "a Vector carrier slot needs a promoted axis to read its positions from".into(),
-        ));
-    }
-    // Iteration axis `j` is space axis `iter_axes[j]`. Every `ScalarExpr` on
-    // this node is written against the iteration space, so an `IndexOf` has to
-    // be resolved through this map and not against `space` directly.
-    let iter_axes: Vec<usize> = (0..space.rank())
-        .filter(|i| !vec_axes.contains(&(*i as u32)))
-        .collect();
     let space_total = space.iterations().unwrap_or(0);
     let acc_elem = scalar_element(*acc);
     let acc_ty = ElementType::Scalar(acc_elem);
-    let limits = ctx.caps.limits;
     let schedule = op.fold_schedule(Some(theta), ctx.caps).expect("GPU Fold");
     let strat = schedule.strategy;
     let lane_group = strat.lane_group(ctx.caps.subgroup_width()).max(1);
-    let block = schedule.block.max(ctx.block_floor);
+    let block = ctx.block(schedule.block);
+    let b = &ctx.b;
 
     // Output rows are `space` minus the reduced axis and every promoted axis:
     // a promoted extent lives in the carrier's lanes, not in the write map.
@@ -299,64 +192,29 @@ pub(crate) fn lower_kfold(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> R
     for i in vec_axes.iter().rev() {
         row_space.dims.remove(*i as usize);
     }
-    let rows = space_extent_expr(&mut ctx, &row_space)?;
+    let rows = ctx.extent_product(&row_space.dims)?;
     let axis_extent = ctx.dim_expr(space.dims[axis])?;
-    let inner: TileExpr = {
-        let mut acc_e = ctx.b.u32(1);
-        for dim in space.dims.iter().skip(axis + 1) {
-            let e = ctx.dim_expr(*dim)?;
-            acc_e = ctx.b.mul(acc_e, e);
-        }
-        acc_e
-    };
-
-    let out = ctx.output()?;
-    let out_view = ctx.linear_view(out)?;
-    let out_elem = out_view.buffer.element;
+    let inner = ctx.extent_product(&space.dims[axis + 1..])?;
+    let out = ctx.linear_view(ctx.output()?)?;
     let mut stmts: Vec<Stmt> = Vec::new();
 
-    let grid = grid_for(&row_space, block / lane_group, &ctx.binding, &limits)?;
-    let group = ctx.global_index(block, grid);
-    let lg_e = ctx.b.u32(lane_group);
-    let row = ctx.b.binary(
-        TileBinaryOp::Div,
-        group.clone(),
-        lg_e.clone(),
-        NumericContract::RELAXED,
-    );
-    let lane = ctx.b.binary(
-        TileBinaryOp::Rem,
-        group,
-        lg_e.clone(),
-        NumericContract::RELAXED,
-    );
-    let row_live = ctx.b.compare(TileCompareOp::Lt, row.clone(), rows);
-
-    let outer = ctx.b.binary(
-        TileBinaryOp::Div,
-        row.clone(),
-        inner.clone(),
-        NumericContract::RELAXED,
-    );
-    let within = ctx.b.binary(
-        TileBinaryOp::Rem,
-        row.clone(),
-        inner.clone(),
-        NumericContract::RELAXED,
-    );
+    let grid = grid_for(
+        &row_space,
+        block / lane_group,
+        &ctx.binding,
+        &ctx.caps.limits,
+    )?;
+    let lg_e = b.u32(lane_group);
+    let (row, lane) = b.divrem(ctx.global_index(block), lg_e.clone());
+    let row_live = b.lt(row.clone(), rows);
     // One output row spans every promoted position of every reduced element,
     // so its stride carries `vec_extent`.
-    let pos_stride = ctx.b.mul(inner.clone(), axis_extent.clone());
-    let row_stride = if fast.is_some() {
-        pos_stride.clone()
-    } else {
-        let ve = ctx.b.u32(vec_extent as u32);
-        ctx.b.mul(pos_stride.clone(), ve)
+    let pos_stride = b.mul(inner.clone(), axis_extent.clone());
+    let row_stride = match fast {
+        Some(_) => pos_stride.clone(),
+        None => b.mul(pos_stride.clone(), b.u32(vec_extent as u32)),
     };
-    let row_base = {
-        let hi = ctx.b.mul(outer, row_stride);
-        ctx.b.add(hi, within)
-    };
+    let row_base = b.row_base(row.clone(), inner.clone(), row_stride);
 
     // One lifted value per lane at element `k`, each guarded to its own
     // identity outside the reduced extent: a lane past the extent must
@@ -366,246 +224,190 @@ pub(crate) fn lower_kfold(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> R
     // A `Vector` slot is `vec_extent` registers, and lane `(slot, p)` reads
     // every operand at promoted position `p`; an operand invariant in the
     // promoted axes is hash-consed back to one read reused across positions.
-    let lift_at =
-        |ctx: &mut Ctx<'_>, k: &TileExpr, body: &mut Vec<Stmt>| -> Result<Vec<TileExpr>> {
-            let in_range = ctx
-                .b
-                .compare(TileCompareOp::Lt, k.clone(), axis_extent.clone());
-            let mut per_pos: Vec<(Vec<TileExpr>, Vec<TileExpr>)> =
-                Vec::with_capacity(vec_extent as usize);
-            let mut produced: rustc_hash::FxHashMap<TileExpr, TileExpr> =
-                rustc_hash::FxHashMap::default();
-            let mut first_index = None;
-            for p in 0..vec_extent {
-                let idx = {
-                    let off = ctx.b.mul(k.clone(), inner.clone());
-                    let base = ctx.b.add(row_base.clone(), off);
-                    if p == 0 {
-                        base
-                    } else {
-                        let pe = ctx.b.u32(p as u32);
-                        let shift = ctx.b.mul(pos_stride.clone(), pe);
-                        ctx.b.add(base, shift)
-                    }
-                };
-                let first = first_index.get_or_insert_with(|| idx.clone());
-                let mut args = Vec::with_capacity(ops.len());
-                for (slot, operand) in ops.iter().enumerate() {
-                    if let Some((source, source_slot)) = producer
-                        && slot == source_slot
-                    {
-                        let invariant = !matches!(
-                            operand.access,
-                            fusor_ir::ir::launch::AccessPlan::Unflatten(_)
-                        ) && operand.layout.rank() == space.rank()
+    let lift_at = |k: &TileExpr, body: &mut Vec<Stmt>| -> Result<Vec<TileExpr>> {
+        let in_range = b.lt(k.clone(), axis_extent.clone());
+        let mut per_pos: Vec<(Vec<TileExpr>, Vec<TileExpr>)> =
+            Vec::with_capacity(vec_extent as usize);
+        let mut produced: rustc_hash::FxHashMap<TileExpr, TileExpr> = Default::default();
+        let first = b.at(row_base.clone(), k.clone(), inner.clone());
+        for p in 0..vec_extent {
+            let idx = match p {
+                0 => first.clone(),
+                _ => b.at(first.clone(), pos_stride.clone(), b.u32(p as u32)),
+            };
+            let mut args = Vec::with_capacity(ops.len());
+            for (slot, operand) in ops.iter().enumerate() {
+                args.push(match producer {
+                    Some((source, source_slot)) if slot == source_slot => {
+                        let invariant = !matches!(operand.access, AccessPlan::Unflatten(_))
+                            && operand.layout.rank() == space.rank()
                             && vec_axes.iter().all(|axis| {
-                                operand.layout.strides()[*axis as usize]
-                                    .known_eq(fusor_ir::shape::Dim::Const(0))
+                                operand.layout.strides()[*axis as usize].known_eq(Dim::Const(0))
                             });
                         let at = ctx.operand_address(
                             operand,
-                            if invariant {
-                                first.clone()
-                            } else {
-                                idx.clone()
-                            },
+                            if invariant { &first } else { &idx }.clone(),
                             space_total,
                         )?;
-                        let value = if let Some(value) = produced.get(&at) {
-                            value.clone()
-                        } else {
-                            let value = fold_element(ctx, source, at.clone(), body)?;
-                            produced.insert(at, value.clone());
-                            value
-                        };
-                        args.push(value);
-                    } else {
-                        args.push(ctx.load_mapped(operand, idx.clone(), space_total)?);
+                        match produced.get(&at) {
+                            Some(value) => value.clone(),
+                            None => {
+                                let value = fold_element(&ctx, source, at.clone(), body)?;
+                                produced.insert(at, value.clone());
+                                value
+                            }
+                        }
                     }
-                }
-                // `IndexOf` on this node names an ITERATION axis; resolve it
-                // through `iter_axes` rather than against `space` directly.
-                let full = ctx.coords_from_linear(idx, space)?;
-                let coords: Vec<TileExpr> = iter_axes.iter().map(|i| full[*i].clone()).collect();
-                per_pos.push((args, coords));
+                    _ => ctx.load_mapped(operand, idx.clone(), space_total)?,
+                });
             }
-            let lane_slots = carrier
-                .lane_slots()
-                .ok_or_else(|| Error::Plan("this carrier has a symbolic Vector extent".into()))?;
-            let mut out = Vec::with_capacity(lanes);
-            for (slot, p) in lane_slots {
+            // `IndexOf` on this node names an ITERATION axis; resolve it
+            // through `iter_axes` rather than against `space` directly.
+            let full = ctx.coords_from_linear(idx, space)?;
+            let coords = lanes.iter_axes.iter().map(|i| full[*i].clone()).collect();
+            per_pos.push((args, coords));
+        }
+        lanes
+            .slots
+            .iter()
+            .map(|&(slot, p)| {
                 let (args, coords) = &per_pos[p as usize];
-                let (args, coords) = (args.clone(), coords.clone());
-                let v = ctx.eval_scalar(&carrier.lift[slot], &args, &coords)?;
-                let v = ctx.b.cast(v, acc_ty);
-                let ident = identity_expr(ctx, carrier.identity[slot], acc_elem);
-                out.push(ctx.b.select(in_range.clone(), v, ident));
-            }
-            Ok(out)
-        };
+                let v = b.cast(ctx.eval_scalar(&carrier.lift[slot], args, coords)?, acc_ty);
+                Ok(b.select(
+                    in_range.clone(),
+                    v,
+                    b.identity(carrier.identity[slot], acc_elem),
+                ))
+            })
+            .collect()
+    };
 
     let one_pass = space.dims[axis]
         .as_const()
         .is_some_and(|k| k <= u64::from(lane_group));
-
     let partials: Vec<TileExpr> = if one_pass {
-        lift_at(&mut ctx, &lane, &mut stmts)?
+        lift_at(&lane, &mut stmts)?
     } else {
         // The per-lane strided loop, carrying `lanes` SSA accumulators seeded
         // from the carrier's identities and absorbed with its own `merge`.
-        let index = ctx.b.local(ElementType::Scalar(ScalarElement::U32));
-        let idx_read = ctx.b.load_local(index.clone());
-        let k = {
-            let scaled = ctx.b.mul(idx_read, lg_e.clone());
-            ctx.b.add(scaled, lane.clone())
-        };
-        let mut accs: Vec<Accumulator> = Vec::with_capacity(lanes);
-        let mut acc_reads: Vec<TileExpr> = Vec::with_capacity(lanes);
-        let lane_ident = carrier
-            .identity_lanes()
-            .ok_or_else(|| Error::Plan("this carrier has a symbolic Vector extent".into()))?;
-        for &ident in lane_ident.iter().take(lanes) {
-            let local = ctx.b.local(acc_ty);
-            let init = identity_expr(&mut ctx, ident, acc_elem);
-            let read = ctx.b.load_local(local.clone());
-            acc_reads.push(read.clone());
+        let index = b.local(ScalarElement::U32.element());
+        let k = b.add(
+            b.mul(b.load_local(index.clone()), lg_e.clone()),
+            lane.clone(),
+        );
+        let mut accs: Vec<Accumulator> = Vec::with_capacity(lanes.lanes());
+        for &ident in lanes.identities.iter().take(lanes.lanes()) {
+            let local = b.local(acc_ty);
+            let read = b.load_local(local.clone());
             accs.push(Accumulator {
                 local,
-                init,
+                init: b.identity(ident, acc_elem),
                 update: read,
             });
         }
         let mut loop_body = Vec::new();
-        let values = lift_at(&mut ctx, &k, &mut loop_body)?;
-        let mut args = acc_reads.clone();
-        args.extend(values);
-        for slot in 0..lanes {
-            accs[slot].update = match fast {
-                Some(op) => ctx.b.binary(
+        let mut args: Vec<TileExpr> = accs.iter().map(|a| a.update.clone()).collect();
+        args.extend(lift_at(&k, &mut loop_body)?);
+        for (slot, acc) in accs.iter_mut().enumerate() {
+            acc.update = match fast {
+                Some(op) => b.binary(
                     op.binary(),
                     args[0].clone(),
                     args[1].clone(),
-                    NumericContract::RELAXED,
+                    fusor_ir::dtype::NumericContract::RELAXED,
                 ),
-                None => ctx.eval_scalar(&merges[slot], &args, &[])?,
+                None => ctx.eval_scalar(&lanes.merges[slot], &args, &[])?,
             };
         }
-        let count = {
-            let lg_minus_1 = ctx.b.u32(lane_group - 1);
-            let numerator = ctx.b.add(axis_extent.clone(), lg_minus_1);
-            ctx.b.binary(
-                TileBinaryOp::Div,
-                numerator,
-                lg_e.clone(),
-                NumericContract::RELAXED,
-            )
-        };
+        let count = b.div(b.add(axis_extent.clone(), b.u32(lane_group - 1)), lg_e);
+        let reads = accs.iter().map(|a| b.load_local(a.local.clone())).collect();
         stmts.push(Stmt::Loop {
             count: Some(count),
             index: Some(index),
-            accumulators: accs.clone(),
+            accumulators: accs,
             body: loop_body,
         });
-        accs.iter()
-            .map(|a| ctx.b.load_local(a.local.clone()))
-            .collect()
+        reads
     };
 
     // The cross-lane close: one scratch tile per lane, one merge per lane.
     // Skipped at a one-lane group: that invocation already reduced the whole
     // axis for its own row and there is no partner to merge with.
     // `fold_scratch_bytes` reports 0 here; the two must agree.
-    let reduced: Vec<TileExpr> = if let Some(op) = fast {
-        let value = partials[0].clone();
-        vec![match strat {
-            FoldStrat::Subgroup => ctx.b.reduce(op, ReduceKind::Subgroup, value),
-            _ if lane_group <= 1 => value,
-            _ => {
-                let scratch = ctx.b.tile("fold_scratch", acc_ty, &[block]);
-                ctx.b.reduce(
+    let reduced: Vec<TileExpr> = match fast {
+        Some(op) => {
+            let value = partials[0].clone();
+            vec![match strat {
+                FoldStrat::Subgroup => b.reduce(op, ReduceKind::Subgroup, value),
+                _ if lane_group <= 1 => value,
+                _ => b.reduce(
                     op,
                     ReduceKind::Workgroup {
-                        scratch,
+                        scratch: b.tile("fold_scratch", acc_ty, &[block]),
                         group_size: lane_group,
                     },
                     value,
-                )
-            }
-        }]
-    } else if lane_group <= 1 {
-        partials
-    } else {
-        let scratch: smallvec::SmallVec<[fusor_ir::ir::kernel::Tile; 4]> = (0..lanes)
-            .map(|_| ctx.b.tile("fold_scratch", acc_ty, &[block]))
-            .collect();
-        let lhs: smallvec::SmallVec<[fusor_ir::ir::kernel::Local; 4]> =
-            (0..lanes).map(|_| ctx.b.local(acc_ty)).collect();
-        let rhs: smallvec::SmallVec<[fusor_ir::ir::kernel::Local; 4]> =
-            (0..lanes).map(|_| ctx.b.local(acc_ty)).collect();
-        let outs: smallvec::SmallVec<[fusor_ir::ir::kernel::Local; 4]> =
-            (0..lanes).map(|_| ctx.b.local(acc_ty)).collect();
-        let mut merge_args: Vec<TileExpr> = Vec::with_capacity(2 * lanes);
-        for l in lhs.iter().chain(rhs.iter()) {
-            merge_args.push(ctx.b.load_local(l.clone()));
+                ),
+            }]
         }
-        let mut body: smallvec::SmallVec<[TileExpr; 4]> = smallvec::SmallVec::new();
-        for merge in merges.iter().take(lanes) {
-            body.push(ctx.eval_scalar(merge, &merge_args, &[])?);
+        None if lane_group <= 1 => partials,
+        None => {
+            let scratch = (0..lanes.lanes())
+                .map(|_| b.tile("fold_scratch", acc_ty, &[block]))
+                .collect();
+            let (reduce, outs) =
+                b.merge_tree(scratch, lane_group, partials, None, acc_ty, |args| {
+                    merge_body(&ctx, &lanes.merges, args, None)
+                })?;
+            stmts.push(reduce);
+            outs
         }
-        stmts.push(Stmt::Reduce {
-            kind: Box::new(ReduceKind::Workgroup {
-                scratch: scratch[0].clone(),
-                group_size: lane_group,
-            }),
-            values: partials.into_iter().collect(),
-            merge: Box::new(fusor_ir::ir::kernel::MergeBody { lhs, rhs, body }),
-            fast: None,
-            outs: outs.clone(),
-            scratch,
-        });
-        // One output per slot, at the trailing carrier axis.
-        outs.iter().map(|l| ctx.b.load_local(l.clone())).collect()
     };
-    let lane_zero = {
-        let z = ctx.b.u32(0);
-        ctx.b.compare(TileCompareOp::Eq, lane, z)
-    };
-    let mask = ctx.b.and(row_live, lane_zero);
-    let lanes_e = ctx.b.u32(lanes as u32);
-    let base = ctx.b.mul(row.clone(), lanes_e);
-    for (slot, post) in posts.iter().enumerate().take(lanes) {
+    let mask = b.and(row_live, b.eq(lane, b.u32(0)));
+    let base = b.mul(row.clone(), b.u32(lanes.lanes() as u32));
+    for (slot, post) in lanes.posts.iter().enumerate() {
         let value = ctx.eval_scalar(post, &reduced, std::slice::from_ref(&row))?;
-        let value = ctx.b.cast(value, out_elem);
-        let addr = if fast.is_some() {
-            row.clone()
-        } else {
-            let off = ctx.b.u32(slot as u32);
-            ctx.b.add(base.clone(), off)
-        };
         stmts.push(Stmt::Store {
-            dst: out_view.clone(),
-            addr: Addr::Linear(addr),
-            value,
+            dst: out.clone(),
+            addr: Addr::Linear(match fast {
+                Some(_) => row.clone(),
+                None => b.add(base.clone(), b.u32(slot as u32)),
+            }),
+            value: b.cast(value, out.buffer.element),
             mask: mask.clone(),
         });
     }
 
-    Ok(ctx.finish(
-        if producer.is_some() {
-            "kstream_fold"
-        } else if fast.is_some() {
-            "kfold"
-        } else {
-            "kfold_carrier"
-        },
-        grid,
-        block,
-        stmts,
-    ))
+    let name = match (producer, fast) {
+        (Some(_), _) => "kstream_fold",
+        (None, Some(_)) => "kfold",
+        (None, None) => "kfold_carrier",
+    };
+    Ok(ctx.finish(name, grid, block, stmts))
+}
+
+/// A carrier's per-lane merge body over `lhs ++ rhs` reads, each cast to
+/// `cast` when given.
+pub(crate) fn merge_body(
+    ctx: &Ctx<'_>,
+    merges: &[ScalarExpr],
+    args: &[TileExpr],
+    cast: Option<ElementType>,
+) -> Result<smallvec::SmallVec<[TileExpr; 4]>> {
+    merges
+        .iter()
+        .map(|merge| {
+            let v = ctx.eval_scalar(merge, args, &[])?;
+            Ok(match cast {
+                Some(ty) => ctx.b.cast(v, ty),
+                None => v,
+            })
+        })
+        .collect()
 }
 
 fn fold_element(
-    ctx: &mut Ctx<'_>,
+    ctx: &Ctx<'_>,
     source: &Launch,
     row: TileExpr,
     body: &mut Vec<Stmt>,
@@ -622,51 +424,35 @@ fn fold_element(
     else {
         return Err(Error::Plan("a streamed producer must be a Fold".into()));
     };
+    let b = &ctx.b;
+    let axis = *axis as usize;
     let element = scalar_element(*acc);
     let ty = ElementType::Scalar(element);
-    let extent = ctx.dim_expr(space.dims[*axis as usize])?;
-    let mut inner = ctx.b.u32(1);
-    for dim in space.dims.iter().skip(*axis as usize + 1) {
-        let size = ctx.dim_expr(*dim)?;
-        inner = ctx.b.mul(inner, size);
-    }
-    let outer = ctx.b.binary(
-        TileBinaryOp::Div,
+    let extent = ctx.dim_expr(space.dims[axis])?;
+    let inner = ctx.extent_product(&space.dims[axis + 1..])?;
+    let base = b.row_base(
         row.clone(),
         inner.clone(),
-        NumericContract::RELAXED,
+        b.mul(inner.clone(), extent.clone()),
     );
-    let within = ctx.b.binary(
-        TileBinaryOp::Rem,
-        row.clone(),
-        inner.clone(),
-        NumericContract::RELAXED,
-    );
-    let stride = ctx.b.mul(inner.clone(), extent.clone());
-    let base = ctx.b.mul(outer, stride);
-    let base = ctx.b.add(base, within);
-    let index = ctx.b.local(ScalarElement::U32.element());
-    let k = ctx.b.load_local(index.clone());
-    let offset = ctx.b.mul(k.clone(), inner);
-    let at = ctx.b.add(base, offset);
-    let mut output_space = space.clone();
-    output_space.dims.remove(*axis as usize);
+    let index = b.local(ScalarElement::U32.element());
+    let k = b.load_local(index.clone());
+    let at = b.at(base, k.clone(), inner);
+    let mut output_space: IndexSpace = space.clone();
+    output_space.dims.remove(axis);
     let mut coords = ctx.coords_from_linear(row.clone(), &output_space)?;
-    coords.insert(*axis as usize, k);
+    coords.insert(axis, k);
     let args = ops
         .iter()
         .map(|o| {
-            if !matches!(o.access, fusor_ir::ir::launch::AccessPlan::Unflatten(_))
+            if !matches!(o.access, AccessPlan::Unflatten(_))
                 && o.layout.shape() == space.dims.as_slice()
             {
                 let mut address = ctx.dim_expr(o.layout.offset())?;
                 for (coordinate, stride) in coords.iter().zip(o.layout.strides()) {
-                    if stride.known_eq(fusor_ir::shape::Dim::Const(0)) {
-                        continue;
+                    if !stride.known_eq(Dim::Const(0)) {
+                        address = b.at(address, coordinate.clone(), ctx.dim_expr(*stride)?);
                     }
-                    let stride = ctx.dim_expr(*stride)?;
-                    let offset = ctx.b.mul(coordinate.clone(), stride);
-                    address = ctx.b.add(address, offset);
                 }
                 ctx.load_operand(o, address)
             } else {
@@ -674,68 +460,20 @@ fn fold_element(
             }
         })
         .collect::<Result<Vec<_>>>()?;
-    let lifted = ctx.eval_scalar(&carrier.lift[0], &args, &coords)?;
-    let lifted = ctx.b.cast(lifted, ty);
-    let accumulator = ctx.b.local(ty);
-    let value = ctx.b.load_local(accumulator.clone());
-    let update = ctx.eval_scalar(&carrier.merge[0], &[value, lifted], &[])?;
-    let init = identity_expr(ctx, carrier.identity[0], element);
+    let lifted = b.cast(ctx.eval_scalar(&carrier.lift[0], &args, &coords)?, ty);
+    let accumulator = b.local(ty);
+    let value = b.load_local(accumulator.clone());
+    let update = ctx.eval_scalar(&carrier.merge[0], &[value.clone(), lifted], &[])?;
     body.push(Stmt::Loop {
         count: Some(extent),
         index: Some(index),
         accumulators: vec![Accumulator {
-            local: accumulator.clone(),
-            init,
+            local: accumulator,
+            init: b.identity(carrier.identity[0], element),
             update,
         }],
         body: Vec::new(),
     });
-    let value = ctx.b.load_local(accumulator);
     let value = ctx.eval_scalar(&post[0], &[value], &[row])?;
-    Ok(ctx.b.cast(value, ty))
-}
-
-/// A carrier identity as a tile literal. The infinities go through the
-/// builder's own spellings so the emitted text is unchanged.
-pub(crate) fn identity_expr(ctx: &mut Ctx<'_>, s: Splat, elem: ScalarElement) -> TileExpr {
-    let f = match s {
-        Splat::F32(v) => v,
-        Splat::F16(b) => half::f16::from_bits(b).to_f32(),
-        Splat::BF16(b) => half::bf16::from_bits(b).to_f32(),
-        Splat::U32(v) => {
-            return if v == 0 {
-                ctx.b.zero(elem)
-            } else if v == u32::MAX {
-                ctx.b.pos_inf(elem)
-            } else {
-                ctx.b.u32(v)
-            };
-        }
-        Splat::I32(v) => {
-            return if v == 0 {
-                ctx.b.zero(elem)
-            } else if v == i32::MIN {
-                ctx.b.neg_inf(elem)
-            } else if v == i32::MAX {
-                ctx.b.pos_inf(elem)
-            } else {
-                ctx.b.i32(v)
-            };
-        }
-    };
-    if f == f32::NEG_INFINITY {
-        ctx.b.neg_inf(elem)
-    } else if f == f32::INFINITY {
-        ctx.b.pos_inf(elem)
-    } else if f == 0.0 {
-        ctx.b.zero(elem)
-    } else if f == 1.0 {
-        match elem {
-            ScalarElement::U32 => ctx.b.u32(1),
-            ScalarElement::I32 => ctx.b.i32(1),
-            _ => ctx.b.f32(1.0),
-        }
-    } else {
-        ctx.b.f32(f)
-    }
+    Ok(b.cast(value, ty))
 }

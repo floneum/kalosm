@@ -23,6 +23,7 @@ use crate::domains::{
     DomainCtx, coop_domain, default_planner, fold_domain_for, map_domain, sgemm_domain,
     sgemv_domain,
 };
+use crate::rules::adopt;
 
 rule!(
     LOWER_COOP,
@@ -317,9 +318,7 @@ fn lower_family(
         b: ContractSide::one(identity(compute_dtype(fb.dtype)), b_op),
         sched,
     };
-    let new = b.add_launch(op).ok()?;
-    b.union(id, new).ok()?;
-    Some(new)
+    adopt(b, id, op)
 }
 
 /// `Contract -> Contract { family: Coop }`. Guarded on a *fixed* subgroup
@@ -374,9 +373,7 @@ pub fn lower_generic(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
         return None;
     }
     *sched = ScheduleDomain::Fold(domain.into());
-    let new = b.add_launch(fold).ok()?;
-    b.union(id, new).ok()?;
-    Some(new)
+    adopt(b, id, fold)
 }
 
 /// Split an epilogue the cooperative kernel cannot host into

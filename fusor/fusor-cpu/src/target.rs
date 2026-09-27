@@ -93,8 +93,8 @@ impl Target for CpuTarget {
         crate::rules::CPU_RULES
     }
 
-    fn lower(&self, node: &Node, id: Id, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
-        crate::lower::lower(&self.caps, node, id, theta, cx)
+    fn lower(&self, node: &Node, _: Id, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
+        crate::lower::lower(&self.caps, node, theta, cx)
     }
 
     fn emit(&self, ir: &KernelIr) -> std::result::Result<Artifact, EmitError> {

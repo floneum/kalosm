@@ -113,17 +113,7 @@ impl Emitter<'_> {
         op: TileReduceOp,
         group_size: u32,
     ) -> Result<Handle<Expression>, EmitError> {
-        let block = self.workgroup_invocations;
-        if group_size == 0
-            || !group_size.is_power_of_two()
-            || group_size > block
-            || !block.is_multiple_of(group_size)
-        {
-            return Err(EmitError::Unsupported(format!(
-                "tree reduce needs a power-of-two group size dividing the block, got \
-                 {group_size} with block {block}"
-            )));
-        }
+        self.check_tree(group_size)?;
 
         let lane = self.lane();
         let lane_ptr = self.tile_dynamic_pointer(out, scratch, lane)?;
@@ -137,43 +127,14 @@ impl Emitter<'_> {
             Span::default(),
         );
 
-        let (compare_index, result_index) = if group_size == block {
-            let zero = self.u32_lit(0);
-            (lane, zero)
-        } else {
-            let group_offset = self.mod_literal_u32(out, lane, group_size);
-            let group_base = self.bin(out, BinaryOperator::Subtract, lane, group_offset);
-            (group_offset, group_base)
-        };
-
-        let mut stride = group_size / 2;
-        while stride > 0 {
-            let limit = self.u32_lit(stride);
-            let participates = self.bin(out, BinaryOperator::Less, compare_index, limit);
-            let scratch_c = scratch.clone();
-            let (accept, ()) = self.nested(move |em, accept| {
-                let rhs_index = em.add_literal_u32(accept, lane, stride);
-                let lhs_ptr = em.tile_dynamic_pointer(accept, &scratch_c, lane)?;
-                let rhs_ptr = em.tile_dynamic_pointer(accept, &scratch_c, rhs_index)?;
-                let lhs = em.load_tile_value(accept, &scratch_c, lhs_ptr)?;
-                let rhs = em.load_tile_value(accept, &scratch_c, rhs_ptr)?;
-                let reduced = em.combine(accept, op, lhs, rhs);
-                em.store_tile_value(accept, &scratch_c, lhs_ptr, reduced)
-            })?;
-            out.push(
-                Statement::If {
-                    condition: participates,
-                    accept,
-                    reject: Block::new(),
-                },
-                Span::default(),
-            );
-            out.push(
-                Statement::ControlBarrier(Barrier::WORK_GROUP),
-                Span::default(),
-            );
-            stride /= 2;
-        }
+        let result_index = self.tree_levels(out, lane, group_size, |em, accept, rhs_index| {
+            let lhs_ptr = em.tile_dynamic_pointer(accept, scratch, lane)?;
+            let rhs_ptr = em.tile_dynamic_pointer(accept, scratch, rhs_index)?;
+            let lhs = em.load_tile_value(accept, scratch, lhs_ptr)?;
+            let rhs = em.load_tile_value(accept, scratch, rhs_ptr)?;
+            let reduced = em.combine(accept, op, lhs, rhs);
+            em.store_tile_value(accept, scratch, lhs_ptr, reduced)
+        })?;
 
         let result_ptr = self.tile_dynamic_pointer(out, scratch, result_index)?;
         self.load_tile_value(out, scratch, result_ptr)
@@ -243,17 +204,7 @@ impl Emitter<'_> {
             }
         };
         let n = values.len();
-        let block = self.workgroup_invocations;
-        if group_size == 0
-            || !group_size.is_power_of_two()
-            || group_size > block
-            || !block.is_multiple_of(group_size)
-        {
-            return Err(EmitError::Unsupported(format!(
-                "tree reduce needs a power-of-two group size dividing the block, got \
-                 {group_size} with block {block}"
-            )));
-        }
+        self.check_tree(group_size)?;
 
         let staged: Vec<Handle<Expression>> = values
             .iter()
@@ -273,7 +224,68 @@ impl Emitter<'_> {
             Span::default(),
         );
 
-        let (compare_index, result_index) = if group_size == block {
+        let result_index = self.tree_levels(out, lane, group_size, |em, accept, rhs_index| {
+            // Both partials into the formals first: a merge reads only its
+            // formals, so nothing below can observe a half-written level.
+            for (i, tile) in scratch.iter().enumerate() {
+                let lhs_ptr = em.tile_dynamic_pointer(accept, tile, lane)?;
+                let value = em.load_tile_value(accept, tile, lhs_ptr)?;
+                let local = em.private_local(&merge.lhs[i])?;
+                em.store_local(accept, local, value);
+                let rhs_ptr = em.tile_dynamic_pointer(accept, tile, rhs_index)?;
+                let value = em.load_tile_value(accept, tile, rhs_ptr)?;
+                let local = em.private_local(&merge.rhs[i])?;
+                em.store_local(accept, local, value);
+            }
+            let merged: Vec<Handle<Expression>> = merge
+                .body
+                .iter()
+                .map(|e| em.expr(e, accept))
+                .collect::<Result<_, _>>()?;
+            for (tile, value) in scratch.iter().zip(merged) {
+                let ptr = em.tile_dynamic_pointer(accept, tile, lane)?;
+                em.store_tile_value(accept, tile, ptr, value)?;
+            }
+            Ok(())
+        })?;
+
+        for i in 0..n {
+            let ptr = self.tile_dynamic_pointer(out, &scratch[i], result_index)?;
+            let value = self.load_tile_value(out, &scratch[i], ptr)?;
+            let local = self.private_local(&outs[i])?;
+            self.store_local(out, local, value);
+        }
+        Ok(())
+    }
+
+    /// A tree reduction's group must be a power of two dividing the block.
+    fn check_tree(&self, group_size: u32) -> Result<(), EmitError> {
+        let block = self.workgroup_invocations;
+        if group_size == 0
+            || !group_size.is_power_of_two()
+            || group_size > block
+            || !block.is_multiple_of(group_size)
+        {
+            return Err(EmitError::Unsupported(format!(
+                "tree reduce needs a power-of-two group size dividing the block, got \
+                 {group_size} with block {block}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The halving levels of a tree over each `group_size` lanes, a barrier
+    /// after each: the lanes in the low half of the remaining stride run
+    /// `level(rhs_index)` against their partner. Returns the index of each
+    /// group's result slot.
+    fn tree_levels(
+        &mut self,
+        out: &mut Block,
+        lane: Handle<Expression>,
+        group_size: u32,
+        mut level: impl FnMut(&mut Self, &mut Block, Handle<Expression>) -> Result<(), EmitError>,
+    ) -> Result<Handle<Expression>, EmitError> {
+        let (compare_index, result_index) = if group_size == self.workgroup_invocations {
             let zero = self.u32_lit(0);
             (lane, zero)
         } else {
@@ -281,37 +293,13 @@ impl Emitter<'_> {
             let group_base = self.bin(out, BinaryOperator::Subtract, lane, group_offset);
             (group_offset, group_base)
         };
-
         let mut stride = group_size / 2;
         while stride > 0 {
             let limit = self.u32_lit(stride);
             let participates = self.bin(out, BinaryOperator::Less, compare_index, limit);
-            let tiles: Vec<Tile> = scratch.to_vec();
-            let merge = merge.clone();
-            let (accept, ()) = self.nested(move |em, accept| {
+            let (accept, ()) = self.nested(|em, accept| {
                 let rhs_index = em.add_literal_u32(accept, lane, stride);
-                // Both partials into the formals first: a merge reads only its
-                // formals, so nothing below can observe a half-written level.
-                for (i, tile) in tiles.iter().enumerate() {
-                    let lhs_ptr = em.tile_dynamic_pointer(accept, tile, lane)?;
-                    let value = em.load_tile_value(accept, tile, lhs_ptr)?;
-                    let local = em.private_local(&merge.lhs[i])?;
-                    em.store_local(accept, local, value);
-                    let rhs_ptr = em.tile_dynamic_pointer(accept, tile, rhs_index)?;
-                    let value = em.load_tile_value(accept, tile, rhs_ptr)?;
-                    let local = em.private_local(&merge.rhs[i])?;
-                    em.store_local(accept, local, value);
-                }
-                let merged: Vec<Handle<Expression>> = merge
-                    .body
-                    .iter()
-                    .map(|e| em.expr(e, accept))
-                    .collect::<Result<_, _>>()?;
-                for (tile, value) in tiles.iter().zip(merged) {
-                    let ptr = em.tile_dynamic_pointer(accept, tile, lane)?;
-                    em.store_tile_value(accept, tile, ptr, value)?;
-                }
-                Ok(())
+                level(em, accept, rhs_index)
             })?;
             out.push(
                 Statement::If {
@@ -327,14 +315,7 @@ impl Emitter<'_> {
             );
             stride /= 2;
         }
-
-        for i in 0..n {
-            let ptr = self.tile_dynamic_pointer(out, &scratch[i], result_index)?;
-            let value = self.load_tile_value(out, &scratch[i], ptr)?;
-            let local = self.private_local(&outs[i])?;
-            self.store_local(out, local, value);
-        }
-        Ok(())
+        Ok(result_index)
     }
 
     /// The binary the reduction folds with.

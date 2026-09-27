@@ -854,8 +854,7 @@ impl<'a> Compiler<'a> {
                     index: i,
                 })
             }
-            K::Unary { op, value, numeric } => {
-                let _ = numeric;
+            K::Unary { op, value, .. } => {
                 if *op == fusor_ir::scalar::UnOp::Unpack2x16Float {
                     let x = self.compile_value(value)?;
                     let out = self.slots(2);

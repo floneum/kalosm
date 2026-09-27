@@ -1,9 +1,7 @@
 //! The SGEMV schedule domain. The domain is a pure function of the device.
 
 use fusor_ir::device::Caps;
-use fusor_ir::dtype::Dtype;
 use fusor_ir::ir::launch::{SgemvDomain, SgemvParams};
-use fusor_ir::shape::Dim;
 use smallvec::SmallVec;
 
 use crate::domains::{DomainCtx, UNMEASURED, sgemv_order};
@@ -99,39 +97,48 @@ const fn w(vector: u32, subgroups: u32, cols: u32, parts: u32, gap: u32) -> Sgem
     }
 }
 
-/// Compatibility entry point kept for the scaffold's `domains::sgemv_legal`
-/// re-export. None of `m`, `n`, `k` or `dtype` filters the domain.
-pub fn legal(m: Dim, n: Dim, k: Dim, dtype: Dtype, caps: &Caps) -> SgemvDomain {
-    let _ = (m, n, k, dtype);
-    let cx = DomainCtx::new(caps, crate::domains::default_planner());
-    sgemv_domain(&cx)
+/// Whether the subgroup-per-column structure tiles `p` exactly: whole
+/// fixed-width subgroups (it indexes lanes by `subgroup_id` and reduces
+/// within one subgroup) each owning `cols / subgroups` columns, and a split
+/// window whose runs, gap and width tile the subgroup's pass. The generator
+/// admits exactly these points and the lowering relies on them.
+pub fn cols_structure_legal(p: &SgemvParams, caps: &Caps) -> bool {
+    let width = caps.subgroup_width();
+    let run = p.run();
+    caps.subgroups.is_some_and(|s| s.is_fixed())
+        && p.subgroups > 0
+        && p.subgroups.saturating_mul(width) <= max_lanes(caps)
+        && p.cols.is_multiple_of(p.subgroups)
+        && (p.parts <= 1
+            || (p.vector.is_multiple_of(p.parts)
+                && run > 0
+                && p.gap.is_multiple_of(run)
+                && p.gap > run
+                && (width * run).is_multiple_of(p.gap)))
+}
+
+fn max_lanes(caps: &Caps) -> u32 {
+    caps.limits
+        .max_compute_invocations_per_workgroup
+        .min(caps.limits.max_compute_workgroup_size[0])
 }
 
 /// Every legal `(vector, subgroups, cols, parts, gap)` on this device,
 /// ordered by `(seed_rank, sgemv_order)`.
 pub fn sgemv_domain(cx: &DomainCtx<'_>) -> SgemvDomain {
     let width = cx.caps.subgroup_width();
-    let max_lanes = cx
-        .caps
-        .limits
-        .max_compute_invocations_per_workgroup
-        .min(cx.caps.limits.max_compute_workgroup_size[0]);
-    // The subgroup-per-column structure indexes lanes by `subgroup_id` and
-    // reduces within one subgroup, which is only a static schedule when the
-    // device pins its subgroup width.
-    let fixed_subgroup = cx.caps.subgroups.is_some_and(|s| s.is_fixed());
 
     // `FUSOR_PIN_SGEMV="vector,subgroups,cols[,parts,gap]"` restricts the
     // domain to one cell for measuring per-shape kernel tables without the
     // adoption race in the loop. Ordinary runs never set it.
-    let pin: Option<SgemvParams> = std::env::var("FUSOR_PIN_SGEMV").ok().and_then(|s| {
-        let p: Vec<u32> = s.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-        match p.len() {
+    let pin = crate::flags::flags()
+        .pin_sgemv
+        .as_ref()
+        .and_then(|p| match p.len() {
             3 => Some(v(p[0], p[1], p[2])),
             5 => Some(w(p[0], p[1], p[2], p[3], p[4])),
             _ => None,
-        }
-    });
+        });
 
     let mut all: Vec<SgemvParams> = Vec::new();
     for vector in VECTOR_CHOICES {
@@ -139,19 +146,18 @@ pub fn sgemv_domain(cx: &DomainCtx<'_>) -> SgemvDomain {
             // The launched block is `subgroups * subgroup_width`; a
             // block wider than the device's invocation limit cannot be
             // created at all.
-            if subgroups.saturating_mul(width) > max_lanes {
+            if subgroups.saturating_mul(width) > max_lanes(cx.caps) {
                 continue;
             }
             for cols in COLS_CHOICES {
+                let cell = v(vector, subgroups, cols);
                 if cols > 1
-                    && (!fixed_subgroup
-                        || cols % subgroups != 0
+                    && (!cols_structure_legal(&cell, cx.caps)
                         || cols / subgroups > MAX_COLS_PER_SUBGROUP
                         || vector * (cols / subgroups) > MAX_UNROLL)
                 {
                     continue;
                 }
-                let cell = v(vector, subgroups, cols);
                 if pin.is_none_or(|p| p == cell) {
                     all.push(cell);
                 }
@@ -164,20 +170,9 @@ pub fn sgemv_domain(cx: &DomainCtx<'_>) -> SgemvDomain {
                     continue;
                 }
                 for parts in PARTS_CHOICES {
-                    if vector % parts != 0 {
-                        continue;
-                    }
-                    let run = vector / parts;
                     for gap in GAP_CHOICES {
-                        if run == 0
-                            || gap % run != 0
-                            || gap <= run
-                            || !(width * run).is_multiple_of(gap)
-                        {
-                            continue;
-                        }
                         let cell = w(vector, subgroups, cols, parts, gap);
-                        if pin.is_none_or(|p| p == cell) {
+                        if cols_structure_legal(&cell, cx.caps) && pin.is_none_or(|p| p == cell) {
                             all.push(cell);
                         }
                     }

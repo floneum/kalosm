@@ -5,13 +5,13 @@
 //! retry. Back-pressure on in-flight submissions is a runtime policy
 //! ([`GpuConfig::max_in_flight_submits`]).
 
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use web_time::{Duration, Instant};
 
 use fusor_ir::Result;
 use fusor_ir::error::Error;
-use fusor_ir::extract::{Plan, PlanHash};
 use fusor_ir::target::{Artifact, Buf, Uniforms};
 use parking_lot::Mutex;
 
@@ -49,10 +49,7 @@ fn scopeguard<F: FnMut()>(f: F) -> ScopeGuard<F> {
 /// chunked, never dropped to a pass per dispatch — a Metal pass boundary
 /// costs on the order of a small kernel.
 pub fn dispatches_per_pass(total: usize) -> usize {
-    if let Some(n) = std::env::var("FUSOR_PASS_SIZE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-    {
+    if let Some(n) = crate::flags().pass_size {
         return n;
     }
     if total >= PASS_CHUNK_THRESHOLD {
@@ -119,18 +116,12 @@ impl std::future::Future for MapDone {
     }
 }
 
-/// `FUSOR_TRACE_DISPATCH`, read once.
-fn trace_dispatch() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FUSOR_TRACE_DISPATCH").is_some())
-}
-
 /// Under `FUSOR_TRACE_DISPATCH`, every binding's buffer and whether any two
 /// are the same buffer: D3D12 forbids one resource bound as both a read-only
 /// input and the output of a dispatch, and WARP answers that with a device
 /// removal rather than a validation error.
 pub(crate) fn trace_binds(name: &str, grid: [u32; 3], binds: &[Buf]) {
-    if !trace_dispatch() {
+    if !crate::flags().trace_dispatch {
         return;
     }
     let mut seen: Vec<usize> = Vec::new();
@@ -219,13 +210,8 @@ pub enum CommandRecord {
         bind_group: Arc<wgpu::BindGroup>,
         grid: [u32; 3],
     },
-    CopyBuffer {
-        src: Buf,
-        src_offset: u64,
-        dst: Buf,
-        dst_offset: u64,
-        bytes: u64,
-    },
+    /// `bytes` from the start of `src` to the start of `dst`.
+    CopyBuffer { src: Buf, dst: Buf, bytes: u64 },
 }
 
 impl CommandRecord {
@@ -268,6 +254,39 @@ impl TimingMode<'_> {
             TimingMode::Focus(f) => *f == ix,
             TimingMode::Sparse(ixs) => ixs.binary_search(&ix).is_ok(),
             _ => false,
+        }
+    }
+}
+
+/// How one resolve is timed: the query set its dispatches write, and which
+/// of them do.
+pub(crate) struct TimingPlan {
+    set: Option<wgpu::QuerySet>,
+    kind: TimingKind,
+    /// `(plan index, live index)` of each focused launch, ascending.
+    focus: Vec<(usize, usize)>,
+    live: Vec<usize>,
+}
+
+enum TimingKind {
+    All,
+    Focus,
+    Whole,
+    Range { start: usize, n: usize },
+}
+
+impl TimingPlan {
+    pub(crate) fn set(&self) -> Option<&wgpu::QuerySet> {
+        self.set.as_ref()
+    }
+
+    pub(crate) fn mode(&self) -> TimingMode<'_> {
+        match self.kind {
+            TimingKind::All => TimingMode::All,
+            TimingKind::Focus if self.live.len() == 1 => TimingMode::Focus(self.live[0]),
+            TimingKind::Focus => TimingMode::Sparse(&self.live),
+            TimingKind::Whole => TimingMode::Whole,
+            TimingKind::Range { start, n } => TimingMode::Range { start, n },
         }
     }
 }
@@ -563,7 +582,7 @@ impl Launcher {
         // for each, naming the kernel and whether the device survived it —
         // the only way to attribute a driver-side device loss to a kernel,
         // since the loss is reported asynchronously and after the fact.
-        let trace = trace_dispatch();
+        let trace = crate::flags().trace_dispatch;
         let per_submit = if trace {
             1
         } else {
@@ -696,26 +715,14 @@ impl Launcher {
         let mut at = 0usize;
         while at < records.len() {
             match records[at] {
-                CommandRecord::CopyBuffer {
-                    src,
-                    src_offset,
-                    dst,
-                    dst_offset,
-                    bytes,
-                } => {
+                CommandRecord::CopyBuffer { src, dst, bytes } => {
                     let s = src
                         .downcast_ref::<GpuBuffer>()
                         .ok_or_else(|| Error::Device("copy source is not pooled".into()))?;
                     let d = dst
                         .downcast_ref::<GpuBuffer>()
                         .ok_or_else(|| Error::Device("copy destination is not pooled".into()))?;
-                    encoder.copy_buffer_to_buffer(
-                        &s.buffer,
-                        *src_offset,
-                        &d.buffer,
-                        *dst_offset,
-                        *bytes,
-                    );
+                    encoder.copy_buffer_to_buffer(&s.buffer, 0, &d.buffer, 0, *bytes);
                     at += 1;
                 }
                 CommandRecord::Dispatch { .. } => {
@@ -938,11 +945,13 @@ impl Launcher {
     pub fn copy_buffer(&self, src: &Buf, dst: &Buf, bytes: u64) -> Result<()> {
         self.lost.check()?;
         crate::pool::COPY_BYTES.fetch_add(bytes, std::sync::atomic::Ordering::Relaxed);
+        self.encode_copy(src, dst, bytes)
+    }
+
+    fn encode_copy(&self, src: &Buf, dst: &Buf, bytes: u64) -> Result<()> {
         let record = CommandRecord::CopyBuffer {
             src: src.clone(),
-            src_offset: 0,
             dst: dst.clone(),
-            dst_offset: 0,
             bytes,
         };
         self.encode_command_records(&[record], None, TimingMode::All)
@@ -957,7 +966,7 @@ impl Launcher {
     /// graph and overflow the recursion limit. The map is issued and later
     /// read out by two synchronous halves around one await on [`MapDone`].
     async fn readback_into(&self, src: &Buf, staging: &Buf, bytes: u64) -> Result<Vec<u8>> {
-        let trace = trace_dispatch();
+        let trace = crate::flags().trace_dispatch;
         let state = |what: &str| {
             if trace {
                 let src_size = src.downcast_ref::<GpuBuffer>().map_or(0, |b| b.size);
@@ -965,16 +974,7 @@ impl Launcher {
                 eprintln!("[trace] readback {what}: {bytes}B of a {src_size}B buffer -> {lost}");
             }
         };
-        {
-            let record = CommandRecord::CopyBuffer {
-                src: src.clone(),
-                src_offset: 0,
-                dst: staging.clone(),
-                dst_offset: 0,
-                bytes,
-            };
-            self.encode_command_records(&[record], None, TimingMode::All)?;
-        }
+        self.encode_copy(src, staging, bytes)?;
         if trace {
             let _ = self.device.poll(wgpu::PollType::wait_indefinitely());
             state("copy");
@@ -1086,27 +1086,30 @@ impl Launcher {
             .ok_or_else(|| Error::Device("query resolve target is not pooled".into()))?;
         let host = staging
             .downcast_ref::<GpuBuffer>()
-            .ok_or_else(|| Error::Device("query staging buffer is not pooled".into()))?;
+            .ok_or_else(|| Error::Device("query staging buffer is not pooled".into()))?
+            .buffer
+            .clone();
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("fusor timestamp resolve"),
             });
         encoder.resolve_query_set(set, 0..slots as u32, &dst.buffer, 0);
-        encoder.copy_buffer_to_buffer(&dst.buffer, 0, &host.buffer, 0, bytes);
+        encoder.copy_buffer_to_buffer(&dst.buffer, 0, &host, 0, bytes);
         self.queue.submit([encoder.finish()]);
 
-        let slice = host.buffer.slice(..);
-        let (tx, rx) = std::sync::mpsc::channel();
-        slice.map_async(wgpu::MapMode::Read, move |r| {
-            let _ = tx.send(r);
-        });
+        let done = self.begin_map(&staging, bytes)?;
         self.poll_wait()?;
-        rx.recv()
-            .map_err(|_| Error::Device("timestamp callback never fired".into()))?
-            .map_err(|e| Error::Device(format!("timestamp map failed: {e}")))?;
-        let raw = slice.get_mapped_range().to_vec();
-        host.buffer.unmap();
+        // `poll_wait` drove the map to completion; nothing is left to await.
+        let mapped = std::pin::pin!(done)
+            .poll(&mut std::task::Context::from_waker(std::task::Waker::noop()));
+        match mapped {
+            std::task::Poll::Ready(Ok(result)) => {
+                result.map_err(|e| Error::Device(format!("timestamp map failed: {e}")))?
+            }
+            _ => return Err(Error::Device("timestamp callback never fired".into())),
+        }
+        let raw = Self::finish_map(&staging, bytes)?;
         pool.recycle(staging);
         pool.recycle(resolved);
 
@@ -1122,6 +1125,175 @@ impl Launcher {
         Ok((0..dispatches)
             .map(|d| tick(d * 2 + 1).saturating_sub(tick(d * 2)) as f64 * period / 1000.0)
             .collect())
+    }
+
+    /// Choose how a resolve of `records` is timed.
+    ///
+    /// A plan too large for a full per-dispatch query set can still time the
+    /// launches the tuner names (`focus`, in plan order). A named focus wins
+    /// over whole-plan timing: a backend without
+    /// `TIMESTAMP_QUERY_INSIDE_PASSES` writes boundary samples only, so each
+    /// timed dispatch takes its own compute pass, and a caller that named the
+    /// launches it will read gets those and no others.
+    pub(crate) fn timing_plan(
+        &self,
+        records: &[CommandRecord],
+        focus: Option<Vec<usize>>,
+    ) -> TimingPlan {
+        // The encoder counts *live* dispatches, so the focused plan indices
+        // are restated; the sparse slot map binary-searches that list, so it
+        // is ascending and duplicate-free.
+        let mut focus = focus.unwrap_or_default();
+        focus.sort_unstable();
+        focus.dedup();
+        let live_before = |ix: usize| {
+            records[..ix]
+                .iter()
+                .filter(|r| !r.is_empty_dispatch())
+                .count()
+        };
+        let focus: Vec<(usize, usize)> = focus
+            .into_iter()
+            .filter(|&ix| records.get(ix).is_some_and(|r| !r.is_empty_dispatch()))
+            .map(|ix| (ix, live_before(ix)))
+            .collect();
+        let live: Vec<usize> = focus.iter().map(|&(_, l)| l).collect();
+        let flags = crate::flags();
+        let (set, kind) = if !focus.is_empty() {
+            (self.timestamp_query_set(focus.len()), TimingKind::Focus)
+        } else if flags.time_plan {
+            // The whole plan's GPU span as `TPLAN <us>`: the number the
+            // step rate is made of, free of host and clock-state noise
+            // between two plans measured back to back.
+            self.set_tuning(true);
+            (self.timestamp_query_set(1), TimingKind::Whole)
+        } else if let Some(start) = flags.time_range {
+            // Times live dispatches `[start, start+cap)` of any plan and
+            // prints each span as `TSPAN <index> <kernel> <us>`: the
+            // per-kernel profile of one resolve, for finding where a step's
+            // time goes.
+            let live = live_before(records.len());
+            let cap = (wgpu::QUERY_SET_MAX_QUERIES as usize / 2).min(live.saturating_sub(start));
+            if cap == 0 {
+                (None, TimingKind::All)
+            } else {
+                self.set_tuning(true);
+                (
+                    self.timestamp_query_set(cap),
+                    TimingKind::Range { start, n: cap },
+                )
+            }
+        } else if self.can_time_whole(records.len()) {
+            (self.timestamp_query_set(records.len()), TimingKind::All)
+        } else {
+            (None, TimingKind::All)
+        };
+        TimingPlan {
+            set,
+            kind,
+            focus,
+            live,
+        }
+    }
+
+    /// Read a timed resolve's samples back and publish them: the per-launch
+    /// profile in plan order, or the `TPLAN` / `TSPAN` lines.
+    ///
+    /// The query set is resolved from a command buffer submitted after a
+    /// `poll_wait`: Metal's writeback of the final encoder's boundary samples
+    /// races a resolve encoded behind it and leaves slots zero.
+    pub(crate) fn publish_timing(
+        &self,
+        pool: &BufferPool,
+        timing: &TimingPlan,
+        records: &[CommandRecord],
+        start: Instant,
+    ) -> Result<()> {
+        let Some(set) = timing.set() else {
+            return Ok(());
+        };
+        self.poll_wait()?;
+        let name = |r: &CommandRecord| match r {
+            CommandRecord::Dispatch { name, .. } => *name,
+            CommandRecord::CopyBuffer { .. } => "?",
+        };
+        match timing.kind {
+            // Only the focused dispatches were timed; each span lands at its
+            // own plan index and every other slot reads zero, which the
+            // consumers already treat as "not timed".
+            TimingKind::Focus => {
+                let samples = self.read_timestamps(pool, set, timing.focus.len())?;
+                if samples.iter().any(|s| *s > 0.0) {
+                    let mut per_launch = vec![0.0; records.len()];
+                    for (&(plan_ix, _), us) in timing.focus.iter().zip(samples) {
+                        per_launch[plan_ix] = us;
+                    }
+                    self.set_last_profile(per_launch);
+                }
+            }
+            TimingKind::Whole => {
+                let samples = self.read_timestamps(pool, set, 1)?;
+                if let Some(us) = samples.first() {
+                    eprintln!("TPLAN {us:.1} n={}", records.len());
+                }
+            }
+            // `TSPAN <live index> <kernel> <us> L<plan launch> grid=[x,y,z]`:
+            // the plan index is what a plan dump names, the live index is
+            // what the encoder counted.
+            TimingKind::Range { start, n } => {
+                let samples = self.read_timestamps(pool, set, n)?;
+                let live: Vec<(usize, &CommandRecord)> = records
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, r)| !r.is_empty_dispatch())
+                    .collect();
+                for (j, us) in samples.iter().enumerate() {
+                    let ix = start + j;
+                    let (lix, record) = live.get(ix).copied().unzip();
+                    let grid = match record {
+                        Some(CommandRecord::Dispatch { grid, .. }) => *grid,
+                        _ => [0; 3],
+                    };
+                    eprintln!(
+                        "TSPAN {ix} {} {us:.1} L{} grid={grid:?}",
+                        record.map_or("?", name),
+                        lix.unwrap_or(usize::MAX)
+                    );
+                }
+            }
+            TimingKind::All => {
+                let live = records.iter().filter(|r| !r.is_empty_dispatch()).count();
+                let mut samples = self.read_timestamps(pool, set, live)?.into_iter();
+                // Back to plan order: a zero-grid launch never reached the
+                // encoder and owns no sample.
+                let per_launch: Vec<f64> = records
+                    .iter()
+                    .map(|r| match r.is_empty_dispatch() {
+                        true => 0.0,
+                        false => samples.next().unwrap_or(0.0),
+                    })
+                    .collect();
+                if self.config.trace_gpu_kernels {
+                    let named: Vec<(String, f64)> = records
+                        .iter()
+                        .zip(&per_launch)
+                        .map(|(r, us)| (name(r).to_string(), *us))
+                        .collect();
+                    self.push_profile(KernelProfile::from_samples(
+                        start.elapsed().as_secs_f64() * 1000.0,
+                        &named,
+                    ));
+                }
+                // An all-zero read is a device that did not write the slots,
+                // not a plan that took no time. Publishing it would make every
+                // candidate look infinitely fast, so the tuner falls back to
+                // the wall clock.
+                if per_launch.iter().any(|us| *us > 0.0) {
+                    self.set_last_profile(per_launch);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Turn the per-dispatch timestamp path on for a tuning pass.
@@ -1190,11 +1362,6 @@ impl BuildCursor {
         let i = self.next.fetch_add(1, Ordering::Relaxed);
         (i < len).then_some(i)
     }
-}
-
-/// The plan's cache key: the plan is the key.
-pub const fn plan_key(plan: &Plan) -> PlanHash {
-    plan.hash
 }
 
 // Explicit auto-trait impls, for the reason given on `GpuTarget`: a future

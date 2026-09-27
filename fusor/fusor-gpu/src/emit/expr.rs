@@ -25,8 +25,6 @@ use super::{
     Emitter, LOCAL_INVOCATION_INDEX_ARG, MEM_SPACES, MemStamp, ScratchKind, WORKGROUP_ID_ARG, key,
 };
 
-/// The largest finite f32 WGSL will parse back identically.
-pub(crate) const WGSL_SAFE_F32_MAX: f32 = 3.40282e38;
 
 /// Whether a finite f32 has to be spelled through its bit pattern.
 ///
@@ -520,32 +518,8 @@ impl Emitter<'_> {
                 )));
             }
         };
-        let lit = match (op, scalar) {
-            (TileReduceOp::Sum, ScalarElement::F32) => Literal::F32(0.0),
-            (TileReduceOp::Product, ScalarElement::F32) => Literal::F32(1.0),
-            (TileReduceOp::Max, ScalarElement::F32) => Literal::F32(-WGSL_SAFE_F32_MAX),
-            (TileReduceOp::Min, ScalarElement::F32) => Literal::F32(WGSL_SAFE_F32_MAX),
-            (TileReduceOp::Sum, ScalarElement::F16) => Literal::F16(half::f16::from_f32(0.0)),
-            (TileReduceOp::Product, ScalarElement::F16) => Literal::F16(half::f16::from_f32(1.0)),
-            (TileReduceOp::Max, ScalarElement::F16) => Literal::F16(half::f16::from_f32(-65504.0)),
-            (TileReduceOp::Min, ScalarElement::F16) => Literal::F16(half::f16::from_f32(65504.0)),
-            (TileReduceOp::Sum, ScalarElement::U32) => Literal::U32(0),
-            (TileReduceOp::Product, ScalarElement::U32) => Literal::U32(1),
-            (TileReduceOp::Max, ScalarElement::U32) => Literal::U32(0),
-            (TileReduceOp::Min, ScalarElement::U32) => Literal::U32(u32::MAX),
-            (TileReduceOp::Sum, ScalarElement::I32) => Literal::I32(0),
-            (TileReduceOp::Product, ScalarElement::I32) => Literal::I32(1),
-            (TileReduceOp::Max, ScalarElement::I32) => Literal::I32(i32::MIN),
-            (TileReduceOp::Min, ScalarElement::I32) => Literal::I32(i32::MAX),
-            (TileReduceOp::Sum, ScalarElement::Bool) => Literal::Bool(false),
-            (TileReduceOp::Product, ScalarElement::Bool) => Literal::Bool(true),
-            (TileReduceOp::Max, ScalarElement::Bool) => Literal::Bool(false),
-            (TileReduceOp::Min, ScalarElement::Bool) => Literal::Bool(true),
-            (_, ScalarElement::BF16) => {
-                return Err(EmitError::MissingCapability("shader-bf16"));
-            }
-        };
-        Ok(self.append(Expression::Literal(lit)))
+        let lit = tile_literal(fusor_tile::build::reduce_identity(op, scalar))?;
+        Ok(self.append(lit))
     }
 
     /// Save the enclosing block's memo. Nested blocks may reuse its SSA values,

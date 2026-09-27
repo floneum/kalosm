@@ -2,13 +2,14 @@
 //! and `i()` are all one `Logical::Gather`, so they share these two alternatives.
 
 use fusor_ir::egraph::{Builder, Facts, Id, RuleTag};
-use fusor_ir::ir::launch::{GatherMode, IndexSpace, Launch, ScheduleDomain};
+use fusor_ir::ir::launch::{AccessPlan, GatherMode, IndexSpace, Launch, Operand, ScheduleDomain};
 use fusor_ir::ir::logical::Logical;
 use fusor_ir::ir::{Level, Node, Op, OpTag};
 use fusor_ir::rule;
 use fusor_ir::shape::Dim;
 
 use crate::domains::{DomainCtx, default_planner, map_domain};
+use crate::rules::adopt;
 use crate::rules::contract::alias;
 
 rule!(
@@ -36,23 +37,32 @@ fn parts(node: &Node) -> Option<(u32, Id, Id)> {
 
 fn mint(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>, mode: GatherMode) -> Option<Id> {
     let (axis, x_id, idx_id) = parts(node)?;
-    let x = f.operand(0)?;
-    let idx = f.operand(1)?;
+    let x = alias(x_id, f.operand(0)?);
+    gather(b, id, f, axis, x, idx_id, mode)
+}
+
+/// A `Gather` of `x` at `idx_id`'s indices over this node's output space.
+fn gather(
+    b: &mut Builder<'_>,
+    id: Id,
+    f: &Facts<'_>,
+    axis: u32,
+    x: Operand,
+    idx_id: Id,
+    mode: GatherMode,
+) -> Option<Id> {
+    let idx = alias(idx_id, f.operand(1)?);
     let out: Vec<Dim> = f.own().shape.iter().copied().collect();
-    let x_op = alias(x_id, x);
-    let idx_op = alias(idx_id, idx);
     let cx = DomainCtx::new(f.caps(), default_planner());
-    let accesses = [x_op.access.clone(), idx_op.access.clone()];
+    let accesses = [x.access.clone(), idx.access.clone()];
     let op = Launch::Gather {
         space: IndexSpace::new(out.iter().copied()),
         axis,
         mode,
-        ops: vec![x_op, idx_op],
+        ops: vec![x, idx],
         sched: ScheduleDomain::Map(map_domain(&out, &accesses, &cx).into()),
     };
-    let new = b.add_launch(op).ok()?;
-    b.union(id, new).ok()?;
-    Some(new)
+    adopt(b, id, op)
 }
 
 /// One workgroup per gathered row. The universal form: no divisibility, no
@@ -106,27 +116,12 @@ pub fn gather_quantized_rows(
         }
     }
     let leaf = leaf?;
-    let x = f.operand(0)?;
-    let idx = f.operand(1)?;
-    let out: Vec<Dim> = f.own().shape.iter().copied().collect();
     // The leaf operand is laid out over the *dense* element space the
     // decode-at-index loaders address, which is the dequant's shape.
-    let x_op = fusor_ir::ir::launch::Operand {
+    let x = Operand {
         src: leaf,
-        layout: fusor_ir::shape::Layout::contiguous(&x.shape),
-        access: fusor_ir::ir::launch::AccessPlan::Alias,
+        layout: fusor_ir::shape::Layout::contiguous(&f.operand(0)?.shape),
+        access: AccessPlan::Alias,
     };
-    let idx_op = alias(idx_id, idx);
-    let cx = DomainCtx::new(f.caps(), default_planner());
-    let accesses = [x_op.access.clone(), idx_op.access.clone()];
-    let op = Launch::Gather {
-        space: IndexSpace::new(out.iter().copied()),
-        axis,
-        mode: GatherMode::QuantizedRows,
-        ops: vec![x_op, idx_op],
-        sched: ScheduleDomain::Map(map_domain(&out, &accesses, &cx).into()),
-    };
-    let new = b.add_launch(op).ok()?;
-    b.union(id, new).ok()?;
-    Some(new)
+    gather(b, id, f, axis, x, idx_id, GatherMode::QuantizedRows)
 }
