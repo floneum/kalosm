@@ -24,8 +24,7 @@ use fusor_ir::shape::Dim;
 use smallvec::SmallVec;
 use std::sync::Arc;
 
-/// Extent a `Dim::Sym` prices at: a nominal value keeps the ranking total
-/// without letting a concrete binding leak into the plan.
+/// Extent a `Dim::Sym` prices at, so no concrete binding leaks into a plan.
 pub(crate) const SYM_NOMINAL: u64 = 1024;
 
 /// What role a leaf plays in the realized DAG.
@@ -35,8 +34,7 @@ pub(crate) enum LeafRole {
     NotLeaf,
     /// A constant or a uniform scalar: no buffer, no traffic, no component.
     Free,
-    /// An externally supplied buffer: read traffic, but never a write and
-    /// never a `BufferPlan` — allocation derives only what the plan produces.
+    /// An externally supplied buffer: read traffic, never a `BufferPlan`.
     External,
 }
 
@@ -112,8 +110,8 @@ impl<T: Copy> IdMap<T> {
     }
 }
 
-/// Work is cached per node. Schedule seeds are shared by normalized operation
-/// and facts within one search with a fixed cost model.
+/// Per-node work, schedule seeds by normalized op and facts, and built
+/// components, within one search with a fixed cost model.
 #[derive(Default)]
 pub struct NodeCache {
     graph: Option<u64>,
@@ -327,9 +325,7 @@ pub struct Component {
     pub line_bytes: u64,
     pub coop_steps: u64,
     pub lane_steps: u64,
-    /// Slab members that live in workgroup memory: read by nothing outside
-    /// the slab, and within the budget the device leaves after the fold
-    /// scratch. No buffer, no binding, no traffic.
+    /// Slab members kept in workgroup memory: no buffer, binding or traffic.
     pub private: Vec<Id>,
     pub grid: [u32; 3],
     pub block: u32,
@@ -354,11 +350,7 @@ impl Component {
     }
 }
 
-/// The DAG one `(sigma, m, theta)` denotes.
-///
-/// `LaunchPlan` borrows its `members` and `reads` slices, so an owned launch
-/// list would make this struct self-referential; launches are built on demand
-/// by [`Realized::launches`] from the owned [`Component`]s.
+/// The DAG one `(sigma, m, theta)` denotes; launches borrow from it on demand.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Realized {
     /// Selected nodes in post-order, leaves included.
@@ -369,8 +361,7 @@ pub struct Realized {
 }
 
 impl Realized {
-    /// Borrowed launch views for the cost model. `extraction` supplies the
-    /// `theta` map the plans point at, so no map is cloned per move.
+    /// Borrowed launch views for the cost model.
     pub fn launches<'a>(&'a self, extraction: &'a Extraction) -> Vec<LaunchPlan<'a>> {
         self.components
             .iter()
@@ -399,28 +390,28 @@ impl Realized {
     }
 }
 
-/// Math a cooperative contraction's staging fill re-executes beyond what the
-/// schedule-independent `work_of` row counts.
-///
-/// The A tile is re-staged once per n-tile and N pass, and the B tile once
-/// per m-tile. Each staging pass runs the side's `pre` per loaded
-/// element. `work_of` prices one execution per element, so the extra is
-/// `pre_work x (tiles - 1)` per side; an identity `pre` contributes zero.
-fn staging_rework(graph: &EGraph, member: Id, theta: Option<SchedPoint>) -> Work {
-    let Some(SchedPoint::Coop { geom, .. }) = theta else {
-        return Work::default();
+/// A cooperative member's extra work: the staging fill re-running each side's
+/// `pre` once per tile past the first, padded-tile MACs and operand staging.
+/// Returns the padded output bytes its stores write.
+fn coop_work(
+    graph: &EGraph,
+    member: Id,
+    theta: Option<SchedPoint>,
+    caps: &Caps,
+    work: &mut Work,
+) -> Option<u64> {
+    let Some(SchedPoint::Coop { geom, staging }) = theta else {
+        return None;
     };
     let op = &graph.node(member).op;
     let (Op::Launch(Launch::Contract { a, b, .. }), Some(Mnkb { m, n, k, batch })) =
         (op, Mnkb::priced(op))
     else {
-        return Work::default();
+        return None;
     };
     let tiling = Tiling::new(m, n, geom.bm, geom.bn);
-    let tiles_m = tiling.tiles_m.max(1);
-    let tiles_n = tiling
-        .tiles_n
-        .saturating_mul(u64::from(geom.n_passes.max(1)));
+    let (bm, bn) = (tiling.bm, tiling.bn);
+    let passes = u64::from(geom.n_passes.max(1));
     let side_extra = |side: &fusor_ir::ir::launch::ContractSide, elems: u64, tiles: u64| {
         let mut w = fusor_ir::semantics::work::epilogue_work(&side.pre, elems);
         for o in &side.ops {
@@ -429,32 +420,10 @@ fn staging_rework(graph: &EGraph, member: Id, theta: Option<SchedPoint>) -> Work
         }
         w.scale(tiles.saturating_sub(1))
     };
-    let a_extra = side_extra(a, batch.saturating_mul(m).saturating_mul(k), tiles_n);
-    let b_extra = side_extra(b, batch.saturating_mul(k).saturating_mul(n), tiles_m);
-    a_extra.add(b_extra)
-}
-
-/// Work on padded cooperative tiles and their operand staging traffic.
-/// Returns the padded output bytes that the cooperative stores write.
-fn coop_work(
-    graph: &EGraph,
-    member: Id,
-    theta: Option<SchedPoint>,
-    caps: &Caps,
-) -> (Work, Option<u64>) {
-    let Some(SchedPoint::Coop { geom, staging }) = theta else {
-        return (Work::default(), None);
-    };
-    let op = &graph.node(member).op;
-    let (Op::Launch(Launch::Contract { a, .. }), Some(Mnkb { m, n, k, batch })) =
-        (op, Mnkb::priced(op))
-    else {
-        return (Work::default(), None);
-    };
-    let tiling = Tiling::new(m, n, geom.bm, geom.bn);
-    let (bm, bn) = (tiling.bm, tiling.bn);
-    let passes = u64::from(geom.n_passes.max(1));
-    let bn_pass = bn / passes;
+    let tiles_n = tiling.tiles_n.saturating_mul(passes);
+    *work = work
+        .add(side_extra(a, batch.saturating_mul(m).saturating_mul(k), tiles_n))
+        .add(side_extra(b, batch.saturating_mul(k).saturating_mul(n), tiling.tiles_m.max(1)));
     let groups = distribute_workgroups(
         tiling.groups(batch),
         caps.limits.max_compute_workgroups_per_dimension,
@@ -465,14 +434,13 @@ fn coop_work(
     let k_step = u64::from(geom.bk.max(1)).saturating_mul(u64::from(staging.max(1)));
     let k_pad = k.div_ceil(k_step).saturating_mul(k_step);
     let output_elements = groups.saturating_mul(bm).saturating_mul(bn);
-    // Every K step writes both operand tiles. Each subgroup column reads
-    // the A tile and each subgroup row reads the B tile; fragment loads
-    // shared by accumulator columns/rows are common subexpressions.
+    // Every K step writes both operand tiles; each subgroup column reads A
+    // and each subgroup row reads B.
     let staged = bm
         .saturating_mul(1 + u64::from(geom.cg.max(1)))
-        .saturating_add(bn_pass.saturating_mul(1 + u64::from(geom.rg.max(1))));
+        .saturating_add((bn / passes).saturating_mul(1 + u64::from(geom.rg.max(1))));
     let operand_bytes = scalar_element(graph.facts(a.primary().src).dtype).byte_size();
-    let work = Work {
+    *work = work.add(Work {
         macs: output_elements
             .saturating_mul(k_pad)
             .saturating_sub(batch.saturating_mul(m).saturating_mul(n).saturating_mul(k)),
@@ -482,17 +450,12 @@ fn coop_work(
             .saturating_mul(staged)
             .saturating_mul(operand_bytes),
         ..Work::default()
-    };
-    let writes = output_elements.saturating_mul(graph.facts(member).dtype.byte_size());
-    (work, Some(writes))
+    });
+    Some(output_elements.saturating_mul(graph.facts(member).dtype.byte_size()))
 }
 
-/// Realize `(sigma, m, theta)` from `roots` and cut it into launches.
-///
-/// A class with no `sigma` entry is [`Error::Plan`]; so is a selection whose
-/// resolved edges form a cycle (a class member created *after* its own
-/// consumer can be selected into one, and the search must be able to reject
-/// that rather than loop).
+/// Realize `(sigma, m, theta)` from `roots` and cut it into launches. An
+/// unselected class or a cyclic selection is [`Error::Plan`].
 pub fn realize(
     graph: &EGraph,
     roots: &[Id],
@@ -504,8 +467,7 @@ pub fn realize(
     realize_with(graph, roots, extraction, cost, arena, &mut cache)
 }
 
-/// Realize with cached node work. Component descriptors stay within an
-/// internal search, whose planner is fixed for the cache's lifetime.
+/// Realize with cached node work; the planner is fixed for the cache's life.
 pub(crate) fn realize_with(
     graph: &EGraph,
     roots: &[Id],
@@ -636,8 +598,7 @@ impl Selected {
     }
 }
 
-/// `cost.total` over the realized launches. The accept test for every
-/// local-search move is this number, never a local delta heuristic.
+/// `cost.total` over the realized launches: every move's accept test.
 pub fn exact_cost(
     realized: &Realized,
     extraction: &Extraction,
@@ -647,8 +608,7 @@ pub fn exact_cost(
     cost.total(&launches)
 }
 
-/// Rebuild one ordinary launch with the extraction's actual selected inputs.
-/// Its dependencies and all other launches remain in the realized DAG.
+/// Rebuild one ordinary launch over its selected inputs.
 pub(crate) fn ordinary_component(
     graph: &EGraph,
     extraction: &Extraction,
@@ -704,8 +664,7 @@ pub(crate) fn leaf_role(graph: &EGraph, id: Id) -> LeafRole {
     }
 }
 
-/// The iteration domain of one node. Launch nodes carry it; everything else is
-/// priced over its own shape.
+/// The iteration domain of one node; a non-launch prices over its shape.
 pub(crate) fn index_space(graph: &EGraph, id: Id) -> IndexSpace {
     match &graph.node(id).op {
         Op::Launch(Launch::StreamFold { fold, .. }) => match fold.as_ref() {
@@ -860,8 +819,7 @@ pub(crate) fn fold_scratch_elements(
     Some(carrier.lanes()?.saturating_mul(u64::from(scratch)))
 }
 
-/// Workgroup bytes `id`'s tiles at `theta` take: its schedule's staging and
-/// its fold's scratch.
+/// Workgroup bytes of `id`'s staging and fold scratch at `theta`.
 pub(crate) fn tile_bytes(
     graph: &EGraph,
     id: Id,
@@ -903,10 +861,8 @@ fn tiles_for(theta: Option<SchedPoint>, elem: ScalarElement, fold_scratch: Optio
                 decls.push(tile("sgemm_b", elem, &[p.bk.max(1), p.bn.max(1)]));
             }
         }
-        Some(SchedPoint::Sgemv(p))
-            // The subgroup-per-column structure (`cols > 1`) closes each
-            // column inside one subgroup and stages nothing.
-            if p.cols <= 1 => {
+        // `cols > 1` closes each column in one subgroup and stages nothing.
+        Some(SchedPoint::Sgemv(p)) if p.cols <= 1 => {
                 decls.push(tile("sgemv_partials", elem, &[p.subgroups.max(1)]));
             }
         _ => {}
@@ -919,13 +875,11 @@ fn tiles_for(theta: Option<SchedPoint>, elem: ScalarElement, fold_scratch: Optio
     Tiles { decls }
 }
 
-/// Bytes a cache line holds on every device this targets; the amplification
-/// is a ratio against it, so the exact figure matters less than having one.
+/// Bytes per cache line; amplification is a ratio against it.
 const LINE_BYTES: u64 = 128;
 
-/// Element stride of an sgemv operand's innermost k axis. `trailing` is the
-/// extent of the axes after k: `1` for A (`[.., m, k]`), `n` for B
-/// (`[.., k, n]`).
+/// Element stride of an sgemv operand's k axis; `trailing` is the extent
+/// after k: `1` for A, `n` for B.
 fn sgemv_k_stride(layout: &fusor_ir::shape::Layout, trailing: u64) -> u64 {
     let shape = layout.shape();
     let mut after = 1u64;
@@ -940,8 +894,7 @@ fn sgemv_k_stride(layout: &fusor_ir::shape::Layout, trailing: u64) -> u64 {
     dim_extent(layout.strides()[axis - 1]).max(1)
 }
 
-/// How many times its useful bytes a dense row-major operand of a fold moves
-/// through the memory pipe. See [`operand_line_amplification`].
+/// [`operand_line_amplification`] of a dense row-major fold operand.
 pub(crate) fn fold_line_amplification(
     dims: &[u64],
     axis: usize,
@@ -956,11 +909,9 @@ pub(crate) fn fold_line_amplification(
     operand_line_amplification(dims, &strides, axis, lane_group, caps, elem_bytes)
 }
 
-/// How many times its useful bytes one operand read at a fold's iteration
-/// space moves through the memory pipe at `lane_group` lanes per row. One
-/// subgroup load covers `lane_group` consecutive k of each of
-/// `width / lane_group` consecutive output elements; each distinct line it
-/// touches costs a whole line. `strides` are the operand's own, over `dims`.
+/// How many times its useful bytes an operand read at a fold's space moves
+/// through memory at `lane_group` lanes per row: each distinct line one
+/// subgroup load touches costs a whole line.
 pub(crate) fn operand_line_amplification(
     dims: &[u64],
     strides: &[u64],
@@ -1006,10 +957,8 @@ pub(crate) fn operand_line_amplification(
     (lines.len() as u64 * line_elems / reads.max(1)).clamp(1, line_elems)
 }
 
-/// The longest dependent chain one workgroup of `root` runs at `theta`: for
-/// a tiled contraction the k steps of one tile (split-K divides them), for
-/// a fold the iterations of one lane over the reduced axis, for a slab the
-/// sum over its stages. What no occupancy shortens.
+/// The `(coop, lane)` dependent chain one workgroup of `root` runs at
+/// `theta`; a slab sums its stages. What no occupancy shortens.
 pub(crate) fn serial_steps(
     graph: &EGraph,
     root: Id,
@@ -1039,8 +988,7 @@ pub(crate) fn serial_steps(
     }
 }
 
-/// [`serial_steps`] for one launch node from its own op: a contraction's k
-/// steps at `theta`, a fold's iterations per lane.
+/// [`serial_steps`] of one launch node from its own op.
 pub fn node_serial_steps(op: &Op, theta: Option<SchedPoint>, caps: &Caps) -> (u64, u64) {
     match op {
         Op::Launch(Launch::StreamFold {
@@ -1060,22 +1008,13 @@ pub fn node_serial_steps(op: &Op, theta: Option<SchedPoint>, caps: &Caps) -> (u6
         }
         Op::Launch(Launch::Contract { k, .. }) => {
             let k = k.as_const().unwrap_or(1).max(1);
-            // A step is one fragment depth of k, whatever `bk` stages at
-            // once: a deeper tile runs its fragments back to back, so the
-            // chain is as long either way.
+            // A step is one fragment depth of k, whatever `bk` stages.
             let depth = u64::from(fusor_ir::ir::launch::CoopGeom::COOP_DIM.max(1));
             match theta {
-                // One subgroup multiplies its `(bm / rg) x (bn / cg)` block a
-                // fragment at a time, every depth: that chain is the step
-                // count. `16x16` on one subgroup and `32x32` on four are the
-                // same chain; what separates them is traffic.
-                // A depth step is a staged load and a barrier; `16x16` on
-                // one subgroup (four multiplies per depth) measured the same
-                // as on four (one each), so the multiplies are not the step.
+                // A depth step is a staged load and a barrier, whatever the
+                // multiplies per subgroup.
                 Some(SchedPoint::Coop { .. }) => (k.div_ceil(depth), 0),
-                // A scalar-tiled lane walks every k with its register tile's
-                // FMAs and staged loads: measured 8-10x a fragment chain on
-                // the same shape (281 us against 33 us at 1024x96x96).
+                // A scalar-tiled lane walks every k: measured 8-10x a fragment.
                 Some(SchedPoint::Sgemm(_)) => (0, k.saturating_mul(4)),
                 Some(SchedPoint::Sgemv(p)) => (0, k.div_ceil(u64::from(sgemv_lanes(p, caps)))),
                 _ => (0, k),
@@ -1093,8 +1032,7 @@ pub fn node_serial_steps(op: &Op, theta: Option<SchedPoint>, caps: &Caps) -> (u6
                 k.div_ceil(u64::from(fold_lane_group(theta, caps).max(1))),
             )
         }
-        // The dense scatter walks every update once per output lane, each
-        // step a dependent index load.
+        // A dense scatter walks every update per output lane.
         Op::Launch(Launch::Scatter { ops, .. }) => {
             let updates = ops
                 .get(1)
@@ -1119,8 +1057,7 @@ struct SlabFold {
     lanes: u32,
 }
 
-/// `stage` as a fold stage of a slab of `slabs` at `block` lanes; `None`
-/// when it is not a fold.
+/// `stage` as a fold stage of a slab of `slabs` at `block` lanes.
 fn slab_fold_stage(
     graph: &EGraph,
     stage: Id,
@@ -1196,10 +1133,7 @@ pub(crate) fn geometry(theta: Option<SchedPoint>, space: &IndexSpace, caps: &Cap
             block: ((p.bm / p.tm.max(1)) * (p.bn / p.tn.max(1))).max(1),
             workgroups: m.div_ceil(p.bm.max(1) as u64) * n.div_ceil(p.bn.max(1) as u64) * batch,
         },
-        // The grid `lower_sgemv` actually launches: one workgroup per output
-        // element at `cols == 1` (`batch * m * n`), one per `cols`-wide
-        // column group at `cols > 1` (`batch * m * ceil(n / cols)`,
-        // `lower_sgemv_subgroup_cols`).
+        // One workgroup per output, or per `cols`-wide column group.
         Some(SchedPoint::Sgemv(p)) => Geometry {
             block: (p.subgroups.max(1) * width).max(1),
             workgroups: m
@@ -1207,8 +1141,7 @@ pub(crate) fn geometry(theta: Option<SchedPoint>, space: &IndexSpace, caps: &Cap
                 .saturating_mul(n.div_ceil(u64::from(p.cols.max(1))))
                 .max(1),
         },
-        // A fold workgroup has `emitted_block(lane_group)` lanes and computes
-        // `block / lane_group` output rows.
+        // `emitted_block(lane_group)` lanes, `block / lane_group` rows.
         Some(SchedPoint::Fold(strat)) => {
             let (block, lane_group) = match strat {
                 FoldStrat::Subgroup => (
@@ -1241,9 +1174,8 @@ pub(crate) fn geometry(theta: Option<SchedPoint>, space: &IndexSpace, caps: &Cap
     }
 }
 
-/// The 3-D fold against `max_compute_workgroups_per_dimension`. **Slab count
-/// first, then size x**: saturating x instead leaves the last slab nearly
-/// empty and every extra group still runs the prologue.
+/// The 3-D grid under `max_per_dim`: slab count first, then size x, so the
+/// last slab is not left nearly empty.
 pub fn distribute_workgroups(total: impl Into<u64>, max_per_dim: u32) -> [u32; 3] {
     let total = total.into();
     let max = u64::from(max_per_dim.max(1));
@@ -1267,10 +1199,7 @@ enum Frame {
 type Operands = IdMap<SmallVec<[Id; 4]>>;
 type ComponentMembers = SmallVec<[Id; 4]>;
 
-/// Why the selected nodes or their launch components cannot be ordered.
-///
-/// `Cycle` is repairable: it names a class whose selected member closes a
-/// loop, and [`crate::extract`] re-selects that one class.
+/// Why a selection cannot be ordered; `Cycle` names a member to re-select.
 enum WalkFail {
     Cycle(Id),
     Other(Error),
@@ -1285,14 +1214,8 @@ impl From<WalkFail> for Error {
     }
 }
 
-/// The node at which this selection closes a cycle, if it closes one.
-///
-/// The node graph is acyclic, but a selection over it need not be: [`select`]
-/// replaces an operand id by its class's selected member, which may have a
-/// larger id than the consumer that reached it. Two classes can form a cycle
-/// in which neither member names its own class, so [`is_self_referential`]
-/// (the depth-1 case) sees nothing. Composite ownership can also turn an
-/// acyclic node order into cyclic launch dependencies.
+/// The node at which this selection, or its composite ownership, closes a
+/// cycle: selected members may name each other's classes.
 pub(crate) fn selection_cycle(graph: &EGraph, extraction: &Extraction, roots: &[Id]) -> Option<Id> {
     let resolved = roots
         .iter()
@@ -1331,9 +1254,7 @@ fn walk(
                     OPEN => return Err(WalkFail::Cycle(v)),
                     _ => {
                         state.insert(v, OPEN);
-                        // A slab names its members by id — they are the spellings
-                        // its lowering reads — and its last member shares its
-                        // class, so selecting them would walk back into the slab.
+                        // A composite names its members by id.
                         let kids: SmallVec<[Id; 4]> = resolved_children(graph, extraction, v)
                             .map(|(c, n)| n.ok_or_else(|| unselected(graph, c)))
                             .collect::<Result<_>>()
@@ -1371,8 +1292,7 @@ fn cut(
     let mut owners = IdMap::with_len(graph.len(), slots);
     let mut index_of = IdMap::with_len(graph.len(), slots);
     let result = (|| {
-        // Consumers follow members in the postorder, so an outer composite
-        // assigns ownership before its nested composites pass it to their stages.
+        // Reverse postorder: outer composites own before nested ones.
         for &id in order.iter().rev() {
             if leaf_role(graph, id) != LeafRole::NotLeaf {
                 continue;
@@ -1404,11 +1324,8 @@ fn cut(
             groups[idx as usize].push(*v);
         }
 
-        // Groups came out in the order their *first* node appears, which is not
-        // a dependency order: a composite whose first member reads nothing may
-        // have a later member that reads a launch appearing after that first
-        // node. Order the groups as a DAG instead, earliest-first among the
-        // ready ones so the order stays deterministic.
+        // First-appearance order is not a dependency order: sort the groups
+        // as a DAG, earliest ready first.
         let n = groups.len();
         let mut deps: Vec<SmallVec<[usize; 4]>> = vec![SmallVec::new(); n];
         let mut indegree = vec![0usize; n];
@@ -1513,9 +1430,7 @@ fn build_component<'a>(
         let mut w = cache.work_of(graph, *m);
         let theta_m = extraction.theta.get(m).copied();
         quantized_work(graph, *m, operands(*m), theta_m, caps, &mut w)?;
-        w = w.add(staging_rework(graph, *m, theta_m));
-        let (cooperative, padded_writes) = coop_work(graph, *m, theta_m, caps);
-        w = w.add(cooperative);
+        let padded_writes = coop_work(graph, *m, theta_m, caps, &mut w);
         let materialized = extraction.is_materialized(*m) || roots.contains(m);
         if materialized {
             writes = writes.saturating_add(padded_writes.unwrap_or_else(|| bytes_of(out)));
@@ -1523,8 +1438,7 @@ fn build_component<'a>(
         work = work.add(w);
     }
 
-    // Distinct external operands, with the reread factor the consuming
-    // iteration space implies.
+    // Distinct external operands and their consumers' reread factors.
     let mut ext: Vec<(Id, u64, u32)> = Vec::new();
     for m in &members {
         let iters = iterations_of(&index_space(graph, *m));
@@ -1563,8 +1477,8 @@ fn build_component<'a>(
         let contract_reads = match (op, Mnkb::of(op, dim_extent), window) {
             (Op::Launch(Launch::Contract { a, .. }), Some(c), Some((columns, copies))) => {
                 let rows_k = c.batch.saturating_mul(c.m).saturating_mul(c.k);
-                // SGEMV shares A within a subgroup; SGEMM shares it across
-                // one lane's register columns. Every output row scans B.
+                // A is shared per subgroup (sgemv) or per register column
+                // (sgemm); every output row scans B.
                 let a_scans =
                     c.n.div_ceil(u64::from(columns))
                         .saturating_mul(u64::from(copies));
@@ -1605,8 +1519,7 @@ fn build_component<'a>(
         Op::Launch(op) => fold_theta(op, theta, caps),
         _ => theta,
     };
-    // What runs side by side in this launch: a group's members, each at its
-    // own point and geometry, else the root alone.
+    // What runs side by side: a group's members, else the root.
     let units: SmallVec<[(Id, Option<SchedPoint>, Geometry); 4]> = match &graph.node(root).op {
         Op::Launch(Launch::Group { members: gm, .. }) => gm
             .iter()
@@ -1617,8 +1530,7 @@ fn build_component<'a>(
             .collect(),
         _ => smallvec::smallvec![(root, theta, member_geometry(graph, extraction, root, caps))],
     };
-    // A group's dispatch is its members' workgroups summed, at the widest
-    // block.
+    // A group dispatches its members' workgroups at the widest block.
     let geom = if is_group(graph, root) {
         Geometry {
             block: units.iter().map(|(_, _, g)| g.block).max().unwrap_or(1),
@@ -1639,11 +1551,8 @@ fn build_component<'a>(
     };
     let mut wg_bytes = tile_bytes(graph, root, theta, caps, arena)? as u64;
 
-    // Uncoalesced fold reads: every operand walked at the fold's iteration
-    // space pays the line amplification of its lane group. A slab pays it
-    // per fold stage at that stage's lanes per row.
+    // Uncoalesced reads pay line amplification at each fold's lanes per row.
     let mut line_bytes = 0u64;
-    // Every fold the launch runs, with the lanes per row it runs at.
     let mut stages: SmallVec<[(Id, u32); 4]> = SmallVec::new();
     for &(m, theta, g) in &units {
         match &graph.node(m).op {
@@ -1656,9 +1565,7 @@ fn build_component<'a>(
             _ => {}
         }
     }
-    // A cooperative contraction pulls each operand once per tile on the other
-    // side: `M*N*K*(1/bn + 1/bm)` elements through the memory pipe, of which
-    // `M*K + K*N` are the operands themselves.
+    // A coop contraction pulls each operand once per tile on the other side.
     if let Some(Mnkb { m, n, k, batch }) = Mnkb::priced(&graph.node(root).op)
         && let Some(SchedPoint::Coop { geom, .. }) = theta
     {
@@ -1669,8 +1576,7 @@ fn build_component<'a>(
         let useful = batch * k * (m + n);
         line_bytes = line_bytes.saturating_add(pulled.saturating_sub(useful).saturating_mul(elem));
     }
-    // An sgemv lane walks consecutive k, so an operand strided along k pulls
-    // a whole line per element on every one of its rereads.
+    // An sgemv operand strided along k pulls a line per element per reread.
     if let Op::Launch(Launch::Contract { n, a, b, .. }) = &graph.node(root).op
         && let Some(SchedPoint::Sgemv(_)) = theta
     {
@@ -1706,8 +1612,7 @@ fn build_component<'a>(
             Op::Launch(Launch::Fold { ops, .. } | Launch::Map { ops, .. }) => ops,
             _ => continue,
         };
-        // The fold whose iteration space walks this member's operands: the
-        // member itself when it is a stage, else the stage its reads span.
+        // The fold walking this member's operands: itself, else one it spans.
         let spans = |stage: Id| match &graph.node(stage).op {
             Op::Launch(Launch::Fold { space, .. }) => ops.iter().all(|op| {
                 op.layout.shape().len() == space.dims.len()
@@ -1771,10 +1676,8 @@ fn build_component<'a>(
         .map(|(m, theta, g)| serial_steps(graph, *m, *theta, g.block, caps))
         .fold((0, 0), |a, b| (a.0.max(b.0), a.1.max(b.1)));
 
-    // A slab's middle members nothing outside reads live in workgroup memory
-    // as far as it fits; the rest, and anything read outside, in buffers. A
-    // group's member slabs keep their own privates; the group itself has
-    // none.
+    // A slab's unshared middle members live in workgroup memory as far as
+    // it fits; a group's member slabs keep their own.
     let mut private: Vec<Id> = Vec::new();
     for &(slab, _, _) in &units {
         let Op::Launch(Launch::Slab { members: sm, .. }) = &graph.node(slab).op else {
@@ -1816,8 +1719,7 @@ fn build_component<'a>(
     })
 }
 
-/// The geometry one node launches at on its own: a slab's, or its schedule
-/// point's over its index space.
+/// The geometry one node launches at on its own.
 fn member_geometry(graph: &EGraph, extraction: &Extraction, m: Id, caps: &Caps) -> Geometry {
     let theta = extraction.theta.get(&m).copied();
     let launch = match &graph.node(m).op {
@@ -1858,19 +1760,13 @@ fn member_geometry(graph: &EGraph, extraction: &Extraction, m: Id, caps: &Caps) 
     }
 }
 
-/// True when a class has exactly one member, in which case selection is
-/// forced and no member vector need be built.
+/// True when a class has exactly one member.
 pub(crate) fn is_singleton(graph: &EGraph, class: ClassId) -> bool {
     !matches!(graph.node(class.0).op, Op::Union(..))
 }
 
-/// True when `id` is a node the plan may actually select: a `Leaf`, or
-/// anything at `Level::Launch`.
-///
-/// This is clause 1 of `verify_plan`, and every decision that writes `sigma`
-/// has to agree with it. It cannot be left to the cost model: a `Logical` node
-/// and its lowered `Launch` twin report the same `work()`, so cost ties and a
-/// tie broken by smaller `Id` returns the un-lowered original.
+/// True when a plan may select `id`: a `Leaf` or a `Launch`-level node. Cost
+/// cannot decide this: a `Logical` node ties its lowered twin.
 pub(crate) fn is_runnable(graph: &EGraph, id: Id) -> bool {
     if !matches!(graph.node(id).op, Op::Logical(Logical::Leaf(_)))
         && graph.level(id) != fusor_ir::ir::Level::Launch
@@ -1880,14 +1776,10 @@ pub(crate) fn is_runnable(graph: &EGraph, id: Id) -> bool {
     !is_self_referential(graph, id)
 }
 
-/// True when `id` names its own e-class as an operand.
-///
-/// Such a member cannot be selected for that class: the selection would
-/// denote "compute X by computing X". A rule bug must degrade the plan, never
-/// make a class unextractable.
+/// True when `id` names its own e-class as an operand, so selecting it would
+/// compute X by computing X.
 pub(crate) fn is_self_referential(graph: &EGraph, id: Id) -> bool {
-    // A slab's last member is in the slab's own class by construction, and is
-    // read by id rather than selected; that is not a cycle.
+    // A composite's last member shares its class but is read by id.
     if is_composite(graph, id) {
         return false;
     }
@@ -1899,10 +1791,8 @@ pub(crate) fn is_self_referential(graph: &EGraph, id: Id) -> bool {
         .any(|c| graph.class_of(*c) == class)
 }
 
-/// A member's fold carrier footprint: accumulator lanes and accumulator bytes.
-/// `None` for anything that is not a `Fold`, and for a `Fold` whose slot
-/// extent is symbolic — an unallocatable carrier the fold domain generator
-/// already declines to score.
+/// A fold's carrier lanes and accumulator bytes; `None` when not a fold or
+/// its slot extent is symbolic.
 pub(crate) fn fold_footprint(graph: &EGraph, id: Id) -> Option<(u64, u64)> {
     match &graph.node(id).op {
         Op::Launch(Launch::Fold { carrier, acc, .. }) => Some((carrier.lanes()?, acc.byte_size())),
@@ -1910,9 +1800,7 @@ pub(crate) fn fold_footprint(graph: &EGraph, id: Id) -> Option<(u64, u64)> {
     }
 }
 
-/// Whether a composite can materialize its externally visible values in
-/// this graph. This depends on consumers and buffer choices, not kernel
-/// correctness or the contents of a schedule domain.
+/// Whether a composite can bind its externally visible values in this graph.
 pub(crate) fn composite_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
     slab_bindings_fit(graph, id, caps) && group_bindings_fit(graph, id, caps)
 }
@@ -1957,15 +1845,12 @@ fn cached_bindings_fit(
     if let Some(fit) = hit {
         return fit;
     }
-    // A group queries its slabs through this same cache.
     let fit = compute();
     MEMO.with(|memo| memo.borrow_mut().as_mut().unwrap().fits.insert(id, fit));
     fit
 }
 
-/// Whether group `id` can bind: each member's own buffers and the distinct
-/// outside inputs, a member slab's stages as its layout says. Memoized
-/// like [`slab_bindings_fit`].
+/// Whether group `id` can bind its members' buffers and distinct inputs.
 pub(crate) fn group_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
     let Op::Launch(Launch::Group { members, .. }) = &graph.node(id).op else {
         return true;
@@ -2009,10 +1894,8 @@ fn group_members_fit(graph: &EGraph, members: &[Id], caps: &Caps) -> bool {
     2 + outs + inputs <= caps.limits.max_storage_buffers_per_shader_stage as usize
 }
 
-/// Whether slab `id` can bind, with every middle member nothing outside the
-/// slab reads kept in workgroup memory as far as it fits. The readers index
-/// says what is read outside; `build_component` decides the same layout
-/// from the realized consumers, which read no more than that.
+/// Whether slab `id` can bind under [`slab_layout`], judged on every reader
+/// in the graph (a superset of the realized ones).
 pub(crate) fn slab_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
     let Op::Launch(Launch::Slab { members, .. }) = &graph.node(id).op else {
         return true;
@@ -2026,9 +1909,8 @@ pub(crate) fn slab_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
     })
 }
 
-/// Whether a class binds its own storage buffer: an external leaf, or a
-/// root the caller reads back. Every other value is packed into the step
-/// arena, which a launch binds once.
+/// Whether a class binds its own storage buffer (an external leaf or a
+/// root) rather than the step arena.
 pub(crate) fn own_buffer(
     graph: &EGraph,
     class: ClassId,
@@ -2041,12 +1923,9 @@ pub(crate) fn own_buffer(
             .any(|m| leaf_role(graph, *m) == LeafRole::External)
 }
 
-/// A slab's workgroup memory and bindings: the widest fold stage's scratch,
-/// then as many middle members as fit — smallest share first, of those
-/// `shared` says nothing outside reads and that are not roots — and the
-/// storage buffers left over: the uniform block, the output, every distinct
-/// outside class read, and every middle member still in a buffer. `Err`
-/// when those exceed the device's bindings.
+/// A slab's private middle members and workgroup bytes: fold scratch, then
+/// unshared non-root members smallest first as they fit. `Err` when the
+/// storage buffers left over exceed the device's bindings.
 pub(crate) fn slab_layout(
     graph: &EGraph,
     root: Id,
@@ -2104,9 +1983,7 @@ pub(crate) fn slab_layout(
             }
         }
     }
-    // The uniform block, the step arena, the output when the caller reads
-    // it back, and every input or buffered middle member that is a leaf or
-    // a root: everything else lives in the arena binding.
+    // Uniforms, the arena, and every own-buffer output, input or member.
     let owns = |c: ClassId| own_buffer(graph, c, &root_classes);
     let bound = 2
         + inputs.iter().filter(|c| owns(**c)).count()
@@ -2125,8 +2002,8 @@ pub(crate) fn slab_layout(
     Ok((private, used))
 }
 
-/// The members of `class` a selection may take: acyclic, then runnable, then
-/// able to bind, each filter dropped when it would leave nothing.
+/// The members of `class` a selection may take: acyclic, runnable, able to
+/// bind, each filter dropped when it would leave nothing.
 pub(crate) fn selectable(graph: &EGraph, class: ClassId, caps: &Caps) -> Vec<Id> {
     fn narrow(pool: Vec<Id>, keep: impl Fn(Id) -> bool) -> Vec<Id> {
         let kept: Vec<Id> = pool.iter().copied().filter(|m| keep(*m)).collect();
@@ -2137,17 +2014,9 @@ pub(crate) fn selectable(graph: &EGraph, class: ClassId, caps: &Caps) -> Vec<Id>
     narrow(pool, |m| composite_bindings_fit(graph, m, caps))
 }
 
-/// The classes reachable from `roots`, ascending, plus a node mask covering
-/// every id those classes hold — members and `Union` spines both.
-///
-/// Reachability is the children closure over every member, so it covers
-/// everything selection, pricing or realization can touch while excluding the
-/// ambient graph a long-lived session accumulates.
-///
-/// The mask is closed: every child of every masked node resolves to a masked
-/// class whose ids are all masked, so a fixpoint over masked slots alone
-/// (see `bounds_scoped`) equals the whole-graph
-/// fixpoint restricted to the mask.
+/// The classes reachable from `roots`, ascending, and a mask of every id
+/// they hold. The mask is closed under children, so a fixpoint over it
+/// equals the whole-graph one restricted to it.
 pub(crate) fn reachable(graph: &EGraph, roots: &[Id]) -> (Vec<ClassId>, fixedbitset::FixedBitSet) {
     let (mut classes, mask) = reachable_unsorted(graph, roots);
     classes.sort_unstable();
@@ -2175,8 +2044,7 @@ pub(crate) fn reachable_unsorted(
     let mut stack: Vec<Id> = Vec::new();
     while let Some(class) = work.pop() {
         out.push(class);
-        // Walk the union spine and every member; ids of distinct classes are
-        // disjoint, so the mask doubles as this walk's visited set.
+        // Classes are disjoint, so the mask is this walk's visited set.
         stack.push(class.0);
         while let Some(cur) = stack.pop() {
             if mask.contains(cur.index()) {
@@ -2200,8 +2068,7 @@ pub(crate) fn reachable_unsorted(
     (out, mask)
 }
 
-/// Every class in the graph, ascending. Iteration order of every decision
-/// path is this, never a hash map's.
+/// Every class in the graph, ascending.
 pub(crate) fn classes(graph: &EGraph) -> Vec<ClassId> {
     let mut out: Vec<ClassId> = Vec::new();
     let mut seen = fixedbitset::FixedBitSet::with_capacity(graph.len());
