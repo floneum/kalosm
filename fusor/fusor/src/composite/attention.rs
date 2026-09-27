@@ -76,9 +76,7 @@ fn split_query_heads(t: &mut GraphTape<'_>, q: Val, groups: u64) -> Result<Val> 
         return Ok(q);
     }
     let shape = t.shape_of(q);
-    let h = shape[1]
-        .as_const()
-        .ok_or_else(|| Error::Shape("attention head count must be decidable".into()))?;
+    let h = heads(shape[1])?;
     let hkv = h / groups;
     let specs: SmallVec<[StrideSpec; 6]> = smallvec::smallvec![
         StrideSpec::dim(0, shape[0]),
@@ -90,6 +88,11 @@ fn split_query_heads(t: &mut GraphTape<'_>, q: Val, groups: u64) -> Result<Val> 
     t.restride(&specs, q)
 }
 
+fn heads(d: Dim) -> Result<u64> {
+    d.as_const()
+        .ok_or_else(|| Error::Shape("attention head count must be decidable".into()))
+}
+
 /// Merge the `(Hkv, g)` pair a grouped contraction output carries back into
 /// one head axis. The output is contiguous by construction.
 fn merge_heads(t: &mut GraphTape<'_>, v: Val, groups: u64) -> Result<Val> {
@@ -97,9 +100,7 @@ fn merge_heads(t: &mut GraphTape<'_>, v: Val, groups: u64) -> Result<Val> {
         return Ok(v);
     }
     let shape = t.shape_of(v);
-    let hkv = shape[1]
-        .as_const()
-        .ok_or_else(|| Error::Shape("attention head count must be decidable".into()))?;
+    let hkv = heads(shape[1])?;
     let mut specs: SmallVec<[StrideSpec; 6]> = SmallVec::new();
     specs.push(StrideSpec::dim(0, shape[0]));
     specs.push(StrideSpec::dim(2, Dim::Const(hkv * groups)));
@@ -323,25 +324,8 @@ pub fn attention_lse(
         let sum = t.cast(dtype, sum)?;
         let ln = t.unary(UnOp::Log, sum)?;
         let lse = t.binary(BinOp::Add, m, ln)?;
-        merge_lse_heads(t, lse, groups)
+        merge_heads(t, lse, groups)
     })
-}
-
-/// The `[.., Hkv, g, Lq]` head pair of an lse, merged back to `[.., H, Lq]`.
-fn merge_lse_heads(t: &mut GraphTape<'_>, v: Val, groups: u64) -> Result<Val> {
-    if groups == 1 {
-        return Ok(v);
-    }
-    let shape = t.shape_of(v);
-    let hkv = shape[1]
-        .as_const()
-        .ok_or_else(|| Error::Shape("attention head count must be decidable".into()))?;
-    let specs: SmallVec<[StrideSpec; 6]> = smallvec::smallvec![
-        StrideSpec::dim(0, shape[0]),
-        StrideSpec::dim(2, Dim::Const(hkv * groups)),
-        StrideSpec::dim(3, shape[3]),
-    ];
-    t.restride(&specs, v)
 }
 
 /// Attention and its row log-sum-exp together.
@@ -447,8 +431,8 @@ pub fn attention_grads(
         t.scatter_set(2, base, index_upper, dv, true)
     })?;
 
-    let dk = narrow_axis(&combined, 2, 0, lk)?;
-    let dv = narrow_axis(&combined, 2, lk, lk)?;
+    let dk = combined.narrow(2, 0, lk as usize)?;
+    let dv = combined.narrow(2, lk as usize, lk as usize)?;
     Ok((dq, dk, dv))
 }
 
@@ -514,24 +498,4 @@ fn grad_scores(
         &[delta],
     )?;
     t.binary(BinOp::Mul, p, scaled)
-}
-
-/// A zero-cost strided view of `len` positions of `axis` starting at `start`.
-fn narrow_axis(x: &Tensor, axis: u32, start: u64, len: u64) -> Result<Tensor> {
-    let shape = x.graph.facts(x.id).shape.clone();
-    let specs: SmallVec<[StrideSpec; 6]> = shape
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(i, d)| {
-            if i == axis as usize {
-                StrideSpec::dim(i as u32, Dim::Const(len)).with_offset(Dim::Const(start))
-            } else {
-                StrideSpec::dim(i as u32, d)
-            }
-        })
-        .collect();
-    let xid = x.id;
-    let id = x.graph.build(|t| t.restride(&specs, xid))?;
-    Ok(x.graph.tensor(id))
 }

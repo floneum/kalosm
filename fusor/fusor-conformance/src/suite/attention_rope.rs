@@ -7,10 +7,8 @@
 //! reading garbage.
 
 use fusor::composite::{
-    attention, attention_causal, attention_grads, attention_lse, attention_masked,
-    attention_with_lse, base_inverse_frequency, rope, rope_interleaved, rope_interleaved_pair,
-    rope_interleaved_pair_with_position, rope_interleaved_with_position, rope_pair,
-    rope_pair_with_position, rope_with_position, rotate_half,
+    RopeLayout, RopePos, attention, attention_causal, attention_grads, attention_lse,
+    attention_masked, attention_with_lse, base_inverse_frequency, rope, rope_pair, rotate_half,
 };
 use fusor::graph::GraphRef;
 use fusor::tensor::Dyn as Tensor;
@@ -643,7 +641,7 @@ pub fn cases() -> Cases {
         "rope",
         ROPE_SPEC,
         async move |s: &Session, shape: &[u64], seed: u32| {
-            rope_case(s, seed, "rope", rope_dims(shape), false, 0, rope).await
+            rope_case(s, seed, "rope", rope_dims(shape), false, 0).await
         },
     ));
     cases.push_case(fuzz_case(
@@ -651,16 +649,7 @@ pub fn cases() -> Cases {
         "rope_interleaved",
         ROPE_SPEC,
         async move |s: &Session, shape: &[u64], seed: u32| {
-            rope_case(
-                s,
-                seed,
-                "rope_interleaved",
-                rope_dims(shape),
-                true,
-                0,
-                rope_interleaved,
-            )
-            .await
+            rope_case(s, seed, "rope_interleaved", rope_dims(shape), true, 0).await
         },
     ));
     cases.push_case(fuzz_case(
@@ -671,16 +660,7 @@ pub fn cases() -> Cases {
             // The offset is sampled apart from the shape stream, and nonzero
             // so the case never degenerates into plain `rope`.
             let offset = Rng::new(seed ^ 0x5eed).range(1, 6);
-            rope_case(
-                s,
-                seed,
-                "rope_offset",
-                rope_dims(shape),
-                false,
-                offset,
-                rope,
-            )
-            .await
+            rope_case(s, seed, "rope_offset", rope_dims(shape), false, offset).await
         },
     ));
     cases.push_case(fuzz_case(
@@ -688,7 +668,7 @@ pub fn cases() -> Cases {
         "rope_pair",
         ROPE_SPEC,
         async move |s: &Session, shape: &[u64], seed: u32| {
-            rope_pair_case(s, seed, "rope_pair", rope_dims(shape), false, rope_pair).await
+            rope_pair_case(s, seed, "rope_pair", rope_dims(shape), false).await
         },
     ));
     cases.push_case(fuzz_case(
@@ -696,15 +676,7 @@ pub fn cases() -> Cases {
         "rope_interleaved_pair",
         ROPE_SPEC,
         async move |s: &Session, shape: &[u64], seed: u32| {
-            rope_pair_case(
-                s,
-                seed,
-                "rope_interleaved_pair",
-                rope_dims(shape),
-                true,
-                rope_interleaved_pair,
-            )
-            .await
+            rope_pair_case(s, seed, "rope_interleaved_pair", rope_dims(shape), true).await
         },
     ));
     cases.push_case(fuzz_case(
@@ -712,15 +684,8 @@ pub fn cases() -> Cases {
         "rope_pair_with_position",
         ROPE_SPEC,
         async move |s: &Session, shape: &[u64], seed: u32| {
-            rope_position_pair_case(
-                s,
-                seed,
-                "rope_pair_with_position",
-                rope_dims(shape),
-                false,
-                rope_pair_with_position,
-            )
-            .await
+            rope_position_pair_case(s, seed, "rope_pair_with_position", rope_dims(shape), false)
+                .await
         },
     ));
     cases.push_case(fuzz_case(
@@ -734,7 +699,6 @@ pub fn cases() -> Cases {
                 "rope_interleaved_pair_with_position",
                 rope_dims(shape),
                 true,
-                rope_interleaved_pair_with_position,
             )
             .await
         },
@@ -744,15 +708,7 @@ pub fn cases() -> Cases {
         "rope_with_position",
         ROPE_SPEC,
         async move |s: &Session, shape: &[u64], seed: u32| {
-            rope_position_case(
-                s,
-                seed,
-                "rope_with_position",
-                rope_dims(shape),
-                false,
-                rope_with_position,
-            )
-            .await
+            rope_position_case(s, seed, "rope_with_position", rope_dims(shape), false).await
         },
     ));
     cases.push_case(fuzz_case(
@@ -766,7 +722,6 @@ pub fn cases() -> Cases {
                 "rope_interleaved_with_position",
                 rope_dims(shape),
                 true,
-                rope_interleaved_with_position,
             )
             .await
         },
@@ -1109,11 +1064,13 @@ async fn attention_backward(session: &Session, d: AttnDims, seed: u32) -> CaseRe
     Ok(())
 }
 
-type RopeBuild = fn(&Tensor, &Tensor, &Tensor, u64) -> fusor::Result<Tensor>;
-type RopePairBuild = fn(&Tensor, &Tensor, &Tensor, &Tensor, u64) -> fusor::Result<(Tensor, Tensor)>;
-type RopePosBuild = fn(&Tensor, &Tensor, &Tensor, &Tensor) -> fusor::Result<Tensor>;
-type RopePosPairBuild =
-    fn(&Tensor, &Tensor, &Tensor, &Tensor, &Tensor) -> fusor::Result<(Tensor, Tensor)>;
+fn layout(interleaved: bool) -> RopeLayout {
+    if interleaved {
+        RopeLayout::Interleaved
+    } else {
+        RopeLayout::Halves
+    }
+}
 
 /// Upload the sin/cos tables covering `max_len` positions, returning both the
 /// device tensors and the host copies the reference reads.
@@ -1136,14 +1093,13 @@ async fn rope_case(
     d: RopeDims,
     interleaved: bool,
     offset: u64,
-    build: RopeBuild,
 ) -> CaseResult {
     let x_data = Domain::Wide.sample(seed, d.len());
     let graph = graph_of(session);
     let (ct, st, cos, sin) = upload_tables(graph.handle(), d.dh, d.l + offset as usize)?;
     let x = upload(graph.handle(), &dims(&d.shape()), &x_data)?;
-    let y =
-        build(&x, &ct, &st, offset).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
+    let y = rope(&x, &ct, &st, layout(interleaved), RopePos::Offset(offset))
+        .map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
     let expected = host_rope(&x_data, &cos, &sin, d, offset as usize, interleaved);
     expect_values(session, &d.shape(), Dtype::F32, &read(&y).await?, &expected).await?;
@@ -1158,7 +1114,6 @@ async fn rope_pair_case(
     name: &'static str,
     d: RopeDims,
     interleaved: bool,
-    build: RopePairBuild,
 ) -> CaseResult {
     let q_data = Domain::Wide.sample(seed, d.len());
     let k_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, d.len());
@@ -1166,8 +1121,8 @@ async fn rope_pair_case(
     let (ct, st, cos, sin) = upload_tables(graph.handle(), d.dh, d.l)?;
     let q = upload(graph.handle(), &dims(&d.shape()), &q_data)?;
     let k = upload(graph.handle(), &dims(&d.shape()), &k_data)?;
-    let (rq, rk) =
-        build(&q, &k, &ct, &st, 0).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
+    let (rq, rk) = rope_pair(&q, &k, &ct, &st, layout(interleaved), RopePos::Offset(0))
+        .map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
     let want_q = host_rope(&q_data, &cos, &sin, d, 0, interleaved);
     let want_k = host_rope(&k_data, &cos, &sin, d, 0, interleaved);
@@ -1219,7 +1174,6 @@ async fn rope_position_case(
     name: &'static str,
     d: RopeDims,
     interleaved: bool,
-    build: RopePosBuild,
 ) -> CaseResult {
     let x_data = Domain::Wide.sample(seed, d.len());
     let max_len = d.l + 8;
@@ -1228,7 +1182,8 @@ async fn rope_position_case(
     let (ct, st, cos, sin) = upload_tables(graph.handle(), d.dh, max_len)?;
     let x = upload(graph.handle(), &dims(&d.shape()), &x_data)?;
     let p = from_u32(graph.handle(), &dims(&[d.l as u64]), &positions)?;
-    let y = build(&x, &ct, &st, &p).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
+    let y = rope(&x, &ct, &st, layout(interleaved), RopePos::Positions(&p))
+        .map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
     let expected = host_rope_at(&x_data, &cos, &sin, &positions, d, interleaved);
     expect_values(session, &d.shape(), Dtype::F32, &read(&y).await?, &expected).await?;
@@ -1241,7 +1196,6 @@ async fn rope_position_pair_case(
     name: &'static str,
     d: RopeDims,
     interleaved: bool,
-    build: RopePosPairBuild,
 ) -> CaseResult {
     let q_data = Domain::Wide.sample(seed, d.len());
     let k_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, d.len());
@@ -1252,8 +1206,15 @@ async fn rope_position_pair_case(
     let q = upload(graph.handle(), &dims(&d.shape()), &q_data)?;
     let k = upload(graph.handle(), &dims(&d.shape()), &k_data)?;
     let p = from_u32(graph.handle(), &dims(&[d.l as u64]), &positions)?;
-    let (rq, rk) =
-        build(&q, &k, &ct, &st, &p).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
+    let (rq, rk) = rope_pair(
+        &q,
+        &k,
+        &ct,
+        &st,
+        layout(interleaved),
+        RopePos::Positions(&p),
+    )
+    .map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
     for (data, got) in [(&q_data, &rq), (&k_data, &rk)] {
         let expected = host_rope_at(data, &cos, &sin, &positions, d, interleaved);
@@ -1296,7 +1257,7 @@ async fn rope_norm_preserving(session: &Session, d: RopeDims, seed: u32) -> Case
     let graph = graph_of(session);
     let (ct, st, _, _) = upload_tables(graph.handle(), d.dh, d.l)?;
     let x = upload(graph.handle(), &dims(&d.shape()), &x_data)?;
-    let y = rope(&x, &ct, &st, 0)?;
+    let y = rope(&x, &ct, &st, RopeLayout::Halves, RopePos::Offset(0))?;
     let got = read(&y).await?;
     for (head, chunk) in got.chunks(d.dh).enumerate() {
         let src = &x_data[head * d.dh..head * d.dh + d.dh];
@@ -1321,7 +1282,7 @@ async fn rope_backward(session: &Session, d: RopeDims, seed: u32) -> CaseResult 
     let graph = graph_of(session);
     let (ct, st, cos, sin) = upload_tables(graph.handle(), d.dh, d.l)?;
     let x = upload(graph.handle(), &dims(&d.shape()), &x_data)?;
-    let y = rope(&x, &ct, &st, 0)?;
+    let y = rope(&x, &ct, &st, RopeLayout::Halves, RopePos::Offset(0))?;
     let got = gradient_of(&graph, &y, &x).await?;
 
     let half = d.dh / 2;

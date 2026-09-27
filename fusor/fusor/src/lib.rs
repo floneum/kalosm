@@ -45,7 +45,7 @@ pub mod session;
 pub mod tensor;
 
 pub use device::Device;
-pub use tensor::typed::{Axis, Element, Minus1, Minus2, Tensor, cat, stack};
+pub use tensor::typed::{Axis, Element, Minus1, Minus2, Tensor, stack};
 
 pub use graph::Graph;
 pub use quantized::QMatrix;

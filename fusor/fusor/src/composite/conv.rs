@@ -13,39 +13,9 @@ use fusor_ir::shape::{Dim, SlidingWindow, StrideSpec};
 use fusor_ir::{Error, Result};
 use smallvec::SmallVec;
 
-use crate::composite::{const_dim, core_op, index_run};
+use crate::composite::{const_dim, core_op};
 use crate::tensor::Tensor;
 
-/// Zero-pad one axis by `left` before and `right` after.
-///
-/// A `Scatter{Set}` into a `Const` zero leaf, with `unique: true` because the
-/// index run is strictly increasing by construction. `cat`, `stack`, `repeat`
-/// and `slice_assign` are the same node.
-pub fn pad_with_zeros(x: &Tensor, axis: u32, left: u64, right: u64) -> Result<Tensor> {
-    if left == 0 && right == 0 {
-        return Ok(x.clone());
-    }
-    let facts = x.graph.facts(x.id);
-    let len = const_dim(
-        *facts
-            .shape
-            .get(axis as usize)
-            .ok_or_else(|| Error::Shape(format!("pad axis {axis} out of range")))?,
-        "pad_with_zeros",
-    )?;
-    let idx = index_run(&x.graph, left, len)?;
-    let mut padded = facts.shape.clone();
-    padded[axis as usize] = Dim::Const(left + len + right);
-    let (xid, iid) = (x.id, idx);
-    let dtype = facts.dtype;
-    let id = x.graph.build(|t| {
-        let base = t.zeros_shaped(dtype, &padded)?;
-        t.scatter_set(axis, base, iid, xid, true)
-    })?;
-    Ok(x.graph.tensor(id))
-}
-
-/// Symmetric padding of one axis.
 /// Split axis `axis` of `v` into `(outer, inner)`.
 ///
 /// Always legal, at any strides: `Restride` composes relative to the current
@@ -180,7 +150,7 @@ pub fn grouped_conv(
 
     let mut padded = x.clone();
     for (i, p) in padding.iter().enumerate() {
-        padded = pad_with_zeros(&padded, (2 + i) as u32, *p as u64, *p as u64)?;
+        padded = padded.pad_with_zeros(2 + i, *p as usize, *p as usize)?;
     }
 
     let (xid, wid) = (padded.id, weight.id);

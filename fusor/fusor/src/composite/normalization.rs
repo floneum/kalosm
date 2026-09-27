@@ -3,48 +3,42 @@
 use fusor_autograd::tape::{GraphTape, TapeExt, accum_dtype};
 use fusor_ir::autograd::{Tape, Val};
 use fusor_ir::scalar::{BinOp, ScalarExpr, UnOp};
+use fusor_ir::shape::Dim;
 use fusor_ir::{Error, Result};
 
 use crate::composite::core_op;
 use crate::graph::GraphRef;
 use crate::tensor::Tensor;
 
-/// `exp(x - max) / sum(exp(x - max))` over `axis`. Every entry point shares
-/// this.
-pub(crate) fn softmax_defn(t: &mut GraphTape<'_>, x: Val, axis: u32) -> Result<Val> {
+/// The shared prologue of both softmaxes over `axis`: `x - max`, its `exp`,
+/// the sum of that (accumulated wide, cast back) and the axis extent.
+fn exp_sum(t: &mut GraphTape<'_>, x: Val, axis: u32, what: &str) -> Result<(Val, Val, Val, Dim)> {
     let shape = t.shape_of(x);
     let dtype = t.dtype_of(x);
     let extent = *shape
         .get(axis as usize)
-        .ok_or_else(|| Error::Shape(format!("softmax axis {axis} out of range")))?;
+        .ok_or_else(|| Error::Shape(format!("{what} axis {axis} out of range")))?;
 
     let m = t.fold_binop(BinOp::Max, axis, dtype, x)?;
     let m = t.broadcast_axis(m, axis, extent)?;
     let centered = t.binary(BinOp::Sub, x, m)?;
     let e = t.unary(UnOp::Exp, centered)?;
-
-    let acc = accum_dtype(dtype);
-    let s = t.fold_binop(BinOp::Add, axis, acc, e)?;
+    let s = t.fold_binop(BinOp::Add, axis, accum_dtype(dtype), e)?;
     let s = t.cast(dtype, s)?;
+    Ok((centered, e, s, extent))
+}
+
+/// `exp(x - max) / sum(exp(x - max))` over `axis`. Every entry point shares
+/// this.
+pub(crate) fn softmax_defn(t: &mut GraphTape<'_>, x: Val, axis: u32) -> Result<Val> {
+    let (_, e, s, extent) = exp_sum(t, x, axis, "softmax")?;
     let s = t.broadcast_axis(s, axis, extent)?;
     t.binary(BinOp::Div, e, s)
 }
 
 /// `x - max - log(sum(exp(x - max)))`.
 pub(crate) fn log_softmax_defn(t: &mut GraphTape<'_>, x: Val, axis: u32) -> Result<Val> {
-    let shape = t.shape_of(x);
-    let dtype = t.dtype_of(x);
-    let extent = *shape
-        .get(axis as usize)
-        .ok_or_else(|| Error::Shape(format!("log_softmax axis {axis} out of range")))?;
-
-    let m = t.fold_binop(BinOp::Max, axis, dtype, x)?;
-    let mb = t.broadcast_axis(m, axis, extent)?;
-    let centered = t.binary(BinOp::Sub, x, mb)?;
-    let e = t.unary(UnOp::Exp, centered)?;
-    let acc = accum_dtype(dtype);
-    let s = t.fold_binop(BinOp::Add, axis, acc, e)?;
-    let s = t.cast(dtype, s)?;
+    let (centered, _, s, extent) = exp_sum(t, x, axis, "log_softmax")?;
     let ls = t.unary(UnOp::Log, s)?;
     let ls = t.broadcast_axis(ls, axis, extent)?;
     t.binary(BinOp::Sub, centered, ls)
@@ -69,6 +63,26 @@ fn mean_axis(t: &mut GraphTape<'_>, x: Val, axis: u32) -> Result<Val> {
     t.mul_scalar(s, 1.0 / n.max(1) as f32)
 }
 
+/// `x`, mean-centred when `remove_mean`, and the mean of its square over
+/// `axis`: the biased variance, or the RMS statistic when not centred.
+fn centered_variance(
+    t: &mut GraphTape<'_>,
+    x: Val,
+    axis: u32,
+    remove_mean: bool,
+) -> Result<(Val, Val)> {
+    let centered = if remove_mean {
+        let extent = t.shape_of(x)[axis as usize];
+        let mu = mean_axis(t, x, axis)?;
+        let mu = t.broadcast_axis(mu, axis, extent)?;
+        t.binary(BinOp::Sub, x, mu)?
+    } else {
+        x
+    };
+    let sq = t.binary(BinOp::Mul, centered, centered)?;
+    Ok((centered, mean_axis(t, sq, axis)?))
+}
+
 /// `x op broadcast(y)`, right-aligned; the IR has no implicit broadcast.
 fn broadcast_bin(t: &mut GraphTape<'_>, op: BinOp, x: Val, y: Val) -> Result<Val> {
     let shape = t.shape_of(x);
@@ -90,35 +104,8 @@ fn inv_sqrt_eps(t: &mut GraphTape<'_>, v: Val, eps: fusor_ir::shape::SymId) -> R
     t.map(body, &[v])
 }
 
-/// `x / sqrt(mean(x^2) + eps) * w [+ b]` over the last axis.
-pub(crate) fn rms_norm_defn(
-    t: &mut GraphTape<'_>,
-    x: Val,
-    weight: Option<Val>,
-    bias: Option<Val>,
-    eps: fusor_ir::shape::SymId,
-) -> Result<Val> {
-    let rank = t.rank_of(x);
-    let axis = rank
-        .checked_sub(1)
-        .ok_or_else(|| Error::Shape("rms_norm needs at least a rank-1 value".into()))?
-        as u32;
-    let sq = t.binary(BinOp::Mul, x, x)?;
-    let ms = mean_axis(t, sq, axis)?;
-    let inv = inv_sqrt_eps(t, ms, eps)?;
-    let extent = t.shape_of(x)[axis as usize];
-    let inv = t.broadcast_axis(inv, axis, extent)?;
-    let mut y = t.binary(BinOp::Mul, x, inv)?;
-    if let Some(w) = weight {
-        y = broadcast_bin(t, BinOp::Mul, y, w)?;
-    }
-    if let Some(b) = bias {
-        y = broadcast_bin(t, BinOp::Add, y, b)?;
-    }
-    Ok(y)
-}
-
-/// Optional mean-centre, biased variance, `/sqrt(var + eps)`, `*w`, `+b`.
+/// Optional mean-centre, `/sqrt(mean(x^2) + eps)`, `*w`, `+b` over the last
+/// axis. Without the centring this is RMS normalization.
 pub(crate) fn layer_norm_defn(
     t: &mut GraphTape<'_>,
     x: Val,
@@ -130,19 +117,10 @@ pub(crate) fn layer_norm_defn(
     let rank = t.rank_of(x);
     let axis = rank
         .checked_sub(1)
-        .ok_or_else(|| Error::Shape("layer_norm needs at least a rank-1 value".into()))?
+        .ok_or_else(|| Error::Shape("normalization needs at least a rank-1 value".into()))?
         as u32;
     let extent = t.shape_of(x)[axis as usize];
-
-    let centered = if remove_mean {
-        let mu = mean_axis(t, x, axis)?;
-        let mu = t.broadcast_axis(mu, axis, extent)?;
-        t.binary(BinOp::Sub, x, mu)?
-    } else {
-        x
-    };
-    let sq = t.binary(BinOp::Mul, centered, centered)?;
-    let var = mean_axis(t, sq, axis)?;
+    let (centered, var) = centered_variance(t, x, axis, remove_mean)?;
     let inv = inv_sqrt_eps(t, var, eps)?;
     let inv = t.broadcast_axis(inv, axis, extent)?;
     let mut y = t.binary(BinOp::Mul, centered, inv)?;
@@ -219,7 +197,7 @@ impl Tensor {
             let shape = t.shape_of(x);
             let r = t.broadcast_to(r, &shape)?;
             let sum = t.binary(BinOp::Add, x, r)?;
-            rms_norm_defn(t, sum, Some(w), b, sym)
+            layer_norm_defn(t, sum, Some(w), b, sym, false)
         })
     }
 
@@ -233,7 +211,7 @@ impl Tensor {
         let x = self.id;
         let w = weight.map(|t| t.id);
         let b = bias.map(|t| t.id);
-        core_op(&self.graph, |t| rms_norm_defn(t, x, w, b, sym))
+        core_op(&self.graph, |t| layer_norm_defn(t, x, w, b, sym, false))
     }
 
     /// `(x - mean) / sqrt(var + eps) * weight + bias` over the last axis.
@@ -259,13 +237,6 @@ impl Tensor {
     pub fn variance_last(&self) -> Result<Tensor> {
         let x = self.id;
         let axis = last_axis(&self.graph, self)?;
-        core_op(&self.graph, |t| {
-            let extent = t.shape_of(x)[axis as usize];
-            let mu = mean_axis(t, x, axis)?;
-            let mu = t.broadcast_axis(mu, axis, extent)?;
-            let c = t.binary(BinOp::Sub, x, mu)?;
-            let sq = t.binary(BinOp::Mul, c, c)?;
-            mean_axis(t, sq, axis)
-        })
+        core_op(&self.graph, |t| Ok(centered_variance(t, x, axis, true)?.1))
     }
 }

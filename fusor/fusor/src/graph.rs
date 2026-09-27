@@ -288,7 +288,7 @@ impl GraphRef {
                 self.clear_class_device_buf(id);
             }
         }
-        if std::env::var_os("FUSOR_REAP_DEBUG").is_some() {
+        if crate::session::flags().reap_debug {
             eprintln!(
                 "[reap] zombies {} (live handles {}, bound {})",
                 zombies.len(),
@@ -308,6 +308,33 @@ impl GraphRef {
         id
     }
 
+    /// A fresh `Leaf::Buffer`: no host bytes and no device buffer yet.
+    pub(crate) fn buffer_leaf(&self, dtype: Dtype, shape: &[Dim]) -> Result<Id> {
+        self.add_logical(Logical::Leaf(LeafKind::Buffer {
+            name: self.fresh_buffer_id(),
+            dtype,
+            shape: shape.iter().copied().collect(),
+        }))
+    }
+
+    /// A fresh block-quantized `[rows, cols]` leaf holding `bytes`.
+    pub(crate) fn quantized_leaf(
+        &self,
+        fmt: QFmt,
+        layout: QLayout,
+        shape: [Dim; 2],
+        bytes: Vec<u8>,
+    ) -> Result<Id> {
+        let id = self.add_logical(Logical::Leaf(LeafKind::Quantized {
+            name: self.fresh_buffer_id(),
+            fmt,
+            layout,
+            shape: shape.into_iter().collect(),
+        }))?;
+        self.set_leaf_bytes(id, bytes);
+        Ok(id)
+    }
+
     /// An immutable rank-N leaf holding `bytes`, named by its content.
     ///
     /// A leaf's hash-cons key is its `LeafKind`, and host bytes live in a side
@@ -324,11 +351,7 @@ impl GraphRef {
         if let Some(id) = self.state.constants.lock().get(&key).copied() {
             return Ok(id);
         }
-        let id = self.add_logical(Logical::Leaf(LeafKind::Buffer {
-            name: self.fresh_buffer_id(),
-            dtype,
-            shape: shape.iter().copied().collect(),
-        }))?;
+        let id = self.buffer_leaf(dtype, shape)?;
         self.set_leaf_bytes(id, key.bytes.clone());
         self.state.constants.lock().insert(key, id);
         Ok(id)
@@ -351,11 +374,7 @@ impl GraphRef {
         if !bytes.len().is_multiple_of(4) {
             return Ok(None);
         }
-        let id = self.add_logical(Logical::Leaf(LeafKind::Buffer {
-            name: self.fresh_buffer_id(),
-            dtype: Dtype::U32,
-            shape: std::iter::once(Dim::Const(bytes.len() as u64 / 4)).collect(),
-        }))?;
+        let id = self.buffer_leaf(Dtype::U32, &[Dim::Const(bytes.len() as u64 / 4)])?;
         self.set_leaf_bytes_shared(id, bytes);
         self.state.word_leaves.lock().insert(src, id);
         Ok(Some(id))
@@ -400,14 +419,13 @@ impl GraphRef {
                 &bytes,
                 &mut repacked,
             )?;
-            let id = self.add_logical(Logical::Leaf(LeafKind::Quantized {
-                name: self.fresh_buffer_id(),
+            let shape = [shape[0], shape[1]];
+            Ok(Some(self.quantized_leaf(
                 fmt,
-                layout: QLayout::F32Scales,
+                QLayout::F32Scales,
                 shape,
-            }))?;
-            self.set_leaf_bytes(id, repacked);
-            Ok(Some(id))
+                repacked,
+            )?))
         };
         let out = mint()?;
         self.state.repack_leaves.lock().insert(src, out);
@@ -452,32 +470,14 @@ impl GraphRef {
         self.state.symbols.lock().scalars.get(&sym).copied()
     }
 
-    /// Every `(sym, value)` runtime scalar declared so far.
+    /// Every `(sym, value)` runtime scalar declared so far, by symbol.
     pub(crate) fn uniform_scalars(&self) -> Vec<(SymId, f32)> {
-        let mut out: Vec<(SymId, f32)> = self
-            .state
-            .symbols
-            .lock()
-            .scalars
-            .iter()
-            .map(|(s, v)| (*s, *v))
-            .collect();
-        out.sort_by_key(|(s, _)| *s);
-        out
+        sorted(&self.state.symbols.lock().scalars)
     }
 
-    /// Every `(sym, extent)` dim binding declared so far.
+    /// Every `(sym, extent)` dim binding declared so far, by symbol.
     pub(crate) fn dim_bindings(&self) -> Vec<(SymId, u64)> {
-        let mut out: Vec<(SymId, u64)> = self
-            .state
-            .symbols
-            .lock()
-            .dims
-            .iter()
-            .map(|(s, v)| (*s, *v))
-            .collect();
-        out.sort_by_key(|(s, _)| *s);
-        out
+        sorted(&self.state.symbols.lock().dims)
     }
 
     /// Attach host bytes to an external leaf.
@@ -537,16 +537,7 @@ impl GraphRef {
             let g = self.state.egraph.lock();
             ids.iter()
                 .copied()
-                .filter(|id| {
-                    matches!(
-                        &g.node(*id).op,
-                        Op::Logical(Logical::Leaf(
-                            LeafKind::Buffer { .. }
-                                | LeafKind::Param { .. }
-                                | LeafKind::Quantized { .. }
-                        ))
-                    )
-                })
+                .filter(|id| is_external_leaf(&g.node(*id).op))
                 .collect()
         };
         let store = self.state.leaves.lock();
@@ -572,11 +563,6 @@ impl GraphRef {
         for m in members.iter() {
             store.device.remove(m);
         }
-    }
-
-    pub(crate) fn set_device_buf(&self, id: Id, buf: Buf) {
-        let mut store = self.state.leaves.lock();
-        store.device.insert(id, (buf, None));
     }
 
     #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
@@ -606,8 +592,6 @@ impl GraphRef {
         }
     }
 
-    /// Register each `(value, buffer, layout)` under every id of the value's
-    /// e-class, for the whole batch under one lock apiece.
     /// Every computed (non-leaf) value that currently carries a device
     /// buffer: what a later resolve may read as an input instead of
     /// recomputing.
@@ -625,6 +609,8 @@ impl GraphRef {
         self.state.leaves.lock().device.insert(id, (buf, layout));
     }
 
+    /// Register each `(value, buffer, layout)` under every id of the value's
+    /// e-class, for the whole batch under one lock apiece.
     pub(crate) fn bind_classes(&self, items: &[(Id, Buf, Option<Arc<fusor_ir::shape::Layout>>)]) {
         let classes: Vec<Arc<[Id]>> = {
             let mut g = self.state.egraph.lock();
@@ -662,12 +648,9 @@ impl GraphRef {
     /// download, and downloading a buffer whose dispatch has not run yet
     /// returns zeros rather than an error. See [`GraphRef::state`].
     pub(crate) fn read_back(&self, id: Id) -> Result<Vec<u8>> {
-        let tensor = self.tensor(id);
-        let resolving = self.state.resolve_lock.lock();
-        self.state
-            .session
-            .resolve_locked(&resolving, std::slice::from_ref(&tensor))?;
-        self.state.session.read_bytes_locked(&resolving, self, id)
+        self.with_resolved(id, |session, resolving| {
+            session.read_bytes_locked(resolving, self, id)
+        })
     }
 
     /// [`Self::read_back`]'s device-side twin: resolve `id` and return a
@@ -675,27 +658,33 @@ impl GraphRef {
     /// buffer carries. The same guard spans the resolve and the copy, for
     /// the reason `read_back` gives.
     pub(crate) fn copy_device(&self, id: Id) -> Result<(Buf, Option<fusor_ir::shape::Layout>)> {
-        let tensor = self.tensor(id);
-        let resolving = self.state.resolve_lock.lock();
-        self.state
-            .session
-            .resolve_locked(&resolving, std::slice::from_ref(&tensor))?;
-        self.state.session.copy_device_locked(&resolving, self, id)
+        self.with_resolved(id, |session, resolving| {
+            session.copy_device_locked(resolving, self, id)
+        })
     }
 
     /// [`Self::read_back`], awaited. The graph lock spans the resolve and
     /// the readback plan; the download runs after it, holding its own
     /// handle on the buffer (see `Session::read_plan_locked`).
     pub(crate) async fn read_back_async(&self, id: Id) -> Result<Vec<u8>> {
-        let plan = {
-            let tensor = self.tensor(id);
-            let resolving = self.state.resolve_lock.lock();
-            self.state
-                .session
-                .resolve_locked(&resolving, std::slice::from_ref(&tensor))?;
-            self.state.session.read_plan_locked(&resolving, self, id)?
-        };
+        let plan = self.with_resolved(id, |session, resolving| {
+            session.read_plan_locked(resolving, self, id)
+        })?;
         self.state.session.read_bytes(plan).await
+    }
+
+    /// Resolve `id` and run `then` under the same `resolve_lock` guard.
+    fn with_resolved<T>(
+        &self,
+        id: Id,
+        then: impl FnOnce(&Session, &crate::session::ResolveGuard<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let tensor = self.tensor(id);
+        let resolving = self.state.resolve_lock.lock();
+        self.state
+            .session
+            .resolve_locked(&resolving, std::slice::from_ref(&tensor))?;
+        then(&self.state.session, &resolving)
     }
 }
 
@@ -761,12 +750,7 @@ impl Graph {
     /// A step-local input buffer.
     pub fn leaf(&self, name: &str, shape: &[Dim], dtype: Dtype) -> Result<Tensor> {
         let _ = name;
-        let id = self.inner.add_logical(Logical::Leaf(LeafKind::Buffer {
-            name: self.inner.fresh_buffer_id(),
-            dtype,
-            shape: shape.iter().copied().collect(),
-        }))?;
-        Ok(self.inner.tensor(id))
+        Ok(self.inner.tensor(self.inner.buffer_leaf(dtype, shape)?))
     }
 
     /// A step-local buffer with host contents.
@@ -794,13 +778,9 @@ impl Graph {
         shape: [Dim; 2],
         bytes: &[u8],
     ) -> Result<Tensor> {
-        let id = self.inner.add_logical(Logical::Leaf(LeafKind::Quantized {
-            name: self.inner.fresh_buffer_id(),
-            fmt,
-            layout,
-            shape: shape.into_iter().collect(),
-        }))?;
-        self.inner.set_leaf_bytes(id, bytes.to_vec());
+        let id = self
+            .inner
+            .quantized_leaf(fmt, layout, shape, bytes.to_vec())?;
         Ok(self.inner.tensor(id))
     }
 
@@ -949,6 +929,22 @@ impl Gradients {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+fn sorted<V: Copy>(map: &FxHashMap<SymId, V>) -> Vec<(SymId, V)> {
+    let mut out: Vec<(SymId, V)> = map.iter().map(|(s, v)| (*s, *v)).collect();
+    out.sort_by_key(|(s, _)| *s);
+    out
+}
+
+/// Whether `op` is a leaf whose bytes the caller supplies.
+pub(crate) fn is_external_leaf(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Logical(Logical::Leaf(
+            LeafKind::Buffer { .. } | LeafKind::Param { .. } | LeafKind::Quantized { .. }
+        ))
+    )
 }
 
 /// A parent declaration for a custom backward.

@@ -16,6 +16,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use fusor::cache::MaskKind;
+use fusor::composite::{RopeLayout, RopePos};
 use fusor::{Device, Dim, Minus1, Tensor};
 use fusor_gguf::{Gguf, VarBuilder};
 
@@ -611,7 +612,7 @@ impl VisionAttention {
         let q = heads(qkv.narrow(Minus1, 0, dim));
         let k = heads(qkv.narrow(Minus1, dim, dim));
         let v = heads(qkv.narrow(Minus1, 2 * dim, dim));
-        let (q, k) = q.rope_pair(&k, cos, sin, 0);
+        let (q, k) = q.rope_pair(&k, cos, sin, RopeLayout::Halves, RopePos::Offset(0));
         let scale = 1.0 / (self.head_dim as f32).sqrt();
 
         let full = cu_seqlens.len() == 2 && cu_seqlens[0] == 0 && cu_seqlens[1] as usize == seq_len;

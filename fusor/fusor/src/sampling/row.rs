@@ -39,11 +39,7 @@ pub(crate) fn dims(v: &[u64]) -> Vec<Dim> {
 /// A dense f32 host constant. Dense because a splat leaf would reintroduce the
 /// stride-0 operand this module exists to avoid.
 pub(crate) fn konst(g: &GraphRef, shape: &[u64], data: &[f32]) -> Result<Tensor> {
-    let mut bytes = Vec::with_capacity(data.len() * 4);
-    for v in data {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
-    Tensor::from_slice(g, Dtype::F32, &dims(shape), &bytes)
+    Tensor::from_slice(g, Dtype::F32, &dims(shape), bytemuck::cast_slice(data))
 }
 
 /// The fixed matrices a draw needs. None depends on the logits, so each is

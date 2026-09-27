@@ -105,13 +105,7 @@ impl QMatrix {
                 )));
             }
         }
-        let id = graph.add_logical(Logical::Leaf(LeafKind::Quantized {
-            name: graph.fresh_buffer_id(),
-            fmt,
-            layout,
-            shape: shape.into_iter().collect(),
-        }))?;
-        graph.set_leaf_bytes(id, bytes.to_vec());
+        let id = graph.quantized_leaf(fmt, layout, shape, bytes.to_vec())?;
         Ok(Self {
             tensor: graph.tensor(id),
             fmt,

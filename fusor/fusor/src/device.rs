@@ -207,12 +207,7 @@ impl Device {
 
     /// The backend name, either `"cpu"` or `"gpu"`.
     pub fn name(&self) -> &'static str {
-        match self {
-            #[cfg(feature = "cpu")]
-            Self::Cpu(_) => "cpu",
-            #[cfg(feature = "gpu")]
-            Self::Gpu(_) => "gpu",
-        }
+        self.backend().name()
     }
 
     /// The backend selector this device was built from.
@@ -351,6 +346,12 @@ impl KernelProfile {
 pub(crate) fn ok<T>(what: &str, r: Result<T>) -> T {
     match r {
         Ok(v) => v,
-        Err(e) => panic!("fusor {what}: {e}"),
+        Err(e) => fail(what, e),
     }
+}
+
+/// The panic [`ok`] raises, for a check that has no `Result` to unwrap.
+#[track_caller]
+pub(crate) fn fail(what: &str, e: crate::Error) -> ! {
+    panic!("fusor {what}: {e}")
 }

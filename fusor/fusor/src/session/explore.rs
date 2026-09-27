@@ -5,7 +5,7 @@
 //! plan for the incumbent, arms the per-dispatch timestamp path for that one
 //! resolve, and files the kernel's GPU span into the tune cache's sliding
 //! windows. A candidate displaces the incumbent in the replay memo only when
-//! its window minimum beats the incumbent's by [`TUNE_MARGIN`], on at least
+//! its window minimum beats the incumbent's by [`super::TUNE_MARGIN`], on at least
 //! [`MIN_OBS`] samples.
 //!
 //! Granularity follows layout. A candidate that leaves every other launch
@@ -28,21 +28,21 @@
 
 use std::sync::Arc;
 
-use fusor_cost::extract::{incumbent_signature, launch_signature, launch_work};
+use fusor_cost::extract::{incumbent_signature, launch_work};
 use fusor_ir::egraph::Id;
 use fusor_ir::extract::{Plan, ReplayKey};
 use rustc_hash::FxHashMap;
 
 use super::{
-    Backend, Session, TUNE_MARGIN, autotune_min_macs, batch_aligns, plan_sparse_diff, plans_align,
-    verify_members,
+    Backend, Session, aligned_except, beats, flags, launch_sigs, log_if, plan_sparse_diff,
+    plans_align, verify_members,
 };
 use crate::graph::GraphRef;
 
 /// One in this many replay-hit resolves of a key is an exploration step.
 /// Deterministic — a per-key counter, never an RNG — so a run is exactly
 /// reproducible. `FUSOR_EXPLORE_EPS` overrides; `0` disables the explorer.
-const EXPLORE_EPSILON: u64 = 16;
+pub(super) const EXPLORE_EPSILON: u64 = 16;
 
 /// Window samples an arm needs before its window-min may displace the
 /// incumbent, and before the explorer stops considering it under-explored.
@@ -81,21 +81,6 @@ fn plan_step_bytes(plan: &Plan) -> u64 {
                 .map(|e| e.saturating_mul(b.dtype.byte_size()))
         })
         .sum()
-}
-
-fn epsilon() -> u64 {
-    static EPS: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
-    *EPS.get_or_init(|| {
-        std::env::var("FUSOR_EXPLORE_EPS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(EXPLORE_EPSILON)
-    })
-}
-
-fn tune_log() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FUSOR_AUTOTUNE_LOG").is_some())
 }
 
 /// A short, process-stable key for whole-plan windows.
@@ -231,12 +216,8 @@ fn diff_field(plan_field: &str, launch_sigs: &[String], inc: &[usize]) -> String
 
 impl ArmSet {
     fn metadata(graph: &GraphRef, incumbent: &Arc<Plan>) -> Self {
+        let launch_sigs = launch_sigs(graph, incumbent);
         let g = graph.state().egraph.lock();
-        let launch_sigs: Vec<String> = incumbent
-            .launches
-            .iter()
-            .map(|l| launch_signature(&g, l))
-            .collect();
         let incumbent_labels: Vec<String> = (0..incumbent.launches.len())
             .map(|ix| incumbent_signature(&g, incumbent, ix).unwrap_or_else(|| "base".to_string()))
             .collect();
@@ -290,7 +271,7 @@ impl ArmSet {
             return false;
         };
         match (tune.window_min(field, label), tune.window_min(field, inc)) {
-            (Some(a), Some(b)) => (a as f64) < b as f64 * (1.0 - TUNE_MARGIN),
+            (Some(a), Some(b)) => beats(a as f64, b as f64),
             _ => false,
         }
     }
@@ -304,54 +285,41 @@ impl ArmSet {
         }
     }
 
-    /// How many observations the *incumbent's* side of the comparison holds.
-    /// For a diff arm that is the thinnest window among its changed launches:
-    /// every one of them needs a span before the sum means anything.
-    fn incumbent_obs(&self, tune: &fusor_cost::tune_cache::TuneCache, arm: &Arm) -> usize {
+    /// The `(field, label)` windows holding the incumbent's side of an arm's
+    /// comparison: one launch, the whole plan, or a diff arm's changed
+    /// launches.
+    fn incumbent_windows<'a>(&'a self, arm: &'a Arm) -> Vec<(&'a str, &'a str)> {
+        let launch = |j: usize| {
+            (
+                self.launch_sigs[j].as_str(),
+                self.incumbent_labels[j].as_str(),
+            )
+        };
         match arm.gran() {
-            Gran::Launch => tune.observations(
-                self.launch_sigs[arm.ix].as_str(),
-                self.incumbent_labels[arm.ix].as_str(),
-            ),
-            Gran::Whole => {
-                tune.observations(self.plan_field.as_str(), self.incumbent_plan_label.as_str())
-            }
-            Gran::Diff { inc, .. } => inc
-                .iter()
-                .map(|&j| {
-                    tune.observations(
-                        self.launch_sigs[j].as_str(),
-                        self.incumbent_labels[j].as_str(),
-                    )
-                })
-                .min()
-                .unwrap_or(0),
+            Gran::Launch => vec![launch(arm.ix)],
+            Gran::Whole => vec![(self.plan_field.as_str(), self.incumbent_plan_label.as_str())],
+            Gran::Diff { inc, .. } => inc.iter().map(|&j| launch(j)).collect(),
         }
     }
 
-    /// The incumbent-side number an arm must beat, in ns. For a diff arm the
-    /// sum of per-launch window minimums is at most the minimum of sums, so
-    /// the comparison is biased *for* the incumbent — a diff adoption is
-    /// conservative by construction.
+    /// How many observations the incumbent's side holds: the thinnest of its
+    /// windows, since every one needs a span before a sum means anything.
+    fn incumbent_obs(&self, tune: &fusor_cost::tune_cache::TuneCache, arm: &Arm) -> usize {
+        self.incumbent_windows(arm)
+            .into_iter()
+            .map(|(f, l)| tune.observations(f, l))
+            .min()
+            .unwrap_or(0)
+    }
+
+    /// The incumbent-side number an arm must beat, in ns: the sum of its
+    /// windows' minimums, which is at most the minimum of sums, so a diff
+    /// adoption is conservative by construction.
     fn incumbent_min(&self, tune: &fusor_cost::tune_cache::TuneCache, arm: &Arm) -> Option<u64> {
-        match arm.gran() {
-            Gran::Launch => tune.window_min(
-                self.launch_sigs[arm.ix].as_str(),
-                self.incumbent_labels[arm.ix].as_str(),
-            ),
-            Gran::Whole => {
-                tune.window_min(self.plan_field.as_str(), self.incumbent_plan_label.as_str())
-            }
-            Gran::Diff { inc, .. } => inc
-                .iter()
-                .map(|&j| {
-                    tune.window_min(
-                        self.launch_sigs[j].as_str(),
-                        self.incumbent_labels[j].as_str(),
-                    )
-                })
-                .sum::<Option<u64>>(),
-        }
+        self.incumbent_windows(arm)
+            .into_iter()
+            .map(|(f, l)| tune.window_min(f, l))
+            .sum()
     }
 }
 
@@ -389,7 +357,7 @@ impl Session {
         key: ReplayKey,
         incumbent: Arc<Plan>,
     ) -> Arc<Plan> {
-        if epsilon() == 0 || verify_members() || self.inner.tune.is_empty() {
+        if flags().explore_eps == 0 || verify_members() || self.inner.tune.is_empty() {
             return incumbent;
         }
         let mut set = ArmSet::metadata(graph, &incumbent);
@@ -409,7 +377,7 @@ impl Session {
         key: ReplayKey,
         incumbent: &Arc<Plan>,
     ) -> Option<ExploreRun> {
-        let eps = epsilon();
+        let eps = flags().explore_eps;
         if eps == 0 || verify_members() {
             return None;
         }
@@ -466,8 +434,7 @@ impl Session {
                     let (f, l) = set.arm_field(a);
                     let am = tune.window_min(f, l)?;
                     let bm = set.incumbent_min(tune, a)?;
-                    ((am as f64) < bm as f64 * (1.0 - TUNE_MARGIN))
-                        .then(|| (i, l.to_string(), am, bm))
+                    (beats(am as f64, bm as f64)).then(|| (i, l.to_string(), am, bm))
                 })
                 .min_by_key(|(_, _, am, _)| *am)
         };
@@ -476,12 +443,11 @@ impl Session {
                 || self.materialize_arm(graph, roots, incumbent, set, i, whole);
             match built.then(|| set.arms[i].plan.clone()).flatten() {
                 Some(plan) => {
-                    if tune_log() {
-                        eprintln!(
-                            "[tune] ADOPT `{label}`: window-min {a} ns vs incumbent {b} ns, \
+                    log_if!(
+                        autotune_log,
+                        "[tune] ADOPT `{label}`: window-min {a} ns vs incumbent {b} ns, \
                              from the arm sweep"
-                        );
-                    }
+                    );
                     self.inner.replay.insert(key, (*plan).clone());
                     // Everything in the arm set described the displaced
                     // incumbent.
@@ -516,7 +482,7 @@ impl Session {
                         incumbent,
                         ix,
                         self.inner.cost.as_ref(),
-                        autotune_min_macs(),
+                        flags().autotune_min_macs,
                     )
                 };
                 let tune = &self.inner.tune;
@@ -741,18 +707,17 @@ impl Session {
                 roots,
                 incumbent,
                 self.inner.cost.as_ref(),
-                autotune_min_macs(),
+                flags().autotune_min_macs,
                 &[(ix, label.clone())],
             )
         };
         let Some(plan) = plan else { return false };
-        if tune_log() {
-            eprintln!(
-                "[tune] candidate L{ix} `{label}`: modeled {:.1} us vs incumbent {:.1} us",
-                plan.cost.0 as f64 / 1e6,
-                incumbent.cost.0 as f64 / 1e6,
-            );
-        }
+        log_if!(
+            autotune_log,
+            "[tune] candidate L{ix} `{label}`: modeled {:.1} us vs incumbent {:.1} us",
+            plan.cost.0 as f64 / 1e6,
+            incumbent.cost.0 as f64 / 1e6,
+        );
         let bytes = plan_step_bytes(&plan);
         let entry = set.over_budget.entry((ix, label.clone())).or_insert(bytes);
         *entry = (*entry).min(bytes);
@@ -768,14 +733,13 @@ impl Session {
             && !inc.is_empty()
         {
             let field = diff_field(&set.plan_field, &set.launch_sigs, &inc);
-            if tune_log() {
-                eprintln!(
-                    "[tune] diff arm L{ix} `{label}`: cand {cand:?} inc {inc:?} \
+            log_if!(
+                autotune_log,
+                "[tune] diff arm L{ix} `{label}`: cand {cand:?} inc {inc:?} \
                      ({} vs {} launches) -> {field}",
-                    plan.launches.len(),
-                    incumbent.launches.len(),
-                );
-            }
+                plan.launches.len(),
+                incumbent.launches.len(),
+            );
             Gran::Diff { cand, inc, field }
         } else {
             // Restructured too widely to attribute a window, and the plan is
@@ -796,19 +760,16 @@ impl Session {
         let Some(spans_us) = target.launcher().take_last_profile() else {
             // The device could not time this resolve; a wall clock is not a
             // kernel span, so nothing is recorded.
-            if tune_log() {
-                eprintln!("[tune] explore step yielded no profile");
-            }
+            log_if!(autotune_log, "[tune] explore step yielded no profile");
             return;
         };
         if spans_us.len() != run.plan.launches.len() {
-            if tune_log() {
-                eprintln!(
-                    "[tune] explore profile length mismatch: {} spans vs {} launches",
-                    spans_us.len(),
-                    run.plan.launches.len()
-                );
-            }
+            log_if!(
+                autotune_log,
+                "[tune] explore profile length mismatch: {} spans vs {} launches",
+                spans_us.len(),
+                run.plan.launches.len()
+            );
             return;
         }
         let ns = |us: f64| (us * 1000.0) as u64;
@@ -833,7 +794,7 @@ impl Session {
                         timed += 1;
                     }
                 }
-                if tune_log() && !run.whole {
+                if flags().autotune_log && !run.whole {
                     eprintln!("[tune] incumbent sample: {timed} focused span(s) filed");
                 }
                 if run.whole && total_ns > 0 {
@@ -848,8 +809,7 @@ impl Session {
                         let inc = tune.window_min(&set.launch_sigs[j], &set.incumbent_labels[j]);
                         match (tune.best(&set.launch_sigs[j]), inc) {
                             (Some((name, best)), Some(inc)) => {
-                                name != set.incumbent_labels[j]
-                                    && (best as f64) < inc as f64 * (1.0 - TUNE_MARGIN)
+                                name != set.incumbent_labels[j] && beats(best as f64, inc as f64)
                             }
                             _ => false,
                         }
@@ -903,8 +863,9 @@ impl Session {
                             .collect();
                         if spans.len() == cand.len() && spans.iter().all(|us| *us > 0.0) {
                             tune.observe(field, &pick.label, ns(spans.iter().sum()));
-                        } else if tune_log() {
-                            eprintln!(
+                        } else {
+                            log_if!(
+                                autotune_log,
                                 "[tune] diff arm `{}` at {field}: {} of {} spans timed, \
                                  nothing filed",
                                 pick.label,
@@ -950,7 +911,7 @@ impl Session {
                     return None;
                 }
                 let inc_min = tune.window_min(&sigs[j], &labels[j])?;
-                ((best as f64) < inc_min as f64 * (1.0 - TUNE_MARGIN)).then_some((j, best_name))
+                (beats(best as f64, inc_min as f64)).then_some((j, best_name))
             })
             .collect();
         // Batch first: every winner composed onto one extraction, one replan,
@@ -967,18 +928,18 @@ impl Session {
                         roots,
                         &current,
                         self.inner.cost.as_ref(),
-                        autotune_min_macs(),
+                        flags().autotune_min_macs,
                         &winners,
                     )
                     .filter(|plan| {
-                        batch_aligns(plan, &current, &winners)
+                        aligned_except(plan, &current, |j| winners.iter().any(|(s, _)| *s == j))
                             && winners.iter().all(|(j, name)| {
                                 incumbent_signature(&g, plan, *j).as_deref() == Some(name)
                             })
                     })
             };
             if let Some(plan) = batch {
-                if tune_log() {
+                if flags().autotune_log {
                     for (j, name) in &winners {
                         eprintln!(
                             "[tune] ADOPT(prior) L{j} `{name}` over `{}` for {}: from \
@@ -1000,30 +961,20 @@ impl Session {
                 let Some((_, best)) = tune.best(&sigs[j]) else {
                     continue;
                 };
-                let variants = {
-                    let g = graph.state().egraph.lock();
-                    self.inner.extractor.launch_variants(
-                        &g,
-                        roots,
-                        &current,
-                        j,
-                        self.inner.cost.as_ref(),
-                        autotune_min_macs(),
-                    )
-                };
+                let variants =
+                    self.launch_variants(graph, roots, &current, j, flags().autotune_min_macs);
                 let Some((_, plan)) = variants
                     .into_iter()
                     .find(|(l, p)| *l == best_name && plans_align(p, &current, j))
                 else {
                     continue;
                 };
-                if tune_log() {
-                    eprintln!(
-                        "[tune] ADOPT(prior) L{j} `{best_name}` over `{inc_label}` for {}: \
+                log_if!(
+                    autotune_log,
+                    "[tune] ADOPT(prior) L{j} `{best_name}` over `{inc_label}` for {}: \
                          window-min {best} ns vs {inc_min} ns, from persisted windows",
-                        sigs[j]
-                    );
-                }
+                    sigs[j]
+                );
                 current = Arc::new(plan);
                 adopted += 1;
             }
@@ -1039,17 +990,8 @@ impl Session {
         {
             rounds += 1;
             for &j in set.pending.iter().rev().take(DIFF_SCAN_TOP_K) {
-                let variants = {
-                    let g = graph.state().egraph.lock();
-                    self.inner.extractor.launch_variants(
-                        &g,
-                        roots,
-                        &current,
-                        j,
-                        self.inner.cost.as_ref(),
-                        autotune_min_macs(),
-                    )
-                };
+                let variants =
+                    self.launch_variants(graph, roots, &current, j, flags().autotune_min_macs);
                 let budget = plan_step_bytes(&current).saturating_add(ARM_EXTRA_BYTES);
                 for (label, plan) in variants {
                     if plans_align(&plan, &current, j) {
@@ -1079,13 +1021,12 @@ impl Session {
                     else {
                         continue;
                     };
-                    if (a as f64) < b as f64 * (1.0 - TUNE_MARGIN) {
-                        if tune_log() {
-                            eprintln!(
-                                "[tune] ADOPT(prior) diff L{j} `{label}` for {field}: \
+                    if beats(a as f64, b as f64) {
+                        log_if!(
+                            autotune_log,
+                            "[tune] ADOPT(prior) diff L{j} `{label}` for {field}: \
                                  summed window-min {a} ns vs incumbent {b} ns"
-                            );
-                        }
+                        );
                         current = Arc::new(plan);
                         adopted += 1;
                         *set = ArmSet::metadata(graph, &current);
@@ -1098,9 +1039,10 @@ impl Session {
         if adopted == 0 {
             return None;
         }
-        if tune_log() {
-            eprintln!("[tune] adopted {adopted} launch(es) from the persisted prior");
-        }
+        log_if!(
+            autotune_log,
+            "[tune] adopted {adopted} launch(es) from the persisted prior"
+        );
         Some(current)
     }
 
@@ -1124,14 +1066,17 @@ impl Session {
         let (Some(a), Some(b)) = (tune.window_min(af, al), set.incumbent_min(tune, arm)) else {
             return;
         };
-        if (a as f64) < b as f64 * (1.0 - TUNE_MARGIN) {
-            if tune_log() {
-                eprintln!(
-                    "[tune] ADOPT L{} `{}` for {}: window-min {} ns vs incumbent {} ns, \
+        if beats(a as f64, b as f64) {
+            log_if!(
+                autotune_log,
+                "[tune] ADOPT L{} `{}` for {}: window-min {} ns vs incumbent {} ns, \
                      from production samples",
-                    pick.ix, al, af, a, b
-                );
-            }
+                pick.ix,
+                al,
+                af,
+                a,
+                b
+            );
             if let Some(plan) = &arm.plan {
                 self.inner.replay.insert(run.key, (**plan).clone());
             }

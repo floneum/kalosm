@@ -207,7 +207,7 @@ pub fn cases() -> Cases {
                 seed,
                 &|x| {
                     x.unsqueeze(1)?
-                        .expand(&dims(&[shape[0], e, shape[1], shape[2]]))
+                        .broadcast_as(&dims(&[shape[0], e, shape[1], shape[2]]))
                 },
                 &|d| {
                     let mut out = Vec::with_capacity(a * e as usize * b * c);
@@ -429,7 +429,7 @@ pub fn cases() -> Cases {
             let mut rng = Rng::new(seed ^ 0x5eed);
             let lo = rng.range(0, 2) as usize;
             let hi = rng.range(0, 2) as usize;
-            check_view(s, shape, seed, &|x| x.pad_axis(2, (lo, hi)), &|d| {
+            check_view(s, shape, seed, &|x| x.pad_with_zeros(2, lo, hi), &|d| {
                 ref_pad(d, shape, 2, lo, hi)
             })
             .await
