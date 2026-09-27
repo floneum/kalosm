@@ -22,7 +22,7 @@ use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 
 use crate::arena;
-use crate::liveness::{LivenessInfo, analyze, for_each_addr_expr};
+use crate::liveness::{LivenessInfo, analyze};
 
 /// Memo key: everything `arena_plan`'s result depends on.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
@@ -222,7 +222,7 @@ impl BodyHasher {
 
     fn addr(&mut self, a: &Addr, h: &mut FxHasher) {
         std::mem::discriminant(a).hash(h);
-        for_each_addr_expr(a, &mut |e| self.expr(e, h));
+        a.for_each_expr(&mut |e| self.expr(e, h));
     }
 
     fn reduce_kind(&mut self, k: &ReduceKind, h: &mut FxHasher) {

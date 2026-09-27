@@ -13,6 +13,7 @@ mod bindings;
 mod caps;
 mod device;
 mod emit;
+mod flags;
 pub mod launch;
 mod lower;
 pub mod pool;
@@ -29,3 +30,5 @@ pub use launch::Launcher;
 pub use pool::BufferPool;
 pub use rules::GPU_RULES;
 pub use target::GpuTarget;
+
+pub(crate) use flags::flags;

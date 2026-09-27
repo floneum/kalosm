@@ -751,7 +751,7 @@ mod tests {
             eprintln!("adapter has no subgroups; skipping");
             return;
         }
-        let mut kernel = Kernel::new();
+        let kernel = Kernel::new();
         let u32_ty = ScalarElement::U32.element();
         let yes = kernel.bool(true);
         let one = kernel.u32(1);

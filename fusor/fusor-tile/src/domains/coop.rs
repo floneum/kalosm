@@ -99,10 +99,10 @@ fn generate_schedules(operand: Dtype, cx: &DomainCtx<'_>) -> SmallVec<[CoopSched
         .min(caps.limits.max_compute_workgroup_size[0]);
     let max_bytes = caps.limits.max_compute_workgroup_storage_size;
     let stage = stage_element(operand);
-    let pin: Option<Vec<u32>> = std::env::var("FUSOR_PIN_COOP").ok().and_then(|v| {
-        let p: Vec<u32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
-        (p.len() >= 3).then_some(p)
-    });
+    let pin = crate::flags::flags()
+        .pin_coop
+        .as_ref()
+        .filter(|p| p.len() >= 3);
     let mut out = SmallVec::new();
     for bm in BM_CHOICES {
         for bn in BN_CHOICES {
@@ -112,7 +112,7 @@ fn generate_schedules(operand: Dtype, cx: &DomainCtx<'_>) -> SmallVec<[CoopSched
                     while n_passes <= bn / MIN_PASS_COLS {
                         if let Some(geom) = geom_of(bm, bn, bk, n_passes, subgroups)
                             && geom.legal(width, max_lanes)
-                            && pin.as_ref().is_none_or(|p| {
+                            && pin.is_none_or(|p| {
                                 geom.bm == p[0]
                                     && geom.bn == p[1]
                                     && geom.bk == p[2]

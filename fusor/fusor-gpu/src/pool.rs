@@ -197,7 +197,7 @@ impl BufferPool {
             if live.saturating_add(size) > ceiling {
                 // Who holds the ceiling: every bucket's pinned (refcount > 1)
                 // and idle bytes, largest first.
-                if std::env::var_os("FUSOR_POOL_DEBUG").is_some() {
+                if crate::flags().pool_debug {
                     let free = self.free.lock();
                     let mut rows: Vec<(u64, usize, usize)> = free
                         .iter()

@@ -28,7 +28,7 @@ rule!(
     level = Level::Launch,
     head = OpTag::LaunchGather,
     tag = RuleTag::Additive,
-    apply = tile_gather,
+    apply = tile_indexed,
 );
 
 rule!(
@@ -36,7 +36,7 @@ rule!(
     level = Level::Launch,
     head = OpTag::LaunchScatter,
     tag = RuleTag::Additive,
-    apply = tile_scatter,
+    apply = tile_indexed,
 );
 
 /// Attach the complete legal reduction domain to a `Fold` that arrived
@@ -94,9 +94,7 @@ pub fn tile_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opt
     if let Launch::Fold { sched, .. } = &mut rebuilt {
         *sched = ScheduleDomain::Fold(dom.into());
     }
-    let new = b.add_launch(rebuilt).ok()?;
-    b.union(id, new).ok()?;
-    Some(new)
+    adopt(b, id, rebuilt)
 }
 
 /// The accesses of a node's operand list, as the map-domain generator reads
@@ -106,26 +104,32 @@ fn accesses(ops: &[Operand]) -> Vec<fusor_ir::ir::launch::AccessPlan> {
     ops.iter().map(|o| o.access.clone()).collect()
 }
 
-/// Attach the elementwise tiling domain to a floor-lowered `Gather`,
-/// without touching `mode`.
+/// Attach the elementwise tiling domain to a floor-lowered `Gather` or
+/// `Scatter`, without touching `mode`.
 ///
-/// `gather::GATHER_*` mint a mode and a domain together; splitting them makes
-/// both late decisions.
+/// `gather::GATHER_*` and `scatter::SCATTER_*` mint a mode and a domain
+/// together; splitting them makes both late decisions, and stops the floor's
+/// mode from being the one alternative with no schedule.
 ///
 /// There is deliberately no `TILE_MAP` beside this: a `Map` domain minted as
 /// an additive alternative measurably regresses extraction, and has to be
 /// attached where the node is minted (`lower_floor.rs`) so it replaces
 /// `ScheduleDomain::Point` instead of competing with it.
-pub fn tile_gather(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::Launch(l1) = &node.op else {
-        return None;
-    };
-    let Launch::Gather {
-        space,
-        ops,
-        sched: ScheduleDomain::Point,
-        ..
-    } = l1
+pub fn tile_indexed(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
+    let Op::Launch(
+        l1 @ (Launch::Gather {
+            space,
+            ops,
+            sched: ScheduleDomain::Point,
+            ..
+        }
+        | Launch::Scatter {
+            space,
+            ops,
+            sched: ScheduleDomain::Point,
+            ..
+        }),
+    ) = &node.op
     else {
         return None;
     };
@@ -138,45 +142,15 @@ pub fn tile_gather(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> O
         return None;
     }
     let mut rebuilt = l1.clone();
-    if let Launch::Gather { sched, .. } = &mut rebuilt {
+    if let Launch::Gather { sched, .. } | Launch::Scatter { sched, .. } = &mut rebuilt {
         *sched = ScheduleDomain::Map(dom.into());
     }
-    let new = b.add_launch(rebuilt).ok()?;
-    b.union(id, new).ok()?;
-    Some(new)
+    adopt(b, id, rebuilt)
 }
 
-/// Attach the elementwise tiling domain to a floor-lowered `Scatter`,
-/// without touching `mode`.
-///
-/// Same split as [`tile_gather`]: this only stops the floor's mode from
-/// being the one alternative with no schedule.
-pub fn tile_scatter(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::Launch(l1) = &node.op else {
-        return None;
-    };
-    let Launch::Scatter {
-        space,
-        ops,
-        sched: ScheduleDomain::Point,
-        ..
-    } = l1
-    else {
-        return None;
-    };
-    let dom = map_domain(
-        &space.dims,
-        &accesses(ops),
-        &DomainCtx::new(f.caps(), default_planner()),
-    );
-    if dom.tilings.len() <= 1 {
-        return None;
-    }
-    let mut rebuilt = l1.clone();
-    if let Launch::Scatter { sched, .. } = &mut rebuilt {
-        *sched = ScheduleDomain::Map(dom.into());
-    }
-    let new = b.add_launch(rebuilt).ok()?;
+/// Add `op` as an alternative in `id`'s class.
+pub(crate) fn adopt(b: &mut Builder<'_>, id: Id, op: Launch) -> Option<Id> {
+    let new = b.add_launch(op).ok()?;
     b.union(id, new).ok()?;
     Some(new)
 }
@@ -185,7 +159,7 @@ pub fn tile_scatter(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
 /// no semantics; it exists only so a run is reproducible.
 pub static TILE_RULES: &[Rule] = &[
     TILE_FOLD,
-    // `Map` is deliberately absent — see the note above `tile_gather`.
+    // `Map` is deliberately absent — see the note above `tile_indexed`.
     TILE_GATHER,
     TILE_SCATTER,
     contract::LOWER_COOP,

@@ -8,12 +8,6 @@ pub mod map;
 pub mod sgemm;
 pub mod sgemv;
 
-pub use coop::legal as coop_legal;
-pub use fold::legal as fold_legal;
-pub use map::legal as map_legal;
-pub use sgemm::legal as sgemm_legal;
-pub use sgemv::legal as sgemv_legal;
-
 pub use coop::{coop_domain, coop_tiles, stage_element};
 pub use fold::{emitted_block, fold_domain, fold_domain_for};
 pub use map::map_domain;

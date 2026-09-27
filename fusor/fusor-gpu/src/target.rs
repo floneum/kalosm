@@ -12,7 +12,7 @@ use fusor_ir::device::Caps;
 use fusor_ir::dtype::Persistence;
 use fusor_ir::egraph::{EGraph, Id, Rule};
 use fusor_ir::error::Error;
-use fusor_ir::extract::{Plan, PlanHash};
+use fusor_ir::extract::Plan;
 use fusor_ir::ir::Node;
 use fusor_ir::ir::kernel::KernelIr;
 use fusor_ir::ir::launch::SchedPoint;
@@ -21,7 +21,7 @@ use fusor_ir::target::{Artifact, Buf, EmitError, LowerCtx, Target, Uniforms};
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
 
 use crate::device::GpuDevice;
-use crate::launch::{BuildCursor, CommandRecord, GpuArtifact, KernelProfile, Launcher, TimingMode};
+use crate::launch::{BuildCursor, CommandRecord, GpuArtifact, KernelProfile, Launcher};
 use crate::pool::BufferPool;
 use crate::uniforms::UniformPack;
 
@@ -161,36 +161,6 @@ impl Drop for CompileGuard {
 }
 fn scopeguard_compile(t: Instant) -> CompileGuard {
     CompileGuard(t)
-}
-fn gapstep() -> bool {
-    use std::sync::OnceLock;
-    static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FUSOR_GAPSTEP").is_some())
-}
-
-/// Whether `FUSOR_VERIFY_ARTIFACT_CACHE` is set, read once.
-#[cfg(feature = "compiler-tests")]
-fn verify_artifact_cache() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FUSOR_VERIFY_ARTIFACT_CACHE").is_some())
-}
-
-#[cfg(not(feature = "compiler-tests"))]
-fn verify_artifact_cache() -> bool {
-    false
-}
-
-/// Whether `FUSOR_NO_PIPELINE_SHARE` is set, read once.
-fn no_pipeline_share() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FUSOR_NO_PIPELINE_SHARE").is_some())
-}
-
-/// The directory `FUSOR_WGSL_DUMP` names, read once.
-fn wgsl_dump_dir() -> Option<&'static std::path::Path> {
-    static DIR: std::sync::OnceLock<Option<std::path::PathBuf>> = std::sync::OnceLock::new();
-    DIR.get_or_init(|| std::env::var_os("FUSOR_WGSL_DUMP").map(std::path::PathBuf::from))
-        .as_deref()
 }
 
 /// `hash((sym, value) for sym in consulted)` under the current binding.
@@ -336,11 +306,6 @@ impl GpuTarget {
         self.launcher.take_kernel_profiles()
     }
 
-    /// The plan is the cache key.
-    pub const fn plan_key(&self, plan: &Plan) -> PlanHash {
-        plan.hash
-    }
-
     /// Prepare a selected candidate's uploads and changed launches from owned data.
     /// Dispatch still resolves its current symbol bindings through the cache.
     #[cfg(not(target_arch = "wasm32"))]
@@ -352,7 +317,7 @@ impl GpuTarget {
         launches: &[usize],
         uploads: Vec<Arc<Vec<u8>>>,
     ) -> Result<Option<std::thread::JoinHandle<Result<Vec<Buf>>>>> {
-        if no_pipeline_share() || launches.is_empty() {
+        if crate::flags().no_pipeline_share || launches.is_empty() {
             return Ok(None);
         }
         let pack = Arc::new(UniformPack::new(plan));
@@ -363,18 +328,8 @@ impl GpuTarget {
         let mut kernels = launches
             .iter()
             .map(|&launch_ix| {
-                let launch = plan
-                    .launches
-                    .get(launch_ix)
-                    .ok_or_else(|| Error::Plan(format!("no launch at index {launch_ix}")))?;
-                let item = LaunchWork {
-                    root: launch.root,
-                    launch_ix,
-                    grid: launch.grid,
-                    artifact: None,
-                };
-                self.lower_uncached(plan, graph, &item, &binds, &pack)
-                    .map(|lowered| (lowered.ir, lowered.ph))
+                let lowered = self.lower_uncached(plan, graph, launch_ix, &binds, &pack)?;
+                Ok((lowered.ir, lowered.ph))
             })
             .collect::<Result<Vec<_>>>()?;
         kernels.retain(|(_, ph)| {
@@ -401,7 +356,7 @@ impl GpuTarget {
                 target.device.queue().submit([]);
             }
             for (ir, ph) in kernels {
-                target.pipeline_for(&ir, ph)?;
+                target.pipeline(&ir, ph, true)?;
             }
             Ok(buffers)
         })))
@@ -445,7 +400,8 @@ impl GpuTarget {
         //   so they exceed `build` whenever the workers overlap.
         // - `chunkwait`/`pollus` how long the host was blocked on the GPU
         //   (chunked-submit backpressure, and `poll_wait`).
-        let gap = gapstep();
+        let flags = crate::flags();
+        let gap = flags.gapstep;
         if gap {
             let prev = LAST_EXIT.lock().replace(start);
             let outside = prev.map(|p| start.duration_since(p).as_secs_f64() * 1e3);
@@ -500,20 +456,9 @@ impl GpuTarget {
             }
         }
 
-        let mut work: Vec<LaunchWork> = Vec::with_capacity(plan.launches.len());
-        for (launch_ix, launch) in plan.launches.iter().enumerate() {
-            work.push(LaunchWork {
-                root: launch.root,
-                launch_ix,
-                grid: launch.grid,
-                artifact: None,
-            });
-        }
-
         // Phase 2: probe the cache, then build the cold set.
         let __t_p1 = start.elapsed();
         let keys = plan_artifact_keys(plan, &pack, graph.arena_id());
-        let queue_len = work.len();
         // The probe is the partition: every launch whose variant is already
         // built finishes here with a hash lookup, and what is left is the
         // cold set, which goes to the cohort whole.
@@ -522,29 +467,19 @@ impl GpuTarget {
         // the reads it records are the caller's, not a lowering's.
         let probe_binding =
             crate::lower::DimBinding::from_pairs(binds.dims.iter().map(|(k, v)| (*k, *v)));
-        for (i, item) in work.iter_mut().enumerate().take(queue_len) {
-            match self.cached_artifact(plan, graph, item, binds, &probe_binding, &keys, &pack)? {
-                Some((artifact, grid)) => {
-                    item.artifact = Some(artifact);
-                    item.grid = grid;
-                }
-                None => cold.push(i),
+        let mut built: Vec<Option<(Artifact, [u32; 3])>> = Vec::with_capacity(plan.launches.len());
+        for launch_ix in 0..plan.launches.len() {
+            let hit =
+                self.cached_artifact(plan, graph, launch_ix, binds, &probe_binding, &keys, &pack)?;
+            if hit.is_none() {
+                cold.push(launch_ix);
             }
+            built.push(hit);
         }
         let __t_probe = start.elapsed();
         let __cold = cold.len();
         if !cold.is_empty() {
             let len = cold.len();
-            let items: Vec<LaunchWork> = cold
-                .iter()
-                .map(|&i| LaunchWork {
-                    root: work[i].root,
-                    launch_ix: work[i].launch_ix,
-                    grid: work[i].grid,
-                    artifact: None,
-                })
-                .collect();
-
             // Pass A: lower, and compile what nobody else is on. A worker
             // that has just lowered a body claims its pipeline slot and
             // compiles it there and then, so compiles overlap the remaining
@@ -556,9 +491,9 @@ impl GpuTarget {
             let worker = || {
                 while let Some(j) = cursor.take(len) {
                     let built = self
-                        .lower_uncached(plan, graph, &items[j], binds, &pack)
+                        .lower_uncached(plan, graph, cold[j], binds, &pack)
                         .and_then(|l| {
-                            let a = self.try_pipeline_for(&l.ir, l.ph)?;
+                            let a = self.pipeline(&l.ir, l.ph, false)?;
                             Ok((l, a))
                         });
                     *lowered[j].0.lock() = Some(built);
@@ -572,9 +507,8 @@ impl GpuTarget {
             std::thread::scope(|scope| {
                 // `FUSOR_COMPILE_THREADS` caps the parallel compiles, for
                 // telling one shader's compiler blow-up from their sum.
-                let threads = std::env::var("FUSOR_COMPILE_THREADS")
-                    .ok()
-                    .and_then(|v| v.parse::<usize>().ok())
+                let threads = flags
+                    .compile_threads
                     .or_else(|| std::thread::available_parallelism().map(|n| n.get()).ok())
                     .unwrap_or(1)
                     .min(len);
@@ -594,47 +528,39 @@ impl GpuTarget {
             // Pass B: file every launch's variant. Whatever Pass A skipped is
             // finished here, by which time the worker that claimed it has
             // published the artifact.
-            for (j, (l, artifact)) in lowered.into_iter().enumerate() {
+            for (&launch_ix, (l, artifact)) in cold.iter().zip(lowered) {
                 let artifact = match artifact {
                     Some(a) => a,
-                    None => self.pipeline_for(&l.ir, l.ph)?,
+                    None => self
+                        .pipeline(&l.ir, l.ph, true)?
+                        .ok_or_else(|| Error::Device("a pipeline slot came back unbuilt".into()))?,
                 };
-                let i = cold[j];
-                if gap && std::env::var_os("FUSOR_COLDLIST").is_some() {
+                if gap && flags.coldlist {
                     let gs = l.binding.grid_derivation(l.ir.grid, &self.caps().limits);
+                    let consulted = l.binding.body_consulted(gs.is_some());
                     eprintln!(
-                        "COLD ix={} name={} ph={:x} replay={} consulted={:?} vals={:?}",
-                        items[j].launch_ix,
+                        "COLD ix={launch_ix} name={} ph={:x} replay={} consulted={consulted:?} vals={:?}",
                         l.ir.name,
                         l.ph as u64,
                         gs.is_some(),
-                        l.binding.body_consulted(gs.is_some()),
-                        l.binding
-                            .body_consulted(gs.is_some())
+                        consulted
                             .iter()
                             .map(|s| binds.dims.get(s).copied().unwrap_or(0))
                             .collect::<Vec<_>>(),
                     );
                 }
-                let grid = self.record_variant(keys[items[j].launch_ix], l, &artifact, binds)?;
-                work[i].artifact = Some(artifact);
-                work[i].grid = grid;
+                let grid = self.record_variant(keys[launch_ix], l, &artifact, binds)?;
+                built[launch_ix] = Some((artifact, grid));
             }
         }
 
         // Phase 3: serial, exact plan order.
         let __t_p2 = start.elapsed();
-        let total = work.len();
-        // A plan too large for a full per-dispatch query set can still time
-        // one launch: the tuner names a plan index, and two slots bracket
-        // that dispatch alone.
-        let focus_plan_ix = self.launcher.take_tuning_focus();
+        let total = built.len();
+        let focus = self.launcher.take_tuning_focus();
         let mut records = Vec::with_capacity(total);
-        // Plan launch index and grid per live dispatch, for `TSPAN`.
-        let mut dispatch_launch: Vec<(usize, [u32; 3])> = Vec::new();
-        for item in &mut work {
-            let artifact = item
-                .artifact
+        for (launch_ix, slot) in built.iter().enumerate() {
+            let (artifact, grid) = slot
                 .as_ref()
                 .ok_or_else(|| Error::Device("a launch was never built".into()))?;
             let gpu = artifact
@@ -642,7 +568,7 @@ impl GpuTarget {
                 .ok_or_else(|| Error::Device("artifact is not a gpu pipeline".into()))?;
             // This launch's buffers: the caller's, or the plan's, allocated
             // at their first use here.
-            let launch = &plan.launches[item.launch_ix];
+            let launch = &plan.launches[launch_ix];
             let mut ordered: Vec<_> = launch.bindings.iter().collect();
             ordered.sort_by_key(|b| b.binding);
             let mut buffers = Vec::with_capacity(ordered.len() + 1);
@@ -679,7 +605,7 @@ impl GpuTarget {
                             Error::Device(format!(
                                 "{e} (at launch {} of {}: {} plan buffers live holding {} MB, \
                                  {} not yet allocated)",
-                                item.launch_ix,
+                                launch_ix,
                                 total,
                                 resolved.len(),
                                 held >> 20,
@@ -692,20 +618,17 @@ impl GpuTarget {
                 };
                 buffers.push(buf);
             }
-            crate::launch::trace_binds(gpu.name, item.grid, &buffers);
+            crate::launch::trace_binds(gpu.name, *grid, &buffers);
             let bind_group = self.launcher.bind_group(gpu, &buffers)?;
             // `buffers` is dropped here: the bind group holds the device
             // buffers, and a pool handle kept past this point would pin
             // every intermediate for the whole resolve.
             drop(buffers);
-            if !item.grid.contains(&0) {
-                dispatch_launch.push((item.launch_ix, item.grid));
-            }
             records.push(CommandRecord::Dispatch {
                 name: gpu.name,
                 pipeline: gpu.pipeline.clone(),
                 bind_group,
-                grid: item.grid,
+                grid: *grid,
             });
             // A step-local buffer whose last reader or writer is this launch
             // returns to the pool now: the bind group keeps the device
@@ -713,7 +636,7 @@ impl GpuTarget {
             // later launch may reuse it.
             for b in &ordered {
                 if !b.arena
-                    && last_use.get(&b.value) == Some(&item.launch_ix)
+                    && last_use.get(&b.value) == Some(&launch_ix)
                     && !binds.buffers.contains_key(&b.value)
                     && plan
                         .buffers
@@ -726,77 +649,9 @@ impl GpuTarget {
             }
         }
         let __t_bind = start.elapsed();
-        // The focused indices are stated in plan order; the encoder counts
-        // *live* dispatches, so restate them. An empty dispatch never
-        // reaches the encoder and cannot be timed at all.
-        let focus_plan_ix = focus_plan_ix.map(|mut ixs| {
-            // The sparse slot map binary-searches the live list, so it must
-            // be ascending and duplicate-free.
-            ixs.sort_unstable();
-            ixs.dedup();
-            ixs
-        });
-        let focus_pairs: Vec<(usize, usize)> = focus_plan_ix
-            .as_deref()
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|&ix| {
-                records.get(ix).filter(|r| !r.is_empty_dispatch()).map(|_| {
-                    let live = records[..ix]
-                        .iter()
-                        .filter(|r| !r.is_empty_dispatch())
-                        .count();
-                    (ix, live)
-                })
-            })
-            .collect();
-        let focus_live: Vec<usize> = focus_pairs.iter().map(|&(_, l)| l).collect();
-        // A named focus wins over whole-plan timing: a backend without
-        // `TIMESTAMP_QUERY_INSIDE_PASSES` writes boundary samples only, so
-        // each timed dispatch takes its own compute pass. A caller that
-        // named the launches it will read gets those and no others.
-        let (query_set, mode) = if focus_pairs.len() == 1 {
-            (
-                self.launcher.timestamp_query_set(1),
-                TimingMode::Focus(focus_live[0]),
-            )
-        } else if !focus_pairs.is_empty() {
-            (
-                self.launcher.timestamp_query_set(focus_pairs.len()),
-                TimingMode::Sparse(&focus_live),
-            )
-        } else if std::env::var_os("FUSOR_TIME_PLAN").is_some() {
-            // The whole plan's GPU span as `TPLAN <us>`: the number the
-            // step rate is made of, free of host and clock-state noise
-            // between two plans measured back to back.
-            self.launcher.set_tuning(true);
-            (self.launcher.timestamp_query_set(1), TimingMode::Whole)
-        } else if let Some(start) = std::env::var("FUSOR_TIME_RANGE")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-        {
-            // Times live dispatches `[start, start+cap)` of any plan and
-            // prints each span as `TSPAN <index> <kernel> <us>`: the
-            // per-kernel profile of one resolve, for finding where a step's
-            // time goes.
-            let live = records.iter().filter(|r| !r.is_empty_dispatch()).count();
-            let cap = (wgpu::QUERY_SET_MAX_QUERIES as usize / 2).min(live.saturating_sub(start));
-            if cap == 0 {
-                (None, TimingMode::All)
-            } else {
-                self.launcher.set_tuning(true);
-                (
-                    self.launcher.timestamp_query_set(cap),
-                    TimingMode::Range { start, n: cap },
-                )
-            }
-        } else if self.launcher.can_time_whole(total) {
-            (self.launcher.timestamp_query_set(total), TimingMode::All)
-        } else {
-            (None, TimingMode::All)
-        };
+        let timing = self.launcher.timing_plan(&records, focus);
         self.launcher
-            .encode_command_records(&records, query_set.as_ref(), mode)?;
+            .encode_command_records(&records, timing.set(), timing.mode())?;
         let __t_enc = start.elapsed();
         // Release step-local buffers back to the pool in exact plan order.
         for buffer in &plan.buffers {
@@ -840,102 +695,8 @@ impl GpuTarget {
             *LAST_EXIT.lock() = Some(Instant::now());
         }
 
-        if let Some(set) = query_set.as_ref() {
-            // The query set is resolved from a command buffer submitted after
-            // a `poll_wait`: Metal's writeback of the final encoder's boundary
-            // samples races a resolve encoded behind it and leaves slots zero.
-            self.launcher.poll_wait()?;
-            if matches!(mode, TimingMode::Focus(_) | TimingMode::Sparse(_)) {
-                // Only the focused dispatches were timed; each span lands at
-                // its own plan index and every other slot reads zero, which
-                // the consumers already treat as "not timed".
-                let samples = self
-                    .launcher
-                    .read_timestamps(&self.pool, set, focus_pairs.len())?;
-                if samples.iter().any(|s| *s > 0.0) {
-                    let mut per_launch = vec![0.0; records.len()];
-                    for (k, &(plan_ix, _)) in focus_pairs.iter().enumerate() {
-                        if let Some(slot) = per_launch.get_mut(plan_ix) {
-                            *slot = samples.get(k).copied().unwrap_or(0.0);
-                        }
-                    }
-                    self.launcher.set_last_profile(per_launch);
-                }
-                return Ok(());
-            }
-            if matches!(mode, TimingMode::Whole) {
-                let samples = self.launcher.read_timestamps(&self.pool, set, 1)?;
-                if let Some(us) = samples.first() {
-                    eprintln!("TPLAN {us:.1} n={total}");
-                }
-                return Ok(());
-            }
-            if let TimingMode::Range { start, n } = mode {
-                let samples = self.launcher.read_timestamps(&self.pool, set, n)?;
-                let names: Vec<&'static str> = work
-                    .iter()
-                    .map(|w| {
-                        w.artifact
-                            .as_ref()
-                            .and_then(|a| a.downcast_ref::<GpuArtifact>())
-                            .map(|g| g.name)
-                            .unwrap_or("?")
-                    })
-                    .collect();
-                // `TSPAN <live index> <kernel> <us> L<plan launch> grid=[x,y,z]`:
-                // the plan index is what a plan dump names, the live index is
-                // what the encoder counted.
-                for (j, us) in samples.iter().enumerate() {
-                    let ix = start + j;
-                    let (lix, grid) = dispatch_launch
-                        .get(ix)
-                        .copied()
-                        .unwrap_or((usize::MAX, [0; 3]));
-                    eprintln!(
-                        "TSPAN {ix} {} {us:.1} L{lix} grid={grid:?}",
-                        names.get(lix).copied().unwrap_or("?")
-                    );
-                }
-                return Ok(());
-            }
-            let live = records.iter().filter(|r| !r.is_empty_dispatch()).count();
-            let samples = self.launcher.read_timestamps(&self.pool, set, live)?;
-            // Back to plan order: a zero-grid launch never reached the encoder
-            // and owns no sample.
-            let mut next = 0usize;
-            let mut per_launch = Vec::with_capacity(records.len());
-            for record in &records {
-                if record.is_empty_dispatch() {
-                    per_launch.push(0.0);
-                } else {
-                    per_launch.push(samples.get(next).copied().unwrap_or(0.0));
-                    next += 1;
-                }
-            }
-            if self.config.trace_gpu_kernels {
-                let named: Vec<(String, f64)> = work
-                    .iter()
-                    .zip(&per_launch)
-                    .filter_map(|(w, us)| {
-                        w.artifact
-                            .as_ref()?
-                            .downcast_ref::<GpuArtifact>()
-                            .map(|g| (g.name.to_string(), *us))
-                    })
-                    .collect();
-                self.launcher.push_profile(KernelProfile::from_samples(
-                    start.elapsed().as_secs_f64() * 1000.0,
-                    &named,
-                ));
-            }
-            // An all-zero read is a device that did not write the slots, not a
-            // plan that took no time. Publishing it would make every candidate
-            // look infinitely fast, so the tuner falls back to the wall clock.
-            if per_launch.iter().any(|us| *us > 0.0) {
-                self.launcher.set_last_profile(per_launch);
-            }
-        }
-        Ok(())
+        self.launcher
+            .publish_timing(&self.pool, &timing, &records, start)
     }
 
     /// The artifact this launch already carries under `binding`, or `None`
@@ -947,18 +708,13 @@ impl GpuTarget {
         &self,
         plan: &Plan,
         graph: &EGraph,
-        item: &LaunchWork,
+        launch_ix: usize,
         binds: &BindingEnv,
         binding: &crate::lower::DimBinding,
         keys: &[ArtifactKey],
         pack: &Arc<UniformPack>,
     ) -> Result<Option<(Artifact, [u32; 3])>> {
-        let launch = plan
-            .launches
-            .get(item.launch_ix)
-            .filter(|l| l.root == item.root)
-            .ok_or_else(|| Error::Plan(format!("no launch roots at {}", item.root)))?;
-        let key = keys[item.launch_ix];
+        let key = keys[launch_ix];
         let cached = {
             let mut lock = self.artifacts.lock();
             match lock.get_mut(&key) {
@@ -988,66 +744,38 @@ impl GpuTarget {
         let Some((artifact, grid, cached_ph)) = cached else {
             return Ok(None);
         };
-        {
-            if !verify_artifact_cache() {
-                return Ok(Some((artifact, grid)));
-            }
-            // Verification mode: relower and compare identity + grid.
-            let cx = LowerCtx {
-                plan,
-                launch,
-                graph,
-                symbols: &plan.symbols,
-                dim_bindings: &[],
-            };
-            let theta = plan
-                .extraction
-                .theta
-                .get(&launch.root)
-                .copied()
-                .unwrap_or(SchedPoint::Point);
-            let node = graph.node(launch.root);
-            let binding =
-                crate::lower::DimBinding::from_pairs(binds.dims.iter().map(|(k, v)| (*k, *v)));
-            let mut kernels =
-                crate::lower::lower_node(self.caps(), node, theta, &cx, binding, pack.clone())?;
-            let ir = kernels.remove(0);
-            let same_body = if pipeline_hash(&ir) == cached_ph {
-                true
-            } else {
-                let emitted = crate::emit::emit(&ir, self.caps()).map_err(Error::from)?;
-                let key = format!("{}\n{}", ir.block, wgsl_text(&emitted)?);
-                self.pipelines_by_source
-                    .lock()
-                    .peek(&key)
-                    .and_then(|a| a.downcast_ref::<GpuArtifact>())
-                    .zip(artifact.downcast_ref::<GpuArtifact>())
-                    .is_some_and(|(a, b)| a.id == b.id)
-            };
-            if !same_body || ir.grid != grid {
-                eprintln!(
-                    "[artifact-cache] MISMATCH root {} name {}: body {} grid {:?} cached ({}, {:?})",
-                    launch.root,
-                    ir.name,
-                    pipeline_hash(&ir),
-                    ir.grid,
-                    cached_ph,
-                    grid,
-                );
-                if let Some(dir) = std::env::var_os("FUSOR_MISMATCH_DUMP") {
-                    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-                    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    if n < 40 {
-                        let dir = std::path::PathBuf::from(dir);
-                        let _ = std::fs::write(
-                            dir.join(format!("mismatch_{n}_{}.txt", launch.root)),
-                            format!("{ir:#?}"),
-                        );
-                    }
+        if !crate::flags().verify_artifact_cache {
+            return Ok(Some((artifact, grid)));
+        }
+        // Verification mode: relower and compare identity + grid.
+        let Lowered { ir, ph, .. } = self.lower_uncached(plan, graph, launch_ix, binds, pack)?;
+        let same_body = ph == cached_ph || {
+            let emitted = crate::emit::emit(&ir, self.caps()).map_err(Error::from)?;
+            let key = format!("{}\n{}", ir.block, wgsl_text(&emitted)?);
+            self.pipelines_by_source
+                .lock()
+                .peek(&key)
+                .and_then(|a| a.downcast_ref::<GpuArtifact>())
+                .zip(artifact.downcast_ref::<GpuArtifact>())
+                .is_some_and(|(a, b)| a.id == b.id)
+        };
+        if !same_body || ir.grid != grid {
+            eprintln!(
+                "[artifact-cache] MISMATCH launch {launch_ix} name {}: body {ph} grid {:?} cached ({cached_ph}, {grid:?})",
+                ir.name, ir.grid,
+            );
+            if let Some(dir) = &crate::flags().mismatch_dump {
+                static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                if n < 40 {
+                    let _ = std::fs::write(
+                        dir.join(format!("mismatch_{n}_{launch_ix}.txt")),
+                        format!("{ir:#?}"),
+                    );
                 }
             }
-            Ok(Some((artifact, grid)))
         }
+        Ok(Some((artifact, grid)))
     }
 
     /// Emit one lowered body and compile it, consulting the WGSL-identity
@@ -1056,10 +784,10 @@ impl GpuTarget {
     fn compile_body(&self, ir: &KernelIr, ph: u128) -> Result<Artifact> {
         let __t = Instant::now();
         let _g = scopeguard_compile(__t);
-        let share = !no_pipeline_share();
+        let share = !crate::flags().no_pipeline_share;
         let emitted = crate::emit::emit(ir, self.caps()).map_err(Error::from)?;
         let text = wgsl_text(&emitted)?;
-        if let Some(dir) = wgsl_dump_dir() {
+        if let Some(dir) = &crate::flags().wgsl_dump {
             let _ = std::fs::create_dir_all(dir);
             let _ = std::fs::write(dir.join(format!("{}_{:016x}.wgsl", ir.name, ph)), &text);
         }
@@ -1091,15 +819,14 @@ impl GpuTarget {
         &self,
         plan: &Plan,
         graph: &EGraph,
-        item: &LaunchWork,
+        launch_ix: usize,
         binds: &BindingEnv,
         pack: &Arc<UniformPack>,
     ) -> Result<Lowered> {
         let launch = plan
             .launches
-            .get(item.launch_ix)
-            .filter(|l| l.root == item.root)
-            .ok_or_else(|| Error::Plan(format!("no launch roots at {}", item.root)))?;
+            .get(launch_ix)
+            .ok_or_else(|| Error::Plan(format!("no launch at index {launch_ix}")))?;
         let cx = LowerCtx {
             plan,
             launch,
@@ -1117,17 +844,12 @@ impl GpuTarget {
         let binding =
             crate::lower::DimBinding::from_pairs(binds.dims.iter().map(|(k, v)| (*k, *v)));
         let __tl = Instant::now();
-        let mut kernels =
+        let ir =
             crate::lower::lower_node(self.caps(), node, theta, &cx, binding.clone(), pack.clone())?;
         LOWER_US.fetch_add(
             __tl.elapsed().as_micros() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
-        let ir = if kernels.is_empty() {
-            return Err(Error::Plan("a launch lowered to no kernel".into()));
-        } else {
-            kernels.remove(0)
-        };
         let ph = pipeline_hash(&ir);
         #[cfg(any(test, feature = "compiler-tests"))]
         fusor_tile::verify_kernel(&ir, self.caps())?;
@@ -1136,45 +858,29 @@ impl GpuTarget {
 
     /// The compiled pipeline for one lowered body, deduplicated on the kernel
     /// body. The slot is claimed before the compile and held across it, so a
-    /// second caller on the same body waits for the first.
-    fn try_pipeline_for(&self, ir: &KernelIr, ph: u128) -> Result<Option<Artifact>> {
-        if no_pipeline_share() {
+    /// second caller on the same body finds the artifact. With `wait` a slot
+    /// another worker holds is waited on; without, it is skipped (`None`).
+    fn pipeline(&self, ir: &KernelIr, ph: u128, wait: bool) -> Result<Option<Artifact>> {
+        if crate::flags().no_pipeline_share {
             return self.compile_body(ir, ph).map(Some);
         }
         let slot: PipelineSlot = {
             let mut lock = self.pipelines.lock();
             Arc::clone(lock.get_or_insert(ph, PipelineSlot::default))
         };
-        let Some(mut built) = slot.try_lock() else {
-            return Ok(None);
+        let mut built = match wait {
+            true => slot.lock(),
+            false => match slot.try_lock() {
+                Some(built) => built,
+                None => return Ok(None),
+            },
         };
-        match built.as_ref() {
-            Some(a) => Ok(Some(a.clone())),
-            None => {
-                let a = self.compile_body(ir, ph)?;
-                *built = Some(a.clone());
-                Ok(Some(a))
-            }
+        if let Some(a) = built.as_ref() {
+            return Ok(Some(a.clone()));
         }
-    }
-
-    fn pipeline_for(&self, ir: &KernelIr, ph: u128) -> Result<Artifact> {
-        if no_pipeline_share() {
-            return self.compile_body(ir, ph);
-        }
-        let slot: PipelineSlot = {
-            let mut lock = self.pipelines.lock();
-            Arc::clone(lock.get_or_insert(ph, PipelineSlot::default))
-        };
-        let mut built = slot.lock();
-        match built.as_ref() {
-            Some(a) => Ok(a.clone()),
-            None => {
-                let a = self.compile_body(ir, ph)?;
-                *built = Some(a.clone());
-                Ok(a)
-            }
-        }
+        let a = self.compile_body(ir, ph)?;
+        *built = Some(a.clone());
+        Ok(Some(a))
     }
 
     /// File one lowering's artifact under its launch key, returning **the
@@ -1233,14 +939,6 @@ impl<T> Default for Mutexed<T> {
     fn default() -> Self {
         Self(parking_lot::Mutex::new(None))
     }
-}
-
-struct LaunchWork {
-    root: Id,
-    /// Index into `plan.launches` (and the per-plan key vector).
-    launch_ix: usize,
-    grid: [u32; 3],
-    artifact: Option<Artifact>,
 }
 
 /// Everything a resolve needs that is not in the plan: the symbol bindings,
@@ -1312,7 +1010,7 @@ impl GpuTarget {
             )
         };
         self.launcher.note_pipeline_compile();
-        let trace = std::env::var_os("FUSOR_TRACE_DISPATCH").is_some();
+        let trace = crate::flags().trace_dispatch;
         if trace {
             eprintln!("[compile] start {name} bindings={}", entries.len());
         }
@@ -1357,8 +1055,8 @@ impl Target for GpuTarget {
         crate::rules::GPU_RULES
     }
 
-    fn lower(&self, node: &Node, id: Id, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
-        crate::lower::lower(self.caps(), node, id, theta, cx)
+    fn lower(&self, node: &Node, _: Id, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
+        crate::lower::lower(self.caps(), node, theta, cx)
     }
 
     fn emit(&self, ir: &KernelIr) -> std::result::Result<Artifact, EmitError> {
@@ -1400,9 +1098,8 @@ impl GpuTarget {
     /// attributed to a cache rather than guessed at.
     fn cache_stats(&self) {
         use std::sync::atomic::{AtomicU64, Ordering};
-        static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         static N: AtomicU64 = AtomicU64::new(0);
-        if !*ON.get_or_init(|| std::env::var_os("FUSOR_CACHE_STATS").is_some()) {
+        if !crate::flags().cache_stats {
             return;
         }
         let n = N.fetch_add(1, Ordering::Relaxed);

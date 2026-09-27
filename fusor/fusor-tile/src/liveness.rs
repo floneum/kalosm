@@ -337,17 +337,6 @@ pub(crate) fn for_each_tile(kind: &TileExprKind, f: &mut dyn FnMut(&Tile, TileUs
     }
 }
 
-/// The expressions inside one address.
-pub(crate) fn for_each_addr_expr(addr: &Addr, f: &mut dyn FnMut(&TileExpr)) {
-    match addr {
-        Addr::Linear(index) => f(index),
-        Addr::Rc2 { row, col } => {
-            f(row);
-            f(col);
-        }
-    }
-}
-
 struct Walk {
     position: u32,
     tiles: FxHashMap<TileKeyPtr, TileLiveness>,

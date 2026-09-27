@@ -7,6 +7,7 @@ use fusor_ir::ir::{Level, Node, Op, OpTag};
 use fusor_ir::rule;
 
 use crate::domains::{DomainCtx, default_planner, map_domain};
+use crate::rules::adopt;
 use crate::rules::contract::alias;
 
 rule!(
@@ -73,9 +74,7 @@ fn mint(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>, mode: ScatterMo
         ops: vec![alias(p.base, base), alias(p.idx, idx), alias(p.upd, upd)],
         sched: ScheduleDomain::Map(map_domain(&upd.shape, &accesses, &cx).into()),
     };
-    let new = b.add_launch(op).ok()?;
-    b.union(id, new).ok()?;
-    Some(new)
+    adopt(b, id, op)
 }
 
 /// One in-place write per update. `Add` needs `atomicAdd` on f32 in

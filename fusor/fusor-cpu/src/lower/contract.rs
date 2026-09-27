@@ -3,29 +3,20 @@
 use std::sync::Arc;
 
 use fusor_ir::Result;
-use fusor_ir::device::Caps;
 use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
-    Accumulator, Addr, BufferDecl, ElementType, KernelIr, LocalDecl, ScalarElement, Stmt,
-    StorageView, TileExpr, TileExprKind,
+    Accumulator, Addr, BufferDecl, ElementType, KernelIr, ScalarElement, Stmt, TileExpr,
 };
-use fusor_ir::ir::launch::{ContractSide, Launch, SchedPoint};
+use fusor_ir::ir::launch::{ContractSide, Launch};
 use fusor_ir::ir::{Node, Op};
-use fusor_ir::scalar::{BinOp, CmpOp, ScalarExpr, ScalarKind};
+use fusor_ir::scalar::{ScalarExpr, ScalarKind};
 use fusor_ir::shape::{Dim, Layout};
 use fusor_ir::target::LowerCtx;
+use fusor_tile::build::Kernel;
 
-use super::{
-    Binds, OperandSrc, Translate, bin, cmp, default_block, global_lane, grid_for, lit_f32, lit_u32,
-    u32_ty,
-};
+use super::{Binds, DEFAULT_BLOCK, OperandSrc, Translate, global_lane, grid_for, view};
 
-pub(crate) fn lower(
-    caps: &Caps,
-    node: &Node,
-    _theta: SchedPoint,
-    cx: &LowerCtx<'_>,
-) -> Result<KernelIr> {
+pub(crate) fn lower(node: &Node, cx: &LowerCtx<'_>) -> Result<KernelIr> {
     let Op::Launch(Launch::Contract {
         m,
         n,
@@ -72,7 +63,7 @@ pub(crate) fn lower(
             name,
         });
     }
-    lower_jit(caps, cx, binds, out, [batch, m, n, k], a, b, post, *acc)
+    lower_jit(cx, binds, out, [batch, m, n, k], a, b, post, *acc)
 }
 
 type BoundSide = Vec<(Arc<BufferDecl>, [u32; 3])>;
@@ -86,7 +77,7 @@ fn side(
     side.ops
         .iter()
         .map(|operand| {
-            if crate::lower::const_operand(cx, operand.src).is_some() {
+            if fusor_tile::build::const_splat(cx, operand.src).is_some() {
                 return None;
             }
             // A GEMM call reads from the buffer's start; an offset layout —
@@ -107,34 +98,33 @@ fn side(
 /// private accumulator across `k`.
 #[allow(clippy::too_many_arguments)]
 fn lower_jit(
-    caps: &Caps,
     cx: &LowerCtx<'_>,
     binds: Binds,
-    out: Arc<BufferDecl>,
+    out: std::sync::Arc<BufferDecl>,
     [batch, m, n, k]: [u32; 4],
     a: &ContractSide,
-    b: &ContractSide,
+    b_side: &ContractSide,
     post: &ScalarExpr,
     acc: fusor_ir::dtype::Dtype,
 ) -> Result<KernelIr> {
-    let block = default_block(caps);
+    let b = Kernel::new();
+    let block = DEFAULT_BLOCK;
     let total = u64::from(batch) * u64::from(m) * u64::from(n);
     let total_u32 = u32::try_from(total)
         .map_err(|_| Error::Legality("CPU JIT contraction output exceeds u32 indexing".into()))?;
     let grid = grid_for(total, block);
-    let flat = global_lane(block);
-    let valid = cmp(CmpOp::Lt, flat.clone(), lit_u32(total_u32));
-    let col = bin(BinOp::Rem, flat.clone(), lit_u32(n), u32_ty());
-    let rest = bin(BinOp::Div, flat.clone(), lit_u32(n), u32_ty());
-    let row = bin(BinOp::Rem, rest.clone(), lit_u32(m), u32_ty());
-    let batch_idx = bin(BinOp::Div, rest, lit_u32(m), u32_ty());
-    let k_local = Arc::new(LocalDecl::new(u32_ty()));
-    let k_idx = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(&k_local)), u32_ty());
+    let flat = global_lane(&b, block);
+    let valid = b.lt(flat.clone(), b.u32(total_u32));
+    let (rest, col) = b.divrem(flat.clone(), b.u32(n));
+    let (batch_idx, row) = b.divrem(rest, b.u32(m));
+    let k_local = b.local(ScalarElement::U32.element());
+    let k_idx = b.load_local(k_local.clone());
     let uniforms = binds.buffers.first().cloned();
 
-    let a_srcs = jit_side(cx, &binds, a, [batch, m, k])?;
-    let b_srcs = jit_side(cx, &binds, b, [batch, k, n])?;
+    let a_srcs = jit_side(&b, cx, &binds, a, [batch, m, k])?;
+    let b_srcs = jit_side(&b, cx, &binds, b_side, [batch, k, n])?;
     let a_value = side_value(
+        &b,
         cx,
         a,
         &a_srcs,
@@ -144,8 +134,9 @@ fn lower_jit(
         uniforms.clone(),
     )?;
     let b_value = side_value(
+        &b,
         cx,
-        b,
+        b_side,
         &b_srcs,
         [batch, k, n],
         [&batch_idx, &k_idx, &col],
@@ -153,37 +144,32 @@ fn lower_jit(
         uniforms.clone(),
     )?;
     let acc_ty = ElementType::Scalar(super::elem_of(acc)?);
-    let a_value = cast_to(a_value, acc_ty);
-    let b_value = cast_to(b_value, acc_ty);
-    let local = Arc::new(LocalDecl::new(acc_ty));
-    let previous = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(&local)), acc_ty);
-    let product = bin(BinOp::Mul, a_value, b_value, acc_ty);
-    let update = bin(BinOp::Add, previous, product, acc_ty);
-    let zero = cast_to(lit_f32(0.0), acc_ty);
-    let accumulated = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(&local)), acc_ty);
+    let local = b.local(acc_ty);
+    let previous = b.load_local(local.clone());
+    let update = b.add(
+        previous.clone(),
+        b.mul(b.cast(a_value, acc_ty), b.cast(b_value, acc_ty)),
+    );
     let value = Translate {
-        args: &[accumulated],
+        b: &b,
+        args: &[previous],
         coords: &[],
         uniforms,
     }
     .run(post)?;
     let body = vec![
         Stmt::Loop {
-            count: Some(lit_u32(k)),
+            count: Some(b.u32(k)),
             index: Some(k_local),
             accumulators: vec![Accumulator {
                 local,
-                init: zero,
+                init: b.cast(b.f32(0.0), acc_ty),
                 update,
             }],
             body: Vec::new(),
         },
         Stmt::Store {
-            dst: StorageView {
-                layout: out.layout.clone(),
-                buffer: out,
-                offset: 0,
-            },
+            dst: view(&out),
             addr: Addr::Linear(flat),
             value,
             mask: valid,
@@ -220,6 +206,7 @@ enum Addressing {
 type JitSide = Vec<JitOperand>;
 
 fn jit_side(
+    b: &Kernel,
     cx: &LowerCtx<'_>,
     binds: &Binds,
     side: &ContractSide,
@@ -244,7 +231,7 @@ fn jit_side(
                 }
             };
             Ok(JitOperand {
-                src: super::operand_src(cx, binds, operand.src)?,
+                src: super::operand_src(b, cx, binds, operand.src)?,
                 offset,
                 addressing,
             })
@@ -252,15 +239,16 @@ fn jit_side(
         .collect()
 }
 
-/// The axis range each group covers, row-major with the last axis fastest.
-fn group_axes(extents: &[u32], groups: [u32; 3]) -> Option<[(usize, usize); 3]> {
+/// The axis range each group covers, row-major with the last axis fastest,
+/// and how many leading axes the three groups consumed.
+fn group_ranges(extents: &[u32], groups: [u32; 3]) -> Option<([(usize, usize); 3], usize)> {
     let mut out = [(0, 0); 3];
     let mut axis = 0;
     for (group, wanted) in groups.into_iter().map(|v| v.max(1)).enumerate() {
         let start = axis;
         let mut product = 1u64;
         while product < u64::from(wanted) && axis < extents.len() {
-            product = product.saturating_mul(u64::from(extents[axis].max(1)));
+            product = product.saturating_mul(u64::from(extents[axis]));
             axis += 1;
         }
         if product != u64::from(wanted) {
@@ -268,12 +256,19 @@ fn group_axes(extents: &[u32], groups: [u32; 3]) -> Option<[(usize, usize); 3]> 
         }
         out[group] = (start, axis);
     }
-    (axis == extents.len()).then_some(out)
+    Some((out, axis))
+}
+
+/// [`group_ranges`] over every axis, extent-0 axes counting as 1.
+fn group_axes(extents: &[u32], groups: [u32; 3]) -> Option<[(usize, usize); 3]> {
+    let extents: Vec<u32> = extents.iter().map(|e| (*e).max(1)).collect();
+    group_ranges(&extents, groups).and_then(|(r, used)| (used == extents.len()).then_some(r))
 }
 
 /// `offset + Σ coord * stride`, the group coordinates decomposed over the
 /// layout's axes.
 fn axes_index(
+    b: &Kernel,
     extents: &[u32],
     strides: &[u32],
     groups: [u32; 3],
@@ -283,36 +278,35 @@ fn axes_index(
     let ranges = group_axes(extents, groups).unwrap_or([(0, 0); 3]);
     let mut terms: Vec<TileExpr> = Vec::new();
     if offset != 0 {
-        terms.push(lit_u32(offset));
+        terms.push(b.u32(offset));
     }
     for (group, (start, end)) in ranges.into_iter().enumerate() {
         let mut rest = indices[group].clone();
         for i in (start..end).rev() {
             let extent = extents[i].max(1);
-            let coord = if i == start {
-                rest.clone()
-            } else {
-                bin(BinOp::Rem, rest.clone(), lit_u32(extent), u32_ty())
+            let coord = match i == start {
+                true => rest.clone(),
+                false => b.rem(rest.clone(), b.u32(extent)),
             };
-            if strides[i] != 0 {
-                terms.push(if strides[i] == 1 {
-                    coord
-                } else {
-                    bin(BinOp::Mul, coord, lit_u32(strides[i]), u32_ty())
-                });
+            match strides[i] {
+                0 => {}
+                1 => terms.push(coord),
+                stride => terms.push(b.mul(coord, b.u32(stride))),
             }
             if i != start {
-                rest = bin(BinOp::Div, rest, lit_u32(extent), u32_ty());
+                rest = b.div(rest, b.u32(extent));
             }
         }
     }
     terms
         .into_iter()
-        .reduce(|l, r| bin(BinOp::Add, l, r, u32_ty()))
-        .unwrap_or_else(|| lit_u32(0))
+        .reduce(|l, r| b.add(l, r))
+        .unwrap_or_else(|| b.u32(0))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn side_value(
+    b: &Kernel,
     cx: &LowerCtx<'_>,
     side: &ContractSide,
     sources: &JitSide,
@@ -326,24 +320,24 @@ fn side_value(
         .map(|o| {
             let index = match &o.addressing {
                 Addressing::Collapsed(strides) => {
-                    let base = strided_index(indices, *strides);
-                    if o.offset == 0 {
-                        base
-                    } else {
-                        bin(BinOp::Add, lit_u32(o.offset), base, u32_ty())
+                    let base = strided_index(b, indices, *strides);
+                    match o.offset {
+                        0 => base,
+                        offset => b.add(b.u32(offset), base),
                     }
                 }
                 Addressing::Axes { extents, strides } => {
-                    axes_index(extents, strides, groups, indices, o.offset)
+                    axes_index(b, extents, strides, groups, indices, o.offset)
                 }
             };
-            o.src.at(index, mask.clone())
+            o.src.at(b, index, mask.clone())
         })
         .collect::<Vec<_>>();
-    let coords = side_coords(cx, side, groups, indices).ok_or_else(|| {
+    let coords = side_coords(b, cx, side, groups, indices).ok_or_else(|| {
         Error::Legality("CPU JIT contraction cannot state side coordinates".into())
     })?;
     Translate {
+        b,
         args: &args,
         coords: &coords,
         uniforms,
@@ -351,23 +345,23 @@ fn side_value(
     .run(&side.pre)
 }
 
-fn strided_index(indices: [&TileExpr; 3], strides: [u32; 3]) -> TileExpr {
+fn strided_index(b: &Kernel, indices: [&TileExpr; 3], strides: [u32; 3]) -> TileExpr {
     indices
         .into_iter()
         .zip(strides)
         .filter(|(_, stride)| *stride != 0)
-        .map(|(index, stride)| {
-            if stride == 1 {
-                index.clone()
-            } else {
-                bin(BinOp::Mul, index.clone(), lit_u32(stride), u32_ty())
-            }
+        .map(|(index, stride)| match stride {
+            1 => index.clone(),
+            _ => b.mul(index.clone(), b.u32(stride)),
         })
-        .reduce(|left, right| bin(BinOp::Add, left, right, u32_ty()))
-        .unwrap_or_else(|| lit_u32(0))
+        .reduce(|left, right| b.add(left, right))
+        .unwrap_or_else(|| b.u32(0))
 }
 
+/// The per-axis coordinates a side's `pre` reads, each group's flat index
+/// split over the axes it covers.
 fn side_coords(
+    b: &Kernel,
     cx: &LowerCtx<'_>,
     side: &ContractSide,
     groups: [u32; 3],
@@ -376,41 +370,22 @@ fn side_coords(
     if !side.pre.reads_index_of() {
         return Some(Vec::new());
     }
-    let extents = super::const_extents(cx, side.primary().layout.shape()).ok()?;
-    let mut coords = vec![lit_u32(0); extents.len()];
-    let mut axis = 0;
-    for (group, wanted) in groups.into_iter().enumerate() {
-        let start = axis;
-        let mut product = 1u64;
-        while product < u64::from(wanted.max(1)) && axis < extents.len() {
-            product = product.saturating_mul(u64::from(extents[axis].max(1)));
-            axis += 1;
-        }
-        if product != u64::from(wanted.max(1)) {
-            return None;
-        }
-        let mut rest = indices[group].clone();
-        for i in (start..axis).rev() {
-            let extent = lit_u32(extents[i].max(1));
-            coords[i] = bin(BinOp::Rem, rest.clone(), extent.clone(), u32_ty());
-            rest = bin(BinOp::Div, rest, extent, u32_ty());
+    let extents: Vec<u32> = super::const_extents(cx, side.primary().layout.shape())
+        .ok()?
+        .into_iter()
+        .map(|e| e.max(1))
+        .collect();
+    let (ranges, _) = group_ranges(&extents, groups)?;
+    let mut coords = vec![b.u32(0); extents.len()];
+    for ((start, end), index) in ranges.into_iter().zip(indices) {
+        let mut rest = index.clone();
+        for i in (start..end).rev() {
+            let extent = b.u32(extents[i]);
+            coords[i] = b.rem(rest.clone(), extent.clone());
+            rest = b.div(rest, extent);
         }
     }
     Some(coords)
-}
-
-fn cast_to(value: TileExpr, to: ElementType) -> TileExpr {
-    if value.element() == to {
-        value
-    } else {
-        TileExpr::new(
-            TileExprKind::Cast {
-                value: value.clone(),
-                to,
-            },
-            to,
-        )
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -479,7 +454,7 @@ fn gelu_gemm_name(
     let [(bbuf, bstrides)] = b.as_slice() else {
         return Err(Error::Legality("CPU GEMM needs one B operand".into()));
     };
-    if a_pre.structural_hash() != 17_166_440_295_432_690_555
+    if *a_pre != tanh_gelu_of_bias()
         || !matches!(b_pre.kind(), ScalarKind::Arg(0))
         || !matches!(post.kind(), ScalarKind::Arg(0))
     {
@@ -513,6 +488,33 @@ fn gelu_gemm_name(
         bstrides[1],
         bstrides[2]
     )))
+}
+
+/// The frontend's f32 tanh GELU (`composite::activations::gelu_expr`) over
+/// `Arg(0) + Arg(1)`: the absorbed bias-add-GELU the platform kernel fuses.
+fn tanh_gelu_of_bias() -> ScalarExpr {
+    use fusor_ir::dtype::{Dtype, Splat};
+    use fusor_ir::scalar::{BinOp, UnOp};
+    let lit = |v: f32| ScalarExpr::lit(Splat::F32(v));
+    let bin = ScalarExpr::bin;
+    let clamp = |x, lo: f32, hi: f32| bin(BinOp::Min, bin(BinOp::Max, x, lit(lo)), lit(hi));
+    let x = bin(
+        BinOp::Add,
+        ScalarExpr::arg(0, Dtype::F32),
+        ScalarExpr::arg(1, Dtype::F32),
+    );
+    let x3 = bin(BinOp::Mul, x.clone(), bin(BinOp::Mul, x.clone(), x.clone()));
+    let cubic = bin(BinOp::Add, x.clone(), bin(BinOp::Mul, lit(0.044_715), x3));
+    let inner = clamp(bin(BinOp::Mul, lit(0.797_884_6), cubic), -15.0, 15.0);
+    let p = ScalarExpr::un(UnOp::Exp, inner.clone());
+    let n = ScalarExpr::un(UnOp::Exp, ScalarExpr::un(UnOp::Neg, inner));
+    let tanh = bin(
+        BinOp::Div,
+        bin(BinOp::Sub, p.clone(), n.clone()),
+        bin(BinOp::Add, p, n),
+    );
+    let one_plus = clamp(bin(BinOp::Add, lit(1.0), clamp(tanh, -1.0, 1.0)), 0.0, 2.0);
+    bin(BinOp::Mul, bin(BinOp::Mul, lit(0.5), x), one_plus)
 }
 
 fn compatible(strides: [u32; 3], [rows, cols]: [u32; 2], broadcast: [u32; 2]) -> Result<()> {
@@ -549,30 +551,25 @@ fn collapse_resolved(extents: &[u32], strides: &[u32], groups: [u32; 3]) -> Opti
         .zip(strides.iter().copied())
         .filter(|(extent, _)| *extent != 1)
         .collect();
+    let sizes: Vec<u32> = axes.iter().map(|(extent, _)| *extent).collect();
+    let (ranges, used) = group_ranges(&sizes, groups)?;
+    if used != axes.len() {
+        return None;
+    }
     let mut out = [0; 3];
-    let mut axis = 0;
-    for (group, wanted) in groups.into_iter().map(|value| value.max(1)).enumerate() {
-        let start = axis;
-        let mut product = 1u64;
-        while product < wanted as u64 && axis < axes.len() {
-            product *= axes[axis].0 as u64;
-            axis += 1;
-        }
-        if product != wanted as u64 {
-            return None;
-        }
-        if axis == start {
+    for (group, (start, end)) in ranges.into_iter().enumerate() {
+        if start == end {
             continue;
         }
-        if axes[start..axis]
+        if axes[start..end]
             .windows(2)
             .any(|pair| pair[0].1 as u64 != pair[1].1 as u64 * pair[1].0 as u64)
         {
             return None;
         }
-        out[group] = axes[axis - 1].1;
+        out[group] = axes[end - 1].1;
     }
-    (axis == axes.len()).then_some(out)
+    Some(out)
 }
 
 // Kept out of the public interface; tests cover layout collapsing and the
@@ -583,28 +580,18 @@ mod tests {
 
     #[test]
     fn collapses_dense_and_unit_axes() {
-        let dense = Layout::contiguous(&[Dim::Const(3), Dim::Const(8), Dim::Const(5)]);
         assert_eq!(
             collapse_resolved(&[3, 8, 5], &[40, 5, 1], [3, 8, 5]),
             Some([40, 5, 1])
         );
-        let unit = Layout::contiguous(&[Dim::Const(16), Dim::Const(1)]);
         assert_eq!(
             collapse_resolved(&[16, 1], &[1, 1], [1, 16, 1]),
             Some([0, 1, 0])
         );
-        let _ = (dense, unit);
     }
 
     #[test]
     fn rejects_a_gapped_layout() {
-        let layout = Layout::from_parts(
-            Dim::Const(0),
-            &[Dim::Const(4), Dim::Const(4)],
-            &[Dim::Const(8), Dim::Const(1)],
-        )
-        .unwrap();
         assert_eq!(collapse_resolved(&[4, 4], &[8, 1], [1, 16, 1]), None);
-        let _ = layout;
     }
 }

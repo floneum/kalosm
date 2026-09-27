@@ -443,6 +443,19 @@ pub enum Addr {
     Rc2 { row: TileExpr, col: TileExpr },
 }
 
+impl Addr {
+    /// The expressions inside this address.
+    pub fn for_each_expr(&self, f: &mut dyn FnMut(&TileExpr)) {
+        match self {
+            Addr::Linear(index) => f(index),
+            Addr::Rc2 { row, col } => {
+                f(row);
+                f(col);
+            }
+        }
+    }
+}
+
 /// Cross-lane reduction strategy. One node with the strategy as a
 /// parameter, so it stays a late capability-driven choice.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -928,6 +941,95 @@ pub enum Stmt {
 }
 
 impl Stmt {
+    /// Every statement of `body` and of the bodies nested in it, pre-order.
+    pub fn walk(body: &[Stmt], f: &mut dyn FnMut(&Stmt)) {
+        for stmt in body {
+            f(stmt);
+            match stmt {
+                Stmt::If { accept, reject, .. } => {
+                    Stmt::walk(accept, f);
+                    Stmt::walk(reject, f);
+                }
+                Stmt::Loop { body, .. } => Stmt::walk(body, f),
+                _ => {}
+            }
+        }
+    }
+
+    /// [`Stmt::walk`], mutably.
+    pub fn walk_mut(body: &mut [Stmt], f: &mut dyn FnMut(&mut Stmt)) {
+        for stmt in body {
+            f(stmt);
+            match stmt {
+                Stmt::If { accept, reject, .. } => {
+                    Stmt::walk_mut(accept, f);
+                    Stmt::walk_mut(reject, f);
+                }
+                Stmt::Loop { body, .. } => Stmt::walk_mut(body, f),
+                _ => {}
+            }
+        }
+    }
+
+    /// The expressions of this statement, not of its nested bodies.
+    pub fn for_each_expr(&self, f: &mut dyn FnMut(&TileExpr)) {
+        match self {
+            Stmt::Store {
+                addr, value, mask, ..
+            }
+            | Stmt::AtomicAdd {
+                addr, value, mask, ..
+            } => {
+                addr.for_each_expr(f);
+                f(value);
+                f(mask);
+            }
+            Stmt::StoreLocal { value, .. } => f(value),
+            Stmt::StoreTile { index, value, .. } => {
+                f(index);
+                f(value);
+            }
+            Stmt::FillTile { value, bounds, .. } => {
+                f(value);
+                for bound in bounds.iter().flatten() {
+                    f(bound);
+                }
+            }
+            Stmt::CoopStore { acc, addr, .. } => {
+                f(acc);
+                addr.for_each_expr(f);
+            }
+            Stmt::CoopStoreTile { acc, row, col, .. } => {
+                f(acc);
+                f(row);
+                f(col);
+            }
+            Stmt::If { condition, .. } => f(condition),
+            Stmt::Loop {
+                count,
+                accumulators,
+                ..
+            } => {
+                if let Some(count) = count {
+                    f(count);
+                }
+                for Accumulator { init, update, .. } in accumulators {
+                    f(init);
+                    f(update);
+                }
+            }
+            Stmt::Reduce { values, merge, .. } => {
+                for value in values {
+                    f(value);
+                }
+                for lane in &merge.body {
+                    f(lane);
+                }
+            }
+            Stmt::Break | Stmt::Return | Stmt::Barrier | Stmt::StorageBarrier => {}
+        }
+    }
+
     /// The memory spaces this statement makes stale for a reader.
     ///
     /// Either because it writes them, or — for the two barriers — because it

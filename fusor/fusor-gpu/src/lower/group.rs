@@ -8,13 +8,13 @@
 use fusor_ir::Result;
 use fusor_ir::error::Error;
 use fusor_ir::extract::Dispatch;
-use fusor_ir::ir::kernel::{KernelIr, Stmt, TileCompareOp};
+use fusor_ir::ir::kernel::{KernelIr, Stmt};
 use fusor_ir::ir::launch::{Launch, SchedPoint};
 use fusor_ir::target::LowerCtx;
 
 use crate::lower::{Ctx, distribute_workgroups, lower_member};
 
-pub(crate) fn lower_kgroup(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Result<KernelIr> {
+pub(crate) fn lower_kgroup(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Result<KernelIr> {
     let Launch::Group { members, .. } = op else {
         return Err(Error::Plan("lower_kgroup on a non-Group node".into()));
     };
@@ -75,8 +75,7 @@ pub(crate) fn lower_kgroup(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> 
     let mut offset = 0u32;
     let mut body: Vec<Stmt> = Vec::with_capacity(members.len());
     for m in members.iter().copied() {
-        let off = ctx.b.u32(offset);
-        let local = ctx.b.sub(linear.clone(), off);
+        let local = ctx.b.sub(linear.clone(), ctx.b.u32(offset));
         let k = lower_at(m, local.clone(), block)?;
         if k.block != block {
             return Err(Error::Plan(format!(
@@ -91,8 +90,7 @@ pub(crate) fn lower_kgroup(mut ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> 
         offset = offset
             .checked_add(n)
             .ok_or_else(|| Error::Plan("a group's grid overflows a u32".into()))?;
-        let n_e = ctx.b.u32(n);
-        let inside = ctx.b.compare(TileCompareOp::Lt, local, n_e);
+        let inside = ctx.b.lt(local, ctx.b.u32(n));
         // A uniform barrier between members lets the arena alias their
         // tiles: a workgroup runs one member, but the planner shares bytes
         // only across a barrier it can see.

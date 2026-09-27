@@ -30,7 +30,6 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
 use crate::arena::scalar_of;
-use crate::liveness::for_each_addr_expr;
 
 fn invalid(msg: impl Into<String>) -> Error {
     Error::Lower(LowerError::Validation(msg.into()))
@@ -112,7 +111,7 @@ fn for_each_element(ir: &KernelIr, f: &mut dyn FnMut(ElementType)) {
             }
         });
     });
-    for_each_stmt(&ir.body, &mut |stmt| match stmt {
+    Stmt::walk(&ir.body, &mut |stmt| match stmt {
         Stmt::StoreTile { dst, .. } | Stmt::FillTile { dst, .. } => f(dst.element),
         Stmt::CoopStoreTile { tile, .. } => f(tile.element),
         Stmt::StoreLocal { dst, .. } => f(dst.element),
@@ -427,7 +426,7 @@ fn check_types(ir: &KernelIr) -> Result<()> {
     }
     // Statement-level type agreement.
     let mut error: Option<Error> = None;
-    for_each_stmt(&ir.body, &mut |stmt| {
+    Stmt::walk(&ir.body, &mut |stmt| {
         if error.is_some() {
             return;
         }
@@ -560,7 +559,7 @@ fn check_loads_in(body: &[Stmt], env: &mut BoundEnv, seen: &mut FxHashSet<u64>) 
             }
             other => {
                 let mut result = Ok(());
-                stmt_root_exprs(other, &mut |expr| {
+                other.for_each_expr(&mut |expr| {
                     if result.is_ok() {
                         result = check_expr_loads(expr, env, seen);
                     }
@@ -789,7 +788,7 @@ fn local_key(local: &Local) -> usize {
 /// length is rejected rather than truncated.
 pub(crate) fn check_reduce_stmts(body: &[Stmt]) -> Result<()> {
     let mut error: Option<Error> = None;
-    for_each_stmt(body, &mut |stmt| {
+    Stmt::walk(body, &mut |stmt| {
         if error.is_some() {
             return;
         }
@@ -1022,7 +1021,7 @@ fn check_accumulator_writes(
 /// on one side, addressed rank-2.
 pub(crate) fn check_coop_stores(body: &[Stmt]) -> Result<()> {
     let mut error: Option<Error> = None;
-    for_each_stmt(body, &mut |stmt| {
+    Stmt::walk(body, &mut |stmt| {
         if error.is_some() {
             return;
         }
@@ -1052,83 +1051,9 @@ pub(crate) fn check_coop_stores(body: &[Stmt]) -> Result<()> {
 // Traversal helpers
 // ---------------------------------------------------------------------------
 
-/// Every statement in the tree, pre-order.
-pub(crate) fn for_each_stmt(body: &[Stmt], f: &mut dyn FnMut(&Stmt)) {
-    for stmt in body {
-        f(stmt);
-        match stmt {
-            Stmt::If { accept, reject, .. } => {
-                for_each_stmt(accept, f);
-                for_each_stmt(reject, f);
-            }
-            Stmt::Loop { body, .. } => for_each_stmt(body, f),
-            _ => {}
-        }
-    }
-}
-
-/// Every expression appearing directly in a statement (not its children).
-pub(crate) fn for_each_root_expr(body: &[Stmt], f: &mut dyn FnMut(&TileExpr)) {
-    for_each_stmt(body, &mut |stmt| stmt_root_exprs(stmt, f));
-}
-
-/// The expressions of one statement, without recursing into nested bodies.
-fn stmt_root_exprs(stmt: &Stmt, f: &mut dyn FnMut(&TileExpr)) {
-    match stmt {
-        Stmt::Store {
-            addr, value, mask, ..
-        }
-        | Stmt::AtomicAdd {
-            addr, value, mask, ..
-        } => {
-            for_each_addr_expr(addr, f);
-            f(value);
-            f(mask);
-        }
-        Stmt::StoreLocal { value, .. } => f(value),
-        Stmt::StoreTile { index, value, .. } => {
-            f(index);
-            f(value);
-        }
-        Stmt::FillTile { value, bounds, .. } => {
-            f(value);
-            for bound in bounds.iter().flatten() {
-                f(bound);
-            }
-        }
-        Stmt::CoopStore { acc, addr, .. } => {
-            f(acc);
-            for_each_addr_expr(addr, f);
-        }
-        Stmt::CoopStoreTile { acc, row, col, .. } => {
-            f(acc);
-            f(row);
-            f(col);
-        }
-        Stmt::If { condition, .. } => f(condition),
-        Stmt::Loop {
-            count,
-            accumulators,
-            ..
-        } => {
-            if let Some(count) = count {
-                f(count);
-            }
-            for Accumulator { init, update, .. } in accumulators {
-                f(init);
-                f(update);
-            }
-        }
-        Stmt::Reduce { values, merge, .. } => {
-            for value in values {
-                f(value);
-            }
-            for lane in &merge.body {
-                f(lane);
-            }
-        }
-        Stmt::Break | Stmt::Return | Stmt::Barrier | Stmt::StorageBarrier => {}
-    }
+/// Every expression appearing directly in a statement of the tree.
+fn for_each_root_expr(body: &[Stmt], f: &mut dyn FnMut(&TileExpr)) {
+    Stmt::walk(body, &mut |stmt| stmt.for_each_expr(f));
 }
 
 /// Post-order over an expression DAG, visiting each distinct node once.

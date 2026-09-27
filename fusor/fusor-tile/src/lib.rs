@@ -12,7 +12,9 @@
 
 mod arena;
 mod barrier;
+pub mod build;
 pub mod domains;
+mod flags;
 mod liveness;
 pub mod planner;
 pub mod rules;

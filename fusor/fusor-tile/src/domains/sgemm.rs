@@ -2,9 +2,7 @@
 //! predicates for candidate generation.
 
 use fusor_ir::device::Caps;
-use fusor_ir::dtype::Dtype;
 use fusor_ir::ir::launch::{SgemmDomain, SgemmParams};
-use fusor_ir::shape::Dim;
 use smallvec::SmallVec;
 
 use crate::domains::{DomainCtx, UNMEASURED, sgemm_order};
@@ -57,14 +55,6 @@ const fn p(double_buffer: bool, bm: u32, bn: u32, bk: u32, tm: u32, tn: u32) -> 
         tm,
         tn,
     }
-}
-
-/// Entry point for the scaffold's `domains::sgemm_legal` re-export.
-/// `m`, `n` and `k` price the domain; they never filter it.
-pub fn legal(m: Dim, n: Dim, k: Dim, dtype: Dtype, caps: &Caps) -> SgemmDomain {
-    let _ = (m, n, k);
-    let cx = DomainCtx::new(caps, crate::domains::default_planner());
-    sgemm_domain(dtype.byte_size() as u32, &cx)
 }
 
 /// Every `(double_buffer, BM, BN, BK, TM, TN)` satisfying the four
