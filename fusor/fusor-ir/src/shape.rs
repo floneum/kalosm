@@ -402,6 +402,28 @@ impl Layout {
     pub fn overlaps(&self) -> bool {
         self.strides.iter().any(|s| s.known_eq(Dim::Const(0)))
     }
+
+    /// One single-sub-axis [`AxisGroup`] per axis, or `None` when an extent
+    /// or stride is symbolic or overflows `u32`.
+    pub fn affine_groups(&self) -> Option<SmallVec<[AxisGroup; 4]>> {
+        self.shape
+            .iter()
+            .zip(&self.strides)
+            .map(|(d, s)| {
+                Some(AxisGroup::affine(
+                    u32::try_from(d.as_const()?).ok()?,
+                    u32::try_from(s.as_const()?).ok()?,
+                ))
+            })
+            .collect()
+    }
+}
+
+/// Element count of `shape`, or `None` under a symbolic extent or overflow.
+pub fn const_elements(shape: &[Dim]) -> Option<u64> {
+    shape
+        .iter()
+        .try_fold(1u64, |acc, d| acc.checked_mul(d.as_const()?))
 }
 
 /// One sub-axis of a logical axis. Strides may be zero (broadcast) or

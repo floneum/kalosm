@@ -24,19 +24,17 @@ rule!(
 /// extent. Whether specializing pays is decided by the pricing crate, and both
 /// variants stay live either way.
 pub fn specialize_dim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    let Op::Launch(Launch::Contract {
-        output,
-        m,
-        n,
-        k,
-        batch,
-        family,
-        post,
-        acc,
-        a,
-        b: rhs,
-        sched,
-    }) = &node.op
+    let Op::Launch(
+        op @ Launch::Contract {
+            m,
+            n,
+            k,
+            batch,
+            a,
+            b: rhs,
+            ..
+        },
+    ) = &node.op
     else {
         return None;
     };
@@ -78,20 +76,12 @@ pub fn specialize_dim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) 
         return None;
     }
 
-    let specialized = b
-        .add_launch(Launch::Contract {
-            output: output.clone(),
-            m: new_m.unwrap_or(*m),
-            n: new_n.unwrap_or(*n),
-            k: new_k.unwrap_or(*k),
-            batch: new_batch.unwrap_or(*batch),
-            family: *family,
-            post: post.clone(),
-            acc: *acc,
-            a: a.clone(),
-            b: rhs.clone(),
-            sched: sched.clone(),
-        })
-        .ok()?;
+    let mut specialized = op.clone();
+    if let Launch::Contract { m, n, k, batch, .. } = &mut specialized {
+        for (field, new) in [(m, new_m), (n, new_n), (k, new_k), (batch, new_batch)] {
+            *field = new.unwrap_or(*field);
+        }
+    }
+    let specialized = b.add_launch(specialized).ok()?;
     b.union(id, specialized).ok()
 }

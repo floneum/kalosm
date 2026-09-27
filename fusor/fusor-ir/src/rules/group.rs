@@ -10,7 +10,10 @@ use crate::egraph::{Builder, ClassId, Facts, Id, RuleTag};
 use crate::ir::launch::{Family, Launch, ScheduleDomain};
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
-use crate::rules::slab::{Deps, copy_operands, is_contraction, stage_rank};
+use crate::rules::slab::{
+    Deps, copy_operands, has_contract_spelling, is_contraction, outside_inputs, own_buffer,
+    stage_rank,
+};
 use rustc_hash::FxHashSet;
 use smallvec::SmallVec;
 
@@ -132,18 +135,6 @@ fn covers(b: &Builder<'_>, m: Id, out: &mut FxHashSet<ClassId>) {
     }
 }
 
-/// Whether a class binds its own buffer: an external leaf or a root the
-/// caller reads back. Everything else shares the step arena's binding.
-fn own_buffer(b: &Builder<'_>, class: ClassId, roots: &FxHashSet<ClassId>) -> bool {
-    roots.contains(&class)
-        || b.class_members(class.0).iter().any(|m| {
-            matches!(
-                b.node(*m).op,
-                Op::Logical(crate::ir::logical::Logical::Leaf(_))
-            )
-        })
-}
-
 /// Bindings a member needs beyond the uniform block and the arena: its
 /// output and every slab stage a root reads back, and its outside inputs
 /// that own a buffer.
@@ -156,15 +147,7 @@ fn bindings(
     let mut out = usize::from(roots.contains(&b.class_of(m)));
     match &b.node(m).op {
         Op::Launch(Launch::Slab { members, .. }) => {
-            let own: FxHashSet<ClassId> = members.iter().map(|s| b.class_of(*s)).collect();
-            for s in members.iter() {
-                for c in b.node(*s).children.iter() {
-                    let class = b.class_of(*c);
-                    if !own.contains(&class) {
-                        inputs.insert(class);
-                    }
-                }
-            }
+            outside_inputs(b, members, inputs);
             out += members[..members.len() - 1]
                 .iter()
                 .filter(|s| roots.contains(&b.class_of(**s)))
@@ -218,16 +201,14 @@ pub fn form_group(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> O
     let mut classes: Vec<ClassId> = Vec::new();
     // Siblings are contractions reading one of this contraction's inputs:
     // the products one activation or one gradient feeds.
-    let contraction = |m: Id| matches!(b.node(m).op, Op::Launch(Launch::Contract { .. }));
-    if !contraction(id)
-        && let Some(head) = head_root
-    {
+    let contraction = matches!(node.op, Op::Launch(Launch::Contract { .. }));
+    if !contraction && let Some(head) = head_root {
         classes.extend(roots.iter().filter(|r| **r < head).map(|r| b.class_of(*r)));
-    } else if contraction(id) {
+    } else if contraction {
         for c in node.children.iter() {
             for reader in b.readers_of(*c) {
                 let rc = b.class_of(reader);
-                if rc < class && b.class_members(rc.0).into_iter().any(contraction) {
+                if rc < class && has_contract_spelling(b, rc.0) {
                     classes.push(rc);
                 }
             }

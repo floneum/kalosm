@@ -22,13 +22,15 @@ pub mod split_k;
 pub mod stream;
 pub mod tuple;
 
+use crate::carrier::Carrier;
 use crate::dtype::Dtype;
-use crate::egraph::{Builder, Id, Rule};
+use crate::egraph::{Builder, Id, Rule, ViewSpine};
 use crate::ir::Op;
-use crate::ir::launch::{AccessPlan, IndexSpace, Launch, Operand};
+use crate::ir::launch::{AccessPlan, IndexSpace, Launch, Operand, ScheduleDomain};
 use crate::ir::logical::Logical;
 use crate::scalar::ScalarExpr;
-use crate::shape::{Dim, Layout, StrideSpec};
+use crate::shape::{Dim, Dims, Layout, StrideSpec};
+use smallvec::SmallVec;
 
 /// Position of a rule in whatever slice was handed to the driver. `RuleId`
 /// is positional, not global: a target concatenates [`CORE_RULES`] with its
@@ -110,6 +112,15 @@ pub fn rule(id: RuleId) -> &'static Rule {
     &CORE_RULES[id.0 as usize]
 }
 
+/// Bytes of private accumulator one invocation may hold: 256 (64 `f32`
+/// lanes, the widest shipped tile) for a carrier `PROMOTE` widens, 1024 for
+/// a `TUPLE` joint. `Caps` has no portable register-budget fact, so both are
+/// conservative policy; over budget a rule declines rather than minting a
+/// node no backend can lower.
+pub(crate) fn private_acc_bytes(_caps: &crate::device::Caps, promoted: bool) -> u64 {
+    if promoted { 256 } else { 1024 }
+}
+
 /// An operand read straight out of its producer's dense row-major layout.
 pub(crate) fn alias_operand_of(src: Id, shape: &[Dim]) -> Operand {
     Operand {
@@ -166,6 +177,146 @@ pub(crate) fn map_view(b: &Builder<'_>, id: Id) -> Option<MapView> {
         }
         _ => None,
     }
+}
+
+/// Splice `inner`'s body in for `Arg(slot)` of a reader of `ops`: the
+/// reader's other operands keep their order and low indices, the producer's
+/// are appended by the caller. Returns the retained operands and the
+/// substitution renumbering the reader's `Arg`s onto them.
+pub(crate) fn splice_args(
+    b: &Builder<'_>,
+    ops: &[Operand],
+    slot: usize,
+    inner: &MapView,
+) -> (Vec<Operand>, Vec<ScalarExpr>) {
+    let base = ops.len() - 1;
+    let body = shift_args(&inner.body, base as u32, &operand_dtypes(b, &inner.ops));
+    let args = operand_dtypes(b, ops)
+        .iter()
+        .enumerate()
+        .map(|(j, d)| match j.cmp(&slot) {
+            std::cmp::Ordering::Equal => body.clone(),
+            std::cmp::Ordering::Less => ScalarExpr::arg(j as u32, *d),
+            std::cmp::Ordering::Greater => ScalarExpr::arg(j as u32 - 1, *d),
+        })
+        .collect();
+    let mut retained: Vec<Operand> = Vec::with_capacity(base + inner.ops.len());
+    retained.extend(
+        ops.iter()
+            .enumerate()
+            .filter(|(j, _)| *j != slot)
+            .map(|(_, o)| o.clone()),
+    );
+    (retained, args)
+}
+
+/// A reduction nest, normalized out of whichever spelling the operand named
+/// as [`map_view`] normalizes a map: a `Logical::Fold` reads as the
+/// `Launch::Fold` fields `lower_fold` would mint, its lift as written.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct FoldView {
+    /// The id the operand named.
+    pub id: Id,
+    pub space: IndexSpace,
+    pub axis: u32,
+    pub vec_axes: SmallVec<[u32; 2]>,
+    pub carrier: Carrier,
+    pub acc: Dtype,
+    pub post: SmallVec<[ScalarExpr; 4]>,
+    pub ops: Vec<Operand>,
+    pub sched: ScheduleDomain,
+}
+
+impl FoldView {
+    /// The domain this nest's own expressions are written against.
+    pub(crate) fn iter_space(&self) -> IndexSpace {
+        IndexSpace {
+            dims: self.space.iter_dims(&self.vec_axes),
+        }
+    }
+
+    /// The reduced axis's index in [`Self::iter_space`]: `vec_axes` is the
+    /// contiguous block immediately before `axis`.
+    pub(crate) fn reduced_iter_axis(&self) -> Option<u32> {
+        self.axis
+            .checked_sub(u32::try_from(self.vec_axes.len()).ok()?)
+    }
+
+    /// The output dims before the carrier axis.
+    pub(crate) fn base_dims(&self) -> Dims {
+        self.space.fold_out_dims(self.axis, &self.vec_axes)
+    }
+}
+
+/// Read `id` as a reduction nest, in either spelling.
+pub(crate) fn fold_view(b: &Builder<'_>, id: Id) -> Option<FoldView> {
+    match b.node(id).op.clone() {
+        Op::Launch(Launch::Fold {
+            space,
+            axis,
+            vec_axes,
+            carrier,
+            acc,
+            post,
+            ops,
+            sched,
+        }) => Some(FoldView {
+            id,
+            space,
+            axis,
+            vec_axes,
+            carrier,
+            acc,
+            post,
+            ops,
+            sched,
+        }),
+        Op::Logical(Logical::Fold {
+            carrier,
+            axis,
+            acc,
+            ins,
+        }) => {
+            let in_shape = b.facts_of(*ins.first()?).shape.clone();
+            Some(FoldView {
+                id,
+                space: IndexSpace::new(in_shape.iter().copied()),
+                axis,
+                vec_axes: SmallVec::new(),
+                post: (0..carrier.width())
+                    .map(|i| ScalarExpr::arg(i as u32, acc))
+                    .collect(),
+                carrier,
+                acc,
+                ops: ins
+                    .iter()
+                    .map(|x| alias_operand_of(*x, &in_shape))
+                    .collect(),
+                sched: ScheduleDomain::Point,
+            })
+        }
+        _ => None,
+    }
+}
+
+/// Re-apply a chain of pure views over a rewritten base, innermost first.
+/// Rebuilding the nodes rather than composing their specs keeps every relative
+/// stride exactly as it was written.
+pub(crate) fn rebuild_spine(b: &mut Builder<'_>, spine: &ViewSpine, base: Id) -> Option<Id> {
+    let mut cur = base;
+    for &v in &spine.views {
+        let Op::Logical(Logical::Restride { specs, bounds, .. }) = b.node(v).op.clone() else {
+            return None;
+        };
+        cur = b
+            .add_logical(Logical::Restride {
+                specs,
+                bounds,
+                x: cur,
+            })
+            .ok()?;
+    }
+    Some(cur)
 }
 
 /// Renumber `Arg(i)` to `Arg(i + by)` throughout `e`, given each argument's

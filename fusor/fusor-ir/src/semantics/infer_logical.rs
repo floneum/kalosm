@@ -221,13 +221,7 @@ fn infer_map(expr: &ScalarExpr, ins: &[ValueFacts], outs: u8) -> Result<ValueFac
     // The frontend emits `Restride { multiplier: 0 }` instead.
     if let Some(first) = ins.first() {
         for other in &ins[1..] {
-            let same = other.rank() == first.rank()
-                && other
-                    .shape
-                    .iter()
-                    .zip(&first.shape)
-                    .all(|(a, b)| a.known_eq(*b));
-            if !same {
+            if other.shape != first.shape {
                 return Err(Error::Shape(format!(
                     "Map operands must have identical shape; the frontend emits \
                      Restride{{multiplier:0}} ({:?} vs {:?})",
@@ -277,9 +271,7 @@ fn infer_fold(carrier: &Carrier, axis: u32, acc: Dtype, ins: &[ValueFacts]) -> R
         )));
     }
     for (i, f) in ins.iter().enumerate().skip(1) {
-        if f.shape.len() != x.shape.len()
-            || !f.shape.iter().zip(&x.shape).all(|(a, b)| a.known_eq(*b))
-        {
+        if f.shape != x.shape {
             return Err(Error::Shape(format!(
                 "Fold operand {i} has shape {:?}, expected {:?}",
                 f.shape, x.shape

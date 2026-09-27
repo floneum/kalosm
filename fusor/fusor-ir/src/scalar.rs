@@ -323,6 +323,25 @@ impl ScalarExpr {
         found
     }
 
+    /// Whether the body reads the coordinate of `axis`.
+    pub fn reads_axis(&self, axis: u32) -> bool {
+        let mut found = false;
+        self.walk(&mut |e| found |= matches!(e.kind(), ScalarKind::IndexOf(a) if *a == axis));
+        found
+    }
+
+    /// Append every `Arg` index the body reads to `out`, first use first,
+    /// skipping any already there.
+    pub fn collect_args(&self, out: &mut Vec<u32>) {
+        self.walk(&mut |e| {
+            if let ScalarKind::Arg(i) = e.kind()
+                && !out.contains(i)
+            {
+                out.push(*i);
+            }
+        });
+    }
+
     /// Substitute operand expressions for `Arg(i)` throughout the body.
     pub fn compose(&self, args: &[ScalarExpr]) -> Self {
         self.rewrite(&mut |e| match e.kind() {

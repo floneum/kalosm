@@ -233,6 +233,17 @@ impl Splat {
         }
     }
 
+    /// The value as `f64`, exact for every variant.
+    pub fn to_f64(self) -> f64 {
+        match self {
+            Self::F32(v) => f64::from(v),
+            Self::F16(b) => half::f16::from_bits(b).to_f64(),
+            Self::BF16(b) => half::bf16::from_bits(b).to_f64(),
+            Self::U32(v) => f64::from(v),
+            Self::I32(v) => f64::from(v),
+        }
+    }
+
     pub const fn bits(self) -> u32 {
         match self {
             Self::F32(v) => v.to_bits(),

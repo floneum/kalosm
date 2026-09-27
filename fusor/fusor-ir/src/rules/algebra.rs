@@ -164,10 +164,7 @@ fn fold_split(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option
     // One blocking view serves every operand, so all operands must agree on
     // the shape it is stated against; otherwise decline.
     for i in 1..ins.len() {
-        let other = &f.operand(i)?.shape;
-        if other.len() != shape.len()
-            || !other.iter().zip(shape.iter()).all(|(a, c)| a.known_eq(*c))
-        {
+        if f.operand(i)?.shape != shape {
             return None;
         }
     }
@@ -336,7 +333,7 @@ fn fold_elide(b: &mut Builder<'_>, node: &Node, f: &Facts<'_>) -> Option<Id> {
     // Narrowing to `[lo, hi)` renumbers the reduced coordinate down by `lo`;
     // a body that names that coordinate would read the wrong index, so it
     // declines unless the window starts at zero.
-    if lo > 0 && bodies.iter().any(|e| reads_index_of(e, *axis)) {
+    if lo > 0 && bodies.iter().any(|e| e.reads_axis(*axis)) {
         return None;
     }
 
@@ -385,7 +382,7 @@ fn true_range(cond: &ScalarExpr, axis: u32, extent: u64) -> Option<(u64, u64)> {
         (_, ScalarKind::IndexOf(i)) if *i == axis => (flip(*op), eval_closed(a)?),
         _ => return None,
     };
-    let v = to_f64(bound);
+    let v = bound.to_f64();
     if !v.is_finite() || v.fract() != 0.0 || v < 0.0 || v > u32::MAX as f64 {
         return None;
     }
@@ -416,13 +413,6 @@ fn flip(op: CmpOp) -> CmpOp {
         CmpOp::Eq => CmpOp::Eq,
         CmpOp::Ne => CmpOp::Ne,
     }
-}
-
-/// Whether `e` names the loop coordinate of `axis`.
-fn reads_index_of(e: &ScalarExpr, axis: u32) -> bool {
-    let mut found = false;
-    e.walk(&mut |e| found |= matches!(e.kind(), ScalarKind::IndexOf(a) if *a == axis));
-    found
 }
 
 /// Whether `e` rounds anywhere: the one syntactic marker of a value whose
@@ -702,15 +692,15 @@ fn eval_closed(e: &ScalarExpr) -> Option<Splat> {
     match e.kind() {
         ScalarKind::Lit(Lit(v)) => Some(*v),
         ScalarKind::Un { op, x } => {
-            let v = to_f64(eval_closed(x)?);
+            let v = eval_closed(x)?.to_f64();
             from_f64(apply_un(*op, v)?, out)
         }
         ScalarKind::Bin { op, a, b } => {
-            let (x, y) = (to_f64(eval_closed(a)?), to_f64(eval_closed(b)?));
+            let (x, y) = (eval_closed(a)?.to_f64(), eval_closed(b)?.to_f64());
             from_f64(apply_bin(*op, x, y, out)?, out)
         }
         ScalarKind::Cmp { op, a, b } => {
-            let (x, y) = (to_f64(eval_closed(a)?), to_f64(eval_closed(b)?));
+            let (x, y) = (eval_closed(a)?.to_f64(), eval_closed(b)?.to_f64());
             let t = match op {
                 CmpOp::Lt => x < y,
                 CmpOp::Le => x <= y,
@@ -722,16 +712,16 @@ fn eval_closed(e: &ScalarExpr) -> Option<Splat> {
             from_f64(if t { 1.0 } else { 0.0 }, out)
         }
         ScalarKind::Select { c, t, f } => {
-            if to_f64(eval_closed(c)?) != 0.0 {
+            if eval_closed(c)?.to_f64() != 0.0 {
                 eval_closed(t)
             } else {
                 eval_closed(f)
             }
         }
-        ScalarKind::Cast { to, x } => from_f64(to_f64(eval_closed(x)?), *to),
+        ScalarKind::Cast { to, x } => from_f64(eval_closed(x)?.to_f64(), *to),
         ScalarKind::Bitcast { to, x } => from_bits(eval_closed(x)?.bits(), *to),
         ScalarKind::Round { mode, x } => {
-            let v = to_f64(eval_closed(x)?);
+            let v = eval_closed(x)?.to_f64();
             from_f64(apply_round(*mode, v), out)
         }
         ScalarKind::Arg(_)
@@ -739,16 +729,6 @@ fn eval_closed(e: &ScalarExpr) -> Option<Splat> {
         | ScalarKind::IndexOf(_)
         | ScalarKind::Dot { .. }
         | ScalarKind::Splat { .. } => None,
-    }
-}
-
-fn to_f64(s: Splat) -> f64 {
-    match s {
-        Splat::F32(v) => f64::from(v),
-        Splat::F16(bits) => half::f16::from_bits(bits).to_f64(),
-        Splat::BF16(bits) => half::bf16::from_bits(bits).to_f64(),
-        Splat::U32(v) => f64::from(v),
-        Splat::I32(v) => f64::from(v),
     }
 }
 
@@ -953,7 +933,7 @@ fn peephole(e: &ScalarExpr) -> Option<ScalarExpr> {
             let ScalarKind::Lit(Lit(v)) = c.kind() else {
                 return None;
             };
-            Some(if to_f64(*v) != 0.0 {
+            Some(if v.to_f64() != 0.0 {
                 t.clone()
             } else {
                 f.clone()
@@ -965,7 +945,7 @@ fn peephole(e: &ScalarExpr) -> Option<ScalarExpr> {
 }
 
 fn lit_is(e: &ScalarExpr, v: f64) -> bool {
-    matches!(e.kind(), ScalarKind::Lit(Lit(s)) if to_f64(*s) == v)
+    matches!(e.kind(), ScalarKind::Lit(Lit(s)) if s.to_f64() == v)
 }
 
 /// The type side of the `widen-compute` lowering rule: a `Map` storing F16 or
@@ -1026,7 +1006,7 @@ fn widen(e: &ScalarExpr) -> Option<ScalarExpr> {
             if d.compute_dtype() == d {
                 e.clone()
             } else {
-                ScalarExpr::lit(from_f64(to_f64(*v), d.compute_dtype())?)
+                ScalarExpr::lit(from_f64(v.to_f64(), d.compute_dtype())?)
             }
         }
         ScalarKind::IndexOf(a) => ScalarExpr::index_of(*a),

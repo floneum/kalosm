@@ -29,7 +29,7 @@ use crate::egraph::{Builder, Facts, Id, RuleTag};
 use crate::ir::launch::{AccessPlan, ContractSide, IndexSpace, Launch, Operand};
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
-use crate::rules::{MapView, access_legal_in, map_view, operand_dtypes, shift_args};
+use crate::rules::{MapView, access_legal_in, map_view, operand_dtypes, shift_args, splice_args};
 use crate::scalar::ScalarExpr;
 use crate::shape::{AxisGroup, Dim, Layout, MultiFlattenMap};
 use smallvec::SmallVec;
@@ -115,26 +115,7 @@ fn splice(
     if !reads_producer_densely(&ops[slot], &inner.space.dims, space, vec_axes) {
         return None;
     }
-    let base = ops.len() - 1;
-    let inner_dtypes = operand_dtypes(b, &inner.ops);
-    let body = shift_args(&inner.body, base as u32, &inner_dtypes);
-    let outer_dtypes = operand_dtypes(b, ops);
-
-    let mut args: Vec<ScalarExpr> = Vec::with_capacity(ops.len());
-    for (j, d) in outer_dtypes.iter().enumerate() {
-        args.push(match j.cmp(&slot) {
-            std::cmp::Ordering::Equal => body.clone(),
-            std::cmp::Ordering::Less => ScalarExpr::arg(j as u32, *d),
-            std::cmp::Ordering::Greater => ScalarExpr::arg(j as u32 - 1, *d),
-        });
-    }
-    let mut new_ops: Vec<Operand> = Vec::with_capacity(base + inner.ops.len());
-    new_ops.extend(
-        ops.iter()
-            .enumerate()
-            .filter(|(j, _)| *j != slot)
-            .map(|(_, o)| o.clone()),
-    );
+    let (mut new_ops, args) = splice_args(b, ops, slot, inner);
     for o in &inner.ops {
         if space == &inner.space {
             new_ops.push(o.clone());
@@ -191,18 +172,7 @@ pub(crate) fn widen_operand(
 pub(crate) fn operand_groups(o: &Operand) -> Option<SmallVec<[AxisGroup; 4]>> {
     match &o.access {
         AccessPlan::Unflatten(m) => Some(m.groups.clone()),
-        AccessPlan::Alias => o
-            .layout
-            .shape()
-            .iter()
-            .zip(o.layout.strides())
-            .map(|(d, s)| {
-                Some(AxisGroup::affine(
-                    u32::try_from(d.as_const()?).ok()?,
-                    u32::try_from(s.as_const()?).ok()?,
-                ))
-            })
-            .collect::<Option<_>>(),
+        AccessPlan::Alias => o.layout.affine_groups(),
         AccessPlan::Gather | AccessPlan::Pack { .. } => None,
     }
 }
@@ -337,17 +307,7 @@ fn dense_read_map(
     space: &IndexSpace,
     vec_axes: &[u32],
 ) -> Option<crate::ir::launch::AddressMap> {
-    let strides = Layout::row_major_strides(producer_shape);
-    let src: SmallVec<[AxisGroup; 4]> = producer_shape
-        .iter()
-        .zip(&strides)
-        .map(|(d, s)| {
-            Some(AxisGroup::affine(
-                u32::try_from(d.as_const()?).ok()?,
-                u32::try_from(s.as_const()?).ok()?,
-            ))
-        })
-        .collect::<Option<_>>()?;
+    let src = Layout::contiguous(producer_shape).affine_groups()?;
     let groups = widen_groups(&src, space, vec_axes)?;
     Operand {
         src: Id(0),
@@ -397,28 +357,7 @@ fn splice_through_address_map(
     if ops[slot].address_map()? != want {
         return None;
     }
-
-    let base = ops.len() - 1;
-    let inner_dtypes = operand_dtypes(b, &inner.ops);
-    let body = shift_args(&inner.body, base as u32, &inner_dtypes);
-    let outer_dtypes = operand_dtypes(b, ops);
-
-    let mut args: Vec<ScalarExpr> = Vec::with_capacity(ops.len());
-    for (j, d) in outer_dtypes.iter().enumerate() {
-        args.push(match j.cmp(&slot) {
-            std::cmp::Ordering::Equal => body.clone(),
-            std::cmp::Ordering::Less => ScalarExpr::arg(j as u32, *d),
-            std::cmp::Ordering::Greater => ScalarExpr::arg(j as u32 - 1, *d),
-        });
-    }
-
-    let mut new_ops: Vec<Operand> = Vec::with_capacity(base + inner.ops.len());
-    new_ops.extend(
-        ops.iter()
-            .enumerate()
-            .filter(|(j, _)| *j != slot)
-            .map(|(_, o)| o.clone()),
-    );
+    let (mut new_ops, args) = splice_args(b, ops, slot, inner);
     for o in &inner.ops {
         // Collapse a pure view into the layout first, with the same helper the
         // dependence query uses: the floor spells a broadcast as a `Restride`
@@ -475,24 +414,52 @@ fn absorb_step(
 /// term the rule builds.
 const MAX_ABSORBED_OPERANDS: usize = 32;
 
+/// Splice producers into `exprs` one step at a time until none is left or the
+/// next list would not bind, returning the final operand list, or `None`
+/// when nothing absorbed. Every step replaces one operand by producers with
+/// strictly smaller ids, so it terminates; the ceiling bounds the width a
+/// producer read twice by one chain adds.
+fn absorb_chain(
+    b: &Builder<'_>,
+    f: &Facts<'_>,
+    mut cur: Vec<Operand>,
+    exprs: &mut [ScalarExpr],
+    step: impl Fn(&[Operand]) -> Option<Spliced>,
+) -> Option<Vec<Operand>> {
+    let budget = f.caps().limits.max_storage_buffers_per_shader_stage as usize;
+    let mut fired = false;
+    while cur.len() <= MAX_ABSORBED_OPERANDS {
+        let Some(spliced) = step(&cur) else {
+            break;
+        };
+        // Stop at the last operand list the device can bind: one launch is
+        // one bind group, so a fused nest reading more distinct buffers than
+        // `max_storage_buffers_per_shader_stage` allows is a kernel the
+        // backend cannot create, and extraction has already committed by the
+        // time `create_bind_group_layout` says so.
+        if storage_bindings(b, &spliced.ops) > budget {
+            break;
+        }
+        for e in exprs.iter_mut() {
+            *e = e.compose(&spliced.args);
+        }
+        cur = spliced.ops;
+        fired = true;
+    }
+    fired.then_some(cur)
+}
+
 /// ABSORB, greedy: absorb the maximal chain of elementwise producers into
 /// every slot's lift and mint ONE fold.
 pub fn absorb(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let fused = build_absorbed_fold(b, node, f)?;
-    b.union(id, fused).ok()
-}
-
-fn build_absorbed_fold(b: &mut Builder<'_>, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Launch(
         k @ Launch::Fold {
             space,
-            axis,
             vec_axes,
             carrier,
             acc,
-            post,
             ops,
-            sched,
+            ..
         },
     ) = &node.op
     else {
@@ -508,33 +475,13 @@ fn build_absorbed_fold(b: &mut Builder<'_>, node: &Node, f: &Facts<'_>) -> Optio
         return None;
     }
     let iter = k.iter_space();
-
-    let budget = f.caps().limits.max_storage_buffers_per_shader_stage as usize;
-    let mut cur: Vec<Operand> = ops.clone();
+    // Substituted into EVERY slot's lift. A carrier is one expression per
+    // slot; absorbing into slot 0 alone is how a multi-slot fold silently
+    // computes one right answer and one wrong one.
     let mut lift: SmallVec<[ScalarExpr; 4]> = carrier.lift.clone();
-    let mut fired = false;
-    while cur.len() <= MAX_ABSORBED_OPERANDS {
-        let Some(spliced) = absorb_step(b, &cur, space, &iter, vec_axes) else {
-            break;
-        };
-        // Stop at the last operand list the device can bind: one launch is
-        // one bind group, so a fused nest reading more distinct buffers than
-        // `max_storage_buffers_per_shader_stage` allows is a kernel the
-        // backend cannot create, and extraction has already committed by the
-        // time `create_bind_group_layout` says so.
-        if storage_bindings(b, &spliced.ops) > budget {
-            break;
-        }
-        // Substituted into EVERY slot's lift. A carrier is one expression per
-        // slot; absorbing into slot 0 alone is how a multi-slot fold silently
-        // computes one right answer and one wrong one.
-        lift = lift.iter().map(|l| l.compose(&spliced.args)).collect();
-        cur = spliced.ops;
-        fired = true;
-    }
-    if !fired {
-        return None;
-    }
+    let cur = absorb_chain(b, f, ops.clone(), &mut lift, |cur| {
+        absorb_step(b, cur, space, &iter, vec_axes)
+    })?;
     let mut distinct = Vec::new();
     let remap: Vec<_> = cur
         .iter()
@@ -547,25 +494,19 @@ fn build_absorbed_fold(b: &mut Builder<'_>, node: &Node, f: &Facts<'_>) -> Optio
             }
         })
         .collect();
-    lift = lift
-        .iter()
-        .map(|e| crate::carrier::map_args(e, &|i| remap[i as usize]))
-        .collect();
-    let cur = distinct;
-    let fused = Launch::Fold {
-        space: space.clone(),
-        axis: *axis,
-        vec_axes: vec_axes.clone(),
-        carrier: carrier.clone().with_lift(lift),
-        acc: *acc,
-        post: post.clone(),
-        ops: cur,
-        sched: sched.clone(),
-    };
+    let mut fused = k.clone();
+    if let Launch::Fold { carrier, ops, .. } = &mut fused {
+        carrier.lift = lift
+            .iter()
+            .map(|e| crate::carrier::map_args(e, &|i| remap[i as usize]))
+            .collect();
+        *ops = distinct;
+    }
     // Checked before minting: an absorbed operand whose layout does not match
     // this nest's index space is a node `verify_plan` would reject.
     crate::verify_launch::check_operand_access(&fused).ok()?;
-    b.add_launch(fused).ok()
+    let fused = b.add_launch(fused).ok()?;
+    b.union(id, fused).ok()
 }
 
 /// Storage bindings one launch rooted at a nest with these operands needs:
@@ -614,54 +555,30 @@ fn storage_bindings(b: &Builder<'_>, ops: &[Operand]) -> usize {
 /// every class member widens the extraction frontier under a fixed move
 /// budget and was measured as a net regression.
 pub fn map_into_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::Launch(Launch::Map {
-        space,
-        body,
-        ops,
-        sched,
-    }) = &node.op
+    let Op::Launch(
+        op @ Launch::Map {
+            space, body, ops, ..
+        },
+    ) = &node.op
     else {
         return None;
     };
     if ops.is_empty() {
         return None;
     }
-    let budget = f.caps().limits.max_storage_buffers_per_shader_stage as usize;
-    let mut cur: Vec<Operand> = ops.clone();
-    let mut expr = body.clone();
-    let mut fired = false;
-    // Terminates for `ABSORB`'s reason: every step replaces one operand by
-    // producers with strictly smaller ids. The ceiling bounds the width a
-    // producer read twice by one chain adds, not the depth.
-    while cur.len() <= MAX_ABSORBED_OPERANDS {
-        let Some(spliced) = cur.iter().enumerate().find_map(|(i, o)| {
+    let mut body = [body.clone()];
+    let cur = absorb_chain(b, f, ops.clone(), &mut body, |cur| {
+        cur.iter().enumerate().find_map(|(i, o)| {
             let view = map_view(b, o.src)?;
             // A `Map` has no `vec_axes`, so its iteration space is its
             // index space and the promoted dispatch has nothing to add.
-            splice(b, &cur, i, &view, space, space, &[])
-        }) else {
-            break;
-        };
-        // Stop at the last operand list the device can bind: one launch is
-        // one bind group, so a fused map reading more distinct buffers than
-        // `max_storage_buffers_per_shader_stage` allows is a kernel the
-        // backend cannot create.
-        if storage_bindings(b, &spliced.ops) > budget {
-            break;
-        }
-        expr = expr.compose(&spliced.args);
-        cur = spliced.ops;
-        fired = true;
+            splice(b, cur, i, &view, space, space, &[])
+        })
+    })?;
+    let mut fused = op.clone();
+    if let Launch::Map { body: b0, ops, .. } = &mut fused {
+        (*b0, *ops) = (body[0].clone(), cur);
     }
-    if !fired {
-        return None;
-    }
-    let fused = Launch::Map {
-        space: space.clone(),
-        body: expr,
-        ops: cur,
-        sched: sched.clone(),
-    };
     crate::verify_launch::check_operand_access(&fused).ok()?;
     let fused = b.add_launch(fused).ok()?;
     b.union(id, fused).ok()
@@ -672,19 +589,17 @@ pub fn map_into_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
 /// `Contract` carries exactly two operand edges, so only a one-operand
 /// producer can be absorbed without inventing a third edge.
 pub fn map_into_contract(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::Launch(Launch::Contract {
-        output,
-        m,
-        n,
-        k,
-        batch,
-        family,
-        post,
-        acc,
-        a,
-        b: rhs,
-        sched,
-    }) = &node.op
+    let Op::Launch(
+        op @ Launch::Contract {
+            m,
+            n,
+            k,
+            batch,
+            a,
+            b: rhs,
+            ..
+        },
+    ) = &node.op
     else {
         return None;
     };
@@ -708,21 +623,12 @@ pub fn map_into_contract(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>
     if storage_bindings(b, &all) > budget {
         return None;
     }
-    let fused = b
-        .add_launch(Launch::Contract {
-            output: output.clone(),
-            m: *m,
-            n: *n,
-            k: *k,
-            batch: *batch,
-            family: *family,
-            post: post.clone(),
-            acc: *acc,
-            a: new_a.unwrap_or_else(|| a.clone()),
-            b: new_b.unwrap_or_else(|| rhs.clone()),
-            sched: sched.clone(),
-        })
-        .ok()?;
+    let mut fused = op.clone();
+    if let Launch::Contract { a, b: rhs, .. } = &mut fused {
+        *a = new_a.unwrap_or_else(|| a.clone());
+        *rhs = new_b.unwrap_or_else(|| rhs.clone());
+    }
+    let fused = b.add_launch(fused).ok()?;
     b.union(id, fused).ok()
 }
 
@@ -765,15 +671,7 @@ fn absorb_into_side(
             // Only an identity read of the view composes by substitution:
             // the operand's own strides must be the view value's dense
             // row-major set, or the composed walk is not the view's.
-            let view_shape = b.facts_of(p.src).shape.clone();
-            if p.layout.shape() != &view_shape[..]
-                || !p.layout.offset().known_eq(Dim::Const(0))
-                || p.layout
-                    .strides()
-                    .iter()
-                    .zip(&Layout::row_major_strides(&view_shape))
-                    .any(|(s, w)| !s.known_eq(*w))
-            {
+            if !p.layout.is_contiguous() || p.layout.shape() != &b.facts_of(p.src).shape[..] {
                 continue;
             }
             let Op::Logical(crate::ir::logical::Logical::Restride { specs, .. }) =
@@ -952,17 +850,10 @@ pub fn fold_post_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_
     if ops.len() != 1 || !matches!(ops[0].access, AccessPlan::Alias) {
         return None;
     }
-    let Op::Launch(Launch::Fold {
-        space: inner_space,
-        axis,
-        vec_axes,
-        carrier,
-        acc,
-        post,
-        ops: inner_ops,
-        sched,
-    }) = b.node(ops[0].src).op.clone()
-    else {
+    let Op::Launch(mut extended) = b.node(ops[0].src).op.clone() else {
+        return None;
+    };
+    let Launch::Fold { carrier, post, .. } = &mut extended else {
         return None;
     };
     // A `Map` body reads one value; a multi-slot fold offers several, and
@@ -971,28 +862,11 @@ pub fn fold_post_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_
         return None;
     }
     // The epilogue must run at the fold's own output space.
-    let out_shape = &b.facts_of(ops[0].src).shape;
-    if space.dims.len() != out_shape.len()
-        || !space
-            .dims
-            .iter()
-            .zip(out_shape.iter())
-            .all(|(a, c)| a.known_eq(*c))
-    {
+    if space.dims != b.facts_of(ops[0].src).shape {
         return None;
     }
     let _ = f;
-    let extended = b
-        .add_launch(Launch::Fold {
-            space: inner_space,
-            axis,
-            vec_axes,
-            carrier,
-            acc,
-            post: smallvec::smallvec![body.compose(&[post[0].clone()])],
-            ops: inner_ops,
-            sched,
-        })
-        .ok()?;
+    *post = smallvec::smallvec![body.compose(&[post[0].clone()])];
+    let extended = b.add_launch(extended).ok()?;
     b.union(id, extended).ok()
 }

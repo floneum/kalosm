@@ -31,9 +31,7 @@ impl ValueFacts {
     }
 
     pub fn elements(&self) -> Option<u64> {
-        self.shape
-            .iter()
-            .try_fold(1u64, |acc, d| acc.checked_mul(d.as_const()?))
+        crate::shape::const_elements(&self.shape)
     }
 
     pub fn bytes(&self) -> Option<u64> {

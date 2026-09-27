@@ -12,7 +12,7 @@ use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
 use crate::rules::ident_expr;
 use crate::scalar::{BinOp, CmpOp, ScalarExpr};
-use crate::shape::{Dim, Layout};
+use crate::shape::{Dim, Layout, const_row_major};
 use smallvec::SmallVec;
 
 rule!(
@@ -22,16 +22,6 @@ rule!(
     tag = RuleTag::Additive,
     apply = scatter_as_fold,
 );
-
-fn contiguous_strides(shape: &[Dim]) -> Option<Vec<u64>> {
-    let mut strides = vec![0u64; shape.len()];
-    let mut acc = 1u64;
-    for (i, d) in shape.iter().enumerate().rev() {
-        strides[i] = acc;
-        acc = acc.checked_mul(d.as_const()?)?;
-    }
-    Some(strides)
-}
 
 pub fn scatter_as_fold(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     // The dense scatter's per-lane loop is the GPU's problem; the CPU
@@ -76,8 +66,8 @@ pub fn scatter_as_fold(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>)
     let rank = base_shape.len();
     let mut space: SmallVec<[Dim; 6]> = SmallVec::from_vec(base_shape.clone());
     space.push(updates);
-    let base_strides = contiguous_strides(&base_shape)?;
-    let upd_strides = contiguous_strides(upd_shape)?;
+    let base_strides = const_row_major(&base_shape)?;
+    let upd_strides = const_row_major(upd_shape)?;
     let dim = |v: u64| Dim::Const(v);
     let layout = |strides: Vec<u64>| -> Option<Layout> {
         let strides: Vec<Dim> = strides.into_iter().map(dim).collect();

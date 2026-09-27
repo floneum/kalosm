@@ -211,13 +211,7 @@ pub(crate) fn check_map_shapes(cx: &VerifyCtx<'_>) -> Result<()> {
         return Ok(());
     };
     for (i, other) in cx.operands.iter().enumerate().skip(1) {
-        let same = other.rank() == first.rank()
-            && other
-                .shape
-                .iter()
-                .zip(&first.shape)
-                .all(|(a, b)| a.known_eq(*b));
-        if !same {
+        if other.shape != first.shape {
             return Err(fail(
                 cx,
                 format!(

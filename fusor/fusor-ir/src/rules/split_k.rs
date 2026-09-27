@@ -30,19 +30,20 @@ const MIN_CHUNK: u64 = 32;
 const SPLITS: [u64; 4] = [4, 8, 16, 32];
 
 pub fn split_k(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    let Op::Launch(Launch::Contract {
-        output,
-        m,
-        n,
-        k,
-        batch,
-        family,
-        post,
-        acc,
-        a,
-        b: rhs,
-        sched,
-    }) = &node.op
+    let Op::Launch(
+        op @ Launch::Contract {
+            output,
+            m,
+            n,
+            k,
+            batch,
+            post,
+            acc,
+            a,
+            b: rhs,
+            ..
+        },
+    ) = &node.op
     else {
         return None;
     };
@@ -133,21 +134,22 @@ pub fn split_k(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Opti
         let b2 = side(rhs, b_k.axis, b_k.batch_axes)?;
         let mut partial_output = output.clone();
         partial_output.dims.insert(batch_axes, Dim::Const(s));
-        let partials = b
-            .add_launch(Launch::Contract {
-                output: partial_output.clone(),
-                m: *m,
-                n: *n,
-                k: chunk,
-                batch: *batch * Dim::Const(s),
-                family: *family,
-                post: ident_expr(*acc),
-                acc: *acc,
-                a: a2,
-                b: b2,
-                sched: sched.clone(),
-            })
-            .ok()?;
+        let mut partials = op.clone();
+        if let Launch::Contract {
+            output,
+            k,
+            batch,
+            post,
+            a,
+            b: rhs,
+            ..
+        } = &mut partials
+        {
+            (*output, *k, *post, *a, *rhs) =
+                (partial_output.clone(), chunk, ident_expr(*acc), a2, b2);
+            *batch = *batch * Dim::Const(s);
+        }
+        let partials = b.add_launch(partials).ok()?;
         let sum = b
             .add_launch(Launch::Fold {
                 space: partial_output.clone(),

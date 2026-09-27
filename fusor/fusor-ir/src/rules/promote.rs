@@ -26,16 +26,12 @@
 //! order, so `TM x TN` register tiling is two steps of this rewrite. The rule
 //! mints the first step only; see the note beside [`promote`].
 //!
-//! The inverse — flattening a promoted slot back into a free axis — is minted
-//! too, so promotion and no promotion stay live in one class and compete on
-//! cost. Partial promotion needs no mode of its own: a strip-mine splits `D`
-//! into `(D/DB, DB)` and this law promotes the inner factor.
-//!
-//! [`CORE_RULES`](crate::rules::CORE_RULES) registers `PROMOTE`; it does not
-//! register [`PROMOTE_FLATTEN`].
+//! The promoted nest joins the unpromoted one's class, so promotion and no
+//! promotion compete on cost. Partial promotion needs no mode of its own: a
+//! strip-mine splits `D` into `(D/DB, DB)` and this law promotes the inner
+//! factor.
 
-use crate::carrier::{Carrier, SlotTy};
-use crate::device::Caps;
+use crate::carrier::Carrier;
 use crate::egraph::{Builder, Facts, Id, RuleTag};
 use crate::ir::launch::{IndexSpace, Launch};
 use crate::ir::{Level, Node, Op, OpTag};
@@ -51,25 +47,6 @@ rule!(
     tag = RuleTag::Additive,
     apply = promote,
 );
-
-rule!(
-    PROMOTE_FLATTEN,
-    level = Level::Launch,
-    head = OpTag::LaunchFold,
-    tag = RuleTag::Additive,
-    apply = promote_flatten,
-);
-
-/// Bytes one invocation may hold in private accumulator registers.
-///
-/// `Caps` has no portable register-budget fact, so this is a conservative
-/// cross-backend policy: 256 B is 64 `f32` lanes, the widest accumulator the
-/// shipped geometries ask for. Over budget the rule declines; the fallback is
-/// strip-then-promote, reached on a later round.
-pub fn private_acc_bytes(caps: &Caps) -> u64 {
-    let _ = caps;
-    256
-}
 
 /// One promotion's worth of node state. `space` and `ops` stay fixed;
 /// the caller derives a schedule domain for the new carrier.
@@ -87,16 +64,18 @@ struct Promoted {
 /// cost. Which other free axis to promote instead stays reachable through the
 /// interchange the schedule domain carries.
 pub fn promote(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::Launch(Launch::Fold {
-        space,
-        axis,
-        vec_axes,
-        carrier,
-        acc,
-        post,
-        ops,
-        sched,
-    }) = &node.op
+    let Op::Launch(
+        op @ Launch::Fold {
+            space,
+            axis,
+            vec_axes,
+            carrier,
+            acc,
+            post,
+            sched,
+            ..
+        },
+    ) = &node.op
     else {
         return None;
     };
@@ -105,7 +84,6 @@ pub fn promote(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Optio
     if !vec_axes.is_empty() {
         return None;
     }
-    let axis = *axis as usize;
     equal_slot_lanes(carrier)?;
     let want = f.own().shape.clone();
 
@@ -114,31 +92,31 @@ pub fn promote(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Optio
         carrier: carrier.clone(),
         post: post.clone(),
     };
-    let next = promote_once(space, axis, *acc, &state, f)?;
-    let got = fold_out_shape(space, axis, &next.vec_axes, &next.carrier)?;
+    let next = promote_once(space, *axis as usize, *acc, &state, f)?;
+    let got = space.fold_shape(*axis, &next.vec_axes, &next.carrier)?;
     // The output shape is identical whenever the carrier appended nothing
     // before; a carrier that already had a slot axis absorbs the promoted
     // axis and a pure alias puts it back. Decide before minting.
     let view = recovery_view(carrier, &got, &want)?;
-    let sched = sched.with_fold_carrier(next.carrier.lanes()?, acc.byte_size(), f.caps())?;
-    let fold = b
-        .add_launch(Launch::Fold {
-            space: space.clone(),
-            axis: axis as u32,
-            vec_axes: next.vec_axes,
-            carrier: next.carrier,
-            acc: *acc,
-            post: next.post,
-            ops: ops.clone(),
-            sched,
-        })
-        .ok()?;
+    let new_sched = sched.with_fold_carrier(next.carrier.lanes()?, acc.byte_size(), f.caps())?;
+    let mut fold = op.clone();
+    if let Launch::Fold {
+        vec_axes,
+        carrier,
+        post,
+        sched,
+        ..
+    } = &mut fold
+    {
+        (*vec_axes, *carrier, *post, *sched) = (next.vec_axes, next.carrier, next.post, new_sched);
+    }
+    let fold = b.add_launch(fold).ok()?;
     let value = apply_view(b, fold, &view)?;
 
     // This law does not change the node's `ValueFacts` at all: a botched
     // renumbering or mis-ordered recovery view shows up here as a shape
     // mismatch instead of as a wrong number on a device.
-    if !shapes_eq(&b.facts_of(value).shape, &want) {
+    if b.facts_of(value).shape != want {
         return None;
     }
     b.union(id, value).ok()
@@ -206,7 +184,7 @@ fn promote_once(
     //    `verify_plan` would have to reject.
     let promoted = state.carrier.promote(extent)?;
     let lanes = promoted.lanes()?;
-    if lanes.checked_mul(acc.byte_size())? > private_acc_bytes(f.caps()) {
+    if lanes.checked_mul(acc.byte_size())? > crate::rules::private_acc_bytes(f.caps(), true) {
         return None;
     }
 
@@ -226,85 +204,6 @@ fn promote_once(
         },
         post: state.post.iter().map(shift).collect(),
     })
-}
-
-/// The inverse: flatten the outermost promoted axis back into the iteration
-/// domain, so full, partial and no promotion all stay live in one class.
-///
-/// The flattened axis's coordinate is one no expression referred to — it was
-/// not in the iteration space — so the renumbering that reintroduces it is a
-/// pure shift up.
-pub fn promote_flatten(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::Launch(Launch::Fold {
-        space,
-        axis,
-        vec_axes,
-        carrier,
-        acc,
-        post,
-        ops,
-        sched,
-    }) = &node.op
-    else {
-        return None;
-    };
-    let axis = *axis as usize;
-    if axis + 1 != space.rank() || vec_axes.is_empty() {
-        return None;
-    }
-    // The block is contiguous and ends at `axis - 1`; its *first* element is
-    // the most recently promoted axis and the only one that can come back
-    // without disturbing the row-major lane order of the rest.
-    let d = *vec_axes.first()? as usize;
-    if vec_axes
-        .iter()
-        .enumerate()
-        .any(|(i, a)| *a as usize != d + i)
-        || d + vec_axes.len() != axis
-    {
-        return None;
-    }
-    let e = space.dims.get(d)?.as_const()?;
-    if e == 0 {
-        return None;
-    }
-    let flattened = demote(carrier, e)?;
-
-    // The flattened axis reappears in the free list exactly where the carrier
-    // axis used to hold it, and only the `Vector(e) -> Scalar` case lands back
-    // on the identical shape. A wider slot would need the trailing two axes
-    // *merged*, which a `StrideSpec` vector cannot express (that is
-    // `AccessPlan::Unflatten`'s job), so this declines rather than unioning two
-    // different shapes into one class.
-    let new_vec: SmallVec<[u32; 2]> = vec_axes.iter().skip(1).copied().collect();
-    let want = f.own().shape.clone();
-    let got = fold_out_shape(space, axis, &new_vec, &flattened)?;
-    if !shapes_eq(&got, &want) {
-        return None;
-    }
-
-    let shift = |x: &ScalarExpr| shift_index_of(x, d as u32, 1);
-    let new_carrier = Carrier {
-        lift: flattened.lift.iter().map(shift).collect(),
-        merge: flattened.merge.iter().map(shift).collect(),
-        ..flattened
-    };
-    let fold = b
-        .add_launch(Launch::Fold {
-            space: space.clone(),
-            axis: axis as u32,
-            vec_axes: new_vec,
-            carrier: new_carrier,
-            acc: *acc,
-            post: post.iter().map(shift).collect(),
-            ops: ops.clone(),
-            sched: sched.clone(),
-        })
-        .ok()?;
-    if !shapes_eq(&b.facts_of(fold).shape, &want) {
-        return None;
-    }
-    b.union(id, fold).ok()
 }
 
 /// The innermost free axis of a well-formed reduction nest, or `None`.
@@ -329,7 +228,7 @@ fn promotable_axis(space: &IndexSpace, axis: usize, vec_axes: &[u32]) -> Option<
 /// reads is a slot of the accumulator — the condition that refuses to promote
 /// an axis the accumulator depends on positionally.
 fn positionwise_in(carrier: &Carrier, post: &[ScalarExpr], axis: u32) -> bool {
-    if carrier.reads_index_of(axis) || post.iter().any(|e| reads_index_of(e, axis)) {
+    if carrier.reads_index_of(axis) || post.iter().any(|e| e.reads_axis(axis)) {
         return false;
     }
     let w = carrier.width() as u32;
@@ -349,32 +248,6 @@ fn equal_slot_lanes(carrier: &Carrier) -> Option<u64> {
         .iter()
         .all(|s| s.lanes() == Some(first))
         .then_some(first)
-}
-
-/// The output shape of a `Fold`, spelled exactly as inference spells it: the
-/// space minus the reduced axis and every promoted axis, then the carrier's
-/// lane count appended.
-fn fold_out_shape(
-    space: &IndexSpace,
-    axis: usize,
-    vec_axes: &[u32],
-    carrier: &Carrier,
-) -> Option<Dims> {
-    let mut shape: Dims = space
-        .dims
-        .iter()
-        .enumerate()
-        .filter(|(i, _)| *i != axis && !vec_axes.contains(&(*i as u32)))
-        .map(|(_, d)| *d)
-        .collect();
-    if let Some(d) = carrier.out_dim()? {
-        shape.push(d);
-    }
-    Some(shape)
-}
-
-fn shapes_eq(a: &[Dim], b: &[Dim]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.known_eq(*y))
 }
 
 /// How the promoted fold's value is read back at the original shape: one
@@ -406,7 +279,7 @@ type Recovery = SmallVec<[(u64, u32); 4]>;
 /// divmod of the wanted axis, which a `StrideSpec` vector cannot express, and
 /// the rule declines.
 fn recovery_view(base: &Carrier, got: &[Dim], want: &[Dim]) -> Option<Recovery> {
-    if shapes_eq(got, want) {
+    if got == want {
         return Some(Recovery::new());
     }
     let q = equal_slot_lanes(base)?;
@@ -426,7 +299,7 @@ fn recovery_view(base: &Carrier, got: &[Dim], want: &[Dim]) -> Option<Recovery> 
     // `want` is the promoted node's shape with that axis put back, then the
     // original carrier axis if the original carrier had one.
     if want.len() != last + 1 + carried
-        || !shapes_eq(&got[..last], &want[..last])
+        || got[..last] != want[..last]
         || !want.get(last)?.known_eq(Dim::Const(e))
         || (carried == 1 && !want.last()?.known_eq(Dim::Const(slot_axis)))
     {
@@ -481,29 +354,6 @@ fn apply_view(b: &mut Builder<'_>, fold: Id, view: &Recovery) -> Option<Id> {
     crate::rules::lower_floor::floor_alias_map(b, fold, layout, &out, dtype)
 }
 
-/// The inverse of [`Carrier::promote`] at one axis: `Vector(d0*e)` becomes
-/// `Vector(d0)`, or `Scalar` when the whole slot was that axis.
-fn demote(c: &Carrier, e: u64) -> Option<Carrier> {
-    let slots: SmallVec<[SlotTy; 4]> = c
-        .slots
-        .iter()
-        .map(|s| match s {
-            SlotTy::Scalar => None,
-            SlotTy::Vector(d) => {
-                let n = d.as_const()?;
-                if e == 0 || n % e != 0 {
-                    return None;
-                }
-                Some(match n / e {
-                    1 => SlotTy::Scalar,
-                    r => SlotTy::Vector(Dim::Const(r)),
-                })
-            }
-        })
-        .collect::<Option<_>>()?;
-    Some(Carrier { slots, ..c.clone() })
-}
-
 /// Renumber `IndexOf(j)` to `IndexOf(j + by)` for every `j > from` (shifting
 /// down, `by < 0`) or `j >= from` (shifting up). Every other node rides
 /// through untouched.
@@ -515,12 +365,6 @@ fn shift_index_of(e: &ScalarExpr, from: u32, by: i32) -> ScalarExpr {
         ScalarKind::Dot { .. } | ScalarKind::Splat { .. } => Some(e.clone()),
         _ => None,
     })
-}
-
-fn reads_index_of(e: &ScalarExpr, axis: u32) -> bool {
-    let mut found = false;
-    e.walk(&mut |e| found |= matches!(e.kind(), ScalarKind::IndexOf(a) if *a == axis));
-    found
 }
 
 /// The largest `Arg` index an expression reads.

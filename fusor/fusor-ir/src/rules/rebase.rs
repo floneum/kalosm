@@ -23,8 +23,8 @@
 //! fire at most once per node.
 
 use crate::carrier::{
-    Carrier, HOM_TABLE, HomRow, HomShape, RETARGET_TABLE, RetargetRow, SlotTy, is_total_on,
-    map_args,
+    Carrier, HOM_TABLE, HomRow, HomShape, RETARGET_TABLE, RetargetRow, SlotTy, commute_canon,
+    is_total_on, map_args,
 };
 use crate::dtype::{Dtype, Splat};
 use crate::egraph::{Builder, Facts, Id, RuleTag};
@@ -33,7 +33,7 @@ use crate::ir::logical::{Logical, TiePolicy};
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
 use crate::rules::{
-    access_legal_in, alias_operand_of, composed_layout, map_view, operand_dtypes, shift_args,
+    access_legal_in, alias_operand_of, composed_layout, fold_view, map_view, splice_args,
 };
 use crate::scalar::{BinOp, CmpOp, ScalarExpr, ScalarKind, UnOp};
 use crate::shape::{Dim, Layout};
@@ -55,20 +55,6 @@ rule!(
     apply = retarget,
 );
 
-/// The flat-index window `[lo, hi)` that `axis` owns in a row-major walk of
-/// `space`. `None` when a dim below `axis` is symbolic or the product
-/// overflows.
-fn axis_window(space: &IndexSpace, axis: u32) -> Option<(u64, u64)> {
-    let a = axis as usize;
-    let divisor = space
-        .dims
-        .get(a + 1..)?
-        .iter()
-        .try_fold(1u64, |acc, d| acc.checked_mul(d.as_const()?))?;
-    let modulus = space.dims.get(a)?.as_const()?;
-    Some((divisor, divisor.checked_mul(modulus)?))
-}
-
 /// Does the read `o` performs land on the *same element* for every value of
 /// `axis`?
 ///
@@ -77,9 +63,7 @@ fn axis_window(space: &IndexSpace, axis: u32) -> Option<(u64, u64)> {
 ///
 /// When the operand's layout is stated axis-for-axis against the space, its
 /// own stride along `axis` answers directly, even under a `Dim::Sym` extent.
-/// Otherwise the divmod form: no
-/// [`AddressTerm`](crate::ir::launch::AddressTerm) overlapping the axis's
-/// `(divisor, modulus)` window may carry a nonzero stride.
+/// Otherwise the divmod form, [`Operand::varies_along`].
 fn invariant_along(o: &Operand, space: &IndexSpace, axis: u32) -> Option<bool> {
     let a = axis as usize;
     if a >= space.rank() {
@@ -101,13 +85,7 @@ fn invariant_along(o: &Operand, space: &IndexSpace, axis: u32) -> Option<bool> {
             None => space.dims[a].known_eq(Dim::ONE).then_some(true),
         };
     }
-    let (lo, hi) = axis_window(space, axis)?;
-    let map = o.address_map()?;
-    Some(!map.terms.iter().any(|t| {
-        let t_lo = u64::from(t.divisor);
-        let t_hi = t_lo.saturating_mul(u64::from(t.modulus));
-        t.stride != 0 && t_lo < hi && lo < t_hi
-    }))
+    o.varies_along(space, axis).map(|v| !v)
 }
 
 /// The read an operand edge actually performs, with one pure view collapsed
@@ -306,52 +284,14 @@ fn reads_arg(e: &ScalarExpr, i: u32) -> bool {
     contains(e, &|x| matches!(x.kind(), ScalarKind::Arg(j) if *j == i))
 }
 
-fn arg_indices(e: &ScalarExpr, out: &mut Vec<u32>) {
-    e.walk(&mut |e| {
-        if let ScalarKind::Arg(i) = e.kind()
-            && !out.contains(i)
-        {
-            out.push(*i);
-        }
-    });
+fn is_lit_value(e: &ScalarExpr, v: f64) -> bool {
+    matches!(e.kind(), ScalarKind::Lit(l) if l.0.to_f64() == v)
 }
 
-fn is_lit_value(e: &ScalarExpr, v: f32) -> bool {
-    matches!(e.kind(), ScalarKind::Lit(l) if splat_f32(l.0) == v)
-}
-
-fn splat_f32(s: Splat) -> f32 {
-    match s {
-        Splat::F32(v) => v,
-        Splat::F16(b) => half::f16::from_bits(b).to_f32(),
-        Splat::BF16(b) => half::bf16::from_bits(b).to_f32(),
-        Splat::U32(v) => v as f32,
-        Splat::I32(v) => v as f32,
-    }
-}
-
-/// Sort every commutative binop's children into a fixed order, so a guard
-/// spelled `Add(Arg(k), Arg(w + k))` still matches `Add(Arg(w + k), Arg(k))`.
-///
-/// `ScalarExpr` does not canonicalize on construction and the e-graph
-/// canonicalizes only `Op::Union` children.
-fn canon(e: &ScalarExpr) -> ScalarExpr {
-    let node = match e.kind() {
-        ScalarKind::Dot { .. } | ScalarKind::Splat { .. } => e.clone(),
-        _ => e.map_children(&mut canon),
-    };
-    if let ScalarKind::Bin { op, a, b } = node.kind()
-        && op.is_commutative()
-        && b.structural_hash() < a.structural_hash()
-    {
-        ScalarExpr::bin(*op, b.clone(), a.clone())
-    } else {
-        node
-    }
-}
-
+/// Equal modulo commutation: `ScalarExpr` does not canonicalize on
+/// construction and the e-graph canonicalizes only `Op::Union` children.
 fn expr_eq(a: &ScalarExpr, b: &ScalarExpr) -> bool {
-    a == b || canon(a) == canon(b)
+    a == b || commute_canon(a) == commute_canon(b)
 }
 
 /// Drop operand edges no lift reads any more, renumbering what is left.
@@ -366,7 +306,7 @@ fn prune_operands(
 ) -> Option<(SmallVec<[ScalarExpr; 4]>, Vec<Operand>)> {
     let mut used: Vec<u32> = Vec::new();
     for l in lifts {
-        arg_indices(l, &mut used);
+        l.collect_args(&mut used);
     }
     used.retain(|i| (*i as usize) < ops.len());
     used.sort_unstable();
@@ -496,7 +436,7 @@ fn match_h(
 /// would make the rewrite a no-op that still costs a node).
 fn is_scaling_lit(e: &ScalarExpr) -> bool {
     matches!(e.kind(), ScalarKind::Lit(l)
-        if splat_f32(l.0) != 0.0 && splat_f32(l.0) != 1.0)
+        if l.0.to_f64() != 0.0 && l.0.to_f64() != 1.0)
 }
 
 /// Does the identity this row states depend on the sign of its factor?
@@ -522,7 +462,7 @@ fn admissible_scale(c: &ScalarExpr, row: &HomRow, invariant: &dyn Fn(&ScalarExpr
         return false;
     }
     if sign_sensitive(row) {
-        return is_scaling_lit(c) && matches!(c.kind(), ScalarKind::Lit(l) if splat_f32(l.0) > 0.0);
+        return is_scaling_lit(c) && matches!(c.kind(), ScalarKind::Lit(l) if l.0.to_f64() > 0.0);
     }
     invariant(c)
 }
@@ -579,16 +519,18 @@ fn hoist_outward(
     f: &Facts<'_>,
     accum: BinOp,
 ) -> Option<Id> {
-    let Op::Launch(Launch::Fold {
-        space,
-        axis,
-        vec_axes,
-        carrier,
-        acc,
-        post,
-        ops,
-        sched,
-    }) = &node.op
+    let Op::Launch(
+        op @ Launch::Fold {
+            space,
+            axis,
+            vec_axes,
+            carrier,
+            acc,
+            post,
+            ops,
+            ..
+        },
+    ) = &node.op
     else {
         return None;
     };
@@ -611,7 +553,7 @@ fn hoist_outward(
             return false;
         }
         let mut used = Vec::new();
-        arg_indices(e, &mut used);
+        e.collect_args(&mut used);
         used.iter()
             .all(|&i| inv.get(i as usize).copied() == Some(true))
     };
@@ -678,7 +620,7 @@ fn hoist_outward(
     for m in &peeled {
         let Some(c) = &m.c else { continue };
         let mut used = Vec::new();
-        arg_indices(c, &mut used);
+        c.collect_args(&mut used);
         for i in used {
             if slot_of.iter().any(|(j, _)| *j == i) {
                 continue;
@@ -714,16 +656,7 @@ fn hoist_outward(
     // The inner fold: same slot shape, `cur` as the accumulation, an identity
     // `post`, and no edge for the factor that just left.
     let inner = b
-        .add_launch(Launch::Fold {
-            space: space.clone(),
-            axis: *axis,
-            vec_axes: vec_axes.clone(),
-            carrier: inner_carrier,
-            acc: *acc,
-            post: smallvec![ScalarExpr::arg(0, *acc)],
-            ops: inner_ops,
-            sched: sched.clone(),
-        })
+        .add_launch(with_fold(op, inner_carrier, *acc, Some(inner_ops)))
         .ok()?;
     let mut outer_ops = vec![alias_operand_of(inner, &out_shape)];
     outer_ops.extend(projected);
@@ -746,22 +679,17 @@ fn hoist_inward(
     f: &Facts<'_>,
     accum: BinOp,
 ) -> Option<Id> {
-    let Op::Launch(Launch::Fold {
-        space,
-        axis,
-        vec_axes,
-        carrier,
-        acc,
-        post,
-        ops,
-        sched,
-    }) = &node.op
+    let Op::Launch(
+        op @ Launch::Fold {
+            carrier, acc, post, ..
+        },
+    ) = &node.op
     else {
         return None;
     };
     let closed = |e: &ScalarExpr| -> bool {
         let mut used = Vec::new();
-        arg_indices(e, &mut used);
+        e.collect_args(&mut used);
         used.is_empty() && !e.reads_index_of()
     };
     let (row, m) = HOM_TABLE
@@ -774,19 +702,28 @@ fn hoist_inward(
         })?;
     let pushed = rebind_accum(carrier, row.to, *acc)?
         .with_lift([m.apply(carrier.lift[0].clone(), &|c| c.clone())]);
-    let alt = b
-        .add_launch(Launch::Fold {
-            space: space.clone(),
-            axis: *axis,
-            vec_axes: vec_axes.clone(),
-            carrier: pushed,
-            acc: *acc,
-            post: smallvec![ScalarExpr::arg(0, *acc)],
-            ops: ops.clone(),
-            sched: sched.clone(),
-        })
-        .ok()?;
+    let alt = b.add_launch(with_fold(op, pushed, *acc, None)).ok()?;
     b.union(id, alt).ok()
+}
+
+/// `fold` accumulating through `carrier` with an identity `post`, reading
+/// `ops` when given.
+fn with_fold(fold: &Launch, carrier: Carrier, acc: Dtype, ops: Option<Vec<Operand>>) -> Launch {
+    let mut out = fold.clone();
+    if let Launch::Fold {
+        carrier: c,
+        post,
+        ops: o,
+        ..
+    } = &mut out
+    {
+        *c = carrier;
+        *post = smallvec![ScalarExpr::arg(0, acc)];
+        if let Some(ops) = ops {
+            *o = ops;
+        }
+    }
+    out
 }
 
 /// The same single-slot carrier accumulating with `op` instead: new identity,
@@ -848,17 +785,32 @@ pub(crate) fn on_iter_space(o: &Operand, space: &IndexSpace, vec_axes: &[u32]) -
         return Some(o.clone());
     }
     let o = as_alias_over(o, space)?;
-    let mut shape: Vec<Dim> = Vec::new();
-    let mut strides: Vec<Dim> = Vec::new();
-    for i in 0..space.rank() {
-        if vec_axes.contains(&(i as u32)) {
-            if o.layout.strides()[i].as_const() != Some(0) {
-                return None;
-            }
-            continue;
-        }
-        shape.push(o.layout.shape()[i]);
-        strides.push(o.layout.strides()[i]);
+    if vec_axes.iter().any(|a| {
+        o.layout
+            .strides()
+            .get(*a as usize)
+            .is_some_and(|s| s.as_const() != Some(0))
+    }) {
+        return None;
+    }
+    drop_axes(&o, vec_axes, None)
+}
+
+/// An alias with the axes in `drop` removed, then a stride-0 axis of
+/// `lanes` appended when given.
+fn drop_axes(o: &Operand, drop: &[u32], lanes: Option<Dim>) -> Option<Operand> {
+    let (mut shape, mut strides): (Vec<Dim>, Vec<Dim>) = o
+        .layout
+        .shape()
+        .iter()
+        .zip(o.layout.strides())
+        .enumerate()
+        .filter(|(i, _)| !drop.contains(&(*i as u32)))
+        .map(|(_, (d, s))| (*d, *s))
+        .unzip();
+    if let Some(lanes) = lanes {
+        shape.push(lanes);
+        strides.push(Dim::Const(0));
     }
     Some(Operand {
         src: o.src,
@@ -880,25 +832,7 @@ fn project_operand(
     if !matches!(o.access, AccessPlan::Alias) {
         return None;
     }
-    let o = &as_alias_over(o, space)?;
-    let mut shape: Vec<Dim> = Vec::new();
-    let mut strides: Vec<Dim> = Vec::new();
-    for i in 0..space.rank() {
-        if drop.contains(&(i as u32)) {
-            continue;
-        }
-        shape.push(o.layout.shape()[i]);
-        strides.push(o.layout.strides()[i]);
-    }
-    if let Some(lanes) = carrier.out_dim()? {
-        shape.push(lanes);
-        strides.push(Dim::Const(0));
-    }
-    Some(Operand {
-        src: o.src,
-        layout: Layout::from_parts(o.layout.offset(), &shape, &strides).ok()?,
-        access: AccessPlan::Alias,
-    })
+    drop_axes(&as_alias_over(o, space)?, drop, carrier.out_dim()?)
 }
 
 /// Hole indices no operand can occupy, used to read a table row's own action
@@ -1041,14 +975,9 @@ pub fn retarget(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opti
     // the space this node states its operand maps against, so the two operand
     // lists are comparable only after projection. With no promoted axis
     // `iter == space`, `iter_axis == axis` and `proj == reads`.
-    let iter = IndexSpace::new(
-        space
-            .dims
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !vec_axes.contains(&(*i as u32)))
-            .map(|(_, d)| *d),
-    );
+    let iter = IndexSpace {
+        dims: space.iter_dims(vec_axes),
+    };
     let iter_axis = *axis - vec_axes.len() as u32;
     let reads: Vec<(Operand, Id)> = ops.iter().map(|o| effective(b, o, space)).collect();
     let proj: Vec<(Operand, Id)> = reads
@@ -1085,58 +1014,6 @@ pub fn retarget(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opti
     None
 }
 
-/// A reduction nest in either spelling — the `Logical::Fold` the frontend
-/// built or the `Launch::Fold` it was lowered to.
-///
-/// Equality in this e-graph is not congruent, so a consuming edge names
-/// whichever id it was handed while both denote the same value.
-struct FoldView {
-    space: IndexSpace,
-    axis: u32,
-    carrier: Carrier,
-    ops: Vec<Operand>,
-}
-
-fn fold_view(b: &Builder<'_>, id: Id) -> Option<FoldView> {
-    match b.node(id).op.clone() {
-        Op::Launch(Launch::Fold {
-            space,
-            axis,
-            vec_axes,
-            carrier,
-            post,
-            ops,
-            ..
-        }) => {
-            // A `post` means a reader sees `post(rho)` and not `rho`; there is
-            // nothing to redirect it to.
-            (vec_axes.is_empty() && post.len() == 1 && post[0].kind() == &ScalarKind::Arg(0))
-                .then_some(FoldView {
-                    space,
-                    axis,
-                    carrier,
-                    ops,
-                })
-        }
-        Op::Logical(Logical::Fold {
-            carrier, axis, ins, ..
-        }) => {
-            let space = IndexSpace::new(b.facts_of(*ins.first()?).shape.iter().copied());
-            let ops = ins
-                .iter()
-                .map(|&s| alias_operand_of(s, &b.facts_of(s).shape))
-                .collect();
-            Some(FoldView {
-                space,
-                axis,
-                carrier,
-                ops,
-            })
-        }
-        _ => None,
-    }
-}
-
 /// Is `src` a fold over the same axis of the same reads?
 ///
 /// Pure address-map and id comparison; no producer is named.
@@ -1148,7 +1025,11 @@ fn reference_fold(
     reader: &[(Operand, Id)],
 ) -> Option<RefFold> {
     for cand in b.class_members(src) {
-        let Some(v) = fold_view(b, cand) else {
+        // A `post` means a reader sees `post(rho)` and not `rho`; there is
+        // nothing to redirect it to.
+        let Some(v) = fold_view(b, cand).filter(|v| {
+            v.vec_axes.is_empty() && v.post.len() == 1 && v.post[0].kind() == &ScalarKind::Arg(0)
+        }) else {
             continue;
         };
         if v.axis != axis || v.carrier.width() != 1 {
@@ -1157,14 +1038,7 @@ fn reference_fold(
         if v.carrier.slots[0] != SlotTy::Scalar || !v.carrier.associative {
             continue;
         }
-        if v.space.dims.len() != space.dims.len()
-            || !v
-                .space
-                .dims
-                .iter()
-                .zip(&space.dims)
-                .all(|(a, c)| a.known_eq(*c))
-        {
+        if v.space.dims != space.dims {
             continue;
         }
         let Some(lift) = common_basis(b, &v, reader) else {
@@ -1190,7 +1064,11 @@ const MAX_EXPANSIONS: usize = 8;
 /// brought down to the reader's basis by the same substitution the fusion law
 /// performs, and the two are compared there. A producer is admitted only if
 /// it is an elementwise value at a covered index space.
-fn common_basis(b: &Builder<'_>, v: &FoldView, reader: &[(Operand, Id)]) -> Option<ScalarExpr> {
+fn common_basis(
+    b: &Builder<'_>,
+    v: &crate::rules::FoldView,
+    reader: &[(Operand, Id)],
+) -> Option<ScalarExpr> {
     let mut lift = v.carrier.lift[0].clone();
     let mut ops = v.ops.clone();
     for _ in 0..MAX_EXPANSIONS {
@@ -1217,24 +1095,8 @@ fn common_basis(b: &Builder<'_>, v: &FoldView, reader: &[(Operand, Id)]) -> Opti
         {
             return None;
         }
-        let base = ops.len() - 1;
-        let body = shift_args(&inner.body, base as u32, &operand_dtypes(b, &inner.ops));
-        let args: Vec<ScalarExpr> = operand_dtypes(b, &ops)
-            .iter()
-            .enumerate()
-            .map(|(j, d)| match j.cmp(&slot) {
-                std::cmp::Ordering::Equal => body.clone(),
-                std::cmp::Ordering::Less => ScalarExpr::arg(j as u32, *d),
-                std::cmp::Ordering::Greater => ScalarExpr::arg(j as u32 - 1, *d),
-            })
-            .collect();
+        let (mut next, args) = splice_args(b, &ops, slot, &inner);
         lift = lift.compose(&args);
-        let mut next: Vec<Operand> = ops
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| *j != slot)
-            .map(|(_, o)| o.clone())
-            .collect();
         next.extend(inner.ops.iter().cloned());
         ops = next;
     }
@@ -1256,16 +1118,18 @@ fn mint_retarget(
     r: usize,
     reference: &RefFold,
 ) -> Option<Id> {
-    let Op::Launch(Launch::Fold {
-        space,
-        axis,
-        vec_axes,
-        carrier,
-        acc,
-        post,
-        ops,
-        sched,
-    }) = &node.op
+    let Op::Launch(
+        op @ Launch::Fold {
+            space,
+            axis,
+            vec_axes,
+            carrier,
+            acc,
+            post,
+            ops,
+            sched,
+        },
+    ) = &node.op
     else {
         return None;
     };
@@ -1390,13 +1254,7 @@ fn mint_retarget(
         };
         // The output's free dims: `space` minus the reduced axis and every
         // promoted axis, since a promoted extent lives in the carrier's lanes.
-        let free: Vec<Dim> = space
-            .dims
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != *axis as usize && !vec_axes.contains(&(*i as u32)))
-            .map(|(_, d)| *d)
-            .collect();
+        let free = space.fold_out_dims(*axis, vec_axes);
         // Both readbacks are checked expressible before the joint node
         // exists, so a decline costs no orphan.
         if !view_expressible(&free, lanes, 1, body_lanes, body_axis)
@@ -1438,18 +1296,18 @@ fn mint_retarget(
             .chain(post.iter().map(|e| e.compose(&finalized)))
             .collect();
 
-        let joint_id = b
-            .add_launch(Launch::Fold {
-                space: space.clone(),
-                axis: *axis,
-                vec_axes: vec_axes.clone(),
-                carrier: joint,
-                acc: *acc,
-                post: joint_post,
-                ops: new_ops,
-                sched,
-            })
-            .ok()?;
+        let mut joint_fold = op.clone();
+        if let Launch::Fold {
+            carrier,
+            post,
+            ops,
+            sched: s,
+            ..
+        } = &mut joint_fold
+        {
+            (*carrier, *post, *ops, *s) = (joint, joint_post, new_ops, sched);
+        }
+        let joint_id = b.add_launch(joint_fold).ok()?;
 
         let body_view = slot_view(b, joint_id, &free, lanes, 1, body_lanes, body_axis)?;
         let ref_view = slot_view(b, joint_id, &free, lanes, 0, 1, None)?;

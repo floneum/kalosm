@@ -13,7 +13,8 @@
 //! 5. Every operand's `AccessPlan` satisfies that operand's access
 //!    predicate. A failed access analysis disqualifies **this rewrite only**.
 //! 6. A composite sequences at least two independently scheduled members.
-//! 7. Every node carries an `Effect`.
+//! 7. Every node carries an `Effect`: `semantics::effect_of` derives it from
+//!    the op, so there is nothing stored to disagree with.
 //! 8. Allocation is *not* described at Launch; a node claiming a buffer is an
 //!    error.
 
@@ -22,10 +23,9 @@ use crate::device::Caps;
 use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::ir::kernel::{ArenaPlanner, ScalarElement};
-use crate::ir::launch::{AccessPlan, Effect, IndexSpace, Launch, Operand, ScheduleDomain};
+use crate::ir::launch::{AccessPlan, IndexSpace, Launch, ScheduleDomain};
 use crate::ir::logical::ScatterCombine;
 use crate::ir::{Op, VerifyCtx};
-use crate::semantics::effect_of;
 use crate::shape::{Dim, Layout};
 
 /// Verify one Launch node against `caps` and the exact arena plan.
@@ -51,11 +51,8 @@ pub fn verify_launch(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<(
                 "a streamed Fold needs a bounded scalar producer and reassociation".into(),
             ));
         }
-        let count = crate::semantics::children::children_launch(producer).len();
-        let produced =
-            crate::semantics::infer_launch::infer_launch(producer, &cx.operands[..count])?;
-        let mut inputs = cx.operands[count..].to_vec();
-        inputs.insert(*operand as usize, produced.clone());
+        let (count, produced, inputs) =
+            crate::semantics::infer_launch::stream_inputs(producer, fold, *operand, cx.operands)?;
         for (recipe, operands, result) in [
             (producer.as_ref(), &cx.operands[..count], &produced),
             (fold.as_ref(), inputs.as_slice(), cx.result),
@@ -97,18 +94,8 @@ pub fn verify_launch(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<(
     // 6.
     check_composite_domain(op).map_err(|e| relabel(cx, format!("{e}")))?;
 
-    // 7.
-    let declared = effect_of(&cx.node.op);
-    let expected = expected_effect(op);
-    if declared != expected {
-        return Err(relabel(
-            cx,
-            format!("effect {declared:?} disagrees with the classification {expected:?}"),
-        ));
-    }
-
     // 8.
-    for (i, o) in operands_of(op).iter().enumerate() {
+    for (i, o) in op.operands().enumerate() {
         if !o.layout.offset().known_eq(Dim::Const(0)) {
             return Err(relabel(
                 cx,
@@ -424,8 +411,8 @@ pub fn check_operand_access(op: &Launch) -> Result<()> {
             }
         }
     }
-    let space = index_space_of(op);
-    for (i, o) in operands_of(op).iter().enumerate() {
+    let space = op.space();
+    for (i, o) in op.operands().enumerate() {
         let fail = |msg: String| Error::Legality(format!("operand {i}: {msg}"));
         match &o.access {
             // Always legal: a gather derives its own addresses.
@@ -468,20 +455,6 @@ pub fn check_operand_access(op: &Launch) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Invariant 7's classification: `Scatter` writing through operand 0 with
-/// atomics or a `Set` combine mutates state; everything else is pure.
-fn expected_effect(op: &Launch) -> Effect {
-    match op {
-        Launch::Scatter { mode, combine, .. }
-            if matches!(mode, crate::ir::launch::ScatterMode::Atomic)
-                || matches!(combine, ScatterCombine::Set) =>
-        {
-            Effect::InPlace(crate::ir::launch::BufferRole(0))
-        }
-        _ => Effect::Pure,
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -558,13 +531,12 @@ fn check_vec_axes(
     // anything. This is the clause that makes a mixed `[Scalar, Vector]`
     // accumulator safe to mint at all.
     if let Op::Launch(o) = &cx.node.op {
-        let ops = operands_of(o);
-        let varies: Vec<bool> = ops
-            .iter()
+        let varies: Vec<bool> = o
+            .operands()
             .map(|o| {
                 vec_axes
                     .iter()
-                    .any(|a| operand_varies_along(o, space, *a) != Some(false))
+                    .any(|a| o.varies_along(space, *a) != Some(false))
             })
             .collect();
         for (k, s) in carrier.slots.iter().enumerate() {
@@ -572,7 +544,7 @@ fn check_vec_axes(
                 continue;
             }
             let mut used = Vec::new();
-            collect_args(&carrier.lift[k], &mut used);
+            carrier.lift[k].collect_args(&mut used);
             if let Some(i) = used
                 .iter()
                 .find(|i| varies.get(**i as usize).copied() == Some(true))
@@ -615,79 +587,11 @@ fn check_vec_axes(
     Ok(())
 }
 
-/// Every `Arg` index an expression names.
-fn collect_args(e: &crate::scalar::ScalarExpr, out: &mut Vec<u32>) {
-    use crate::scalar::ScalarKind as K;
-    match e.kind() {
-        K::Arg(i) => {
-            if !out.contains(i) {
-                out.push(*i);
-            }
-        }
-        K::Un { x, .. }
-        | K::Cast { x, .. }
-        | K::Bitcast { x, .. }
-        | K::Round { x, .. }
-        | K::Splat { x, .. } => collect_args(x, out),
-        K::Bin { a, b, .. } | K::Cmp { a, b, .. } | K::Dot { a, b } => {
-            collect_args(a, out);
-            collect_args(b, out);
-        }
-        K::Select { c, t, f } => {
-            collect_args(c, out);
-            collect_args(t, out);
-            collect_args(f, out);
-        }
-        K::Lit(_) | K::Uniform(_) | K::IndexOf(_) => {}
-    }
-}
-
-/// Whether an operand's read moves as `axis`'s coordinate advances.
-///
-/// `Some(false)` is "provably invariant"; `None` is "cannot tell", which every
-/// caller here must treat as "varies".
-fn operand_varies_along(o: &Operand, space: &IndexSpace, axis: u32) -> Option<bool> {
-    let a = axis as usize;
-    if a >= space.rank() {
-        return None;
-    }
-    // The flat-index window this axis occupies, row-major over `space`.
-    let mut below = 1u64;
-    for d in space.dims.iter().skip(a + 1) {
-        below = below.checked_mul(d.as_const()?)?;
-    }
-    let hi = below.checked_mul(space.dims[a].as_const()?)?;
-    let map = o.address_map()?;
-    Some(map.terms.iter().any(|t| {
-        let t_lo = u64::from(t.divisor);
-        let t_hi = t_lo.saturating_mul(u64::from(t.modulus));
-        t.stride != 0 && t_lo < hi && below < t_hi
-    }))
-}
-
 fn cx_post_reads(cx: &VerifyCtx<'_>, axis: u32) -> bool {
     let Op::Launch(Launch::Fold { post, .. }) = &cx.node.op else {
         return false;
     };
-    post.iter().any(|e| reads_index_of(e, axis))
-}
-
-fn reads_index_of(e: &crate::scalar::ScalarExpr, axis: u32) -> bool {
-    use crate::scalar::ScalarKind as K;
-    match e.kind() {
-        K::IndexOf(a) => *a == axis,
-        K::Un { x, .. } | K::Cast { x, .. } | K::Bitcast { x, .. } | K::Round { x, .. } => {
-            reads_index_of(x, axis)
-        }
-        K::Bin { a, b, .. } | K::Cmp { a, b, .. } | K::Dot { a, b } => {
-            reads_index_of(a, axis) || reads_index_of(b, axis)
-        }
-        K::Select { c, t, f } => {
-            reads_index_of(c, axis) || reads_index_of(t, axis) || reads_index_of(f, axis)
-        }
-        K::Splat { x, .. } => reads_index_of(x, axis),
-        _ => false,
-    }
+    post.iter().any(|e| e.reads_axis(axis))
 }
 
 fn relabel(cx: &VerifyCtx<'_>, msg: String) -> Error {
@@ -712,43 +616,6 @@ fn write_layout(op: &Launch, cx: &VerifyCtx<'_>) -> Layout {
             .map(|o| o.layout.clone())
             .unwrap_or_else(|| Layout::contiguous(&cx.result.shape)),
         _ => Layout::contiguous(&cx.result.shape),
-    }
-}
-
-fn index_space_of(op: &Launch) -> Option<&IndexSpace> {
-    match op {
-        Launch::Map { space, .. }
-        | Launch::Fold { space, .. }
-        | Launch::Gather { space, .. }
-        | Launch::Scatter { space, .. } => Some(space),
-        _ => None,
-    }
-}
-
-/// Every `Operand` a node carries, in `children_of` order.
-fn operands_of(op: &Launch) -> Vec<Operand> {
-    match op {
-        Launch::Map { ops, .. }
-        | Launch::Fold { ops, .. }
-        | Launch::Gather { ops, .. }
-        | Launch::Scatter { ops, .. } => ops.clone(),
-        Launch::Contract { a, b, .. } => a.ops.iter().chain(b.ops.iter()).cloned().collect(),
-        Launch::StreamFold {
-            producer,
-            fold,
-            operand,
-            ..
-        } => {
-            let mut ops = operands_of(producer);
-            ops.extend(
-                operands_of(fold)
-                    .into_iter()
-                    .enumerate()
-                    .filter_map(|(i, op)| (i != *operand as usize).then_some(op)),
-            );
-            ops
-        }
-        Launch::Slab { .. } | Launch::Group { .. } => Vec::new(),
     }
 }
 

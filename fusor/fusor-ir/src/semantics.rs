@@ -12,7 +12,7 @@ use crate::facts::{ValueFacts, Work};
 use crate::ir::kernel::ArenaPlanner;
 use crate::ir::launch::{BufferRole, Effect, Launch, ScatterMode};
 use crate::ir::logical::ScatterCombine;
-use crate::ir::{Children, Level, Op, Semantics, VerifyCtx};
+use crate::ir::{Children, Op, Semantics, VerifyCtx};
 use std::sync::Arc;
 
 /// The core semantics. Holds the [`ArenaPlanner`] because `verify_launch` admits
@@ -90,11 +90,4 @@ pub fn effect_of(op: &Op) -> Effect {
         }
         Op::Logical(_) | Op::Launch(_) | Op::Union(..) => Effect::Pure,
     }
-}
-
-/// Level of an operator, for callers that build a [`crate::ir::Node`] by hand.
-/// `Union` inherits its operands' level, which the e-graph resolves; here it
-/// defaults to `Logical`.
-pub fn level_of(op: &Op) -> Level {
-    op.level().unwrap_or(Level::Logical)
 }

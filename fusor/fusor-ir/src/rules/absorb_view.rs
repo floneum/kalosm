@@ -5,12 +5,12 @@
 //! buys nothing but a dispatch and a round trip through memory.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
-use crate::ir::launch::{AccessPlan, ContractSide, Launch, Operand};
+use crate::ir::launch::{AccessPlan, Launch, Operand};
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
 use crate::rules::map_view;
 use crate::scalar::ScalarKind;
-use crate::shape::{Dim, Layout};
+use crate::shape::{Dim, Layout, const_elements};
 
 rule!(
     ABSORB_VIEW_INTO_CONTRACT,
@@ -25,7 +25,7 @@ rule!(
     level = Level::Launch,
     head = OpTag::LaunchMap,
     tag = RuleTag::Additive,
-    apply = absorb_view_stage,
+    apply = absorb_broadcast,
 );
 
 rule!(
@@ -33,7 +33,7 @@ rule!(
     level = Level::Launch,
     head = OpTag::LaunchFold,
     tag = RuleTag::Additive,
-    apply = absorb_view_stage,
+    apply = absorb_broadcast,
 );
 
 /// A map or fold reading a *broadcast* copy — one whose own read has no
@@ -42,32 +42,32 @@ rule!(
 /// every view here minted a head per reader and saturation took minutes,
 /// and a broadcast copy is what every optimizer chain shares, so it made
 /// every chain's slab overlap every other's.
-pub fn absorb_view_stage(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
+pub fn absorb_broadcast(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
+    absorb(b, id, node, true)
+}
+
+pub fn absorb_view(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
+    absorb(b, id, node, false)
+}
+
+/// Mint the reader with every operand [`through_copy`] accepts read through
+/// its copy instead.
+fn absorb(b: &mut Builder<'_>, id: Id, node: &Node, broadcast_only: bool) -> Option<Id> {
     let Op::Launch(op) = &node.op else {
         return None;
     };
-    let ops = match op {
-        Launch::Map { ops, .. } | Launch::Fold { ops, .. } => ops,
-        _ => return None,
-    };
-    let mut changed = false;
-    let new_ops: Vec<Operand> = ops
-        .iter()
-        .map(|o| match through_copy(b, o, true) {
-            Some(seen) => {
-                changed = true;
-                seen
-            }
-            None => o.clone(),
-        })
+    let seen: Vec<Option<Operand>> = op
+        .operands()
+        .map(|o| through_copy(b, o, broadcast_only))
         .collect();
-    if !changed {
+    if seen.iter().all(Option::is_none) {
         return None;
     }
     let mut absorbed = op.clone();
-    match &mut absorbed {
-        Launch::Map { ops, .. } | Launch::Fold { ops, .. } => *ops = new_ops,
-        _ => return None,
+    for (o, s) in absorbed.operands_mut().zip(seen) {
+        if let Some(s) = s {
+            *o = s;
+        }
     }
     let minted = b.add_launch(absorbed).ok()?;
     // Reading a copy of one's own class through it changes nothing, and a
@@ -76,67 +76,6 @@ pub fn absorb_view_stage(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_
         return None;
     }
     b.union(id, minted).ok()
-}
-
-pub fn absorb_view(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    let Op::Launch(Launch::Contract {
-        output,
-        m,
-        n,
-        k,
-        batch,
-        family,
-        post,
-        acc,
-        a,
-        b: rhs,
-        sched,
-    }) = &node.op
-    else {
-        return None;
-    };
-    let mut changed = false;
-    let mut side = |side: &ContractSide| -> ContractSide {
-        let ops = side
-            .ops
-            .iter()
-            .map(|o| match through_copy(b, o, false) {
-                Some(seen) => {
-                    changed = true;
-                    seen
-                }
-                None => o.clone(),
-            })
-            .collect();
-        ContractSide {
-            pre: side.pre.clone(),
-            ops,
-        }
-    };
-    let a2 = side(a);
-    let b2 = side(rhs);
-    if !changed {
-        return None;
-    }
-    let absorbed = b
-        .add_launch(Launch::Contract {
-            output: output.clone(),
-            m: *m,
-            n: *n,
-            k: *k,
-            batch: *batch,
-            family: *family,
-            post: post.clone(),
-            acc: *acc,
-            a: a2,
-            b: b2,
-            sched: sched.clone(),
-        })
-        .ok()?;
-    if b.class_of(absorbed) == b.class_of(id) {
-        return None;
-    }
-    b.union(id, absorbed).ok()
 }
 
 /// `o` read through the copy that produces it. A copy whose own read is
@@ -167,15 +106,11 @@ fn through_copy(b: &Builder<'_>, o: &Operand, broadcast_only: bool) -> Option<Op
         if view.space.dims.as_slice() != out_shape.as_slice() {
             continue;
         }
-        let out_elems: Option<u64> = out_shape
-            .iter()
-            .try_fold(1u64, |a, d| d.as_const().map(|d| a * d));
-        let src_elems: Option<u64> = src
-            .layout
-            .shape()
-            .iter()
-            .try_fold(1u64, |a, d| d.as_const().map(|d| a * d));
-        if src.layout.is_contiguous() && out_elems.is_some() && out_elems == src_elems {
+        let out_elems = const_elements(&out_shape);
+        if src.layout.is_contiguous()
+            && out_elems.is_some()
+            && out_elems == const_elements(src.layout.shape())
+        {
             return Some(Operand {
                 src: src.src,
                 layout: o.layout.clone(),
@@ -256,23 +191,17 @@ pub fn forward_views(
         return None;
     };
     let mut changed = false;
-    let mut read = |b: &Builder<'_>, o: &Operand| -> Operand {
-        if copy(b, o.src)
-            && let Some(seen) = through_copy(b, o, false)
-        {
-            changed = true;
-            return seen;
-        }
-        o.clone()
-    };
     let mut rewritten = op.clone();
     match &mut rewritten {
-        Launch::Map { ops, .. } | Launch::Fold { ops, .. } => {
-            *ops = ops.iter().map(|o| read(b, o)).collect();
-        }
-        Launch::Contract { a, b: rhs, .. } => {
-            a.ops = a.ops.iter().map(|o| read(b, o)).collect();
-            rhs.ops = rhs.ops.iter().map(|o| read(b, o)).collect();
+        Launch::Map { .. } | Launch::Fold { .. } | Launch::Contract { .. } => {
+            for o in rewritten.operands_mut() {
+                if copy(b, o.src)
+                    && let Some(seen) = through_copy(b, o, false)
+                {
+                    *o = seen;
+                    changed = true;
+                }
+            }
         }
         Launch::Slab { members, .. } | Launch::Group { members, .. } => {
             let old = members.clone();

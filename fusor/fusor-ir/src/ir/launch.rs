@@ -8,7 +8,7 @@ use crate::dtype::Dtype;
 use crate::egraph::Id;
 use crate::ir::OpTag;
 use crate::scalar::ScalarExpr;
-use crate::shape::{Dim, Layout, MultiFlattenMap, SlidingWindow};
+use crate::shape::{Dim, Dims, Layout, MultiFlattenMap, SlidingWindow};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
@@ -218,9 +218,7 @@ impl Launch {
         if output.iter().any(|d| d.known_eq(Dim::Const(0))) {
             return false;
         }
-        let count = output
-            .iter()
-            .try_fold(1u64, |n, d| n.checked_mul(d.as_const()?));
+        let count = crate::shape::const_elements(&output);
         let last = read
             .layout
             .shape()
@@ -325,20 +323,75 @@ impl Launch {
             Self::StreamFold { fold, .. } => fold.iter_space(),
             Self::Fold {
                 space, vec_axes, ..
-            } if !vec_axes.is_empty() => IndexSpace::new(
-                space
-                    .dims
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| !vec_axes.contains(&(*i as u32)))
-                    .map(|(_, d)| *d),
-            ),
+            } if !vec_axes.is_empty() => IndexSpace {
+                dims: space.iter_dims(vec_axes),
+            },
+            _ => self.space().cloned().unwrap_or_default(),
+        }
+    }
+
+    /// The index space operand layouts are stated against, for the nodes
+    /// that declare one.
+    pub fn space(&self) -> Option<&IndexSpace> {
+        match self {
             Self::Map { space, .. }
             | Self::Fold { space, .. }
             | Self::Gather { space, .. }
-            | Self::Scatter { space, .. } => space.clone(),
-            _ => IndexSpace::default(),
+            | Self::Scatter { space, .. } => Some(space),
+            _ => None,
         }
+    }
+
+    /// The operand lists this node reads directly: `ops`, or a contraction's
+    /// two sides. A streamed fold's recipes and a composite's members are not.
+    fn operand_lists(&self) -> [&[Operand]; 2] {
+        match self {
+            Self::Map { ops, .. }
+            | Self::Fold { ops, .. }
+            | Self::Gather { ops, .. }
+            | Self::Scatter { ops, .. } => [ops, &[]],
+            Self::Contract { a, b, .. } => [&a.ops, &b.ops],
+            Self::StreamFold { .. } | Self::Slab { .. } | Self::Group { .. } => [&[], &[]],
+        }
+    }
+
+    /// Every operand this node reads, in `children_of` order: a contraction's
+    /// A side then its B side, a streamed fold's producer operands then its
+    /// fold's minus the generated one. A composite reads none.
+    pub fn operands(&self) -> impl Iterator<Item = &Operand> {
+        let ([a, b], [c, d], skip) = match self {
+            Self::StreamFold {
+                producer,
+                fold,
+                operand,
+                ..
+            } => {
+                let first = producer.operand_lists();
+                let skip = first[0].len() + first[1].len() + *operand as usize;
+                (first, fold.operand_lists(), skip)
+            }
+            _ => (self.operand_lists(), [&[][..], &[]], usize::MAX),
+        };
+        [a, b, c, d]
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter(move |(i, _)| *i != skip)
+            .map(|(_, o)| o)
+    }
+
+    /// [`Self::operand_lists`], mutably and flattened: the operands a rule
+    /// may re-spell in place.
+    pub fn operands_mut(&mut self) -> impl Iterator<Item = &mut Operand> {
+        let [a, b]: [&mut [Operand]; 2] = match self {
+            Self::Map { ops, .. }
+            | Self::Fold { ops, .. }
+            | Self::Gather { ops, .. }
+            | Self::Scatter { ops, .. } => [ops, &mut []],
+            Self::Contract { a, b, .. } => [&mut a.ops, &mut b.ops],
+            Self::StreamFold { .. } | Self::Slab { .. } | Self::Group { .. } => [&mut [], &mut []],
+        };
+        a.iter_mut().chain(b.iter_mut())
     }
 
     /// This node's enumerable schedule space.
@@ -384,9 +437,35 @@ impl IndexSpace {
     }
 
     pub fn iterations(&self) -> Option<u64> {
+        crate::shape::const_elements(&self.dims)
+    }
+
+    /// A fold's iteration dims: this space minus its promoted axes.
+    pub fn iter_dims(&self, vec_axes: &[u32]) -> Dims {
+        self.dims_except(|i| vec_axes.contains(&i))
+    }
+
+    /// A fold's output dims before its carrier axis: this space minus the
+    /// reduced axis and every promoted axis.
+    pub fn fold_out_dims(&self, axis: u32, vec_axes: &[u32]) -> Dims {
+        self.dims_except(|i| i == axis || vec_axes.contains(&i))
+    }
+
+    /// A fold's output shape, spelled as inference spells it: `None` under a
+    /// multi-slot carrier with a symbolic `Vector` extent.
+    pub fn fold_shape(&self, axis: u32, vec_axes: &[u32], carrier: &Carrier) -> Option<Dims> {
+        let mut shape = self.fold_out_dims(axis, vec_axes);
+        shape.extend(carrier.out_dim()?);
+        Some(shape)
+    }
+
+    fn dims_except(&self, drop: impl Fn(u32) -> bool) -> Dims {
         self.dims
             .iter()
-            .try_fold(1u64, |acc, d| acc.checked_mul(d.as_const()?))
+            .enumerate()
+            .filter(|(i, _)| !drop(*i as u32))
+            .map(|(_, d)| *d)
+            .collect()
     }
 }
 
@@ -551,20 +630,9 @@ impl Operand {
     /// base offset, which `MultiFlattenMap` has nowhere to put.
     pub fn address_map(&self) -> Option<AddressMap> {
         let offset = u32::try_from(self.layout.offset().as_const()?).ok()?;
-        let groups: SmallVec<[crate::shape::AxisGroup; 4]> = match &self.access {
+        let groups = match &self.access {
             AccessPlan::Unflatten(map) => map.groups.clone(),
-            _ => self
-                .layout
-                .shape()
-                .iter()
-                .zip(self.layout.strides())
-                .map(|(d, s)| {
-                    Some(crate::shape::AxisGroup::affine(
-                        u32::try_from(d.as_const()?).ok()?,
-                        u32::try_from(s.as_const()?).ok()?,
-                    ))
-                })
-                .collect::<Option<_>>()?,
+            _ => self.layout.affine_groups()?,
         };
 
         // Row-major over the logical axes, then most-significant-first within
@@ -590,6 +658,21 @@ impl Operand {
         terms.sort_unstable_by_key(|t| std::cmp::Reverse(t.divisor));
         coalesce(&mut terms);
         Some(AddressMap { offset, terms })
+    }
+
+    /// Whether this read moves as `axis`'s coordinate advances over a
+    /// row-major walk of `space`: some address term with a stride overlaps
+    /// the axis's flat-index window. `None` when undecidable.
+    pub fn varies_along(&self, space: &IndexSpace, axis: u32) -> Option<bool> {
+        let a = axis as usize;
+        let lo = crate::shape::const_elements(space.dims.get(a + 1..)?)?;
+        let hi = lo.checked_mul(space.dims.get(a)?.as_const()?)?;
+        let map = self.address_map()?;
+        Some(map.terms.iter().any(|t| {
+            let t_lo = u64::from(t.divisor);
+            let t_hi = t_lo.saturating_mul(u64::from(t.modulus));
+            t.stride != 0 && t_lo < hi && lo < t_hi
+        }))
     }
 
     /// Re-spell this edge under another [`AccessPlan`], or decline when the

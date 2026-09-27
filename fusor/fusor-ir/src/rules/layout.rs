@@ -9,11 +9,10 @@
 //! pack rule on `Contract`.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
-use crate::ir::launch::{AccessPlan, ContractSide, Launch, Operand};
+use crate::ir::launch::{AccessPlan, Operand};
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
-use crate::shape::{AxisGroup, Layout, MultiFlattenMap, SubAxis};
-use smallvec::SmallVec;
+use crate::shape::{Layout, MultiFlattenMap, const_elements};
 
 rule!(
     OPERAND_ALIAS,
@@ -47,33 +46,24 @@ rule!(
     apply = operand_unflatten,
 );
 
-/// Rebuild a `Map` with the first operand that `pick` rewrites replaced.
-fn remap_kmap(
+/// Mint the reader with the first operand `pick` re-spells replaced, in
+/// `Launch::operands` order: a contraction's A side before its B side.
+fn respell_first(
     b: &mut Builder<'_>,
     id: Id,
     node: &Node,
     pick: impl Fn(&Operand) -> Option<Operand>,
 ) -> Option<Id> {
-    let Op::Launch(Launch::Map {
-        space,
-        body,
-        ops,
-        sched,
-    }) = &node.op
-    else {
+    let Op::Launch(op) = &node.op else {
         return None;
     };
-    let slot = ops.iter().position(|o| pick(o).is_some())?;
-    let mut new_ops = ops.clone();
-    new_ops[slot] = pick(&ops[slot])?;
-    let alt = b
-        .add_launch(Launch::Map {
-            space: space.clone(),
-            body: body.clone(),
-            ops: new_ops,
-            sched: sched.clone(),
-        })
-        .ok()?;
+    let (slot, new) = op
+        .operands()
+        .enumerate()
+        .find_map(|(i, o)| Some((i, pick(o)?)))?;
+    let mut alt = op.clone();
+    *alt.operands_mut().nth(slot)? = new;
+    let alt = b.add_launch(alt).ok()?;
     b.union(id, alt).ok()
 }
 
@@ -89,7 +79,7 @@ fn remap_kmap(
 /// dropping that map re-reads the base densely and loses the broadcast,
 /// transpose or window the view expressed.
 pub fn operand_alias(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    remap_kmap(b, id, node, |o| {
+    respell_first(b, id, node, |o| {
         if matches!(o.access, AccessPlan::Alias) {
             return None;
         }
@@ -107,7 +97,7 @@ pub fn operand_alias(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -
 /// contiguous layout a gather and an alias name the *same* index map, so
 /// minting both would put one access in the graph twice under two spellings.
 pub fn operand_gather(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    remap_kmap(b, id, node, |o| {
+    respell_first(b, id, node, |o| {
         if matches!(o.access, AccessPlan::Gather) || o.layout.is_contiguous() {
             return None;
         }
@@ -120,71 +110,27 @@ pub fn operand_gather(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) 
 
 /// Stage this operand into a dense tile first. Legal when the packed layout
 /// is contiguous and holds exactly as many elements as the operand does.
+///
+/// Each operand of a side is loaded through its own access plan, so packing
+/// one and aliasing its neighbour is sound.
 pub fn operand_pack(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    let Op::Launch(Launch::Contract {
-        output,
-        m,
-        n,
-        k,
-        batch,
-        family,
-        post,
-        acc,
-        a,
-        b: rhs,
-        sched,
-    }) = &node.op
-    else {
-        return None;
-    };
-    let repack = |o: &Operand| -> Option<Operand> {
+    respell_first(b, id, node, |o| {
         // Packing a layout that is already dense row-major stages it into a
         // byte-identical tile — the same access under two spellings.
         if matches!(o.access, AccessPlan::Pack { .. }) || o.layout.is_contiguous() {
             return None;
         }
         let into = Layout::contiguous(o.layout.shape());
-        if !into.is_contiguous() || elements(&into)? != elements(&o.layout)? {
+        if !into.is_contiguous()
+            || const_elements(into.shape())? != const_elements(o.layout.shape())?
+        {
             return None;
         }
         // Packing stages the elements the *layout* addresses: an
         // independently-stated `Unflatten` map must survive the re-spelling
         // or the rule declines.
         o.respell(AccessPlan::Pack { into })
-    };
-    // Each operand of a side is loaded through its own access plan, so packing
-    // one and aliasing its neighbour is sound. Exactly one alternative is
-    // minted per fire — the first packable operand in `children_of` order.
-    let pack_first = |side: &ContractSide| -> Option<ContractSide> {
-        let (i, packed) = side
-            .ops
-            .iter()
-            .enumerate()
-            .find_map(|(i, o)| Some((i, repack(o)?)))?;
-        let mut out = side.clone();
-        out.ops[i] = packed;
-        Some(out)
-    };
-    let (new_a, new_b) = match pack_first(a) {
-        Some(pa) => (pa, rhs.clone()),
-        None => (a.clone(), pack_first(rhs)?),
-    };
-    let alt = b
-        .add_launch(Launch::Contract {
-            output: output.clone(),
-            m: *m,
-            n: *n,
-            k: *k,
-            batch: *batch,
-            family: *family,
-            post: post.clone(),
-            acc: *acc,
-            a: new_a,
-            b: new_b,
-            sched: sched.clone(),
-        })
-        .ok()?;
-    b.union(id, alt).ok()
+    })
 }
 
 /// Read this operand through an explicit index map. Legal only when the
@@ -195,34 +141,16 @@ pub fn operand_pack(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) ->
 /// implies, so it is skipped for the same canonicalization reason as
 /// [`operand_gather`].
 pub fn operand_unflatten(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    remap_kmap(b, id, node, |o| {
+    respell_first(b, id, node, |o| {
         if matches!(o.access, AccessPlan::Unflatten(_)) || o.layout.is_contiguous() {
             return None;
         }
-        let map = decompose(&o.layout)?;
+        // One group per axis of a decidable strided layout.
+        let groups = o.layout.affine_groups().filter(|g| !g.is_empty())?;
         Some(Operand {
             src: o.src,
             layout: o.layout.clone(),
-            access: AccessPlan::Unflatten(map),
+            access: AccessPlan::Unflatten(MultiFlattenMap { groups }),
         })
     })
-}
-
-fn elements(l: &Layout) -> Option<u64> {
-    l.shape()
-        .iter()
-        .try_fold(1u64, |acc, d| acc.checked_mul(d.as_const()?))
-}
-
-/// One `AxisGroup` per logical axis of a decidable strided layout.
-fn decompose(l: &Layout) -> Option<MultiFlattenMap> {
-    let mut groups: SmallVec<[AxisGroup; 4]> = SmallVec::new();
-    for (d, s) in l.shape().iter().zip(l.strides()) {
-        let extent = u32::try_from(d.as_const()?).ok()?;
-        let stride = u32::try_from(s.as_const()?).ok()?;
-        groups.push(AxisGroup {
-            sub_axes: smallvec::smallvec![SubAxis { extent, stride }],
-        });
-    }
-    (!groups.is_empty()).then_some(MultiFlattenMap { groups })
 }

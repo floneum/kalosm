@@ -134,9 +134,7 @@ impl Carrier {
     /// Sum of slot lanes — the extent of the carrier axis appended to the
     /// output shape. `None` if any `Vector` extent is symbolic.
     pub fn lanes(&self) -> Option<u64> {
-        self.slots
-            .iter()
-            .try_fold(0u64, |a, s| a.checked_add(s.lanes()?))
+        self.slot_offset(self.width())
     }
 
     /// Lane offset of slot `i` in the appended carrier axis.
@@ -239,7 +237,7 @@ impl Carrier {
         self.lift
             .iter()
             .chain(&self.merge)
-            .any(|e| reads_index_of(e, axis))
+            .any(|e| e.reads_axis(axis))
     }
 
     /// The tupling law, with slot deduplication as canonicalization.
@@ -863,12 +861,6 @@ pub fn retype_args(e: &ScalarExpr, dtype: Dtype) -> ScalarExpr {
     })
 }
 
-fn reads_index_of(e: &ScalarExpr, axis: u32) -> bool {
-    let mut found = false;
-    e.walk(&mut |e| found |= matches!(e.kind(), ScalarKind::IndexOf(a) if *a == axis));
-    found
-}
-
 /// The signature deduplication compares slots on, or `None` when the slot's
 /// merge reads a sibling and is therefore not a function of its own history.
 fn self_contained_signature(
@@ -899,7 +891,7 @@ fn self_contained_signature(
 /// `Add(a, b)` and `Add(b, a)` compare equal. `ScalarExpr` does not canonicalize
 /// on construction, so a guard spelled `merge[k] == Add(Arg(k), Arg(n+k))`
 /// would otherwise silently stop firing on half the graphs.
-fn commute_canon(e: &ScalarExpr) -> ScalarExpr {
+pub(crate) fn commute_canon(e: &ScalarExpr) -> ScalarExpr {
     use ScalarKind as K;
     match e.kind() {
         K::Un { op, x } => ScalarExpr::un(*op, commute_canon(x)),
@@ -923,13 +915,7 @@ fn commute_canon(e: &ScalarExpr) -> ScalarExpr {
 }
 
 fn splat_f32(s: &Splat) -> f32 {
-    match *s {
-        Splat::F32(v) => v,
-        Splat::F16(b) => half::f16::from_bits(b).to_f32(),
-        Splat::BF16(b) => half::bf16::from_bits(b).to_f32(),
-        Splat::U32(v) => v as f32,
-        Splat::I32(v) => v as f32,
-    }
+    s.to_f64() as f32
 }
 
 fn same(a: &[f32], b: &[f32]) -> bool {

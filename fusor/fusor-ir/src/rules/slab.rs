@@ -90,8 +90,8 @@ pub fn form_slab(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Op
     // a middle member with a buffer. Roots only: a forward chain merged
     // this way grows past what one kernel should run. Bounded, since each
     // round adds whole slabs.
-    let root_classes_all: FxHashSet<ClassId> = b.roots().iter().map(|r| b.class_of(*r)).collect();
-    let head_is_root = root_classes_all.contains(&b.class_of(id));
+    let root_classes: FxHashSet<ClassId> = b.roots().iter().map(|r| b.class_of(*r)).collect();
+    let head_is_root = root_classes.contains(&b.class_of(id));
     for _ in 0..4 {
         if !head_is_root {
             break;
@@ -105,7 +105,7 @@ pub fn form_slab(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Op
                 if let Op::Launch(Launch::Slab { members: ms, .. }) = &b.node(r).op
                     && ms
                         .last()
-                        .is_some_and(|l| root_classes_all.contains(&b.class_of(*l)))
+                        .is_some_and(|l| root_classes.contains(&b.class_of(*l)))
                     && ms.contains(&m)
                     && !ms.iter().any(|x| b.class_of(*x) == b.class_of(id))
                 {
@@ -198,7 +198,6 @@ pub fn form_slab(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Op
     // from outside, and every middle member something outside the slab
     // reads — one nothing else reads stays in workgroup memory.
     let budget = b.caps().limits.max_storage_buffers_per_shader_stage as usize;
-    let root_classes: FxHashSet<ClassId> = b.roots().iter().map(|r| b.class_of(*r)).collect();
     let first = members.len().saturating_sub(MAX_MEMBERS);
     // Each member's finest partition against the whole chain. A tail has
     // fewer members, so fewer member operands to be local to, so its finest
@@ -232,16 +231,8 @@ pub fn form_slab(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Op
         let Some(slabs) = coarsen(g, widest, b.caps()) else {
             continue;
         };
-        let classes: FxHashSet<ClassId> = tail.iter().map(|m| b.class_of(*m)).collect();
         let mut inputs: FxHashSet<ClassId> = FxHashSet::default();
-        for m in tail {
-            for c in b.node(*m).children.iter() {
-                let class = b.class_of(*c);
-                if !classes.contains(&class) {
-                    inputs.insert(class);
-                }
-            }
-        }
+        outside_inputs(b, tail, &mut inputs);
         // Members something outside reads bind too; which those are is the
         // extractor's to know (`slab_bindings_fit`), and asking the graph
         // here costs a reader scan per member per chain. A root member is
@@ -251,18 +242,10 @@ pub fn form_slab(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Op
             .iter()
             .filter(|m| root_classes.contains(&b.class_of(**m)))
             .count();
-        // Only leaves and roots bind their own buffers; the rest share the
-        // step arena's one binding.
-        let owns = |c: &ClassId| {
-            root_classes.contains(c)
-                || b.class_members(c.0).iter().any(|m| {
-                    matches!(
-                        b.node(*m).op,
-                        Op::Logical(crate::ir::logical::Logical::Leaf(_))
-                    )
-                })
-        };
-        let inputs = inputs.iter().filter(|c| owns(c)).count();
+        let inputs = inputs
+            .iter()
+            .filter(|c| own_buffer(b, **c, &root_classes))
+            .count();
         if 3 + inputs + root_members > budget {
             continue;
         }
@@ -365,6 +348,31 @@ fn varies(o: &Operand, op: &Launch) -> bool {
         .iter()
         .enumerate()
         .any(|(i, t)| t.stride != 0 && (u64::from(t.divisor) < total || map.needs_modulo(i, total)))
+}
+
+/// Every class `members` read that none of them computes, into `out`.
+pub(crate) fn outside_inputs(b: &Builder<'_>, members: &[Id], out: &mut FxHashSet<ClassId>) {
+    let own: FxHashSet<ClassId> = members.iter().map(|m| b.class_of(*m)).collect();
+    for m in members {
+        for c in b.node(*m).children.iter() {
+            let class = b.class_of(*c);
+            if !own.contains(&class) {
+                out.insert(class);
+            }
+        }
+    }
+}
+
+/// Whether a class binds its own buffer: an external leaf or a root the
+/// caller reads back. Everything else shares the step arena's one binding.
+pub(crate) fn own_buffer(b: &Builder<'_>, class: ClassId, roots: &FxHashSet<ClassId>) -> bool {
+    roots.contains(&class)
+        || b.class_members(class.0).iter().any(|m| {
+            matches!(
+                b.node(*m).op,
+                Op::Logical(crate::ir::logical::Logical::Leaf(_))
+            )
+        })
 }
 
 /// Whether `id`'s class also has a `Contract` spelling: the value is a

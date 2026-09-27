@@ -7,7 +7,7 @@ use crate::facts::ValueFacts;
 use crate::ir::launch::Launch;
 use crate::ir::logical::Logical;
 use crate::ir::{Children, Level, Node, Op, OpTag, Semantics};
-use crate::shape::{Dim, SymId};
+use crate::shape::SymId;
 use fixedbitset::FixedBitSet;
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
@@ -50,8 +50,6 @@ pub struct NodeKey {
     pub op: Op,
     pub children: Children,
 }
-
-type ReaderClasses = FxHashMap<ClassId, Arc<FxHashSet<ClassId>>>;
 
 /// The e-graph: one node arena, one memo, one facts table, no union-find.
 pub struct EGraph {
@@ -103,10 +101,6 @@ pub struct EGraph {
     /// Per node, the nodes that read it as a child, by the id they wrote.
     /// Nodes never move, so the index is append-only with `nodes`.
     readers: Vec<SmallVec<[Id; 4]>>,
-    /// The classes reading each class, computed at a node count and valid
-    /// until the next node: a rule application asks about the same chain's
-    /// members many times while it mints nothing.
-    reader_classes_memo: std::sync::Mutex<(usize, ReaderClasses)>,
 }
 
 impl EGraph {
@@ -114,7 +108,6 @@ impl EGraph {
         Self {
             nodes: Vec::new(),
             readers: Vec::new(),
-            reader_classes_memo: std::sync::Mutex::new((usize::MAX, FxHashMap::default())),
             facts: Vec::new(),
             memo: Arc::new(FxHashMap::default()),
             parent: Vec::new(),
@@ -132,15 +125,6 @@ impl EGraph {
             saturated_root_sets: FxHashSet::default(),
             saturated_at_len: None,
             l0_term_memo: FxHashMap::default(),
-        }
-    }
-
-    /// `d` at its hinted value when every symbol it reaches is bound, else
-    /// `d` itself.
-    pub fn hinted(&self, d: Dim) -> Dim {
-        match d.evaluate(&mut |s| self.dim_hints.get(&s).copied()) {
-            Some(v) => Dim::Const(v),
-            None => d,
         }
     }
 
@@ -300,10 +284,6 @@ impl EGraph {
         cur
     }
 
-    pub fn chain(&self, id: Id) -> Vec<Id> {
-        self.members(self.class_of(id))
-    }
-
     /// Brings the readers index up to `len` nodes: every node added by a
     /// path other than [`Self::add`] — a replayed delta — is indexed here.
     fn index_readers_to(&mut self, len: usize) {
@@ -321,7 +301,7 @@ impl EGraph {
     pub fn readers(&self, class: ClassId) -> Vec<Id> {
         let mut out: Vec<Id> = Vec::new();
         let mut seen: FxHashSet<Id> = FxHashSet::default();
-        self.for_each_reader(class, |r| {
+        self.any_reader(class, |r| {
             if seen.insert(r) {
                 out.push(r);
             }
@@ -330,37 +310,9 @@ impl EGraph {
         out
     }
 
-    /// Whether some non-`Union` reader of `class` satisfies `pred`; stops
-    /// at the first.
-    pub fn any_reader(&self, class: ClassId, pred: impl FnMut(Id) -> bool) -> bool {
-        self.for_each_reader(class, pred)
-    }
-
-    /// The classes whose nodes read `class`, memoized at the current node
-    /// count.
-    pub fn reader_classes(&self, class: ClassId) -> Arc<FxHashSet<ClassId>> {
-        let mut memo = self
-            .reader_classes_memo
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if memo.0 != self.nodes.len() {
-            *memo = (self.nodes.len(), FxHashMap::default());
-        }
-        if let Some(hit) = memo.1.get(&class) {
-            return Arc::clone(hit);
-        }
-        let mut out: FxHashSet<ClassId> = FxHashSet::default();
-        self.for_each_reader(class, |r| {
-            out.insert(self.class_of(r));
-            false
-        });
-        let out = Arc::new(out);
-        memo.1.insert(class, Arc::clone(&out));
-        out
-    }
-
-    /// Visits the readers of `class` until `f` answers true.
-    fn for_each_reader(&self, class: ClassId, mut f: impl FnMut(Id) -> bool) -> bool {
+    /// Whether some non-`Union` reader of `class` satisfies `f`; stops at
+    /// the first.
+    pub fn any_reader(&self, class: ClassId, mut f: impl FnMut(Id) -> bool) -> bool {
         for id in self.class_ids(class) {
             let Some(readers) = self.readers.get(id.index()) else {
                 continue;
@@ -377,22 +329,31 @@ impl EGraph {
         false
     }
 
+    /// Every id `class` holds, `Union` spine included, in walk order.
     pub fn class_ids(&self, class: ClassId) -> Vec<Id> {
         let mut out = Vec::new();
-        // The spine is a DAG; a set membership test keeps this linear.
+        self.walk_class(class, |id, _| out.push(id));
+        out
+    }
+
+    /// Visit every id of `class` once, spine first-seen first. The spine is a
+    /// DAG; a set membership test keeps this linear.
+    fn walk_class(&self, class: ClassId, mut f: impl FnMut(Id, bool)) {
         let mut seen: FxHashSet<Id> = FxHashSet::default();
         let mut stack = vec![class.0];
         while let Some(cur) = stack.pop() {
             if !seen.insert(cur) {
                 continue;
             }
-            out.push(cur);
-            if let Op::Union(a, b) = self.nodes[cur.index()].op {
-                stack.push(b);
-                stack.push(a);
+            match self.nodes[cur.index()].op {
+                Op::Union(a, b) => {
+                    f(cur, true);
+                    stack.push(b);
+                    stack.push(a);
+                }
+                _ => f(cur, false),
             }
         }
-        out
     }
 
     /// [`Self::class_ids`], memoized against the arena length.
@@ -411,22 +372,11 @@ impl EGraph {
     /// Every non-`Union` member of an e-class, in creation order.
     pub fn members(&self, class: ClassId) -> Vec<Id> {
         let mut out = Vec::new();
-        // The `Union` spine is a DAG, so shared spine nodes are marked seen
-        // to avoid re-descending their subtrees.
-        let mut seen: FxHashSet<Id> = FxHashSet::default();
-        let mut stack = vec![class.0];
-        while let Some(cur) = stack.pop() {
-            if !seen.insert(cur) {
-                continue;
+        self.walk_class(class, |id, spine| {
+            if !spine {
+                out.push(id);
             }
-            match self.nodes[cur.index()].op {
-                Op::Union(a, b) => {
-                    stack.push(b);
-                    stack.push(a);
-                }
-                _ => out.push(cur),
-            }
-        }
+        });
         out
     }
 
@@ -560,7 +510,6 @@ impl<'a> Builder<'a> {
     pub fn class_members(&self, id: Id) -> Vec<Id> {
         self.graph.members(self.graph.class_of(id))
     }
-    /// Whether some node outside `classes` reads `id`'s class.
     /// Every id `id`'s class holds, spine included.
     pub fn class_ids(&self, id: Id) -> Vec<Id> {
         self.graph.class_ids(self.graph.class_of(id))
@@ -582,20 +531,11 @@ impl<'a> Builder<'a> {
     pub fn readers_of(&self, id: Id) -> Vec<Id> {
         self.graph.readers(self.graph.class_of(id))
     }
-    pub fn read_outside(&self, id: Id, classes: &FxHashSet<ClassId>) -> bool {
-        self.graph
-            .reader_classes(self.graph.class_of(id))
-            .iter()
-            .any(|c| !classes.contains(c))
-    }
     pub fn node(&self, id: Id) -> &Node {
         self.graph.node(id)
     }
     pub fn facts_of(&self, id: Id) -> &ValueFacts {
         self.graph.facts(id)
-    }
-    pub fn level_of(&self, id: Id) -> Level {
-        self.graph.level(id)
     }
     pub fn add_logical(&mut self, op: Logical) -> Result<Id> {
         self.graph.add(Op::Logical(op))

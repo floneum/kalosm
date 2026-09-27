@@ -31,7 +31,7 @@ rule!(
     level = Level::Launch,
     head = OpTag::LaunchFold,
     tag = RuleTag::Additive,
-    apply = fold_views_into_fold_index,
+    apply = fold_views_into_index,
 );
 
 /// Compose a coordinate-independent map into a contraction's epilogue,
@@ -44,58 +44,18 @@ pub fn sink_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -
         return None;
     }
     let spine = b.trace_pure_views(ops[0].src);
-    let base = b.node(spine.base).op.clone();
-
-    let sunk = match base {
-        Op::Launch(Launch::Contract {
-            output,
-            m,
-            n,
-            k,
-            batch,
-            family,
-            post,
-            acc,
-            a,
-            b: rhs,
-            sched,
-        }) => {
-            if !epilogue_preserves_accum(body.dtype(), acc) {
-                return None;
-            }
-            b.add_launch(Launch::Contract {
-                output,
-                m,
-                n,
-                k,
-                batch,
-                family,
-                post: body.compose(&[post]),
-                acc,
-                a,
-                b: rhs,
-                sched,
-            })
-            .ok()?
-        }
-        _ => return None,
+    let Op::Launch(mut sunk) = b.node(spine.base).op.clone() else {
+        return None;
     };
-
-    // Re-apply the spine, innermost first. Each view keeps its own relative
-    // spec vector, which is what makes a multi-node spine compose correctly.
-    let mut cursor = sunk;
-    for view in spine.views.iter() {
-        let Op::Logical(Logical::Restride { specs, bounds, .. }) = b.node(*view).op.clone() else {
-            return None;
-        };
-        cursor = b
-            .add_logical(Logical::Restride {
-                specs,
-                bounds,
-                x: cursor,
-            })
-            .ok()?;
+    let Launch::Contract { post, acc, .. } = &mut sunk else {
+        return None;
+    };
+    if !epilogue_preserves_accum(body.dtype(), *acc) {
+        return None;
     }
+    *post = body.compose(&[post.clone()]);
+    let sunk = b.add_launch(sunk).ok()?;
+    let cursor = crate::rules::rebuild_spine(b, &spine, sunk)?;
     b.union(id, cursor).ok()
 }
 
@@ -111,71 +71,27 @@ fn epilogue_preserves_accum(epilogue: Dtype, acc: Dtype) -> bool {
 /// Read a view through the operand's index map instead of through a
 /// materialized copy. `MultiFlattenMap::divmod_ops` is the term the pricing
 /// crate charges for the divmod chain, so this stays ungated here.
+///
+/// A `Fold`'s operands are indexed over `space` exactly as a `Map`'s are, so
+/// it is the same rewrite. `vec_axes` needs no special case: it renumbers
+/// nothing, and `check_vec_axes` refuses an illegal spelling at `add_launch`.
 pub fn fold_views_into_index(
     b: &mut Builder<'_>,
     id: Id,
     node: &Node,
     _f: &Facts<'_>,
 ) -> Option<Id> {
-    let Op::Launch(Launch::Map {
-        space,
-        body,
-        ops,
-        sched,
-    }) = &node.op
+    let Op::Launch(op @ (Launch::Map { space, ops, .. } | Launch::Fold { space, ops, .. })) =
+        &node.op
     else {
         return None;
     };
     let new_ops = fold_operand_views(b, ops, space)?;
-    let alt = b
-        .add_launch(Launch::Map {
-            space: space.clone(),
-            body: body.clone(),
-            ops: new_ops,
-            sched: sched.clone(),
-        })
-        .ok()?;
-    b.union(id, alt).ok()
-}
-
-/// The same law with a `Fold` in the consumer position.
-///
-/// A `Fold`'s operands are indexed over `space` exactly as a `Map`'s are, so
-/// the rewrite is the same rewrite. `vec_axes` needs no special case: it
-/// renumbers nothing, and `check_vec_axes` on the minted node refuses an
-/// illegal spelling at `add_launch`.
-pub fn fold_views_into_fold_index(
-    b: &mut Builder<'_>,
-    id: Id,
-    node: &Node,
-    _f: &Facts<'_>,
-) -> Option<Id> {
-    let Op::Launch(Launch::Fold {
-        space,
-        axis,
-        vec_axes,
-        carrier,
-        acc,
-        post,
-        ops,
-        sched,
-    }) = &node.op
-    else {
-        return None;
-    };
-    let new_ops = fold_operand_views(b, ops, space)?;
-    let alt = b
-        .add_launch(Launch::Fold {
-            space: space.clone(),
-            axis: *axis,
-            vec_axes: vec_axes.clone(),
-            carrier: carrier.clone(),
-            acc: *acc,
-            post: post.clone(),
-            ops: new_ops,
-            sched: sched.clone(),
-        })
-        .ok()?;
+    let mut alt = op.clone();
+    for (o, new) in alt.operands_mut().zip(new_ops) {
+        *o = new;
+    }
+    let alt = b.add_launch(alt).ok()?;
     b.union(id, alt).ok()
 }
 
@@ -197,7 +113,7 @@ fn fold_operand_views(
         // only when that layout was the dense read of the consuming space. A
         // permuted, broadcast or offset alias says something else, and every
         // one of those spellings reaches here.
-        if !reads_its_view_densely(slot, space) {
+        if !slot.layout.is_contiguous() || slot.layout.shape() != space.dims.as_slice() {
             continue;
         }
         let spine = b.trace_pure_views(slot.src);
@@ -213,13 +129,7 @@ fn fold_operand_views(
             let Some(layout) = crate::rules::composed_spine_layout(b, &spine) else {
                 continue;
             };
-            if layout.rank() != space.dims.len()
-                || !layout
-                    .shape()
-                    .iter()
-                    .zip(&space.dims)
-                    .all(|(l, d)| l.known_eq(*d))
-            {
+            if layout.shape() != space.dims.as_slice() {
                 continue;
             }
             *slot = Operand {
@@ -267,38 +177,6 @@ fn fold_operand_views(
         changed = true;
     }
     changed.then_some(new_ops)
-}
-
-/// Whether `o`'s own layout is the dense row-major read of `space` at offset
-/// zero — the one layout [`fold_operand_views`] may discard, because it is the
-/// one the replacement map reproduces.
-///
-/// `verify_launch::check_operand_access` pins an `Alias`'s rank and extents
-/// only, so transposed, broadcast and windowed operands all arrive here;
-/// replacing their layout with `unflatten_of`'s map addresses a different
-/// element at every coordinate but the first.
-fn reads_its_view_densely(o: &Operand, space: &crate::ir::launch::IndexSpace) -> bool {
-    if !o.layout.offset().known_eq(Dim::Const(0)) {
-        return false;
-    }
-    if o.layout.rank() != space.dims.len() {
-        return false;
-    }
-    if !o
-        .layout
-        .shape()
-        .iter()
-        .zip(&space.dims)
-        .all(|(l, d)| l.known_eq(*d))
-    {
-        return false;
-    }
-    let want = Layout::row_major_strides(&space.dims);
-    o.layout
-        .strides()
-        .iter()
-        .zip(&want)
-        .all(|(s, w)| s.known_eq(*w))
 }
 
 /// The index map a relative spec vector induces over a dense base, and the

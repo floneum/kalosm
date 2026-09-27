@@ -23,24 +23,16 @@ pub fn work_of(op: &Op, ins: &[ValueFacts], out: &ValueFacts) -> Work {
     }
 }
 
-/// `(arith, transcendental, index)` of evaluating every slot's lift once.
-/// Shared subexpressions across slots are counted once, matching what a
-/// structurally-CSE'd emitter issues. `UnOp::is_transcendental()` and
-/// `BinOp::Pow` are transcendental; `IndexOf` is an index op; everything else
-/// is arithmetic.
-pub fn carrier_lift_cost(c: &crate::carrier::Carrier) -> (u64, u64, u64) {
+/// `(arith, transcendental, index)` of evaluating `exprs` once each.
+/// Shared subexpressions are counted once, matching what a structurally-CSE'd
+/// emitter issues. `UnOp::is_transcendental()` and `BinOp::Pow` are
+/// transcendental; `IndexOf` is an index op; everything else is arithmetic.
+pub fn expr_cost<'a>(exprs: impl IntoIterator<Item = &'a ScalarExpr>) -> (u64, u64, u64) {
     let mut seen: FxHashSet<u64> = FxHashSet::default();
     let mut acc = (0u64, 0u64, 0u64);
-    for e in &c.lift {
+    for e in exprs {
         count(e, &mut seen, &mut acc);
     }
-    acc
-}
-
-pub fn scalar_expr_cost(e: &ScalarExpr) -> (u64, u64, u64) {
-    let mut seen: FxHashSet<u64> = FxHashSet::default();
-    let mut acc = (0u64, 0u64, 0u64);
-    count(e, &mut seen, &mut acc);
     acc
 }
 
@@ -96,21 +88,13 @@ pub fn work_l0(op: &Logical, ins: &[ValueFacts], out: &ValueFacts) -> Work {
         // the plan already accounts for, and a projection is a relabelling.
         Logical::Leaf(_) | Logical::Project { .. } => Work::default(),
 
-        Logical::Map { expr, .. } => {
-            let (arith, trans, index) = scalar_expr_cost(expr);
-            Work {
-                macs: e.saturating_mul(arith),
-                transcendentals: e.saturating_mul(trans),
-                index_ops: e.saturating_mul(index),
-                wg_bytes: 0,
-            }
-        }
+        Logical::Map { expr, .. } => epilogue_work(expr, e),
 
         // One merge per slot per element, plus the lift.
         Logical::Fold { carrier, .. } => {
             let width = carrier.width() as u64;
             let ein = ins.first().map_or(0, elements);
-            let (lift_a, lift_t, lift_i) = carrier_lift_cost(carrier);
+            let (lift_a, lift_t, lift_i) = expr_cost(&carrier.lift);
             Work {
                 macs: ein
                     .saturating_mul(width.saturating_add(lift_a))
@@ -166,20 +150,12 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
     let e = elements(out);
     match op {
         Launch::Map { body, ops, .. } => {
-            let (arith, trans, index) = scalar_expr_cost(body);
-            let decode: u64 = ins
-                .iter()
-                .map(|f| decode_ops_of(f.dtype))
-                .fold(0, u64::saturating_add);
-            Work {
-                macs: e.saturating_mul(arith),
-                transcendentals: e.saturating_mul(trans),
-                index_ops: e
-                    .saturating_mul(index)
-                    .saturating_add(operand_index_ops(ops, e))
-                    .saturating_add(e.saturating_mul(decode)),
-                wg_bytes: 0,
-            }
+            let mut w = epilogue_work(body, e);
+            w.index_ops = w
+                .index_ops
+                .saturating_add(operand_index_ops(ops, e))
+                .saturating_add(e.saturating_mul(decode_ops(ins)));
+            w
         }
 
         // A promoted axis leaves the iteration domain and reappears as
@@ -198,34 +174,28 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             // nest is charged `lanes` times its true cost. The filter is a
             // no-op on every unpromoted node.
             let ein = space
-                .dims
+                .iter_dims(vec_axes)
                 .iter()
-                .enumerate()
-                .filter(|(i, _)| !vec_axes.contains(&(*i as u32)))
-                .map(|(_, d)| priced(*d))
+                .map(|d| priced(*d))
                 .fold(1u64, |a, b| a.saturating_mul(b));
             let (lift_a, lift_t, lift_i) = carrier
                 .lift
                 .iter()
                 .zip(&carrier.slots)
                 .map(|(e, slot)| {
-                    let (a, t, i) = scalar_expr_cost(e);
+                    let (a, t, i) = expr_cost([e]);
                     let n = slot.lanes().unwrap_or(1);
                     (a * n, t * n, i * n)
                 })
                 .fold((0, 0, 0), |a, b| (a.0 + b.0, a.1 + b.1, a.2 + b.2));
-            let (merge_a, merge_t, merge_i) =
-                expression_list_cost(&carrier.merge_lanes().unwrap_or_default());
+            let (merge_a, merge_t, merge_i) = expr_cost(&carrier.merge_lanes().unwrap_or_default());
             let (post_a, post_t, post_i) =
-                expression_list_cost(&carrier.expand_lanes(post).unwrap_or_default());
+                expr_cost(&carrier.expand_lanes(post).unwrap_or_default());
             let rows = ein / priced(space.dims[*axis as usize]).max(1);
             // The inline decode of a quantized operand, once per iterated
             // element — the same schedule-independent floor `Map` and
             // `Contract` price.
-            let decode: u64 = ins
-                .iter()
-                .map(|f| decode_ops_of(f.dtype))
-                .fold(0, u64::saturating_add);
+            let decode = decode_ops(ins);
             Work {
                 macs: ein
                     .saturating_mul(merge_a.saturating_add(lift_a))
@@ -248,11 +218,9 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             operand,
             ..
         } => {
-            let count = super::children::children_launch(producer).len();
-            let produced = super::infer_launch::infer_launch(producer, &ins[..count])
-                .expect("admitted producer");
-            let mut inputs = ins[count..].to_vec();
-            inputs.insert(*operand as usize, produced.clone());
+            let (count, produced, inputs) =
+                super::infer_launch::stream_inputs(producer, fold, *operand, ins)
+                    .expect("admitted producer");
             let consumer = work_l1(fold, &inputs, out);
             let source = work_l1(producer, &ins[..count], &produced);
             let outputs = elements(&produced).max(1);
@@ -331,15 +299,6 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
     }
 }
 
-fn expression_list_cost(expressions: &[ScalarExpr]) -> (u64, u64, u64) {
-    let mut seen = FxHashSet::default();
-    let mut cost = (0, 0, 0);
-    for expression in expressions {
-        count(expression, &mut seen, &mut cost);
-    }
-    cost
-}
-
 /// Producer evaluations performed by a streamed Fold. Promoted positions
 /// sharing the generated operand's address reuse one evaluation.
 pub fn stream_evaluations(fold: &Launch, operand: u32) -> u64 {
@@ -385,6 +344,13 @@ pub fn quant_decode_ops(fmt: crate::dtype::QFmt) -> u64 {
     }
 }
 
+/// Per-element decode ops summed over every operand.
+fn decode_ops(ins: &[ValueFacts]) -> u64 {
+    ins.iter()
+        .map(|f| decode_ops_of(f.dtype))
+        .fold(0, u64::saturating_add)
+}
+
 /// [`quant_decode_ops`] for a dtype, zero when dense.
 pub fn decode_ops_of(d: crate::dtype::Dtype) -> u64 {
     match d {
@@ -394,7 +360,7 @@ pub fn decode_ops_of(d: crate::dtype::Dtype) -> u64 {
 }
 
 pub fn epilogue_work(expr: &ScalarExpr, iterations: u64) -> Work {
-    let (arith, trans, index) = scalar_expr_cost(expr);
+    let (arith, trans, index) = expr_cost([expr]);
     Work {
         macs: iterations.saturating_mul(arith),
         transcendentals: iterations.saturating_mul(trans),

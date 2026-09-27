@@ -28,14 +28,13 @@
 //! RETARGET's job.
 
 use crate::carrier::{ArgRemap, Carrier, Tupled, map_args, retype_args};
-use crate::device::Caps;
-use crate::dtype::{Dtype, NumericContract};
-use crate::egraph::{Builder, Facts, Id, RuleTag, ViewSpine};
-use crate::ir::launch::{IndexSpace, Launch, Operand, ScheduleDomain};
+use crate::dtype::NumericContract;
+use crate::egraph::{Builder, Facts, Id, RuleTag};
+use crate::ir::launch::{Launch, Operand};
 use crate::ir::logical::Logical;
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
-use crate::rules::alias_operand_of;
+use crate::rules::{FoldView, rebuild_spine};
 use crate::scalar::ScalarExpr;
 use crate::shape::{BoundsProof, Dim, StrideSpec};
 use rustc_hash::FxHashSet;
@@ -46,7 +45,7 @@ rule!(
     level = Level::Launch,
     head = OpTag::LaunchMap,
     tag = RuleTag::Additive,
-    apply = tuple_at_consumer,
+    apply = tuple_at,
 );
 
 rule!(
@@ -54,85 +53,8 @@ rule!(
     level = Level::Launch,
     head = OpTag::LaunchFold,
     tag = RuleTag::Additive,
-    apply = tuple_siblings,
+    apply = tuple_at,
 );
-
-/// The consumer rooting at a `Map`.
-pub fn tuple_at_consumer(b: &mut Builder<'_>, id: Id, n: &Node, f: &Facts<'_>) -> Option<Id> {
-    tuple_at(b, id, n, f)
-}
-
-/// The consumer rooting at a `Fold` — a reducing nest that reads two reducing
-/// nests.
-pub fn tuple_siblings(b: &mut Builder<'_>, id: Id, n: &Node, f: &Facts<'_>) -> Option<Id> {
-    tuple_at(b, id, n, f)
-}
-
-/// The private accumulator budget one invocation may hold, in bytes.
-///
-/// Placeholder until [`Caps`] carries a calibrated field: the conservative
-/// constant every target can honour, 256 f32 registers per lane. A carrier
-/// wider than the budget is unschedulable, not merely slower, so the rule
-/// declines rather than minting a node no backend can lower.
-const fn private_acc_bytes(_caps: &Caps) -> u64 {
-    1024
-}
-
-/// A reduction nest, normalized out of whichever spelling the operand named.
-///
-/// Equality in this e-graph is not congruent, so a `Logical::Fold` and the
-/// `Launch::Fold` it was lowered to are one class while a consumer's operand
-/// still names whichever id the frontend built. This normalizes them the way
-/// `lower_fold` does — retyping the lift to the operand dtype — so the two
-/// spellings produce one hash-consed joint node.
-#[derive(Clone, Debug, PartialEq, Eq)]
-struct FoldView {
-    /// The id the operand named, which is the id the join unions against.
-    id: Id,
-    space: IndexSpace,
-    axis: u32,
-    vec_axes: SmallVec<[u32; 2]>,
-    carrier: Carrier,
-    acc: Dtype,
-    post: SmallVec<[ScalarExpr; 4]>,
-    ops: Vec<Operand>,
-    sched: ScheduleDomain,
-}
-
-impl FoldView {
-    /// The domain this nest's own expressions are written against.
-    fn iter_space(&self) -> IndexSpace {
-        IndexSpace::new(
-            self.space
-                .dims
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| !self.vec_axes.contains(&(*i as u32)))
-                .map(|(_, d)| *d),
-        )
-    }
-
-    /// The reduced axis's index in [`Self::iter_space`], the number both
-    /// spellings of one reduction agree on. `vec_axes` is the contiguous
-    /// block immediately before `axis` (`verify_launch::check_vec_axes`), so
-    /// subtracting their count is the whole renumbering.
-    fn reduced_iter_axis(&self) -> Option<u32> {
-        self.axis
-            .checked_sub(u32::try_from(self.vec_axes.len()).ok()?)
-    }
-
-    /// The output dims before the carrier axis: `space` minus the reduced axis
-    /// and minus every accumulator-resident axis.
-    fn base_dims(&self) -> SmallVec<[Dim; 6]> {
-        self.space
-            .dims
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != self.axis as usize && !self.vec_axes.contains(&(*i as u32)))
-            .map(|(_, d)| *d)
-            .collect()
-    }
-}
 
 /// The same nest, whichever id spells it. Ignores `id`: that is the
 /// Logical-versus-Launch spelling the acyclicity walk must not miss. Also
@@ -157,71 +79,28 @@ fn fold_view(b: &Builder<'_>, id: Id) -> Option<FoldView> {
     // typed `acc` and shaped like the nest's output. A spelling whose facts
     // disagree is not a value this law may redirect.
     let f = b.facts_of(id);
-    let mut want = v.base_dims();
-    if let Some(d) = v.carrier.out_dim()? {
-        want.push(d);
-    }
-    if f.dtype != v.acc
-        || f.shape.len() != want.len()
-        || !f.shape.iter().zip(want.iter()).all(|(a, c)| a.known_eq(*c))
-    {
+    let want = v.space.fold_shape(v.axis, &v.vec_axes, &v.carrier)?;
+    if f.dtype != v.acc || f.shape != want {
         return None;
     }
     Some(v)
 }
 
-/// The nest itself, in either spelling.
+/// The nest itself, in either spelling. A `Logical::Fold`'s lift is retyped
+/// to the operand dtype as `lower_fold` does, so the two spellings produce
+/// one hash-consed joint node.
 fn bare_fold_view(b: &Builder<'_>, id: Id) -> Option<FoldView> {
-    match b.node(id).op.clone() {
-        Op::Launch(Launch::Fold {
-            space,
-            axis,
-            vec_axes,
-            carrier,
-            acc,
-            post,
-            ops,
-            sched,
-        }) => Some(FoldView {
-            id,
-            space,
-            axis,
-            vec_axes,
-            carrier,
-            acc,
-            post,
-            ops,
-            sched,
-        }),
-        Op::Logical(Logical::Fold {
-            carrier,
-            axis,
-            acc,
-            ins,
-        }) => {
-            let src = *ins.first()?;
-            let in_shape = b.facts_of(src).shape.clone();
-            let dtype = b.facts_of(src).dtype;
-            let width = carrier.width();
-            let lift: SmallVec<[ScalarExpr; 4]> =
-                carrier.lift.iter().map(|e| retype_args(e, dtype)).collect();
-            Some(FoldView {
-                id,
-                space: IndexSpace::new(in_shape.iter().copied()),
-                axis,
-                vec_axes: SmallVec::new(),
-                carrier: carrier.with_lift(lift),
-                acc,
-                post: (0..width).map(|i| ScalarExpr::arg(i as u32, acc)).collect(),
-                ops: ins
-                    .iter()
-                    .map(|x| alias_operand_of(*x, &in_shape))
-                    .collect(),
-                sched: crate::rules::lower_floor::floor_sched(),
-            })
-        }
-        _ => None,
+    let mut v = crate::rules::fold_view(b, id)?;
+    if let Op::Logical(_) = b.node(id).op {
+        let dtype = b.facts_of(v.ops[0].src).dtype;
+        v.carrier.lift = v
+            .carrier
+            .lift
+            .iter()
+            .map(|e| retype_args(e, dtype))
+            .collect();
     }
+    Some(v)
 }
 
 /// Which operand slots of the rewritten consumer read what.
@@ -235,59 +114,19 @@ struct Joint {
     rhs_read: Id,
 }
 
-fn tuple_at(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    let srcs: SmallVec<[Id; 4]> = match &node.op {
-        Op::Launch(Launch::Map { ops, .. }) | Op::Launch(Launch::Fold { ops, .. }) => {
-            ops.iter().map(|o| o.src).collect()
-        }
-        _ => return None,
+/// [`TUPLE`] roots at a `Map` consumer, [`TUPLE_SIBLING`] at a `Fold` — a
+/// reducing nest that reads two reducing nests.
+pub fn tuple_at(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
+    let Op::Launch(op @ (Launch::Map { .. } | Launch::Fold { .. })) = &node.op else {
+        return None;
     };
+    let srcs: SmallVec<[Id; 4]> = op.operands().map(|o| o.src).collect();
     let rewire = join_pair(b, &srcs)?;
-    let rebuilt = match node.op.clone() {
-        Op::Launch(Launch::Map {
-            space,
-            body,
-            mut ops,
-            sched,
-        }) => {
-            for (slot, src) in rewire.at {
-                ops.get_mut(slot)?.src = src;
-            }
-            b.add_launch(Launch::Map {
-                space,
-                body,
-                ops,
-                sched,
-            })
-            .ok()?
-        }
-        Op::Launch(Launch::Fold {
-            space,
-            axis,
-            vec_axes,
-            carrier,
-            acc,
-            post,
-            mut ops,
-            sched,
-        }) => {
-            for (slot, src) in rewire.at {
-                ops.get_mut(slot)?.src = src;
-            }
-            b.add_launch(Launch::Fold {
-                space,
-                axis,
-                vec_axes,
-                carrier,
-                acc,
-                post,
-                ops,
-                sched,
-            })
-            .ok()?
-        }
-        _ => return None,
-    };
+    let mut rebuilt = op.clone();
+    for (slot, src) in rewire.at {
+        rebuilt.operands_mut().nth(slot)?.src = src;
+    }
+    let rebuilt = b.add_launch(rebuilt).ok()?;
     b.union(id, rebuilt).ok()
 }
 
@@ -393,7 +232,7 @@ fn join(b: &mut Builder<'_>, f1: &FoldView, f2: &FoldView) -> Option<Joint> {
     // extent is allocatable on neither backend.
     let lanes = t.carrier.lanes()?;
     let bytes = lanes.checked_mul(f1.acc.byte_size())?;
-    if bytes > private_acc_bytes(b.caps()) {
+    if bytes > crate::rules::private_acc_bytes(b.caps(), false) {
         return None;
     }
     // The rewritten nest's contract is the meet over the unified operand
@@ -484,7 +323,9 @@ fn unify_ops(lhs: &[Operand], rhs: &[Operand]) -> Option<(Vec<Operand>, ArgRemap
     let mut ops = lhs.to_vec();
     let mut map: SmallVec<[u32; 4]> = SmallVec::new();
     for o in rhs {
-        match ops.iter().position(|p| same_read(p, o)) {
+        // Identical source and addressing expressions read the same elements,
+        // including when the dimensions are resolved at dispatch.
+        match ops.iter().position(|p| p == o) {
             Some(k) => map.push(u32::try_from(k).ok()?),
             None => {
                 map.push(u32::try_from(ops.len()).ok()?);
@@ -493,12 +334,6 @@ fn unify_ops(lhs: &[Operand], rhs: &[Operand]) -> Option<(Vec<Operand>, ArgRemap
         }
     }
     Some((ops, ArgRemap { map }))
-}
-
-/// Identical source and addressing expressions read the same elements,
-/// including when the dimensions are resolved at dispatch.
-fn same_read(a: &Operand, b: &Operand) -> bool {
-    a == b
 }
 
 /// Whether either nest's result is transitively reachable from `from`.
@@ -629,24 +464,4 @@ fn slot_view(
             .ok()
         }
     }
-}
-
-/// Re-apply a chain of pure views over a rewritten base, innermost first.
-/// Rebuilding the nodes rather than composing their specs keeps every relative
-/// stride exactly as it was written.
-fn rebuild_spine(b: &mut Builder<'_>, spine: &ViewSpine, base: Id) -> Option<Id> {
-    let mut cur = base;
-    for &v in &spine.views {
-        let Op::Logical(Logical::Restride { specs, bounds, .. }) = b.node(v).op.clone() else {
-            return None;
-        };
-        cur = b
-            .add_logical(Logical::Restride {
-                specs,
-                bounds,
-                x: cur,
-            })
-            .ok()?;
-    }
-    Some(cur)
 }

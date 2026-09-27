@@ -10,8 +10,7 @@
 //!
 //! `Point` is the marker the schedule rules match on. A rule that needs to mint a
 //! nest carrying no schedule of its own calls `floor_map`,
-//! `floor_alias_map` or `floor_fold`, and a descriptor that needs the
-//! value calls `floor_sched`.
+//! `floor_alias_map` or `floor_fold`.
 
 use crate::carrier::Carrier;
 use crate::dtype::Dtype;
@@ -103,16 +102,6 @@ fn space_of(f: &Facts<'_>) -> IndexSpace {
     IndexSpace::new(f.own().shape.iter().copied())
 }
 
-/// The schedule a nest carries before any schedule rule has spoken.
-///
-/// For a *descriptor* rather than a node: [`crate::rules::tuple`] normalizes an
-/// `Logical::Fold` into the `Fold` fields it would lower to, and the schedule field
-/// of that normalization is this — the same value [`lower_fold`] would put
-/// there. Prefer the node constructors below wherever an id is what is wanted.
-pub(crate) fn floor_sched() -> ScheduleDomain {
-    ScheduleDomain::Point
-}
-
 /// A `Map` minted with no schedule of its own.
 ///
 /// The schedule rules expand it exactly as they expand a `lower_map` output:
@@ -127,7 +116,7 @@ pub(crate) fn floor_map(
         space,
         body,
         ops,
-        sched: floor_sched(),
+        sched: ScheduleDomain::Point,
     })
     .ok()
 }
@@ -176,12 +165,28 @@ pub(crate) fn floor_fold(
     post: SmallVec<[ScalarExpr; 4]>,
     ops: Vec<Operand>,
 ) -> Option<Id> {
+    let fold = floor_fold_op(space, axis, vec_axes, carrier, acc, post, ops, b.caps())?;
+    b.add_launch(fold).ok()
+}
+
+/// The `Fold` [`floor_fold`] mints: `None` past `u32` flat addressing or
+/// when no fold schedule fits the carrier.
+#[allow(clippy::too_many_arguments)]
+fn floor_fold_op(
+    space: IndexSpace,
+    axis: u32,
+    vec_axes: SmallVec<[u32; 2]>,
+    carrier: Carrier,
+    acc: Dtype,
+    post: SmallVec<[ScalarExpr; 4]>,
+    ops: Vec<Operand>,
+    caps: &crate::device::Caps,
+) -> Option<Launch> {
     if space.iterations().is_some_and(|n| n > u64::from(u32::MAX)) {
         return None;
     }
-    let sched =
-        ScheduleDomain::Point.with_fold_carrier(carrier.lanes()?, acc.byte_size(), b.caps())?;
-    b.add_launch(Launch::Fold {
+    let sched = ScheduleDomain::Point.with_fold_carrier(carrier.lanes()?, acc.byte_size(), caps)?;
+    Some(Launch::Fold {
         space,
         axis,
         vec_axes,
@@ -191,7 +196,6 @@ pub(crate) fn floor_fold(
         ops,
         sched,
     })
-    .ok()
 }
 
 /// `Logical::Map` -> `Launch::Map` reading every operand through its own dense
@@ -204,14 +208,7 @@ pub fn lower_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opt
         .iter()
         .map(|&s| alias_operand_of(s, &b.facts_of(s).shape.clone()))
         .collect();
-    let k = b
-        .add_launch(Launch::Map {
-            space: space_of(f),
-            body: expr.clone(),
-            ops,
-            sched: ScheduleDomain::Point,
-        })
-        .ok()?;
+    let k = floor_map(b, space_of(f), expr.clone(), ops)?;
     b.union(id, k).ok()
 }
 
@@ -331,24 +328,18 @@ pub fn contract_fold(node: &Node, f: &Facts<'_>) -> Option<Launch> {
             &b_shape,
         )?,
     ];
-    let space = IndexSpace::new(space);
-    if space.iterations().is_some_and(|n| n > u64::from(u32::MAX)) {
-        return None;
-    }
     let carrier = Carrier::binop(BinOp::Add, Carrier::binop_identity(BinOp::Add, *acc)?, *acc)
         .with_lift([pre]);
-    let sched =
-        ScheduleDomain::Point.with_fold_carrier(carrier.lanes()?, acc.byte_size(), f.caps())?;
-    Some(Launch::Fold {
-        space,
+    floor_fold_op(
+        IndexSpace::new(space),
         axis,
-        vec_axes: SmallVec::new(),
+        SmallVec::new(),
         carrier,
-        acc: *acc,
-        post: smallvec::smallvec![ident_expr(*acc)],
+        *acc,
+        smallvec::smallvec![ident_expr(*acc)],
         ops,
-        sched,
-    })
+        f.caps(),
+    )
 }
 
 /// One contraction operand read over the fold's `[out..., k]` index space.
@@ -492,14 +483,7 @@ pub fn lower_restride(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -
         layout: composed_layout(specs, &in_shape)?,
         access: AccessPlan::Alias,
     };
-    let k = b
-        .add_launch(Launch::Map {
-            space: space_of(f),
-            body: ident_expr(dtype),
-            ops: vec![operand],
-            sched: ScheduleDomain::Point,
-        })
-        .ok()?;
+    let k = floor_map(b, space_of(f), ident_expr(dtype), vec![operand])?;
     b.union(id, k).ok()
 }
 
@@ -517,18 +501,12 @@ pub fn lower_window(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
 
     let access = window_map(specs, &in_shape, &out_shape, &in_strides)
         .map_or(AccessPlan::Gather, AccessPlan::Unflatten);
-    let k = b
-        .add_launch(Launch::Map {
-            space: space_of(f),
-            body: ident_expr(dtype),
-            ops: vec![Operand {
-                src: *x,
-                layout: Layout::contiguous(&in_shape),
-                access,
-            }],
-            sched: ScheduleDomain::Point,
-        })
-        .ok()?;
+    let operand = Operand {
+        src: *x,
+        layout: Layout::contiguous(&in_shape),
+        access,
+    };
+    let k = floor_map(b, space_of(f), ident_expr(dtype), vec![operand])?;
     b.union(id, k).ok()
 }
 
@@ -625,14 +603,12 @@ pub fn lower_dequant(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
         return None;
     };
     let out = f.own().dtype;
-    let k = b
-        .add_launch(Launch::Map {
-            space: space_of(f),
-            body: ident_expr(if out.is_quantized() { Dtype::F32 } else { out }),
-            ops: vec![alias_operand_of(*x, &f.operand(0)?.shape.clone())],
-            sched: ScheduleDomain::Point,
-        })
-        .ok()?;
+    let k = floor_map(
+        b,
+        space_of(f),
+        ident_expr(if out.is_quantized() { Dtype::F32 } else { out }),
+        vec![alias_operand_of(*x, &f.operand(0)?.shape.clone())],
+    )?;
     b.union(id, k).ok()
 }
 
@@ -642,13 +618,11 @@ pub fn lower_project(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
     let Op::Logical(Logical::Project { slot, x }) = &node.op else {
         return None;
     };
-    let k = b
-        .add_launch(Launch::Map {
-            space: space_of(f),
-            body: ScalarExpr::arg(u32::from(*slot), f.own().dtype),
-            ops: vec![alias_operand_of(*x, &f.operand(0)?.shape.clone())],
-            sched: ScheduleDomain::Point,
-        })
-        .ok()?;
+    let k = floor_map(
+        b,
+        space_of(f),
+        ScalarExpr::arg(u32::from(*slot), f.own().dtype),
+        vec![alias_operand_of(*x, &f.operand(0)?.shape.clone())],
+    )?;
     b.union(id, k).ok()
 }
