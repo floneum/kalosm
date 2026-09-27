@@ -11,12 +11,14 @@
 
 #![warn(unreachable_pub)]
 
+mod debug;
 pub mod extract;
 pub mod facts;
 pub mod forward;
 mod lower_bound;
 mod model;
 mod moves;
+mod nodes;
 pub mod plan;
 mod quantized;
 pub mod realize;

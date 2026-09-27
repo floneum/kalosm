@@ -1,7 +1,6 @@
 //! The replay memo, keyed on the extraction inputs. Validity is "the inputs
 //! are identical".
 
-use fixedbitset::FixedBitSet;
 use fusor_ir::Result;
 use fusor_ir::egraph::{ClassId, EGraph, Id};
 use fusor_ir::extract::{Plan, PlanHash, ReplayKey};
@@ -197,19 +196,7 @@ pub fn l0_term_hash(graph: &EGraph, roots: &[Id]) -> u64 {
     // Every id of every class reachable from the roots, in id order so the
     // hash does not depend on traversal order. A class's members are what
     // the extractor chooses among, so a plan's ids all lie in this set.
-    let mut seen = FixedBitSet::with_capacity(graph.len());
-    let mut stack: Vec<Id> = roots.to_vec();
-    while let Some(id) = stack.pop() {
-        if seen.contains(id.index()) {
-            continue;
-        }
-        for m in graph.class_ids(graph.class_of(id)) {
-            if seen.put(m.index()) {
-                continue;
-            }
-            stack.extend(graph.node(m).children.iter().copied());
-        }
-    }
+    let (_, seen) = crate::realize::reachable_unsorted(graph, roots);
     // `Hash for ScalarExpr` writes a cached digest, so this stays O(nodes).
     for i in seen.ones() {
         let v = Id(i as u32);

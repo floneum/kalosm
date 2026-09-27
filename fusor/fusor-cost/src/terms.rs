@@ -156,3 +156,12 @@ pub(crate) fn occupancy_scale_num_den(facts: &DeviceFacts, resident_lanes: u64) 
 pub(crate) fn scaled(value: Picoseconds, num: u128, den: u128) -> Picoseconds {
     ps(u128::from(value.0) * num / den.max(1))
 }
+
+/// One workgroup's dependent chain: `coop` fragment steps and `lane` loop
+/// steps at the device's step latencies.
+pub(crate) fn serial_ps(facts: &DeviceFacts, coop: u64, lane: u64) -> Picoseconds {
+    Picoseconds(
+        coop.saturating_mul(facts.coop_step_ps)
+            .saturating_add(lane.saturating_mul(facts.lane_step_ps)),
+    )
+}

@@ -49,7 +49,7 @@ const fn cpu_mac_table(fma_f32: u64) -> [[u64; RateDtype::COUNT]; 3] {
 /// overwrites it.
 ///
 /// Not a `const fn`: [`DeviceFacts`] owns a [`Caps`], which owns a `String`.
-pub fn seed_facts_gpu(caps: &Caps) -> DeviceFacts {
+pub(crate) fn seed_facts_gpu(caps: &Caps) -> DeviceFacts {
     DeviceFacts {
         // A k=1024 weight gradient on 36 workgroups of one `16x16` subgroup
         // measured 70-230 us: 128 depths of four fragment multiplies, about
@@ -83,7 +83,7 @@ pub fn seed_facts_gpu(caps: &Caps) -> DeviceFacts {
 /// workgroup tile maps onto (thread-local 64-byte-aligned scratch).
 /// `store_ps_per_element` has no per-class CPU measurement; the GPU-class
 /// value seeds it and `bench_epilogue_occupancy` overwrites it.
-pub fn seed_facts_cpu(caps: &Caps) -> DeviceFacts {
+pub(crate) fn seed_facts_cpu(caps: &Caps) -> DeviceFacts {
     let threads = u64::from(caps.threads.max(1));
     DeviceFacts {
         coop_step_ps: 0,

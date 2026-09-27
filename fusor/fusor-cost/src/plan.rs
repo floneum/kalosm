@@ -28,14 +28,19 @@ use std::hash::{Hash, Hasher};
 
 /// Everything derived from one realized extraction: buffers, launches,
 /// symbols, hash and cost.
-pub fn derive_plan(
+pub(crate) fn derive_plan(
     graph: &EGraph,
     extraction: &Extraction,
     realized: &Realized,
     facts: &DeviceFacts,
     cost: fusor_ir::cost::Picoseconds,
 ) -> Result<Plan> {
-    let buffers = derive_buffers(graph, extraction, realized)?;
+    let private: FxHashSet<Id> = realized
+        .components
+        .iter()
+        .flat_map(|c| c.private.iter().copied())
+        .collect();
+    let buffers = derive_buffers(graph, extraction, realized, &private)?;
     let (mut dims, scalar_symbols) = classified_symbols_of(graph, realized);
     for buffer in &buffers {
         collect_layout(
@@ -52,11 +57,6 @@ pub fn derive_plan(
     symbols.extend(scalar_symbols.iter().copied());
 
     let mut launches = Vec::with_capacity(realized.components.len());
-    let private: FxHashSet<Id> = realized
-        .components
-        .iter()
-        .flat_map(|c| c.private.iter().copied())
-        .collect();
     for c in &realized.components {
         // A slab member kept in workgroup memory is read by nothing outside
         // that slab; a launch binding one would read a buffer nothing wrote.
@@ -187,19 +187,15 @@ fn pack_arena(
     Ok(top)
 }
 
-/// One [`BufferPlan`] per node in `m ∪ roots`, in realized order. Leaves are
-/// excluded: an external buffer is supplied, a constant is folded, and a
-/// uniform lives in binding 0.
-pub fn derive_buffers(
+/// One [`BufferPlan`] per node in `m ∪ roots` outside workgroup memory, in
+/// realized order. Leaves are excluded: an external buffer is supplied, a
+/// constant is folded, and a uniform lives in binding 0.
+fn derive_buffers(
     graph: &EGraph,
     extraction: &Extraction,
     realized: &Realized,
+    private: &FxHashSet<Id>,
 ) -> Result<Vec<BufferPlan>> {
-    let private: FxHashSet<Id> = realized
-        .components
-        .iter()
-        .flat_map(|c| c.private.iter().copied())
-        .collect();
     let mut out = Vec::new();
     for id in &realized.order {
         if realize::leaf_role(graph, *id) != realize::LeafRole::NotLeaf {
@@ -232,7 +228,7 @@ pub fn derive_buffers(
 /// Bindings of one launch, in binding-index order. **Binding 0 is reserved
 /// for the uniform block** and is never listed here; storage bindings start
 /// at 1, reads first sorted by value id, then writes.
-pub fn derive_bindings(
+fn derive_bindings(
     graph: &EGraph,
     extraction: &Extraction,
     realized: &Realized,
@@ -302,8 +298,8 @@ pub fn buffer_layout_for(
             .ok_or_else(|| Error::Plan("cooperative matrix groups require concrete extents".into()))
     };
     let (m, n) = (constant(*m)?, constant(*n)?);
-    let m_padded = m.max(1).div_ceil(u64::from(geom.bm)) * u64::from(geom.bm);
-    let n_padded = n.max(1).div_ceil(u64::from(geom.bn)) * u64::from(geom.bn);
+    let tiling = crate::nodes::Tiling::new(m.max(1), n.max(1), geom.bm, geom.bn);
+    let (m_padded, n_padded) = (tiling.padded_m(), tiling.padded_n());
     let elements = *batch * Dim::Const(m_padded) * Dim::Const(n_padded);
     if m == 0 || n == 0 {
         return Ok((Layout::contiguous(shape), elements));
@@ -340,17 +336,11 @@ fn layout_elements(shape: &[Dim]) -> Dim {
     shape.iter().copied().fold(Dim::ONE, |a, b| a * b)
 }
 
-/// Every `SymId` the uniform block must carry, in binding order: dims
-/// ascending, then scalars ascending, matching `Uniforms::to_bytes`.
-pub fn symbols_of(graph: &EGraph, realized: &Realized) -> Vec<SymId> {
-    let (mut dims, scalars) = classified_symbols_of(graph, realized);
-    dims.extend(scalars);
-    dims
-}
-
-/// [`symbols_of`] split into `(dims, scalars)`: the extents, offsets and
-/// strides the kernels index by, and the runtime scalars they read.
-pub fn classified_symbols_of(graph: &EGraph, realized: &Realized) -> (Vec<SymId>, Vec<SymId>) {
+/// Every `SymId` the uniform block must carry, split into `(dims, scalars)`:
+/// the extents, offsets and strides the kernels index by, and the runtime
+/// scalars they read. Each ascending; the uniform block binds dims first,
+/// matching `Uniforms::to_bytes`.
+fn classified_symbols_of(graph: &EGraph, realized: &Realized) -> (Vec<SymId>, Vec<SymId>) {
     let mut visitor = Symbols::default();
     for id in &realized.order {
         collect_dims(&graph.facts(*id).shape, &mut visitor.dims);

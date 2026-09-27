@@ -157,7 +157,11 @@ impl TuneCache {
     /// is an empty cache, never an error: the worst it can cost is a tuning
     /// pass this process would have done anyway.
     pub fn load(caps_fingerprint: u64) -> Self {
-        let path = cache_path(caps_fingerprint);
+        Self::at(cache_path(caps_fingerprint))
+    }
+
+    /// A cache persisted at `path`, or in memory only.
+    fn at(path: Option<PathBuf>) -> Self {
         let (seen, combos) = match &path {
             Some(p) => read_tables(p),
             None => Default::default(),
@@ -245,20 +249,6 @@ impl TuneCache {
         }
         combos.insert(plan.to_string(), (picks, score));
         *self.dirty.lock() = true;
-    }
-
-    /// Whether every candidate offered for this launch has already been
-    /// measured here, so there is nothing left to learn.
-    ///
-    /// Once there is nothing new to try, the accumulated minimum over every
-    /// past run is a better estimate than one fresh noisy sample, so the tuner
-    /// applies it rather than re-deriving it.
-    pub fn converged(&self, launch: &str, candidates: &[String]) -> bool {
-        let seen = self.seen.lock();
-        let Some(entry) = seen.get(launch) else {
-            return false;
-        };
-        !candidates.is_empty() && candidates.iter().all(|c| entry.contains_key(c.as_str()))
     }
 
     /// Split candidates into what to race and what to skip, best prior first.
@@ -371,18 +361,6 @@ impl TuneCache {
     }
 }
 
-/// Round-trip a cache through a specific path. Used by the tests and by
-/// anything that wants a scratch cache rather than the device's.
-pub fn at_path(path: &Path) -> TuneCache {
-    let (seen, combos) = read_tables(path);
-    TuneCache {
-        path: Some(path.to_path_buf()),
-        seen: Mutex::new(seen),
-        combos: Mutex::new(combos),
-        dirty: Mutex::new(false),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -418,7 +396,7 @@ mod tests {
         assert!(!cache.has_observations_with_prefix("diff:", 2));
         cache.observe("diff:plan", "candidate", 40);
         cache.save();
-        let restored = at_path(&path);
+        let restored = TuneCache::at(Some(path.clone()));
         assert_eq!(restored.window_min("launch", "a"), Some(40));
         assert_eq!(restored.observations("launch", "a"), 2);
         assert_eq!(restored.combo("plan"), Some(vec![Some("a".into())]));
@@ -428,7 +406,7 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         disk["format"] = (FORMAT + 1).into();
         std::fs::write(&path, serde_json::to_string(&disk).unwrap()).unwrap();
-        let obsolete = at_path(&path);
+        let obsolete = TuneCache::at(Some(path.clone()));
         assert!(obsolete.is_empty());
         assert!(!obsolete.has_observations_with_prefix("diff:", 2));
         assert_eq!(obsolete.combo("plan"), None);

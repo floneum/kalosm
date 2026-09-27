@@ -1,5 +1,9 @@
 //! Resolve selected nodes, derive their buffers, and order their dispatches.
 
+use crate::nodes::{
+    Mnkb, Tiling, composite_members, domain_of, fold_lane_group, fold_theta, is_composite,
+    is_group, resolved_children, sgemv_block, sgemv_lanes,
+};
 use fusor_ir::cost::{CostModel, LaunchPlan, Picoseconds};
 use fusor_ir::device::Caps;
 use fusor_ir::dtype::Dtype;
@@ -22,11 +26,11 @@ use std::sync::Arc;
 
 /// Extent a `Dim::Sym` prices at: a nominal value keeps the ranking total
 /// without letting a concrete binding leak into the plan.
-pub const SYM_NOMINAL: u64 = 1024;
+pub(crate) const SYM_NOMINAL: u64 = 1024;
 
 /// What role a leaf plays in the realized DAG.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub enum LeafRole {
+pub(crate) enum LeafRole {
     /// Not a leaf; an ordinary launch member.
     NotLeaf,
     /// A constant or a uniform scalar: no buffer, no traffic, no component.
@@ -38,7 +42,7 @@ pub enum LeafRole {
 
 /// Indexed node values, with slot storage recycled between candidate walks.
 #[derive(Clone, Debug, Default)]
-pub struct IdMap<T> {
+pub(crate) struct IdMap<T> {
     slots: Vec<u32>,
     values: Vec<(Id, T)>,
 }
@@ -56,19 +60,19 @@ impl<T> IdMap<T> {
     }
 
     #[inline]
-    pub fn get(&self, id: Id) -> Option<&T> {
+    pub(crate) fn get(&self, id: Id) -> Option<&T> {
         self.values
             .get(*self.slots.get(id.index())? as usize)
             .map(|(_, value)| value)
     }
 
     #[inline]
-    pub fn contains(&self, id: Id) -> bool {
+    pub(crate) fn contains(&self, id: Id) -> bool {
         self.get(id).is_some()
     }
 
     #[inline]
-    pub fn insert(&mut self, id: Id, value: T) {
+    pub(crate) fn insert(&mut self, id: Id, value: T) {
         if self.slots.len() <= id.index() {
             self.slots.resize(id.index() + 1, u32::MAX);
         }
@@ -83,7 +87,7 @@ impl<T> IdMap<T> {
     }
 
     #[inline]
-    pub fn entry_or_default(&mut self, id: Id) -> &mut T
+    pub(crate) fn entry_or_default(&mut self, id: Id) -> &mut T
     where
         T: Default,
     {
@@ -103,7 +107,7 @@ impl<T> IdMap<T> {
 
 impl<T: Copy> IdMap<T> {
     #[inline]
-    pub fn copied(&self, id: Id) -> Option<T> {
+    pub(crate) fn copied(&self, id: Id) -> Option<T> {
         self.get(id).copied()
     }
 }
@@ -125,7 +129,6 @@ struct ComponentContext {
     nodes: usize,
     caps: Caps,
     roots: Vec<ClassId>,
-    no_private: bool,
 }
 
 #[derive(PartialEq, Eq, Hash)]
@@ -171,7 +174,6 @@ impl NodeCache {
             nodes: graph.len(),
             caps: caps.clone(),
             roots,
-            no_private: std::env::var_os("FUSOR_NO_PRIVATE").is_some(),
         };
         if self.context.as_ref() != Some(&context) {
             self.components.clear();
@@ -194,9 +196,8 @@ impl NodeCache {
         if let Some(theta) = self.schedules.get(&key) {
             return Some(*theta);
         }
-        let theta = domain
-            .iter()
-            .min_by_key(|theta| cost.node_math(graph.node(id), &key.1, &key.2, Some(*theta)))?;
+        let theta =
+            crate::lower_bound::cheapest_point(graph.node(id), &key.1, &key.2, domain, cost)?;
         self.schedules.insert(key, theta);
         Some(theta)
     }
@@ -226,20 +227,9 @@ fn quantized_work(
     let Some(SchedPoint::Sgemv(p)) = theta else {
         return Ok(());
     };
-    let Op::Launch(Launch::Contract {
-        m,
-        n,
-        k,
-        batch,
-        a,
-        b,
-        ..
-    }) = &graph.node(id).op
-    else {
-        return Ok(());
-    };
-    let (Some(m), Some(n), Some(k), Some(batch)) =
-        (m.as_const(), n.as_const(), k.as_const(), batch.as_const())
+    let op = &graph.node(id).op;
+    let (Op::Launch(Launch::Contract { a, b, .. }), Some(Mnkb { m, n, k, batch })) =
+        (op, Mnkb::of(op, |d| d.as_const().unwrap_or(0)))
     else {
         return Ok(());
     };
@@ -291,9 +281,7 @@ fn quantized_work(
         else {
             continue;
         };
-        let block = (p.subgroups.max(1) * caps.subgroup_width())
-            .min(caps.limits.max_compute_invocations_per_workgroup)
-            .max(1);
+        let block = sgemv_block(p, caps);
         let key = crate::quantized::DecodeKey {
             fmt,
             layout,
@@ -304,11 +292,7 @@ fn quantized_work(
             n: n as u32,
             offset,
             params: p,
-            width: if p.cols > 1 {
-                caps.subgroup_width()
-            } else {
-                block
-            },
+            width: sgemv_lanes(p, caps),
         };
         let (instructions, _) = crate::quantized::decode_window(key)?;
         let generic = batch
@@ -426,23 +410,16 @@ fn staging_rework(graph: &EGraph, member: Id, theta: Option<SchedPoint>) -> Work
     let Some(SchedPoint::Coop { geom, .. }) = theta else {
         return Work::default();
     };
-    let Op::Launch(Launch::Contract {
-        m,
-        n,
-        k,
-        batch,
-        a,
-        b,
-        ..
-    }) = &graph.node(member).op
+    let op = &graph.node(member).op;
+    let (Op::Launch(Launch::Contract { a, b, .. }), Some(Mnkb { m, n, k, batch })) =
+        (op, Mnkb::priced(op))
     else {
         return Work::default();
     };
-    let priced = |d: &Dim| dim_extent(*d).max(1);
-    let (m, n, k, batch) = (priced(m), priced(n), priced(k), priced(batch));
-    let tiles_m = m.div_ceil(u64::from(geom.bm.max(1))).max(1);
-    let tiles_n = n
-        .div_ceil(u64::from(geom.bn.max(1)))
+    let tiling = Tiling::new(m, n, geom.bm, geom.bn);
+    let tiles_m = tiling.tiles_m.max(1);
+    let tiles_n = tiling
+        .tiles_n
         .saturating_mul(u64::from(geom.n_passes.max(1)));
     let side_extra = |side: &fusor_ir::ir::launch::ContractSide, elems: u64, tiles: u64| {
         let mut w = fusor_ir::semantics::work::epilogue_work(&side.pre, elems);
@@ -468,24 +445,23 @@ fn coop_work(
     let Some(SchedPoint::Coop { geom, staging }) = theta else {
         return (Work::default(), None);
     };
-    let Op::Launch(Launch::Contract {
-        m, n, k, batch, a, ..
-    }) = &graph.node(member).op
+    let op = &graph.node(member).op;
+    let (Op::Launch(Launch::Contract { a, .. }), Some(Mnkb { m, n, k, batch })) =
+        (op, Mnkb::priced(op))
     else {
         return (Work::default(), None);
     };
-    let priced = |d: &Dim| dim_extent(*d).max(1);
-    let (m, n, k, batch) = (priced(m), priced(n), priced(k), priced(batch));
-    let (bm, bn) = (u64::from(geom.bm.max(1)), u64::from(geom.bn.max(1)));
+    let tiling = Tiling::new(m, n, geom.bm, geom.bn);
+    let (bm, bn) = (tiling.bm, tiling.bn);
     let passes = u64::from(geom.n_passes.max(1));
     let bn_pass = bn / passes;
-    let groups = batch
-        .saturating_mul(m.div_ceil(bm))
-        .saturating_mul(n.div_ceil(bn));
-    let groups = distribute_workgroups(groups, caps.limits.max_compute_workgroups_per_dimension)
-        .into_iter()
-        .map(u64::from)
-        .product::<u64>();
+    let groups = distribute_workgroups(
+        tiling.groups(batch),
+        caps.limits.max_compute_workgroups_per_dimension,
+    )
+    .into_iter()
+    .map(u64::from)
+    .product::<u64>();
     let k_step = u64::from(geom.bk.max(1)).saturating_mul(u64::from(staging.max(1)));
     let k_pad = k.div_ceil(k_step).saturating_mul(k_step);
     let output_elements = groups.saturating_mul(bm).saturating_mul(bn);
@@ -530,7 +506,7 @@ pub fn realize(
 
 /// Realize with cached node work. Component descriptors stay within an
 /// internal search, whose planner is fixed for the cache's lifetime.
-pub fn realize_with(
+pub(crate) fn realize_with(
     graph: &EGraph,
     roots: &[Id],
     extraction: &Extraction,
@@ -579,10 +555,7 @@ impl Selected {
             if leaf_role(graph, id) == LeafRole::NotLeaf {
                 buffers.insert(id.index());
             }
-            if let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) =
-                &graph.node(id).op
-                && let Some(last) = members.last()
-            {
+            if let Some(last) = composite_members(graph, id).and_then(|m| m.last()) {
                 buffers.remove(last.index());
             }
         }
@@ -684,9 +657,7 @@ pub(crate) fn ordinary_component(
     arena: &dyn ArenaPlanner,
     cache: &mut NodeCache,
 ) -> Result<Component> {
-    if !matches!(&graph.node(node).op, Op::Launch(op)
-        if !matches!(op, Launch::Slab { .. } | Launch::Group { .. }))
-    {
+    if !matches!(graph.node(node).op, Op::Launch(_)) || is_composite(graph, node) {
         return Err(Error::Plan("ordinary component requires one launch".into()));
     }
     let inputs = graph
@@ -710,16 +681,20 @@ pub(crate) fn ordinary_component(
 }
 
 /// The member `sigma` selected for `id`'s class.
-pub fn select(graph: &EGraph, extraction: &Extraction, id: Id) -> Result<Id> {
-    let class = graph.class_of(id);
+pub(crate) fn select(graph: &EGraph, extraction: &Extraction, id: Id) -> Result<Id> {
     extraction
-        .sigma
-        .get(&class)
-        .copied()
-        .ok_or_else(|| Error::Plan(format!("class {} has no selected member", class.0)))
+        .selected(graph.class_of(id))
+        .ok_or_else(|| unselected(graph, id))
 }
 
-pub fn leaf_role(graph: &EGraph, id: Id) -> LeafRole {
+fn unselected(graph: &EGraph, id: Id) -> Error {
+    Error::Plan(format!(
+        "class {} has no selected member",
+        graph.class_of(id).0
+    ))
+}
+
+pub(crate) fn leaf_role(graph: &EGraph, id: Id) -> LeafRole {
     match &graph.node(id).op {
         Op::Logical(Logical::Leaf(LeafKind::Const { .. } | LeafKind::Uniform { .. })) => {
             LeafRole::Free
@@ -731,7 +706,7 @@ pub fn leaf_role(graph: &EGraph, id: Id) -> LeafRole {
 
 /// The iteration domain of one node. Launch nodes carry it; everything else is
 /// priced over its own shape.
-pub fn index_space(graph: &EGraph, id: Id) -> IndexSpace {
+pub(crate) fn index_space(graph: &EGraph, id: Id) -> IndexSpace {
     match &graph.node(id).op {
         Op::Launch(Launch::StreamFold { fold, .. }) => match fold.as_ref() {
             Launch::Fold { space, .. } => space.clone(),
@@ -755,7 +730,7 @@ pub fn index_space(graph: &EGraph, id: Id) -> IndexSpace {
 }
 
 /// Extent a dim prices at.
-pub fn dim_extent(d: Dim) -> u64 {
+pub(crate) fn dim_extent(d: Dim) -> u64 {
     d.evaluate(&mut |_| Some(SYM_NOMINAL))
         .unwrap_or(SYM_NOMINAL)
 }
@@ -787,15 +762,18 @@ pub(crate) fn work_at(graph: &EGraph, id: Id, extent: impl Fn(Dim) -> u64) -> Wo
         .work(&op_at(&node.op, &extent), &ins, &facts(id))
 }
 
-pub fn elements_of(facts: &ValueFacts) -> u64 {
-    facts
-        .shape
-        .iter()
+/// The product of `dims` at their priced extents.
+fn extent_product(dims: &[Dim]) -> u64 {
+    dims.iter()
         .map(|d| dim_extent(*d))
         .fold(1u64, |a, b| a.saturating_mul(b))
 }
 
-pub fn bytes_of(facts: &ValueFacts) -> u64 {
+pub(crate) fn elements_of(facts: &ValueFacts) -> u64 {
+    extent_product(&facts.shape)
+}
+
+pub(crate) fn bytes_of(facts: &ValueFacts) -> u64 {
     let elems = elements_of(facts);
     match facts.dtype {
         Dtype::Q(fmt) => {
@@ -806,7 +784,8 @@ pub fn bytes_of(facts: &ValueFacts) -> u64 {
     }
 }
 
-fn quantized_storage(
+/// The storage format and layout of a quantized value's leaf.
+pub(crate) fn quantized_storage(
     graph: &EGraph,
     id: Id,
 ) -> Option<(fusor_ir::dtype::QFmt, fusor_ir::dtype::QLayout)> {
@@ -835,17 +814,12 @@ fn stored_bytes(graph: &EGraph, id: Id) -> u64 {
     )
 }
 
-pub fn iterations_of(space: &IndexSpace) -> u64 {
-    space
-        .dims
-        .iter()
-        .map(|d| dim_extent(*d))
-        .fold(1u64, |a, b| a.saturating_mul(b))
-        .max(1)
+pub(crate) fn iterations_of(space: &IndexSpace) -> u64 {
+    extent_product(&space.dims).max(1)
 }
 
 /// Scalar element a dtype stages as.
-pub const fn scalar_element(d: Dtype) -> ScalarElement {
+pub(crate) const fn scalar_element(d: Dtype) -> ScalarElement {
     match d {
         Dtype::F32 | Dtype::Q(_) => ScalarElement::F32,
         Dtype::F16 => ScalarElement::F16,
@@ -856,7 +830,7 @@ pub const fn scalar_element(d: Dtype) -> ScalarElement {
 }
 
 /// Workgroup elements needed by a fold's accumulator lanes at its emitted schedule.
-pub fn fold_scratch_elements(
+pub(crate) fn fold_scratch_elements(
     graph: &EGraph,
     id: Id,
     theta: Option<SchedPoint>,
@@ -886,12 +860,22 @@ pub fn fold_scratch_elements(
     Some(carrier.lanes()?.saturating_mul(u64::from(scratch)))
 }
 
-/// Workgroup tiles for a schedule and its fold's exact scratch element count.
-pub fn tiles_for(
+/// Workgroup bytes `id`'s tiles at `theta` take: its schedule's staging and
+/// its fold's scratch.
+pub(crate) fn tile_bytes(
+    graph: &EGraph,
+    id: Id,
     theta: Option<SchedPoint>,
-    elem: ScalarElement,
-    fold_scratch: Option<u64>,
-) -> Tiles {
+    caps: &Caps,
+    arena: &dyn ArenaPlanner,
+) -> Result<u32> {
+    let scratch = fold_scratch_elements(graph, id, theta, caps);
+    let tiles = tiles_for(theta, scalar_element(graph.facts(id).dtype), scratch);
+    arena.workgroup_bytes(&tiles, caps)
+}
+
+/// Workgroup tiles for a schedule and its fold's exact scratch element count.
+fn tiles_for(theta: Option<SchedPoint>, elem: ScalarElement, fold_scratch: Option<u64>) -> Tiles {
     fn tile(name: &'static str, elem: ScalarElement, extents: &[u32]) -> Tile {
         Arc::new(TileDecl::new(
             elem.element(),
@@ -958,7 +942,7 @@ fn sgemv_k_stride(layout: &fusor_ir::shape::Layout, trailing: u64) -> u64 {
 
 /// How many times its useful bytes a dense row-major operand of a fold moves
 /// through the memory pipe. See [`operand_line_amplification`].
-pub fn fold_line_amplification(
+pub(crate) fn fold_line_amplification(
     dims: &[u64],
     axis: usize,
     lane_group: u32,
@@ -977,7 +961,7 @@ pub fn fold_line_amplification(
 /// subgroup load covers `lane_group` consecutive k of each of
 /// `width / lane_group` consecutive output elements; each distinct line it
 /// touches costs a whole line. `strides` are the operand's own, over `dims`.
-pub fn operand_line_amplification(
+pub(crate) fn operand_line_amplification(
     dims: &[u64],
     strides: &[u64],
     axis: usize,
@@ -1026,7 +1010,7 @@ pub fn operand_line_amplification(
 /// a tiled contraction the k steps of one tile (split-K divides them), for
 /// a fold the iterations of one lane over the reduced axis, for a slab the
 /// sum over its stages. What no occupancy shortens.
-pub fn serial_steps(
+pub(crate) fn serial_steps(
     graph: &EGraph,
     root: Id,
     theta: Option<SchedPoint>,
@@ -1035,34 +1019,18 @@ pub fn serial_steps(
 ) -> (u64, u64) {
     match &graph.node(root).op {
         Op::Launch(Launch::Slab { slabs, members, .. }) => {
-            let slabs = u64::from((*slabs).max(1));
             let mut steps = 0u64;
             for m in members.iter() {
-                match &graph.node(*m).op {
-                    Op::Launch(Launch::Fold {
-                        space,
-                        axis,
-                        carrier,
-                        ..
-                    }) => {
-                        let total = iterations_of(space);
-                        let k = space
-                            .dims
-                            .get(*axis as usize)
-                            .map(|d| dim_extent(*d))
-                            .unwrap_or(1)
-                            .max(1);
-                        let rows = (total / k) / slabs;
-                        let lpr = slab_subgroup_width(block, rows, k, carrier, caps)
-                            .unwrap_or_else(|| slab_lanes_per_row(block, rows, k));
-                        let groups = u64::from(block / lpr.max(1)).max(1);
-                        steps += rows.div_ceil(groups).max(1) * k.div_ceil(u64::from(lpr));
-                    }
-                    Op::Launch(Launch::Map { space, .. }) => {
-                        let total = iterations_of(space);
-                        steps += (total / slabs).div_ceil(u64::from(block)).max(1);
-                    }
-                    _ => {}
+                if let Some(SlabFold { rows, k, lanes }) =
+                    slab_fold_stage(graph, *m, *slabs, block, caps)
+                {
+                    let groups = u64::from(block / lanes.max(1)).max(1);
+                    steps += rows.div_ceil(groups).max(1) * k.div_ceil(u64::from(lanes));
+                } else if let Op::Launch(Launch::Map { space, .. }) = &graph.node(*m).op {
+                    let total = iterations_of(space);
+                    steps += (total / u64::from((*slabs).max(1)))
+                        .div_ceil(u64::from(block))
+                        .max(1);
                 }
             }
             (0, steps)
@@ -1109,27 +1077,12 @@ pub fn node_serial_steps(op: &Op, theta: Option<SchedPoint>, caps: &Caps) -> (u6
                 // FMAs and staged loads: measured 8-10x a fragment chain on
                 // the same shape (281 us against 33 us at 1024x96x96).
                 Some(SchedPoint::Sgemm(_)) => (0, k.saturating_mul(4)),
-                Some(SchedPoint::Sgemv(p)) => {
-                    let width = caps.subgroup_width();
-                    // Multi-column schedules reduce each column within one
-                    // subgroup; the one-column path shares k across the block.
-                    let lanes = if p.cols > 1 {
-                        width
-                    } else {
-                        (p.subgroups.max(1) * width)
-                            .min(caps.limits.max_compute_invocations_per_workgroup)
-                            .max(1)
-                    };
-                    (0, k.div_ceil(u64::from(lanes)))
-                }
+                Some(SchedPoint::Sgemv(p)) => (0, k.div_ceil(u64::from(sgemv_lanes(p, caps)))),
                 _ => (0, k),
             }
         }
         Op::Launch(op @ Launch::Fold { space, axis, .. }) => {
-            let theta = op
-                .fold_schedule(theta, caps)
-                .map(|s| SchedPoint::Fold(s.strategy))
-                .or(theta);
+            let theta = fold_theta(op, theta, caps);
             let k = space
                 .dims
                 .get(*axis as usize)
@@ -1159,24 +1112,57 @@ pub fn node_serial_steps(op: &Op, theta: Option<SchedPoint>, caps: &Caps) -> (u6
     }
 }
 
-/// The lane group a fold lowers at under `theta`. A point that is not a fold
-/// strategy — a `Point`, or a geometry inherited from a contraction domain —
-/// takes the emitters' default, which is `emitted_block(1)`.
-fn fold_lane_group(theta: Option<SchedPoint>, caps: &Caps) -> u32 {
-    match theta {
-        Some(SchedPoint::Fold(s)) => s.lane_group(caps.subgroup_width()),
-        _ => fusor_ir::ir::launch::emitted_block(1, caps),
-    }
+/// A slab fold stage's rows per slab, reduced extent and lanes per row.
+struct SlabFold {
+    rows: u64,
+    k: u64,
+    lanes: u32,
+}
+
+/// `stage` as a fold stage of a slab of `slabs` at `block` lanes; `None`
+/// when it is not a fold.
+fn slab_fold_stage(
+    graph: &EGraph,
+    stage: Id,
+    slabs: u32,
+    block: u32,
+    caps: &Caps,
+) -> Option<SlabFold> {
+    let Op::Launch(Launch::Fold {
+        space,
+        axis,
+        carrier,
+        ..
+    }) = &graph.node(stage).op
+    else {
+        return None;
+    };
+    let k = dim_extent(*space.dims.get(*axis as usize)?).max(1);
+    let rows = (iterations_of(space) / k) / u64::from(slabs.max(1));
+    let lanes = slab_subgroup_width(block, rows, k, carrier, caps)
+        .unwrap_or_else(|| slab_lanes_per_row(block, rows, k));
+    Some(SlabFold { rows, k, lanes })
+}
+
+/// The block a slab lowers at: its widest stage's share of one slab.
+fn slab_block_of(graph: &EGraph, slabs: u32, members: &[Id], caps: &Caps) -> u32 {
+    let widest = members
+        .iter()
+        .filter_map(|s| index_space(graph, *s).iterations())
+        .map(|n| n / u64::from(slabs.max(1)))
+        .max()
+        .unwrap_or(1);
+    fusor_ir::ir::launch::slab_block(widest, caps)
 }
 
 /// Lanes per workgroup and workgroup count implied by one schedule point.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-pub struct Geometry {
+pub(crate) struct Geometry {
     pub block: u32,
     pub workgroups: u64,
 }
 
-pub fn geometry(theta: Option<SchedPoint>, space: &IndexSpace, caps: &Caps) -> Geometry {
+pub(crate) fn geometry(theta: Option<SchedPoint>, space: &IndexSpace, caps: &Caps) -> Geometry {
     let width = caps.subgroup_width().max(1);
     let default_block = caps
         .limits
@@ -1204,9 +1190,7 @@ pub fn geometry(theta: Option<SchedPoint>, space: &IndexSpace, caps: &Caps) -> G
     match theta {
         Some(SchedPoint::Coop { geom, .. }) => Geometry {
             block: geom.lanes(width).max(1),
-            workgroups: m.div_ceil(geom.bm.max(1) as u64)
-                * n.div_ceil(geom.bn.max(1) as u64)
-                * batch,
+            workgroups: Tiling::new(m, n, geom.bm, geom.bn).groups(batch),
         },
         Some(SchedPoint::Sgemm(p)) => Geometry {
             block: ((p.bm / p.tm.max(1)) * (p.bn / p.tn.max(1))).max(1),
@@ -1309,7 +1293,7 @@ impl From<WalkFail> for Error {
 /// in which neither member names its own class, so [`is_self_referential`]
 /// (the depth-1 case) sees nothing. Composite ownership can also turn an
 /// acyclic node order into cyclic launch dependencies.
-pub fn selection_cycle(graph: &EGraph, extraction: &Extraction, roots: &[Id]) -> Option<Id> {
+pub(crate) fn selection_cycle(graph: &EGraph, extraction: &Extraction, roots: &[Id]) -> Option<Id> {
     let resolved = roots
         .iter()
         .map(|r| select(graph, extraction, *r))
@@ -1350,21 +1334,8 @@ fn walk(
                         // A slab names its members by id — they are the spellings
                         // its lowering reads — and its last member shares its
                         // class, so selecting them would walk back into the slab.
-                        let by_id = matches!(
-                            graph.node(v).op,
-                            Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
-                        );
-                        let kids: SmallVec<[Id; 4]> = graph
-                            .node(v)
-                            .children
-                            .iter()
-                            .map(|c| {
-                                if by_id {
-                                    Ok(*c)
-                                } else {
-                                    select(graph, extraction, *c)
-                                }
-                            })
+                        let kids: SmallVec<[Id; 4]> = resolved_children(graph, extraction, v)
+                            .map(|(c, n)| n.ok_or_else(|| unselected(graph, c)))
                             .collect::<Result<_>>()
                             .map_err(WalkFail::Other)?;
                         stack.push(Frame::Exit(v));
@@ -1408,9 +1379,7 @@ fn cut(
             }
             let owner = owners.copied(id).unwrap_or(id);
             owners.insert(id, owner);
-            if let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) =
-                &graph.node(id).op
-            {
+            if let Some(members) = composite_members(graph, id) {
                 for member in members {
                     if owners.copied(*member).is_some_and(|other| other != owner) {
                         return Err(WalkFail::Cycle(id));
@@ -1481,10 +1450,8 @@ fn cut(
                 if let Some(start) = cycle.iter().position(|previous| *previous == g) {
                     for &g in &cycle[start..] {
                         for &id in &groups[g] {
-                            if matches!(
-                                graph.node(id).op,
-                                Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
-                            ) && extraction.selected(graph.class_of(id)) == Some(id)
+                            if is_composite(graph, id)
+                                && extraction.selected(graph.class_of(id)) == Some(id)
                             {
                                 return Err(WalkFail::Cycle(id));
                             }
@@ -1592,26 +1559,19 @@ fn build_component<'a>(
             Some(SchedPoint::Sgemm(p)) => Some((p.tn.max(1), 1)),
             _ => None,
         };
-        let contract_reads = match (&graph.node(*m).op, window) {
-            (
-                Op::Launch(Launch::Contract {
-                    m, n, k, batch, a, ..
-                }),
-                Some((columns, copies)),
-            ) => {
-                let rows_k = dim_extent(*batch)
-                    .saturating_mul(dim_extent(*m))
-                    .saturating_mul(dim_extent(*k));
-                let n = dim_extent(*n);
+        let op = &graph.node(*m).op;
+        let contract_reads = match (op, Mnkb::of(op, dim_extent), window) {
+            (Op::Launch(Launch::Contract { a, .. }), Some(c), Some((columns, copies))) => {
+                let rows_k = c.batch.saturating_mul(c.m).saturating_mul(c.k);
                 // SGEMV shares A within a subgroup; SGEMM shares it across
                 // one lane's register columns. Every output row scans B.
-                let a_scans = n
-                    .div_ceil(u64::from(columns))
-                    .saturating_mul(u64::from(copies));
+                let a_scans =
+                    c.n.div_ceil(u64::from(columns))
+                        .saturating_mul(u64::from(copies));
                 Some((
                     a.len(),
                     rows_k.saturating_mul(a_scans),
-                    rows_k.saturating_mul(n),
+                    rows_k.saturating_mul(c.n),
                 ))
             }
             _ => None,
@@ -1642,27 +1602,29 @@ fn build_component<'a>(
 
     let theta = extraction.theta.get(&root).copied();
     let theta = match &graph.node(root).op {
-        Op::Launch(op) => op
-            .fold_schedule(theta, caps)
-            .map(|s| SchedPoint::Fold(s.strategy))
-            .or(theta),
+        Op::Launch(op) => fold_theta(op, theta, caps),
         _ => theta,
     };
-    // A group's members each take their own workgroups at their own block;
-    // the dispatch is their sum at the widest block.
-    let group_geoms: Vec<(Id, Geometry)> = match &graph.node(root).op {
+    // What runs side by side in this launch: a group's members, each at its
+    // own point and geometry, else the root alone.
+    let units: SmallVec<[(Id, Option<SchedPoint>, Geometry); 4]> = match &graph.node(root).op {
         Op::Launch(Launch::Group { members: gm, .. }) => gm
             .iter()
-            .map(|m| (*m, member_geometry(graph, extraction, *m, caps)))
+            .map(|m| {
+                let theta = extraction.theta.get(m).copied();
+                (*m, theta, member_geometry(graph, extraction, *m, caps))
+            })
             .collect(),
-        _ => Vec::new(),
+        _ => smallvec::smallvec![(root, theta, member_geometry(graph, extraction, root, caps))],
     };
-    let geom = match &graph.node(root).op {
-        Op::Launch(Launch::Group { .. }) => Geometry {
-            block: group_geoms.iter().map(|(_, g)| g.block).max().unwrap_or(1),
-            workgroups: group_geoms
+    // A group's dispatch is its members' workgroups summed, at the widest
+    // block.
+    let geom = if is_group(graph, root) {
+        Geometry {
+            block: units.iter().map(|(_, _, g)| g.block).max().unwrap_or(1),
+            workgroups: units
                 .iter()
-                .map(|(_, g)| {
+                .map(|(_, _, g)| {
                     let d = distribute_workgroups(
                         g.workgroups,
                         caps.limits.max_compute_workgroups_per_dimension,
@@ -1671,80 +1633,39 @@ fn build_component<'a>(
                 })
                 .sum::<u64>()
                 .max(1),
-        },
-        _ => member_geometry(graph, extraction, root, caps),
+        }
+    } else {
+        units[0].2
     };
-    let scratch = fold_scratch_elements(graph, root, theta, caps);
-    let tiles = tiles_for(theta, scalar_element(graph.facts(root).dtype), scratch);
-    let mut wg_bytes = arena.workgroup_bytes(&tiles, caps)? as u64;
+    let mut wg_bytes = tile_bytes(graph, root, theta, caps, arena)? as u64;
 
     // Uncoalesced fold reads: every operand walked at the fold's iteration
     // space pays the line amplification of its lane group. A slab pays it
     // per fold stage at that stage's lanes per row.
     let mut line_bytes = 0u64;
-    // Every fold the launch runs, with the lanes per row it runs at: the root
-    // fold, a slab's fold stages, or those of a group's members.
-    let slab_stages = |slab: Id, block: u32| -> Vec<(Id, u32)> {
-        let Op::Launch(Launch::Slab {
-            slabs, members: sm, ..
-        }) = &graph.node(slab).op
-        else {
-            return Vec::new();
-        };
-        sm.iter()
-            .filter_map(|m| {
-                let Op::Launch(Launch::Fold {
-                    space,
-                    axis,
-                    carrier,
-                    ..
-                }) = &graph.node(*m).op
-                else {
-                    return None;
-                };
-                let total = iterations_of(space);
-                let k = dim_extent(*space.dims.get(*axis as usize)?).max(1);
-                let rows = (total / k) / u64::from((*slabs).max(1));
-                let lpr = slab_subgroup_width(block, rows, k, carrier, caps)
-                    .unwrap_or_else(|| slab_lanes_per_row(block, rows, k));
-                Some((*m, lpr))
-            })
-            .collect()
-    };
-    let stage_of = |m: Id, theta: Option<SchedPoint>, block: u32| -> Vec<(Id, u32)> {
+    // Every fold the launch runs, with the lanes per row it runs at.
+    let mut stages: SmallVec<[(Id, u32); 4]> = SmallVec::new();
+    for &(m, theta, g) in &units {
         match &graph.node(m).op {
-            Op::Launch(Launch::Fold { .. }) => vec![(m, fold_lane_group(theta, caps))],
-            Op::Launch(Launch::Slab { .. }) => slab_stages(m, block),
-            _ => Vec::new(),
+            Op::Launch(Launch::Fold { .. }) => stages.push((m, fold_lane_group(theta, caps))),
+            Op::Launch(Launch::Slab { slabs, members, .. }) => {
+                stages.extend(members.iter().filter_map(|s| {
+                    slab_fold_stage(graph, *s, *slabs, g.block, caps).map(|f| (*s, f.lanes))
+                }));
+            }
+            _ => {}
         }
-    };
-    let stages: Vec<(Id, u32)> = if group_geoms.is_empty() {
-        stage_of(root, theta, geom.block)
-    } else {
-        group_geoms
-            .iter()
-            .flat_map(|(m, g)| stage_of(*m, extraction.theta.get(m).copied(), g.block))
-            .collect()
-    };
+    }
     // A cooperative contraction pulls each operand once per tile on the other
     // side: `M*N*K*(1/bn + 1/bm)` elements through the memory pipe, of which
     // `M*K + K*N` are the operands themselves.
-    if let Op::Launch(Launch::Contract { m, n, k, batch, .. }) = &graph.node(root).op
+    if let Some(Mnkb { m, n, k, batch }) = Mnkb::priced(&graph.node(root).op)
         && let Some(SchedPoint::Coop { geom, .. }) = theta
     {
-        let (bm, bn, a_passes) = (
-            u64::from(geom.bm),
-            u64::from(geom.bn),
-            u64::from(geom.n_passes.max(1)),
-        );
-        let (m, n, k, batch) = (
-            dim_extent(*m).max(1),
-            dim_extent(*n).max(1),
-            dim_extent(*k).max(1),
-            dim_extent(*batch).max(1),
-        );
+        let tiling = Tiling::new(m, n, geom.bm, geom.bn);
+        let a_passes = u64::from(geom.n_passes.max(1));
         let elem = graph.facts(root).dtype.byte_size().max(1);
-        let pulled = batch * k * (m * n.div_ceil(bn.max(1)) * a_passes + n * m.div_ceil(bm.max(1)));
+        let pulled = batch * k * (m * tiling.tiles_n * a_passes + n * tiling.tiles_m);
         let useful = batch * k * (m + n);
         line_bytes = line_bytes.saturating_add(pulled.saturating_sub(useful).saturating_mul(elem));
     }
@@ -1844,31 +1765,18 @@ fn build_component<'a>(
         }
     }
 
-    let (coop_steps, lane_steps) = if group_geoms.is_empty() {
-        serial_steps(graph, root, theta, geom.block, caps)
-    } else {
-        // Members run side by side: the chain is the longest of theirs.
-        group_geoms
-            .iter()
-            .map(|(m, g)| serial_steps(graph, *m, extraction.theta.get(m).copied(), g.block, caps))
-            .fold((0, 0), |a, b| (a.0.max(b.0), a.1.max(b.1)))
-    };
+    // Members run side by side: the chain is the longest of theirs.
+    let (coop_steps, lane_steps) = units
+        .iter()
+        .map(|(m, theta, g)| serial_steps(graph, *m, *theta, g.block, caps))
+        .fold((0, 0), |a, b| (a.0.max(b.0), a.1.max(b.1)));
 
     // A slab's middle members nothing outside reads live in workgroup memory
-    // as far as it fits; the rest, and anything read outside, in buffers.
-    let mut private: Vec<Id> = Vec::new();
-    // A group's member slabs keep their own privates; the group itself has
+    // as far as it fits; the rest, and anything read outside, in buffers. A
+    // group's member slabs keep their own privates; the group itself has
     // none.
-    let slab_roots: Vec<Id> = match &graph.node(root).op {
-        Op::Launch(Launch::Slab { .. }) => vec![root],
-        Op::Launch(Launch::Group { members: gm, .. }) => gm
-            .iter()
-            .copied()
-            .filter(|m| matches!(graph.node(*m).op, Op::Launch(Launch::Slab { .. })))
-            .collect(),
-        _ => Vec::new(),
-    };
-    for slab in slab_roots {
+    let mut private: Vec<Id> = Vec::new();
+    for &(slab, _, _) in &units {
         let Op::Launch(Launch::Slab { members: sm, .. }) = &graph.node(slab).op else {
             continue;
         };
@@ -1911,28 +1819,18 @@ fn build_component<'a>(
 /// The geometry one node launches at on its own: a slab's, or its schedule
 /// point's over its index space.
 fn member_geometry(graph: &EGraph, extraction: &Extraction, m: Id, caps: &Caps) -> Geometry {
-    let original = &graph.node(m).op;
-    let nested;
-    let op = if let Op::Launch(Launch::StreamFold { fold, .. }) = original {
-        nested = Op::Launch(*fold.clone());
-        &nested
-    } else {
-        original
+    let theta = extraction.theta.get(&m).copied();
+    let launch = match &graph.node(m).op {
+        Op::Launch(Launch::StreamFold { fold, .. }) => Some(fold.as_ref()),
+        Op::Launch(launch) => Some(launch),
+        _ => None,
     };
-    match op {
-        Op::Launch(Launch::Slab { slabs, members, .. }) => {
-            let widest = members
-                .iter()
-                .filter_map(|s| index_space(graph, *s).iterations())
-                .map(|n| n / u64::from((*slabs).max(1)))
-                .max()
-                .unwrap_or(1);
-            Geometry {
-                block: fusor_ir::ir::launch::slab_block(widest, caps),
-                workgroups: u64::from(*slabs).max(1),
-            }
-        }
-        Op::Launch(
+    match launch {
+        Some(Launch::Slab { slabs, members, .. }) => Geometry {
+            block: slab_block_of(graph, *slabs, members, caps),
+            workgroups: u64::from(*slabs).max(1),
+        },
+        Some(
             op @ Launch::Fold {
                 space,
                 axis,
@@ -1940,9 +1838,7 @@ fn member_geometry(graph: &EGraph, extraction: &Extraction, m: Id, caps: &Caps) 
                 ..
             },
         ) if caps.kind == fusor_ir::device::DeviceKind::Gpu => {
-            let schedule = op
-                .fold_schedule(extraction.theta.get(&m).copied(), caps)
-                .unwrap();
+            let schedule = op.fold_schedule(theta, caps).unwrap();
             let block = schedule.block;
             let rows = space
                 .dims
@@ -1958,17 +1854,13 @@ fn member_geometry(graph: &EGraph, extraction: &Extraction, m: Id, caps: &Caps) 
                 workgroups: rows.div_ceil(u64::from(rows_per_group)).max(1),
             }
         }
-        _ => geometry(
-            extraction.theta.get(&m).copied(),
-            &index_space(graph, m),
-            caps,
-        ),
+        _ => geometry(theta, &index_space(graph, m), caps),
     }
 }
 
 /// True when a class has exactly one member, in which case selection is
 /// forced and no member vector need be built.
-pub fn is_singleton(graph: &EGraph, class: ClassId) -> bool {
+pub(crate) fn is_singleton(graph: &EGraph, class: ClassId) -> bool {
     !matches!(graph.node(class.0).op, Op::Union(..))
 }
 
@@ -1979,7 +1871,7 @@ pub fn is_singleton(graph: &EGraph, class: ClassId) -> bool {
 /// has to agree with it. It cannot be left to the cost model: a `Logical` node
 /// and its lowered `Launch` twin report the same `work()`, so cost ties and a
 /// tie broken by smaller `Id` returns the un-lowered original.
-pub fn is_runnable(graph: &EGraph, id: Id) -> bool {
+pub(crate) fn is_runnable(graph: &EGraph, id: Id) -> bool {
     if !matches!(graph.node(id).op, Op::Logical(Logical::Leaf(_)))
         && graph.level(id) != fusor_ir::ir::Level::Launch
     {
@@ -1993,13 +1885,10 @@ pub fn is_runnable(graph: &EGraph, id: Id) -> bool {
 /// Such a member cannot be selected for that class: the selection would
 /// denote "compute X by computing X". A rule bug must degrade the plan, never
 /// make a class unextractable.
-pub fn is_self_referential(graph: &EGraph, id: Id) -> bool {
+pub(crate) fn is_self_referential(graph: &EGraph, id: Id) -> bool {
     // A slab's last member is in the slab's own class by construction, and is
     // read by id rather than selected; that is not a cycle.
-    if matches!(
-        graph.node(id).op,
-        Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
-    ) {
+    if is_composite(graph, id) {
         return false;
     }
     let class = graph.class_of(id);
@@ -2014,7 +1903,7 @@ pub fn is_self_referential(graph: &EGraph, id: Id) -> bool {
 /// `None` for anything that is not a `Fold`, and for a `Fold` whose slot
 /// extent is symbolic — an unallocatable carrier the fold domain generator
 /// already declines to score.
-pub fn fold_footprint(graph: &EGraph, id: Id) -> Option<(u64, u64)> {
+pub(crate) fn fold_footprint(graph: &EGraph, id: Id) -> Option<(u64, u64)> {
     match &graph.node(id).op {
         Op::Launch(Launch::Fold { carrier, acc, .. }) => Some((carrier.lanes()?, acc.byte_size())),
         _ => None,
@@ -2024,18 +1913,8 @@ pub fn fold_footprint(graph: &EGraph, id: Id) -> Option<(u64, u64)> {
 /// Whether a composite can materialize its externally visible values in
 /// this graph. This depends on consumers and buffer choices, not kernel
 /// correctness or the contents of a schedule domain.
-pub fn composite_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
-    if matches!(graph.node(id).op, Op::Launch(Launch::Slab { .. }))
-        && !slab_bindings_fit(graph, id, caps)
-    {
-        return false;
-    }
-    if matches!(graph.node(id).op, Op::Launch(Launch::Group { .. }))
-        && !group_bindings_fit(graph, id, caps)
-    {
-        return false;
-    }
-    true
+pub(crate) fn composite_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
+    slab_bindings_fit(graph, id, caps) && group_bindings_fit(graph, id, caps)
 }
 
 struct BindingsCache {
@@ -2087,77 +1966,54 @@ fn cached_bindings_fit(
 /// Whether group `id` can bind: each member's own buffers and the distinct
 /// outside inputs, a member slab's stages as its layout says. Memoized
 /// like [`slab_bindings_fit`].
-pub fn group_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
-    if !matches!(graph.node(id).op, Op::Launch(Launch::Group { .. })) {
+pub(crate) fn group_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
+    let Op::Launch(Launch::Group { members, .. }) = &graph.node(id).op else {
         return true;
-    }
-    cached_bindings_fit(graph, id, caps, || {
-        group_bindings_fit_uncached(graph, id, caps)
-    })
+    };
+    cached_bindings_fit(graph, id, caps, || group_members_fit(graph, members, caps))
 }
 
-fn group_bindings_fit_uncached(graph: &EGraph, id: Id, caps: &Caps) -> bool {
-    if let Op::Launch(Launch::Group { members, .. }) = &graph.node(id).op {
-        let mut inputs: rustc_hash::FxHashSet<ClassId> = rustc_hash::FxHashSet::default();
-        let mut outs = 0usize;
-        for m in members.iter() {
-            match &graph.node(*m).op {
-                Op::Launch(Launch::Slab { members: sm, .. }) => {
-                    if !slab_bindings_fit(graph, *m, caps) {
-                        return false;
-                    }
-                    let own: rustc_hash::FxHashSet<ClassId> =
-                        sm.iter().map(|s| graph.class_of(*s)).collect();
-                    for s in sm.iter() {
-                        for c in graph.node(*s).children.iter() {
-                            let class = graph.class_of(*c);
-                            if !own.contains(&class) {
-                                inputs.insert(class);
-                            }
-                        }
-                    }
-                    let shared = |x: Id| {
-                        graph.any_reader(graph.class_of(x), |r| !own.contains(&graph.class_of(r)))
-                    };
-                    let Ok((private, _)) = slab_layout(graph, *m, caps, graph.roots(), &shared)
-                    else {
-                        return false;
-                    };
-                    outs += sm.len() - private.len();
-                }
-                _ => {
-                    outs += 1;
-                    for c in graph.node(*m).children.iter() {
-                        inputs.insert(graph.class_of(*c));
-                    }
-                }
-            }
-        }
-        let own: rustc_hash::FxHashSet<ClassId> =
-            members.iter().map(|m| graph.class_of(*m)).collect();
-        let root_classes: rustc_hash::FxHashSet<ClassId> =
-            graph.roots().iter().map(|r| graph.class_of(*r)).collect();
-        let inputs = inputs
-            .iter()
-            .filter(|c| !own.contains(c) && own_buffer(graph, **c, &root_classes))
-            .count();
-        let _ = outs;
-        let outs = members
-            .iter()
-            .filter(|m| root_classes.contains(&graph.class_of(**m)))
-            .count();
-        if 2 + outs + inputs > caps.limits.max_storage_buffers_per_shader_stage as usize {
+fn group_members_fit(graph: &EGraph, members: &[Id], caps: &Caps) -> bool {
+    let mut inputs: rustc_hash::FxHashSet<ClassId> = rustc_hash::FxHashSet::default();
+    for m in members.iter() {
+        let Op::Launch(Launch::Slab { members: sm, .. }) = &graph.node(*m).op else {
+            inputs.extend(graph.node(*m).children.iter().map(|c| graph.class_of(*c)));
+            continue;
+        };
+        if !slab_bindings_fit(graph, *m, caps) {
             return false;
         }
+        let own: rustc_hash::FxHashSet<ClassId> = sm.iter().map(|s| graph.class_of(*s)).collect();
+        for s in sm.iter() {
+            inputs.extend(
+                graph
+                    .node(*s)
+                    .children
+                    .iter()
+                    .map(|c| graph.class_of(*c))
+                    .filter(|class| !own.contains(class)),
+            );
+        }
     }
-    true
+    let own: rustc_hash::FxHashSet<ClassId> = members.iter().map(|m| graph.class_of(*m)).collect();
+    let root_classes: rustc_hash::FxHashSet<ClassId> =
+        graph.roots().iter().map(|r| graph.class_of(*r)).collect();
+    let inputs = inputs
+        .iter()
+        .filter(|c| !own.contains(c) && own_buffer(graph, **c, &root_classes))
+        .count();
+    let outs = members
+        .iter()
+        .filter(|m| root_classes.contains(&graph.class_of(**m)))
+        .count();
+    2 + outs + inputs <= caps.limits.max_storage_buffers_per_shader_stage as usize
 }
 
 /// Whether slab `id` can bind, with every middle member nothing outside the
 /// slab reads kept in workgroup memory as far as it fits. The readers index
 /// says what is read outside; `build_component` decides the same layout
 /// from the realized consumers, which read no more than that.
-pub fn slab_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
+pub(crate) fn slab_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
     let Op::Launch(Launch::Slab { members, .. }) = &graph.node(id).op else {
         return true;
     };
@@ -2173,7 +2029,11 @@ pub fn slab_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
 /// Whether a class binds its own storage buffer: an external leaf, or a
 /// root the caller reads back. Every other value is packed into the step
 /// arena, which a launch binds once.
-pub fn own_buffer(graph: &EGraph, class: ClassId, roots: &rustc_hash::FxHashSet<ClassId>) -> bool {
+pub(crate) fn own_buffer(
+    graph: &EGraph,
+    class: ClassId,
+    roots: &rustc_hash::FxHashSet<ClassId>,
+) -> bool {
     roots.contains(&class)
         || graph
             .members(class)
@@ -2187,7 +2047,7 @@ pub fn own_buffer(graph: &EGraph, class: ClassId, roots: &rustc_hash::FxHashSet<
 /// storage buffers left over: the uniform block, the output, every distinct
 /// outside class read, and every middle member still in a buffer. `Err`
 /// when those exceed the device's bindings.
-pub fn slab_layout(
+pub(crate) fn slab_layout(
     graph: &EGraph,
     root: Id,
     caps: &Caps,
@@ -2200,14 +2060,8 @@ pub fn slab_layout(
     else {
         return Ok((Vec::new(), 0));
     };
+    let block = u64::from(slab_block_of(graph, *slabs, sm, caps));
     let slabs = u64::from((*slabs).max(1));
-    let widest = sm
-        .iter()
-        .filter_map(|m| index_space(graph, *m).iterations())
-        .map(|n| n / slabs)
-        .max()
-        .unwrap_or(1);
-    let block = u64::from(fusor_ir::ir::launch::slab_block(widest, caps));
     let limit = u64::from(caps.limits.max_compute_workgroup_storage_size);
     let scratch = sm
         .iter()
@@ -2227,7 +2081,7 @@ pub fn slab_layout(
     unshared.sort_unstable();
     let mut private: Vec<Id> = Vec::new();
     // `FUSOR_NO_PRIVATE`: every member in a buffer, for bisecting.
-    if std::env::var_os("FUSOR_NO_PRIVATE").is_some() {
+    if crate::debug::flags().no_private {
         unshared.clear();
     }
     for (share, m) in unshared {
@@ -2271,31 +2125,16 @@ pub fn slab_layout(
     Ok((private, used))
 }
 
-pub fn selectable(graph: &EGraph, class: ClassId, caps: &Caps) -> Vec<Id> {
-    let members = graph.members(class);
-    let acyclic: Vec<Id> = members
-        .iter()
-        .copied()
-        .filter(|m| !is_self_referential(graph, *m))
-        .collect();
-    let pool = if acyclic.is_empty() { members } else { acyclic };
-    let runnable: Vec<Id> = pool
-        .iter()
-        .copied()
-        .filter(|m| is_runnable(graph, *m))
-        .collect();
-    let pool = if runnable.is_empty() { pool } else { runnable };
-    // Account for composites whose externally visible members need buffers.
-    let schedulable: Vec<Id> = pool
-        .iter()
-        .copied()
-        .filter(|m| composite_bindings_fit(graph, *m, caps))
-        .collect();
-    if schedulable.is_empty() {
-        pool
-    } else {
-        schedulable
+/// The members of `class` a selection may take: acyclic, then runnable, then
+/// able to bind, each filter dropped when it would leave nothing.
+pub(crate) fn selectable(graph: &EGraph, class: ClassId, caps: &Caps) -> Vec<Id> {
+    fn narrow(pool: Vec<Id>, keep: impl Fn(Id) -> bool) -> Vec<Id> {
+        let kept: Vec<Id> = pool.iter().copied().filter(|m| keep(*m)).collect();
+        if kept.is_empty() { pool } else { kept }
     }
+    let pool = narrow(graph.members(class), |m| !is_self_referential(graph, m));
+    let pool = narrow(pool, |m| is_runnable(graph, m));
+    narrow(pool, |m| composite_bindings_fit(graph, m, caps))
 }
 
 /// The classes reachable from `roots`, ascending, plus a node mask covering
@@ -2309,7 +2148,17 @@ pub fn selectable(graph: &EGraph, class: ClassId, caps: &Caps) -> Vec<Id> {
 /// class whose ids are all masked, so a fixpoint over masked slots alone
 /// (see `bounds_scoped`) equals the whole-graph
 /// fixpoint restricted to the mask.
-pub fn reachable(graph: &EGraph, roots: &[Id]) -> (Vec<ClassId>, fixedbitset::FixedBitSet) {
+pub(crate) fn reachable(graph: &EGraph, roots: &[Id]) -> (Vec<ClassId>, fixedbitset::FixedBitSet) {
+    let (mut classes, mask) = reachable_unsorted(graph, roots);
+    classes.sort_unstable();
+    (classes, mask)
+}
+
+/// [`reachable`] with the classes in discovery order.
+pub(crate) fn reachable_unsorted(
+    graph: &EGraph,
+    roots: &[Id],
+) -> (Vec<ClassId>, fixedbitset::FixedBitSet) {
     let mut mask = fixedbitset::FixedBitSet::with_capacity(graph.len());
     let mut seen = fixedbitset::FixedBitSet::with_capacity(graph.len());
     let mut out: Vec<ClassId> = Vec::new();
@@ -2348,13 +2197,12 @@ pub fn reachable(graph: &EGraph, roots: &[Id]) -> (Vec<ClassId>, fixedbitset::Fi
             }
         }
     }
-    out.sort_unstable();
     (out, mask)
 }
 
 /// Every class in the graph, ascending. Iteration order of every decision
 /// path is this, never a hash map's.
-pub fn classes(graph: &EGraph) -> Vec<ClassId> {
+pub(crate) fn classes(graph: &EGraph) -> Vec<ClassId> {
     let mut out: Vec<ClassId> = Vec::new();
     let mut seen = fixedbitset::FixedBitSet::with_capacity(graph.len());
     for i in 0..graph.len() {
@@ -2366,14 +2214,6 @@ pub fn classes(graph: &EGraph) -> Vec<ClassId> {
     }
     out.sort_unstable();
     out
-}
-
-/// The schedule domain a launch node carries.
-pub fn domain_of(graph: &EGraph, id: Id) -> Option<&ScheduleDomain> {
-    match &graph.node(id).op {
-        Op::Launch(l1) => l1.schedule(),
-        _ => None,
-    }
 }
 
 #[cfg(test)]

@@ -15,7 +15,8 @@
 //! 7. every launch's bind group — its operands **plus the `Uniforms` block** —
 //!    fits `max_storage_buffers_per_shader_stage`.
 
-use crate::realize::{self, scalar_element, tiles_for};
+use crate::nodes::{composite_members, domain_of, is_group, plan_values};
+use crate::realize;
 use fusor_ir::Result;
 use fusor_ir::device::Caps;
 use fusor_ir::egraph::{EGraph, Id};
@@ -48,46 +49,27 @@ pub(crate) fn verify_plan(graph: &EGraph, plan: &Plan) -> Result<()> {
 /// slab's dispatch. Anything else is a stage computed twice or never.
 pub(crate) fn check_slabs(graph: &EGraph, plan: &Plan) -> Result<()> {
     let launch_of = launch_index(plan);
-    let mut realized: Vec<Id> = plan
-        .launches
-        .iter()
-        .flat_map(|l| l.members.iter().copied())
-        .filter(|id| {
-            matches!(
-                graph.node(*id).op,
-                Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
-            )
-        })
-        .collect();
-    realized.sort_unstable();
-    realized.dedup();
+    let mut realized: Vec<Id> = Vec::new();
     // A member slab's class selects the group it ends: the group's buffer is
     // where that value lands.
-    let group_last: FxHashSet<Id> = plan
-        .launches
-        .iter()
-        .flat_map(|l| l.members.iter().copied())
-        .filter_map(|id| match &graph.node(id).op {
-            Op::Launch(Launch::Group { members, .. }) => members.last().copied(),
-            _ => None,
-        })
-        .collect();
+    let mut group_last: FxHashSet<Id> = FxHashSet::default();
     // A group's launch holds every member composite's nodes; the count is
     // checked on the group, and a member slab is checked for the rest.
-    let grouped: FxHashSet<Id> = plan
-        .launches
-        .iter()
-        .flat_map(|l| l.members.iter().copied())
-        .filter_map(|id| match &graph.node(id).op {
-            Op::Launch(Launch::Group { members, .. }) => Some(members.iter().copied()),
-            _ => None,
-        })
-        .flatten()
-        .collect();
+    let mut grouped: FxHashSet<Id> = FxHashSet::default();
+    for id in plan.launches.iter().flat_map(|l| l.members.iter().copied()) {
+        let Some(members) = composite_members(graph, id) else {
+            continue;
+        };
+        realized.push(id);
+        if is_group(graph, id) {
+            group_last.extend(members.last().copied());
+            grouped.extend(members.iter().copied());
+        }
+    }
+    realized.sort_unstable();
+    realized.dedup();
     for id in realized {
-        let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) =
-            &graph.node(id).op
-        else {
+        let Some(members) = composite_members(graph, id) else {
             continue;
         };
         if group_last.contains(&id) {
@@ -316,9 +298,9 @@ pub(crate) fn check_schedules(
                 .map(|m| {
                     format!(
                         "{m:?} {} legal={} domain={:?}",
-                        crate::extract::op_tag(&graph.node(*m).op),
+                        crate::debug::op_tag(&graph.node(*m).op),
                         realize::composite_bindings_fit(graph, *m, caps),
-                        realize::domain_of(graph, *m).map(|d| d.len())
+                        domain_of(graph, *m).map(|d| d.len())
                     )
                 })
                 .collect();
@@ -327,11 +309,7 @@ pub(crate) fn check_schedules(
                 siblings.join("; ")
             )));
         }
-        let domain = match &graph.node(id).op {
-            Op::Launch(l1) => l1.schedule(),
-            _ => None,
-        };
-        let Some(domain) = domain else {
+        let Some(domain) = domain_of(graph, id) else {
             continue;
         };
         let theta = match plan.extraction.theta.get(&id).copied() {
@@ -367,9 +345,7 @@ pub(crate) fn check_schedules(
             }
             _ => {}
         }
-        let scratch = realize::fold_scratch_elements(graph, id, Some(theta), caps);
-        let tiles = tiles_for(Some(theta), scalar_element(graph.facts(id).dtype), scratch);
-        let bytes = arena.workgroup_bytes(&tiles, caps)?;
+        let bytes = realize::tile_bytes(graph, id, Some(theta), caps, arena)?;
         if bytes > max_storage {
             return Err(Error::Plan(format!(
                 "{id} needs {bytes} workgroup bytes, over the {max_storage}-byte limit"
@@ -479,16 +455,7 @@ fn selected(plan: &Plan) -> Vec<Id> {
     // Sigma retains choices for abandoned paths so autotuning can explore
     // them later. Validate the executable DAG, including composite members
     // and external bindings, rather than those unreachable candidates.
-    let mut out: Vec<Id> = plan
-        .launches
-        .iter()
-        .flat_map(|l| {
-            l.members
-                .iter()
-                .copied()
-                .chain(l.bindings.iter().map(|b| b.value))
-        })
-        .collect();
+    let mut out: Vec<Id> = plan_values(plan).collect();
     out.sort_unstable();
     out.dedup();
     out

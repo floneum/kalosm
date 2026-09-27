@@ -11,13 +11,14 @@
 //! One scalar. Precision is a construction invariant (`NumericContract`), not a
 //! cost term, because a time-only model eliminates f32 everywhere.
 
+use crate::nodes::{Mnkb, Tiling, fold_lane_group, fold_theta};
+use crate::realize::fold_line_amplification;
 use crate::terms;
 use fusor_ir::cost::{CostModel, DeviceFacts, LaunchPlan, MacUnit, Picoseconds};
 use fusor_ir::dtype::Dtype;
 use fusor_ir::facts::ValueFacts;
-use fusor_ir::ir::Node;
-use fusor_ir::ir::launch::SchedPoint;
-use fusor_ir::shape::Dim;
+use fusor_ir::ir::launch::{Launch, SchedPoint};
+use fusor_ir::ir::{Node, Op};
 
 /// The one cost model. `score_fs` maps onto its terms one for one:
 /// T1 -> math, T2 -> wg, T3 -> drain, T4 -> the `max`. Split-K combine
@@ -74,13 +75,64 @@ impl Roofline {
         Self { facts }
     }
 
-    /// [`CostModel::launch_cost`] at an explicit operand dtype.
-    ///
-    /// [`LaunchPlan`] carries no dtype, so the trait method assumes f32.
-    /// Callers that know better — every real lowering does — should come
-    /// through here, so an f16 contraction is priced at the f16 MAC rate.
-    pub fn launch_cost_at(&self, launch: &LaunchPlan<'_>, dtype: Dtype) -> Picoseconds {
+    /// Line traffic beyond the useful bytes a fold moves at `theta`'s lane
+    /// group, over the operands it walks at its own iteration space.
+    fn fold_line_floor(
+        &self,
+        node: &Node,
+        ins: &[ValueFacts],
+        theta: Option<SchedPoint>,
+    ) -> Picoseconds {
+        let Op::Launch(op @ Launch::Fold { space, axis, .. }) = &node.op else {
+            return Picoseconds(0);
+        };
+        let Some(total) = space.iterations() else {
+            return Picoseconds(0);
+        };
+        let dims: Vec<u64> = space.dims.iter().filter_map(|d| d.as_const()).collect();
+        let caps = &self.facts.caps;
+        let lane_group = fold_lane_group(fold_theta(op, theta, caps), caps);
+        let mut extra = 0u64;
+        for f in ins {
+            let elems = f
+                .shape
+                .iter()
+                .try_fold(1u64, |a, d| d.as_const().map(|d| a * d));
+            if elems != Some(total) {
+                continue;
+            }
+            let elem = f.dtype.byte_size().max(1);
+            let amp = fold_line_amplification(&dims, *axis as usize, lane_group, caps, elem);
+            extra = extra.saturating_add(total.saturating_mul(elem).saturating_mul(amp - 1));
+        }
+        terms::dram_ps(&self.facts, &[], 0, extra)
+    }
+}
+
+/// Which functional unit and dtype a node's MACs issue on.
+fn unit_and_dtype(
+    ins: &[ValueFacts],
+    out: &ValueFacts,
+    theta: Option<SchedPoint>,
+) -> (MacUnit, Dtype) {
+    // MACs issue at the operand dtype; `acc` is a separate attribute and
+    // does not set the issue rate.
+    let dtype = ins.first().map_or(out.dtype, |f| f.dtype);
+    match theta {
+        Some(SchedPoint::Coop { .. }) => (MacUnit::Coop, dtype),
+        _ => (MacUnit::Fma, dtype),
+    }
+}
+
+impl CostModel for Roofline {
+    fn facts(&self) -> &DeviceFacts {
+        &self.facts
+    }
+
+    /// [`LaunchPlan`] carries no dtype, so a launch prices at f32.
+    fn launch_cost(&self, launch: &LaunchPlan<'_>) -> Picoseconds {
         let f = &self.facts;
+        let dtype = Dtype::F32;
         let sched = Sched::of(launch.theta.get(&launch.root).copied());
         let elem_bytes = dtype.byte_size().max(1);
 
@@ -116,91 +168,8 @@ impl Roofline {
             den,
         );
         // What one workgroup cannot finish faster than: its dependent chain.
-        let serial = Picoseconds(
-            launch
-                .coop_steps
-                .saturating_mul(f.coop_step_ps)
-                .saturating_add(launch.lane_steps.saturating_mul(f.lane_step_ps)),
-        );
+        let serial = terms::serial_ps(f, launch.coop_steps, launch.lane_steps);
         Picoseconds(f.launch_ps) + dram.max(issue).max(serial) + drain
-    }
-}
-
-/// Which functional unit and dtype a node's MACs issue on.
-fn unit_and_dtype(
-    ins: &[ValueFacts],
-    out: &ValueFacts,
-    theta: Option<SchedPoint>,
-) -> (MacUnit, Dtype) {
-    // MACs issue at the operand dtype; `acc` is a separate attribute and
-    // does not set the issue rate.
-    let dtype = ins.first().map_or(out.dtype, |f| f.dtype);
-    match theta {
-        Some(SchedPoint::Coop { .. }) => (MacUnit::Coop, dtype),
-        _ => (MacUnit::Fma, dtype),
-    }
-}
-
-impl Roofline {
-    /// Line traffic beyond the useful bytes a fold moves at `theta`'s lane
-    /// group, over the operands it walks at its own iteration space.
-    fn fold_line_floor(
-        &self,
-        node: &Node,
-        ins: &[ValueFacts],
-        theta: Option<SchedPoint>,
-    ) -> Picoseconds {
-        let fusor_ir::ir::Op::Launch(op @ fusor_ir::ir::launch::Launch::Fold { space, axis, .. }) =
-            &node.op
-        else {
-            return Picoseconds(0);
-        };
-        let Some(total) = space.iterations() else {
-            return Picoseconds(0);
-        };
-        let dims: Vec<u64> = space.dims.iter().filter_map(|d| d.as_const()).collect();
-        let caps = &self.facts.caps;
-        let theta = op
-            .fold_schedule(theta, caps)
-            .map(|s| SchedPoint::Fold(s.strategy))
-            .or(theta);
-        let lane_group = match theta {
-            Some(SchedPoint::Fold(s)) => s.lane_group(caps.subgroup_width()),
-            // The emitters' default at a bare point: the subgroup collective
-            // where there is one, the full block otherwise.
-            _ if caps.subgroups.is_some() => caps.subgroup_width(),
-            _ => fusor_ir::ir::launch::emitted_block(1, caps),
-        };
-        let mut extra = 0u64;
-        for f in ins {
-            let elems = f
-                .shape
-                .iter()
-                .try_fold(1u64, |a, d| d.as_const().map(|d| a * d));
-            if elems != Some(total) {
-                continue;
-            }
-            let elem = f.dtype.byte_size().max(1);
-            let amp = crate::realize::fold_line_amplification(
-                &dims,
-                *axis as usize,
-                lane_group,
-                caps,
-                elem,
-            );
-            extra = extra.saturating_add(total.saturating_mul(elem).saturating_mul(amp - 1));
-        }
-        terms::dram_ps(&self.facts, &[], 0, extra)
-    }
-}
-
-impl CostModel for Roofline {
-    fn facts(&self) -> &DeviceFacts {
-        &self.facts
-    }
-
-    fn launch_cost(&self, launch: &LaunchPlan<'_>) -> Picoseconds {
-        self.launch_cost_at(launch, Dtype::F32)
     }
 
     fn node_math(
@@ -212,38 +181,24 @@ impl CostModel for Roofline {
     ) -> Picoseconds {
         let (unit, dtype) = unit_and_dtype(ins, out, theta);
         let mut work = fusor_ir::semantics::work::work_of(&node.op, ins, out);
-        // A tiled point issues MACs on the *padded* tile. Padding is real
-        // work the theta performs — the kernels stage zero-filled tiles and
-        // run the whole tile's MACs — so charging it keeps the bound
-        // admissible.
-        if let (
-            Some(tile),
-            fusor_ir::ir::Op::Launch(fusor_ir::ir::launch::Launch::Contract {
-                m, n, k, batch, ..
-            }),
-        ) = (
-            theta.and_then(|t| match t {
-                SchedPoint::Coop { geom, .. } => Some((geom.bm, geom.bn)),
-                SchedPoint::Sgemm(p) => Some((p.bm, p.bn)),
-                _ => None,
-            }),
-            &node.op,
+        // A tiled point issues MACs on the *padded* tile: the kernels stage
+        // zero-filled tiles and run the whole tile's MACs.
+        let tile = match theta {
+            Some(SchedPoint::Coop { geom, .. }) => Some((geom.bm, geom.bn)),
+            Some(SchedPoint::Sgemm(p)) => Some((p.bm, p.bn)),
+            _ => None,
+        };
+        if let (Some((bm, bn)), Some(c)) = (
+            tile,
+            Mnkb::of(&node.op, |d| d.as_const().unwrap_or(1).max(1)),
         ) {
-            let geom_bm = tile.0;
-            let geom_bn = tile.1;
-            let priced = |d: &Dim| d.as_const().unwrap_or(1).max(1);
-            let (m, n, k, batch) = (priced(m), priced(n), priced(k), priced(batch));
-            let m_pad = m
-                .div_ceil(u64::from(geom_bm.max(1)))
-                .saturating_mul(u64::from(geom_bm.max(1)));
-            let n_pad = n
-                .div_ceil(u64::from(geom_bn.max(1)))
-                .saturating_mul(u64::from(geom_bn.max(1)));
-            let extra = m_pad
-                .saturating_mul(n_pad)
-                .saturating_sub(m.saturating_mul(n))
-                .saturating_mul(k)
-                .saturating_mul(batch);
+            let t = Tiling::new(c.m, c.n, bm, bn);
+            let extra = t
+                .padded_m()
+                .saturating_mul(t.padded_n())
+                .saturating_sub(c.m.saturating_mul(c.n))
+                .saturating_mul(c.k)
+                .saturating_mul(c.batch);
             work.macs = work.macs.saturating_add(extra);
         }
         // Zero traffic, no occupancy scaling. The admissible lower bound is
@@ -255,14 +210,11 @@ impl CostModel for Roofline {
             terms::math_ps(&self.facts, work, unit, dtype) + self.fold_line_floor(node, ins, theta);
         // A workgroup's dependent chain is a floor of the node at this point
         // too: nothing around it shortens the k loop.
-        if std::env::var_os("FUSOR_NO_SEED_FLOOR").is_some() {
+        if crate::debug::flags().no_seed_floor {
             return t;
         }
         let (coop, lane) = crate::realize::node_serial_steps(&node.op, theta, &self.facts.caps);
-        let serial = coop
-            .saturating_mul(self.facts.coop_step_ps)
-            .saturating_add(lane.saturating_mul(self.facts.lane_step_ps));
-        t.max(Picoseconds(serial))
+        t.max(terms::serial_ps(&self.facts, coop, lane))
     }
 
     fn traffic(&self, bytes: u64, rereads: u32) -> Picoseconds {

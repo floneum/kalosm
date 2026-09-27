@@ -4,8 +4,10 @@
 //! on the exact cost of the completed dispatch DAG. Composite ownership
 //! fixes buffer obligations before either costing or plan construction.
 
+use crate::debug;
 use crate::lower_bound::argmin_member;
 use crate::moves::{self, SchedCache, Trail};
+use crate::nodes::{Mnkb, domain_of, is_composite, is_group, plan_values, resolved_children};
 use crate::plan::derive_plan;
 use crate::realize::{self, NodeCache, Realized};
 use fixedbitset::FixedBitSet;
@@ -59,6 +61,21 @@ impl LocalSearch {
         &self.arena
     }
 
+    fn search<'a>(
+        &'a self,
+        graph: &'a EGraph,
+        roots: &'a [Id],
+        cost: &'a dyn CostModel,
+    ) -> Search<'a> {
+        Search {
+            graph,
+            roots,
+            cost,
+            arena: self.arena.as_ref(),
+            caps: &self.caps,
+        }
+    }
+
     /// Step 2: the seed selection, its schedule points and its initial
     /// materialized set.
     pub fn seed(
@@ -71,25 +88,183 @@ impl LocalSearch {
         let (classes, mask) = realize::reachable(graph, roots);
         let launches = crate::lower_bound::bounds_scoped(graph, None, &mask).launches;
         let mut cache = NodeCache::new(graph.len());
-        self.seed_realized(
-            graph, roots, lb, &launches, cost, &classes, &mut cache, None,
-        )
-        .map(|(ex, _)| ex)
+        self.search(graph, roots, cost)
+            .seed_realized(lb, &launches, &classes, &mut cache, None)
+            .map(|seeded| seeded.ex)
     }
 
-    /// Construct the seed's required buffers before partitioning its launches.
-    #[allow(clippy::too_many_arguments)]
-    fn seed_realized(
+    /// Extract a plan and report the deterministic search work.
+    pub fn extract_traced(
         &self,
         graph: &EGraph,
         roots: &[Id],
+        cost: &dyn CostModel,
+        budget: ExtractBudget,
+    ) -> Result<(Plan, SearchTrace)> {
+        self.extract_seeded_traced(graph, roots, cost, budget, None)
+    }
+
+    fn extract_seeded_traced(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        cost: &dyn CostModel,
+        budget: ExtractBudget,
+        seed: Option<&Plan>,
+    ) -> Result<(Plan, SearchTrace)> {
+        let started = Instant::now();
+        let search = self.search(graph, roots, cost);
+        // Everything below is scoped to the classes this resolve's roots
+        // reach; a long-lived session graph holds every value it ever built.
+        let (classes, mask) = realize::reachable(graph, roots);
+        let crate::lower_bound::Bounds {
+            costs: lb,
+            launches,
+        } = crate::lower_bound::bounds_scoped(graph, Some(cost), &mask);
+        let mut cache = NodeCache::new(graph.len());
+        let mut at = search.seed_realized(&lb, &launches, &classes, &mut cache, seed)?;
+        // The seed is priced the same way every candidate below is: as the
+        // plan it denotes, not as the state the seeding pass left.
+        let mut trail = Trail::default();
+        match search.price(&mut at.ex, &mut cache, &mut trail) {
+            Some((realized, cost)) => {
+                at.realized = realized;
+                at.cost = cost;
+            }
+            None => trail.rollback(&mut at.ex, 0),
+        }
+
+        let chains = classes.len() as u32;
+        // The cap is the only stopping condition. A wall clock here would
+        // make the winning plan — and the `PlanHash` the cross-process cache
+        // is keyed on — depend on machine load. The work divisor is the
+        // scoped node count, since every move re-realizes the DAG under the
+        // roots.
+        let cap = budget.move_cap(mask.count_ones(..), chains);
+        let readers = readers_by_producer(graph, &classes, &self.caps);
+        let mut producers: Vec<ClassId> = readers.keys().copied().collect();
+        producers.sort_unstable();
+        let climb = Climb {
+            lb: &lb,
+            readers: &readers,
+            producers: &producers,
+            cap,
+        };
+        let initial = at.cost;
+
+        // Adopting all views of a multi-slot reduction can improve the plan
+        // even when adopting one view alone cannot. Descend from both that
+        // joint adoption and the plain seed, keeping the cheaper result.
+        let joints = joint_producers(graph, &readers);
+        let plain = at.clone();
+        let mut a = SearchTrace::default();
+        while a.co_moves < cap && search.co_select(&joints, &climb, &mut at, &mut cache, &mut a) {}
+        let joint_moved = !a.best.is_empty();
+        search.descend(&climb, &mut at, &mut cache, &mut a);
+
+        let mut trace = if joint_moved {
+            let mut b_at = plain;
+            let mut b = SearchTrace::default();
+            search.descend(&climb, &mut b_at, &mut cache, &mut b);
+            let (moves, co_moves) = (a.moves.max(b.moves), a.co_moves.max(b.co_moves));
+            let mut chosen = if b_at.cost <= at.cost {
+                at = b_at;
+                b
+            } else {
+                a
+            };
+            chosen.moves = moves;
+            chosen.co_moves = co_moves;
+            chosen
+        } else {
+            // The seeded sweep changed nothing, so the two starts are the same
+            // state and the second descent would repeat the first move for
+            // move.
+            a
+        };
+        trace.chains = chains;
+        trace.best.insert(0, initial);
+
+        let plan = derive_plan(graph, &at.ex, &at.realized, cost.facts(), at.cost)?;
+        debug::dump_plan(graph, &plan, &at.ex, &at.realized, &self.caps, cost);
+        #[cfg(feature = "compiler-tests")]
+        crate::verify_plan::verify_plan_with(graph, &plan, self.arena.as_ref(), &self.caps)
+            .unwrap_or_else(|e| panic!("constructed plan violates a compiler invariant: {e}"));
+
+        trace.micros = started.elapsed().as_micros() as u64;
+        Ok((plan, trace))
+    }
+
+    /// Complete a selection and construct its plan without searching. This
+    /// is the same construction used to price local-search candidates.
+    ///
+    /// The `cache` is the caller's: `Work` is a property of a graph node and
+    /// nothing in it moves with the extraction.
+    pub fn replan(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        ex: &mut Extraction,
+        cost: &dyn CostModel,
+        cache: &mut NodeCache,
+    ) -> Result<Plan> {
+        cache.clear_schedules();
+        let mut trail = Trail::default();
+        let plan = self
+            .search(graph, roots, cost)
+            .price(ex, cache, &mut trail)
+            .ok_or_else(|| Error::Plan("autotune candidate does not realize".into()))
+            .and_then(|(realized, exact)| derive_plan(graph, ex, &realized, cost.facts(), exact));
+        if plan.is_err() {
+            trail.rollback(ex, 0);
+        }
+        // Conformance checks the plan independently of the constructor.
+        #[cfg(feature = "compiler-tests")]
+        if let Ok(plan) = &plan {
+            crate::verify_plan::verify_plan_with(graph, plan, self.arena.as_ref(), &self.caps)
+                .unwrap_or_else(|e| panic!("constructed plan violates a compiler invariant: {e}"));
+        }
+        plan
+    }
+}
+
+/// What every pricing within one extraction shares.
+struct Search<'a> {
+    graph: &'a EGraph,
+    roots: &'a [Id],
+    cost: &'a dyn CostModel,
+    arena: &'a dyn ArenaPlanner,
+    caps: &'a Caps,
+}
+
+/// A selection, the DAG it realizes and that DAG's exact cost.
+#[derive(Clone)]
+struct Incumbent {
+    ex: Extraction,
+    realized: Realized,
+    cost: Picoseconds,
+}
+
+/// The fixed inputs of one descent.
+struct Climb<'a> {
+    lb: &'a [Picoseconds],
+    readers: &'a FxHashMap<ClassId, Vec<(ClassId, Id)>>,
+    /// Every key of `readers`, ascending.
+    producers: &'a [ClassId],
+    cap: u32,
+}
+
+impl Search<'_> {
+    /// Construct the seed's required buffers before partitioning its launches.
+    fn seed_realized(
+        &self,
         lb: &[Picoseconds],
         launches: &[u32],
-        cost: &dyn CostModel,
         classes: &[ClassId],
         cache: &mut NodeCache,
         seed: Option<&Plan>,
-    ) -> Result<(Extraction, Realized)> {
+    ) -> Result<Incumbent> {
+        let graph = self.graph;
         let mut ex = Extraction {
             sigma: FxHashMap::with_capacity_and_hasher(classes.len(), Default::default()),
             m: FixedBitSet::with_capacity(graph.len()),
@@ -98,29 +273,17 @@ impl LocalSearch {
         for class in classes {
             // Start from a concrete lowering before introducing composites
             // or decompositions whose dependencies must be priced together.
-            let pick = realize::selectable(graph, *class, &self.caps)
+            let pick = realize::selectable(graph, *class, self.caps)
                 .into_iter()
-                .filter(|id| {
-                    !matches!(
-                        graph.node(*id).op,
-                        Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
-                    )
-                })
+                .filter(|id| !is_composite(graph, *id))
                 .min()
-                .unwrap_or_else(|| argmin_member(graph, lb, launches, *class, &self.caps));
-            sigma_debug(*class, pick, "seed");
+                .unwrap_or_else(|| argmin_member(graph, lb, launches, *class, self.caps));
+            debug::sigma(*class, pick, "seed");
             ex.sigma.insert(*class, pick);
         }
         let mut reused = FxHashMap::default();
         if let Some(seed) = seed {
-            let live: FxHashSet<_> = seed
-                .launches
-                .iter()
-                .flat_map(|launch| {
-                    std::iter::once(launch.root)
-                        .chain(launch.members.iter().copied())
-                        .chain(launch.bindings.iter().map(|binding| binding.value))
-                })
+            let live: FxHashSet<_> = plan_values(seed)
                 .filter(|member| member.index() < graph.len())
                 .map(|member| graph.class_of(member))
                 .collect();
@@ -151,29 +314,31 @@ impl LocalSearch {
             reused.retain(|class, _| seed.extraction.sigma.contains_key(class));
         }
         loop {
-            let attempt = pin_selection(graph, roots, &mut ex, &mut Trail::default(), cache)
+            let attempt = pin_selection(graph, self.roots, &mut ex, &mut Trail::default(), cache)
                 .and_then(|selected| {
                     seed_theta_trailed(
                         graph,
                         &mut ex,
                         &selected.order,
-                        cost,
+                        self.cost,
                         cache,
                         &mut Trail::default(),
                     );
                     ex.m = selected.buffers(graph);
-                    selected.realize(graph, &ex, cost, self.arena.as_ref(), cache)
+                    selected.realize(graph, &ex, self.cost, self.arena, cache)
                 });
             match attempt {
                 Ok(realized) => {
-                    return self.choose_seed(graph, roots, ex, realized, lb, cost, cache, &reused);
+                    let cost = realize::exact_cost(&realized, &ex, self.cost);
+                    let at = Incumbent { ex, realized, cost };
+                    return Ok(self.choose_seed(at, lb, cache, &reused));
                 }
                 Err(error) => {
                     if seed.is_some() {
-                        return self
-                            .seed_realized(graph, roots, lb, launches, cost, classes, cache, None);
+                        return self.seed_realized(lb, launches, classes, cache, None);
                     }
-                    if !break_selection_cycles(graph, roots, &mut ex, lb, launches, &self.caps)? {
+                    if !break_selection_cycles(graph, self.roots, &mut ex, lb, launches, self.caps)?
+                    {
                         return Err(error);
                     }
                 }
@@ -184,19 +349,16 @@ impl LocalSearch {
     /// One finite sweep over the seed's live classes, producers before
     /// consumers. Every comparison prices the complete selected DAG, so shared
     /// producers execute once and all independent branches contribute.
-    #[allow(clippy::too_many_arguments)]
     fn choose_seed(
         &self,
-        graph: &EGraph,
-        roots: &[Id],
-        mut ex: Extraction,
-        mut realized: Realized,
+        mut at: Incumbent,
         order_costs: &[Picoseconds],
-        cost: &dyn CostModel,
         cache: &mut NodeCache,
         reused: &FxHashMap<ClassId, Id>,
-    ) -> Result<(Extraction, Realized)> {
-        let classes: Vec<_> = realized
+    ) -> Incumbent {
+        let graph = self.graph;
+        let classes: Vec<_> = at
+            .realized
             .components
             .iter()
             .filter(|component| {
@@ -204,349 +366,213 @@ impl LocalSearch {
             })
             .map(|component| graph.class_of(component.root))
             .collect();
-        let mut best = realize::exact_cost(&realized, &ex, cost);
+        let ordinary = |id| matches!(graph.node(id).op, Op::Launch(_)) && !is_composite(graph, id);
+        let inputs = |id: Id| -> Vec<ClassId> {
+            graph
+                .node(id)
+                .children
+                .iter()
+                .map(|child| graph.class_of(*child))
+                .collect()
+        };
         for class in classes {
-            let mut members = realize::selectable(graph, class, &self.caps);
+            let mut members = realize::selectable(graph, class, self.caps);
             members.sort_by_key(|member| (order_costs[member.index()], *member));
             for candidate in members {
-                let Some(index) = realized
+                let Some(index) = at
+                    .realized
                     .components
                     .iter()
                     .position(|component| graph.class_of(component.root) == class)
                 else {
                     break;
                 };
-                let component = &realized.components[index];
+                let component = &at.realized.components[index];
                 let current = component.root;
                 if candidate == current {
                     continue;
                 }
-                let ordinary = |id| {
-                    matches!(&graph.node(id).op, Op::Launch(op)
-                    if !matches!(op, Launch::Slab { .. } | Launch::Group { .. }))
-                };
-                let inputs = |id| {
-                    graph
-                        .node(id)
-                        .children
-                        .iter()
-                        .map(|child| graph.class_of(*child))
-                        .collect::<Vec<_>>()
-                };
                 let same_inputs = component.members.as_slice() == [current]
                     && ordinary(current)
                     && ordinary(candidate)
                     && inputs(current) == inputs(candidate);
                 let mut trail = Trail::default();
-                trail.select(&mut ex, class, candidate);
+                trail.select(&mut at.ex, class, candidate);
+                // A same-inputs swap is screened on its own launch first.
                 if same_inputs {
-                    seed_theta_trailed(graph, &mut ex, &[candidate], cost, cache, &mut trail);
-                    let score = realize::ordinary_component(
+                    seed_theta_trailed(
                         graph,
-                        &ex,
-                        candidate,
-                        cost,
-                        self.arena.as_ref(),
+                        &mut at.ex,
+                        &[candidate],
+                        self.cost,
                         cache,
+                        &mut trail,
+                    );
+                    let score = realize::ordinary_component(
+                        graph, &at.ex, candidate, self.cost, self.arena, cache,
                     )
-                    .map(|replacement| realized.cost_replacing(index, &replacement, &ex, cost));
-                    if !score.is_ok_and(|score| score < best) {
-                        trail.rollback(&mut ex, 0);
+                    .map(|replacement| {
+                        at.realized
+                            .cost_replacing(index, &replacement, &at.ex, self.cost)
+                    });
+                    if !score.is_ok_and(|score| score < at.cost) {
+                        trail.rollback(&mut at.ex, 0);
                         continue;
                     }
                 }
-                match price(
-                    graph,
-                    roots,
-                    &mut ex,
-                    cost,
-                    self.arena.as_ref(),
-                    cache,
-                    &mut trail,
-                ) {
-                    Some((next, score)) if score < best => {
-                        realized = next;
-                        best = score;
-                    }
-                    _ => trail.rollback(&mut ex, 0),
-                }
+                self.improve(&mut at, cache, &mut trail);
             }
         }
-        Ok((ex, realized))
+        at
     }
 
-    /// Extract a plan and report the deterministic search work.
-    pub fn extract_traced(
+    /// Single moves until none improves, then compound co-selections until a
+    /// sweep improves nothing.
+    fn descend(
         &self,
-        graph: &EGraph,
-        roots: &[Id],
-        cost: &dyn CostModel,
-        budget: ExtractBudget,
-    ) -> Result<(Plan, SearchTrace)> {
-        self.extract_seeded_traced(graph, roots, cost, budget, None)
-    }
-
-    fn extract_seeded_traced(
-        &self,
-        graph: &EGraph,
-        roots: &[Id],
-        cost: &dyn CostModel,
-        budget: ExtractBudget,
-        seed: Option<&Plan>,
-    ) -> Result<(Plan, SearchTrace)> {
-        let started = Instant::now();
-        // Everything below is scoped to the classes this resolve's roots
-        // reach; a long-lived session graph holds every value it ever built.
-        let (classes, mask) = realize::reachable(graph, roots);
-        let crate::lower_bound::Bounds {
-            costs: lb,
-            launches,
-        } = crate::lower_bound::bounds_scoped(graph, Some(cost), &mask);
-        let mut cache = NodeCache::new(graph.len());
-        let (mut ex, seeded) = self.seed_realized(
-            graph, roots, &lb, &launches, cost, &classes, &mut cache, seed,
-        )?;
-        // The seed is priced the same way every candidate below is: as the
-        // plan it denotes, not as the state the seeding pass left.
-        let mut trail = Trail::default();
-        let (mut realized, mut best_cost) = match price(
-            graph,
-            roots,
-            &mut ex,
-            cost,
-            self.arena.as_ref(),
-            &mut cache,
-            &mut trail,
-        ) {
-            Some(priced) => priced,
-            None => {
-                trail.rollback(&mut ex, 0);
-                let c = realize::exact_cost(&seeded, &ex, cost);
-                (seeded, c)
-            }
-        };
-
-        let chains = classes.len() as u32;
-        // The cap is the only stopping condition. A wall clock here would
-        // make the winning plan — and the `PlanHash` the cross-process cache
-        // is keyed on — depend on machine load. The work divisor is the
-        // scoped node count, since every move re-realizes the DAG under the
-        // roots.
-        let cap = budget.move_cap(mask.count_ones(..), chains);
-        let mut trace = SearchTrace {
-            chains,
-            best: vec![best_cost],
-            ..SearchTrace::default()
-        };
-        let readers = readers_by_producer(graph, &classes, &self.caps);
-
-        // Adopting all views of a multi-slot reduction can improve the plan
-        // even when adopting one view alone cannot. Descend from both that
-        // joint adoption and the plain seed, keeping the cheaper result.
-        let joints = joint_producers(graph, &readers);
-        let plain = (ex.clone(), realized.clone(), best_cost);
-        let mut seeded_best: Vec<Picoseconds> = Vec::new();
-        let mut seed_moves = 0u32;
-        while seed_moves < cap
-            && co_select_over(
-                &joints,
-                graph,
-                roots,
-                cost,
-                &readers,
-                self.arena.as_ref(),
-                &mut ex,
-                &mut realized,
-                &mut best_cost,
-                &mut cache,
-                &mut seeded_best,
-                &mut seed_moves,
-                cap,
-            )?
-        {}
-
-        let descend = |ex: &mut Extraction,
-                       realized: &mut Realized,
-                       best_cost: &mut Picoseconds,
-                       cache: &mut NodeCache,
-                       best: &mut Vec<Picoseconds>,
-                       moves: &mut u32,
-                       co_moves: &mut u32|
-         -> Result<()> {
-            let mut sched = SchedCache::new();
-            'search: loop {
-                let mut improved = false;
-                for mv in moves::frontier(graph, &realized.order) {
-                    if *moves >= cap {
+        climb: &Climb<'_>,
+        at: &mut Incumbent,
+        cache: &mut NodeCache,
+        trace: &mut SearchTrace,
+    ) {
+        let mut sched = SchedCache::new();
+        'search: loop {
+            let mut improved = false;
+            for mv in moves::frontier(self.graph, &at.realized.order) {
+                if trace.moves >= climb.cap {
+                    break 'search;
+                }
+                let options = moves::candidates(
+                    self.graph,
+                    &at.ex,
+                    &at.realized.order,
+                    mv,
+                    climb.lb,
+                    &mut sched,
+                    self.cost,
+                );
+                for candidate in options {
+                    if trace.moves >= climb.cap {
                         break 'search;
                     }
-                    let options =
-                        moves::candidates(graph, ex, &realized.order, mv, &lb, &mut sched, cost);
-                    for candidate in options {
-                        if *moves >= cap {
-                            break 'search;
-                        }
-                        *moves += 1;
-                        let mut trail = Trail::default();
-                        if !trail.apply(ex, candidate) {
-                            continue;
-                        }
-                        let attempt = price(
-                            graph,
-                            roots,
-                            ex,
-                            cost,
-                            self.arena.as_ref(),
-                            cache,
-                            &mut trail,
-                        );
-                        match attempt {
-                            // Strict improvements only; a tie keeps the earlier
-                            // (smaller-id) state, which keeps the search
-                            // reproducible.
-                            Some((r, c)) if c < *best_cost => {
-                                *best_cost = c;
-                                *realized = r;
-                                best.push(c);
-                                improved = true;
-                                break;
-                            }
-                            // The move is undone after the obligations it
-                            // implied, so a rejected candidate leaves no trace.
-                            _ => trail.rollback(ex, 0),
-                        }
+                    trace.moves += 1;
+                    let mut trail = Trail::default();
+                    if trail.apply(&mut at.ex, candidate) && self.improve(at, cache, &mut trail) {
+                        trace.best.push(at.cost);
+                        improved = true;
+                        break;
                     }
                 }
-                if !improved {
-                    break;
-                }
             }
-
-            // Step 4b: the compound move the single-move climb above cannot
-            // make. Sweeps until a sweep improves nothing.
-            //
-            // Its own counter: the climb normally spends every move `cap`
-            // allows, so a shared counter would make this pass unreachable.
-            // The extraction stays a pure function of the graph.
-            while *co_moves < cap
-                && co_select(
-                    graph,
-                    roots,
-                    cost,
-                    &readers,
-                    self.arena.as_ref(),
-                    ex,
-                    realized,
-                    best_cost,
-                    cache,
-                    best,
-                    co_moves,
-                    cap,
-                )?
-            {}
-
-            Ok(())
-        };
-
-        let mut a_best = seeded_best.clone();
-        let mut a_moves = 0u32;
-        let mut a_co = seed_moves;
-        descend(
-            &mut ex,
-            &mut realized,
-            &mut best_cost,
-            &mut cache,
-            &mut a_best,
-            &mut a_moves,
-            &mut a_co,
-        )?;
-
-        if seeded_best.is_empty() {
-            // The seeded sweep changed nothing, so the two starts are the same
-            // state and the second descent would repeat the first move for
-            // move.
-            trace.moves = a_moves;
-            trace.co_moves = a_co;
-            trace.best.extend(a_best);
-        } else {
-            let (mut b_ex, mut b_realized, mut b_cost) = plain;
-            let mut b_best: Vec<Picoseconds> = Vec::new();
-            let mut b_moves = 0u32;
-            let mut b_co = 0u32;
-            descend(
-                &mut b_ex,
-                &mut b_realized,
-                &mut b_cost,
-                &mut cache,
-                &mut b_best,
-                &mut b_moves,
-                &mut b_co,
-            )?;
-            trace.moves = a_moves.max(b_moves);
-            trace.co_moves = a_co.max(b_co);
-            if b_cost <= best_cost {
-                ex = b_ex;
-                realized = b_realized;
-                best_cost = b_cost;
-                trace.best.extend(b_best);
-            } else {
-                trace.best.extend(a_best);
+            if !improved {
+                break;
             }
         }
 
-        let plan = derive_plan(graph, &ex, &realized, cost.facts(), best_cost)?;
-        // Dump the completed plan for diagnostics.
-        probe_dump(graph, &plan, &ex, &realized, &self.caps, cost);
-        #[cfg(feature = "compiler-tests")]
-        crate::verify_plan::verify_plan_with(graph, &plan, self.arena.as_ref(), &self.caps)
-            .unwrap_or_else(|e| panic!("constructed plan violates a compiler invariant: {e}"));
-
-        trace.micros = started.elapsed().as_micros() as u64;
-        Ok((plan, trace))
+        // Step 4b: the compound move the single-move climb above cannot
+        // make. Its own counter: the climb normally spends every move `cap`
+        // allows, so a shared counter would make this pass unreachable.
+        while trace.co_moves < climb.cap && self.co_select(climb.producers, climb, at, cache, trace)
+        {
+        }
     }
 
-    /// Complete a selection and construct its plan without searching. This
-    /// is the same construction used to price local-search candidates.
+    /// One co-selection sweep over `producers`, in the order given. For each
+    /// producer class, adopt together every class that holds a selectable
+    /// member reading it; keep on a strict improvement in exact global cost,
+    /// revert the trial otherwise.
     ///
-    /// The `cache` is the caller's: `Work` is a property of a graph node and
-    /// nothing in it moves with the extraction.
-    pub fn replan(
+    /// This pass reaches members the budget otherwise keeps unselected, so it
+    /// leans on the e-graph invariant that every member of a class computes
+    /// the same value. Do not weaken that guard to buy launches back.
+    ///
+    /// One realization per producer class that has two or more reading
+    /// classes, counted against `cap`, so the whole extraction remains
+    /// bounded by [`ExtractBudget`] and stays a pure function of the graph.
+    fn co_select(
         &self,
-        graph: &EGraph,
-        roots: &[Id],
-        ex: &mut Extraction,
-        cost: &dyn CostModel,
+        producers: &[ClassId],
+        climb: &Climb<'_>,
+        at: &mut Incumbent,
         cache: &mut NodeCache,
-    ) -> Result<Plan> {
-        cache.clear_schedules();
-        let mut trail = Trail::default();
-        let (realized, exact) = match price(
-            graph,
-            roots,
-            ex,
-            cost,
-            self.arena.as_ref(),
-            cache,
-            &mut trail,
-        ) {
-            Some(priced) => priced,
-            None => {
-                trail.rollback(ex, 0);
-                return Err(Error::Plan("autotune candidate does not realize".into()));
+        trace: &mut SearchTrace,
+    ) -> bool {
+        let mut improved = false;
+        for p in producers {
+            if trace.co_moves >= climb.cap {
+                break;
             }
-        };
-        let plan = match derive_plan(graph, ex, &realized, cost.facts(), exact) {
-            Ok(plan) => plan,
-            Err(error) => {
-                trail.rollback(ex, 0);
-                return Err(error);
+            // The smallest-id member of each reading class that is not already
+            // the selected one. `readers[p]` is sorted, so the first entry per
+            // class is that member.
+            let mut proposal: Vec<(ClassId, Id)> = Vec::new();
+            for (c, m) in &climb.readers[p] {
+                if proposal.last().is_some_and(|(last, _)| last == c) {
+                    continue;
+                }
+                if at.ex.sigma.get(c).copied() != Some(*m) {
+                    proposal.push((*c, *m));
+                }
             }
-        };
-        // Conformance checks the plan independently of the constructor.
-        #[cfg(feature = "compiler-tests")]
-        crate::verify_plan::verify_plan_with(graph, &plan, self.arena.as_ref(), &self.caps)
-            .unwrap_or_else(|e| panic!("constructed plan violates a compiler invariant: {e}"));
-        Ok(plan)
+            if proposal.len() < 2 {
+                continue;
+            }
+            let mut trail = Trail::default();
+            for (class, node) in &proposal {
+                trail.apply(
+                    &mut at.ex,
+                    moves::Candidate::Select {
+                        class: *class,
+                        node: *node,
+                    },
+                );
+            }
+            if trail.mark() == 0 {
+                continue;
+            }
+            trace.co_moves += 1;
+            if self.improve(at, cache, &mut trail) {
+                trace.best.push(at.cost);
+                improved = true;
+            }
+        }
+        improved
+    }
+
+    /// The DAG `ex` denotes once its obligations are recorded on `trail`,
+    /// and its exact cost.
+    fn price(
+        &self,
+        ex: &mut Extraction,
+        cache: &mut NodeCache,
+        trail: &mut Trail,
+    ) -> Option<(Realized, Picoseconds)> {
+        let selected = pin_selection(self.graph, self.roots, ex, trail, cache).ok()?;
+        seed_theta_trailed(self.graph, ex, &selected.order, self.cost, cache, trail);
+        trail.buffers(ex, selected.buffers(self.graph));
+        let realized = selected
+            .realize(self.graph, ex, self.cost, self.arena, cache)
+            .ok()?;
+        let c = realize::exact_cost(&realized, ex, self.cost);
+        Some((realized, c))
+    }
+
+    /// Price the trial `trail` made on `at` and keep it on a strict
+    /// improvement; otherwise undo it with the obligations it implied, so a
+    /// rejected trial leaves no trace. A tie keeps the earlier (smaller-id)
+    /// state, which keeps the search reproducible.
+    fn improve(&self, at: &mut Incumbent, cache: &mut NodeCache, trail: &mut Trail) -> bool {
+        match self.price(&mut at.ex, cache, trail) {
+            Some((realized, cost)) if cost < at.cost => {
+                at.realized = realized;
+                at.cost = cost;
+                true
+            }
+            _ => {
+                trail.rollback(&mut at.ex, 0);
+                false
+            }
+        }
     }
 }
 
@@ -563,21 +589,15 @@ impl LocalSearch {
         points: fn(&ScheduleDomain) -> SmallVec<[SchedPoint; 8]>,
         limit: usize,
     ) -> Vec<(String, Plan)> {
-        let Some(launch) = base.launches.get(launch_ix) else {
+        let Some((root, class)) = launch_target(graph, base, launch_ix, min_macs) else {
             return Vec::new();
         };
-        let root = launch.root;
-        if launch_work(graph, base, launch_ix) < min_macs {
-            return Vec::new();
-        }
         // No purity guard here: whether a plan may be re-run is a property of
         // the caller's use. `Session::autotune` refuses impure plans before
         // probing; the production explorer runs a candidate exactly once,
         // instead of the incumbent, so an impure plan's pure launches stay
         // explorable.
-
-        let class = graph.class_of(root);
-        let fair = fair_points_with(
+        let fair = fair_points(
             graph,
             class,
             base.extraction.theta.get(&root).copied(),
@@ -589,58 +609,30 @@ impl LocalSearch {
         // One cache for the whole sweep: `Work` is a property of the graph
         // alone.
         let mut cache = NodeCache::new(graph.len());
-        // Names every candidate this sweep drops and why.
-        let dbg = std::env::var_os("FUSOR_TUNE_DEBUG").is_some();
-        {
-            for (member, theta, label) in fair {
-                if out.len() >= limit {
-                    if dbg {
-                        eprintln!("[vdbg] L{launch_ix} cap reached at {}", out.len());
-                    }
-                    return out;
-                }
-                let mut ex = base.extraction.clone();
-                let mut trail = Trail::default();
-                if member != root
-                    && !trail.apply(
-                        &mut ex,
-                        moves::Candidate::Select {
-                            class,
-                            node: member,
-                        },
-                    )
-                {
-                    if dbg {
-                        eprintln!("[vdbg] L{launch_ix} SELECT-FAIL {member:?} {label}",);
-                    }
+        for (member, theta, label) in fair {
+            if out.len() >= limit {
+                debug::tune(launch_ix, || format!("cap reached at {}", out.len()));
+                return out;
+            }
+            let mut ex = base.extraction.clone();
+            if !apply_variant(&mut Trail::default(), &mut ex, class, root, member, theta) {
+                debug::tune(launch_ix, || format!("SELECT-FAIL {member:?} {label}"));
+                continue;
+            }
+            // A candidate may change the dispatch count: selecting a
+            // member whose operand must materialize adds that producer's
+            // launch, and dropping one removes it. Such candidates are
+            // raced like any tile and adopted only on a measured
+            // whole-plan win.
+            let plan = match self.replan(graph, roots, &mut ex, cost, &mut cache) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    debug::tune(launch_ix, || format!("REPLAN-FAIL {member:?} {label}: {e}"));
                     continue;
                 }
-                trail.apply(
-                    &mut ex,
-                    moves::Candidate::Schedule {
-                        node: member,
-                        theta,
-                    },
-                );
-                // A candidate may change the dispatch count: selecting a
-                // member whose operand must materialize adds that producer's
-                // launch, and dropping one removes it. Such candidates are
-                // raced like any tile and adopted only on a measured
-                // whole-plan win.
-                let plan = match self.replan(graph, roots, &mut ex, cost, &mut cache) {
-                    Ok(plan) => plan,
-                    Err(e) => {
-                        if dbg {
-                            eprintln!("[vdbg] L{launch_ix} REPLAN-FAIL {member:?} {label}: {e}",);
-                        }
-                        continue;
-                    }
-                };
-                if dbg {
-                    eprintln!("[vdbg] L{launch_ix} OFFER {member:?} {label}");
-                }
-                out.push((label, plan));
-            }
+            };
+            debug::tune(launch_ix, || format!("OFFER {member:?} {label}"));
+            out.push((label, plan));
         }
         out
     }
@@ -730,52 +722,29 @@ impl Extractor for LocalSearch {
         cost: &dyn CostModel,
         min_macs: u64,
     ) -> Vec<(String, Picoseconds)> {
-        let Some(launch) = base.launches.get(launch_ix) else {
+        let Some((root, class)) = launch_target(graph, base, launch_ix, min_macs) else {
             return Vec::new();
         };
-        if launch_work(graph, base, launch_ix) < min_macs {
-            return Vec::new();
-        }
-        let root = launch.root;
-        let class = graph.class_of(root);
+        let search = self.search(graph, roots, cost);
         let mut ex = base.extraction.clone();
         let mut trail = Trail::default();
         let mut cache = NodeCache::new(graph.len());
-        let mut labels: Vec<_> = fair_points(
-            graph,
-            class,
-            base.extraction.theta.get(&root).copied(),
-            root,
-        )
-        .into_iter()
-        .take(TUNE_MAX_VARIANTS)
-        .map(|(member, theta, label)| {
-            let score = if member == root
-                || trail.apply(
-                    &mut ex,
-                    moves::Candidate::Select {
-                        class,
-                        node: member,
-                    },
-                ) {
-                trail.schedule(&mut ex, member, theta);
-                price(
-                    graph,
-                    roots,
-                    &mut ex,
-                    cost,
-                    self.arena.as_ref(),
-                    &mut cache,
-                    &mut trail,
-                )
-                .map(|(_, cost)| cost)
-            } else {
-                None
-            };
-            trail.rollback(&mut ex, 0);
-            (label, score.unwrap_or(Picoseconds(u64::MAX)))
-        })
-        .collect();
+        let here = base.extraction.theta.get(&root).copied();
+        let mut labels: Vec<_> = fair_points(graph, class, here, root, sample_points, true)
+            .into_iter()
+            .take(TUNE_MAX_VARIANTS)
+            .map(|(member, theta, label)| {
+                let score = if apply_variant(&mut trail, &mut ex, class, root, member, theta) {
+                    search
+                        .price(&mut ex, &mut cache, &mut trail)
+                        .map(|(_, cost)| cost)
+                } else {
+                    None
+                };
+                trail.rollback(&mut ex, 0);
+                (label, score.unwrap_or(Picoseconds(u64::MAX)))
+            })
+            .collect();
         labels.sort_by(|(a, ac), (b, bc)| ac.cmp(bc).then_with(|| a.cmp(b)));
         labels
     }
@@ -809,53 +778,55 @@ impl Extractor for LocalSearch {
         let mut trail = Trail::default();
         let mut applied = false;
         for (ix, name) in swaps {
-            let Some(launch) = base.launches.get(*ix) else {
+            let Some((root, class)) = launch_target(graph, base, *ix, min_macs) else {
                 continue;
             };
-            if launch_work(graph, base, *ix) < min_macs {
-                continue;
-            }
-            let root = launch.root;
-            let class = graph.class_of(root);
             let here = base.extraction.theta.get(&root).copied();
-            let Some((member, theta, _)) = fair_points(graph, class, here, root)
-                .into_iter()
-                .find(|(_, _, label)| label == name)
+            let Some((member, theta, _)) =
+                fair_points(graph, class, here, root, sample_points, true)
+                    .into_iter()
+                    .find(|(_, _, label)| label == name)
             else {
                 continue;
             };
-            if member != root
-                && !trail.apply(
-                    &mut ex,
-                    moves::Candidate::Select {
-                        class,
-                        node: member,
-                    },
-                )
-            {
-                continue;
-            }
-            trail.apply(
-                &mut ex,
-                moves::Candidate::Schedule {
-                    node: member,
-                    theta,
-                },
-            );
-            applied = true;
+            applied |= apply_variant(&mut trail, &mut ex, class, root, member, theta);
         }
         if !applied {
             return None;
         }
-        self.replan(
-            graph,
-            roots,
-            &mut ex,
-            cost,
-            &mut NodeCache::new(graph.len()),
-        )
-        .ok()
+        self.replan_extraction(graph, roots, &mut ex, cost).ok()
     }
+}
+
+/// Launch `ix`'s root and its class, when its work reaches `min_macs`.
+fn launch_target(graph: &EGraph, base: &Plan, ix: usize, min_macs: u64) -> Option<(Id, ClassId)> {
+    let root = base.launches.get(ix)?.root;
+    (launch_work(graph, base, ix) >= min_macs).then(|| (root, graph.class_of(root)))
+}
+
+/// Select `member` for `class` unless it is the incumbent `root`, then
+/// schedule it at `theta`. `false` when the selection does not apply.
+fn apply_variant(
+    trail: &mut Trail,
+    ex: &mut Extraction,
+    class: ClassId,
+    root: Id,
+    member: Id,
+    theta: SchedPoint,
+) -> bool {
+    if member != root
+        && !trail.apply(
+            ex,
+            moves::Candidate::Select {
+                class,
+                node: member,
+            },
+        )
+    {
+        return false;
+    }
+    trail.schedule(ex, member, theta);
+    true
 }
 
 /// For each producer class, every `(reading class, member)` pair that reads
@@ -891,41 +862,6 @@ fn readers_by_producer(
     out
 }
 
-/// One co-selection sweep. For each producer class, adopt together every
-/// class that holds a selectable member reading it; keep on a strict
-/// improvement in exact global cost, revert the trial otherwise.
-///
-/// This pass reaches members the budget otherwise keeps unselected, so it
-/// leans on the e-graph invariant that every member of a class computes the
-/// same value. Do not weaken that guard to buy launches back.
-///
-/// One realization per producer class that has two or more reading classes.
-/// Sweeps share `cap` with the frontier search, so the whole extraction
-/// remains bounded by [`ExtractBudget`] and stays a pure function of the
-/// graph.
-#[allow(clippy::too_many_arguments)]
-fn co_select(
-    graph: &EGraph,
-    roots: &[Id],
-    cost: &dyn CostModel,
-    readers: &FxHashMap<ClassId, Vec<(ClassId, Id)>>,
-    arena: &dyn ArenaPlanner,
-    ex: &mut Extraction,
-    realized: &mut Realized,
-    best_cost: &mut Picoseconds,
-    cache: &mut NodeCache,
-    best: &mut Vec<Picoseconds>,
-    moves: &mut u32,
-    cap: u32,
-) -> Result<bool> {
-    let mut producers: Vec<ClassId> = readers.keys().copied().collect();
-    producers.sort_unstable();
-    co_select_over(
-        &producers, graph, roots, cost, readers, arena, ex, realized, best_cost, cache, best,
-        moves, cap,
-    )
-}
-
 /// The producer classes holding a **multi-slot carrier** — a node that fuses
 /// several values into one, so its readers are slot views and adopting one
 /// alone is strictly worse than adopting none.
@@ -947,243 +883,6 @@ fn joint_producers(
         .collect();
     out.sort_unstable();
     out
-}
-
-/// [`co_select`] over a stated set of producer classes, in the order given.
-#[allow(clippy::too_many_arguments)]
-fn co_select_over(
-    producers: &[ClassId],
-    graph: &EGraph,
-    roots: &[Id],
-    cost: &dyn CostModel,
-    readers: &FxHashMap<ClassId, Vec<(ClassId, Id)>>,
-    arena: &dyn ArenaPlanner,
-    ex: &mut Extraction,
-    realized: &mut Realized,
-    best_cost: &mut Picoseconds,
-    cache: &mut NodeCache,
-    best: &mut Vec<Picoseconds>,
-    moves: &mut u32,
-    cap: u32,
-) -> Result<bool> {
-    let mut improved = false;
-    for p in producers {
-        if *moves >= cap {
-            break;
-        }
-        // The smallest-id member of each reading class that is not already
-        // the selected one. `readers[p]` is sorted, so the first entry per
-        // class is that member.
-        let mut proposal: Vec<(ClassId, Id)> = Vec::new();
-        for (c, m) in &readers[p] {
-            if proposal.last().is_some_and(|(last, _)| last == c) {
-                continue;
-            }
-            if ex.sigma.get(c).copied() != Some(*m) {
-                proposal.push((*c, *m));
-            }
-        }
-        if proposal.len() < 2 {
-            continue;
-        }
-        let mut trail = Trail::default();
-        for (class, node) in &proposal {
-            trail.apply(
-                ex,
-                moves::Candidate::Select {
-                    class: *class,
-                    node: *node,
-                },
-            );
-        }
-        if trail.mark() == 0 {
-            continue;
-        }
-        *moves += 1;
-        match price(graph, roots, ex, cost, arena, cache, &mut trail) {
-            Some((r, c)) if c < *best_cost => {
-                *best_cost = c;
-                *realized = r;
-                best.push(c);
-                improved = true;
-            }
-            _ => trail.rollback(ex, 0),
-        }
-    }
-    Ok(improved)
-}
-
-// Dumps every launch of every extracted plan when `FUSOR_DUMP_PLAN` is set,
-// so a launch count can be attributed to specific nodes.
-fn probe_dump(
-    graph: &EGraph,
-    plan: &Plan,
-    _ex: &Extraction,
-    realized: &Realized,
-    caps: &Caps,
-    cost: &dyn CostModel,
-) {
-    if std::env::var_os("FUSOR_DUMP_PLAN").is_none() {
-        return;
-    }
-    let priced = realized.launches(_ex);
-    eprintln!(
-        "PLAN nodes={} classes={} launches={} buffers={}",
-        graph.len(),
-        realize::classes(graph).len(),
-        plan.launches.len(),
-        plan.buffers.len()
-    );
-    for (i, l) in plan.launches.iter().enumerate() {
-        let n = graph.node(l.root);
-        let facts = graph.facts(l.root);
-        let priced_line = priced
-            .iter()
-            .find(|p| p.root == l.root)
-            .map(|p| {
-                format!(
-                    "cost_us={:.1} reads={:?} writes={} line_bytes={} lanes={}",
-                    cost.launch_cost(p).0 as f64 / 1e6,
-                    p.reads,
-                    p.writes,
-                    p.line_bytes,
-                    p.resident_lanes
-                )
-            })
-            .unwrap_or_default();
-        eprintln!(
-            "  L{i}: root={:?} class={} op={} shape={:?} members={} grid={:?} block={} {priced_line}",
-            l.root,
-            graph.class_of(l.root).0.index(),
-            op_tag(&n.op),
-            facts.shape,
-            l.members.len(),
-            l.grid,
-            l.block
-        );
-        for m in l.members.iter() {
-            eprintln!(
-                "        member {:?} {} theta={:?} legal={} dom={:?} class_members={:?}",
-                m,
-                op_tag(&graph.node(*m).op),
-                _ex.theta.get(m),
-                realize::composite_bindings_fit(graph, *m, caps),
-                realize::domain_of(graph, *m).map(|d| d.len()),
-                graph.members(graph.class_of(*m))
-            );
-        }
-    }
-    let _ = realized;
-    // One compact line per launch: the kind, whether the body is a pure
-    // identity copy, and the operand sources by node id, so the launch graph
-    // can be walked offline.
-    if std::env::var_os("FUSOR_DUMP_EDGES").is_some() {
-        for (i, l) in plan.launches.iter().enumerate() {
-            let n = graph.node(l.root);
-            let facts = graph.facts(l.root);
-            let ident = match &n.op {
-                Op::Launch(fusor_ir::ir::launch::Launch::Map { ops, body, .. }) => {
-                    ops.len() == 1
-                        && format!("{body:?}").starts_with("ScalarExpr(ScalarNode { kind: Arg(0)")
-                }
-                _ => false,
-            };
-            let kind = match &n.op {
-                Op::Launch(fusor_ir::ir::launch::Launch::Map { .. }) => "Map",
-                Op::Launch(fusor_ir::ir::launch::Launch::Fold { .. }) => "Fold",
-                Op::Launch(fusor_ir::ir::launch::Launch::Contract { .. }) => "Contract",
-                Op::Launch(fusor_ir::ir::launch::Launch::Gather { .. }) => "Gather",
-                Op::Launch(fusor_ir::ir::launch::Launch::Scatter { .. }) => "Scatter",
-                Op::Launch(fusor_ir::ir::launch::Launch::Slab { .. }) => "Slab",
-                Op::Launch(fusor_ir::ir::launch::Launch::StreamFold { .. }) => "StreamFold",
-                Op::Launch(fusor_ir::ir::launch::Launch::Group { .. }) => "Group",
-                Op::Logical(_) => "Logical",
-                Op::Union(_, _) => "Union",
-            };
-            let mut srcs: Vec<u32> = Vec::new();
-            for m in l.members.iter() {
-                for c in fusor_ir::semantics::children::children_of(&graph.node(*m).op) {
-                    srcs.push(c.0);
-                }
-            }
-            let srcs: Vec<u32> = srcs
-                .into_iter()
-                .map(|s| graph.class_of(fusor_ir::egraph::Id(s)).0.0)
-                .collect();
-            eprintln!(
-                "EDGE {i} kind={kind} ident={ident} class={} shape={:?} srcs={:?}",
-                graph.class_of(l.root).0.0,
-                facts.shape,
-                srcs
-            );
-        }
-    }
-    if std::env::var_os("FUSOR_DUMP_CLASSES").is_none() {
-        return;
-    }
-    for c in realize::classes(graph) {
-        let members: Vec<Id> = graph.members(c);
-        if members.len() < 2 {
-            continue;
-        }
-        eprintln!("  CLASS {c:?} sel={:?}", _ex.sigma.get(&c));
-        for m in members {
-            eprintln!("      {m:?} {}", op_tag(&graph.node(m).op));
-        }
-    }
-}
-
-pub(crate) fn op_tag(op: &Op) -> String {
-    use fusor_ir::ir::launch::Launch;
-    match op {
-        Op::Launch(Launch::Map {
-            space, ops, body, ..
-        }) => {
-            let srcs: Vec<String> = ops
-                .iter()
-                .map(|o| {
-                    format!(
-                        "{}{}@{:?}",
-                        o.src,
-                        match &o.access {
-                            fusor_ir::ir::launch::AccessPlan::Alias => "",
-                            fusor_ir::ir::launch::AccessPlan::Gather => ":G",
-                            fusor_ir::ir::launch::AccessPlan::Pack { .. } => ":P",
-                            fusor_ir::ir::launch::AccessPlan::Unflatten(_) => ":U",
-                        },
-                        o.layout.offset()
-                    )
-                })
-                .collect();
-            let b = format!("{body:?}");
-            format!(
-                "Map space={:?} ops={} srcs={:?} body={}",
-                space.dims,
-                ops.len(),
-                srcs,
-                &b[..b.len().min(120)]
-            )
-        }
-        Op::Launch(Launch::Fold {
-            space,
-            axis,
-            vec_axes,
-            carrier,
-            post,
-            ops,
-            ..
-        }) => format!(
-            "Fold space={:?} axis={axis} vec={vec_axes:?} slots={} post={} ops={}",
-            space.dims,
-            carrier.slots.len(),
-            post.len(),
-            ops.len()
-        ),
-        Op::Launch(Launch::Contract { m, n, k, batch, .. }) => {
-            format!("Contract m={m:?} n={n:?} k={k:?} b={batch:?}")
-        }
-        other => format!("{other:?}").chars().take(160).collect(),
-    }
 }
 
 /// Re-select, class by class, until the seeded selection is acyclic.
@@ -1210,72 +909,8 @@ fn break_selection_cycles(
     let mut seen_cycles = 0usize;
     while let Some(v) = realize::selection_cycle(graph, ex, roots) {
         let class = graph.class_of(v);
-        if std::env::var_os("FUSOR_CYCLE_LOG").is_some() {
-            seen_cycles += 1;
-            let show = |i: Id| {
-                format!("{:?}", graph.node(i).op)
-                    .chars()
-                    .take(120)
-                    .collect::<String>()
-            };
-            let kids: Vec<String> = graph
-                .node(v)
-                .children
-                .iter()
-                .map(|c| {
-                    let cc = graph.class_of(*c);
-                    format!("{c}:c{}->{:?}", cc.0.index(), ex.sigma.get(&cc))
-                })
-                .collect();
-            eprintln!(
-                "CYCLE {seen_cycles} at {v} (class {}) {}\n   kids {kids:?}",
-                class.0.index(),
-                show(v)
-            );
-            // The path back to `v` under the current selection.
-            let mut stack: Vec<(Id, Vec<Id>)> = vec![(v, vec![v])];
-            let mut seen: FxHashSet<Id> = FxHashSet::default();
-            let mut found: Option<Vec<Id>> = None;
-            while let Some((x, path)) = stack.pop() {
-                let by_id = matches!(
-                    graph.node(x).op,
-                    Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
-                );
-                for c in graph.node(x).children.iter() {
-                    let n = if by_id {
-                        *c
-                    } else {
-                        ex.selected(graph.class_of(*c)).unwrap_or(*c)
-                    };
-                    if n == v {
-                        let mut p = path.clone();
-                        p.push(n);
-                        found = Some(p);
-                        break;
-                    }
-                    if seen.insert(n) {
-                        let mut p = path.clone();
-                        p.push(n);
-                        stack.push((n, p));
-                    }
-                }
-                if found.is_some() {
-                    break;
-                }
-            }
-            if let Some(path) = found {
-                for n in path {
-                    eprintln!(
-                        "     {n} (class {}) {}",
-                        graph.class_of(n).0.index(),
-                        show(n)
-                    );
-                }
-            }
-            if seen_cycles > 8 {
-                panic!("FUSOR_CYCLE_LOG: stopping after {seen_cycles} cycles");
-            }
-        }
+        seen_cycles += 1;
+        debug::cycle(graph, ex, v, seen_cycles);
         let out = banned.entry(class).or_default();
         out.insert(v);
         let next =
@@ -1307,7 +942,7 @@ fn break_selection_cycles(
                 (gclass, next)
             }
         };
-        sigma_debug(class, next, "break_selection_cycles");
+        debug::sigma(class, next, "break_selection_cycles");
         ex.sigma.insert(class, next);
         repaired = true;
     }
@@ -1321,17 +956,9 @@ fn cycle_group(graph: &EGraph, ex: &Extraction, v: Id) -> Option<(ClassId, Id)> 
     let mut stack: Vec<Id> = vec![v];
     let mut seen: FxHashSet<Id> = FxHashSet::default();
     while let Some(x) = stack.pop() {
-        let by_id = matches!(
-            graph.node(x).op,
-            Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
-        );
-        for c in graph.node(x).children.iter() {
-            let n = if by_id {
-                *c
-            } else {
-                ex.selected(graph.class_of(*c)).unwrap_or(*c)
-            };
-            if matches!(graph.node(n).op, Op::Launch(Launch::Group { .. })) {
+        for (c, n) in resolved_children(graph, ex, x) {
+            let n = n.unwrap_or(c);
+            if is_group(graph, n) {
                 return Some((graph.class_of(n), n));
             }
             if seen.insert(n) {
@@ -1361,32 +988,6 @@ fn seed_theta_trailed(
     }
 }
 
-/// `FUSOR_SIGMA_DEBUG=<class id>`: prints every selection change of that
-/// class with the site that made it.
-pub(crate) fn sigma_debug(class: ClassId, node: Id, site: &str) {
-    thread_local! { static WANT: Option<u32> = std::env::var("FUSOR_SIGMA_DEBUG").ok().and_then(|v| v.parse().ok()); }
-    if WANT.with(|w| *w == Some(class.0.index() as u32)) {
-        eprintln!("[sigma] class {} <- {node} ({site})", class.0.index());
-    }
-}
-
-fn price(
-    graph: &EGraph,
-    roots: &[Id],
-    ex: &mut Extraction,
-    cost: &dyn CostModel,
-    arena: &dyn ArenaPlanner,
-    cache: &mut NodeCache,
-    trail: &mut Trail,
-) -> Option<(Realized, Picoseconds)> {
-    let selected = pin_selection(graph, roots, ex, trail, cache).ok()?;
-    seed_theta_trailed(graph, ex, &selected.order, cost, cache, trail);
-    trail.buffers(ex, selected.buffers(graph));
-    let realized = selected.realize(graph, ex, cost, arena, cache).ok()?;
-    let c = realize::exact_cost(&realized, ex, cost);
-    Some((realized, c))
-}
-
 fn pin_selection(
     graph: &EGraph,
     roots: &[Id],
@@ -1408,13 +1009,7 @@ fn pin_selection(
 /// Select each composite's concrete middle members and resolve overlapping
 /// ownership before constructing its dispatch and buffers.
 fn pin_slabs_trailed(graph: &EGraph, ex: &mut Extraction, order: &[Id], trail: &mut Trail) {
-    use fusor_ir::ir::launch::Launch as L;
-    fn members_of(graph: &EGraph, id: Id) -> Option<&smallvec::SmallVec<[Id; 8]>> {
-        match &graph.node(id).op {
-            Op::Launch(L::Slab { members, .. } | L::Group { members, .. }) => Some(members),
-            _ => None,
-        }
-    }
+    use crate::nodes::composite_members as members_of;
     /// Every node a composite runs: its members and, for member
     /// composites, theirs.
     fn flat_members(graph: &EGraph, id: Id) -> Vec<Id> {
@@ -1452,7 +1047,7 @@ fn pin_slabs_trailed(graph: &EGraph, ex: &mut Extraction, order: &[Id], trail: &
         .iter()
         .filter_map(|id| {
             members_of(graph, *id).map(|m| {
-                let group = matches!(graph.node(*id).op, Op::Launch(L::Group { .. }));
+                let group = is_group(graph, *id);
                 (
                     !group,
                     if group { u32::MAX - root_of(*id) } else { 0 },
@@ -1574,25 +1169,19 @@ fn sample_points(domain: &ScheduleDomain) -> SmallVec<[SchedPoint; 8]> {
                 }
             }
         }
-        ScheduleDomain::Sgemv(_) => {
+        other => {
             // The sgemv domain is seed-ordered, one cell of each structure in
             // the prefix: multi-column window-16, multi-column window-32,
-            // whole-workgroup-per-element. The front of the domain plus one
-            // deep probe is the whole spread.
-            let n = domain.len();
-            for i in (0..5).chain([n / 2]) {
-                if let Some(p) = domain.point(i)
-                    && !out.contains(&p)
-                {
-                    out.push(p);
-                }
-            }
-        }
-        other => {
-            // Two points off a non-coop family: enough to tell the family
-            // apart from Coop.
+            // whole-workgroup-per-element, so its front plus one deep probe is
+            // the whole spread. Two points off any other family are enough to
+            // tell it apart from Coop.
+            let front = if matches!(other, ScheduleDomain::Sgemv(_)) {
+                5
+            } else {
+                1
+            };
             let n = other.len();
-            for i in [0usize, n / 2] {
+            for i in (0..front).chain([n / 2]) {
                 if let Some(p) = other.point(i)
                     && !out.contains(&p)
                 {
@@ -1674,25 +1263,22 @@ pub fn launch_signature(graph: &EGraph, launch: &Dispatch) -> String {
             .collect::<Vec<_>>()
             .join("x")
     };
-    let tag = match &graph.node(root).op {
-        Op::Launch(l1) => format!("{:?}", l1.tag()),
-        Op::Logical(_) => "Logical".to_string(),
-        Op::Union(..) => "U".to_string(),
-    };
-    let extra = match &graph.node(root).op {
-        Op::Launch(Launch::Contract { m, n, k, batch, .. }) => {
-            let c = |d: &Dim| d.as_const().unwrap_or(0);
-            format!("mnkb={},{},{},{}", c(m), c(n), c(k), c(batch))
-        }
+    let op = &graph.node(root).op;
+    let tag = tag_of(op);
+    let extra = match (op, Mnkb::of(op, |d| d.as_const().unwrap_or(0))) {
+        (_, Some(c)) => format!("mnkb={},{},{},{}", c.m, c.n, c.k, c.batch),
         // `space` is the *iteration* domain and carries the reduced extent;
         // the output shape above does not.
-        Op::Launch(Launch::Fold {
-            space,
-            axis,
-            vec_axes,
-            carrier,
-            ..
-        }) => format!(
+        (
+            Op::Launch(Launch::Fold {
+                space,
+                axis,
+                vec_axes,
+                carrier,
+                ..
+            }),
+            _,
+        ) => format!(
             "space=[{}] axis={axis} vec={vec_axes:?} slots={}",
             extents(&space.dims),
             carrier.slots.len()
@@ -1769,13 +1355,7 @@ pub fn incumbent_signature(graph: &EGraph, plan: &Plan, launch_ix: usize) -> Opt
     let root = launch.root;
     Some(match plan.extraction.theta.get(&root) {
         Some(theta) => variant_signature(graph, root, *theta),
-        None => {
-            let tag = match &graph.node(root).op {
-                Op::Launch(l1) => format!("{:?}", l1.tag()),
-                _ => "?".to_string(),
-            };
-            format!("{tag}|base")
-        }
+        None => format!("{}|base", tag_of(&graph.node(root).op)),
     })
 }
 
@@ -1796,28 +1376,13 @@ fn fair_points(
     class: ClassId,
     here: Option<SchedPoint>,
     root: Id,
-) -> Vec<(Id, SchedPoint, String)> {
-    fair_points_with(graph, class, here, root, sample_points, true)
-}
-
-fn fair_points_with(
-    graph: &EGraph,
-    class: ClassId,
-    here: Option<SchedPoint>,
-    root: Id,
     points: fn(&ScheduleDomain) -> SmallVec<[SchedPoint; 8]>,
     deduplicate_labels: bool,
 ) -> Vec<(Id, SchedPoint, String)> {
     let per_member: Vec<(Id, SmallVec<[SchedPoint; 8]>)> = graph
         .members(class)
         .into_iter()
-        .filter_map(|member| {
-            let Op::Launch(l1) = &graph.node(member).op else {
-                return None;
-            };
-            let domain = l1.schedule()?;
-            Some((member, points(domain)))
-        })
+        .filter_map(|member| Some((member, points(domain_of(graph, member)?))))
         .collect();
     let rounds = per_member.iter().map(|(_, p)| p.len()).max().unwrap_or(0);
     let mut offered: rustc_hash::FxHashSet<String> = rustc_hash::FxHashSet::default();
@@ -1846,29 +1411,23 @@ fn fair_points_with(
 }
 
 fn variant_signature(graph: &EGraph, member: Id, theta: SchedPoint) -> String {
-    let tag = match &graph.node(member).op {
-        Op::Launch(l1) => format!("{:?}", l1.tag()),
-        _ => "?".to_string(),
-    };
+    let op = &graph.node(member).op;
     let mut q = String::new();
-    for child in fusor_ir::semantics::children::children_of(&graph.node(member).op) {
-        if !matches!(graph.facts(child).dtype, fusor_ir::dtype::Dtype::Q(_)) {
-            continue;
-        }
-        let layout = graph
-            .class_ids(graph.class_of(child))
-            .into_iter()
-            .find_map(|m| match &graph.node(m).op {
-                Op::Logical(fusor_ir::ir::logical::Logical::Leaf(
-                    fusor_ir::ir::logical::LeafKind::Quantized { layout, .. },
-                )) => Some(*layout),
-                _ => None,
-            });
-        if let Some(layout) = layout {
+    for child in fusor_ir::semantics::children::children_of(op) {
+        if let Some((_, layout)) = realize::quantized_storage(graph, child) {
             q.push_str(&format!("|q={layout:?}"));
         }
     }
-    format!("{tag}{q}|{theta:?}")
+    format!("{}{q}|{theta:?}", tag_of(op))
+}
+
+/// An op's family as the tune cache files it.
+fn tag_of(op: &Op) -> String {
+    match op {
+        Op::Launch(launch) => format!("{:?}", launch.tag()),
+        Op::Logical(_) => "Logical".to_string(),
+        Op::Union(..) => "U".to_string(),
+    }
 }
 
 /// Structural coverage, independent of the tuner. Small domains are
