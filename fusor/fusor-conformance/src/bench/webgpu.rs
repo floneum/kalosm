@@ -10,6 +10,7 @@
 //! own submitted-work signal, so no readback is on the clock.
 
 use fusor::cache::MaskKind;
+use fusor::composite::{RopeLayout, RopePos};
 use fusor::{Device, Dim, QMatrix, Tensor};
 use fusor_gguf::blocks::block_fields;
 use fusor_ir::dtype::{QFmt, QLayout};
@@ -681,7 +682,7 @@ pub(super) async fn rope_fused_decode_case(
     let input = input_tensor(device, shape, 9, 0.01).await?;
     let cos = values_input(device, pos_shape, &rope_values(pos_shape, head_dim, true)).await?;
     let sin = values_input(device, pos_shape, &rope_values(pos_shape, head_dim, false)).await?;
-    let samples = timed!(device, config, input.rope(&cos, &sin, 0));
+    let samples = timed!(device, config, input.rope(&cos, &sin, RopeLayout::Halves, RopePos::Offset(0)));
     Ok(BenchmarkReport::new(
         name,
         config,

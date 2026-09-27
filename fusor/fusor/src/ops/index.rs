@@ -9,10 +9,12 @@
 
 use std::ops::{Range, RangeFrom, RangeFull, RangeTo};
 
+use fusor_autograd::tape::TapeExt;
 use fusor_ir::dtype::Dtype;
 use fusor_ir::ir::logical::{Logical, ScatterCombine};
 use fusor_ir::shape::Dim;
 
+use crate::composite::{const_dim, core_op, index_run};
 use crate::ops::view::Extent;
 use crate::tensor::Tensor;
 use crate::{Error, Result};
@@ -218,28 +220,23 @@ impl Tensor {
         stack(parts, dim)
     }
 
-    /// Zero-pad one axis.
-    pub fn pad_axis(&self, axis: usize, padding: (usize, usize)) -> Result<Tensor> {
-        self.pad_with_zeros(axis, padding.0, padding.1)
-    }
-
-    /// Zero-pad one axis by `left` before and `right` after.
+    /// Zero-pad one axis by `left` before and `right` after: a `Scatter{Set}`
+    /// of `self` into a `Const` zero fill at a strictly increasing index run.
     pub fn pad_with_zeros(&self, axis: usize, left: usize, right: usize) -> Result<Tensor> {
         self.check_axis(axis, "pad")?;
         if left == 0 && right == 0 {
             return Ok(self.clone());
         }
-        let extent = self
-            .dim(axis)
-            .as_const()
-            .ok_or_else(|| Error::Shape("pad needs a constant extent".into()))?
-            as usize;
-        let shape = self.shape();
-        let mut out: Vec<Dim> = shape.to_vec();
-        out[axis] = Dim::Const((left + extent + right) as u64);
-        let base = Tensor::zeros(&self.graph, self.dtype(), &out)?;
-        let ranges = full_ranges_with(&out, axis, left..left + extent)?;
-        base.slice_assign(&ranges, self)
+        let facts = self.facts();
+        let len = const_dim(facts.shape[axis], "pad_with_zeros")?;
+        let idx = index_run(&self.graph, left as u64, len)?;
+        let mut padded = facts.shape.clone();
+        padded[axis] = Dim::Const(left as u64 + len + right as u64);
+        let (xid, dtype) = (self.id, facts.dtype);
+        core_op(&self.graph, |t| {
+            let base = t.zeros_shaped(dtype, &padded)?;
+            t.scatter_set(axis as u32, base, idx, xid, true)
+        })
     }
 
     /// Tile the tensor `repeats[i]` times along each axis.

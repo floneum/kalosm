@@ -15,14 +15,7 @@ use crate::{Error, Result};
 
 /// Mint a `Leaf::Buffer` with no host bytes and no device buffer.
 pub(crate) fn leaf_buffer_node(graph: &GraphRef, dtype: Dtype, shape: &[Dim]) -> Result<Tensor> {
-    Tensor::emit(
-        graph,
-        Logical::Leaf(LeafKind::Buffer {
-            name: graph.fresh_buffer_id(),
-            dtype,
-            shape: shape.iter().copied().collect(),
-        }),
-    )
+    Ok(graph.tensor(graph.buffer_leaf(dtype, shape)?))
 }
 
 /// Mint a `Leaf::Buffer` and attach owned host bytes to it. The bytes stay on
@@ -122,14 +115,7 @@ impl Tensor {
     /// contents are undefined; every kernel that writes one must write all
     /// of it.
     pub fn uninit(graph: &GraphRef, dtype: Dtype, shape: &[Dim]) -> Result<Tensor> {
-        Tensor::emit(
-            graph,
-            Logical::Leaf(LeafKind::Buffer {
-                name: graph.fresh_buffer_id(),
-                dtype,
-                shape: shape.iter().copied().collect(),
-            }),
-        )
+        leaf_buffer_node(graph, dtype, shape)
     }
 
     /// A trainable parameter: `Persistence::Persistent`, so a quantized
@@ -230,6 +216,21 @@ pub(crate) fn arange_bytes(dtype: Dtype, start: f64, end: f64, step: f64) -> Res
         push_scalar(&mut out, dtype, v);
     }
     Ok(out)
+}
+
+/// `values` encoded at `dtype`: narrowed for f16 and bf16, f32 bytes otherwise.
+pub(crate) fn encode_f32(dtype: Dtype, values: &[f32]) -> Vec<u8> {
+    match dtype {
+        Dtype::F16 => values
+            .iter()
+            .flat_map(|v| half::f16::from_f32(*v).to_bits().to_le_bytes())
+            .collect(),
+        Dtype::BF16 => values
+            .iter()
+            .flat_map(|v| half::bf16::from_f32(*v).to_bits().to_le_bytes())
+            .collect(),
+        _ => values.iter().flat_map(|v| v.to_le_bytes()).collect(),
+    }
 }
 
 fn push_scalar(out: &mut Vec<u8>, dtype: Dtype, v: f64) {

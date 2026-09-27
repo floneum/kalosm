@@ -351,6 +351,12 @@ impl KernelProfile {
 pub(crate) fn ok<T>(what: &str, r: Result<T>) -> T {
     match r {
         Ok(v) => v,
-        Err(e) => panic!("fusor {what}: {e}"),
+        Err(e) => fail(what, e),
     }
+}
+
+/// The panic [`ok`] raises, for a check that has no `Result` to unwrap.
+#[track_caller]
+pub(crate) fn fail(what: &str, e: crate::Error) -> ! {
+    panic!("fusor {what}: {e}")
 }

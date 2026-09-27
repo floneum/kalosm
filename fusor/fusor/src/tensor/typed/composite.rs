@@ -1,167 +1,91 @@
 //! The op library, as methods.
 //!
-//! Every method here calls the corresponding free function at the [`Dyn`]
-//! layer; no math is re-implemented.
+//! Every method here calls the corresponding free function at the
+//! runtime-rank layer; no math is re-implemented.
 
 use crate::cache::MaskKind;
-use crate::composite::{PoolReduce, PoolSize, attention, rope, upsample};
+use crate::composite::{PoolReduce, PoolSize, RopeLayout, RopePos, attention, rope, upsample};
 use crate::quantized::QMatrix;
 use crate::tensor::typed::{Axis, Element, Tensor, narrow_acc};
 
 impl<const R: usize, T: Element> Tensor<R, T> {
-    /// Softmax over `axis`. Rank- and dtype-preserving.
-    #[track_caller]
-    pub fn softmax(&self, axis: impl Axis<R>) -> Self {
-        Self::wrap("softmax", self.as_dyn().softmax(axis.resolve() as u32))
+    forward! {
+        /// Softmax over `axis`. Rank- and dtype-preserving.
+        fn softmax(axis: impl Axis<R> => ax32) -> Self;
+        /// Softmax over the last axis.
+        fn softmax_last_dim() -> Self;
+        /// `log(softmax(x))` over `axis`, evaluated stably.
+        fn log_softmax(axis: impl Axis<R> => ax32) -> Self;
+        /// `x / sqrt(mean(x^2) + eps) * weight` over the last axis.
+        fn rms_norm[const W: usize](weight: &Tensor<W, T> => t, eps: f32 => v) -> Self;
+        /// [`Tensor::rms_norm`] with no learned scale.
+        fn rms_norm_no_weight(eps: f32 => v) -> Self;
+        /// `rms_norm(self + residual)` as one node: the add is inside the
+        /// norm's expansion, which the residual-norm kernel reads.
+        fn rms_norm_residual[const W: usize](
+            residual: &Self => t,
+            weight: &Tensor<W, T> => t,
+            bias: Option<&Tensor<W, T>> => opt,
+            eps: f32 => v,
+        ) -> Self;
+        /// `(x - mean) / sqrt(var + eps) * weight + bias` over the last axis;
+        /// `remove_mean == false` is the RMS-like spelling.
+        fn layer_norm[const W: usize](
+            weight: &Tensor<W, T> => t,
+            bias: Option<&Tensor<W, T>> => opt,
+            eps: f32 => v,
+            remove_mean: bool => v,
+        ) -> Self;
+        /// Scaled dot-product attention, `self` being the queries. `scale:
+        /// None` is `1/sqrt(d)`; grouped-query attention is inferred from the
+        /// head counts.
+        fn attention(k: &Self => t, v: &Self => t, mask: MaskKind => v, scale: Option<f32> => v)
+            -> Self = attention::attention;
+        /// Attention with causality encoded structurally: no mask tensor, and
+        /// the upper triangle is never computed.
+        fn attention_causal(k: &Self => t, v: &Self => t, scale: Option<f32> => v)
+            -> Self = attention::attention_causal;
+        /// Attention against a materialized additive mask of rank `MR`.
+        fn attention_masked[const MR: usize](
+            k: &Self => t,
+            v: &Self => t,
+            mask: MaskKind => v,
+            mask_tensor: Option<&Tensor<MR, T>> => opt,
+            scale: Option<f32> => v,
+        ) -> Self = attention::attention_masked;
     }
 
-    /// Softmax over the last axis.
+    /// Rotary embedding against `[context, head_dim/2]` tables.
     #[track_caller]
-    pub fn softmax_last_dim(&self) -> Self {
-        Self::wrap("softmax_last_dim", self.as_dyn().softmax_last_dim())
-    }
-
-    /// `log(softmax(x))` over `axis`, evaluated stably.
-    #[track_caller]
-    pub fn log_softmax(&self, axis: impl Axis<R>) -> Self {
-        Self::wrap(
-            "log_softmax",
-            self.as_dyn().log_softmax(axis.resolve() as u32),
-        )
-    }
-
-    /// `x / sqrt(mean(x^2) + eps) * weight` over the last axis.
-    #[track_caller]
-    pub fn rms_norm<const W: usize>(&self, weight: &Tensor<W, T>, eps: f32) -> Self {
-        Self::wrap("rms_norm", self.as_dyn().rms_norm(weight.as_dyn(), eps))
-    }
-
-    /// [`Tensor::rms_norm`] with no learned scale.
-    #[track_caller]
-    pub fn rms_norm_no_weight(&self, eps: f32) -> Self {
-        Self::wrap("rms_norm_no_weight", self.as_dyn().rms_norm_no_weight(eps))
-    }
-
-    /// `rms_norm(self + residual)` as one node.
-    ///
-    /// The add is inside the norm's expansion, so this is a different node
-    /// than `(x + r).rms_norm(w, eps)`; the residual-norm kernel reads it.
-    #[track_caller]
-    pub fn rms_norm_residual<const W: usize>(
+    pub fn rope(
         &self,
-        residual: &Self,
-        weight: &Tensor<W, T>,
-        bias: Option<&Tensor<W, T>>,
-        eps: f32,
+        cos: &Tensor<2, T>,
+        sin: &Tensor<2, T>,
+        layout: RopeLayout,
+        pos: RopePos<&Tensor<1, u32>>,
     ) -> Self {
-        Self::wrap(
-            "rms_norm_residual",
-            self.as_dyn().rms_norm_residual(
-                residual.as_dyn(),
-                weight.as_dyn(),
-                bias.map(Tensor::as_dyn),
-                eps,
-            ),
-        )
-    }
-
-    /// `(x - mean) / sqrt(var + eps) * weight + bias` over the last axis.
-    ///
-    /// `remove_mean == false` gives the RMS-like spelling some checkpoints use.
-    #[track_caller]
-    pub fn layer_norm<const W: usize>(
-        &self,
-        weight: &Tensor<W, T>,
-        bias: Option<&Tensor<W, T>>,
-        eps: f32,
-        remove_mean: bool,
-    ) -> Self {
-        Self::wrap(
-            "layer_norm",
-            self.as_dyn()
-                .layer_norm(weight.as_dyn(), bias.map(Tensor::as_dyn), eps, remove_mean),
-        )
-    }
-}
-
-impl<const R: usize, T: Element> Tensor<R, T> {
-    /// Scaled dot-product attention, `self` being the queries.
-    ///
-    /// `scale: None` means the head dimension's `1/sqrt(d)`. Grouped-query
-    /// attention is inferred from the head counts of `self` and `k`.
-    #[track_caller]
-    pub fn attention(&self, k: &Self, v: &Self, mask: MaskKind, scale: Option<f32>) -> Self {
-        Self::wrap(
-            "attention",
-            attention::attention(self.as_dyn(), k.as_dyn(), v.as_dyn(), mask, scale),
-        )
-    }
-
-    /// Attention with causality encoded structurally — no mask tensor is
-    /// built, so the upper triangle is never computed.
-    #[track_caller]
-    pub fn attention_causal(&self, k: &Self, v: &Self, scale: Option<f32>) -> Self {
-        Self::wrap(
-            "attention_causal",
-            attention::attention_causal(self.as_dyn(), k.as_dyn(), v.as_dyn(), scale),
-        )
-    }
-
-    /// Attention against a materialized additive mask.
-    ///
-    /// The mask's rank is its own parameter: both `[Lq, Lk]` and
-    /// `[B, 1, Lq, Lk]` masks are accepted.
-    #[track_caller]
-    pub fn attention_masked<const MR: usize>(
-        &self,
-        k: &Self,
-        v: &Self,
-        mask: MaskKind,
-        mask_tensor: Option<&Tensor<MR, T>>,
-        scale: Option<f32>,
-    ) -> Self {
-        Self::wrap(
-            "attention_masked",
-            attention::attention_masked(
-                self.as_dyn(),
-                k.as_dyn(),
-                v.as_dyn(),
-                mask,
-                mask_tensor.map(Tensor::as_dyn),
-                scale,
-            ),
-        )
-    }
-}
-
-impl<const R: usize, T: Element> Tensor<R, T> {
-    /// Rotary embedding pairing `(i, i + Dh/2)` — the "normal" convention.
-    #[track_caller]
-    pub fn rope(&self, cos: &Tensor<2, T>, sin: &Tensor<2, T>, offset: u64) -> Self {
         Self::wrap(
             "rope",
-            rope::rope(self.as_dyn(), cos.as_dyn(), sin.as_dyn(), offset),
-        )
-    }
-
-    /// Rotary embedding pairing `(2i, 2i + 1)`.
-    #[track_caller]
-    pub fn rope_interleaved(&self, cos: &Tensor<2, T>, sin: &Tensor<2, T>, offset: u64) -> Self {
-        Self::wrap(
-            "rope_interleaved",
-            rope::rope_interleaved(self.as_dyn(), cos.as_dyn(), sin.as_dyn(), offset),
+            rope::rope(
+                self.as_dyn(),
+                cos.as_dyn(),
+                sin.as_dyn(),
+                layout,
+                pos.map(Tensor::as_dyn),
+            ),
         )
     }
 
     /// [`Tensor::rope`] on `self` and `k` in one node, handing back two
-    /// views of it. q and k share the table read and the rotation.
+    /// views of it: q and k share the table read and the rotation.
     #[track_caller]
     pub fn rope_pair(
         &self,
         k: &Self,
         cos: &Tensor<2, T>,
         sin: &Tensor<2, T>,
-        offset: u64,
+        layout: RopeLayout,
+        pos: RopePos<&Tensor<1, u32>>,
     ) -> (Self, Self) {
         let (q, k) = crate::device::ok(
             "rope_pair",
@@ -170,88 +94,13 @@ impl<const R: usize, T: Element> Tensor<R, T> {
                 k.as_dyn(),
                 cos.as_dyn(),
                 sin.as_dyn(),
-                offset,
+                layout,
+                pos.map(Tensor::as_dyn),
             ),
         );
         (
             Self::wrap("rope_pair q", Ok(q)),
             Self::wrap("rope_pair k", Ok(k)),
-        )
-    }
-
-    /// [`Tensor::rope_interleaved`] on `self` and `k` in one node.
-    #[track_caller]
-    pub fn rope_interleaved_pair(
-        &self,
-        k: &Self,
-        cos: &Tensor<2, T>,
-        sin: &Tensor<2, T>,
-        offset: u64,
-    ) -> (Self, Self) {
-        let (q, k) = crate::device::ok(
-            "rope_interleaved_pair",
-            rope::rope_interleaved_pair(
-                self.as_dyn(),
-                k.as_dyn(),
-                cos.as_dyn(),
-                sin.as_dyn(),
-                offset,
-            ),
-        );
-        (
-            Self::wrap("rope_interleaved_pair q", Ok(q)),
-            Self::wrap("rope_interleaved_pair k", Ok(k)),
-        )
-    }
-
-    /// [`Tensor::rope_pair`] against a device-side position vector.
-    #[track_caller]
-    pub fn rope_pair_at(
-        &self,
-        k: &Self,
-        cos: &Tensor<2, T>,
-        sin: &Tensor<2, T>,
-        positions: &Tensor<1, u32>,
-    ) -> (Self, Self) {
-        let (q, k) = crate::device::ok(
-            "rope_pair_at",
-            rope::rope_pair_with_position(
-                self.as_dyn(),
-                k.as_dyn(),
-                cos.as_dyn(),
-                sin.as_dyn(),
-                positions.as_dyn(),
-            ),
-        );
-        (
-            Self::wrap("rope_pair_at q", Ok(q)),
-            Self::wrap("rope_pair_at k", Ok(k)),
-        )
-    }
-
-    /// [`Tensor::rope_interleaved_pair`] against a device-side position
-    /// vector.
-    #[track_caller]
-    pub fn rope_interleaved_pair_at(
-        &self,
-        k: &Self,
-        cos: &Tensor<2, T>,
-        sin: &Tensor<2, T>,
-        positions: &Tensor<1, u32>,
-    ) -> (Self, Self) {
-        let (q, k) = crate::device::ok(
-            "rope_interleaved_pair_at",
-            rope::rope_interleaved_pair_with_position(
-                self.as_dyn(),
-                k.as_dyn(),
-                cos.as_dyn(),
-                sin.as_dyn(),
-                positions.as_dyn(),
-            ),
-        );
-        (
-            Self::wrap("rope_interleaved_pair_at q", Ok(q)),
-            Self::wrap("rope_interleaved_pair_at k", Ok(k)),
         )
     }
 }

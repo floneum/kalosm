@@ -1,8 +1,7 @@
-//! Rotary embeddings, all macro ops. Two pairings (`rope` /
-//! `rope_interleaved`), each with a paired form that rotates `q` and `k` under
-//! one node and a `_with_position` form that keeps the offset on device.
+//! Rotary embeddings, all macro ops: one [`rope`] and one paired
+//! [`rope_pair`], each taking a [`RopeLayout`] and a [`RopePos`].
 //!
-//! Both pairings are the same expression, `x*cos + rot(x)*sin`, and differ
+//! Both layouts are the same expression, `x*cos + rot(x)*sin`, and differ
 //! only in two index vectors: `rot` is one `Gather` along the head axis times
 //! a sign vector.
 //!
@@ -17,7 +16,7 @@ use fusor_ir::shape::{Dim, StrideSpec};
 use fusor_ir::{Error, Result};
 use smallvec::SmallVec;
 
-use crate::composite::{const_dim, core_op, index_leaf, index_run};
+use crate::composite::{const_dim, core_op, float_leaf, index_leaf, index_run};
 use crate::graph::GraphRef;
 use crate::tensor::Tensor;
 
@@ -28,16 +27,16 @@ pub fn base_inverse_frequency(dim: u32, theta: f32) -> Vec<f32> {
         .collect()
 }
 
-/// Which elements pair with which.
+/// Which elements of a head rotate together.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
-enum Pairing {
-    /// `(i, i + Dh/2)`.
+pub enum RopeLayout {
+    /// `(i, i + Dh/2)`, the "normal" convention.
     Halves,
     /// `(2i, 2i + 1)`.
     Interleaved,
 }
 
-impl Pairing {
+impl RopeLayout {
     /// The head-axis permutation `rot` gathers with.
     fn permutation(self, dh: u64) -> Vec<u32> {
         let half = dh / 2;
@@ -70,14 +69,24 @@ impl Pairing {
     }
 }
 
-/// Where the sequence offset comes from.
+/// Which table rows a call reads.
 #[derive(Copy, Clone, Debug)]
-enum Rows {
+pub enum RopePos<P> {
     /// A `narrow` of the table by a host-known offset.
     Offset(u64),
     /// A rank-1 `u32` position tensor: the offset stays on device, so a decode
-    /// loop never re-slices the cache.
-    Positions(Id),
+    /// loop never re-slices the table.
+    Positions(P),
+}
+
+impl<P> RopePos<P> {
+    /// The same position with its tensor converted.
+    pub fn map<Q>(self, f: impl FnOnce(P) -> Q) -> RopePos<Q> {
+        match self {
+            Self::Offset(off) => RopePos::Offset(off),
+            Self::Positions(p) => RopePos::Positions(f(p)),
+        }
+    }
 }
 
 /// Everything the defn needs, all created before the tape opens because index
@@ -86,7 +95,7 @@ struct RopeOperands {
     perm: Id,
     signs: Id,
     expand: Id,
-    rows: Rows,
+    rows: RopePos<Id>,
     seq: Dim,
 }
 
@@ -94,8 +103,8 @@ fn prepare(
     graph: &GraphRef,
     x: &Tensor,
     cos: &Tensor,
-    pairing: Pairing,
-    rows: Rows,
+    layout: RopeLayout,
+    rows: RopePos<&Tensor>,
 ) -> Result<RopeOperands> {
     let xf = graph.facts(x.id);
     if xf.rank() != 4 {
@@ -118,30 +127,12 @@ fn prepare(
         )));
     }
     Ok(RopeOperands {
-        perm: index_leaf(graph, &pairing.permutation(dh))?,
-        signs: sign_leaf(graph, x, &pairing.signs(dh))?,
-        expand: index_leaf(graph, &pairing.table_expansion(dh))?,
-        rows,
+        perm: index_leaf(graph, &layout.permutation(dh))?,
+        signs: float_leaf(graph, xf.dtype, &layout.signs(dh))?,
+        expand: index_leaf(graph, &layout.table_expansion(dh))?,
+        rows: rows.map(|p| p.id),
         seq: xf.shape[2],
     })
-}
-
-/// A rank-1 leaf of `+/-1` in the value's dtype.
-fn sign_leaf(graph: &GraphRef, like: &Tensor, signs: &[f32]) -> Result<Id> {
-    let dtype = graph.facts(like.id).dtype;
-    let mut bytes = Vec::with_capacity(signs.len() * 4);
-    for v in signs {
-        match dtype {
-            fusor_ir::dtype::Dtype::F16 => {
-                bytes.extend_from_slice(&half::f16::from_f32(*v).to_bits().to_le_bytes())
-            }
-            fusor_ir::dtype::Dtype::BF16 => {
-                bytes.extend_from_slice(&half::bf16::from_f32(*v).to_bits().to_le_bytes())
-            }
-            _ => bytes.extend_from_slice(&v.to_le_bytes()),
-        }
-    }
-    graph.constant_leaf(dtype, &[Dim::Const(signs.len() as u64)], bytes)
 }
 
 /// `[L, Dh]` broadcast to the value's `[B, H, L, Dh]`.
@@ -159,8 +150,8 @@ fn broadcast_table(t: &mut GraphTape<'_>, table: Val, like: Val) -> Result<Val> 
 /// The `[L, Dh]` slice of one table this call uses.
 fn table_rows(t: &mut GraphTape<'_>, table: Val, ops: &RopeOperands) -> Result<Val> {
     let rows = match ops.rows {
-        Rows::Offset(0) if t.shape_of(table)[0].known_eq(ops.seq) => table,
-        Rows::Offset(off) => {
+        RopePos::Offset(0) if t.shape_of(table)[0].known_eq(ops.seq) => table,
+        RopePos::Offset(off) => {
             let shape = t.shape_of(table);
             let specs: SmallVec<[StrideSpec; 6]> = smallvec::smallvec![
                 StrideSpec::dim(0, ops.seq).with_offset(Dim::Const(off)),
@@ -168,7 +159,7 @@ fn table_rows(t: &mut GraphTape<'_>, table: Val, ops: &RopeOperands) -> Result<V
             ];
             t.restride(&specs, table)?
         }
-        Rows::Positions(p) => t.gather(0, table, p)?,
+        RopePos::Positions(p) => t.gather(0, table, p)?,
     };
     t.gather(1, rows, ops.expand)
 }
@@ -180,51 +171,49 @@ fn rope_defn(t: &mut GraphTape<'_>, x: Val, cos: Val, sin: Val, ops: &RopeOperan
     let cos = broadcast_table(t, cos, x)?;
     let sin = broadcast_table(t, sin, x)?;
 
-    let rotated = rotate_defn(t, x, ops)?;
+    let rotated = rotate(t, x, 3, ops.perm, ops.signs)?;
     let a = t.binary(BinOp::Mul, x, cos)?;
     let b = t.binary(BinOp::Mul, rotated, sin)?;
     t.binary(BinOp::Add, a, b)
 }
 
-/// One `Gather` along the head axis, times a sign vector. Both pairings are
-/// this; only the two vectors differ.
-fn rotate_defn(t: &mut GraphTape<'_>, x: Val, ops: &RopeOperands) -> Result<Val> {
-    let swapped = t.gather(3, x, ops.perm)?;
-    let shape = t.shape_of(x);
-    let specs: SmallVec<[StrideSpec; 6]> = smallvec::smallvec![
-        StrideSpec::broadcast(shape[0]),
-        StrideSpec::broadcast(shape[1]),
-        StrideSpec::broadcast(shape[2]),
-        StrideSpec::dim(0, shape[3]),
-    ];
-    let signs = t.restride(&specs, ops.signs)?;
+/// One `Gather` along `axis`, times a sign vector broadcast over the rest.
+/// Both layouts are this; only the two vectors differ.
+fn rotate(t: &mut GraphTape<'_>, x: Val, axis: u32, perm: Id, signs: Id) -> Result<Val> {
+    let swapped = t.gather(axis, x, perm)?;
+    let specs: SmallVec<[StrideSpec; 6]> = t
+        .shape_of(x)
+        .iter()
+        .enumerate()
+        .map(|(i, &d)| {
+            if i == axis as usize {
+                StrideSpec::dim(0, d)
+            } else {
+                StrideSpec::broadcast(d)
+            }
+        })
+        .collect();
+    let signs = t.restride(&specs, signs)?;
     t.binary(BinOp::Mul, swapped, signs)
 }
 
-fn rope_with(
+/// Rotary embedding of a `[batch, heads, len, head_dim]` value against
+/// `[context, head_dim/2]` tables.
+pub fn rope(
     x: &Tensor,
     cos: &Tensor,
     sin: &Tensor,
-    pairing: Pairing,
-    rows: Rows,
+    layout: RopeLayout,
+    pos: RopePos<&Tensor>,
 ) -> Result<Tensor> {
     let graph = &x.graph;
-    let ops = prepare(graph, x, cos, pairing, rows)?;
+    let ops = prepare(graph, x, cos, layout, pos)?;
     let (xi, ci, si) = (x.id, cos.id, sin.id);
     core_op(graph, move |t| rope_defn(t, xi, ci, si, &ops))
 }
 
-/// Non-interleaved rope: pairs `(i, i + Dh/2)`.
-pub fn rope(x: &Tensor, cos: &Tensor, sin: &Tensor, offset: u64) -> Result<Tensor> {
-    rope_with(x, cos, sin, Pairing::Halves, Rows::Offset(offset))
-}
-
-/// Interleaved rope: pairs `(2i, 2i + 1)`.
-pub fn rope_interleaved(x: &Tensor, cos: &Tensor, sin: &Tensor, offset: u64) -> Result<Tensor> {
-    rope_with(x, cos, sin, Pairing::Interleaved, Rows::Offset(offset))
-}
-
-/// `cat(-x2, x1)`, exposed because callers spell it directly.
+/// `cat(-x2, x1)` over the last axis, exposed because callers spell it
+/// directly.
 pub fn rotate_half(x: &Tensor) -> Result<Tensor> {
     let graph = &x.graph;
     let facts = graph.facts(x.id);
@@ -236,24 +225,10 @@ pub fn rotate_half(x: &Tensor) -> Result<Tensor> {
         "rotate_half head_dim",
     )?;
     let axis = (facts.rank() - 1) as u32;
-    let perm = index_leaf(graph, &Pairing::Halves.permutation(dh))?;
-    let signs = sign_leaf(graph, x, &Pairing::Halves.signs(dh))?;
+    let perm = index_leaf(graph, &RopeLayout::Halves.permutation(dh))?;
+    let signs = float_leaf(graph, facts.dtype, &RopeLayout::Halves.signs(dh))?;
     let xid = x.id;
-    let id = graph.build(|t| {
-        let swapped = t.gather(axis, xid, perm)?;
-        let shape = t.shape_of(xid);
-        let mut specs: SmallVec<[StrideSpec; 6]> = SmallVec::new();
-        for (i, d) in shape.iter().copied().enumerate() {
-            if i == axis as usize {
-                specs.push(StrideSpec::dim(0, d));
-            } else {
-                specs.push(StrideSpec::broadcast(d));
-            }
-        }
-        let signs = t.restride(&specs, signs)?;
-        t.binary(BinOp::Mul, swapped, signs)
-    })?;
-    Ok(graph.tensor(id))
+    core_op(graph, |t| rotate(t, xid, axis, perm, signs))
 }
 
 /// Rotate `q` and `k` in one node, handed back as two views.
@@ -262,13 +237,13 @@ pub fn rotate_half(x: &Tensor) -> Result<Tensor> {
 /// apart, so there is exactly one producer for a rule to mint a paired kernel
 /// over and the two results cost a `Restride` each. Requires matching batch,
 /// sequence and head dims — the reference asserts the same.
-fn rope_pair_with(
+pub fn rope_pair(
     q: &Tensor,
     k: &Tensor,
     cos: &Tensor,
     sin: &Tensor,
-    pairing: Pairing,
-    rows: Rows,
+    layout: RopeLayout,
+    pos: RopePos<&Tensor>,
 ) -> Result<(Tensor, Tensor)> {
     let graph = &q.graph;
     let (qf, kf) = (graph.facts(q.id), graph.facts(k.id));
@@ -283,7 +258,7 @@ fn rope_pair_with(
     let hq = const_dim(qf.shape[1], "paired rope q heads")?;
     let hk = const_dim(kf.shape[1], "paired rope k heads")?;
 
-    let ops = prepare(graph, q, cos, pairing, rows)?;
+    let ops = prepare(graph, q, cos, layout, pos)?;
     let lower = index_run(graph, 0, hq)?;
     let upper = index_run(graph, hq, hk)?;
     let (qi, ki, ci, si) = (q.id, k.id, cos.id, sin.id);
@@ -299,116 +274,9 @@ fn rope_pair_with(
     })?;
 
     Ok((
-        narrow_heads(&joined, 0, hq)?,
-        narrow_heads(&joined, hq, hk)?,
+        joined.narrow(1, 0, hq as usize)?,
+        joined.narrow(1, hq as usize, hk as usize)?,
     ))
-}
-
-fn narrow_heads(x: &Tensor, start: u64, len: u64) -> Result<Tensor> {
-    let shape = x.graph.facts(x.id).shape.clone();
-    let specs: SmallVec<[StrideSpec; 6]> = shape
-        .iter()
-        .copied()
-        .enumerate()
-        .map(|(i, d)| {
-            if i == 1 {
-                StrideSpec::dim(1, Dim::Const(len)).with_offset(Dim::Const(start))
-            } else {
-                StrideSpec::dim(i as u32, d)
-            }
-        })
-        .collect();
-    let xid = x.id;
-    let id = x.graph.build(|t| t.restride(&specs, xid))?;
-    Ok(x.graph.tensor(id))
-}
-
-/// Rotate `q` and `k` under one node, pairing `(i, i + Dh/2)`.
-///
-/// The pair node names both operands, so the rotation is built once and read
-/// back as two views.
-pub fn rope_pair(
-    q: &Tensor,
-    k: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-    offset: u64,
-) -> Result<(Tensor, Tensor)> {
-    rope_pair_with(q, k, cos, sin, Pairing::Halves, Rows::Offset(offset))
-}
-
-/// [`rope_pair`] pairing `(2i, 2i + 1)`.
-pub fn rope_interleaved_pair(
-    q: &Tensor,
-    k: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-    offset: u64,
-) -> Result<(Tensor, Tensor)> {
-    rope_pair_with(q, k, cos, sin, Pairing::Interleaved, Rows::Offset(offset))
-}
-
-/// The decode-loop form: `positions` is a rank-1 `u32` tensor, so the offset
-/// stays on device and the table is never re-sliced on the host.
-pub fn rope_pair_with_position(
-    q: &Tensor,
-    k: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-    positions: &Tensor,
-) -> Result<(Tensor, Tensor)> {
-    rope_pair_with(
-        q,
-        k,
-        cos,
-        sin,
-        Pairing::Halves,
-        Rows::Positions(positions.id),
-    )
-}
-
-/// [`rope_pair_with_position`] pairing `(2i, 2i + 1)`.
-pub fn rope_interleaved_pair_with_position(
-    q: &Tensor,
-    k: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-    positions: &Tensor,
-) -> Result<(Tensor, Tensor)> {
-    rope_pair_with(
-        q,
-        k,
-        cos,
-        sin,
-        Pairing::Interleaved,
-        Rows::Positions(positions.id),
-    )
-}
-
-/// Single-value forms against a device-side position vector.
-pub fn rope_with_position(
-    x: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-    positions: &Tensor,
-) -> Result<Tensor> {
-    rope_with(x, cos, sin, Pairing::Halves, Rows::Positions(positions.id))
-}
-
-/// Interleaved rotary embedding using a device-side position per row.
-pub fn rope_interleaved_with_position(
-    x: &Tensor,
-    cos: &Tensor,
-    sin: &Tensor,
-    positions: &Tensor,
-) -> Result<Tensor> {
-    rope_with(
-        x,
-        cos,
-        sin,
-        Pairing::Interleaved,
-        Rows::Positions(positions.id),
-    )
 }
 
 #[cfg(test)]
@@ -427,7 +295,7 @@ mod tests {
         let table = tape.zeros_shaped(Dtype::F32, &[Dim::Const(131072), Dim::Const(64)])?;
         let expand = tape.zeros_shaped(Dtype::U32, &[Dim::Const(128)])?;
         let positions = tape.zeros_shaped(Dtype::U32, &[Dim::Const(3)])?;
-        for rows in [Rows::Offset(0), Rows::Offset(7), Rows::Positions(positions)] {
+        for rows in [RopePos::Offset(0), RopePos::Offset(7), RopePos::Positions(positions)] {
             let first = tape.graph().len();
             let result = table_rows(
                 &mut tape,

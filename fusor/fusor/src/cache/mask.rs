@@ -146,8 +146,11 @@ impl<T: Element> MaskCache<T> {
                 }
             }
         }
-        let bytes: Vec<u8> = data.iter().flat_map(|v| v.to_le_bytes()).collect();
-        let dense = graph.tensor(Dtype::F32, &[Dim::Const(q), Dim::Const(k)], &bytes)?;
+        let dense = graph.tensor(
+            Dtype::F32,
+            &[Dim::Const(q), Dim::Const(k)],
+            bytemuck::cast_slice(&data),
+        )?;
         // The triangle is built in f32 on the host — `-inf` is exact in every
         // float width — and cast once per shape, not per step.
         let dense = if T::DTYPE == Dtype::F32 {

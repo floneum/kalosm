@@ -14,14 +14,10 @@ pub use attention::{
     attention, attention_causal, attention_grads, attention_lse, attention_masked,
     attention_with_lse,
 };
-pub use conv::{conv, grouped_conv, pad_with_zeros};
+pub use conv::{conv, grouped_conv};
 pub use loss::{binary_cross_entropy_with_logits, distillation_loss, mse, softmax_cross_entropy};
 pub use pool::{PoolSize, pool, pool_avg, pool_max, pool_min};
-pub use rope::{
-    base_inverse_frequency, rope, rope_interleaved, rope_interleaved_pair,
-    rope_interleaved_pair_with_position, rope_interleaved_with_position, rope_pair,
-    rope_pair_with_position, rope_with_position, rotate_half,
-};
+pub use rope::{RopeLayout, RopePos, base_inverse_frequency, rope, rope_pair, rotate_half};
 pub use upsample::{upsample_bilinear, upsample_nearest, upsample_nearest2d};
 
 use fusor_autograd::tape::GraphTape;
@@ -62,15 +58,18 @@ pub(crate) fn const_dim(d: Dim, what: &str) -> Result<u64> {
 /// A rank-1 `u32` index leaf holding `values`: one small buffer uploaded
 /// once, fed to scatter and gather as a real index tensor.
 pub(crate) fn index_leaf(graph: &GraphRef, values: &[u32]) -> Result<Id> {
-    let mut bytes = Vec::with_capacity(values.len() * 4);
-    for v in values {
-        bytes.extend_from_slice(&v.to_le_bytes());
-    }
+    let bytes = values.iter().flat_map(|v| v.to_le_bytes()).collect();
     graph.constant_leaf(
         fusor_ir::dtype::Dtype::U32,
         &[Dim::Const(values.len() as u64)],
         bytes,
     )
+}
+
+/// A rank-1 float leaf holding `values` encoded at `dtype`.
+pub(crate) fn float_leaf(graph: &GraphRef, dtype: fusor_ir::dtype::Dtype, values: &[f32]) -> Result<Id> {
+    let bytes = crate::tensor::construction::encode_f32(dtype, values);
+    graph.constant_leaf(dtype, &[Dim::Const(values.len() as u64)], bytes)
 }
 
 /// `index_leaf` over the run `start .. start + len`.

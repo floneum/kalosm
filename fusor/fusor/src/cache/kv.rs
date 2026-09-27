@@ -18,13 +18,12 @@
 //!   the uncommitted output, and [`TensorCache::detach`] commits for it.
 
 use fusor_ir::dtype::Dtype;
-use fusor_ir::ir::logical::{LeafKind, Logical};
 use fusor_ir::shape::{Dim, StrideSpec};
 use rustc_hash::FxHashMap;
 
 use crate::device::ok;
-use crate::graph::GraphRef;
 use crate::tensor::Dyn;
+use crate::tensor::construction::leaf_buffer_node;
 use crate::tensor::typed::Element;
 use crate::{Error, Result, Tensor};
 
@@ -291,7 +290,7 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
                 graph.bind_dim(capacity, f.capacity);
                 Dim::Sym(capacity)
             };
-            let store = external_leaf(&graph, &shape, value.dtype())?;
+            let store = leaf_buffer_node(&graph, value.dtype(), &shape)?;
             let sym = graph.named_sym(&f.sym_name);
             let view = readable(&store, axis, Dim::Sym(sym))?;
             f.sym = Some(sym);
@@ -320,7 +319,7 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         let idx = match f.idx.get(&added) {
             Some(t) => t.clone(),
             None => {
-                let t = external_leaf(&graph, &[Dim::Const(added)], Dtype::U32)?;
+                let t = leaf_buffer_node(&graph, Dtype::U32, &[Dim::Const(added)])?;
                 f.idx.insert(added, t.clone());
                 t
             }
@@ -486,17 +485,6 @@ fn fresh_sym_name() -> String {
     )
 }
 
-/// An external leaf minted directly on the graph handle (the `Graph` facade
-/// is not reachable from a tensor).
-fn external_leaf(graph: &GraphRef, shape: &[Dim], dtype: Dtype) -> Result<Dyn> {
-    let id = graph.add_logical(Logical::Leaf(LeafKind::Buffer {
-        name: graph.fresh_buffer_id(),
-        dtype,
-        shape: shape.iter().copied().collect(),
-    }))?;
-    Ok(graph.tensor(id))
-}
-
 fn readable(value: &Dyn, axis: usize, len: Dim) -> Result<Dyn> {
     let specs: Vec<_> = value
         .shape()
@@ -544,7 +532,7 @@ fn reserve<'a>(
                 let graph = source.graph();
                 let mut shape = source.shape().to_vec();
                 shape[axis] = Dim::Const(capacity);
-                let store = external_leaf(graph, &shape, source.dtype())?;
+                let store = leaf_buffer_node(graph, source.dtype(), &shape)?;
                 let kept = source.narrow(axis, 0, state.len as usize)?;
                 let idx = Dyn::arange(graph, Dtype::U32, 0., state.len as f64)?;
                 Some(store.scatter_set(axis, &idx, &kept, true)?)

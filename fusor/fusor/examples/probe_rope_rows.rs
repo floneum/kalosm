@@ -1,5 +1,6 @@
 //! Probe: `rope_pair` over a one-row table at offset 0 must equal the full
-//! table at that row's position, and `rope_pair_at` with a position leaf.
+//! table at that row's position, and a position leaf.
+use fusor::composite::{RopeLayout::Halves, RopePos};
 use fusor::{Device, Dim, Tensor};
 
 fn main() {
@@ -23,13 +24,13 @@ fn main() {
     let cos_t = Tensor::<2>::from_slice(&device, [ctx, half], &cos);
     let sin_t = Tensor::<2>::from_slice(&device, [ctx, half], &sin);
     let p = 22usize;
-    let (qa, ka) = q.rope_pair(&k, &cos_t, &sin_t, p as u64);
+    let (qa, ka) = q.rope_pair(&k, &cos_t, &sin_t, Halves, RopePos::Offset(p as u64));
     let row_c = Tensor::<2>::from_slice(&device, [1, half], &cos[p * half..(p + 1) * half]);
     let row_s = Tensor::<2>::from_slice(&device, [1, half], &sin[p * half..(p + 1) * half]);
-    let (qb, kb) = q.rope_pair(&k, &row_c, &row_s, 0);
+    let (qb, kb) = q.rope_pair(&k, &row_c, &row_s, Halves, RopePos::Offset(0));
     let pos = Tensor::<1, u32>::leaf(&device, [Dim::Const(1)]);
     pos.set_elements(&[p as u32]);
-    let (qc, kc) = q.rope_pair_at(&k, &cos_t, &sin_t, &pos);
+    let (qc, kc) = q.rope_pair(&k, &cos_t, &sin_t, Halves, RopePos::Positions(&pos));
     let diff = |a: &Tensor<4>, b: &Tensor<4>| {
         a.to_flat()
             .iter()

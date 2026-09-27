@@ -13,7 +13,7 @@
 //! boundary, hands the boundary's gradient to the user closure, and continues
 //! from whatever slots the closure names. The closure builds its gradients
 //! with the ordinary tensor API and may name parents that are not its
-//! operands — a fake-quantized weight is a `constant_from_raw` with no
+//! operands — a fake-quantized weight is a [`Graph::constant`] with no
 //! operands whose parent is the master weight.
 
 use std::collections::HashMap;
@@ -51,7 +51,7 @@ impl BackwardTarget {
     pub fn to<const R: usize, T: Element>(slot: GradientSlot, gradient: RawTensor<R, T>) -> Self {
         Self {
             slot,
-            gradient: gradient.into_inner(),
+            gradient: gradient.into_dyn(),
         }
     }
 
@@ -183,11 +183,6 @@ impl<const R: usize, T: Element> std::fmt::Debug for Tensor<R, T> {
 }
 
 impl<const R: usize, T: Element> Tensor<R, T> {
-    /// Adopt a raw value as a constant of `graph`.
-    pub fn constant_from_raw(graph: &Graph, value: RawTensor<R, T>) -> Self {
-        graph.constant(value)
-    }
-
     /// The tape this value lives on.
     pub fn graph(&self) -> Graph {
         self.graph.clone()
@@ -275,7 +270,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     /// loss before the backward and undoes it before the optimizer, and the
     /// scale has to enter here or the f16 activations underflow first.
     pub fn backward_with(&self, seed: RawTensor<R, T>) -> Result<Gradients> {
-        self.backward_from(seed.into_inner())
+        self.backward_from(seed.into_dyn())
     }
 
     /// [`Tensor::backward_with`] seeded with ones.
@@ -309,7 +304,9 @@ impl<const R: usize, T: Element> Tensor<R, T> {
             if let Some((parents, rule)) = boundary {
                 let Some(rule) = rule else { continue };
                 let targets = rule(grad)?;
-                validate(&parents, &targets)?;
+                fusor_autograd::custom::validate_parents(&parents, |p| {
+                    targets.iter().any(|t| t.slot.0 == p)
+                })?;
                 for target in targets {
                     work.push((target.slot.0, target.gradient));
                 }
@@ -357,24 +354,6 @@ fn accumulate(acc: &mut HashMap<Id, Dyn>, value: Id, grad: Dyn) -> Result<()> {
         }
         Some(prev) => {
             acc.insert(value, prev.add_(&grad)?);
-        }
-    }
-    Ok(())
-}
-
-/// Every requires-grad parent must receive a gradient. A rule that omits one
-/// is an error, not a silent zero: the omitted parent's whole subgraph would
-/// starve, and the final check would report the symptom rather than the cause.
-fn validate(parents: &[Parent], targets: &[BackwardTarget]) -> Result<()> {
-    for parent in parents {
-        if !parent.requires_grad {
-            continue;
-        }
-        if !targets.iter().any(|t| t.slot.0 == parent.value) {
-            return Err(Error::Plan(format!(
-                "a with_backwards rule returned no gradient for parent {:?}, which requires one",
-                parent.value
-            )));
         }
     }
     Ok(())
@@ -435,7 +414,7 @@ same!(
     softplus, zeros_like, ones_like,
 );
 
-/// Rank-preserving scalar arithmetic.
+/// Rank-preserving scalar arithmetic and comparisons.
 macro_rules! same_scalar {
     ($($name:ident),* $(,)?) => {
         impl<const R: usize, T: Element> Tensor<R, T> {$(
@@ -449,7 +428,15 @@ macro_rules! same_scalar {
 }
 
 same_scalar!(
-    add_scalar, sub_scalar, mul_scalar, div_scalar, pow_scalar, max_scalar, min_scalar,
+    add_scalar,
+    sub_scalar,
+    mul_scalar,
+    div_scalar,
+    pow_scalar,
+    max_scalar,
+    min_scalar,
+    lte_scalar,
+    gte_scalar,
 );
 
 /// Rank-reducing folds; `O` is `R - 1`.
@@ -467,26 +454,59 @@ macro_rules! reduce {
 
 reduce!(sum, product, max, min, mean);
 
+/// Forwards to the raw op of the same name on the tape: a `t` argument is a
+/// tape value, a `v` argument passes through.
+macro_rules! tape {
+    ($(
+        $(#[$m:meta])*
+        fn $name:ident $([$($g:tt)*])? ($($arg:ident: $ty:ty => $tag:ident),* $(,)?) -> $ret:ty;
+    )*) => {$(
+        $(#[$m])*
+        #[track_caller]
+        pub fn $name $(<$($g)*>)? (&self, $($arg: $ty),*) -> $ret {
+            self.like(self.value.$name($(tape!(@arg $tag $arg)),*))
+        }
+    )*};
+    (@arg t $a:ident) => (&$a.value);
+    (@arg v $a:ident) => ($a);
+}
+
 impl<const R: usize, T: Element> Tensor<R, T> {
-    /// Same-shape binaries, on the tape.
-    #[track_caller]
-    pub fn add(&self, rhs: &Self) -> Self {
-        self.like(self.value.add(&rhs.value))
+    tape! {
+        /// Add two same-shape values.
+        fn add(rhs: &Self => t) -> Self;
+        /// Subtract two same-shape values.
+        fn sub(rhs: &Self => t) -> Self;
+        /// Multiply two same-shape values.
+        fn mul(rhs: &Self => t) -> Self;
+        /// Divide two same-shape values.
+        fn div(rhs: &Self => t) -> Self;
+        /// Reshape the value.
+        fn reshape[const O: usize](shape: [usize; O] => v) -> Tensor<O, T>;
+        /// Swap two axes.
+        fn transpose(d0: impl Axis<R> => v, d1: impl Axis<R> => v) -> Self;
+        /// Reorder the axes.
+        fn permute(order: [usize; R] => v) -> Self;
+        /// Keep `len` elements of one axis starting at `start`.
+        fn narrow(dim: impl Axis<R> => v, start: usize => v, len: usize => v) -> Self;
+        /// Flatten every axis into one.
+        fn flatten_all() -> Tensor<1, T>;
+        /// Gather indices along one axis.
+        fn index_select(dim: impl Axis<R> => v, idx: &RawTensor<1, u32> => v) -> Self;
+        /// Clamp every element to the inclusive scalar interval.
+        fn clamp(
+            lo: impl Into<crate::tensor::Scalar> => v,
+            hi: impl Into<crate::tensor::Scalar> => v,
+        ) -> Self;
+        /// Matrix multiplication over the trailing two axes.
+        fn matmul(rhs: &Self => t) -> Self;
     }
+
+    /// Convert the dtype. Differentiable, so a gradient taken in f16 still
+    /// lands on the f32 master.
     #[track_caller]
-    /// Subtract two same-shape values.
-    pub fn sub(&self, rhs: &Self) -> Self {
-        self.like(self.value.sub(&rhs.value))
-    }
-    #[track_caller]
-    /// Multiply two same-shape values.
-    pub fn mul(&self, rhs: &Self) -> Self {
-        self.like(self.value.mul(&rhs.value))
-    }
-    #[track_caller]
-    /// Divide two same-shape values.
-    pub fn div(&self, rhs: &Self) -> Self {
-        self.like(self.value.div(&rhs.value))
+    pub fn cast<E: Element>(&self) -> Tensor<R, E> {
+        self.like(self.value.cast::<E>())
     }
 
     /// Broadcasting `a + b`, output rank `O = max(R, R2)`.
@@ -505,77 +525,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     #[track_caller]
     pub fn div_<const R2: usize, const O: usize>(&self, rhs: &Tensor<R2, T>) -> Tensor<O, T> {
         self.like(self.value.div_::<R2, O, RawTensor<R2, T>>(&rhs.value))
-    }
-
-    /// Convert the dtype. Differentiable, so a gradient taken in f16 still
-    /// lands on the f32 master.
-    #[track_caller]
-    pub fn cast<E: Element>(&self) -> Tensor<R, E> {
-        self.like(self.value.cast::<E>())
-    }
-
-    #[track_caller]
-    /// Reshape the value.
-    pub fn reshape<const O: usize>(&self, shape: [usize; O]) -> Tensor<O, T> {
-        self.like(self.value.reshape(shape))
-    }
-
-    #[track_caller]
-    /// Swap two axes.
-    pub fn transpose(&self, d0: impl Axis<R>, d1: impl Axis<R>) -> Self {
-        self.like(self.value.transpose(d0, d1))
-    }
-
-    #[track_caller]
-    /// Reorder the axes.
-    pub fn permute(&self, order: [usize; R]) -> Self {
-        self.like(self.value.permute(order))
-    }
-
-    #[track_caller]
-    /// Keep `len` elements of one axis starting at `start`.
-    pub fn narrow(&self, dim: impl Axis<R>, start: usize, len: usize) -> Self {
-        self.like(self.value.narrow(dim, start, len))
-    }
-
-    #[track_caller]
-    /// Flatten every axis into one.
-    pub fn flatten_all(&self) -> Tensor<1, T> {
-        self.like(self.value.flatten_all())
-    }
-
-    #[track_caller]
-    /// Gather indices along one axis.
-    pub fn index_select(&self, dim: impl Axis<R>, idx: &RawTensor<1, u32>) -> Self {
-        self.like(self.value.index_select(dim, idx))
-    }
-
-    #[track_caller]
-    /// Clamp every element to the inclusive scalar interval.
-    pub fn clamp(
-        &self,
-        lo: impl Into<crate::tensor::Scalar>,
-        hi: impl Into<crate::tensor::Scalar>,
-    ) -> Self {
-        self.like(self.value.clamp(lo, hi))
-    }
-
-    #[track_caller]
-    /// Compare every element with `s` using `<=`.
-    pub fn lte_scalar(&self, s: impl Into<crate::tensor::Scalar>) -> Self {
-        self.like(self.value.lte_scalar(s))
-    }
-
-    #[track_caller]
-    /// Compare every element with `s` using `>=`.
-    pub fn gte_scalar(&self, s: impl Into<crate::tensor::Scalar>) -> Self {
-        self.like(self.value.gte_scalar(s))
-    }
-
-    #[track_caller]
-    /// Matrix multiplication over the trailing two axes.
-    pub fn matmul(&self, rhs: &Self) -> Self {
-        self.like(self.value.matmul(&rhs.value))
     }
 
     /// [`RawTensor::conv`], on the tape.
@@ -603,7 +552,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     {
         let parts: Vec<Tensor<R, T>> = parts.into_iter().collect();
         let graph = parts.first().map(|p| p.graph.clone()).unwrap_or_default();
-        let value = crate::tensor::typed::cat(parts.into_iter().map(|p| p.value), dim);
+        let value = RawTensor::cat(parts.into_iter().map(|p| p.value), dim);
         Tensor { value, graph }
     }
 
@@ -611,13 +560,4 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     pub fn detach(&self) -> RawTensor<R, T> {
         self.value.clone()
     }
-}
-
-/// Join values along `dim`; the free spelling of [`Tensor::cat`].
-#[track_caller]
-pub fn cat<const R: usize, T: Element, I>(parts: I, dim: usize) -> Tensor<R, T>
-where
-    I: IntoIterator<Item = Tensor<R, T>>,
-{
-    Tensor::cat(parts, dim)
 }

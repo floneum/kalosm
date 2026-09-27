@@ -6,31 +6,13 @@
 
 use fusor_autograd::tape::{GraphTape, TapeExt};
 use fusor_ir::autograd::{Tape, Val};
-use fusor_ir::dtype::Dtype;
-use fusor_ir::egraph::Id;
 use fusor_ir::scalar::BinOp;
 use fusor_ir::shape::Dim;
 use fusor_ir::{Error, Result};
 use smallvec::SmallVec;
 
-use crate::composite::{const_dim, core_op, index_leaf};
-use crate::graph::GraphRef;
+use crate::composite::{const_dim, core_op, float_leaf, index_leaf};
 use crate::tensor::Tensor;
-
-/// A rank-1 `f32` weight leaf.
-fn weight_leaf(graph: &GraphRef, dtype: Dtype, values: &[f32]) -> Result<Id> {
-    let mut bytes = Vec::with_capacity(values.len() * 4);
-    for v in values {
-        match dtype {
-            Dtype::F16 => bytes.extend_from_slice(&half::f16::from_f32(*v).to_bits().to_le_bytes()),
-            Dtype::BF16 => {
-                bytes.extend_from_slice(&half::bf16::from_f32(*v).to_bits().to_le_bytes())
-            }
-            _ => bytes.extend_from_slice(&v.to_le_bytes()),
-        }
-    }
-    graph.constant_leaf(dtype, &[Dim::Const(values.len() as u64)], bytes)
-}
 
 /// Nearest-neighbour source index for each output position.
 fn nearest_indices(input: u64, output: u64) -> Vec<u32> {
@@ -133,8 +115,8 @@ pub fn upsample_bilinear(x: &Tensor, size: &[Dim], align_corners: bool) -> Resul
     let y1 = index_leaf(graph, &y1)?;
     let x0 = index_leaf(graph, &x0)?;
     let x1 = index_leaf(graph, &x1)?;
-    let wy = weight_leaf(graph, dtype, &wy)?;
-    let wx = weight_leaf(graph, dtype, &wx)?;
+    let wy = float_leaf(graph, dtype, &wy)?;
+    let wx = float_leaf(graph, dtype, &wx)?;
 
     let xid = x.id;
     core_op(graph, move |t| {

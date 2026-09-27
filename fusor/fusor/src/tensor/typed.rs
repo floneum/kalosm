@@ -24,16 +24,11 @@ use fusor_ir::dtype::{Dtype, RoundMode, Splat};
 use fusor_ir::egraph::Id;
 use fusor_ir::shape::{Dim, SlidingWindow, StrideSpec};
 
-use crate::device::{Device, ok};
+use crate::device::{Device, fail, ok};
 use crate::graph::GraphRef;
-use crate::ops::view::Extent;
 use crate::tensor::readback::{TensorSlice, ToVec};
 use crate::tensor::{Scalar, Tensor as Dyn};
 use crate::{Error, Result};
-
-mod composite;
-mod construct;
-mod ops;
 
 /// A Rust scalar with a fusor dtype.
 pub trait Element: bytemuck::Pod + Copy + Send + Sync + 'static {
@@ -174,14 +169,51 @@ fn narrow_acc<T: Element>(r: Result<Dyn>) -> Result<Dyn> {
     }
     v.cast(T::DTYPE)
 }
+/// Forwards each listed method to the runtime-rank op of the same name (or
+/// `= path`, called with the value first), converting arguments by tag: `ax`
+/// resolves an axis, `ax32` resolves it to `u32`, `arr` borrows, `dims`
+/// borrows as extents, `ext` as reshape extents, `t` unwraps a tensor, `opt`
+/// an optional one, `v` passes through. `@acc` narrows an accumulating result.
+macro_rules! forward {
+    ($(
+        $(#[$m:meta])*
+        $(@$acc:ident)? fn $name:ident $([$($g:tt)*])? ($($arg:ident: $ty:ty => $tag:ident),* $(,)?)
+            -> $ret:ty $(= $target:path)?;
+    )*) => {$(
+        $(#[$m])*
+        #[track_caller]
+        pub fn $name $(<$($g)*>)? (&self, $($arg: $ty),*) -> $ret {
+            Self::wrap(
+                stringify!($name),
+                forward!(@acc [$($acc)?] forward!(@callee $name $($target)?)(
+                    &self.raw, $(forward!(@arg $tag $arg)),*
+                )),
+            )
+        }
+    )*};
+    (@callee $name:ident) => ($crate::tensor::Tensor::$name);
+    (@callee $name:ident $target:path) => ($target);
+    (@acc [] $e:expr) => ($e);
+    (@acc [acc] $e:expr) => ($crate::tensor::typed::narrow_acc::<T>($e));
+    (@arg ax $a:ident) => ($a.resolve());
+    (@arg ax32 $a:ident) => ($a.resolve() as u32);
+    (@arg arr $a:ident) => (&$a);
+    (@arg dims $a:ident) => (&$crate::tensor::typed::dims_of($a));
+    (@arg ext $a:ident) => (&$a.map($crate::tensor::Extent::from));
+    (@arg t $a:ident) => ($a.as_dyn());
+    (@arg opt $a:ident) => ($a.map($crate::tensor::typed::Tensor::as_dyn));
+    (@arg v $a:ident) => ($a);
+}
+
+mod composite;
+mod construct;
+mod ops;
 
 impl<const R: usize, T: Element> Tensor<R, T> {
     /// Compile-time rank.
     pub const RANK: usize = R;
 
-    /// Wrap a runtime-rank value.
-    ///
-    /// The inverse of [`Tensor::into_dyn`].
+    /// Wrap a runtime-rank value; the inverse of [`Tensor::into_dyn`].
     ///
     /// # Panics
     /// If the rank or dtype disagrees. [`Tensor::try_from_dyn`] reports
@@ -219,10 +251,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     }
 
     /// The runtime-rank value underneath. The IR never saw the wrapper.
-    pub fn into_inner(self) -> Dyn {
-        self.raw
-    }
-    /// Alias of [`Tensor::into_inner`].
     pub fn into_dyn(self) -> Dyn {
         self.raw
     }
@@ -266,20 +294,17 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         self.shape()[i]
     }
 
-    /// Extents, including the symbolic ones.
-    ///
-    /// [`Tensor::shape`] panics on a [`Dim::Sym`]; this is the accessor for
-    /// the code that has one.
+    /// Extents, including the symbolic ones [`Tensor::shape`] panics on.
     #[track_caller]
     pub fn extents(&self) -> [Dim; R] {
         let shape = self.raw.shape();
         if shape.len() != R {
-            ok::<()>(
+            fail(
                 "Tensor::extents",
-                Err(Error::Shape(format!(
+                Error::Shape(format!(
                     "extents: value has rank {}, not {R}",
                     shape.len()
-                ))),
+                )),
             );
         }
         std::array::from_fn(|i| shape[i])
@@ -322,20 +347,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         ok("Tensor::retype", Tensor::<O, E>::try_from_dyn(self.raw))
     }
 
-    /// Identity, kept for API compatibility; the e-graph owns fusion
-    /// decisions. A value that is never re-leafed keeps its producers alive,
-    /// so a training loop that builds a fresh tape per step accumulates nodes
-    /// in the ambient graph; [`Tensor::detach`] is the correct-but-expensive
-    /// way to cut that off.
-    pub fn into_concrete(self) -> Self {
-        self
-    }
-
-    /// Identity; see [`Tensor::into_concrete`].
-    pub fn to_concrete(&self) -> Self {
-        self.clone()
-    }
-
     /// Materialize and re-leaf, cutting this value off from its producers.
     #[track_caller]
     pub fn detach(&self) -> Self {
@@ -356,12 +367,12 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     pub fn from_slice(device: &Device, shape: [usize; R], data: &[T]) -> Self {
         let want: usize = shape.iter().product();
         if data.len() != want {
-            ok::<()>(
+            fail(
                 "Tensor::from_slice",
-                Err(Error::Shape(format!(
+                Error::Shape(format!(
                     "shape {shape:?} needs {want} elements, got {}",
                     data.len()
-                ))),
+                )),
             );
         }
         Self::wrap(
@@ -536,65 +547,63 @@ impl<const R: usize, T: Element> Operand<R, T> for Tensor<R, T> {
     }
 }
 
+/// Broadcasting binaries, output rank `O = max(R, R2)`.
+macro_rules! broadcast_bin {
+    ($($name:ident),* $(,)?) => {
+        impl<const R: usize, T: Element> Tensor<R, T> {$(
+            #[doc = concat!("[`crate::Tensor::", stringify!($name), "`], broadcasting.")]
+            #[track_caller]
+            pub fn $name<const R2: usize, const O: usize, B: Operand<R2, T>>(
+                &self,
+                rhs: &B,
+            ) -> Tensor<O, T> {
+                Self::wrap(stringify!($name), self.raw.$name(&rhs.operand().raw))
+            }
+        )*}
+    };
+}
+
+broadcast_bin!(add_, sub_, mul_, div_, pow_);
+
 impl<const R: usize, T: Element> Tensor<R, T> {
-    /// Broadcasting `a + b`, output rank `O = max(R, R2)`.
-    #[track_caller]
-    pub fn add_<const R2: usize, const O: usize, B: Operand<R2, T>>(
-        &self,
-        rhs: &B,
-    ) -> Tensor<O, T> {
-        Self::wrap("add_", self.raw.add_(&rhs.operand().raw))
-    }
-
-    /// Broadcasting `a - b`.
-    #[track_caller]
-    pub fn sub_<const R2: usize, const O: usize, B: Operand<R2, T>>(
-        &self,
-        rhs: &B,
-    ) -> Tensor<O, T> {
-        Self::wrap("sub_", self.raw.sub_(&rhs.operand().raw))
-    }
-
-    /// Broadcasting `a * b`.
-    #[track_caller]
-    pub fn mul_<const R2: usize, const O: usize, B: Operand<R2, T>>(
-        &self,
-        rhs: &B,
-    ) -> Tensor<O, T> {
-        Self::wrap("mul_", self.raw.mul_(&rhs.operand().raw))
-    }
-
-    /// Broadcasting `a / b`.
-    #[track_caller]
-    pub fn div_<const R2: usize, const O: usize, B: Operand<R2, T>>(
-        &self,
-        rhs: &B,
-    ) -> Tensor<O, T> {
-        Self::wrap("div_", self.raw.div_(&rhs.operand().raw))
-    }
-
-    /// Broadcasting `a ^ b`.
-    #[track_caller]
-    pub fn pow_<const R2: usize, const O: usize, B: Operand<R2, T>>(
-        &self,
-        rhs: &B,
-    ) -> Tensor<O, T> {
-        Self::wrap("pow_", self.raw.pow_(&rhs.operand().raw))
-    }
-
-    /// Clamp into `[lo, hi]`.
-    #[track_caller]
-    pub fn clamp(&self, lo: impl Into<Scalar>, hi: impl Into<Scalar>) -> Self {
-        Self::wrap("clamp", self.raw.clamp(lo, hi))
-    }
-
-    /// Select elementwise: `self` is the predicate.
-    #[track_caller]
-    pub fn where_cond(&self, on_true: &Self, on_false: &Self) -> Self {
-        Self::wrap(
-            "where_cond",
-            self.raw.where_cond(&on_true.raw, &on_false.raw),
-        )
+    forward! {
+        /// Clamp into `[lo, hi]`.
+        fn clamp(lo: impl Into<Scalar> => v, hi: impl Into<Scalar> => v) -> Self;
+        /// Select elementwise: `self` is the predicate.
+        fn where_cond(on_true: &Self => t, on_false: &Self => t) -> Self;
+        /// Set the rounding mode of a narrowing cast.
+        fn round_mode(mode: RoundMode => v) -> Self;
+        /// Swap two axes.
+        fn transpose(d0: impl Axis<R> => ax, d1: impl Axis<R> => ax) -> Self;
+        /// Swap the last two axes.
+        fn t() -> Self;
+        /// Reorder every axis.
+        fn permute(order: [usize; R] => arr) -> Self;
+        /// A contiguous sub-range of every axis.
+        fn slice(ranges: [Range<usize>; R] => arr) -> Self;
+        /// `len` entries of `dim` starting at `start`.
+        fn narrow(dim: impl Axis<R> => ax, start: usize => v, len: usize => v) -> Self;
+        /// Reshape into a statically known output rank.
+        fn reshape[const O: usize](shape: [usize; O] => ext) -> Tensor<O, T>;
+        /// Broadcast into a statically known output rank.
+        fn broadcast_as[const O: usize](target: [usize; O] => dims) -> Tensor<O, T>;
+        /// Restride into a statically known output rank.
+        fn restride[const O: usize](specs: [StrideSpec; O] => arr) -> Tensor<O, T>;
+        /// Drop a length-1 axis; output rank `O = R - 1`.
+        fn squeeze[const O: usize](dim: impl Axis<R> => ax) -> Tensor<O, T>;
+        /// Insert a length-1 axis; output rank `O = R + 1`.
+        fn unsqueeze[const O: usize](dim: usize => v) -> Tensor<O, T>;
+        /// Every element in one axis.
+        fn flatten_all() -> Tensor<1, T>;
+        /// A sliding-window view; output rank `O = R + windows`.
+        fn sliding_window_view[const O: usize](specs: &[SlidingWindow] => v) -> Tensor<O, T>;
+        /// Gather rows of `dim` named by `idx`.
+        fn index_select(dim: impl Axis<R> => ax, idx: &Tensor<1, u32> => t) -> Self;
+        /// Batched matrix product over the last two axes, accumulated in
+        /// [`Dtype::compute_dtype`] and narrowed back.
+        @acc fn matmul(rhs: &Self => t) -> Self;
+        /// Matrix product against a transposed right-hand side.
+        @acc fn matmul_t(rhs: &Self => t) -> Self;
     }
 
     /// Convert the dtype; the rank is unchanged.
@@ -609,44 +618,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         Self::wrap("bitcast", self.raw.bitcast(E::DTYPE))
     }
 
-    /// Set the rounding mode of a narrowing cast.
-    #[track_caller]
-    pub fn round_mode(&self, mode: RoundMode) -> Self {
-        Self::wrap("round_mode", self.raw.round_mode(mode))
-    }
-}
-
-impl<const R: usize, T: Element> Tensor<R, T> {
-    /// Swap two axes.
-    #[track_caller]
-    pub fn transpose(&self, d0: impl Axis<R>, d1: impl Axis<R>) -> Self {
-        Self::wrap("transpose", self.raw.transpose(d0.resolve(), d1.resolve()))
-    }
-
-    /// Swap the last two axes.
-    #[track_caller]
-    pub fn t(&self) -> Self {
-        Self::wrap("t", self.raw.t())
-    }
-
-    /// Reorder every axis.
-    #[track_caller]
-    pub fn permute(&self, order: [usize; R]) -> Self {
-        Self::wrap("permute", self.raw.permute(&order))
-    }
-
-    /// A contiguous sub-range of every axis.
-    #[track_caller]
-    pub fn slice(&self, ranges: [Range<usize>; R]) -> Self {
-        Self::wrap("slice", self.raw.slice(&ranges))
-    }
-
-    /// `len` entries of `dim` starting at `start`.
-    #[track_caller]
-    pub fn narrow(&self, dim: impl Axis<R>, start: usize, len: usize) -> Self {
-        Self::wrap("narrow", self.raw.narrow(dim.resolve(), start, len))
-    }
-
     /// Split one axis into `chunks` equal pieces.
     #[track_caller]
     pub fn chunk(&self, chunks: usize, dim: impl Axis<R>) -> Vec<Self> {
@@ -654,79 +625,6 @@ impl<const R: usize, T: Element> Tensor<R, T> {
             .into_iter()
             .map(Self::from_dyn)
             .collect()
-    }
-
-    /// Reshape into a statically known output rank.
-    #[track_caller]
-    pub fn reshape<const O: usize>(&self, shape: [usize; O]) -> Tensor<O, T> {
-        let extents: [Extent; O] = shape.map(Extent::from);
-        Self::wrap("reshape", self.raw.reshape(&extents))
-    }
-
-    /// Broadcast into a statically known output rank.
-    #[track_caller]
-    pub fn broadcast_as<const O: usize>(&self, target: [usize; O]) -> Tensor<O, T> {
-        Self::wrap("broadcast_as", self.raw.broadcast_as(&dims_of(target)))
-    }
-
-    /// Alias of [`Tensor::broadcast_as`].
-    #[track_caller]
-    pub fn expand<const O: usize>(&self, target: [usize; O]) -> Tensor<O, T> {
-        self.broadcast_as(target)
-    }
-
-    /// Restride into a statically known output rank.
-    #[track_caller]
-    pub fn restride<const O: usize>(&self, specs: [StrideSpec; O]) -> Tensor<O, T> {
-        Self::wrap("restride", self.raw.restride(&specs))
-    }
-
-    /// Drop a length-1 axis; output rank `O = R - 1`.
-    #[track_caller]
-    pub fn squeeze<const O: usize>(&self, dim: impl Axis<R>) -> Tensor<O, T> {
-        Self::wrap("squeeze", self.raw.squeeze(dim.resolve()))
-    }
-
-    /// Insert a length-1 axis; output rank `O = R + 1`.
-    #[track_caller]
-    pub fn unsqueeze<const O: usize>(&self, dim: usize) -> Tensor<O, T> {
-        Self::wrap("unsqueeze", self.raw.unsqueeze(dim))
-    }
-
-    /// Every element in one axis.
-    #[track_caller]
-    pub fn flatten_all(&self) -> Tensor<1, T> {
-        Self::wrap("flatten_all", self.raw.flatten_all())
-    }
-
-    /// A sliding-window view; output rank `O = R + windows`.
-    #[track_caller]
-    pub fn sliding_window_view<const O: usize>(&self, specs: &[SlidingWindow]) -> Tensor<O, T> {
-        Self::wrap("sliding_window_view", self.raw.sliding_window_view(specs))
-    }
-
-    /// Gather rows of `dim` named by `idx`.
-    #[track_caller]
-    pub fn index_select(&self, dim: impl Axis<R>, idx: &Tensor<1, u32>) -> Self {
-        Self::wrap(
-            "index_select",
-            self.raw.index_select(dim.resolve(), &idx.raw),
-        )
-    }
-
-    /// Batched matrix product over the last two axes.
-    ///
-    /// Accumulates in [`Dtype::compute_dtype`] and narrows back, so an f16
-    /// matmul has f32 accumulators.
-    #[track_caller]
-    pub fn matmul(&self, rhs: &Self) -> Self {
-        Self::wrap("matmul", narrow_acc::<T>(self.raw.matmul(&rhs.raw)))
-    }
-
-    /// Matrix product against a transposed right-hand side.
-    #[track_caller]
-    pub fn matmul_t(&self, rhs: &Self) -> Self {
-        Self::wrap("matmul_t", narrow_acc::<T>(self.raw.matmul_t(&rhs.raw)))
     }
 }
 
@@ -791,13 +689,13 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         stride: [usize; DIFF],
     ) -> Self {
         if WINDOWED != R + DIFF {
-            ok::<()>(
+            fail(
                 "Tensor::conv",
-                Err(Error::Shape(format!(
+                Error::Shape(format!(
                     "conv::<{WEIGHT_RANK}, {DIFF}, {WINDOWED}>: the windowed view of a rank-{R} \
                      input over {DIFF} spatial axes has rank {}, not {WINDOWED}",
                     R + DIFF
-                ))),
+                )),
             );
         }
         let to_u32 = |v: [usize; DIFF], what: &str| -> Vec<u32> {
@@ -897,36 +795,25 @@ impl<const R: usize, T: Element> Neg for &Tensor<R, T> {
     }
 }
 
-/// Join values along `dim`. Every part keeps its rank.
-#[track_caller]
-pub fn cat<const R: usize, T: Element, I>(parts: I, dim: usize) -> Tensor<R, T>
-where
-    I: IntoIterator<Item = Tensor<R, T>>,
-{
-    let parts: Vec<Dyn> = parts.into_iter().map(Tensor::into_inner).collect();
-    let raw = ok("cat", crate::ops::index::cat(&parts, dim));
-    ok("cat", Tensor::try_from_dyn(raw))
-}
-
 /// Stack values into a new axis; output rank `O = R + 1`.
 #[track_caller]
 pub fn stack<const R: usize, const O: usize, T: Element, I>(parts: I, dim: usize) -> Tensor<O, T>
 where
     I: IntoIterator<Item = Tensor<R, T>>,
 {
-    let parts: Vec<Dyn> = parts.into_iter().map(Tensor::into_inner).collect();
-    let raw = ok("stack", crate::ops::index::stack(&parts, dim));
-    ok("stack", Tensor::try_from_dyn(raw))
+    let parts: Vec<Dyn> = parts.into_iter().map(Tensor::into_dyn).collect();
+    Tensor::<R, T>::wrap("stack", crate::ops::index::stack(&parts, dim))
 }
 
 impl<const R: usize, T: Element> Tensor<R, T> {
-    /// [`cat`], as an associated function.
+    /// Join values along `dim`. Every part keeps its rank.
     #[track_caller]
     pub fn cat<I>(parts: I, dim: usize) -> Self
     where
         I: IntoIterator<Item = Tensor<R, T>>,
     {
-        cat(parts, dim)
+        let parts: Vec<Dyn> = parts.into_iter().map(Tensor::into_dyn).collect();
+        Self::wrap("cat", crate::ops::index::cat(&parts, dim))
     }
 }
 
@@ -949,66 +836,30 @@ impl<const R: usize, T: Element> HostSlice<R, T> {
     pub fn to_flat(&self) -> Vec<T> {
         ok("to_flat", self.slice.to_flat::<T>())
     }
-
-    #[track_caller]
-    fn extents(&self) -> [usize; R] {
-        ok(
-            "readback shape",
-            const_extents::<R>(self.slice.shape(), "readback"),
-        )
-    }
-
-    #[track_caller]
-    fn at(&self, idx: &[usize]) -> T {
-        match self.slice.get::<T>(idx) {
-            Some(v) => v,
-            None => panic!("fusor readback: index {idx:?} out of range"),
-        }
-    }
 }
 
 impl<T: Element> ToVec for HostSlice<0, T> {
     type Output = T;
     #[track_caller]
     fn to_vec(&self) -> T {
-        self.at(&[])
+        ok("to_vec", self.slice.scalar::<T>())
     }
 }
 
-impl<T: Element> ToVec for HostSlice<1, T> {
-    type Output = Vec<T>;
-    #[track_caller]
-    fn to_vec(&self) -> Vec<T> {
-        let [n] = self.extents();
-        (0..n).map(|i| self.at(&[i])).collect()
-    }
+/// The nested readback of rank 1 through 3, through the checked view.
+macro_rules! host_to_vec {
+    ($($rank:literal => $out:ty),*) => {$(
+        impl<T: Element> ToVec for HostSlice<$rank, T> {
+            type Output = $out;
+            #[track_caller]
+            fn to_vec(&self) -> $out {
+                ok("to_vec", self.slice.ranked::<$rank, T>().and_then(|r| r.to_vec()))
+            }
+        }
+    )*};
 }
 
-impl<T: Element> ToVec for HostSlice<2, T> {
-    type Output = Vec<Vec<T>>;
-    #[track_caller]
-    fn to_vec(&self) -> Vec<Vec<T>> {
-        let [n, m] = self.extents();
-        (0..n)
-            .map(|i| (0..m).map(|j| self.at(&[i, j])).collect())
-            .collect()
-    }
-}
-
-impl<T: Element> ToVec for HostSlice<3, T> {
-    type Output = Vec<Vec<Vec<T>>>;
-    #[track_caller]
-    fn to_vec(&self) -> Vec<Vec<Vec<T>>> {
-        let [n, m, p] = self.extents();
-        (0..n)
-            .map(|i| {
-                (0..m)
-                    .map(|j| (0..p).map(|k| self.at(&[i, j, k])).collect())
-                    .collect()
-            })
-            .collect()
-    }
-}
+host_to_vec!(1 => Vec<T>, 2 => Vec<Vec<T>>, 3 => Vec<Vec<Vec<T>>>);
 
 impl<const R: usize, T: Element> Tensor<R, T> {
     /// Resolve up to this value and copy it back to the host.

@@ -163,22 +163,10 @@ impl TensorSlice {
             bytemuck::cast_slice_mut(&mut out).copy_from_slice(raw);
             return Ok(out);
         }
-        let mut out = Vec::with_capacity(n);
-        let mut idx = vec![0usize; shape.len()];
-        for _ in 0..n {
-            out.push(
-                self.get::<D>(&idx)
-                    .ok_or_else(|| Error::Shape("readback index out of range".into()))?,
-            );
-            for axis in (0..shape.len()).rev() {
-                idx[axis] += 1;
-                if idx[axis] < shape[axis] {
-                    break;
-                }
-                idx[axis] = 0;
-            }
-        }
-        Ok(out)
+        row_major(&shape, |idx| {
+            self.get::<D>(idx)
+                .ok_or_else(|| Error::Shape("readback index out of range".into()))
+        })
     }
 
     /// Every element widened to `f32`, row-major.
@@ -191,21 +179,7 @@ impl TensorSlice {
         if self.dtype == Dtype::F32 {
             return self.to_flat::<f32>();
         }
-        let shape = self.const_shape()?;
-        let n: usize = shape.iter().product();
-        let mut out = Vec::with_capacity(n);
-        let mut idx = vec![0usize; shape.len()];
-        for _ in 0..n {
-            out.push(self.element_f32(&idx)?);
-            for axis in (0..shape.len()).rev() {
-                idx[axis] += 1;
-                if idx[axis] < shape[axis] {
-                    break;
-                }
-                idx[axis] = 0;
-            }
-        }
-        Ok(out)
+        row_major(&self.const_shape()?, |idx| self.element_f32(idx))
     }
 
     /// One element as the number it denotes.
@@ -226,6 +200,24 @@ impl TensorSlice {
             }
         })
     }
+}
+
+/// `read` at every index of `shape`, row-major.
+fn row_major<D>(shape: &[usize], mut read: impl FnMut(&[usize]) -> Result<D>) -> Result<Vec<D>> {
+    let n: usize = shape.iter().product();
+    let mut out = Vec::with_capacity(n);
+    let mut idx = vec![0usize; shape.len()];
+    for _ in 0..n {
+        out.push(read(&idx)?);
+        for axis in (0..shape.len()).rev() {
+            idx[axis] += 1;
+            if idx[axis] < shape[axis] {
+                break;
+            }
+            idx[axis] = 0;
+        }
+    }
+    Ok(out)
 }
 
 #[cfg(test)]
@@ -378,6 +370,40 @@ impl<const R: usize, D: Element + fmt::Debug> fmt::Debug for Ranked<'_, R, D> {
     }
 }
 
+/// Each readback in a blocking and an awaited spelling over one body.
+macro_rules! readers {
+    ($($(#[$m:meta])* fn $name:ident / $awaited:ident $([$($g:tt)*])? -> $out:ty = |$s:ident| $body:expr;)*) => {
+        impl Tensor {$(
+            $(#[$m])*
+            pub fn $name $(<$($g)*>)? (&self) -> Result<$out> {
+                let $s = self.as_slice()?;
+                $body
+            }
+            #[doc = concat!("[`Self::", stringify!($name), "`], awaited.")]
+            pub async fn $awaited $(<$($g)*>)? (&self) -> Result<$out> {
+                let $s = self.as_slice_async().await?;
+                $body
+            }
+        )*}
+    };
+}
+
+readers! {
+    /// The single element of a rank-0 value.
+    fn to_scalar / to_scalar_async [D: Element] -> D = |s| s.scalar::<D>();
+    /// Row-major host copy.
+    fn to_flat / to_flat_async [D: Element] -> Vec<D> = |s| s.to_flat::<D>();
+    /// Every element as the number it denotes, whatever the value's dtype
+    /// is. See [`TensorSlice::to_vec_f32`].
+    fn to_vec_f32 / to_vec_f32_async -> Vec<f32> = |s| s.to_vec_f32();
+    /// Flat `u32` copy.
+    fn to_vec_u32 / to_vec_u32_async -> Vec<u32> = |s| s.to_flat::<u32>();
+    /// Flat `i32` copy.
+    fn to_vec_i32 / to_vec_i32_async -> Vec<i32> = |s| s.to_flat::<i32>();
+    /// Raw bytes in the value's own dtype and layout.
+    fn to_bytes / to_bytes_async -> Vec<u8> = |s| Ok(s.bytes);
+}
+
 impl Tensor {
     /// Resolve the graph up to this value and copy it back.
     ///
@@ -395,37 +421,9 @@ impl Tensor {
         ))
     }
 
-    /// The single element of a rank-0 value.
-    pub fn to_scalar<D: Element>(&self) -> Result<D> {
-        self.as_slice()?.scalar::<D>()
-    }
-
-    /// Row-major host copy.
-    pub fn to_flat<D: Element>(&self) -> Result<Vec<D>> {
-        self.as_slice()?.to_flat::<D>()
-    }
-
-    /// Every element as the number it denotes, whatever the value's dtype is.
-    /// See [`TensorSlice::to_vec_f32`].
-    pub fn to_vec_f32(&self) -> Result<Vec<f32>> {
-        self.as_slice()?.to_vec_f32()
-    }
-    /// Flat `u32` copy.
-    pub fn to_vec_u32(&self) -> Result<Vec<u32>> {
-        self.to_flat::<u32>()
-    }
-    /// Flat `i32` copy.
-    pub fn to_vec_i32(&self) -> Result<Vec<i32>> {
-        self.to_flat::<i32>()
-    }
-    /// Raw bytes in the value's own dtype and layout.
-    pub fn to_bytes(&self) -> Result<Vec<u8>> {
-        Ok(self.as_slice()?.bytes)
-    }
-
     /// [`Self::as_slice`], awaited. The only readback that works on the
     /// web, where a buffer map completes on the browser's event loop; the
-    /// blocking forms above return an error there.
+    /// blocking forms return an error there.
     pub async fn as_slice_async(&self) -> Result<TensorSlice> {
         let facts = self.facts();
         let bytes = self.graph.read_back_async(self.id).await?;
@@ -434,29 +432,5 @@ impl Tensor {
             Layout::contiguous(&facts.shape),
             facts.dtype,
         ))
-    }
-    /// [`Self::to_scalar`], awaited.
-    pub async fn to_scalar_async<D: Element>(&self) -> Result<D> {
-        self.as_slice_async().await?.scalar::<D>()
-    }
-    /// [`Self::to_flat`], awaited.
-    pub async fn to_flat_async<D: Element>(&self) -> Result<Vec<D>> {
-        self.as_slice_async().await?.to_flat::<D>()
-    }
-    /// [`Self::to_vec_f32`], awaited.
-    pub async fn to_vec_f32_async(&self) -> Result<Vec<f32>> {
-        self.as_slice_async().await?.to_vec_f32()
-    }
-    /// [`Self::to_vec_u32`], awaited.
-    pub async fn to_vec_u32_async(&self) -> Result<Vec<u32>> {
-        self.to_flat_async::<u32>().await
-    }
-    /// [`Self::to_vec_i32`], awaited.
-    pub async fn to_vec_i32_async(&self) -> Result<Vec<i32>> {
-        self.to_flat_async::<i32>().await
-    }
-    /// [`Self::to_bytes`], awaited.
-    pub async fn to_bytes_async(&self) -> Result<Vec<u8>> {
-        Ok(self.as_slice_async().await?.bytes)
     }
 }
