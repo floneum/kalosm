@@ -184,6 +184,31 @@ pub mod support {
         read(&g).await
     }
 
+    /// Check `analytic`, the gradient of `sum(y)` with respect to
+    /// `inputs[wrt]`, against central differences. `build` rebuilds `y` from
+    /// `inputs` uploaded to a fresh probe graph, whose one plan every
+    /// perturbation reuses.
+    pub async fn check_gradient(
+        session: &Session,
+        inputs: &[(&[Dim], &[f32])],
+        wrt: usize,
+        analytic: &[f32],
+        build: impl FnOnce(&[Tensor]) -> fusor::Result<Tensor>,
+    ) -> CaseResult {
+        let graph = graph_of(session);
+        let probe = inputs
+            .iter()
+            .map(|(shape, data)| upload(graph.handle(), shape, data))
+            .collect::<Result<Vec<_>, _>>()?;
+        let loss = loss_of(&build(&probe)?)?;
+        let (shape, data) = inputs[wrt];
+        let numeric = finite_difference_gradient(&[dense_len(shape)], data, |p| {
+            read_probe_loss(&probe[wrt], &loss, p)
+        })
+        .await?;
+        assert_gradient_matches_finite_difference(analytic, &numeric)
+    }
+
     /// Forward against a host reference, then backward against central
     /// differences. The shape every elementwise case takes.
     /// `gpu_forward_tol` replaces the F32 `(absolute, relative)` bound for
@@ -219,17 +244,7 @@ pub mod support {
         }
 
         let analytic = gradient_of(&graph, &y, &x).await?;
-        let usize_shape: Vec<usize> = shape.iter().map(|n| *n as usize).collect();
-        let probe_graph = graph_of(session);
-        let probe_x = upload(probe_graph.handle(), &dimv, data)?;
-        let probe_y = build(&probe_x)?;
-        let probe_loss = loss_of(&probe_y)?;
-        let numeric = finite_difference_gradient(&usize_shape, data, |probe| {
-            read_probe_loss(&probe_x, &probe_loss, probe)
-        })
-        .await?;
-        assert_gradient_matches_finite_difference(&analytic, &numeric)?;
-        Ok(())
+        check_gradient(session, &[(&dimv, data)], 0, &analytic, |t| build(&t[0])).await
     }
 
     /// The shape a plain elementwise case fuzzes over: rank 2, both extents
@@ -271,8 +286,6 @@ pub mod support {
                 domain.sample(seed ^ 0x9e37_79b9, len),
             ];
             let dimv = dims(shape);
-            let usize_shape: Vec<usize> = shape.iter().map(|n| *n as usize).collect();
-
             let graph = graph_of(session);
             let a = upload(graph.handle(), &dimv, &data[0])?;
             let b = upload(graph.handle(), &dimv, &data[1])?;
@@ -286,19 +299,10 @@ pub mod support {
                 .collect();
             expect_values(session, shape, Dtype::F32, &actual, &expected).await?;
 
+            let inputs = [(&dimv[..], &data[0][..]), (&dimv, &data[1])];
             for (side, wrt) in [&a, &b].into_iter().enumerate() {
                 let analytic = gradient_of(&graph, &y, wrt).await?;
-                let probe_graph = graph_of(session);
-                let probe = [
-                    upload(probe_graph.handle(), &dimv, &data[0])?,
-                    upload(probe_graph.handle(), &dimv, &data[1])?,
-                ];
-                let probe_loss = loss_of(&build(&probe[0], &probe[1])?)?;
-                let numeric = finite_difference_gradient(&usize_shape, &data[side], |p| {
-                    read_probe_loss(&probe[side], &probe_loss, p)
-                })
-                .await?;
-                assert_gradient_matches_finite_difference(&analytic, &numeric)?;
+                check_gradient(session, &inputs, side, &analytic, |t| build(&t[0], &t[1])).await?;
             }
             Ok(())
         });

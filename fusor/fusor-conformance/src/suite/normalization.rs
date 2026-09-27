@@ -7,10 +7,9 @@
 use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
 
-use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
 use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims};
 use crate::suite::support::{
-    Domain, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss, upload,
+    Domain, check_gradient, expect_values, gradient_of, graph_of, read, upload,
 };
 
 /// `[rows, width]` for the finite-difference-backed cases. The ceiling stays
@@ -274,16 +273,10 @@ async fn row_case(
     expect_values(session, shape, Dtype::F32, &actual, &expected).await?;
 
     let analytic = gradient_of(&graph, &y, &x).await?;
-    let probe_graph = graph_of(session);
-    let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
-    let probe_y = build(&probe_x, width as u64)?;
-    let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[rows, width], &data, |probe| {
-        read_probe_loss(&probe_x, &probe_loss, probe)
+    check_gradient(session, &[(&dimv, &data)], 0, &analytic, |t| {
+        build(&t[0], width as u64)
     })
-    .await?;
-    assert_gradient_matches_finite_difference(&analytic, &numeric)?;
-    Ok(())
+    .await
 }
 
 /// A norm with a learned weight and optional bias. All three gradients are
@@ -321,19 +314,11 @@ async fn weighted_case(
     expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await?;
 
     let d_x = gradient_of(&graph, &y, &x).await?;
-    let probe_graph = graph_of(session);
-    let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
-    let probe_w = upload(probe_graph.handle(), &wdim, &weight)?;
-    let probe_b = with_bias
-        .then(|| upload(probe_graph.handle(), &wdim, &bias))
-        .transpose()?;
-    let probe_y = build(&probe_x, &probe_w, probe_b.as_ref())?;
-    let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[rows, width], &data, |probe| {
-        read_probe_loss(&probe_x, &probe_loss, probe)
-    })
-    .await?;
-    assert_gradient_matches_finite_difference(&d_x, &numeric)?;
+    let mut inputs = vec![(&dimv[..], &data[..]), (&wdim, &weight)];
+    if with_bias {
+        inputs.push((&wdim, &bias));
+    }
+    check_gradient(session, &inputs, 0, &d_x, |t| build(&t[0], &t[1], t.get(2))).await?;
 
     // d_weight[j] = sum over rows of normalized[r, j] — the stride-0 axis's
     // adjoint is a sum, and it is over the *rows*, not the columns.
@@ -418,16 +403,10 @@ async fn variance_case(session: &Session, shape: &[u64], seed: u32) -> CaseResul
     .await?;
 
     let analytic = gradient_of(&graph, &y, &x).await?;
-    let probe_graph = graph_of(session);
-    let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
-    let probe_y = probe_x.variance_last()?;
-    let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[rows, width], &data, |probe| {
-        read_probe_loss(&probe_x, &probe_loss, probe)
+    check_gradient(session, &[(&dimv, &data)], 0, &analytic, |t| {
+        t[0].variance_last()
     })
-    .await?;
-    assert_gradient_matches_finite_difference(&analytic, &numeric)?;
-    Ok(())
+    .await
 }
 
 /// Every softmax row sums to exactly 1 within tolerance. Cheap, but it is the

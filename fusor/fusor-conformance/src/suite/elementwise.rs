@@ -7,14 +7,11 @@
 use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
 
-use crate::compare::{
-    assert_all_zero, assert_gradient_matches_finite_difference, finite_difference_gradient,
-    relative_eq,
-};
+use crate::compare::{assert_all_zero, assert_gradient_matches_finite_difference, relative_eq};
 use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dense_len, dims, is_gpu};
 use crate::suite::support::{
-    BinaryOp, Domain, ELEMENTWISE_SPEC, UnaryOp, binary_case, comparison_case, expect_values,
-    gradient_of, graph_of, loss_of, read, read_probe_loss, unary_case, upload,
+    BinaryOp, Domain, ELEMENTWISE_SPEC, UnaryOp, binary_case, check_gradient, comparison_case,
+    expect_values, gradient_of, graph_of, read, unary_case, upload,
 };
 
 /// The forward-only rows take no gradient, so they can afford multi-workgroup
@@ -378,17 +375,8 @@ async fn broadcast_case(
         )
         .into());
     }
-    let probe_graph = graph_of(session);
-    let probe_a = upload(probe_graph.handle(), &dims(&[rows, cols]), &lhs)?;
-    let probe_b = upload(probe_graph.handle(), &dims(&[cols]), &rhs)?;
-    let probe_y = op(&probe_a, &probe_b)?;
-    let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[cols as usize], &rhs, |probe| {
-        read_probe_loss(&probe_b, &probe_loss, probe)
-    })
-    .await?;
-    assert_gradient_matches_finite_difference(&d_rhs, &numeric)?;
-    Ok(())
+    let inputs = [(&dims(&[rows, cols])[..], &lhs[..]), (&dims(&[cols]), &rhs)];
+    check_gradient(session, &inputs, 1, &d_rhs, |t| op(&t[0], &t[1])).await
 }
 
 /// A two-operand expression checked forward and on the left gradient.
@@ -418,17 +406,8 @@ async fn expr_case(
     expect_values(session, shape, Dtype::F32, &actual, &expected).await?;
 
     let analytic = gradient_of(&graph, &y, &a).await?;
-    let probe_graph = graph_of(session);
-    let probe_a = upload(probe_graph.handle(), &dimv, &lhs)?;
-    let probe_b = upload(probe_graph.handle(), &dimv, &rhs)?;
-    let probe_y = build(&probe_a, &probe_b)?;
-    let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[len], &lhs, |probe| {
-        read_probe_loss(&probe_a, &probe_loss, probe)
-    })
-    .await?;
-    assert_gradient_matches_finite_difference(&analytic, &numeric)?;
-    Ok(())
+    let inputs = [(&dimv[..], &lhs[..]), (&dimv, &rhs)];
+    check_gradient(session, &inputs, 0, &analytic, |t| build(&t[0], &t[1])).await
 }
 
 /// An approximate exponential: within `tol` of `exp` in relative terms, and

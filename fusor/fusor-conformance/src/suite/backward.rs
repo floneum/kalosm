@@ -12,10 +12,9 @@
 use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
 
-use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
 use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims};
 use crate::suite::support::{
-    Domain, ELEMENTWISE_SPEC, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss,
+    Domain, ELEMENTWISE_SPEC, check_gradient, expect_values, gradient_of, graph_of, loss_of, read,
     upload,
 };
 
@@ -36,10 +35,6 @@ fn backend_of(session: &Session) -> &'static str {
 
 fn len_of(shape: &[u64]) -> usize {
     shape.iter().product::<u64>() as usize
-}
-
-fn usize_shape(shape: &[u64]) -> Vec<usize> {
-    shape.iter().map(|n| *n as usize).collect()
 }
 
 /// The build receives the sampled shape so shape-dependent chains
@@ -186,17 +181,11 @@ async fn chain_case(
     let y = build(&x, shape).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
     let analytic = gradient_of(&graph, &y, &x).await?;
-    let probe_graph = graph_of(session);
-    let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
-    let probe_y = build(&probe_x, shape)?;
-    let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&usize_shape(shape), &data, |probe| {
-        read_probe_loss(&probe_x, &probe_loss, probe)
+    check_gradient(session, &[(&dimv, &data)], 0, &analytic, |t| {
+        build(&t[0], shape)
     })
-    .await?;
-    assert_gradient_matches_finite_difference(&analytic, &numeric)
-        .map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
-    Ok(())
+    .await
+    .map_err(|e| -> CaseError { format!("{name}: {e}").into() })
 }
 
 /// A comparison's gradient must be **present and zero**. `gradient_of`

@@ -12,10 +12,9 @@
 use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
 
-use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
 use crate::harness::{CaseResult, Cases, FuzzDim, Rng, dims};
 use crate::suite::support::{
-    Domain, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss, upload,
+    Domain, check_gradient, expect_values, gradient_of, graph_of, read, upload,
 };
 
 /// The rank-3 source spec. Every single-input case also runs a
@@ -163,16 +162,7 @@ async fn check_view(
     expect_values(session, &out_shape, Dtype::F32, &actual, &expected).await?;
 
     let analytic = gradient_of(&graph, &y, &x).await?;
-    let probe_graph = graph_of(session);
-    let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
-    let probe_y = build(&probe_x)?;
-    let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[len], &data, |probe| {
-        read_probe_loss(&probe_x, &probe_loss, probe)
-    })
-    .await?;
-    assert_gradient_matches_finite_difference(&analytic, &numeric)?;
-    Ok(())
+    check_gradient(session, &[(&dimv, &data)], 0, &analytic, |t| build(&t[0])).await
 }
 
 pub fn cases() -> Cases {
