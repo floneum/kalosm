@@ -181,14 +181,18 @@ impl CostModel for Roofline {
     ) -> Picoseconds {
         let (unit, dtype) = unit_and_dtype(ins, out, theta);
         let mut work = fusor_ir::semantics::work::work_of(&node.op, ins, out);
-        // A cooperative point issues MACs on the *padded* tile: the kernels
-        // stage zero-filled tiles and run the whole tile's MACs. The scalar
-        // tiled path masks per lane and pads nothing, as `realize` prices it.
-        if let (Some(SchedPoint::Coop { geom, .. }), Some(c)) = (
-            theta,
+        // A tiled point issues MACs on the *padded* tile: the kernels stage
+        // zero-filled tiles and run the whole tile's MACs.
+        let tile = match theta {
+            Some(SchedPoint::Coop { geom, .. }) => Some((geom.bm, geom.bn)),
+            Some(SchedPoint::Sgemm(p)) => Some((p.bm, p.bn)),
+            _ => None,
+        };
+        if let (Some((bm, bn)), Some(c)) = (
+            tile,
             Mnkb::of(&node.op, |d| d.as_const().unwrap_or(1).max(1)),
         ) {
-            let t = Tiling::new(c.m, c.n, geom.bm, geom.bn);
+            let t = Tiling::new(c.m, c.n, bm, bn);
             let extra = t
                 .padded_m()
                 .saturating_mul(t.padded_n())
