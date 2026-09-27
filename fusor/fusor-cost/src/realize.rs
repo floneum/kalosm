@@ -1115,21 +1115,9 @@ pub(crate) fn geometry(theta: Option<SchedPoint>, space: &IndexSpace, caps: &Cap
         .clamp(1, 256);
     let dims = &space.dims;
     let rank = dims.len();
-    let m = if rank >= 2 {
-        dim_extent(dims[rank - 2])
-    } else {
-        1
-    };
-    let n = if rank >= 1 {
-        dim_extent(dims[rank - 1])
-    } else {
-        1
-    };
-    let batch: u64 = dims
-        .iter()
-        .take(rank.saturating_sub(2))
-        .map(|d| dim_extent(*d))
-        .fold(1u64, |a, b| a.saturating_mul(b));
+    let back = |i: usize| rank.checked_sub(i).map_or(1, |axis| dim_extent(dims[axis]));
+    let (m, n) = (back(2), back(1));
+    let batch = extent_product(&dims[..rank.saturating_sub(2)]);
     let total = iterations_of(space);
 
     match theta {
@@ -1808,29 +1796,24 @@ pub(crate) fn fold_footprint(graph: &EGraph, id: Id) -> Option<(u64, u64)> {
     }
 }
 
-/// Whether a composite can bind its externally visible values in this graph.
+/// Whether a composite can bind its externally visible values in this graph:
+/// a slab under [`slab_layout`] judged on every reader in the graph, a group
+/// its members' buffers and distinct inputs. Memoized per graph state.
 pub(crate) fn composite_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
-    slab_bindings_fit(graph, id, caps) && group_bindings_fit(graph, id, caps)
-}
-
-struct BindingsCache {
-    arena: u64,
-    nodes: usize,
-    roots: Vec<Id>,
-    caps: Caps,
-    fits: rustc_hash::FxHashMap<Id, bool>,
-}
-
-fn cached_bindings_fit(
-    graph: &EGraph,
-    id: Id,
-    caps: &Caps,
-    compute: impl FnOnce() -> bool,
-) -> bool {
+    struct BindingsCache {
+        arena: u64,
+        nodes: usize,
+        roots: Vec<Id>,
+        caps: Caps,
+        fits: rustc_hash::FxHashMap<Id, bool>,
+    }
     thread_local! {
         static MEMO: std::cell::RefCell<Option<BindingsCache>> = const {
             std::cell::RefCell::new(None)
         };
+    }
+    if !is_composite(graph, id) {
+        return true;
     }
     let hit = MEMO.with(|memo| {
         let mut memo = memo.borrow_mut();
@@ -1853,17 +1836,20 @@ fn cached_bindings_fit(
     if let Some(fit) = hit {
         return fit;
     }
-    let fit = compute();
+    let fit = match &graph.node(id).op {
+        Op::Launch(Launch::Slab { members, .. }) => {
+            let classes: rustc_hash::FxHashSet<ClassId> =
+                members.iter().map(|m| graph.class_of(*m)).collect();
+            let shared = |m: Id| {
+                graph.any_reader(graph.class_of(m), |r| !classes.contains(&graph.class_of(r)))
+            };
+            slab_layout(graph, id, caps, graph.roots(), &shared).is_ok()
+        }
+        Op::Launch(Launch::Group { members, .. }) => group_members_fit(graph, members, caps),
+        _ => true,
+    };
     MEMO.with(|memo| memo.borrow_mut().as_mut().unwrap().fits.insert(id, fit));
     fit
-}
-
-/// Whether group `id` can bind its members' buffers and distinct inputs.
-pub(crate) fn group_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
-    let Op::Launch(Launch::Group { members, .. }) = &graph.node(id).op else {
-        return true;
-    };
-    cached_bindings_fit(graph, id, caps, || group_members_fit(graph, members, caps))
 }
 
 fn group_members_fit(graph: &EGraph, members: &[Id], caps: &Caps) -> bool {
@@ -1873,7 +1859,7 @@ fn group_members_fit(graph: &EGraph, members: &[Id], caps: &Caps) -> bool {
             inputs.extend(graph.node(*m).children.iter().map(|c| graph.class_of(*c)));
             continue;
         };
-        if !slab_bindings_fit(graph, *m, caps) {
+        if !composite_bindings_fit(graph, *m, caps) {
             return false;
         }
         let own: rustc_hash::FxHashSet<ClassId> = sm.iter().map(|s| graph.class_of(*s)).collect();
@@ -1900,21 +1886,6 @@ fn group_members_fit(graph: &EGraph, members: &[Id], caps: &Caps) -> bool {
         .filter(|m| root_classes.contains(&graph.class_of(**m)))
         .count();
     2 + outs + inputs <= caps.limits.max_storage_buffers_per_shader_stage as usize
-}
-
-/// Whether slab `id` can bind under [`slab_layout`], judged on every reader
-/// in the graph (a superset of the realized ones).
-pub(crate) fn slab_bindings_fit(graph: &EGraph, id: Id, caps: &Caps) -> bool {
-    let Op::Launch(Launch::Slab { members, .. }) = &graph.node(id).op else {
-        return true;
-    };
-    cached_bindings_fit(graph, id, caps, || {
-        let classes: rustc_hash::FxHashSet<ClassId> =
-            members.iter().map(|m| graph.class_of(*m)).collect();
-        let shared =
-            |m: Id| graph.any_reader(graph.class_of(m), |r| !classes.contains(&graph.class_of(r)));
-        slab_layout(graph, id, caps, graph.roots(), &shared).is_ok()
-    })
 }
 
 /// Whether a class binds its own storage buffer (an external leaf or a
@@ -2282,8 +2253,8 @@ pub(crate) mod tests {
         let nodes = graph.len();
         let fits = |graph: &EGraph, caps: &Caps| {
             (
-                group_bindings_fit(graph, group, caps),
-                slab_bindings_fit(graph, slab, caps),
+                composite_bindings_fit(graph, group, caps),
+                composite_bindings_fit(graph, slab, caps),
             )
         };
         assert_eq!(fits(&graph, &caps), (true, true));

@@ -263,11 +263,8 @@ pub(crate) fn dump_plan(
     if f.dump_edges {
         for (i, l) in plan.launches.iter().enumerate() {
             let op = &graph.node(l.root).op;
-            let kind = match op {
-                Op::Launch(launch) => format!("{:?}", launch.tag()),
-                Op::Logical(_) => "Logical".into(),
-                Op::Union(..) => "Union".into(),
-            };
+            // A launch root is never a union, so this is the tune-cache tag.
+            let kind = crate::extract::tag_of(op);
             let srcs: Vec<u32> = l
                 .members
                 .iter()

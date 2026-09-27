@@ -28,23 +28,37 @@ thread_local! {
     static DECODE_CACHE: RefCell<FxHashMap<DecodeKey, (u64, u64)>> = RefCell::new(FxHashMap::default());
 }
 
+fn expr(kind: TileExprKind, element: ScalarElement) -> TileExpr {
+    TileExpr::new(kind, element.element())
+}
+
 fn u32_lit(v: u32) -> TileExpr {
-    TileExpr::new(
+    expr(
         TileExprKind::Literal(TileLiteral::U32(v)),
-        ScalarElement::U32.element(),
+        ScalarElement::U32,
     )
 }
 
-fn binary(op: TileBinaryOp, left: TileExpr, right: TileExpr) -> TileExpr {
-    TileExpr::new(
+fn binary_as(
+    element: ScalarElement,
+    op: TileBinaryOp,
+    left: TileExpr,
+    right: TileExpr,
+) -> TileExpr {
+    let numeric = NumericContract::RELAXED;
+    expr(
         TileExprKind::Binary {
             op,
             left,
             right,
-            numeric: NumericContract::RELAXED,
+            numeric,
         },
-        ScalarElement::U32.element(),
+        element,
     )
+}
+
+fn binary(op: TileBinaryOp, left: TileExpr, right: TileExpr) -> TileExpr {
+    binary_as(ScalarElement::U32, op, left, right)
 }
 
 /// Scalar instructions and word loads in one lane's SGEMV reduction. Full
@@ -65,23 +79,14 @@ pub(crate) fn decode_window(key: DecodeKey) -> Result<(u64, u64)> {
 }
 
 fn decode_window_uncached(key: DecodeKey) -> Result<(u64, u64)> {
-    use fusor_ir::scalar::BinOp::{Add, Div, Min, Mul, Rem};
+    use fusor_ir::scalar::BinOp::{Add, Div, LogicalAnd, Min, Mul, Rem};
     let p = key.params;
-    let variable = |v| TileExpr::new(TileExprKind::Builtin(v), ScalarElement::U32.element());
-    let boolean = |v| {
-        TileExpr::new(
-            TileExprKind::Literal(TileLiteral::Bool(v)),
-            ScalarElement::Bool.element(),
-        )
-    };
+    let variable = |v| expr(TileExprKind::Builtin(v), ScalarElement::U32);
     let less = |left, right| {
-        TileExpr::new(
-            TileExprKind::Compare {
-                op: fusor_ir::scalar::CmpOp::Lt,
-                left,
-                right,
-            },
-            ScalarElement::Bool.element(),
+        let op = fusor_ir::scalar::CmpOp::Lt;
+        expr(
+            TileExprKind::Compare { op, left, right },
+            ScalarElement::Bool,
         )
     };
     let wg = variable(Builtin::ProgramId(WorkgroupAxis::X));
@@ -117,7 +122,7 @@ fn decode_window_uncached(key: DecodeKey) -> Result<(u64, u64)> {
         offset: 0,
         layout: storage,
     };
-    let pass_work = |step, vector, contiguous, masked| -> Result<(u64, u64)> {
+    let pass_work = |step, vector, contiguous, masked: bool| -> Result<(u64, u64)> {
         let local = if contiguous || p.cols <= 1 || p.parts <= 1 {
             binary(Mul, lane.clone(), u32_lit(vector))
         } else {
@@ -146,27 +151,17 @@ fn decode_window_uncached(key: DecodeKey) -> Result<(u64, u64)> {
                     v / p.run() * p.gap + v % p.run()
                 };
                 let k = binary(Add, lane_base.clone(), u32_lit(off));
-                let mut mask = if masked {
-                    less(k.clone(), u32_lit(key.reduction))
-                } else {
-                    boolean(true)
+                let in_k = masked.then(|| less(k.clone(), u32_lit(key.reduction)));
+                let in_n = (!key.n.is_multiple_of(p.cols.max(1)))
+                    .then(|| less(column.clone(), u32_lit(key.n)));
+                let mask = match (in_k, in_n) {
+                    (Some(a), Some(b)) => binary_as(ScalarElement::Bool, LogicalAnd, a, b),
+                    (Some(m), None) | (None, Some(m)) => m,
+                    (None, None) => expr(
+                        TileExprKind::Literal(TileLiteral::Bool(true)),
+                        ScalarElement::Bool,
+                    ),
                 };
-                if !key.n.is_multiple_of(p.cols.max(1)) {
-                    let col_ok = less(column.clone(), u32_lit(key.n));
-                    mask = if masked {
-                        TileExpr::new(
-                            TileExprKind::Binary {
-                                op: fusor_ir::scalar::BinOp::LogicalAnd,
-                                left: mask,
-                                right: col_ok,
-                                numeric: NumericContract::RELAXED,
-                            },
-                            ScalarElement::Bool.element(),
-                        )
-                    } else {
-                        col_ok
-                    };
-                }
                 let mut flat = binary(
                     Add,
                     binary(Add, row.clone(), binary(Add, batch_base.clone(), k)),
@@ -183,9 +178,9 @@ fn decode_window_uncached(key: DecodeKey) -> Result<(u64, u64)> {
                     k_base: u32_lit(0),
                     col: flat,
                     mask,
-                    fill: TileExpr::new(
+                    fill: expr(
                         TileExprKind::Literal(TileLiteral::F32(0)),
-                        ScalarElement::F32.element(),
+                        ScalarElement::F32,
                     ),
                 };
                 let decoded = (fusor_gguf::block_spec(key.fmt, key.layout).decode.emit)(&args)?;
@@ -200,7 +195,7 @@ fn decode_window_uncached(key: DecodeKey) -> Result<(u64, u64)> {
         let index = Arc::new(LocalDecl::new(ScalarElement::U32.element()));
         let step = binary(
             Mul,
-            TileExpr::new(TileExprKind::LoadLocal(index), ScalarElement::U32.element()),
+            expr(TileExprKind::LoadLocal(index), ScalarElement::U32),
             u32_lit(pass),
         );
         let full = pass_work(step, p.vector.max(1), false, false)?;

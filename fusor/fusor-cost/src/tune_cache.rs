@@ -6,18 +6,11 @@ use rustc_hash::FxHashMap;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
-/// Candidates scored worse than `best * SKIP_RATIO` are not rebuilt.
-/// Unbounded: the plan optimum is not the per-launch argmin.
-pub const SKIP_RATIO: f64 = f64::INFINITY;
-
 /// Never-measured variants one race times: the model's top K.
 pub const RACE_TOP_K: usize = 3;
 
 /// Observations one `(launch, variant)` window holds; decisions read its min.
 pub const WINDOW: usize = 8;
-
-/// Known variants one resolve re-races, best first. Unbounded.
-pub const RERACE_PER_RESOLVE: usize = usize::MAX;
 
 /// A candidate's last up-to-[`WINDOW`] timing observations, oldest first.
 /// GPU samples are launch nanoseconds; CPU samples are ppm of the base plan.
@@ -218,25 +211,13 @@ impl TuneCache {
         launch: &str,
         candidates: &'a [(String, u64)],
     ) -> (Vec<&'a String>, Vec<&'a String>) {
-        let best = self.best(launch).map(|(_, ns)| ns);
         let seen = self.seen.lock();
         let entry = seen.get(launch);
-
         let mut known: Vec<(&'a String, u64)> = Vec::new();
         let mut fresh: Vec<(&'a String, u64)> = Vec::new();
-        let mut skipped: Vec<&'a String> = Vec::new();
-
         for (c, prior) in candidates {
             match entry.and_then(|e| e.get(c.as_str())) {
-                Some(w) => {
-                    let ns = w.iter().copied().min().unwrap_or(u64::MAX);
-                    let hopeless = best.is_some_and(|b| ns as f64 > b as f64 * SKIP_RATIO);
-                    if hopeless {
-                        skipped.push(c);
-                    } else {
-                        known.push((c, ns));
-                    }
-                }
+                Some(w) => known.push((c, w.iter().copied().min().unwrap_or(u64::MAX))),
                 None => fresh.push((c, *prior)),
             }
         }
@@ -244,15 +225,10 @@ impl TuneCache {
         // Stable: a tie keeps the enumerator's believed-best first.
         fresh.sort_by_key(|a| a.1);
 
-        let mut out: Vec<&'a String> = known
-            .into_iter()
-            .take(RERACE_PER_RESOLVE)
-            .map(|(c, _)| c)
-            .collect();
-        for (c, _) in fresh.into_iter().take(RACE_TOP_K) {
-            out.push(c);
-        }
-        (out, skipped)
+        let out = known.into_iter().chain(fresh.into_iter().take(RACE_TOP_K));
+        // Every known variant re-races: the plan optimum is not the
+        // per-launch argmin, so nothing is skipped.
+        (out.map(|(c, _)| c).collect(), Vec::new())
     }
 
     /// Persist atomically, best-effort, if anything changed.

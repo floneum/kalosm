@@ -116,33 +116,17 @@ pub(crate) fn check_slabs(graph: &EGraph, plan: &Plan) -> Result<()> {
                 members.len()
             )));
         }
-        for m in members.iter() {
-            if launch_of.get(m).copied() != own {
-                let class = graph.class_of(*m);
-                return Err(Error::Plan(format!(
-                    "slab {id}'s member {m} is not in the slab's launch: member launch {:?}, \
-                     slab launch {own:?}, member materialized {}, class {} selects {:?}, \
-                     op {:?}",
-                    launch_of.get(m),
-                    plan.extraction.is_materialized(*m),
-                    class.0,
-                    plan.extraction.selected(class),
-                    graph.node(*m).op.tag(),
-                )));
-            }
+        if let Some(m) = members.iter().find(|m| launch_of.get(m).copied() != own) {
+            return Err(Error::Plan(format!(
+                "slab {id}'s member {m} is in launch {:?}, not the slab's {own:?}",
+                launch_of.get(m)
+            )));
         }
         for m in middle {
-            if plan.extraction.selected(graph.class_of(*m)) != Some(*m) {
-                let class = graph.class_of(*m);
+            let selected = plan.extraction.selected(graph.class_of(*m));
+            if selected != Some(*m) {
                 return Err(Error::Plan(format!(
-                    "slab {id} ({:?}) member {m} ({:?}) is not its class {}'s selection {:?} ({:?})",
-                    graph.node(id).op.tag(),
-                    graph.node(*m).op.tag(),
-                    class.0.index(),
-                    plan.extraction.selected(class),
-                    plan.extraction
-                        .selected(class)
-                        .map(|s| graph.node(s).op.tag()),
+                    "slab {id}'s member {m} is not its class's selection {selected:?}"
                 )));
             }
             if !plan.extraction.is_materialized(*m) {
@@ -183,11 +167,9 @@ pub(crate) fn check_operand_spaces(graph: &EGraph, plan: &Plan) -> Result<()> {
                     .all(|(l, d)| l.known_eq(*d) || l.known_eq(Dim::Const(1)));
             if !(full_rank || suffix) {
                 return Err(Error::Plan(format!(
-                    "selected {id}: fold operand {i} aliases a {:?} layout under the \
-                     {:?} index space; the fold's flat index map cannot address it. \
-                     The rule that minted this member states its operands over the \
-                     wrong space — fix the rule, do not route around the member.",
-                    shape, space.dims
+                    "selected {id}: fold operand {i} aliases a {shape:?} layout the flat index \
+                     map of space {:?} cannot address; fix the rule that minted it",
+                    space.dims
                 )));
             }
         }
@@ -220,12 +202,9 @@ pub(crate) fn check_bind_groups(plan: &Plan, caps: &Caps) -> Result<()> {
         let needed = slots.len() + 1;
         if needed > limit {
             return Err(Error::Plan(format!(
-                "launch {i} (root {}) binds {} storage buffers — {} operands plus the \
-                 Uniforms block — over the {limit}-buffer limit. A rule widened an \
-                 operand list past what this device can bind.",
-                launch.root,
-                needed,
-                launch.bindings.len()
+                "launch {i} (root {}) binds {needed} storage buffers with the uniform block, \
+                 over the {limit}-buffer limit",
+                launch.root
             )));
         }
     }
@@ -269,21 +248,10 @@ pub(crate) fn check_schedules(
                 .find(|d| d.root == id)
                 .map(|d| crate::extract::launch_signature(graph, d))
                 .unwrap_or_default();
-            let siblings: Vec<String> = graph
-                .members(graph.class_of(id))
-                .iter()
-                .map(|m| {
-                    format!(
-                        "{m:?} {} legal={} domain={:?}",
-                        crate::debug::op_tag(&graph.node(*m).op),
-                        realize::composite_bindings_fit(graph, *m, caps),
-                        domain_of(graph, *m).map(|d| d.len())
-                    )
-                })
-                .collect();
             return Err(Error::Plan(format!(
-                "{id} iterates {iters} elements, past u32 flat addressing: {what}; class members: [{}]",
-                siblings.join("; ")
+                "{id} iterates {iters} elements, past u32 flat addressing: {what}; \
+                 class members {:?}",
+                graph.members(graph.class_of(id))
             )));
         }
         let Some(domain) = domain_of(graph, id) else {

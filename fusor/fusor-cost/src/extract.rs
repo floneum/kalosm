@@ -523,18 +523,17 @@ impl LocalSearch {
         points: fn(&ScheduleDomain) -> SmallVec<[SchedPoint; 8]>,
         limit: usize,
     ) -> Vec<(String, Plan)> {
-        let Some((root, class)) = launch_target(graph, base, launch_ix, min_macs) else {
-            return Vec::new();
-        };
         // No purity guard: whether a plan may re-run is the caller's call.
-        let fair = fair_points(
+        let Some((root, class, fair)) = fair_points(
             graph,
-            class,
-            base.extraction.theta.get(&root).copied(),
-            root,
+            base,
+            launch_ix,
+            min_macs,
             points,
             limit != usize::MAX,
-        );
+        ) else {
+            return Vec::new();
+        };
         let mut out: Vec<(String, Plan)> = Vec::new();
         let mut cache = NodeCache::new(graph.len());
         for (member, theta, label) in fair {
@@ -643,15 +642,16 @@ impl Extractor for LocalSearch {
         cost: &dyn CostModel,
         min_macs: u64,
     ) -> Vec<(String, Picoseconds)> {
-        let Some((root, class)) = launch_target(graph, base, launch_ix, min_macs) else {
+        let Some((root, class, fair)) =
+            fair_points(graph, base, launch_ix, min_macs, sample_points, true)
+        else {
             return Vec::new();
         };
         let search = self.search(graph, roots, cost);
         let mut ex = base.extraction.clone();
         let mut trail = Trail::default();
         let mut cache = NodeCache::new(graph.len());
-        let here = base.extraction.theta.get(&root).copied();
-        let mut labels: Vec<_> = fair_points(graph, class, here, root, sample_points, true)
+        let mut labels: Vec<_> = fair
             .into_iter()
             .take(TUNE_MAX_VARIANTS)
             .map(|(member, theta, label)| {
@@ -693,14 +693,12 @@ impl Extractor for LocalSearch {
         let mut trail = Trail::default();
         let mut applied = false;
         for (ix, name) in swaps {
-            let Some((root, class)) = launch_target(graph, base, *ix, min_macs) else {
+            let Some((root, class, fair)) =
+                fair_points(graph, base, *ix, min_macs, sample_points, true)
+            else {
                 continue;
             };
-            let here = base.extraction.theta.get(&root).copied();
-            let Some((member, theta, _)) =
-                fair_points(graph, class, here, root, sample_points, true)
-                    .into_iter()
-                    .find(|(_, _, label)| label == name)
+            let Some((member, theta, _)) = fair.into_iter().find(|(_, _, label)| label == name)
             else {
                 continue;
             };
@@ -711,12 +709,6 @@ impl Extractor for LocalSearch {
         }
         self.replan_extraction(graph, roots, &mut ex, cost).ok()
     }
-}
-
-/// Launch `ix`'s root and its class, when its work reaches `min_macs`.
-fn launch_target(graph: &EGraph, base: &Plan, ix: usize, min_macs: u64) -> Option<(Id, ClassId)> {
-    let root = base.launches.get(ix)?.root;
-    (launch_work(graph, base, ix) >= min_macs).then(|| (root, graph.class_of(root)))
 }
 
 /// Select `member` for `class` unless it is the incumbent `root`, then
@@ -1201,16 +1193,24 @@ pub fn incumbent_signature(graph: &EGraph, plan: &Plan, launch_ix: usize) -> Opt
     })
 }
 
-/// Every `(member, point, label)` a launch's class offers, round-robin over
-/// members, one per label, excluding the incumbent's own point.
+/// Launch `ix`'s root, its class, and every `(member, point, label)` the
+/// class offers, round-robin over members, one per label, excluding the
+/// incumbent's own point; `None` when its work is under `min_macs`.
+#[allow(clippy::type_complexity)]
 fn fair_points(
     graph: &EGraph,
-    class: ClassId,
-    here: Option<SchedPoint>,
-    root: Id,
+    base: &Plan,
+    ix: usize,
+    min_macs: u64,
     points: fn(&ScheduleDomain) -> SmallVec<[SchedPoint; 8]>,
     deduplicate_labels: bool,
-) -> Vec<(Id, SchedPoint, String)> {
+) -> Option<(Id, ClassId, Vec<(Id, SchedPoint, String)>)> {
+    let root = base.launches.get(ix)?.root;
+    if launch_work(graph, base, ix) < min_macs {
+        return None;
+    }
+    let class = graph.class_of(root);
+    let here = base.extraction.theta.get(&root).copied();
     let per_member: Vec<(Id, SmallVec<[SchedPoint; 8]>)> = graph
         .members(class)
         .into_iter()
@@ -1239,7 +1239,7 @@ fn fair_points(
             fair.push((*member, theta, label));
         }
     }
-    fair
+    Some((root, class, fair))
 }
 
 fn variant_signature(graph: &EGraph, member: Id, theta: SchedPoint) -> String {
@@ -1254,7 +1254,7 @@ fn variant_signature(graph: &EGraph, member: Id, theta: SchedPoint) -> String {
 }
 
 /// An op's family as the tune cache files it.
-fn tag_of(op: &Op) -> String {
+pub(crate) fn tag_of(op: &Op) -> String {
     match op {
         Op::Launch(launch) => format!("{:?}", launch.tag()),
         Op::Logical(_) => "Logical".to_string(),

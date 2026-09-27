@@ -157,17 +157,18 @@ fn pack_arena(
         let mut next = 1u32;
         for b in &mut l.bindings {
             b.arena = in_arena.contains(&b.value);
-            b.binding = if b.arena {
+            if b.arena {
                 b.kind = BindKind::ReadWrite;
-                *arena_binding.get_or_insert_with(|| {
-                    let n = next;
+            }
+            b.binding = match arena_binding {
+                Some(shared) if b.arena => shared,
+                _ => {
                     next += 1;
-                    n
-                })
-            } else {
-                let n = next;
-                next += 1;
-                n
+                    if b.arena {
+                        arena_binding = Some(next - 1);
+                    }
+                    next - 1
+                }
             };
         }
     }
@@ -238,31 +239,21 @@ fn derive_bindings(
     // An in-place value is bound once, read-write; it must not appear twice.
     reads.retain(|r| !writes.contains(r));
 
-    let mut out = Vec::with_capacity(reads.len() + writes.len());
-    let mut binding = 1u32;
-    for value in reads {
-        out.push(BindingPlan {
-            binding,
-            value,
-            kind: BindKind::Read,
-            arena: false,
-        });
-        binding += 1;
-    }
-    for value in writes {
-        let kind = match graph.semantics().effect(&graph.node(value).op) {
-            Effect::InPlace(_) => BindKind::ReadWrite,
-            Effect::Pure => BindKind::Write,
-        };
-        out.push(BindingPlan {
+    let write_kind = |value: Id| match graph.semantics().effect(&graph.node(value).op) {
+        Effect::InPlace(_) => BindKind::ReadWrite,
+        Effect::Pure => BindKind::Write,
+    };
+    let kinds = (reads.into_iter().map(|v| (v, BindKind::Read)))
+        .chain(writes.into_iter().map(|v| (v, write_kind(v))));
+    Ok(kinds
+        .zip(1u32..)
+        .map(|((value, kind), binding)| BindingPlan {
             binding,
             value,
             kind,
             arena: false,
-        });
-        binding += 1;
-    }
-    Ok(out)
+        })
+        .collect())
 }
 
 /// Logical strides and allocation extent for a selected node; cooperative
