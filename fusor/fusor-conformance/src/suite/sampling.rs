@@ -12,7 +12,7 @@ use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
 
 use crate::harness::{
-    CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fill_indices, fuzz_case, member_sweep,
+    CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fill_indices, member_sweep,
 };
 use crate::suite::support::{Domain, expect_values, graph_of, read, upload};
 
@@ -60,104 +60,68 @@ fn upload_logits(session: &Session, values: &[f32]) -> Result<(fusor::Graph, Ten
 }
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
-    cases.push_case(fuzz_case(
-        "sampling",
-        "top_k_pairs_k1",
-        TOP_K_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            top_k_case(s, shape[0] as usize, 1, seed).await
-        },
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    let mut cases = Cases::new("sampling");
+    cases.fuzz("top_k_pairs_k1", TOP_K_SPEC, async move |s, shape, seed| {
+        top_k_case(s, shape[0] as usize, 1, seed).await
+    });
+    cases.fuzz(
         "top_k_pairs_sampled_k",
         TOP_K_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
+        async move |s, shape, seed| {
             let vocab = shape[0] as usize;
             let k = Rng::new(seed ^ 0x5eed).range(1, vocab as u64) as usize;
             top_k_case(s, vocab, k, seed).await
         },
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    );
+    cases.fuzz(
         "top_k_pairs_full_vocabulary",
         TOP_K_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            top_k_case(s, shape[0] as usize, shape[0] as usize, seed).await
-        },
-    ));
-    cases.push(
-        "sampling",
-        "top_k_pairs_breaks_ties_by_larger_token_id",
-        tie_rule,
+        async move |s, shape, seed| top_k_case(s, shape[0] as usize, shape[0] as usize, seed).await,
     );
-    cases.push_case(fuzz_case(
-        "sampling",
-        "sample_standard_token",
-        VOCAB_SPEC,
-        standard_case,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    cases.push("top_k_pairs_breaks_ties_by_larger_token_id", tie_rule);
+    cases.fuzz("sample_standard_token", VOCAB_SPEC, standard_case);
+    cases.fuzz(
         "sample_standard_token_at_zero_temperature_is_the_argmax",
         VOCAB_SPEC,
         greedy_case,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    );
+    cases.fuzz(
         "sample_standard_token_respects_top_k",
         VOCAB_SPEC,
         top_k_filter,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    );
+    cases.fuzz(
         "sample_standard_token_respects_top_p",
         VOCAB_SPEC,
         top_p_filter,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    );
+    cases.fuzz(
         "sample_standard_token_respects_min_p",
         VOCAB_SPEC,
         min_p_filter,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    );
+    cases.fuzz(
         "sample_standard_token_applies_the_repetition_penalty",
         VOCAB_SPEC,
         repetition_case,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    );
+    cases.fuzz(
         "sample_standard_token_is_seed_deterministic",
         SEED_SPEC,
         seed_case,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
-        "sample_mirostat2_token",
-        VOCAB_SPEC,
-        mirostat_case,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
-        "sample_mirostat2_token_updates_mu",
-        VOCAB_SPEC,
-        mirostat_mu,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    );
+    cases.fuzz("sample_mirostat2_token", VOCAB_SPEC, mirostat_case);
+    cases.fuzz("sample_mirostat2_token_updates_mu", VOCAB_SPEC, mirostat_mu);
+    cases.fuzz(
         "sample_standard_token_pending_stays_on_device",
         VOCAB_SPEC,
         pending_standard,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    );
+    cases.fuzz(
         "sample_mirostat2_token_pending_stays_on_device",
         VOCAB_SPEC,
         pending_mirostat,
-    ));
+    );
     cases
 }
 

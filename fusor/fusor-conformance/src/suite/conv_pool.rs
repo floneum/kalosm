@@ -10,7 +10,7 @@ use fusor::composite::{
 use fusor::{Dim, Dtype, Session};
 
 use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
-use crate::harness::{CaseResult, Cases, FuzzDim, dims, fuzz_case};
+use crate::harness::{CaseResult, Cases, FuzzDim, dims};
 use crate::suite::support::{
     Domain, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss, upload,
 };
@@ -69,52 +69,26 @@ const UPSAMPLE_SPEC: &[FuzzDim] = &[
 ];
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
-    cases.push_case(fuzz_case("conv_pool", "conv1d", CONV1D_SPEC, conv1d));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "conv2d_strided",
-        CONV2D_SPEC,
-        conv2d_strided,
-    ));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "grouped_conv",
-        GROUPED_CONV_SPEC,
-        grouped_conv,
-    ));
-    cases.push_case(fuzz_case(
-        "conv_pool",
+    let mut cases = Cases::new("conv_pool");
+    cases.fuzz("conv1d", CONV1D_SPEC, conv1d);
+    cases.fuzz("conv2d_strided", CONV2D_SPEC, conv2d_strided);
+    cases.fuzz("grouped_conv", GROUPED_CONV_SPEC, grouped_conv);
+    cases.fuzz(
         "conv2d_overlapping_input_gradient",
         OVERLAP_GRAD_SPEC,
         conv2d_overlapping_input_gradient,
-    ));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "pool",
-        POOL_SPEC,
-        async move |s: &Session, sh: &[u64], seed: u32| pool_case(s, Pool::Avg, sh, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "pool_max",
-        POOL_SPEC,
-        async move |s: &Session, sh: &[u64], seed: u32| pool_case(s, Pool::Max, sh, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "pool_min",
-        POOL_SPEC,
-        async move |s: &Session, sh: &[u64], seed: u32| pool_case(s, Pool::Min, sh, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "upsample_nearest2d",
-        UPSAMPLE_SPEC,
-        upsample_nearest2d,
-    ));
+    );
+    cases.fuzz("pool", POOL_SPEC, async move |s, sh, seed| {
+        pool_case(s, Pool::Avg, sh, seed).await
+    });
+    cases.fuzz("pool_max", POOL_SPEC, async move |s, sh, seed| {
+        pool_case(s, Pool::Max, sh, seed).await
+    });
+    cases.fuzz("pool_min", POOL_SPEC, async move |s, sh, seed| {
+        pool_case(s, Pool::Min, sh, seed).await
+    });
+    cases.fuzz("upsample_nearest2d", UPSAMPLE_SPEC, upsample_nearest2d);
     cases.push(
-        "conv_pool",
         "pool_max_non_overlapping_adjoint_is_mask",
         non_overlapping_adjoint_is_mask,
     );

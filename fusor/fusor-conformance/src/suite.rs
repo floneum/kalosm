@@ -24,9 +24,8 @@ use crate::harness::Cases;
 
 /// Every case, in a fixed area order.
 pub fn registry() -> Cases {
-    let mut all = Cases::new();
     // First: nothing below is interpretable while these fail.
-    all.extend(smoke::cases());
+    let mut all = smoke::cases();
     all.extend(elementwise::cases());
     all.extend(reductions::cases());
     all.extend(multi_slot::cases());
@@ -57,8 +56,7 @@ pub mod support {
         self, assert_gradient_matches_finite_difference, finite_difference_gradient,
     };
     use crate::harness::{
-        Case, CaseError, CaseResult, FuzzDim, dense_len, dims, fill, fill_range, from_f32,
-        fuzz_case,
+        CaseError, CaseResult, Cases, FuzzDim, dense_len, dims, fill, fill_range, from_f32,
     };
 
     /// A unary op, as the case table names it.
@@ -242,87 +240,68 @@ pub mod support {
     /// One unary elementwise case: forward parity plus a finite-difference
     /// backward, at a fresh shape per run.
     pub fn unary_case(
-        area: &'static str,
+        cases: &mut Cases,
         name: &'static str,
-        spec: &'static [FuzzDim],
         domain: Domain,
         build: UnaryOp,
         reference: fn(f32) -> f32,
         gpu_forward_tol: Option<(f32, f32)>,
-    ) -> Case {
-        fuzz_case(
-            area,
-            name,
-            spec,
-            async move |session: &Session, shape: &[u64], seed: u32| {
-                let data = domain.sample(seed, dense_len(&dims(shape)));
-                check_unary(session, shape, &data, &build, &reference, gpu_forward_tol).await
-            },
-        )
+    ) {
+        cases.fuzz(name, ELEMENTWISE_SPEC, async move |session, shape, seed| {
+            let data = domain.sample(seed, dense_len(&dims(shape)));
+            check_unary(session, shape, &data, &build, &reference, gpu_forward_tol).await
+        });
     }
 
     /// One binary elementwise case over two same-shape operands. Both
     /// gradients are checked: a rule that forgets `d_rhs` still passes a
     /// forward-only comparison.
     pub fn binary_case(
-        area: &'static str,
+        cases: &mut Cases,
         name: &'static str,
-        spec: &'static [FuzzDim],
         domain: Domain,
         build: BinaryOp,
         reference: fn(f32, f32) -> f32,
-    ) -> Case {
-        fuzz_case(
-            area,
-            name,
-            spec,
-            async move |session: &Session, shape: &[u64], seed: u32| {
-                let len = dense_len(&dims(shape));
-                // Offset the rhs seed so the two operand streams are unrelated.
-                let lhs = domain.sample(seed, len);
-                let rhs = domain.sample(seed ^ 0x9e37_79b9, len);
-                let dimv = dims(shape);
-                let usize_shape: Vec<usize> = shape.iter().map(|n| *n as usize).collect();
+    ) {
+        cases.fuzz(name, ELEMENTWISE_SPEC, async move |session, shape, seed| {
+            let len = dense_len(&dims(shape));
+            // Offset the rhs seed so the two operand streams are unrelated.
+            let data = [
+                domain.sample(seed, len),
+                domain.sample(seed ^ 0x9e37_79b9, len),
+            ];
+            let dimv = dims(shape);
+            let usize_shape: Vec<usize> = shape.iter().map(|n| *n as usize).collect();
 
-                let graph = graph_of(session);
-                let a = upload(graph.handle(), &dimv, &lhs)?;
-                let b = upload(graph.handle(), &dimv, &rhs)?;
-                let y = build(&a, &b)?;
+            let graph = graph_of(session);
+            let a = upload(graph.handle(), &dimv, &data[0])?;
+            let b = upload(graph.handle(), &dimv, &data[1])?;
+            let y = build(&a, &b)?;
 
-                let actual = read(&y).await?;
-                let expected: Vec<f32> = lhs
-                    .iter()
-                    .zip(&rhs)
-                    .map(|(x, y)| reference(*x, *y))
-                    .collect();
-                expect_values(session, shape, Dtype::F32, &actual, &expected).await?;
+            let actual = read(&y).await?;
+            let expected: Vec<f32> = data[0]
+                .iter()
+                .zip(&data[1])
+                .map(|(x, y)| reference(*x, *y))
+                .collect();
+            expect_values(session, shape, Dtype::F32, &actual, &expected).await?;
 
-                let d_lhs = gradient_of(&graph, &y, &a).await?;
-                let lhs_graph = graph_of(session);
-                let lhs_a = upload(lhs_graph.handle(), &dimv, &lhs)?;
-                let lhs_b = upload(lhs_graph.handle(), &dimv, &rhs)?;
-                let lhs_y = build(&lhs_a, &lhs_b)?;
-                let lhs_loss = loss_of(&lhs_y)?;
-                let numeric_lhs = finite_difference_gradient(&usize_shape, &lhs, |probe| {
-                    read_probe_loss(&lhs_a, &lhs_loss, probe)
+            for (side, wrt) in [&a, &b].into_iter().enumerate() {
+                let analytic = gradient_of(&graph, &y, wrt).await?;
+                let probe_graph = graph_of(session);
+                let probe = [
+                    upload(probe_graph.handle(), &dimv, &data[0])?,
+                    upload(probe_graph.handle(), &dimv, &data[1])?,
+                ];
+                let probe_loss = loss_of(&build(&probe[0], &probe[1])?)?;
+                let numeric = finite_difference_gradient(&usize_shape, &data[side], |p| {
+                    read_probe_loss(&probe[side], &probe_loss, p)
                 })
                 .await?;
-                assert_gradient_matches_finite_difference(&d_lhs, &numeric_lhs)?;
-
-                let d_rhs = gradient_of(&graph, &y, &b).await?;
-                let rhs_graph = graph_of(session);
-                let rhs_a = upload(rhs_graph.handle(), &dimv, &lhs)?;
-                let rhs_b = upload(rhs_graph.handle(), &dimv, &rhs)?;
-                let rhs_y = build(&rhs_a, &rhs_b)?;
-                let rhs_loss = loss_of(&rhs_y)?;
-                let numeric_rhs = finite_difference_gradient(&usize_shape, &rhs, |probe| {
-                    read_probe_loss(&rhs_b, &rhs_loss, probe)
-                })
-                .await?;
-                assert_gradient_matches_finite_difference(&d_rhs, &numeric_rhs)?;
-                Ok(())
-            },
-        )
+                assert_gradient_matches_finite_difference(&analytic, &numeric)?;
+            }
+            Ok(())
+        });
     }
 
     /// One comparison case.
@@ -331,41 +310,35 @@ pub mod support {
     /// dtype, and the backward must produce an all-zero gradient — not an
     /// absent rule.
     pub fn comparison_case(
-        area: &'static str,
+        cases: &mut Cases,
         name: &'static str,
         build: UnaryOp,
         reference: fn(f32) -> f32,
-    ) -> Case {
-        fuzz_case(
-            area,
-            name,
-            ELEMENTWISE_SPEC,
-            async move |session: &Session, shape: &[u64], seed: u32| {
-                let data = Domain::Wide.sample(seed, dense_len(&dims(shape)));
-                let dimv = dims(shape);
-                let graph = graph_of(session);
-                let x = upload(graph.handle(), &dimv, &data)?;
-                let y = build(&x)?;
+    ) {
+        cases.fuzz(name, ELEMENTWISE_SPEC, async move |session, shape, seed| {
+            let data = Domain::Wide.sample(seed, dense_len(&dims(shape)));
+            let graph = graph_of(session);
+            let x = upload(graph.handle(), &dims(shape), &data)?;
+            let y = build(&x)?;
 
-                let actual = read(&y).await?;
-                let expected: Vec<f32> = data.iter().copied().map(reference).collect();
-                expect_values(session, shape, Dtype::F32, &actual, &expected).await?;
-                if let Some((i, v)) = actual
-                    .iter()
-                    .enumerate()
-                    .find(|(_, v)| **v != 0.0 && **v != 1.0)
-                {
-                    return Err(format!(
-                        "{name}: comparison {i} produced {v}; booleans are 1.0/0.0 in the \
+            let actual = read(&y).await?;
+            let expected: Vec<f32> = data.iter().copied().map(reference).collect();
+            expect_values(session, shape, Dtype::F32, &actual, &expected).await?;
+            if let Some((i, v)) = actual
+                .iter()
+                .enumerate()
+                .find(|(_, v)| **v != 0.0 && **v != 1.0)
+            {
+                return Err(format!(
+                    "{name}: comparison {i} produced {v}; booleans are 1.0/0.0 in the \
                      operand's own dtype — there is no bool"
-                    )
-                    .into());
-                }
+                )
+                .into());
+            }
 
-                let grad = gradient_of(&graph, &y, &x).await?;
-                compare::assert_all_zero(name, &grad)?;
-                Ok(())
-            },
-        )
+            let grad = gradient_of(&graph, &y, &x).await?;
+            compare::assert_all_zero(name, &grad)?;
+            Ok(())
+        });
     }
 }

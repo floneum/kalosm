@@ -14,7 +14,7 @@ use fusor_gguf::repack;
 use fusor_ir::dtype::{QFmt, QLayout};
 use half::f16;
 
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, from_u32, fuzz_case};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, from_u32};
 use crate::suite::support::{Domain, expect_values, graph_of, read, upload};
 
 /// Rows of the quantized weight in the fixed cases. One block per row keeps
@@ -140,7 +140,7 @@ fn matrix_from_parts(
 }
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
+    let mut cases = Cases::new("quantized");
 
     for fmt in QFmt::ALL {
         for layout in [QLayout::Native, QLayout::F32Scales] {
@@ -149,14 +149,9 @@ pub fn cases() -> Cases {
                 fmt_name(fmt),
                 layout_name(layout)
             ));
-            cases.push_case(fuzz_case(
-                "quantized",
-                name,
-                DEQUANT_SPEC,
-                async move |s: &Session, shape: &[u64], seed: u32| {
-                    dequantize_case(s, fmt, layout, shape, seed).await
-                },
-            ));
+            cases.fuzz(name, DEQUANT_SPEC, async move |s, shape, seed| {
+                dequantize_case(s, fmt, layout, shape, seed).await
+            });
         }
     }
     // The same decode forced through the `Restride` + `Map` expansion, with
@@ -171,49 +166,37 @@ pub fn cases() -> Cases {
                 continue;
             }
             let name = format!("dequantize_defn_{}_{}", fmt_name(fmt), layout_name(layout));
-            cases.push("quantized", name, async move |s: &Session| {
+            cases.push(name, async move |s: &Session| {
                 dequantize_defn_case(s, fmt, layout).await
             });
         }
     }
     for fmt in QFmt::ALL {
         let name = leak(format!("qmatmul_{}", fmt_name(fmt)));
-        cases.push_case(fuzz_case(
-            "quantized",
-            name,
-            QMATMUL_SPEC,
-            async move |s: &Session, shape: &[u64], seed: u32| {
-                qmatmul_case(s, fmt, shape, seed).await
-            },
-        ));
+        cases.fuzz(name, QMATMUL_SPEC, async move |s, shape, seed| {
+            qmatmul_case(s, fmt, shape, seed).await
+        });
     }
     for fmt in QFmt::ALL {
         let name = leak(format!("repack_round_trip_{}", fmt_name(fmt)));
-        cases.push_case(fuzz_case(
-            "quantized",
-            name,
-            REPACK_SPEC,
-            async move |s: &Session, shape: &[u64], seed: u32| {
-                repack_case(s, fmt, shape, seed).await
-            },
-        ));
+        cases.fuzz(name, REPACK_SPEC, async move |s, shape, seed| {
+            repack_case(s, fmt, shape, seed).await
+        });
     }
 
-    cases.push_case(fuzz_case(
-        "quantized",
+    cases.fuzz(
         "both_layouts_decode_to_the_same_values",
         LAYOUTS_SPEC,
         layouts_agree,
-    ));
-    cases.push_case(fuzz_case(
-        "quantized",
+    );
+    cases.fuzz(
         "q_mat_mul_backward_reaches_the_activation_only",
         BACKWARD_SPEC,
         qmatmul_backward,
-    ));
+    );
     for fmt in QFmt::ALL {
         let name = format!("qmatmul_coop_shape_{}", fmt_name(fmt));
-        cases.push("quantized", name, async move |s: &Session| {
+        cases.push(name, async move |s: &Session| {
             qmatmul_coop_shape(s, fmt).await
         });
     }
@@ -229,23 +212,18 @@ pub fn cases() -> Cases {
                 fmt_name(fmt),
                 layout_name(layout)
             );
-            cases.push("quantized", name, async move |s: &Session| {
+            cases.push(name, async move |s: &Session| {
                 defn_coop_shape(s, fmt, layout).await
             });
         }
     }
     cases.push(
-        "quantized",
         "qgemv_grid_past_the_dimension_cap",
         qgemv_grid_past_the_dimension_cap,
     );
-    cases.push("quantized", "index_select_rows", index_select_rows);
-    cases.push("quantized", "concat_rows", concat_rows);
-    cases.push(
-        "quantized",
-        "qmatrix_load_orientation",
-        qmatrix_load_orientation,
-    );
+    cases.push("index_select_rows", index_select_rows);
+    cases.push("concat_rows", concat_rows);
+    cases.push("qmatrix_load_orientation", qmatrix_load_orientation);
     cases
 }
 

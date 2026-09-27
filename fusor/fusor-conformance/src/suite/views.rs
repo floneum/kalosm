@@ -13,7 +13,7 @@ use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
 
 use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
-use crate::harness::{CaseResult, Cases, FuzzDim, Rng, dims, fuzz_case};
+use crate::harness::{CaseResult, Cases, FuzzDim, Rng, dims};
 use crate::suite::support::{
     Domain, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss, upload,
 };
@@ -176,105 +176,79 @@ async fn check_view(
 }
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
+    let mut cases = Cases::new("views");
 
-    cases.push_case(fuzz_case(
-        "views",
-        "narrow",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            let c = shape[2];
-            let mut rng = Rng::new(seed ^ 0x5eed);
-            let len = rng.range(1, c) as usize;
-            let start = rng.range(0, c - len as u64) as usize;
-            check_view(s, shape, seed, &|x| x.narrow(2, start, len), &|d| {
-                ref_slice(d, shape, 2, start, len)
-            })
-            .await
-        },
-    ));
+    cases.fuzz("narrow", SPEC3, async move |s, shape, seed| {
+        let c = shape[2];
+        let mut rng = Rng::new(seed ^ 0x5eed);
+        let len = rng.range(1, c) as usize;
+        let start = rng.range(0, c - len as u64) as usize;
+        check_view(s, shape, seed, &|x| x.narrow(2, start, len), &|d| {
+            ref_slice(d, shape, 2, start, len)
+        })
+        .await
+    });
 
-    cases.push_case(fuzz_case(
-        "views",
-        "expand",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            let e = Rng::new(seed ^ 0x5eed).range(2, 5);
-            let (a, b, c) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
-            check_view(
-                s,
-                shape,
-                seed,
-                &|x| {
-                    x.unsqueeze(1)?
-                        .broadcast_as(&dims(&[shape[0], e, shape[1], shape[2]]))
-                },
-                &|d| {
-                    let mut out = Vec::with_capacity(a * e as usize * b * c);
-                    for i in 0..a {
-                        for _ in 0..e {
-                            out.extend_from_slice(&d[i * b * c..(i + 1) * b * c]);
-                        }
+    cases.fuzz("expand", SPEC3, async move |s, shape, seed| {
+        let e = Rng::new(seed ^ 0x5eed).range(2, 5);
+        let (a, b, c) = (shape[0] as usize, shape[1] as usize, shape[2] as usize);
+        check_view(
+            s,
+            shape,
+            seed,
+            &|x| {
+                x.unsqueeze(1)?
+                    .broadcast_as(&dims(&[shape[0], e, shape[1], shape[2]]))
+            },
+            &|d| {
+                let mut out = Vec::with_capacity(a * e as usize * b * c);
+                for i in 0..a {
+                    for _ in 0..e {
+                        out.extend_from_slice(&d[i * b * c..(i + 1) * b * c]);
                     }
-                    (vec![shape[0], e, shape[1], shape[2]], out)
-                },
-            )
-            .await
-        },
-    ));
-
-    cases.push_case(fuzz_case(
-        "views",
-        "repeat",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            let r = Rng::new(seed ^ 0x5eed).range(2, 3) as usize;
-            check_view(s, shape, seed, &|x| x.repeat(&[r, 1, 1]), &|d| {
-                let mut out = Vec::with_capacity(r * d.len());
-                for _ in 0..r {
-                    out.extend_from_slice(d);
                 }
-                (vec![r as u64 * shape[0], shape[1], shape[2]], out)
-            })
-            .await
-        },
-    ));
+                (vec![shape[0], e, shape[1], shape[2]], out)
+            },
+        )
+        .await
+    });
+
+    cases.fuzz("repeat", SPEC3, async move |s, shape, seed| {
+        let r = Rng::new(seed ^ 0x5eed).range(2, 3) as usize;
+        check_view(s, shape, seed, &|x| x.repeat(&[r, 1, 1]), &|d| {
+            let mut out = Vec::with_capacity(r * d.len());
+            for _ in 0..r {
+                out.extend_from_slice(d);
+            }
+            (vec![r as u64 * shape[0], shape[1], shape[2]], out)
+        })
+        .await
+    });
 
     // Any factorization of the element count is a legal resize; `[c, a*b]`
     // differs from every flatten below.
-    cases.push_case(fuzz_case(
-        "views",
-        "resize",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            check_view(
-                s,
-                shape,
-                seed,
-                &|x| x.reshape_dims(&dims(&[shape[2], shape[0] * shape[1]])),
-                &|d| (vec![shape[2], shape[0] * shape[1]], d.to_vec()),
-            )
-            .await
-        },
-    ));
+    cases.fuzz("resize", SPEC3, async move |s, shape, seed| {
+        check_view(
+            s,
+            shape,
+            seed,
+            &|x| x.reshape_dims(&dims(&[shape[2], shape[0] * shape[1]])),
+            &|d| (vec![shape[2], shape[0] * shape[1]], d.to_vec()),
+        )
+        .await
+    });
 
-    cases.push_case(fuzz_case(
-        "views",
-        "restride",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            check_view(s, shape, seed, &|x| x.permute(&[2, 0, 1]), &|d| {
-                ref_permute(d, shape, &[2, 0, 1])
-            })
-            .await
-        },
-    ));
+    cases.fuzz("restride", SPEC3, async move |s, shape, seed| {
+        check_view(s, shape, seed, &|x| x.permute(&[2, 0, 1]), &|d| {
+            ref_permute(d, shape, &[2, 0, 1])
+        })
+        .await
+    });
 
-    cases.push_case(fuzz_case(
-        "views",
+    cases.fuzz(
         "restride_strided_overlap",
         SPEC3_OVERLAP,
-        async move |s: &Session, shape: &[u64], seed: u32| {
+        async move |s, shape, seed| {
             let c = shape[2];
             let w = Rng::new(seed ^ 0x5eed).range(2, c - 1);
             check_view(s, shape, seed, &|x| x.windows(2, w as u32, 1), &|d| {
@@ -282,43 +256,32 @@ pub fn cases() -> Cases {
             })
             .await
         },
-    ));
+    );
 
-    cases.push_case(fuzz_case(
-        "views",
-        "restride_layout",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            check_view(s, shape, seed, &|x| x.transpose(0, 2), &|d| {
-                ref_permute(d, shape, &[2, 1, 0])
-            })
-            .await
-        },
-    ));
+    cases.fuzz("restride_layout", SPEC3, async move |s, shape, seed| {
+        check_view(s, shape, seed, &|x| x.transpose(0, 2), &|d| {
+            ref_permute(d, shape, &[2, 1, 0])
+        })
+        .await
+    });
 
     // Step == window: every element appears exactly once.
-    cases.push_case(fuzz_case(
-        "views",
-        "sliding_window_view",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            let w = Rng::new(seed ^ 0x5eed).range(1, shape[2]);
-            check_view(
-                s,
-                shape,
-                seed,
-                &|x| x.windows(2, w as u32, w as u32),
-                &|d| ref_windows(d, shape, w as usize, w as usize),
-            )
-            .await
-        },
-    ));
+    cases.fuzz("sliding_window_view", SPEC3, async move |s, shape, seed| {
+        let w = Rng::new(seed ^ 0x5eed).range(1, shape[2]);
+        check_view(
+            s,
+            shape,
+            seed,
+            &|x| x.windows(2, w as u32, w as u32),
+            &|d| ref_windows(d, shape, w as usize, w as usize),
+        )
+        .await
+    });
 
-    cases.push_case(fuzz_case(
-        "views",
+    cases.fuzz(
         "sliding_window_view_strided",
         SPEC3_WIN,
-        async move |s: &Session, shape: &[u64], seed: u32| {
+        async move |s, shape, seed| {
             let mut rng = Rng::new(seed ^ 0x5eed);
             let w = rng.range(2, shape[2]);
             let step = rng.range(1, w);
@@ -331,150 +294,95 @@ pub fn cases() -> Cases {
             )
             .await
         },
-    ));
+    );
 
-    cases.push_case(fuzz_case(
-        "views",
-        "squeeze",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            check_view(s, shape, seed, &|x| x.unsqueeze(1)?.squeeze(1), &|d| {
-                (shape.to_vec(), d.to_vec())
-            })
-            .await
-        },
-    ));
+    cases.fuzz("squeeze", SPEC3, async move |s, shape, seed| {
+        check_view(s, shape, seed, &|x| x.unsqueeze(1)?.squeeze(1), &|d| {
+            (shape.to_vec(), d.to_vec())
+        })
+        .await
+    });
 
-    cases.push_case(fuzz_case(
-        "views",
-        "squeeze_dims",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            check_view(
-                s,
-                shape,
-                seed,
-                &|x| x.unsqueeze(0)?.unsqueeze(2)?.squeeze(2)?.squeeze(0),
-                &|d| (shape.to_vec(), d.to_vec()),
-            )
-            .await
-        },
-    ));
+    cases.fuzz("squeeze_dims", SPEC3, async move |s, shape, seed| {
+        check_view(
+            s,
+            shape,
+            seed,
+            &|x| x.unsqueeze(0)?.unsqueeze(2)?.squeeze(2)?.squeeze(0),
+            &|d| (shape.to_vec(), d.to_vec()),
+        )
+        .await
+    });
 
-    cases.push_case(fuzz_case(
-        "views",
-        "unsqueeze",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            check_view(s, shape, seed, &|x| x.unsqueeze(1), &|d| {
-                (vec![shape[0], 1, shape[1], shape[2]], d.to_vec())
-            })
-            .await
-        },
-    ));
+    cases.fuzz("unsqueeze", SPEC3, async move |s, shape, seed| {
+        check_view(s, shape, seed, &|x| x.unsqueeze(1), &|d| {
+            (vec![shape[0], 1, shape[1], shape[2]], d.to_vec())
+        })
+        .await
+    });
 
-    cases.push_case(fuzz_case(
-        "views",
-        "unsqueeze_dims",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            check_view(s, shape, seed, &|x| x.unsqueeze(0)?.unsqueeze(4), &|d| {
-                (vec![1, shape[0], shape[1], shape[2], 1], d.to_vec())
-            })
-            .await
-        },
-    ));
+    cases.fuzz("unsqueeze_dims", SPEC3, async move |s, shape, seed| {
+        check_view(s, shape, seed, &|x| x.unsqueeze(0)?.unsqueeze(4), &|d| {
+            (vec![1, shape[0], shape[1], shape[2], 1], d.to_vec())
+        })
+        .await
+    });
 
-    cases.push_case(fuzz_case(
-        "views",
-        "flatten_all",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            check_view(s, shape, seed, &|x| x.flatten_all(), &|d| {
-                (vec![shape[0] * shape[1] * shape[2]], d.to_vec())
-            })
-            .await
-        },
-    ));
+    cases.fuzz("flatten_all", SPEC3, async move |s, shape, seed| {
+        check_view(s, shape, seed, &|x| x.flatten_all(), &|d| {
+            (vec![shape[0] * shape[1] * shape[2]], d.to_vec())
+        })
+        .await
+    });
 
-    cases.push_case(fuzz_case(
-        "views",
-        "flatten_first_n",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            check_view(s, shape, seed, &|x| x.flatten(0, 1), &|d| {
-                (vec![shape[0] * shape[1], shape[2]], d.to_vec())
-            })
-            .await
-        },
-    ));
+    cases.fuzz("flatten_first_n", SPEC3, async move |s, shape, seed| {
+        check_view(s, shape, seed, &|x| x.flatten(0, 1), &|d| {
+            (vec![shape[0] * shape[1], shape[2]], d.to_vec())
+        })
+        .await
+    });
 
-    cases.push_case(fuzz_case(
-        "views",
-        "flatten_last_n",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            check_view(s, shape, seed, &|x| x.flatten(1, 2), &|d| {
-                (vec![shape[0], shape[1] * shape[2]], d.to_vec())
-            })
-            .await
-        },
-    ));
+    cases.fuzz("flatten_last_n", SPEC3, async move |s, shape, seed| {
+        check_view(s, shape, seed, &|x| x.flatten(1, 2), &|d| {
+            (vec![shape[0], shape[1] * shape[2]], d.to_vec())
+        })
+        .await
+    });
 
-    cases.push_case(fuzz_case(
-        "views",
-        "pad_axis",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            let mut rng = Rng::new(seed ^ 0x5eed);
-            let lo = rng.range(0, 2) as usize;
-            let hi = rng.range(0, 2) as usize;
-            check_view(s, shape, seed, &|x| x.pad_with_zeros(2, lo, hi), &|d| {
-                ref_pad(d, shape, 2, lo, hi)
-            })
-            .await
-        },
-    ));
+    cases.fuzz("pad_axis", SPEC3, async move |s, shape, seed| {
+        let mut rng = Rng::new(seed ^ 0x5eed);
+        let lo = rng.range(0, 2) as usize;
+        let hi = rng.range(0, 2) as usize;
+        check_view(s, shape, seed, &|x| x.pad_with_zeros(2, lo, hi), &|d| {
+            ref_pad(d, shape, 2, lo, hi)
+        })
+        .await
+    });
 
-    cases.push_case(fuzz_case(
-        "views",
-        "pad_with_zeros",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            let mut rng = Rng::new(seed ^ 0x5eed);
-            let lo = rng.range(0, 2) as usize;
-            let hi = rng.range(0, 2) as usize;
-            check_view(s, shape, seed, &|x| x.pad_with_zeros(0, lo, hi), &|d| {
-                ref_pad(d, shape, 0, lo, hi)
-            })
-            .await
-        },
-    ));
+    cases.fuzz("pad_with_zeros", SPEC3, async move |s, shape, seed| {
+        let mut rng = Rng::new(seed ^ 0x5eed);
+        let lo = rng.range(0, 2) as usize;
+        let hi = rng.range(0, 2) as usize;
+        check_view(s, shape, seed, &|x| x.pad_with_zeros(0, lo, hi), &|d| {
+            ref_pad(d, shape, 0, lo, hi)
+        })
+        .await
+    });
 
-    cases.push_case(fuzz_case(
-        "views",
-        "t",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            check_view(s, shape, seed, &|x| x.transpose(1, 2), &|d| {
-                ref_permute(d, shape, &[0, 2, 1])
-            })
-            .await
-        },
-    ));
+    cases.fuzz("t", SPEC3, async move |s, shape, seed| {
+        check_view(s, shape, seed, &|x| x.transpose(1, 2), &|d| {
+            ref_permute(d, shape, &[0, 2, 1])
+        })
+        .await
+    });
 
-    cases.push_case(fuzz_case(
-        "views",
-        "chunk",
-        SPEC3,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            let len = Rng::new(seed ^ 0x5eed).range(1, shape[1]) as usize;
-            check_view(s, shape, seed, &|x| x.narrow(1, 0, len), &|d| {
-                ref_slice(d, shape, 1, 0, len)
-            })
-            .await
-        },
-    ));
+    cases.fuzz("chunk", SPEC3, async move |s, shape, seed| {
+        let len = Rng::new(seed ^ 0x5eed).range(1, shape[1]) as usize;
+        check_view(s, shape, seed, &|x| x.narrow(1, 0, len), &|d| {
+            ref_slice(d, shape, 1, 0, len)
+        })
+        .await
+    });
 
     // `cat` along each of the three axes, at both ranks the reference covers.
     // The two operands' extents along the cat axis are sampled independently.
@@ -485,47 +393,27 @@ pub fn cases() -> Cases {
         FuzzDim::Range(1, 4),
         FuzzDim::Range(1, 4),
     ];
-    cases.push_case(fuzz_case(
-        "views",
-        "cat_rank1",
-        CAT1,
-        async move |s: &Session, shape: &[u64], seed: u32| cat_case(s, shape, 0, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "views",
-        "cat_rank2",
-        CAT2,
-        async move |s: &Session, shape: &[u64], seed: u32| cat_case(s, shape, 0, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "views",
-        "cat_dim0",
-        CAT3,
-        async move |s: &Session, shape: &[u64], seed: u32| cat_case(s, shape, 0, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "views",
-        "cat_dim1",
-        CAT3,
-        async move |s: &Session, shape: &[u64], seed: u32| cat_case(s, shape, 1, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "views",
-        "cat_dim2",
-        CAT3,
-        async move |s: &Session, shape: &[u64], seed: u32| cat_case(s, shape, 2, seed).await,
-    ));
+    cases.fuzz("cat_rank1", CAT1, async move |s, shape, seed| {
+        cat_case(s, shape, 0, seed).await
+    });
+    cases.fuzz("cat_rank2", CAT2, async move |s, shape, seed| {
+        cat_case(s, shape, 0, seed).await
+    });
+    cases.fuzz("cat_dim0", CAT3, async move |s, shape, seed| {
+        cat_case(s, shape, 0, seed).await
+    });
+    cases.fuzz("cat_dim1", CAT3, async move |s, shape, seed| {
+        cat_case(s, shape, 1, seed).await
+    });
+    cases.fuzz("cat_dim2", CAT3, async move |s, shape, seed| {
+        cat_case(s, shape, 2, seed).await
+    });
 
     const STACK: &[FuzzDim] = &[FuzzDim::Range(1, 4), FuzzDim::Range(1, 6)];
-    cases.push_case(fuzz_case("views", "stack", STACK, stack_case));
+    cases.fuzz("stack", STACK, stack_case);
 
     const SLICE_ASSIGN: &[FuzzDim] = &[FuzzDim::Range(2, 5), FuzzDim::Range(2, 8)];
-    cases.push_case(fuzz_case(
-        "views",
-        "slice_assign",
-        SLICE_ASSIGN,
-        slice_assign_case,
-    ));
+    cases.fuzz("slice_assign", SLICE_ASSIGN, slice_assign_case);
 
     cases
 }

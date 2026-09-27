@@ -8,7 +8,7 @@ use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
 
 use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fuzz_case};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims};
 use crate::suite::support::{
     Domain, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss, upload,
 };
@@ -118,38 +118,27 @@ fn layer_norm_bare(x: &Tensor, width: u64, remove_mean: bool) -> fusor::Result<T
 }
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
+    let mut cases = Cases::new("normalization");
 
     for (name, build, reference) in plain_rows() {
-        cases.push_case(fuzz_case(
-            "normalization",
-            name,
-            FD_SPEC,
-            async move |s: &Session, shape: &[u64], seed: u32| {
-                row_case(s, shape, seed, name, build, reference).await
-            },
-        ));
+        cases.fuzz(name, FD_SPEC, async move |s, shape, seed| {
+            row_case(s, shape, seed, name, build, reference).await
+        });
     }
 
     // The weighted spellings. Each is checked against `normalized * w (+ b)`
     // with a *non-constant* weight, so a lowering that drops the affine is a
     // value failure rather than a no-op.
-    cases.push_case(fuzz_case(
-        "normalization",
-        "rms_norm",
-        FD_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            weighted_case(s, shape, seed, "rms_norm", host_rms, false, |x, w, _| {
-                x.rms_norm(w, EPS)
-            })
-            .await
-        },
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
+    cases.fuzz("rms_norm", FD_SPEC, async move |s, shape, seed| {
+        weighted_case(s, shape, seed, "rms_norm", host_rms, false, |x, w, _| {
+            x.rms_norm(w, EPS)
+        })
+        .await
+    });
+    cases.fuzz(
         "rms_norm_with_bias",
         FD_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
+        async move |s, shape, seed| {
             weighted_case(
                 s,
                 shape,
@@ -161,29 +150,23 @@ pub fn cases() -> Cases {
             )
             .await
         },
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
-        "layer_norm_fused",
-        FD_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            weighted_case(
-                s,
-                shape,
-                seed,
-                "layer_norm_fused",
-                host_layer_centered,
-                true,
-                |x, w, b| x.layer_norm(w, b, EPS, true),
-            )
-            .await
-        },
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
+    );
+    cases.fuzz("layer_norm_fused", FD_SPEC, async move |s, shape, seed| {
+        weighted_case(
+            s,
+            shape,
+            seed,
+            "layer_norm_fused",
+            host_layer_centered,
+            true,
+            |x, w, b| x.layer_norm(w, b, EPS, true),
+        )
+        .await
+    });
+    cases.fuzz(
         "layer_norm_no_bias",
         FD_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
+        async move |s, shape, seed| {
             weighted_case(
                 s,
                 shape,
@@ -195,55 +178,31 @@ pub fn cases() -> Cases {
             )
             .await
         },
-    ));
+    );
 
-    cases.push_case(fuzz_case(
-        "normalization",
-        "rms_norm_residual",
-        BWD_SPEC,
-        residual_case,
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
-        "variance_last",
-        FD_SPEC,
-        variance_case,
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
-        "softmax_rows_sum_to_one",
-        FWD_SPEC,
-        rows_sum_to_one,
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
-        "softmax_is_shift_invariant",
-        FWD_SPEC,
-        shift_invariance,
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
+    cases.fuzz("rms_norm_residual", BWD_SPEC, residual_case);
+    cases.fuzz("variance_last", FD_SPEC, variance_case);
+    cases.fuzz("softmax_rows_sum_to_one", FWD_SPEC, rows_sum_to_one);
+    cases.fuzz("softmax_is_shift_invariant", FWD_SPEC, shift_invariance);
+    cases.fuzz(
         "softmax_backward_is_the_analytic_jacobian",
         BWD_SPEC,
         softmax_backward,
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
+    );
+    cases.fuzz(
         "welford_agrees_with_the_two_pass_variance",
         WELFORD_SPEC,
         welford_carrier,
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
+    );
+    cases.fuzz(
         "layer_norm_sum_gradient_is_zero",
         BWD_SPEC,
         layer_norm_sum_gradient_is_zero,
-    ));
-    cases.push_case(fuzz_case(
-        "normalization",
+    );
+    cases.fuzz(
         "layer_norm_wide_rows",
         &[FuzzDim::Fixed(128), FuzzDim::Fixed(512)],
-        async |session: &Session, shape: &[u64], seed: u32| {
+        async |session, shape, seed| {
             // Match the benchmark's wide rows, including its split statistics
             // and private intermediates, against independent host arithmetic.
             let graph = graph_of(session);
@@ -254,7 +213,7 @@ pub fn cases() -> Cases {
             let expected = by_row(&data, shape[1] as usize, host_layer_centered);
             expect_values(session, shape, Dtype::F32, &actual, &expected).await
         },
-    ));
+    );
     cases
 }
 

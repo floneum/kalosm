@@ -15,8 +15,7 @@ use fusor::{Dtype, Session};
 use half::{bf16, f16};
 
 use crate::harness::{
-    CaseError, CaseResult, Cases, FuzzDim, dims, fill_indices, fill_range, from_u32, fuzz_case,
-    skip,
+    CaseError, CaseResult, Cases, FuzzDim, dims, fill_indices, fill_range, from_u32, skip,
 };
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
 
@@ -107,21 +106,16 @@ async fn integral(seed: u32, len: usize) -> Vec<f32> {
 }
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
+    let mut cases = Cases::new("dtypes");
 
     // A round trip through every dense dtype: upload, read back, compare
     // against the host's own quantization of the same values.
     for dtype in DENSE {
         let dtype = *dtype;
         let name = leak(format!("roundtrip_{}", dtype_name(dtype)));
-        cases.push_case(fuzz_case(
-            "dtypes",
-            name,
-            SPEC,
-            async move |s: &Session, shape: &[u64], seed: u32| {
-                roundtrip_case(s, dtype, shape, seed).await
-            },
-        ));
+        cases.fuzz(name, SPEC, async move |s, shape, seed| {
+            roundtrip_case(s, dtype, shape, seed).await
+        });
     }
 
     // Every ordered pair of dense dtypes.
@@ -132,55 +126,36 @@ pub fn cases() -> Cases {
             }
             let (from, to) = (*from, *to);
             let name = leak(format!("cast_{}_to_{}", dtype_name(from), dtype_name(to)));
-            cases.push_case(fuzz_case(
-                "dtypes",
-                name,
-                SPEC,
-                async move |s: &Session, shape: &[u64], seed: u32| {
-                    cast_case(s, from, to, shape, seed).await
-                },
-            ));
+            cases.fuzz(name, SPEC, async move |s, shape, seed| {
+                cast_case(s, from, to, shape, seed).await
+            });
         }
     }
 
-    cases.push_case(fuzz_case(
-        "dtypes",
+    cases.fuzz(
         "cast_backward_returns_to_the_master_dtype",
         SPEC,
         cast_backward,
-    ));
-    cases.push_case(fuzz_case(
-        "dtypes",
+    );
+    cases.fuzz(
         "cast_round_trip_through_f16_is_stable",
         SPEC,
         f16_round_trip,
-    ));
-    cases.push_case(fuzz_case(
-        "dtypes",
-        "arithmetic_in_every_float_dtype",
-        SPEC,
-        float_arithmetic,
-    ));
-    cases.push_case(fuzz_case(
-        "dtypes",
+    );
+    cases.fuzz("arithmetic_in_every_float_dtype", SPEC, float_arithmetic);
+    cases.fuzz(
         "comparison_returns_the_operand_dtype",
         SPEC,
         comparison_dtype,
-    ));
-    cases.push_case(fuzz_case("dtypes", "rem_is_u32_only", SPEC, rem_u32_only));
-    cases.push_case(fuzz_case("dtypes", "round_modes", SPEC, round_modes));
-    cases.push_case(fuzz_case(
-        "dtypes",
-        "float_to_int_and_back",
-        SPEC,
-        float_int_round_trip,
-    ));
-    cases.push_case(fuzz_case(
-        "dtypes",
+    );
+    cases.fuzz("rem_is_u32_only", SPEC, rem_u32_only);
+    cases.fuzz("round_modes", SPEC, round_modes);
+    cases.fuzz("float_to_int_and_back", SPEC, float_int_round_trip);
+    cases.fuzz(
         "sum_widens_its_accumulator",
         ACCUM_SPEC,
         widening_accumulator,
-    ));
+    );
     cases
 }
 

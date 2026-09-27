@@ -11,7 +11,7 @@ use crate::compare::{
     assert_all_zero, assert_gradient_matches_finite_difference, finite_difference_gradient,
     relative_eq,
 };
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dense_len, dims, fuzz_case, is_gpu};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dense_len, dims, is_gpu};
 use crate::suite::support::{
     BinaryOp, Domain, ELEMENTWISE_SPEC, UnaryOp, binary_case, comparison_case, expect_values,
     gradient_of, graph_of, loss_of, read, read_probe_loss, unary_case, upload,
@@ -186,148 +186,103 @@ fn gpu_forward_tolerance(name: &str) -> Option<(f32, f32)> {
 }
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
+    let mut cases = Cases::new("elementwise");
 
     for (name, domain, op, reference) in unaries() {
-        cases.push_case(unary_case(
-            "elementwise",
-            name,
-            ELEMENTWISE_SPEC,
-            domain,
-            op,
-            reference,
-            gpu_forward_tolerance(name),
-        ));
+        let tol = gpu_forward_tolerance(name);
+        unary_case(&mut cases, name, domain, op, reference, tol);
     }
     for (name, domain, op, reference) in scalar_arith() {
-        cases.push_case(unary_case(
-            "elementwise",
-            name,
-            ELEMENTWISE_SPEC,
-            domain,
-            op,
-            reference,
-            None,
-        ));
+        unary_case(&mut cases, name, domain, op, reference, None);
     }
     for (name, domain, op, reference) in forward_only() {
-        cases.push_case(fuzz_case(
-            "elementwise",
-            name,
-            FORWARD_SPEC,
-            async move |session: &Session, shape: &[u64], seed: u32| {
-                let data = domain.sample(seed, dense_len(&dims(shape)));
-                non_vacuous(name, &data, reference)?;
-                let graph = graph_of(session);
-                let x = upload(graph.handle(), &dims(shape), &data)?;
-                let y = op(&x)?;
-                let expected: Vec<f32> = data.iter().copied().map(reference).collect();
-                expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await
-            },
-        ));
+        cases.fuzz(name, FORWARD_SPEC, async move |session, shape, seed| {
+            let data = domain.sample(seed, dense_len(&dims(shape)));
+            non_vacuous(name, &data, reference)?;
+            let graph = graph_of(session);
+            let x = upload(graph.handle(), &dims(shape), &data)?;
+            let y = op(&x)?;
+            let expected: Vec<f32> = data.iter().copied().map(reference).collect();
+            expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await
+        });
     }
     for (name, domain, op, reference) in binaries() {
-        cases.push_case(binary_case(
-            "elementwise",
-            name,
-            ELEMENTWISE_SPEC,
-            domain,
-            op,
-            reference,
-        ));
+        binary_case(&mut cases, name, domain, op, reference);
     }
     for (name, op, reference) in scalar_comparisons() {
-        cases.push_case(comparison_case("elementwise", name, op, reference));
+        comparison_case(&mut cases, name, op, reference);
     }
     for (name, op, reference) in tensor_comparisons() {
-        cases.push_case(fuzz_case(
-            "elementwise",
-            name,
-            ELEMENTWISE_SPEC,
-            async move |session: &Session, shape: &[u64], seed: u32| {
-                tensor_comparison_case(session, name, shape, seed, op, reference).await
-            },
-        ));
+        cases.fuzz(name, ELEMENTWISE_SPEC, async move |session, shape, seed| {
+            tensor_comparison_case(session, name, shape, seed, op, reference).await
+        });
     }
     for (name, op, reference) in broadcasting() {
-        cases.push_case(fuzz_case(
-            "elementwise",
-            name,
-            ELEMENTWISE_SPEC,
-            async move |session: &Session, shape: &[u64], seed: u32| {
-                broadcast_case(session, shape, seed, op, reference).await
-            },
-        ));
+        cases.fuzz(name, ELEMENTWISE_SPEC, async move |session, shape, seed| {
+            broadcast_case(session, shape, seed, op, reference).await
+        });
     }
 
     // The two GPU-approximate exponentials get a relative bound rather than
     // an elementwise reference.
-    cases.push_case(fuzz_case(
-        "elementwise",
+    cases.fuzz(
         "approximate_exp",
         ELEMENTWISE_SPEC,
-        async move |session: &Session, shape: &[u64], seed: u32| {
+        async move |session, shape, seed| {
             approximate_exp_case(session, "approximate_exp", shape, seed, 5e-3).await
         },
-    ));
-    cases.push_case(fuzz_case(
-        "elementwise",
+    );
+    cases.fuzz(
         "less_approximate_exp",
         ELEMENTWISE_SPEC,
-        async move |session: &Session, shape: &[u64], seed: u32| {
+        async move |session, shape, seed| {
             approximate_exp_case(session, "less_approximate_exp", shape, seed, 5e-2).await
         },
-    ));
+    );
 
     // The two elementwise extrema, whose adjoint is a mask rather than zero.
-    cases.push_case(binary_case(
-        "elementwise",
+    binary_case(
+        &mut cases,
         "max_elementwise",
-        ELEMENTWISE_SPEC,
         Domain::Wide,
         |a, b| a.maximum(b),
         f32::max,
-    ));
-    cases.push_case(binary_case(
-        "elementwise",
+    );
+    binary_case(
+        &mut cases,
         "min_elementwise",
-        ELEMENTWISE_SPEC,
         Domain::Wide,
         |a, b| a.minimum(b),
         f32::min,
-    ));
+    );
 
     // A chained expression is a different `ScalarExpr::compose` shape than a
     // single op.
-    cases.push_case(fuzz_case(
-        "elementwise",
+    cases.fuzz(
         "std_ops_add_sub",
         ELEMENTWISE_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
+        async move |s, shape, seed| {
             expr_case(s, shape, seed, |a, b| a.add(b)?.sub(b), |x, y| (x + y) - y).await
         },
-    ));
-    cases.push_case(fuzz_case(
-        "elementwise",
+    );
+    cases.fuzz(
         "std_ops_mul_div",
         ELEMENTWISE_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
+        async move |s, shape, seed| {
             expr_case(s, shape, seed, |a, b| a.mul(b)?.div(b), |x, y| (x * y) / y).await
         },
-    ));
-    cases.push_case(fuzz_case(
-        "elementwise",
+    );
+    cases.fuzz(
         "std_ops_neg",
         ELEMENTWISE_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
+        async move |s, shape, seed| {
             expr_case(s, shape, seed, |a, b| a.neg()?.sub(b), |x, y| -x - y).await
         },
-    ));
-    cases.push_case(fuzz_case(
-        "elementwise",
+    );
+    cases.fuzz(
         "std_ops_scalar",
         ELEMENTWISE_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
+        async move |s, shape, seed| {
             expr_case(
                 s,
                 shape,
@@ -337,14 +292,9 @@ pub fn cases() -> Cases {
             )
             .await
         },
-    ));
+    );
 
-    cases.push_case(fuzz_case(
-        "elementwise",
-        "where_cond",
-        ELEMENTWISE_SPEC,
-        where_cond_case,
-    ));
+    cases.fuzz("where_cond", ELEMENTWISE_SPEC, where_cond_case);
     cases
 }
 
