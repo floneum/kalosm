@@ -1,11 +1,6 @@
-//! Uniformity analysis. A bottom-up classification of every [`TileExpr`],
-//! then a statement walk carrying a predicate-uniformity stack. A `Barrier`
-//! (or `StorageBarrier`) under a non-uniform predicate is
-//! [`LowerError::NonUniformBarrier`][fusor_ir::ir::kernel::LowerError::NonUniformBarrier].
-//!
-//! The classification is conservative in the direction that fails lowering
-//! rather than racing: mutable or lane-indexed memory reads, lane-indexed
-//! builtins, subgroup collectives and cooperative fragments are `NonUniform`.
+//! Uniformity analysis: classify every [`TileExpr`], then walk statements
+//! with a predicate-uniformity stack; a barrier under a non-uniform predicate
+//! fails lowering. Unknowns classify `NonUniform`.
 
 use fusor_ir::Result;
 use fusor_ir::error::Error;
@@ -16,8 +11,7 @@ use fusor_ir::ir::kernel::{
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::sync::Arc;
 
-/// Whether a value is provably identical across every invocation of the
-/// group. Unknown is treated as `NonUniform`.
+/// Whether a value is identical across the group; unknown is `NonUniform`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Uniformity {
     Uniform,
@@ -50,8 +44,7 @@ struct Ctx {
 
 impl Ctx {
     fn local(&self, local: &Local) -> Uniformity {
-        // A local nothing ever assigns is a malformed kernel; treat it as
-        // non-uniform so it can never license a barrier.
+        // An unassigned local is malformed; it never licenses a barrier.
         self.locals
             .get(&local_key(local))
             .copied()
@@ -77,8 +70,7 @@ impl Ctx {
                 | Builtin::NumWorkgroups(_)
                 | Builtin::SubgroupSize
                 | Builtin::NumSubgroups => Uniformity::Uniform,
-                // `SubgroupId` is uniform only *within* a subgroup, so at
-                // workgroup scope it is not.
+                // `SubgroupId` is not uniform at workgroup scope.
                 Builtin::Lane | Builtin::SubgroupLane | Builtin::SubgroupId => {
                     Uniformity::NonUniform
                 }
@@ -111,8 +103,7 @@ impl Ctx {
     }
 }
 
-/// A `Barrier` may not appear under an `If` whose predicate is non-uniform
-/// over the group.
+/// A `Barrier` may not appear under a non-uniform `If`.
 pub(crate) fn verify_uniformity(ir: &KernelIr) -> Result<()> {
     let mut ctx = Ctx {
         writable_bindings: ir
@@ -167,9 +158,8 @@ fn collect_assignments(
     }
 }
 
-/// Fixpoint: start every assigned local `Uniform` and downgrade it the moment
-/// any assignment is non-uniform. Monotone, so it terminates; a loop-carried
-/// local settles after at most one extra pass per dependency edge.
+/// Fixpoint: assigned locals start `Uniform` and downgrade on any
+/// non-uniform assignment. Monotone, so it terminates.
 fn classify_locals(body: &[Stmt], ctx: &mut Ctx) {
     let mut assignments = Vec::new();
     let mut counters = Vec::new();
@@ -220,9 +210,7 @@ fn walk_stmt(stmt: &Stmt, enclosing: Uniformity, ctx: &mut Ctx, path: &mut Vec<u
             }
             Ok(())
         }
-        // A workgroup reduction lowers to a staged tree with a barrier
-        // between every level. Those barriers are emitted, not written, so they
-        // are checked here at the statement that produces them.
+        // A workgroup reduction emits barriers between tree levels; check them here.
         Stmt::Reduce { kind, .. } => {
             if matches!(kind.as_ref(), ReduceKind::Workgroup { .. })
                 && enclosing == Uniformity::NonUniform
@@ -244,8 +232,7 @@ fn walk_stmt(stmt: &Stmt, enclosing: Uniformity, ctx: &mut Ctx, path: &mut Vec<u
             walk(reject, inner, ctx, path)
         }
         Stmt::Loop { count, body, .. } => {
-            // A loop whose trip count differs per lane makes its body
-            // divergent for barrier purposes.
+            // A per-lane trip count makes the body divergent.
             let inner = match count {
                 Some(count) => enclosing.meet(ctx.classify(count)),
                 None => enclosing,

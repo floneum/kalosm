@@ -1,9 +1,5 @@
-//! Packing binding 0. It holds `[u32 symbolic dims..., f32 uniform scalars...]`
-//! and is a storage buffer, because the derived
-//! bind-group mechanism walks storage globals.
-//!
-//! Binding 0 carries symbolic dimensions and scalars that would otherwise
-//! need to be baked literals or constants.
+//! Packing binding 0: `[u32 symbolic dims..., f32 uniform scalars...]`, a
+//! storage buffer so the derived bind-group mechanism sees it.
 
 use fusor_ir::Result;
 use fusor_ir::error::Error;
@@ -12,10 +8,8 @@ use fusor_ir::shape::{Dim, SymId};
 use fusor_ir::target::Uniforms;
 use rustc_hash::FxHashMap;
 
-/// The word layout of binding 0 for one plan, plus the packer that fills it.
-///
-/// The layout is a function of the *plan* alone — never of a binding — so a
-/// sequence-length change re-fills the same words and recompiles nothing.
+/// The word layout of binding 0 for one plan: a function of the plan alone,
+/// so a sequence-length change recompiles nothing.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct UniformPack {
     /// Symbols carried as `u32` extents, in `Plan::symbols` order.
@@ -27,11 +21,8 @@ pub(crate) struct UniformPack {
 }
 
 impl UniformPack {
-    /// The word layout's identity is its dimension and scalar symbol order.
-    ///
-    /// A kernel body bakes these slot indices, which is why an artifact's
-    /// cache key carries this and not `Plan::symbols`: two plans that agree
-    /// on the pack emit the same words whatever else differs between them.
+    /// The layout's identity: its dim and scalar symbol order, which kernel bodies
+    /// bake as slot indices.
     pub(crate) fn digest(&self) -> u64 {
         use std::hash::{Hash, Hasher};
         let mut h = rustc_hash::FxHasher::default();
@@ -40,13 +31,8 @@ impl UniformPack {
         h.finish()
     }
 
-    /// Derive the word layout of binding 0 from a plan.
-    ///
-    /// A symbol appears in exactly one of the two groups: `scalar_syms` when
-    /// the plan names it a runtime scalar (a `Leaf::Uniform`), `dim_syms`
-    /// otherwise — an extent, a view offset, a stride — whether or not any
-    /// buffer layout mentions it. The classification is a property of the
-    /// plan, so it does not move when a value does.
+    /// Derive binding 0's word layout from a plan. A symbol is a scalar when the
+    /// plan names it a `Leaf::Uniform`, else a dim.
     pub(crate) fn new(plan: &Plan) -> Self {
         let mut dim_syms = Vec::new();
         let mut scalar_syms = Vec::new();

@@ -1,5 +1,4 @@
-//! 64-byte-aligned buffers, so a `f32x16` load is never split across a cache
-//! line and a workgroup tile can be addressed as a raw byte arena.
+//! 64-byte-aligned buffers: SIMD loads never split a cache line.
 
 use fusor_ir::Result;
 use fusor_ir::error::Error;
@@ -11,11 +10,9 @@ pub struct AlignedBuf {
     len: usize,
 }
 
-// SAFETY: `AlignedBuf` owns its allocation exclusively; there is no interior
-// mutability and no shared aliasing, so moving it across threads is sound.
+// SAFETY: exclusive ownership, no interior mutability.
 unsafe impl Send for AlignedBuf {}
-// SAFETY: `&AlignedBuf` only exposes read-only access to owned bytes, plus
-// [`AlignedBuf::as_mut_ptr`], whose contract is documented there.
+// SAFETY: read-only access, plus [`AlignedBuf::as_mut_ptr`] (see its contract).
 unsafe impl Sync for AlignedBuf {}
 
 impl AlignedBuf {
@@ -36,16 +33,6 @@ impl AlignedBuf {
             return Err(Error::Device(format!("out of memory allocating {len} B")));
         }
         Ok(Self { ptr, len })
-    }
-
-    /// Grow in place-ish: reallocate zeroed when `len` exceeds the current
-    /// capacity, otherwise keep the existing allocation.
-    pub fn ensure(&mut self, len: usize) -> Result<()> {
-        if len <= self.len {
-            return Ok(());
-        }
-        *self = Self::zeroed(len)?;
-        Ok(())
     }
 
     pub fn len(&self) -> usize {
@@ -76,13 +63,8 @@ impl AlignedBuf {
         self.ptr
     }
 
-    /// Aliasing escape hatch for the launcher: a dispatch hands the same
-    /// `&AlignedBuf` to every worker thread and each writes its own disjoint
-    /// slice. Disjointness is discharged by `verify_launch` (a nest's write
-    /// map must be injective unless it declares an associative combine)
-    /// before a kernel reaches the launcher. Cross-lane accumulation
-    /// goes through `Program`'s private-accumulate-then-merge
-    /// path.
+    /// Aliasing escape hatch: every worker gets the same buffer and writes a
+    /// disjoint slice, which `verify_launch` proves before launch.
     pub fn as_mut_ptr(&self) -> *mut u8 {
         self.ptr
     }

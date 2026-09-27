@@ -1,26 +1,15 @@
-//! Kernel expressions -> SIMD lane operations at a statically-known width.
-//!
-//! This is the SSA tape. One [`Instr`] per distinct `TileExprKind` node, one
-//! register slot per node; flattening the hash-consed DAG in topological order
-//! is the CSE.
-//!
-//! The register file is `[u32; W]` with `W` a const generic resolved once per
-//! launch, so an `MxN` register accumulator tile is expressible.
-//!
-//! `ElementType::Scalar(F16|BF16)` loads widen to `F32` registers and stores
-//! narrow: the emitter half of the `widen-compute` rule.
+//! Kernel expressions -> the SSA tape: one [`Instr`] and register slot per
+//! distinct node over a `[u32; W]` register file. F16/BF16 widen to F32 on load
+//! and narrow on store.
 
 use fusor_ir::dtype::RoundMode;
 use fusor_ir::ir::kernel::ScalarElement;
 use fusor_ir::scalar::{BinOp, CmpOp, UnOp};
 
-use super::access::AccessForm;
-
 /// A tape register index.
 pub(crate) type Slot = u32;
 
-/// Compute type of a register. Storage-only narrow floats never appear: they
-/// widen on load and narrow on store.
+/// Compute type of a register; narrow floats widen on load.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum NumTy {
     F32,
@@ -39,8 +28,7 @@ impl NumTy {
     }
 }
 
-/// One tape instruction. `out` is the base register slot; a vector-typed
-/// result occupies `out .. out + lanes`.
+/// One tape instruction; a vector result occupies `out .. out + lanes`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Instr {
     /// Bit pattern splatted across the register.
@@ -61,8 +49,7 @@ pub enum Instr {
         out: Slot,
         local: u16,
     },
-    /// Masked load. `index` is a per-lane element index; `form` is the access
-    /// lowering chosen once at compile time from the layout.
+    /// Masked load.
     Load {
         out: Slot,
         buf: u16,
@@ -70,7 +57,6 @@ pub enum Instr {
         index: Slot,
         mask: Slot,
         fill: Slot,
-        form: AccessForm,
     },
     LoadTile {
         out: Slot,
@@ -91,9 +77,7 @@ pub enum Instr {
         b: Slot,
         ty: NumTy,
     },
-    /// A contracted `a * b + c`. Minted only when the operand's
-    /// `NumericContract::contract` is set; a strict value emits separate
-    /// `Bin{Mul}` and `Bin{Add}` instructions.
+    /// A contracted `a * b + c`, minted only when `NumericContract::contract` is set.
     Fma {
         out: Slot,
         a: Slot,
@@ -130,8 +114,7 @@ pub enum Instr {
         from: NumTy,
         to: NumTy,
     },
-    /// Narrow to a storage element and widen straight back — what a `Cast` to
-    /// `F16`/`BF16` means when the register file only holds f32.
+    /// Narrow to F16/BF16 and widen back: a `Cast` in an f32 register file.
     Narrow {
         out: Slot,
         x: Slot,
@@ -162,10 +145,6 @@ pub enum Instr {
         out: Slot,
         x: Slot,
     },
-    Copy {
-        out: Slot,
-        x: Slot,
-    },
 }
 
 impl Instr {
@@ -190,13 +169,11 @@ impl Instr {
             | Instr::Select { out, .. }
             | Instr::VecCompose { out, .. }
             | Instr::VecComponent { out, .. }
-            | Instr::Unpack2x16 { out, .. }
-            | Instr::Copy { out, .. } => *out,
+            | Instr::Unpack2x16 { out, .. } => *out,
         }
     }
 
-    /// Is this a fused multiply-add? `numeric_contract_blocks_contraction`
-    /// inspects the tape with this.
+    /// Is this a fused multiply-add?
     pub fn is_fma(&self) -> bool {
         matches!(self, Instr::Fma { .. })
     }
@@ -304,8 +281,7 @@ pub(crate) fn round_mode(mode: RoundMode, x: f32) -> f32 {
     }
 }
 
-/// `exp(r)` for `|r| <= ln2/2`. Taylor to `r^8`; the `r^9` term is below 1e-10
-/// over the reduced range.
+/// `exp(r)` for `|r| <= ln2/2`, Taylor to `r^8`.
 #[inline(always)]
 fn exp_poly(r: f32) -> f32 {
     let mut p = 2.480_158_7e-5; // 1/8!
@@ -358,18 +334,32 @@ pub(crate) fn log1pf(u: f32) -> f32 {
         };
     }
     if u.abs() < 0.414_213_57 {
-        let s = u / (2.0 + u);
-        let s2 = s * s;
-        let mut p = 1.0 / 13.0;
-        p = p * s2 + 1.0 / 11.0;
-        p = p * s2 + 1.0 / 9.0;
-        p = p * s2 + 1.0 / 7.0;
-        p = p * s2 + 0.2;
-        p = p * s2 + 1.0 / 3.0;
-        p = p * s2 + 1.0;
-        return 2.0 * s * p;
+        return log_series(u / (2.0 + u));
     }
     logf(1.0 + u)
+}
+
+/// `2 atanh(s)` by its odd series through `s^13`: `log(m)` at `s = (m-1)/(m+1)`.
+#[inline(always)]
+fn log_series(s: f32) -> f32 {
+    let s2 = s * s;
+    let mut p = 1.0 / 13.0;
+    for c in [1.0 / 11.0, 1.0 / 9.0, 1.0 / 7.0, 0.2, 1.0 / 3.0, 1.0] {
+        p = p * s2 + c;
+    }
+    2.0 * s * p
+}
+
+/// `(s, e)` with `x = m * 2^e`, `s = (m-1)/(m+1)`; denormals scale into range.
+#[inline(always)]
+fn log_split(x: f32) -> (f32, f32) {
+    let (x, bias) = if x < f32::MIN_POSITIVE {
+        (x * 16_777_216.0, -24.0f32)
+    } else {
+        (x, 0.0)
+    };
+    let (m, e) = frexp_norm(x);
+    ((m - 1.0) / (m + 1.0), e as f32 + bias)
 }
 
 /// Split `x` into `(mantissa in [sqrt(1/2), sqrt(2)), exponent)`.
@@ -385,8 +375,7 @@ fn frexp_norm(x: f32) -> (f32, i32) {
     (m, e)
 }
 
-/// Natural log by mantissa/exponent split plus a degree-13 odd polynomial in
-/// `s = (m-1)/(m+1)`.
+/// Natural log: mantissa/exponent split plus an odd polynomial in `(m-1)/(m+1)`.
 #[inline(always)]
 pub(crate) fn logf(x: f32) -> f32 {
     if x < 0.0 {
@@ -398,25 +387,9 @@ pub(crate) fn logf(x: f32) -> f32 {
     if x.is_infinite() {
         return x;
     }
-    // Scale denormals into the normal range before splitting.
-    let (x, bias) = if x < f32::MIN_POSITIVE {
-        (x * 16_777_216.0, -24.0f32)
-    } else {
-        (x, 0.0)
-    };
-    let (m, e) = frexp_norm(x);
-    let e = e as f32 + bias;
-    let s = (m - 1.0) / (m + 1.0);
-    let s2 = s * s;
-    let mut p = 1.0 / 13.0;
-    p = p * s2 + 1.0 / 11.0;
-    p = p * s2 + 1.0 / 9.0;
-    p = p * s2 + 1.0 / 7.0;
-    p = p * s2 + 0.2;
-    p = p * s2 + 1.0 / 3.0;
-    p = p * s2 + 1.0;
+    let (s, e) = log_split(x);
     // `e * LN2` in two pieces keeps the exponent contribution exact.
-    2.0 * s * p + (e * LN2_HI + e * LN2_LO)
+    log_series(s) + (e * LN2_HI + e * LN2_LO)
 }
 
 #[inline(always)]
@@ -424,22 +397,8 @@ pub(crate) fn log2f(x: f32) -> f32 {
     if x <= 0.0 || !x.is_finite() {
         return logf(x) * LOG2_E;
     }
-    let (x, bias) = if x < f32::MIN_POSITIVE {
-        (x * 16_777_216.0, -24.0f32)
-    } else {
-        (x, 0.0)
-    };
-    let (m, e) = frexp_norm(x);
-    let s = (m - 1.0) / (m + 1.0);
-    let s2 = s * s;
-    let mut p = 1.0 / 13.0;
-    p = p * s2 + 1.0 / 11.0;
-    p = p * s2 + 1.0 / 9.0;
-    p = p * s2 + 1.0 / 7.0;
-    p = p * s2 + 0.2;
-    p = p * s2 + 1.0 / 3.0;
-    p = p * s2 + 1.0;
-    (e as f32 + bias) + 2.0 * s * p * LOG2_E
+    let (s, e) = log_split(x);
+    e + log_series(s) * LOG2_E
 }
 
 #[inline(always)]
@@ -532,8 +491,7 @@ pub(crate) fn tanf(x: f32) -> f32 {
     if q & 1 == 0 { s / c } else { -c / s }
 }
 
-/// `tanh` by the [7/8] Padé rational near zero and the `exp` identity outside
-/// it, so the relative error stays flat across the whole line.
+/// `tanh`: [7/8] Padé near zero, the `exp` identity outside.
 #[inline(always)]
 pub(crate) fn tanhf(x: f32) -> f32 {
     let a = x.abs();
@@ -840,8 +798,7 @@ pub(crate) fn apply_narrow(to: ScalarElement, bits: u32) -> u32 {
     }
 }
 
-/// Read one element of a storage element type out of raw bytes, widened to a
-/// compute register lane.
+/// Read one storage element out of raw bytes, widened to a register lane.
 ///
 /// # Safety
 /// `index` must be inside the buffer `base` points at.
@@ -864,11 +821,9 @@ pub(crate) unsafe fn read_elem(elem: ScalarElement, base: *const u8, index: usiz
     }
 }
 
-/// Write one compute register lane back into a storage element type.
-///
+/// Write one register lane back as a storage element.
 /// # Safety
-/// `index` must be inside the buffer `base` points at, and no other thread may
-/// be writing the same element (`verify_launch` invariant 3).
+/// `index` in bounds, and no concurrent writer (`verify_launch` invariant 3).
 #[inline(always)]
 pub(crate) unsafe fn write_elem(elem: ScalarElement, base: *mut u8, index: usize, bits: u32) {
     unsafe {

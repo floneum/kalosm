@@ -3,7 +3,6 @@
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct CollectivePlan {
-    width: u32,
     partials: u32,
 }
 impl CollectivePlan {
@@ -11,16 +10,9 @@ impl CollectivePlan {
     pub fn new(block: u32, fixed_width: u32) -> Option<Self> {
         (fixed_width > 0 && block >= fixed_width && block.is_multiple_of(fixed_width)).then(|| {
             Self {
-                width: fixed_width,
                 partials: block / fixed_width,
             }
         })
-    }
-    pub fn width(self) -> u32 {
-        self.width
-    }
-    pub fn scratch_elements(self) -> u32 {
-        if self.partials == 1 { 0 } else { self.partials }
     }
     /// Every lane receives the result. Leading synchronization protects the
     /// previous users of a reused scratch slot, including a loop's back edge.

@@ -1,8 +1,5 @@
-//! `Gather`'s two modes and `Scatter`'s two.
-//!
-//! Both nests read their lane tiling off `theta`. Currently the cost model does
-//! not select tiled points, so `theta` is typically `SchedPoint::Point` and
-//! bodies run one element per lane.
+//! `Gather`'s two modes and `Scatter`'s two, both at the lane tiling `theta`
+//! selected.
 
 use fusor_ir::Result;
 use fusor_ir::error::Error;
@@ -16,10 +13,8 @@ use fusor_tile::build::ScatterGeometry;
 use crate::lower::{Ctx, distribute_workgroups};
 use fusor_tile::domains::emitted_block;
 
-/// The register-reuse tiling this launch runs at.
-///
-/// [`SchedPoint::Point`] is the floor lowering's untiled point and resolves to
-/// one element per lane. Any other family is a planner bug.
+/// The register-reuse tiling this launch runs at; [`SchedPoint::Point`] is one
+/// element per lane.
 fn tiling(theta: SchedPoint) -> Result<MapTiling> {
     match theta {
         SchedPoint::Map(t) => Ok(MapTiling {
@@ -38,15 +33,9 @@ fn tiling(theta: SchedPoint) -> Result<MapTiling> {
     }
 }
 
-/// How far apart one lane's `tm` elements sit, and whether the tiling is
-/// legal at all on this shape.
-///
-/// A lane owns `tm` elements one step of the tiled axis apart, which is
-/// `stride = prod(extents[axis+1..])` elements in the flattened space. The
-/// map from lanes to elements is a bijection only when
-/// `extents[..=axis].product() >= tm`; otherwise the tiled axis has fewer
-/// blocks than the tile and the tile degrades to 1 rather than the plan
-/// failing.
+/// How far apart one lane's `tm` elements sit (`prod(extents[axis+1..])`), or
+/// `None` when the tiled axis has fewer blocks than `tm` and the tile degrades
+/// to 1.
 fn tile_stride(extents: &[u64], axis: usize, tm: u32) -> Option<u64> {
     if tm <= 1 || axis + 1 >= extents.len() {
         return None;
@@ -56,11 +45,9 @@ fn tile_stride(extents: &[u64], axis: usize, tm: u32) -> Option<u64> {
     (blocks >= u64::from(tm)).then_some(stride)
 }
 
-/// The lanes a tile needs to cover a space of `n` elements, and the flat
-/// element offsets each lane owns. The tiled axis is blocked, so the lane
-/// count reaches `ceil(blocks / tm)` whole tiles even when the last one is
-/// partly masked: at `[13, 8]` with `tm = 2` a naive `n / tm` is 52 lanes
-/// and element 100 is then written by nobody.
+/// The lanes a tile needs over `n` elements and the offsets each owns. The
+/// lane count covers `ceil(blocks / tm)` whole tiles: a naive `n / tm` leaves
+/// trailing elements unwritten.
 struct LaneTile {
     lanes: u64,
     stride: Option<u64>,
@@ -108,11 +95,9 @@ impl LaneTile {
     }
 }
 
-/// `RowPerGroup` and `QuantizedRows`, each at the lane tiling `theta`
-/// selected. `QuantizedRows` shares the scalar nest: the source address is a
-/// flat index into the source's dense logical space either way, and
-/// `load_operand` runs the format's decode program there, so only gathered
-/// rows decode.
+/// `RowPerGroup` and `QuantizedRows` at the lane tiling `theta` selected.
+/// `QuantizedRows` shares the scalar nest; `load_operand` decodes only the
+/// gathered rows.
 pub(crate) fn lower_kgather(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Result<KernelIr> {
     let Launch::Gather {
         space, axis, ops, ..
@@ -130,9 +115,8 @@ pub(crate) fn lower_kgather(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Res
     let out = ctx.linear_view(ctx.output()?)?;
     let block = ctx.block(emitted_block(1, ctx.caps));
 
-    // The output index space, and the one axis on which the source differs
-    // from it. Addressing every gather as if `axis` were 0 is only right
-    // when the gathered axis is outermost.
+    // The output index space and the one axis on which the source differs from
+    // it.
     let extents = space
         .dims
         .iter()
@@ -196,26 +180,13 @@ pub(crate) fn lower_kgather(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Res
     Ok(ctx.finish("kgather", grid, block, body))
 }
 
-/// `out = base` with `out[.., idx[u], ..] (combine)= upd[.., u, ..]`, at the
-/// lane tiling `theta` selected. Both `ScatterMode`s lower through this one
-/// nest: **one lane per output element, a counted loop over the updates**,
-/// costing `O(out x updates)` index comparisons.
+/// `out = base` with `out[.., idx[u], ..] (combine)= upd[.., u, ..]`: one lane
+/// per output element, a counted loop over the updates. The output buffer does
+/// not hold the base, so this nest reads it; one writer per element keeps the
+/// accumulation order fixed and bit-reproducible.
 ///
-/// The update-parallel forms (one lane per update, `atomicAdd` or a
-/// workgroup-private histogram) are correct only when the output buffer
-/// already holds the base; `derive_bindings` gives a `Scatter`'s value its own
-/// buffer and nothing copies the base in, so this nest must read the base.
-///
-/// Every output element is written by exactly one lane, so no atomic is needed
-/// and the accumulation order is fixed: the result is bit-reproducible at any
-/// occupancy, which is what `verify_launch`'s associativity obligation asks for.
-///
-/// **`tm` is the number of destination bins one lane owns.** With `tm` bins in
-/// one lane the `idx[u]` read is hash-consed to one expression serving `tm`
-/// accumulators. The bins axis is the only one that can be tiled without
-/// breaking store coalescing: consecutive lanes still write consecutive
-/// `inner` positions. `theta.dim` is not read: `space` is minted two ways, so
-/// an axis index taken from it cannot be identified with a destination axis.
+/// `tm` is the number of destination bins one lane owns, sharing one `idx[u]`
+/// read; `theta.dim` is not read.
 pub(crate) fn lower_kscatter(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Result<KernelIr> {
     let Launch::Scatter {
         axis, combine, ops, ..
@@ -255,9 +226,7 @@ pub(crate) fn lower_kscatter(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Re
     let row_span = b.u32(shape.bins.saturating_mul(shape.inner).max(1));
     let updates_e = b.u32(shape.updates);
 
-    // One index read per update, shared by every accumulator this lane
-    // carries: `u_bin` does not depend on the output element, so the `tm`
-    // slots hash-cons onto one load.
+    // One index read per update, hash-consed across the `tm` accumulators.
     let u_local = b.local(ScalarElement::U32.element());
     let u = b.load_local(u_local.clone());
     let u_bin = b.cast(
@@ -286,9 +255,8 @@ pub(crate) fn lower_kscatter(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Re
             within,
         );
         let v = b.cast(ctx.load_operand(upd, upd_index)?, acc_ty);
-        // `Add` duplicates accumulate: an embedding table receiving one token
-        // twice gets the summed gradient. `Set` is only reachable when the
-        // node proved its indices unique.
+        // `Add` accumulates duplicates; `Set` is only reachable with proven-unique
+        // indices.
         let combined = match combine {
             ScatterCombine::Add => b.add(acc_read.clone(), v),
             ScatterCombine::Set => v,

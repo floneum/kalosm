@@ -14,7 +14,7 @@ use fusor_ir::shape::{Dim, Layout};
 use fusor_ir::target::LowerCtx;
 use fusor_tile::build::Kernel;
 
-use super::{Binds, DEFAULT_BLOCK, OperandSrc, Translate, global_lane, grid_for, view};
+use super::{Binds, DEFAULT_BLOCK, OperandSrc, global_lane, grid_for, view};
 
 pub(crate) fn lower(node: &Node, cx: &LowerCtx<'_>) -> Result<KernelIr> {
     let Op::Launch(Launch::Contract {
@@ -39,8 +39,7 @@ pub(crate) fn lower(node: &Node, cx: &LowerCtx<'_>) -> Result<KernelIr> {
     ];
     let binds = Binds::build(cx)?;
     let out = binds.of(cx.launch.root)?;
-    // The platform GEMM is Accelerate, so it exists on macOS only; everywhere
-    // else every contraction takes the Cranelift SIMD path below.
+    // The platform GEMM is Accelerate (macOS only); elsewhere the Cranelift path.
     let platform = if cfg!(target_os = "macos") {
         side(cx, &binds, a, [batch, m, k])
             .zip(side(cx, &binds, b, [batch, k, n]))
@@ -48,20 +47,12 @@ pub(crate) fn lower(node: &Node, cx: &LowerCtx<'_>) -> Result<KernelIr> {
                 gemm_name(
                     m, n, k, batch, &out, &bound_a, &bound_b, &a.pre, &b.pre, post,
                 )
-                .ok()
             })
     } else {
         None
     };
     if let Some(name) = platform {
-        return Ok(KernelIr {
-            buffers: binds.buffers,
-            grid: [1, 1, 1],
-            block: 1,
-            body: Vec::new(),
-            byte_arena: None,
-            name,
-        });
+        return Ok(binds.finish(name, [1, 1, 1], 1, Vec::new()));
     }
     lower_jit(cx, binds, out, [batch, m, n, k], a, b, post, *acc)
 }
@@ -80,8 +71,7 @@ fn side(
             if fusor_tile::build::const_splat(cx, operand.src).is_some() {
                 return None;
             }
-            // A GEMM call reads from the buffer's start; an offset layout —
-            // a slot of a multi-slot fold, a window — goes to the JIT.
+            // A GEMM reads from the buffer start; an offset layout goes to the JIT.
             if super::resolved_layout(cx, &operand.layout).ok()?.0 != 0 {
                 return None;
             }
@@ -91,11 +81,8 @@ fn side(
         .collect()
 }
 
-/// A contraction is more general than matrix multiplication: attention masks,
-/// sampling rows, absorbed producers and fused epilogues all use the same
-/// launch node. Only the small subset recognized above is a BLAS call. This
-/// kernel is the native Cranelift path for the rest: one output per lane and a
-/// private accumulator across `k`.
+/// The native path for every contraction that is not a recognized BLAS call
+/// (masks, absorbed producers, epilogues): one output per lane, private `k` accumulator.
 #[allow(clippy::too_many_arguments)]
 fn lower_jit(
     cx: &LowerCtx<'_>,
@@ -119,7 +106,6 @@ fn lower_jit(
     let (batch_idx, row) = b.divrem(rest, b.u32(m));
     let k_local = b.local(ScalarElement::U32.element());
     let k_idx = b.load_local(k_local.clone());
-    let uniforms = binds.buffers.first().cloned();
 
     let a_srcs = jit_side(&b, cx, &binds, a, [batch, m, k])?;
     let b_srcs = jit_side(&b, cx, &binds, b_side, [batch, k, n])?;
@@ -131,7 +117,7 @@ fn lower_jit(
         [batch, m, k],
         [&batch_idx, &row, &k_idx],
         valid.clone(),
-        uniforms.clone(),
+        &binds,
     )?;
     let b_value = side_value(
         &b,
@@ -141,7 +127,7 @@ fn lower_jit(
         [batch, k, n],
         [&batch_idx, &k_idx, &col],
         valid.clone(),
-        uniforms.clone(),
+        &binds,
     )?;
     let acc_ty = ElementType::Scalar(super::elem_of(acc)?);
     let local = b.local(acc_ty);
@@ -150,13 +136,7 @@ fn lower_jit(
         previous.clone(),
         b.mul(b.cast(a_value, acc_ty), b.cast(b_value, acc_ty)),
     );
-    let value = Translate {
-        b: &b,
-        args: &[previous],
-        coords: &[],
-        uniforms,
-    }
-    .run(post)?;
+    let value = binds.translate(&b, &[previous], &[], post)?;
     let body = vec![
         Stmt::Loop {
             count: Some(b.u32(k)),
@@ -175,20 +155,11 @@ fn lower_jit(
             mask: valid,
         },
     ];
-    Ok(KernelIr {
-        buffers: binds.buffers,
-        grid,
-        block,
-        body,
-        byte_arena: None,
-        name: "cpu_contract_jit",
-    })
+    Ok(binds.finish("cpu_contract_jit", grid, block, body))
 }
 
-/// One operand's source and how its `(batch, row, col)` coordinates reach
-/// an element: three collapsed strides when each axis group is one dense
-/// run, else the layout's own axes, decomposed per group — a permuted head
-/// split, a broadcast, a merged axis, an offset slot are all just strides.
+/// One operand's source and how `(batch, row, col)` reach an element: three
+/// collapsed strides when each group is one dense run, else per-axis strides.
 struct JitOperand {
     src: OperandSrc,
     offset: u32,
@@ -219,8 +190,7 @@ fn jit_side(
             let addressing = match collapse_resolved(&extents, &strides, groups) {
                 Some(c) => Addressing::Collapsed(c),
                 None => {
-                    // The axes must partition into the groups, whatever
-                    // their strides.
+                    // The axes must partition into the groups.
                     if group_axes(&extents, groups).is_none() {
                         return Err(Error::Legality(format!(
                             "CPU JIT contraction cannot partition layout {:?} into its groups",
@@ -239,8 +209,7 @@ fn jit_side(
         .collect()
 }
 
-/// The axis range each group covers, row-major with the last axis fastest,
-/// and how many leading axes the three groups consumed.
+/// Each group's axis range, row-major, and how many leading axes were consumed.
 fn group_ranges(extents: &[u32], groups: [u32; 3]) -> Option<([(usize, usize); 3], usize)> {
     let mut out = [(0, 0); 3];
     let mut axis = 0;
@@ -265,8 +234,7 @@ fn group_axes(extents: &[u32], groups: [u32; 3]) -> Option<[(usize, usize); 3]> 
     group_ranges(&extents, groups).and_then(|(r, used)| (used == extents.len()).then_some(r))
 }
 
-/// `offset + Σ coord * stride`, the group coordinates decomposed over the
-/// layout's axes.
+/// `offset + Σ coord * stride` over the layout's axes.
 fn axes_index(
     b: &Kernel,
     extents: &[u32],
@@ -313,7 +281,7 @@ fn side_value(
     groups: [u32; 3],
     indices: [&TileExpr; 3],
     mask: TileExpr,
-    uniforms: Option<Arc<BufferDecl>>,
+    binds: &Binds,
 ) -> Result<TileExpr> {
     let args = sources
         .iter()
@@ -336,13 +304,7 @@ fn side_value(
     let coords = side_coords(b, cx, side, groups, indices).ok_or_else(|| {
         Error::Legality("CPU JIT contraction cannot state side coordinates".into())
     })?;
-    Translate {
-        b,
-        args: &args,
-        coords: &coords,
-        uniforms,
-    }
-    .run(&side.pre)
+    binds.translate(b, &args, &coords, &side.pre)
 }
 
 fn strided_index(b: &Kernel, indices: [&TileExpr; 3], strides: [u32; 3]) -> TileExpr {
@@ -358,8 +320,7 @@ fn strided_index(b: &Kernel, indices: [&TileExpr; 3], strides: [u32; 3]) -> Tile
         .unwrap_or_else(|| b.u32(0))
 }
 
-/// The per-axis coordinates a side's `pre` reads, each group's flat index
-/// split over the axes it covers.
+/// Per-axis coordinates a side's `pre` reads.
 fn side_coords(
     b: &Kernel,
     cx: &LowerCtx<'_>,
@@ -388,6 +349,8 @@ fn side_coords(
     Some(coords)
 }
 
+/// The platform GEMM call for an f32 contraction with no epilogue, or with the
+/// bias-GELU input transform fused into A; the name encodes the call.
 #[allow(clippy::too_many_arguments)]
 fn gemm_name(
     m: u32,
@@ -400,98 +363,40 @@ fn gemm_name(
     a_pre: &ScalarExpr,
     b_pre: &ScalarExpr,
     post: &ScalarExpr,
-) -> Result<&'static str> {
-    let identity = |expr: &ScalarExpr| matches!(expr.kind(), ScalarKind::Arg(0));
-    let f32_storage = ElementType::Scalar(ScalarElement::F32);
-    let [(abuf, astrides)] = a.as_slice() else {
-        return gelu_gemm_name(m, n, k, batch, out, a, b, a_pre, b_pre, post);
+) -> Option<&'static str> {
+    let arg0 = |e: &ScalarExpr| matches!(e.kind(), ScalarKind::Arg(0));
+    let f32s = ElementType::Scalar(ScalarElement::F32);
+    let key = |(buf, s): &(Arc<BufferDecl>, [u32; 3])| {
+        format!("{},{},{},{}", buf.binding, s[0], s[1], s[2])
     };
-    let [(bbuf, bstrides)] = b.as_slice() else {
-        return Err(Error::Legality("CPU GEMM needs one B operand".into()));
+    let [(_, bstrides)] = b.as_slice() else {
+        return None;
     };
-    if out.element != f32_storage || abuf.element != f32_storage || bbuf.element != f32_storage {
-        return Err(Error::Legality(
-            "CPU GEMM currently requires f32 storage".into(),
-        ));
+    if !arg0(b_pre)
+        || !arg0(post)
+        || out.element != f32s
+        || a.iter().chain(b).any(|(buf, _)| buf.element != f32s)
+        || !compatible(*bstrides, [k, n], [1, 0])
+    {
+        return None;
     }
-    if !identity(a_pre) || !identity(b_pre) || !identity(post) {
-        return Err(Error::Legality(
-            "CPU GEMM requires its epilogue as a separate Cranelift map".into(),
-        ));
-    }
-    compatible(*astrides, [m, k], [0, 1])?;
-    compatible(*bstrides, [k, n], [1, 0])?;
-    Ok(leak(format!(
-        "cpu_contract_blas:{m},{n},{k},{batch},{},{},{},{},{},{},{},{},{}",
+    let (kind, a_key) = match a.as_slice() {
+        [(_, s)] if arg0(a_pre) && compatible(*s, [m, k], [0, 1]) => ("blas", key(&a[0])),
+        [(_, s), (_, bias)]
+            if *a_pre == tanh_gelu_of_bias() && *s == [0, k, 1] && *bias == [0, 0, 1] =>
+        {
+            ("gelu_blas", format!("{},{}", key(&a[0]), key(&a[1])))
+        }
+        _ => return None,
+    };
+    Some(leak(format!(
+        "cpu_contract_{kind}:{m},{n},{k},{batch},{},{a_key},{}",
         out.binding,
-        abuf.binding,
-        astrides[0],
-        astrides[1],
-        astrides[2],
-        bbuf.binding,
-        bstrides[0],
-        bstrides[1],
-        bstrides[2]
+        key(&b[0])
     )))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn gelu_gemm_name(
-    m: u32,
-    n: u32,
-    k: u32,
-    batch: u32,
-    out: &BufferDecl,
-    a: &BoundSide,
-    b: &BoundSide,
-    a_pre: &ScalarExpr,
-    b_pre: &ScalarExpr,
-    post: &ScalarExpr,
-) -> Result<&'static str> {
-    let [(abuf, astrides), (bias, bias_strides)] = a.as_slice() else {
-        return Err(Error::Legality("CPU GEMM needs one A operand".into()));
-    };
-    let [(bbuf, bstrides)] = b.as_slice() else {
-        return Err(Error::Legality("CPU GEMM needs one B operand".into()));
-    };
-    if *a_pre != tanh_gelu_of_bias()
-        || !matches!(b_pre.kind(), ScalarKind::Arg(0))
-        || !matches!(post.kind(), ScalarKind::Arg(0))
-    {
-        return Err(Error::Legality(
-            "CPU GEMM requires its epilogue as a separate Cranelift map".into(),
-        ));
-    }
-    let f32_storage = ElementType::Scalar(ScalarElement::F32);
-    if [out, abuf.as_ref(), bias.as_ref(), bbuf.as_ref()]
-        .iter()
-        .any(|buffer| buffer.element != f32_storage)
-        || *astrides != [0, k, 1]
-        || *bias_strides != [0, 0, 1]
-    {
-        return Err(Error::Legality("unsupported fused CPU GEMM input".into()));
-    }
-    compatible(*bstrides, [k, n], [1, 0])?;
-    Ok(leak(format!(
-        "cpu_contract_gelu_blas:{m},{n},{k},{batch},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-        out.binding,
-        abuf.binding,
-        astrides[0],
-        astrides[1],
-        astrides[2],
-        bias.binding,
-        bias_strides[0],
-        bias_strides[1],
-        bias_strides[2],
-        bbuf.binding,
-        bstrides[0],
-        bstrides[1],
-        bstrides[2]
-    )))
-}
-
-/// The frontend's f32 tanh GELU (`composite::activations::gelu_expr`) over
-/// `Arg(0) + Arg(1)`: the absorbed bias-add-GELU the platform kernel fuses.
+/// The frontend's f32 tanh GELU over `Arg(0) + Arg(1)`: the fusable bias-GELU.
 fn tanh_gelu_of_bias() -> ScalarExpr {
     use fusor_ir::dtype::{Dtype, Splat};
     use fusor_ir::scalar::{BinOp, UnOp};
@@ -517,17 +422,10 @@ fn tanh_gelu_of_bias() -> ScalarExpr {
     bin(BinOp::Mul, bin(BinOp::Mul, lit(0.5), x), one_plus)
 }
 
-fn compatible(strides: [u32; 3], [rows, cols]: [u32; 2], broadcast: [u32; 2]) -> Result<()> {
-    if (strides[2] == 1 && strides[1] >= cols)
+fn compatible(strides: [u32; 3], [rows, cols]: [u32; 2], broadcast: [u32; 2]) -> bool {
+    (strides[2] == 1 && strides[1] >= cols)
         || (strides[1] == 1 && strides[2] >= rows)
         || strides[1..] == broadcast
-    {
-        Ok(())
-    } else {
-        Err(Error::Legality(format!(
-            "CPU GEMM cannot address strides {strides:?}"
-        )))
-    }
 }
 
 fn leak(value: String) -> &'static str {
@@ -572,8 +470,7 @@ fn collapse_resolved(extents: &[u32], strides: &[u32], groups: [u32; 3]) -> Opti
     Some(out)
 }
 
-// Kept out of the public interface; tests cover layout collapsing and the
-// platform GEMM adapter covers execution.
+// Private; tests cover layout collapsing.
 #[cfg(test)]
 mod tests {
     use super::*;

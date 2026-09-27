@@ -1,10 +1,5 @@
-//! `Map` and `Fold` as SIMD loop nests with a register accumulator tile.
-//!
-//! `Map` reads its register-reuse tiling off `SchedPoint::Map(MapTiling)`
-//! (`dim`, `tm`, `vector`); `Fold` reads its strategy off
-//! `SchedPoint::Fold(FoldStrat)` and lowers all three: `Subgroup` to a
-//! horizontal reduce, `WgTree` to a tree over a scratch tile, and
-//! `LoopThenTree` to per-lane loop accumulation followed by that tree.
+//! `Map` and `Fold` as SIMD loop nests, reading tiling and strategy off
+//! the `SchedPoint`.
 
 use fusor_ir::Result;
 use fusor_ir::device::Caps;
@@ -19,18 +14,12 @@ use fusor_ir::target::LowerCtx;
 use fusor_tile::build::{FoldLanes, Kernel};
 
 use super::{
-    Binds, DEFAULT_BLOCK, Translate, const_extents, coords_of, global_lane, grid_for, operand_at,
-    view,
+    Binds, DEFAULT_BLOCK, const_extents, coords_of, global_lane, grid_for, operand_at, view,
 };
 
-/// The workgroup width a fold allocates its scratch over.
-///
-/// The resolved point decides it: `FoldStrat::Subgroup` runs one SIMD group
-/// wide, the two tree strategies run their own `lane_group` floored by the
-/// domain's default width. It is then narrowed by the axis and floored at 4
-/// so the tree always has levels to walk. Narrowing is safe in both
-/// directions: the per-lane strided loop (`passes`) covers whatever the width
-/// does not.
+/// The fold's scratch width: one SIMD group for `Subgroup`, else the
+/// `lane_group` floored by the default width, narrowed by the axis and floored
+/// at 4; the strided per-lane loop covers the rest.
 fn fold_block(strat: FoldStrat, caps: &Caps, axis_extent: u32) -> u32 {
     let wide = match strat {
         FoldStrat::Subgroup => caps
@@ -55,10 +44,7 @@ pub(crate) fn lower(
     };
     match op {
         Launch::Map { .. } => lower_map(node, theta, cx),
-        // The carrier tree is the one native fold representation. It handles
-        // both scalar operators and multi-slot carriers, so lowering every
-        // fold through it prevents the planner from selecting a second shape
-        // that has no Cranelift implementation.
+        // Every fold lowers through the carrier tree, the one shape Cranelift implements.
         Launch::Fold { .. } => lower_fold_carrier(caps, op, theta, cx, None),
         Launch::StreamFold {
             producer,
@@ -70,9 +56,8 @@ pub(crate) fn lower(
     }
 }
 
-/// One elementwise pass: one lane per output element, `tm` elements per lane
-/// when the tiling says so, so the loop-invariant operands stay resident in
-/// registers across the `tm` outputs.
+/// One elementwise pass, `tm` elements per lane when tiled so invariant
+/// operands stay in registers.
 fn lower_map(node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
     let Op::Launch(Launch::Map {
         space, body, ops, ..
@@ -82,7 +67,6 @@ fn lower_map(node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<Kernel
     };
     let b = Kernel::new();
     let binds = Binds::build(cx)?;
-    let uniforms = binds.buffers.first().cloned();
     let extents = const_extents(cx, &space.dims)?;
     let n = extents.iter().map(|e| *e as u64).product::<u64>().max(1);
 
@@ -104,13 +88,7 @@ fn lower_map(node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<Kernel
             .iter()
             .map(|o| operand_at(&b, cx, &binds, o, flat.clone(), n, mask.clone()))
             .collect::<Result<Vec<_>>>()?;
-        let value = Translate {
-            b: &b,
-            args: &args,
-            coords: &coords,
-            uniforms: uniforms.clone(),
-        }
-        .run(body)?;
+        let value = binds.translate(&b, &args, &coords, body)?;
         stmts.push(Stmt::Store {
             dst: out.clone(),
             addr: Addr::Linear(flat),
@@ -119,26 +97,12 @@ fn lower_map(node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<Kernel
         });
     }
 
-    Ok(KernelIr {
-        buffers: binds.buffers,
-        grid,
-        block,
-        body: stmts,
-        byte_arena: None,
-        name: "cpu_map",
-    })
+    Ok(binds.finish("cpu_map", grid, block, stmts))
 }
 
-/// Lower a `Fold` through its carrier.
-///
-/// One accumulator per carrier lane, seeded from that lane's own identity,
-/// absorbed with the carrier's own `merge`, and closed by `Stmt::Reduce`'s N-ary
-/// tree over one scratch tile per lane. The output carries `carrier.lanes()`
-/// values per row, matching the trailing carrier axis `infer_launch` appends.
-///
-/// The SIMD butterfly folds one register with one operator, so there is no
-/// horizontal-reduce form for a multi-lane merge and this always closes with
-/// the scratch tree.
+/// Lower a `Fold` through its carrier: one identity-seeded accumulator per
+/// lane, merged, then closed by `Stmt::Reduce`'s scratch tree (the SIMD
+/// butterfly cannot merge multiple lanes); `carrier.lanes()` outputs per row.
 fn lower_fold_carrier(
     caps: &Caps,
     fold: &Launch,
@@ -162,21 +126,11 @@ fn lower_fold_carrier(
     let lanes = FoldLanes::of(carrier, post, space.rank(), axis, vec_axes, Error::Legality)?;
     let b = Kernel::new();
     let binds = Binds::build(cx)?;
-    let uniforms = binds.buffers.first().cloned();
-    let translate = |args: &[TileExpr], coords: &[TileExpr], e| {
-        Translate {
-            b: &b,
-            args,
-            coords,
-            uniforms: uniforms.clone(),
-        }
-        .run(e)
-    };
+    let translate =
+        |args: &[TileExpr], coords: &[TileExpr], e| binds.translate(&b, args, coords, e);
     let extents = const_extents(cx, &space.dims)?;
-    // A promoted nest: `space` is `free.. ++ vec.. ++ [reduced]`, so one output
-    // row spans `vec_extent * axis_extent` consecutive elements and a `Vector`
-    // slot is `vec_extent` registers; the reduced axis being last is what makes
-    // the address below one multiply.
+    // Promoted nest: `space` is `free.. ++ vec.. ++ [reduced]`, so one output row
+    // spans `vec_extent * axis_extent` consecutive elements.
     let vec_extent: u32 = vec_axes
         .iter()
         .map(|i| extents[*i as usize])
@@ -212,13 +166,8 @@ fn lower_fold_carrier(
     let lane = b.builtin(Builtin::Lane);
     let (outer_idx, inner_idx) = b.divrem(row.clone(), b.u32(inner));
 
-    // One lifted value per lane at element `k`, each guarded to its own
-    // identity outside the reduced extent: a shared identity would let a
-    // padding lane count in Welford's constant `1` slot.
-    //
-    // Lane `(slot, p)` reads every operand at promoted position `p`. An
-    // operand invariant in the promoted axes is read at the same address for
-    // every position and the emitter's CSE collapses it to one load.
+    // One lifted value per lane at `k`, each guarded to its own identity past the
+    // extent (Welford's constant `1` slot). Promoted-invariant operands CSE to one load.
     let lift_at = |k: TileExpr, body: &mut Vec<Stmt>| -> Result<Vec<TileExpr>> {
         let mask = b.lt(k.clone(), b.u32(axis_extent));
         let row_elems = axis_extent.saturating_mul(vec_extent);
@@ -291,8 +240,7 @@ fn lower_fold_carrier(
 
     let mut body: Vec<Stmt> = Vec::new();
     let partials: Vec<TileExpr> = if passes > 1 {
-        // The per-lane strided loop, carrying `lanes` accumulators seeded from
-        // the carrier's identities and absorbed with its own `merge`.
+        // The per-lane strided loop over identity-seeded accumulators.
         let index = b.local(ScalarElement::U32.element());
         let k = b.add(
             b.mul(b.load_local(index.clone()), b.u32(block)),
@@ -348,14 +296,7 @@ fn lower_fold_carrier(
         });
     }
 
-    Ok(KernelIr {
-        buffers: binds.buffers,
-        grid: [rows.max(1) as u32, 1, 1],
-        block,
-        body,
-        byte_arena: None,
-        name: "cpu_fold_carrier",
-    })
+    Ok(binds.finish("cpu_fold_carrier", [rows.max(1) as u32, 1, 1], block, body))
 }
 
 fn fold_element(
@@ -398,16 +339,7 @@ fn fold_element(
         .iter()
         .map(|operand| operand_at(b, cx, binds, operand, flat.clone(), total, mask.clone()))
         .collect::<Result<Vec<_>>>()?;
-    let uniforms = binds.buffers.first().cloned();
-    let translate = |args: &[TileExpr], coords: &[TileExpr], e| {
-        Translate {
-            b,
-            args,
-            coords,
-            uniforms: uniforms.clone(),
-        }
-        .run(e)
-    };
+    let translate = |args: &[TileExpr], coords: &[TileExpr], e| binds.translate(b, args, coords, e);
     let lifted = translate(&args, &coords, &carrier.lift[0])?;
     let local = b.local(ScalarElement::F32.element());
     let value = b.load_local(local.clone());

@@ -1,20 +1,19 @@
 //! Kernel expressions -> naga expressions, plus the plumbing every other emit
 //! module shares.
 //!
-//! `NumericContract` rides on `Unary`/`Binary` and is an **emitter
-//! obligation** here: `reassoc: false` forbids the identity elimination,
-//! literal folding and operand reordering that would break
-//! `round(x, HalfAwayFromZero)` on Metal, and `contract: false` forbids fusing
-//! a multiply into an `Fma`.
+//! `NumericContract` is an emitter obligation: `reassoc: false` forbids
+//! identity elimination, literal folding and operand reordering, and
+//! `contract: false` forbids fusing a multiply into an `Fma`.
 
 use fusor_ir::dtype::{NumericContract, RoundMode};
 use fusor_ir::ir::kernel::{
-    Addr, Buffer, ElementType, Local, MemReads, ScalarElement, Source, StorageView, Tile, TileExpr,
-    TileExprKind, TileLiteral, TileReduceOp,
+    Addr, Buffer, ElementType, Local, MemReads, ScalarElement, Source, StorageView, Tile,
+    TileBinaryOp, TileExpr, TileExprKind, TileLiteral, TileReduceOp,
 };
 use fusor_ir::scalar::{BinOp, CmpOp, UnOp};
 use fusor_ir::shape::AxisGroup;
 use fusor_ir::target::EmitError;
+use naga::Barrier;
 use naga::{
     BinaryOperator, Block, Expression, GlobalVariable, Handle, Literal, LocalVariable,
     MathFunction, Range, Scalar, ScalarKind, Span, Statement,
@@ -25,14 +24,8 @@ use super::{
     Emitter, LOCAL_INVOCATION_INDEX_ARG, MEM_SPACES, MemStamp, ScratchKind, WORKGROUP_ID_ARG, key,
 };
 
-/// Whether a finite f32 has to be spelled through its bit pattern.
-///
-/// `±f32::MAX` prints as `3.4028235e38`, which as an exact decimal lies
-/// above the type's maximum; naga's parser rounds it back, but Tint refuses
-/// the module ("value cannot be represented as 'f32'") and the browser then
-/// never runs the kernel. Every smaller magnitude prints within half an ulp
-/// of itself and so within range. `bitcast<f32>(0x7f7fffffu)` is the same
-/// value on every backend.
+/// Whether a finite f32 has to be spelled through its bit pattern: `±f32::MAX`
+/// prints above the type's maximum and Tint rejects the module.
 fn needs_bit_spelling(v: f32) -> bool {
     v.is_finite() && v.abs() == f32::MAX
 }
@@ -80,61 +73,59 @@ impl Emitter<'_> {
         self.emit_expr(body, Expression::Binary { op, left, right })
     }
 
-    pub(crate) fn math1(
+    /// A math call over one to three arguments.
+    pub(crate) fn math(
         &mut self,
         body: &mut Block,
         fun: MathFunction,
-        arg: Handle<Expression>,
+        args: &[Handle<Expression>],
     ) -> Handle<Expression> {
-        self.emit_expr(
-            body,
-            Expression::Math {
-                fun,
-                arg,
-                arg1: None,
-                arg2: None,
-                arg3: None,
-            },
-        )
+        let math = Expression::Math {
+            fun,
+            arg: args[0],
+            arg1: args.get(1).copied(),
+            arg2: args.get(2).copied(),
+            arg3: None,
+        };
+        self.emit_expr(body, math)
     }
 
-    pub(crate) fn math2(
+    pub(crate) fn select(
         &mut self,
         body: &mut Block,
-        fun: MathFunction,
-        arg: Handle<Expression>,
-        arg1: Handle<Expression>,
+        condition: Handle<Expression>,
+        accept: Handle<Expression>,
+        reject: Handle<Expression>,
     ) -> Handle<Expression> {
-        self.emit_expr(
-            body,
-            Expression::Math {
-                fun,
-                arg,
-                arg1: Some(arg1),
-                arg2: None,
-                arg3: None,
-            },
-        )
+        let select = Expression::Select {
+            condition,
+            accept,
+            reject,
+        };
+        self.emit_expr(body, select)
     }
 
-    pub(crate) fn math3(
+    /// A kernel condition lowered to a naga `bool`.
+    pub(crate) fn cond(
         &mut self,
         body: &mut Block,
-        fun: MathFunction,
-        arg: Handle<Expression>,
-        arg1: Handle<Expression>,
-        arg2: Handle<Expression>,
-    ) -> Handle<Expression> {
-        self.emit_expr(
-            body,
-            Expression::Math {
-                fun,
-                arg,
-                arg1: Some(arg1),
-                arg2: Some(arg2),
-                arg3: None,
-            },
-        )
+        condition: &TileExpr,
+    ) -> Result<Handle<Expression>, EmitError> {
+        let c = self.expr(condition, body)?;
+        self.condition_value(body, c, condition.element())
+    }
+
+    /// A masked load's fill (cast to `element`), then its mask.
+    fn fill_and_mask(
+        &mut self,
+        body: &mut Block,
+        fill: &TileExpr,
+        mask: &TileExpr,
+        element: ElementType,
+    ) -> Result<(Handle<Expression>, Handle<Expression>), EmitError> {
+        let fill_h = self.expr(fill, body)?;
+        let fill_h = self.cast_tile_value(body, fill_h, fill.element(), element)?;
+        Ok((fill_h, self.cond(body, mask)?))
     }
 
     pub(crate) fn cast_as(
@@ -236,9 +227,8 @@ impl Emitter<'_> {
             .ok_or_else(|| EmitError::Unsupported("local not declared".into()))
     }
 
-    // The u32 index peepholes apply to index arithmetic only and are
-    // unreachable from any float value, so no `NumericContract` can observe
-    // them.
+    // The u32 index peepholes never reach a float value, so no
+    // `NumericContract` can observe them.
 
     pub(crate) fn u32_literal_of(&self, h: Handle<Expression>) -> Option<u32> {
         match self.exprs[h] {
@@ -338,8 +328,7 @@ impl Emitter<'_> {
     }
 
     /// Flatten logical coordinates through a [`fusor_ir::shape::MultiFlattenMap`]:
-    /// one divmod chain per axis, most-significant-first, zero strides
-    /// (broadcast) and colliding strides (im2col) both legal.
+    /// one divmod chain per axis; zero and colliding strides are legal.
     pub(crate) fn storage_index_from_coords(
         &mut self,
         body: &mut Block,
@@ -549,11 +538,8 @@ impl Emitter<'_> {
     }
 }
 
-/// Saved memo state for one block scope.
-///
-/// `Emitter::mem_epoch` is absent: the counters must survive scope exit so a
-/// write inside the nested block still invalidates the parent's memoized
-/// reads.
+/// Saved memo state for one block scope. `Emitter::mem_epoch` is excluded so
+/// a nested write still invalidates the parent's memoized reads.
 pub(crate) struct Scope {
     memo: rustc_hash::FxHashMap<TileExpr, (Handle<Expression>, super::MemStamp)>,
 }
@@ -637,13 +623,9 @@ pub(crate) fn compare_operator(op: CmpOp) -> BinaryOperator {
 }
 
 impl Emitter<'_> {
-    /// Lower one expression, reusing the hash-cons memo so a repeated subtree
-    /// emits once.
-    ///
-    /// A memoized *pure* tree is the same SSA value forever. A tree that
-    /// reads memory is only the same value while nothing has written the
-    /// spaces it reads, so its entry is stamped with [`Emitter::mem_epoch`]
-    /// and re-emitted once any of those counters has moved.
+    /// Lower one expression through the hash-cons memo. A tree that reads memory
+    /// is stamped with [`Emitter::mem_epoch`] and re-emitted once a space it
+    /// reads has been written.
     pub(crate) fn expr(
         &mut self,
         expr: &TileExpr,
@@ -669,27 +651,14 @@ impl Emitter<'_> {
             .all(|(i, space)| !reads.intersects(*space) || stamp[i] == self.mem_epoch[i])
     }
 
-    /// Record that `written` has been stored to, or that a barrier has made
-    /// another invocation's stores to it visible. Every memoized value that
-    /// reads one of those spaces is stale from here on.
+    /// Record that `written` was stored to or made visible by a barrier; every
+    /// memoized read of those spaces is stale from here on.
     pub(crate) fn invalidate_mem(&mut self, written: MemReads) {
         for (i, space) in MEM_SPACES.iter().enumerate() {
             if written.intersects(*space) {
                 self.mem_epoch[i] = self.mem_epoch[i].wrapping_add(1);
             }
         }
-    }
-
-    /// Emit an operation under a numeric contract, refusing any relaxation the
-    /// contract forbids for the duration of `build`.
-    pub(crate) fn guarded<R>(
-        &mut self,
-        numeric: NumericContract,
-        body: &mut Block,
-        build: impl FnOnce(&mut Self, &mut Block) -> Result<R, EmitError>,
-    ) -> Result<R, EmitError> {
-        let _ = numeric;
-        build(self, body)
     }
 
     fn expr_uncached(
@@ -711,10 +680,8 @@ impl Emitter<'_> {
             }
             TileExprKind::Builtin(b) => self.builtin(body, *b),
             TileExprKind::LoadLocal(local) => {
-                // Cooperative accumulators chain through the SSA memo: a live
-                // entry is reused without emitting a Load, so
-                // `StoreLocal(acc, CoopMma{c: LoadLocal(acc)})` becomes one
-                // Load, N MMAs and one Store.
+                // Cooperative accumulators chain through the SSA memo, so
+                // `StoreLocal(acc, CoopMma{c: LoadLocal(acc)})` is one Load, N MMAs, one Store.
                 if matches!(local.element, ElementType::CoopMatrix { .. })
                     && let Some(value) = self.coop_acc.get(&key(local))
                 {
@@ -734,22 +701,17 @@ impl Emitter<'_> {
                 let ptr = self.tile_dynamic_pointer(body, tile, index)?;
                 self.load_tile_value(body, tile, ptr)
             }
-            TileExprKind::Unary { op, value, numeric } => {
-                let numeric = *numeric;
-                let op = *op;
-                let value = value.clone();
-                self.guarded(numeric, body, |em, body| {
-                    let v = em.expr(&value, body)?;
-                    Ok(match unary_math(op) {
-                        Some(fun) => em.math1(body, fun, v),
-                        None => em.emit_expr(
-                            body,
-                            Expression::Unary {
-                                op: naga::UnaryOperator::Negate,
-                                expr: v,
-                            },
-                        ),
-                    })
+            TileExprKind::Unary { op, value, .. } => {
+                let v = self.expr(value, body)?;
+                Ok(match unary_math(*op) {
+                    Some(fun) => self.math(body, fun, &[v]),
+                    None => {
+                        let negate = Expression::Unary {
+                            op: naga::UnaryOperator::Negate,
+                            expr: v,
+                        };
+                        self.emit_expr(body, negate)
+                    }
                 })
             }
             TileExprKind::Binary {
@@ -789,19 +751,10 @@ impl Emitter<'_> {
                 accept,
                 reject,
             } => {
-                let cond_ty = condition.element();
-                let c = self.expr(condition, body)?;
-                let c = self.condition_value(body, c, cond_ty)?;
+                let c = self.cond(body, condition)?;
                 let a = self.expr(accept, body)?;
                 let r = self.expr(reject, body)?;
-                Ok(self.emit_expr(
-                    body,
-                    Expression::Select {
-                        condition: c,
-                        accept: a,
-                        reject: r,
-                    },
-                ))
+                Ok(self.select(body, c, a, r))
             }
             TileExprKind::Vec {
                 scalar,
@@ -838,7 +791,7 @@ impl Emitter<'_> {
                 }
                 let l = self.expr(left, body)?;
                 let r = self.expr(right, body)?;
-                Ok(self.math2(body, MathFunction::Dot, l, r))
+                Ok(self.math(body, MathFunction::Dot, &[l, r]))
             }
             TileExprKind::Reduce { op, kind, value } => {
                 let op = *op;
@@ -863,43 +816,38 @@ impl Emitter<'_> {
         builtin: fusor_ir::ir::kernel::Builtin,
     ) -> Result<Handle<Expression>, EmitError> {
         use fusor_ir::ir::kernel::Builtin as B;
-        let slot = match builtin {
+        use fusor_ir::ir::kernel::WorkgroupAxis as A;
+        let (arg, axis) = match builtin {
             B::Lane => return Ok(self.lane()),
-            B::ProgramId(axis) => {
-                let wg = self.function_arg(WORKGROUP_ID_ARG);
-                let index = match axis {
-                    fusor_ir::ir::kernel::WorkgroupAxis::X => 0,
-                    fusor_ir::ir::kernel::WorkgroupAxis::Y => 1,
-                    fusor_ir::ir::kernel::WorkgroupAxis::Z => 2,
+            B::ProgramId(axis) => (WORKGROUP_ID_ARG, axis),
+            B::NumWorkgroups(axis) => (
+                self.num_workgroups_arg
+                    .ok_or(EmitError::MissingCapability("num_workgroups argument"))?,
+                axis,
+            ),
+            B::SubgroupId | B::SubgroupLane | B::SubgroupSize | B::NumSubgroups => {
+                let slot = match builtin {
+                    B::SubgroupId => 0,
+                    B::SubgroupLane => 1,
+                    B::SubgroupSize => 2,
+                    _ => 3,
                 };
-                return Ok(self.emit_expr(body, Expression::AccessIndex { base: wg, index }));
+                let arg =
+                    self.subgroup_args[slot].ok_or(EmitError::MissingCapability("subgroups"))?;
+                return Ok(self.function_arg(arg));
             }
-            B::NumWorkgroups(axis) => {
-                let arg = self
-                    .num_workgroups_arg
-                    .ok_or(EmitError::MissingCapability("num_workgroups argument"))?;
-                let nw = self.function_arg(arg);
-                let index = match axis {
-                    fusor_ir::ir::kernel::WorkgroupAxis::X => 0,
-                    fusor_ir::ir::kernel::WorkgroupAxis::Y => 1,
-                    fusor_ir::ir::kernel::WorkgroupAxis::Z => 2,
-                };
-                return Ok(self.emit_expr(body, Expression::AccessIndex { base: nw, index }));
-            }
-            B::SubgroupId => 0,
-            B::SubgroupLane => 1,
-            B::SubgroupSize => 2,
-            B::NumSubgroups => 3,
         };
-        let arg = self.subgroup_args[slot].ok_or(EmitError::MissingCapability("subgroups"))?;
-        Ok(self.function_arg(arg))
+        let base = self.function_arg(arg);
+        let index = match axis {
+            A::X => 0,
+            A::Y => 1,
+            A::Z => 2,
+        };
+        Ok(self.emit_expr(body, Expression::AccessIndex { base, index }))
     }
 
-    /// `Round` is a real primitive, not a comparison chain.
-    ///
-    /// `HalfAwayFromZero` is `sign(x) * floor(abs(x) + 0.5)` — **never** the
-    /// `(x + 2^23) - 2^23` trick, which Metal's default fast math folds away
-    /// and which would silently disable QAT.
+    /// `Round` as a primitive. `HalfAwayFromZero` is `sign(x) * floor(abs(x) + 0.5)`,
+    /// never the `(x + 2^23) - 2^23` trick Metal's fast math folds away.
     fn round(
         &mut self,
         body: &mut Block,
@@ -908,10 +856,10 @@ impl Emitter<'_> {
         element: ElementType,
     ) -> Result<Handle<Expression>, EmitError> {
         Ok(match mode {
-            RoundMode::HalfToEven => self.math1(body, MathFunction::Round, value),
-            RoundMode::Floor => self.math1(body, MathFunction::Floor, value),
-            RoundMode::Ceil => self.math1(body, MathFunction::Ceil, value),
-            RoundMode::Trunc => self.math1(body, MathFunction::Trunc, value),
+            RoundMode::HalfToEven => self.math(body, MathFunction::Round, &[value]),
+            RoundMode::Floor => self.math(body, MathFunction::Floor, &[value]),
+            RoundMode::Ceil => self.math(body, MathFunction::Ceil, &[value]),
+            RoundMode::Trunc => self.math(body, MathFunction::Trunc, &[value]),
             RoundMode::HalfAwayFromZero => {
                 let half = match element {
                     ElementType::Scalar(ScalarElement::F16) => {
@@ -919,10 +867,10 @@ impl Emitter<'_> {
                     }
                     _ => self.f32_lit(0.5),
                 };
-                let sign = self.math1(body, MathFunction::Sign, value);
-                let abs = self.math1(body, MathFunction::Abs, value);
+                let sign = self.math(body, MathFunction::Sign, &[value]);
+                let abs = self.math(body, MathFunction::Abs, &[value]);
                 let biased = self.bin(body, BinaryOperator::Add, abs, half);
-                let floored = self.math1(body, MathFunction::Floor, biased);
+                let floored = self.math(body, MathFunction::Floor, &[biased]);
                 self.bin(body, BinaryOperator::Multiply, sign, floored)
             }
         })
@@ -936,9 +884,8 @@ impl Emitter<'_> {
         right: &TileExpr,
         numeric: NumericContract,
     ) -> Result<Handle<Expression>, EmitError> {
-        // Contraction: `mul` feeding `add` becomes one `Fma`, but only when
-        // *both* nodes permit it. `contract: false` forbids the fusion, which
-        // is what keeps a strict expression's rounding observable.
+        // Contraction: `mul` feeding `add` becomes one `Fma` only when both nodes
+        // permit it.
         if op == BinOp::Add && numeric.contract && expr_is_float(left.element()) {
             for (mul, other) in [(left, right), (right, left)] {
                 if let TileExprKind::Binary {
@@ -952,7 +899,7 @@ impl Emitter<'_> {
                     let a = self.expr(a, body)?;
                     let b = self.expr(b, body)?;
                     let c = self.expr(other, body)?;
-                    return Ok(self.math3(body, MathFunction::Fma, a, b, c));
+                    return Ok(self.math(body, MathFunction::Fma, &[a, b, c]));
                 }
             }
         }
@@ -972,7 +919,7 @@ impl Emitter<'_> {
             Some(naga_op) => self.bin(body, naga_op, l, r),
             None => {
                 let fun = binary_math(op).expect("pow/min/max are the only math binaries");
-                self.math2(body, fun, l, r)
+                self.math(body, fun, &[l, r])
             }
         })
     }
@@ -1064,21 +1011,10 @@ impl Emitter<'_> {
                     let index = self.addr_index(body, view, addr)?;
                     return self.load_storage_value(body, view, index);
                 }
-                let fill_source = fill.element();
-                let fill_h = self.expr(fill, body)?;
-                let fill_h = self.cast_tile_value(body, fill_h, fill_source, element)?;
-                let mask_h = self.expr(mask, body)?;
-                let mask_ty = mask.element();
-                let mask_h = self.condition_value(body, mask_h, mask_ty)?;
+                let (fill_h, mask_h) = self.fill_and_mask(body, fill, mask, element)?;
 
-                // Branchless masking: clamping the element index into the
-                // buffer makes the load unconditionally safe, so it issues
-                // straight-line and the mask collapses to one `select`. A
-                // masked-out lane still yields `fill`, it just also performs
-                // a discarded in-buffer read. The clamp bound is the buffer's
-                // *runtime* length (`arrayLength`), never a baked element
-                // count: a symbolic buffer's decl extent would change the
-                // emitted body per sequence length.
+                // Branchless masking: the index is clamped into the buffer's runtime length
+                // (`arrayLength`, never a baked count) and the mask becomes one `select`.
                 let count = view.buffer.layout.element_count();
                 match u32::try_from(count) {
                     Ok(count) if count > 0 => {
@@ -1092,21 +1028,11 @@ impl Emitter<'_> {
                         }
                         let one = self.u32_lit(1);
                         let last = self.bin(body, BinaryOperator::Subtract, len, one);
-                        let index = self.math2(body, MathFunction::Min, index, last);
+                        let index = self.math(body, MathFunction::Min, &[index, last]);
                         let loaded = self.load_storage_absolute(body, view, index)?;
-                        let selected = self.emit_expr(
-                            body,
-                            Expression::Select {
-                                condition: mask_h,
-                                accept: loaded,
-                                reject: fill_h,
-                            },
-                        );
-                        // Force the result into a named temporary. A backend
-                        // inlines a single-use expression into its consumer,
-                        // so an unrolled run of these nests one `select(..)`
-                        // inside the next and can overrun Metal's 256-bracket
-                        // limit; a name caps the nesting at one load.
+                        let selected = self.select(body, mask_h, loaded, fill_h);
+                        // Force the result into a named temporary so an unrolled run does not nest
+                        // `select`s past Metal's 256-bracket limit.
                         let n = self.forced_names.len();
                         self.forced_names.push((selected, format!("masked_{n}")));
                         Ok(selected)
@@ -1125,13 +1051,20 @@ impl Emitter<'_> {
             }
             Source::Quantized(q) => {
                 let f32_element = ElementType::Scalar(ScalarElement::F32);
-                // The block program decodes **one flat element index** into
-                // the weight's own dense element order, so an `Rc2` address
-                // must be flattened *through the view's element strides*
-                // before it reaches the program; handing it the raw
-                // `(row, col)` pair reads the wrong block for every column
-                // past the first.
+                // The block program decodes one flat element index in the weight's dense
+                // order, so an `Rc2` address is flattened through the view's element strides.
                 let u32_e = ElementType::Scalar(ScalarElement::U32);
+                let lit = |v| TileExpr::new(TileExprKind::Literal(TileLiteral::U32(v)), u32_e);
+                let bin = |op, left, right| {
+                    let numeric = NumericContract::RELAXED;
+                    let kind = TileExprKind::Binary {
+                        op,
+                        left,
+                        right,
+                        numeric,
+                    };
+                    TileExpr::new(kind, u32_e)
+                };
                 let flat_of = |coords: [&TileExpr; 2]| -> Result<TileExpr, EmitError> {
                     let groups = &q.data.layout.indexing.groups;
                     if groups.len() != 2 {
@@ -1153,37 +1086,16 @@ impl Emitter<'_> {
                         let term = if sub.stride == 1 {
                             coord.clone()
                         } else {
-                            TileExpr::new(
-                                TileExprKind::Binary {
-                                    op: fusor_ir::ir::kernel::TileBinaryOp::Mul,
-                                    left: coord.clone(),
-                                    right: TileExpr::new(
-                                        TileExprKind::Literal(TileLiteral::U32(sub.stride)),
-                                        u32_e,
-                                    ),
-                                    numeric: fusor_ir::dtype::NumericContract::RELAXED,
-                                },
-                                u32_e,
-                            )
+                            bin(TileBinaryOp::Mul, coord.clone(), lit(sub.stride))
                         };
                         acc = Some(match acc {
-                            Some(a) => TileExpr::new(
-                                TileExprKind::Binary {
-                                    op: fusor_ir::ir::kernel::TileBinaryOp::Add,
-                                    left: a,
-                                    right: term,
-                                    numeric: fusor_ir::dtype::NumericContract::RELAXED,
-                                },
-                                u32_e,
-                            ),
+                            Some(a) => bin(TileBinaryOp::Add, a, term),
                             None => term,
                         });
                     }
-                    Ok(acc.unwrap_or_else(|| {
-                        TileExpr::new(TileExprKind::Literal(TileLiteral::U32(0)), u32_e)
-                    }))
+                    Ok(acc.unwrap_or_else(|| lit(0)))
                 };
-                let zero = TileExpr::new(TileExprKind::Literal(TileLiteral::U32(0)), u32_e);
+                let zero = lit(0);
                 let (row, col, element_view) = match addr {
                     Addr::Rc2 { row, col } => (flat_of([row, col])?, zero, true),
                     Addr::Linear(index) => (index.clone(), zero, false),
@@ -1192,14 +1104,9 @@ impl Emitter<'_> {
                 if mask.is_constant_true() {
                     return self.decode_one(body, &q, &row, &col);
                 }
-                // Clamp-and-select, never a branch: with the flat index
-                // clamped into the value's extent the decode is a pure
-                // expression in the *enclosing* block, so the window's shared
-                // subexpressions deduplicate and the mask survives as a
-                // select on the value. Only an `Rc2` address rides an
-                // element-space view whose extents bound the flat index; the
-                // `Linear` arm's view is the raw word stream and its extent
-                // clamps the wrong unit.
+                // Clamp-and-select, never a branch, so the decode stays a pure expression
+                // whose window subexpressions deduplicate. Only an `Rc2` address has an
+                // element-space extent to clamp against.
                 let total: u64 = q
                     .data
                     .layout
@@ -1208,40 +1115,12 @@ impl Emitter<'_> {
                     .map(|&e| u64::from(e))
                     .product();
                 if element_view && total > 0 && total <= u64::from(u32::MAX) {
-                    let clamped = TileExpr::new(
-                        TileExprKind::Binary {
-                            op: fusor_ir::ir::kernel::TileBinaryOp::Min,
-                            left: row,
-                            right: TileExpr::new(
-                                TileExprKind::Literal(TileLiteral::U32(total as u32 - 1)),
-                                u32_e,
-                            ),
-                            numeric: fusor_ir::dtype::NumericContract::RELAXED,
-                        },
-                        u32_e,
-                    );
+                    let clamped = bin(TileBinaryOp::Min, row, lit(total as u32 - 1));
                     let decoded = self.decode_one(body, &q, &clamped, &col)?;
-                    let fill_source = fill.element();
-                    let fill_h = self.expr(fill, body)?;
-                    let fill_h = self.cast_tile_value(body, fill_h, fill_source, f32_element)?;
-                    let mask_h = self.expr(mask, body)?;
-                    let mask_ty = mask.element();
-                    let mask_h = self.condition_value(body, mask_h, mask_ty)?;
-                    return Ok(self.emit_expr(
-                        body,
-                        Expression::Select {
-                            condition: mask_h,
-                            accept: decoded,
-                            reject: fill_h,
-                        },
-                    ));
+                    let (fill_h, mask_h) = self.fill_and_mask(body, fill, mask, f32_element)?;
+                    return Ok(self.select(body, mask_h, decoded, fill_h));
                 }
-                let fill_source = fill.element();
-                let fill_h = self.expr(fill, body)?;
-                let fill_h = self.cast_tile_value(body, fill_h, fill_source, f32_element)?;
-                let mask_h = self.expr(mask, body)?;
-                let mask_ty = mask.element();
-                let mask_h = self.condition_value(body, mask_h, mask_ty)?;
+                let (fill_h, mask_h) = self.fill_and_mask(body, fill, mask, f32_element)?;
                 self.masked_value(body, f32_element, fill_h, mask_h, move |em, accept| {
                     em.decode_one(accept, &q, &row, &col)
                 })
@@ -1278,29 +1157,61 @@ impl Emitter<'_> {
         let tmp = self.scratch_local(ScratchKind::Value, element, self.depth)?;
         self.store_local(body, tmp, fill);
         self.depth += 1;
-        let (mut accept, stored) = self.nested(|em, accept| {
-            let v = value(em, accept)?;
-            Ok(v)
-        })?;
+        let (mut accept, stored) = self.nested(value)?;
         self.depth -= 1;
         let ptr = self.local_var(tmp);
-        accept.push(
+        push(
+            &mut accept,
             Statement::Store {
                 pointer: ptr,
                 value: stored,
             },
-            Span::default(),
         );
-        body.push(
-            Statement::If {
-                condition: mask,
+        push_if(body, Some(mask), accept);
+        Ok(self.emit_load(body, ptr))
+    }
+}
+
+pub(crate) fn push(out: &mut Block, statement: Statement) {
+    out.push(statement, Span::default());
+}
+
+pub(crate) fn barrier(out: &mut Block) {
+    push(out, Statement::ControlBarrier(Barrier::WORK_GROUP));
+}
+
+/// `if condition { accept }`, or `accept` as a bare block when unconditional.
+pub(crate) fn push_if(out: &mut Block, condition: Option<Handle<Expression>>, accept: Block) {
+    push(
+        out,
+        match condition {
+            Some(condition) => Statement::If {
+                condition,
                 accept,
                 reject: Block::new(),
             },
-            Span::default(),
-        );
-        Ok(self.emit_load(body, ptr))
-    }
+            None => Statement::Block(accept),
+        },
+    );
+}
+
+pub(crate) fn push_break_if(out: &mut Block, condition: Handle<Expression>) {
+    push_if(
+        out,
+        Some(condition),
+        Block::from_vec(vec![Statement::Break]),
+    );
+}
+
+pub(crate) fn push_loop(out: &mut Block, body: Block) {
+    push(
+        out,
+        Statement::Loop {
+            body,
+            continuing: Block::new(),
+            break_if: None,
+        },
+    );
 }
 
 fn expr_is_float(element: ElementType) -> bool {

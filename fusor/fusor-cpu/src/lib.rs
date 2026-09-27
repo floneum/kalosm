@@ -1,11 +1,5 @@
-//! `fusor-cpu` — the same `KernelIr` through a different emitter.
-//!
-//! Dense contractions use the platform GEMM implementation. All other CPU
-//! kernels compile to native code with Cranelift.
-//!
-//! `Barrier` splits the lane loop into two loops over the lane range; mapping
-//! `Barrier` to a no-op miscompiles every kernel that stages through workgroup
-//! memory.
+//! `fusor-cpu` — `KernelIr` through a CPU emitter: platform GEMM for dense
+//! contractions, Cranelift for everything else. `Barrier` splits the lane loop.
 
 #![warn(unreachable_pub)]
 

@@ -1,6 +1,5 @@
 //! All-pairs arena recheck: every byte-overlapping tile pair must be separated
-//! by a guaranteed uniform barrier. Recomputes [`LivenessInfo`] from the body
-//! independently of the packer.
+//! by a guaranteed uniform barrier, on independently recomputed liveness.
 
 use fusor_ir::Result;
 use fusor_ir::error::Error;

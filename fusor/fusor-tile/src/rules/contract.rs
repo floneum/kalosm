@@ -1,9 +1,5 @@
 //! R3 and R4: the order-free family lowerings and the epilogue un-fusing
-//! rule.
-//!
-//! `lower_family` mints **one node, not four and not four hundred**: the
-//! full legal `(geometry, staging)` space rides on the node and is
-//! resolved by extraction.
+//! rule. `lower_family` mints one node carrying the full legal space.
 
 use fusor_ir::contract_spec::partition;
 use fusor_ir::dtype::Dtype;
@@ -155,13 +151,8 @@ pub fn alias(src: Id, facts: &ValueFacts) -> Operand {
     }
 }
 
-/// Both pre chains must be dtype-preserving, the post chain must read the
-/// operand dtype and write either the operand dtype or — for f16 operands —
-/// f32. A narrowing post would round the accumulator ahead of the chain.
-///
-/// This is a *legality* predicate on the epilogue, never a routing
-/// decision: an epilogue the coop kernel cannot host un-fuses into a second
-/// dispatch as one alternative and routes to the generic fold as another.
+/// Pre chains must preserve dtype; the post chain reads the operand dtype and
+/// writes it or (for f16) f32. Legality only: an unhostable epilogue un-fuses.
 pub fn coop_epilogue_hostable(
     pre_a: &ScalarExpr,
     pre_b: &ScalarExpr,
@@ -188,17 +179,10 @@ fn contract_parts(node: &Node) -> Option<(&EinSpec, Dtype, Id, Id)> {
     }
 }
 
-/// Whether this family can address these operands.
-///
-/// A block-quantized operand is admitted to [`Family::Coop`] (which decodes
-/// during the staging fill into workgroup tiles) and, on GPU, to
-/// [`Family::Sgemv`] (which decodes per loaded element). The other families
-/// read operands element-wise from a dense layout with no staging step to
-/// decode in, so they decline; `LOWER_DEQUANT` still gets those operands to a
-/// runnable form.
+/// Whether this family can address these operands. Quantized operands go to
+/// Coop (decoded in the staging fill) and, on GPU, Sgemv; others decline.
 fn operands_addressable(f: &Facts<'_>, family: Family) -> bool {
-    // The CPU nest reads buffers through plain collapsed strides and would
-    // read block words as floats, so it keeps the dense-only rule.
+    // The CPU nest would read block words as floats.
     let q_ok = |family: Family| {
         family == Family::Coop
             || (family == Family::Sgemv && f.caps().kind == fusor_ir::device::DeviceKind::Gpu)
@@ -208,20 +192,14 @@ fn operands_addressable(f: &Facts<'_>, family: Family) -> bool {
         .all(|o| !o.dtype.is_quantized() || q_ok(family))
 }
 
-/// The dtype the matrix unit actually sees. A quantized operand is decoded
-/// during the staging fill, so the fragments are f32 and the storage format
-/// never reaches the MMA — the coop legality probe and the MAC rate must be
-/// asked about the decoded type, not the stored one.
+/// The dtype the matrix unit sees: quantized operands decode to f32 in the
+/// staging fill, so legality and MAC rate ask about that.
 fn compute_dtype(d: Dtype) -> Dtype {
     if d.is_quantized() { Dtype::F32 } else { d }
 }
 
-/// Read an operand in canonical label order **through its layout** rather than
-/// requiring the spec to have been written that way: `Operand` carries a full
-/// strided `Layout`, and permuting the strides states exactly the same read.
-///
-/// Returns `None` when a label is missing or an extent is symbolic, in which
-/// case the caller declines and the generic fold still carries the value.
+/// Read an operand in canonical label order through its strides. `None` when
+/// a label is missing or an extent symbolic; the generic fold carries it.
 fn permuted_alias(
     src: Id,
     facts: &ValueFacts,
@@ -259,10 +237,7 @@ fn lower_family(
     let (spec, acc, a_id, b_id) = contract_parts(node)?;
     let (fa, fb) = (f.operand(0)?, f.operand(1)?);
     let operand_dtype = compute_dtype(fa.dtype);
-    // `out` still has to be canonical: `Contract` does not parameterize its
-    // *write* map, so an output in another axis order genuinely is a different
-    // kernel. Both *reads* are a stride vector away from canonical, so they are
-    // permuted rather than required.
+    // `out` must be canonical (the write map is fixed); reads just permute.
     let part = partition(spec).ok()?;
     let cat = |x: &[Label], y: &[Label]| -> SmallVec<[Label; 8]> {
         x.iter().chain(y.iter()).copied().collect()
@@ -321,10 +296,8 @@ fn lower_family(
     adopt(b, id, op)
 }
 
-/// `Contract -> Contract { family: Coop }`. Guarded on a *fixed* subgroup
-/// width, a reported cooperative configuration for this `(operand, acc)`
-/// pair, and a non-empty legal geometry set. Legality only: a badly padded
-/// coop tile is still a candidate and loses on cost.
+/// `Contract -> Contract { family: Coop }`, guarded on a fixed subgroup width,
+/// a cooperative config for the dtypes and a non-empty geometry set.
 pub fn lower_coop(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let (_, acc, _, _) = contract_parts(node)?;
     let operand = f.dtype(0)?;
@@ -377,11 +350,7 @@ pub fn lower_generic(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
 }
 
 /// Split an epilogue the cooperative kernel cannot host into
-/// `Map{body: post} . Contract{post: identity}`.
-///
-/// A hostable epilogue fires no rule; `lower_generic`'s node is already the
-/// third alternative. This is what stops one unsupported activation from
-/// costing the whole coop speedup.
+/// `Map{body: post} . Contract{post: identity}`, keeping the coop speedup.
 pub fn unfuse_coop_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Launch(l1) = &node.op else {
         return None;

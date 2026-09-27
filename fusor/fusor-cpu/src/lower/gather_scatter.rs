@@ -1,14 +1,5 @@
-//! `Gather` and `Scatter`.
-//!
-//! Both `ScatterMode`s name one map and differ only in strategy. On a target
-//! with no f32 atomic they share one nest: one lane per output element, a
-//! counted loop over the updates. Every output element is written by exactly one
-//! lane, so no atomic is needed and the result is bit-reproducible.
-//!
-//! Both nests read their lane tiling off `theta`. `Gather` and `Scatter` carry
-//! the same elementwise `ScheduleDomain::Map` a `Map` carries, and can use
-//! `tm` elements per lane like the grid-strided register tile in `map_fold`,
-//! amortizing the index read in scatter workloads.
+//! `Gather` and `Scatter`: one lane per output element (`tm` with a grid-stride
+//! tiling), a scatter looping over the updates, so no atomic is needed.
 
 use fusor_ir::Result;
 use fusor_ir::error::Error;
@@ -39,18 +30,8 @@ pub(crate) fn lower(node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result
     }
 }
 
-/// How many output elements one lane owns, read off `theta`.
-///
-/// [`SchedPoint::Point`] is the floor lowering's untiled point, so it is
-/// answered with 1 rather than refused. Any other family on these nodes is a
-/// planner bug.
-///
-/// `MapTiling::dim` is ignored: this backend tiles with a grid stride
-/// (`flat + t * grid.x * block`), exactly as `lower_map` does, so one lane's
-/// elements are a fixed distance apart whatever axis the domain named and
-/// coverage stays a bijection with no divisibility side condition.
-/// `MapTiling::vector` is ignored too: `emit::pick_width` chooses the SIMD
-/// instantiation from `caps.simd_widths` and the block width.
+/// Output elements per lane, read off `theta` (`Point` is 1). Tiling is a grid
+/// stride, so `MapTiling::dim` and `vector` are ignored.
 fn lane_tile(theta: SchedPoint) -> Result<u32> {
     match theta {
         SchedPoint::Map(t) => Ok(t.tm.max(1)),
@@ -61,9 +42,7 @@ fn lane_tile(theta: SchedPoint) -> Result<u32> {
     }
 }
 
-/// The `tm` flat output indices one lane owns, a whole grid apart, so lanes
-/// `0..stride` cover `[0, tm * stride) >= [0, n)` exactly once with no
-/// divisibility condition; and the grid that makes it so.
+/// The `tm` flat indices one lane owns, a grid apart, and that grid.
 fn lane_offsets(b: &Kernel, n: u64, tm: u32) -> ([u32; 3], Vec<TileExpr>) {
     let grid = grid_for(n.div_ceil(u64::from(tm)), DEFAULT_BLOCK);
     let stride = grid[0].saturating_mul(DEFAULT_BLOCK);
@@ -78,10 +57,6 @@ fn lane_offsets(b: &Kernel, n: u64, tm: u32) -> ([u32; 3], Vec<TileExpr>) {
 }
 
 /// `out[i, rest] = src[idx[i], rest]`, one lane per output element.
-///
-/// Both `GatherMode`s share this nest; they differ only in how many output
-/// elements one lane owns, which is a schedule attribute rather than a
-/// different kernel.
 fn gather(
     cx: &LowerCtx<'_>,
     space: &IndexSpace,
@@ -104,10 +79,8 @@ fn gather(
     }
     let inner: u32 = extents[axis + 1..].iter().product::<u32>().max(1);
     let out_stride = extents[axis].max(1) * inner;
-    // The source's extent along the gathered axis, the only axis where source
-    // and output disagree. Scaling the source's outer coordinate by the
-    // output's stride reads the wrong row whenever the index vector is not
-    // exactly as long as the axis it indexes.
+    // The source's extent on the gathered axis: the outer coordinate must step by
+    // the source's stride, not the output's.
     let src_shape = const_extents(cx, src.layout.shape())?;
     let src_axis = *src_shape
         .get(axis)
@@ -124,8 +97,7 @@ fn gather(
         // Split the flat output index into (outer, gathered, inner).
         let (outer, rest) = b.divrem(flat.clone(), b.u32(out_stride));
         let (g, within) = b.divrem(rest, b.u32(inner));
-        // The gathered coordinate replaces `g`; everything else is unchanged —
-        // but the outer coordinate steps by the *source's* stride.
+        // Replace the gathered coordinate; outer steps by the source's stride.
         let row = idx.at(&b, g, mask.clone());
         let src_index = b.add(
             b.add(b.mul(outer, b.u32(src_stride)), b.mul(row, b.u32(inner))),
@@ -139,34 +111,13 @@ fn gather(
         });
     }
 
-    Ok(KernelIr {
-        buffers: binds.buffers,
-        grid,
-        block: DEFAULT_BLOCK,
-        body,
-        byte_arena: None,
-        name: "cpu_gather",
-    })
+    Ok(binds.finish("cpu_gather", grid, DEFAULT_BLOCK, body))
 }
 
-/// `out = base` with `out[.., idx[u], ..] (combine)= upd[.., u, ..]`.
-///
-/// The nest walks the output, not the updates: a `Scatter`'s value is its
-/// *base* with the updates applied, and the plan gives that value its own
-/// buffer — nothing copies the base in beforehand — so a kernel that only
-/// visits the written elements leaves every other one undefined.
-///
-/// One lane per output element, a counted loop over the updates, and the
-/// accumulator carried in a register: the write map is not injective, so the
-/// nest declares an associative `combine` (`verify_launch` invariant 3) and
-/// discharges it by making each output element the *only* writer of itself.
-/// The accumulation order is therefore fixed and the result bit-reproducible
-/// at any thread count — no atomic, on a target that has none for f32, so
-/// either `ScatterMode` lowers here.
-///
-/// `tm` output elements per lane, in one loop: the loop costs one `idx[u]`
-/// read per output element per update, and `tm` accumulators in the same loop
-/// share that read.
+/// `out = base` with `out[.., idx[u], ..] (combine)= upd[.., u, ..]`. Walks the
+/// output (the plan never copies the base in), one lane per element over a
+/// counted loop of updates: each element is its own sole writer, so the result
+/// is bit-reproducible without atomics; `tm` accumulators share one `idx[u]` read.
 fn scatter(
     cx: &LowerCtx<'_>,
     axis: u32,
@@ -196,8 +147,7 @@ fn scatter(
     let (grid, offsets) = lane_offsets(&b, total, tm);
     let u_local = b.local(ScalarElement::U32.element());
     let u = b.load_local(u_local.clone());
-    // The lowest offset is live whenever any of this lane's offsets is, so it
-    // is the right mask for the one index read they share.
+    // The lowest offset is live whenever any is: the mask for the shared index read.
     let first_live = b.lt(global_lane(&b, DEFAULT_BLOCK), b.u32(total as u32));
     let u_bin = idx.at(&b, u.clone(), first_live);
 
@@ -218,9 +168,7 @@ fn scatter(
         );
         let contribution = upd.at(&b, upd_index, live.clone());
         let combined = match combine {
-            // `Add` duplicates accumulate — normative: an embedding table
-            // receiving one token twice gets the summed gradient. `Set` is only
-            // reachable when the node proved its indices unique.
+            // `Add` accumulates duplicates; `Set` only when indices are proven unique.
             ScatterCombine::Add => b.add(acc.clone(), contribution),
             ScatterCombine::Set => contribution,
         };
@@ -253,12 +201,5 @@ fn scatter(
     }];
     body.extend(stores);
 
-    Ok(KernelIr {
-        buffers: binds.buffers,
-        grid,
-        block: DEFAULT_BLOCK,
-        body,
-        byte_arena: None,
-        name: "cpu_scatter",
-    })
+    Ok(binds.finish("cpu_scatter", grid, DEFAULT_BLOCK, body))
 }

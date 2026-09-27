@@ -5,12 +5,12 @@ use fusor_ir::ir::kernel::{
 };
 use fusor_ir::target::EmitError;
 use naga::{
-    Barrier, BinaryOperator, Block, CollectiveOperation, Expression, Handle, MathFunction, Span,
-    Statement, SubgroupOperation,
+    BinaryOperator, Block, CollectiveOperation, Expression, Handle, MathFunction, Statement,
+    SubgroupOperation,
 };
 
 use super::Emitter;
-use super::expr::{binary_math, binary_operator};
+use super::expr::{barrier, binary_math, binary_operator, push, push_if};
 
 impl Emitter<'_> {
     pub(crate) fn reduce(
@@ -20,18 +20,14 @@ impl Emitter<'_> {
         value: &TileExpr,
         out: &mut Block,
     ) -> Result<Handle<Expression>, EmitError> {
+        let element = value.element();
+        let v = self.expr(value, out)?;
         match kind {
-            ReduceKind::Subgroup => {
-                let element = value.element();
-                let v = self.expr(value, out)?;
-                self.subgroup_reduce(out, v, op, element)
-            }
+            ReduceKind::Subgroup => self.subgroup_reduce(out, v, op, element),
             ReduceKind::Workgroup {
                 scratch,
                 group_size,
             } => {
-                let element = value.element();
-                let v = self.expr(value, out)?;
                 if self.upgrades_tree(*group_size, element) {
                     self.collective_tree_reduce(out, scratch, v, op, element)
                 } else {
@@ -87,24 +83,21 @@ impl Emitter<'_> {
         };
         let ty = self.element_type(ElementType::Scalar(scalar))?;
         let result = self.append(Expression::SubgroupOperationResult { ty });
-        out.push(
+        push(
+            out,
             Statement::SubgroupCollectiveOperation {
                 op: subgroup_op,
                 collective_op: CollectiveOperation::Reduce,
                 argument: value,
                 result,
             },
-            Span::default(),
         );
         Ok(result)
     }
 
-    /// `Workgroup` — **barrier, seed `scratch[lane]`, barrier, then the halving
-    /// tree with a barrier after each stride**.
-    ///
-    /// The leading barrier is load-bearing: when the scratch tile is reused
-    /// inside one kernel, a lane could otherwise overwrite `scratch[lane]`
-    /// while another lane still reads the previous reduction's value.
+    /// `Workgroup`: barrier, seed `scratch[lane]`, barrier, then the halving tree
+    /// with a barrier per stride. The leading barrier protects a reused scratch
+    /// tile from the previous reduction's readers.
     fn tree_reduce(
         &mut self,
         out: &mut Block,
@@ -117,15 +110,9 @@ impl Emitter<'_> {
 
         let lane = self.lane();
         let lane_ptr = self.tile_dynamic_pointer(out, scratch, lane)?;
-        out.push(
-            Statement::ControlBarrier(Barrier::WORK_GROUP),
-            Span::default(),
-        );
+        barrier(out);
         self.store_tile_value(out, scratch, lane_ptr, value)?;
-        out.push(
-            Statement::ControlBarrier(Barrier::WORK_GROUP),
-            Span::default(),
-        );
+        barrier(out);
 
         let result_index = self.tree_levels(out, lane, group_size, |em, accept, rhs_index| {
             let lhs_ptr = em.tile_dynamic_pointer(accept, scratch, lane)?;
@@ -140,15 +127,9 @@ impl Emitter<'_> {
         self.load_tile_value(out, scratch, result_ptr)
     }
 
-    /// The whole-block tree on a fixed-subgroup-width device: one collective
-    /// per subgroup, the per-subgroup partials staged through the first
-    /// `block/width` scratch slots, and a serial fold every lane performs in
-    /// the same order — two barriers total against the tree's
-    /// `2 + log2(block)`.
-    ///
-    /// Every lane folds the identical slots in the identical order, so all
-    /// lanes hold the same total. When one subgroup covers the block the
-    /// collective alone is the reduction: no scratch, no barriers.
+    /// The whole-block tree on a fixed-width device: one collective per subgroup,
+    /// partials staged through `block/width` scratch slots, then an identical
+    /// serial fold on every lane (two barriers). One subgroup needs no scratch.
     fn collective_tree_reduce(
         &mut self,
         out: &mut Block,
@@ -174,16 +155,9 @@ impl Emitter<'_> {
         )
     }
 
-    /// The N-ary reduction: an explicit log-tree over `lanes * block`
-    /// scratch, evaluating the carrier's `merge` at every level.
-    ///
-    /// `Subgroup` is refused: there is no hardware collective for a
-    /// multi-lane merge. Per-lane accumulation is lowered with `Stmt::Loop`
-    /// before this collective.
-    ///
-    /// Every `merge` expression reads only its formals, so all `lanes` merges
-    /// are evaluated before any is written back and no level can read a slot its
-    /// sibling has already overwritten.
+    /// The N-ary reduction: a log-tree over `lanes * block` scratch evaluating the
+    /// carrier's `merge` at every level; `Subgroup` is refused. All merges of a
+    /// level are evaluated before any is written back.
     pub(crate) fn reduce_n(
         &mut self,
         kind: &ReduceKind,
@@ -211,18 +185,12 @@ impl Emitter<'_> {
             .map(|v| self.expr(v, out))
             .collect::<Result<_, _>>()?;
         let lane = self.lane();
-        out.push(
-            Statement::ControlBarrier(Barrier::WORK_GROUP),
-            Span::default(),
-        );
+        barrier(out);
         for (tile, value) in scratch.iter().zip(&staged) {
             let ptr = self.tile_dynamic_pointer(out, tile, lane)?;
             self.store_tile_value(out, tile, ptr, *value)?;
         }
-        out.push(
-            Statement::ControlBarrier(Barrier::WORK_GROUP),
-            Span::default(),
-        );
+        barrier(out);
 
         let result_index = self.tree_levels(out, lane, group_size, |em, accept, rhs_index| {
             // Both partials into the formals first: a merge reads only its
@@ -274,10 +242,8 @@ impl Emitter<'_> {
         Ok(())
     }
 
-    /// The halving levels of a tree over each `group_size` lanes, a barrier
-    /// after each: the lanes in the low half of the remaining stride run
-    /// `level(rhs_index)` against their partner. Returns the index of each
-    /// group's result slot.
+    /// The halving levels over each `group_size` lanes, a barrier after each.
+    /// Returns each group's result slot index.
     fn tree_levels(
         &mut self,
         out: &mut Block,
@@ -301,18 +267,8 @@ impl Emitter<'_> {
                 let rhs_index = em.add_literal_u32(accept, lane, stride);
                 level(em, accept, rhs_index)
             })?;
-            out.push(
-                Statement::If {
-                    condition: participates,
-                    accept,
-                    reject: Block::new(),
-                },
-                Span::default(),
-            );
-            out.push(
-                Statement::ControlBarrier(Barrier::WORK_GROUP),
-                Span::default(),
-            );
+            push_if(out, Some(participates), accept);
+            barrier(out);
             stride /= 2;
         }
         Ok(result_index)
@@ -332,7 +288,7 @@ impl Emitter<'_> {
             None => {
                 let fun: MathFunction =
                     binary_math(binop).expect("min/max are the only math reductions");
-                self.math2(body, fun, left, right)
+                self.math(body, fun, &[left, right])
             }
         }
     }
@@ -355,10 +311,7 @@ impl crate::reduction::CollectiveEmitter for NagaCollective<'_, '_> {
             .subgroup_reduce(self.out, value, self.op, self.element)
     }
     fn barrier(&mut self) {
-        self.out.push(
-            Statement::ControlBarrier(Barrier::WORK_GROUP),
-            Span::default(),
-        );
+        barrier(self.out);
     }
     fn store_leader(&mut self, value: Self::Value) -> Result<(), EmitError> {
         let u32e = ElementType::Scalar(ScalarElement::U32);
@@ -375,14 +328,7 @@ impl crate::reduction::CollectiveEmitter for NagaCollective<'_, '_> {
             let ptr = em.tile_dynamic_pointer(accept, &scratch, sid)?;
             em.store_tile_value(accept, &scratch, ptr, value)
         })?;
-        self.out.push(
-            Statement::If {
-                condition: leader,
-                accept,
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
+        push_if(self.out, Some(leader), accept);
         Ok(())
     }
     fn load_partial(&mut self, index: u32) -> Result<Self::Value, EmitError> {

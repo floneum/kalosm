@@ -1,13 +1,6 @@
-//! `KernelIr` -> a runnable CPU loop nest.
-//!
-//! `KernelIr` is **compiled**, not interpreted per element. [`compile`] lowers
-//! one kernel into a [`Program`]: a flat SSA `tape` plus a list of segments.
-//! Flattening the hash-consed `TileExpr` DAG into the tape is the CSE.
-//!
-//! One grid point is one workgroup. `block` lanes are walked in chunks of `W`,
-//! and `Stmt::Barrier` lowers to a **segment split** (see
-//! [`stmt::block`]) so a lane chunk can never read a tile slot a later chunk
-//! has not written.
+//! `KernelIr` compiled into a [`Program`]: a flat SSA tape (flattening the
+//! hash-consed DAG is the CSE) plus segments. `Stmt::Barrier` is a segment split
+//! (see [`stmt::block`]) so no lane chunk reads a tile slot not yet written.
 
 pub(crate) mod access;
 pub(crate) mod expr;
@@ -18,8 +11,8 @@ use fusor_ir::Result;
 use fusor_ir::device::Caps;
 use fusor_ir::dtype::NumericContract;
 use fusor_ir::ir::kernel::{
-    Addr, ArenaPlanner, BufferDecl, Builtin, ElementType, KernelIr, LocalDecl, MemoryLevel,
-    ScalarElement, Source, Stmt, Tile, TileDecl, TileExpr, TileExprKind, TileLayout, TileLiteral,
+    Addr, BufferDecl, Builtin, ElementType, KernelIr, LocalDecl, MemoryLevel, ScalarElement,
+    Source, Stmt, Tile, TileDecl, TileExpr, TileExprKind, TileLayout, TileLiteral,
 };
 use fusor_ir::scalar::BinOp;
 use fusor_ir::target::{Buf, EmitError, Uniforms};
@@ -27,13 +20,12 @@ use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 use expr::{Instr, NumTy, Slot, UniformSrc};
-use stmt::{CAcc, CStmt, LaneLoop};
+use stmt::{CAcc, CStmt};
 
 /// One workgroup tile's placement in the thread-local scratch arena.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct TileInfo {
     pub elem: ScalarElement,
-    pub elements: u32,
     pub byte_offset: u32,
     pub extents: [u32; 2],
 }
@@ -41,12 +33,10 @@ pub struct TileInfo {
 /// A compiled kernel body.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct Program {
-    /// The SSA tape: one instruction per distinct expression node, referenced
-    /// by half-open ranges from the statements.
+    /// The SSA tape: one instruction per distinct expression node.
     pub tape: Vec<Instr>,
-    /// Top-level segments, in order. A `Barrier` between two statements is a
-    /// boundary here, not a runtime no-op.
-    pub segments: Vec<LaneLoop>,
+    /// Top-level segments, in order; a `Barrier` is a boundary between them.
+    pub segments: Vec<Vec<CStmt>>,
     pub regs: usize,
     pub locals: usize,
     pub tiles: Vec<TileInfo>,
@@ -54,15 +44,12 @@ pub struct Program {
     pub arena_bytes: u32,
     pub block: u32,
     pub width: u32,
-    /// Set when the body contains `Stmt::AtomicAdd`; the launcher then runs on
-    /// one worker so the accumulation stays deterministic.
+    /// Set when the body has `Stmt::AtomicAdd`; the launcher then runs one worker.
     pub has_atomic: bool,
 }
 
 impl Program {
-    /// Total `Store` statements at every depth. Used by
-    /// `matmul_epilogue_fuses_in_k_loop` to assert nothing is materialized in
-    /// between.
+    /// Total `Store` statements at every depth.
     pub fn store_count(&self) -> usize {
         fn go(s: &[CStmt]) -> usize {
             s.iter()
@@ -75,7 +62,7 @@ impl Program {
                 })
                 .sum()
         }
-        self.segments.iter().map(|l| go(&l.stmts)).sum()
+        self.segments.iter().map(|l| go(l)).sum()
     }
 
     /// Fused multiply-adds on the tape. Zero under `NumericContract::STRICT`.
@@ -90,18 +77,13 @@ pub struct CpuArtifact {
     pub prog: Arc<Program>,
     pub contract: Option<crate::gemm::ContractSpec>,
     pub jit: Option<crate::jit::JitKernel>,
-    pub grid: [u32; 3],
-    pub block: u32,
     pub name: &'static str,
-    pub arena_bytes: u32,
 }
 
 /// The public handle the `Target` hands back.
 #[derive(Clone, Debug)]
 pub struct CpuKernel {
     pub name: &'static str,
-    pub block: u32,
-    pub vector_width: u32,
     pub artifact: CpuArtifact,
 }
 
@@ -114,49 +96,20 @@ impl CpuKernel {
 
 /// Emit a kernel for this device.
 pub fn emit(ir: &KernelIr, caps: &Caps) -> Result<CpuKernel, EmitError> {
-    let artifact = compile(ir, caps, None)?;
+    let artifact = compile(ir, caps)?;
     Ok(CpuKernel {
         name: artifact.name,
-        block: artifact.block,
-        vector_width: artifact.prog.width,
         artifact,
     })
 }
 
-/// Compile one `KernelIr`.
-///
-/// The supplied planner constructs the arena. Compiler tests independently
-/// check uniformity and arena invariants before compilation. Without a planner
-/// the arena uses sequential packing; CPU thread-local scratch aliases freely.
-pub(crate) fn compile(
-    ir: &KernelIr,
-    caps: &Caps,
-    planner: Option<&dyn ArenaPlanner>,
-) -> std::result::Result<CpuArtifact, EmitError> {
+/// Compile one `KernelIr`. The arena packs sequentially, which is legal
+/// because CPU thread-local scratch aliases freely.
+pub(crate) fn compile(ir: &KernelIr, caps: &Caps) -> std::result::Result<CpuArtifact, EmitError> {
     let width = pick_width(caps, ir.block);
-
-    let arena = match planner {
-        Some(p) => {
-            #[cfg(any(test, feature = "compiler-tests"))]
-            p.verify_uniformity(ir)
-                .map_err(|e| EmitError::Validation(e.to_string()))?;
-            let plan = p
-                .arena_plan(ir, caps)
-                .map_err(|e| EmitError::Validation(e.to_string()))?;
-            #[cfg(any(test, feature = "compiler-tests"))]
-            p.verify_arena(ir, &plan)
-                .map_err(|e| EmitError::Validation(e.to_string()))?;
-            Some(plan)
-        }
-        None => None,
-    };
-
     let mut c = Compiler::new(ir, width);
-    if let Some(plan) = &arena {
-        c.seed_arena(plan);
-    }
     let body = c.compile_stmts(&ir.body)?;
-    let segments = stmt::block(&body, ir.block.max(1), width)?;
+    let segments = stmt::block(&body)?;
 
     let prog = Arc::new(Program {
         tape: c.tape,
@@ -185,16 +138,8 @@ pub(crate) fn compile(
         prog,
         contract,
         jit,
-        grid: ir.grid,
-        block: ir.block.max(1),
         name: ir.name,
-        arena_bytes: prog_arena(&arena, c.arena_bytes),
     })
-}
-
-fn prog_arena(plan: &Option<fusor_ir::ir::kernel::ArenaPlan>, minimum: u32) -> u32 {
-    plan.as_ref()
-        .map_or(minimum, |p| p.total_bytes.max(minimum))
 }
 
 /// The widest legal instantiation that still divides the work sensibly.
@@ -223,8 +168,7 @@ struct Compiler<'a> {
     tape: Vec<Instr>,
     regs: u32,
     memo: FxHashMap<TileExpr, Slot>,
-    /// Workgroup reduces already staged, mapped to the tile read that replaces
-    /// them.
+    /// Workgroup reduces already staged, mapped to the tile read replacing them.
     redirect: FxHashMap<TileExpr, TileExpr>,
     tiles: Vec<TileInfo>,
     tile_index: FxHashMap<usize, u16>,
@@ -252,29 +196,6 @@ impl<'a> Compiler<'a> {
             arena_bytes: 0,
             has_atomic: false,
             pre: Vec::new(),
-        }
-    }
-
-    /// Adopt the planner's placements, so the CPU arena and the Launch occupancy
-    /// term read the same `arena_plan` value.
-    fn seed_arena(&mut self, plan: &fusor_ir::ir::kernel::ArenaPlan) {
-        for p in &plan.placements {
-            let key = Arc::as_ptr(&p.tile) as usize;
-            if self.tile_index.contains_key(&key) {
-                continue;
-            }
-            let idx = self.tiles.len() as u16;
-            self.tiles.push(TileInfo {
-                elem: match p.tile.element {
-                    ElementType::Scalar(s) => s,
-                    _ => ScalarElement::F32,
-                },
-                elements: p.tile.layout.element_count() as u32,
-                byte_offset: p.byte_offset,
-                extents: extents2(&p.tile),
-            });
-            self.tile_index.insert(key, idx);
-            self.arena_bytes = self.arena_bytes.max(p.byte_offset + p.byte_len);
         }
     }
 
@@ -323,15 +244,13 @@ impl<'a> Compiler<'a> {
             ElementType::Scalar(s) => s,
             _ => ScalarElement::F32,
         };
-        // Sequential packing: legal on CPU because thread-local scratch
-        // aliases freely.
+        // Sequential packing: thread-local scratch aliases freely.
         let offset = align_up(self.arena_bytes, 64);
         let len = elements * elem.byte_size() as u32;
         self.arena_bytes = offset + len;
         let idx = self.tiles.len() as u16;
         self.tiles.push(TileInfo {
             elem,
-            elements,
             byte_offset: offset,
             extents: extents2(t),
         });
@@ -393,8 +312,7 @@ impl<'a> Compiler<'a> {
                 let elem = scalar_of(dst.buffer.element)?;
                 let prep = self.begin();
                 let index = self.compile_addr(dst.offset, addr)?;
-                let v = self.compile_expr(value)?;
-                let v = self.coerce_store(v, value, elem)?;
+                let v = self.compile_value(value)?;
                 let m = self.compile_mask(mask)?;
                 let prep = prep..self.end();
                 if matches!(s, Stmt::AtomicAdd { .. }) {
@@ -447,14 +365,14 @@ impl<'a> Compiler<'a> {
                 let info = self.tiles[tile as usize].clone();
                 let prep = self.begin();
                 let v = self.compile_expr(value)?;
-                let lo = match &bounds[0] {
-                    Some(e) => Some(self.compile_expr(e)?),
-                    None => None,
-                };
-                let hi = match &bounds[1] {
-                    Some(e) => Some(self.compile_expr(e)?),
-                    None => None,
-                };
+                let lo = bounds[0]
+                    .as_ref()
+                    .map(|e| self.compile_expr(e))
+                    .transpose()?;
+                let hi = bounds[1]
+                    .as_ref()
+                    .map(|e| self.compile_expr(e))
+                    .transpose()?;
                 CStmt::FillTile {
                     prep: prep..self.end(),
                     tile,
@@ -492,10 +410,7 @@ impl<'a> Compiler<'a> {
             } => {
                 let idx = index.as_ref().map(|l| self.local_of(l));
                 let prep = self.begin();
-                let cnt = match count {
-                    Some(e) => Some(self.compile_expr(e)?),
-                    None => None,
-                };
+                let cnt = count.as_ref().map(|e| self.compile_expr(e)).transpose()?;
                 let mut accs = Vec::with_capacity(accumulators.len());
                 for a in accumulators {
                     let local = self.local_of(&a.local);
@@ -526,9 +441,7 @@ impl<'a> Compiler<'a> {
                     body,
                 }
             }
-            // The N-ary reduction. A one-lane node with a hardware operator has
-            // already been rewritten into the expression form by
-            // [`desugar_fast_reduce`], so this is the general merge.
+            // The general N-ary merge; one-lane hardware reduces were desugared.
             Stmt::Reduce {
                 kind,
                 values,
@@ -599,9 +512,8 @@ impl<'a> Compiler<'a> {
         })
     }
 
-    /// Hoist every collective reduction reachable from a statement into a
-    /// collective staging pass in front of it, and record the tile read that
-    /// replaces it.
+    /// Hoist every collective reduction in a statement into a staging pass in
+    /// front of it, recording the tile read that replaces it.
     fn stage_reduces_in(&mut self, s: &Stmt) -> std::result::Result<(), EmitError> {
         let mut found = Vec::new();
         let mut seen: rustc_hash::FxHashSet<TileExpr> = rustc_hash::FxHashSet::default();
@@ -693,11 +605,7 @@ impl<'a> Compiler<'a> {
     /// Compile an expression consumed as a lane mask.
     fn compile_mask(&mut self, e: &TileExpr) -> std::result::Result<Slot, EmitError> {
         if e.is_constant_true() {
-            let out = self.slot();
-            return Ok(self.push(Instr::Const {
-                out,
-                bits: u32::MAX,
-            }));
+            return Ok(self.konst(u32::MAX));
         }
         let s = self.compile_expr(e)?;
         if produces_mask(e) {
@@ -708,24 +616,9 @@ impl<'a> Compiler<'a> {
         Ok(self.push(Instr::ValueToMask { out, x: s, ty }))
     }
 
-    /// Compile a value, materializing a mask to 1/0 when the consumer wants a
-    /// number.
+    /// Compile a value, materializing a mask to 1/0.
     fn compile_value(&mut self, e: &TileExpr) -> std::result::Result<Slot, EmitError> {
         let s = self.compile_expr(e)?;
-        if !produces_mask(e) {
-            return Ok(s);
-        }
-        let ty = num_ty(e.element());
-        let out = self.slot();
-        Ok(self.push(Instr::MaskToValue { out, x: s, ty }))
-    }
-
-    fn coerce_store(
-        &mut self,
-        s: Slot,
-        e: &TileExpr,
-        _elem: ScalarElement,
-    ) -> std::result::Result<Slot, EmitError> {
         if !produces_mask(e) {
             return Ok(s);
         }
@@ -772,25 +665,14 @@ impl<'a> Compiler<'a> {
                 match b {
                     Builtin::Lane => self.push(Instr::LaneId { out }),
                     other => {
+                        use fusor_ir::ir::kernel::WorkgroupAxis as A;
                         let which = match other {
-                            Builtin::ProgramId(fusor_ir::ir::kernel::WorkgroupAxis::X) => {
-                                UniformSrc::ProgramX
-                            }
-                            Builtin::ProgramId(fusor_ir::ir::kernel::WorkgroupAxis::Y) => {
-                                UniformSrc::ProgramY
-                            }
-                            Builtin::ProgramId(fusor_ir::ir::kernel::WorkgroupAxis::Z) => {
-                                UniformSrc::ProgramZ
-                            }
-                            Builtin::NumWorkgroups(fusor_ir::ir::kernel::WorkgroupAxis::X) => {
-                                UniformSrc::GridX
-                            }
-                            Builtin::NumWorkgroups(fusor_ir::ir::kernel::WorkgroupAxis::Y) => {
-                                UniformSrc::GridY
-                            }
-                            Builtin::NumWorkgroups(fusor_ir::ir::kernel::WorkgroupAxis::Z) => {
-                                UniformSrc::GridZ
-                            }
+                            Builtin::ProgramId(A::X) => UniformSrc::ProgramX,
+                            Builtin::ProgramId(A::Y) => UniformSrc::ProgramY,
+                            Builtin::ProgramId(A::Z) => UniformSrc::ProgramZ,
+                            Builtin::NumWorkgroups(A::X) => UniformSrc::GridX,
+                            Builtin::NumWorkgroups(A::Y) => UniformSrc::GridY,
+                            Builtin::NumWorkgroups(A::Z) => UniformSrc::GridZ,
                             Builtin::SubgroupId => UniformSrc::SubgroupId,
                             Builtin::SubgroupLane => UniformSrc::SubgroupLane,
                             Builtin::SubgroupSize => UniformSrc::SubgroupSize,
@@ -815,8 +697,6 @@ impl<'a> Compiler<'a> {
                 Source::Storage(view) => {
                     let buf = self.buffer_of(&view.buffer)?;
                     let elem = scalar_of(view.buffer.element)?;
-                    let form = access::form_of(&view.layout, addr);
-                    access::note_form(form);
                     let index = self.compile_addr(view.offset, addr)?;
                     let m = self.compile_mask(mask)?;
                     let f = self.compile_value(fill)?;
@@ -828,12 +708,10 @@ impl<'a> Compiler<'a> {
                         index,
                         mask: m,
                         fill: f,
-                        form,
                     })
                 }
                 Source::Quantized(q) => {
-                    // A quantized load is one lane of a decoded block; the
-                    // decode program supplies the expression.
+                    // A quantized load is one lane of a decoded block.
                     let (k_base, col) = match &**addr {
                         Addr::Rc2 { row, col } => (row.clone(), col.clone()),
                         Addr::Linear(e) => (e.clone(), zero_u32()),
@@ -877,31 +755,19 @@ impl<'a> Compiler<'a> {
                 numeric,
             } => {
                 // `contract: false` forbids fusing a mul+add into a mul_add.
-                if *op == BinOp::Add && numeric.contract && ty == NumTy::F32 {
-                    if let Some((a, b)) = mul_operands(left, numeric) {
-                        let sa = self.compile_value(&a)?;
-                        let sb = self.compile_value(&b)?;
-                        let sc = self.compile_value(right)?;
-                        let out = self.slot();
-                        return Ok(self.push(Instr::Fma {
-                            out,
-                            a: sa,
-                            b: sb,
-                            c: sc,
-                        }));
-                    }
-                    if let Some((a, b)) = mul_operands(right, numeric) {
-                        let sa = self.compile_value(&a)?;
-                        let sb = self.compile_value(&b)?;
-                        let sc = self.compile_value(left)?;
-                        let out = self.slot();
-                        return Ok(self.push(Instr::Fma {
-                            out,
-                            a: sa,
-                            b: sb,
-                            c: sc,
-                        }));
-                    }
+                let fused = (*op == BinOp::Add && numeric.contract && ty == NumTy::F32)
+                    .then(|| {
+                        mul_operands(left, numeric)
+                            .map(|ab| (ab, right))
+                            .or_else(|| mul_operands(right, numeric).map(|ab| (ab, left)))
+                    })
+                    .flatten();
+                if let Some(((a, b), c)) = fused {
+                    let a = self.compile_value(&a)?;
+                    let b = self.compile_value(&b)?;
+                    let c = self.compile_value(c)?;
+                    let out = self.slot();
+                    return Ok(self.push(Instr::Fma { out, a, b, c }));
                 }
                 let a = self.compile_value(left)?;
                 let b = self.compile_value(right)?;
@@ -970,8 +836,7 @@ impl<'a> Compiler<'a> {
                 let c = self.compile_mask(condition)?;
                 let t = self.compile_value(accept)?;
                 let f = self.compile_value(reject)?;
-                // A vector occupies `lanes` consecutive registers, so a
-                // vector-typed select is `lanes` selects.
+                // A vector occupies `lanes` registers, so a vector select is `lanes` selects.
                 match e.element() {
                     ElementType::Vector { lanes, .. } if lanes > 1 => {
                         let out = self.slots(lanes);
@@ -1070,8 +935,7 @@ fn tile_bin(op: BinOp, a: TileExpr, b: TileExpr, ty: ElementType) -> TileExpr {
     )
 }
 
-/// The operands of a `mul` node, when contraction into an fma is permitted by
-/// *both* the enclosing add and the multiply itself.
+/// The operands of a `mul` node, when both it and the enclosing add allow fma.
 fn mul_operands(e: &TileExpr, outer: &NumericContract) -> Option<(TileExpr, TileExpr)> {
     match e.kind() {
         TileExprKind::Binary {
@@ -1084,8 +948,7 @@ fn mul_operands(e: &TileExpr, outer: &NumericContract) -> Option<(TileExpr, Tile
     }
 }
 
-/// `seen` is required for termination: a Kernel term is a hash-consed **DAG**,
-/// so walking it as a tree is exponential in the sharing depth.
+/// `seen` is required: walking a hash-consed DAG as a tree is exponential.
 fn collect_group_reduces(
     e: &TileExpr,
     out: &mut Vec<TileExpr>,
@@ -1094,8 +957,7 @@ fn collect_group_reduces(
     if !seen.insert(e.clone()) {
         return;
     }
-    // Children first: a reduce nested inside another reduce's value must be
-    // staged before it.
+    // Children first: a nested reduce is staged before its parent.
     e.kind()
         .visit_children(&mut |child| collect_group_reduces(child, out, seen));
     if matches!(e.kind(), TileExprKind::Reduce { .. }) && !out.contains(e) {
@@ -1103,9 +965,7 @@ fn collect_group_reduces(
     }
 }
 
-/// Rewrite a one-lane `Stmt::Reduce` carrying a hardware operator into the
-/// expression form, so it goes down the same staging path. `None` when nothing
-/// is to rewrite.
+/// Rewrite a one-lane hardware-operator `Stmt::Reduce` into expression form.
 fn desugar_fast_reduce(s: &Stmt) -> Option<Stmt> {
     let Stmt::Reduce {
         kind,
@@ -1193,8 +1053,7 @@ fn visit_stmt_exprs(s: &Stmt, f: &mut impl FnMut(&TileExpr)) {
                 f(&a.init);
             }
         }
-        // The merge reads only its formals, so nothing in it can need staging;
-        // the per-lane partials can.
+        // The merge reads only its formals; only the partials can need staging.
         Stmt::Reduce { values, .. } => {
             for v in values {
                 f(v);
@@ -1211,8 +1070,7 @@ pub struct RawBuf {
     pub bytes: usize,
 }
 
-// SAFETY: the launcher only hands a `RawBuf` to workers whose lane ranges write
-// disjoint elements — `verify_launch` invariant 3.
+// SAFETY: workers get disjoint write ranges (`verify_launch` invariant 3).
 unsafe impl Send for RawBuf {}
 // SAFETY: as above.
 unsafe impl Sync for RawBuf {}
@@ -1320,13 +1178,7 @@ mod tests {
     /// Compile and run one kernel over f32 buffers, returning the outputs.
     fn run_f32(ir: &KernelIr, inputs: &[Vec<f32>], out_len: usize) -> Vec<f32> {
         let caps = crate::caps::cpu_caps();
-        let art = compile(ir, caps, None).expect("compile");
-        let kernel = CpuKernel {
-            name: art.name,
-            block: art.block,
-            vector_width: art.prog.width,
-            artifact: art,
-        };
+        let kernel = emit(ir, caps).expect("compile");
         let mut binds = Vec::new();
         for v in inputs {
             let mut b = AlignedBuf::zeroed(v.len() * 4).unwrap();
@@ -1391,7 +1243,7 @@ mod tests {
             name: "reverse",
         };
 
-        let art = compile(&ir, crate::caps::cpu_caps(), None).unwrap();
+        let art = compile(&ir, crate::caps::cpu_caps()).unwrap();
         assert_eq!(
             art.prog.segments.len(),
             2,
@@ -1437,7 +1289,7 @@ mod tests {
             byte_arena: None,
             name: "fma",
         };
-        compile(&ir, crate::caps::cpu_caps(), None).unwrap().prog
+        compile(&ir, crate::caps::cpu_caps()).unwrap().prog
     }
 
     #[test]
@@ -1471,8 +1323,7 @@ mod tests {
             "strict must emit separate mul and add"
         );
 
-        // `round(x, HalfAwayFromZero)` at an exact .5 rounds away from zero:
-        // MSQ1 export idempotence depends on it.
+        // Exact .5 rounds away from zero; MSQ1 export idempotence depends on it.
         for i in -16i32..=16 {
             if i % 2 == 0 {
                 continue;
@@ -1487,7 +1338,6 @@ mod tests {
 
     #[test]
     fn four_access_lowerings() {
-        access::reset_form_counts();
         let uni = decl(0, ScalarElement::U32, 1, false);
         let src = decl(1, ScalarElement::F32, 64, false);
         let out = decl(2, ScalarElement::F32, 4 * 8, true);
@@ -1525,16 +1375,9 @@ mod tests {
             assert_eq!(got[16 + k], data[16 + k], "unit-inner lane {k}");
             assert_eq!(got[24 + k], data[3 * k], "gather lane {k}");
         }
-        let counts = access::form_counts();
-        for (i, f) in access::AccessForm::ALL.iter().enumerate() {
-            assert!(counts[i] > 0, "{f:?} was never selected");
-        }
     }
 
-    /// A vector-typed `Select` selects **every** lane.
-    ///
-    /// Pins the regression where one `Instr::Select` wrote register `out`
-    /// only, leaving lanes 1.. uninitialized.
+    /// A vector-typed `Select` selects every lane, not only register `out`.
     #[test]
     fn a_masked_vector_select_writes_every_lane() {
         const LANES: u32 = 8;
@@ -1637,9 +1480,9 @@ mod tests {
                 byte_arena: None,
                 name: "widen",
             };
-            let art = compile(&ir, crate::caps::cpu_caps(), None).unwrap();
-            // The register file holds f32: every ALU instruction is typed F32,
-            // never a one-lane narrow float.
+            let kernel = emit(&ir, crate::caps::cpu_caps()).unwrap();
+            let art = &kernel.artifact;
+            // The register file holds f32: every ALU instruction is typed F32.
             assert!(art.prog.tape.iter().all(|i| !matches!(
                 i,
                 Instr::Un { ty: NumTy::U32, .. } | Instr::Un { ty: NumTy::I32, .. }
@@ -1654,12 +1497,6 @@ mod tests {
             )));
 
             // Bitwise equality against `f16::from_f32(exp(f32::from(x)))`.
-            let kernel = CpuKernel {
-                name: art.name,
-                block: art.block,
-                vector_width: art.prog.width,
-                artifact: art,
-            };
             let vals: Vec<f32> = (0..n).map(|i| (i as f32) * 0.03 - 3.0).collect();
             let mut inb = AlignedBuf::zeroed(n as usize * 2).unwrap();
             for (i, v) in vals.iter().enumerate() {
@@ -1832,7 +1669,7 @@ mod tests {
             name: "gemv_epilogue",
         };
 
-        let art = compile(&ir, crate::caps::cpu_caps(), None).unwrap();
+        let art = compile(&ir, crate::caps::cpu_caps()).unwrap();
         assert_eq!(art.prog.segments.len(), 1, "no barrier, so one segment");
         assert_eq!(
             art.prog.store_count(),
@@ -1860,9 +1697,8 @@ mod tests {
 
     #[test]
     fn scatter_add_accumulates_duplicates() {
-        // 4096 indices into 64 bins x 8 lanes, 7% of them in one bin, plus a
-        // pure-padding tail. One workgroup per bin, so the accumulation order
-        // is fixed and the result is bit-reproducible at any thread count.
+        // 4096 indices into 64 bins x 8 lanes, 7% in one bin, plus a padding tail;
+        // one workgroup per bin keeps the result bit-reproducible.
         const BINS: u32 = 64;
         const WIDTH: u32 = 8;
         const N: u32 = 4096;
@@ -1937,8 +1773,7 @@ mod tests {
             name: "scatter_add",
         };
 
-        // 7% of the indices land in bin 3; the last 256 are pure padding into
-        // a bin nothing reads back.
+        // 7% of the indices land in bin 3; the last 256 are padding.
         let indices: Vec<u32> = (0..N)
             .map(|i| {
                 if i % 14 == 0 {
@@ -1963,13 +1798,7 @@ mod tests {
         }
 
         let caps = crate::caps::cpu_caps();
-        let art = compile(&ir, caps, None).unwrap();
-        let kernel = CpuKernel {
-            name: art.name,
-            block: art.block,
-            vector_width: art.prog.width,
-            artifact: art,
-        };
+        let kernel = emit(&ir, caps).unwrap();
         let mk_f32 = |v: &[f32]| {
             let mut b = AlignedBuf::zeroed(v.len() * 4).unwrap();
             b.as_mut_slice().copy_from_slice(bytemuck::cast_slice(v));
@@ -2061,9 +1890,7 @@ mod tests {
             N / 64
         );
 
-        // Sixteen times the workgroups, same bound: the dispatch count tracks
-        // the worker pool, not the grid. A per-row dispatch would be 1024x
-        // this.
+        // Sixteen times the workgroups, same bound: dispatches track the pool, not the grid.
         let wide = KernelIr {
             block: 4,
             grid: [N / 4, 1, 1],
@@ -2119,13 +1946,8 @@ mod tests {
             assert_eq!(lane, if i % 2 == 0 { 1.0 } else { -1.0 }, "lane {i}");
         }
     }
-    /// **Loop accumulators step simultaneously.**
-    ///
-    /// Two accumulators that swap — `a' = b`, `b' = a` — must still swap after N
-    /// iterations. Writing them back one at a time makes `b'` read the already
-    /// updated `a`, so both collapse to the original `b`; a `(n, mean, m2)`
-    /// carrier hits the same edge, where `mean`'s update reads `n` and the
-    /// variance comes back about half right rather than obviously broken.
+    /// Loop accumulators step simultaneously: a swap `a' = b, b' = a` must still
+    /// swap after N iterations (a Welford carrier hits the same edge).
     #[test]
     fn loop_accumulators_read_the_values_they_entered_the_step_with() {
         let uni = decl(0, ScalarElement::U32, 1, false);

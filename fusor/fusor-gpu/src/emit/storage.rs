@@ -6,12 +6,9 @@
 
 use fusor_ir::ir::kernel::{Buffer, ElementType, ScalarElement, StorageView};
 use fusor_ir::target::EmitError;
-use naga::{
-    AtomicFunction, BinaryOperator, Block, Expression, Handle, MathFunction, Scalar, ScalarKind,
-    Span, Statement,
-};
+use naga::{BinaryOperator, Block, Expression, Handle, MathFunction, ScalarKind, Statement};
 
-use super::expr::element_scalar;
+use super::expr::{element_scalar, push};
 use super::{Emitter, key};
 
 impl Emitter<'_> {
@@ -54,7 +51,7 @@ impl Emitter<'_> {
             return Ok(value);
         }
         if self.packed_half(&view.buffer) {
-            let halves = self.math1(body, MathFunction::Unpack2x16float, value);
+            let halves = self.math(body, MathFunction::Unpack2x16float, &[value]);
             let half = self.mod_literal_u32(body, index, 2);
             let value = self.emit_expr(
                 body,
@@ -97,7 +94,7 @@ impl Emitter<'_> {
         } else {
             self.cast_as(body, value, element_scalar(physical)?.kind, None)
         };
-        body.push(Statement::Store { pointer, value }, Span::default());
+        push(body, Statement::Store { pointer, value });
         Ok(())
     }
 
@@ -121,7 +118,7 @@ impl Emitter<'_> {
                 components: vec![value, zero],
             },
         );
-        let bits = self.math1(out, MathFunction::Pack2x16float, pair);
+        let bits = self.math(out, MathFunction::Pack2x16float, &[pair]);
         let low = self.u32_lit(0xffff);
         let bits = self.bin(out, BinaryOperator::And, bits, low);
         let half = self.mod_literal_u32(out, index, 2);
@@ -130,49 +127,10 @@ impl Emitter<'_> {
         let bits = self.bin(out, BinaryOperator::ShiftLeft, bits, shift);
         let full = self.u32_lit(u32::MAX);
         let keep = self.bin(out, BinaryOperator::ExclusiveOr, mask, full);
-        let cas_ty = self.module.generate_predeclared_type(
-            naga::PredeclaredType::AtomicCompareExchangeWeakResult(Scalar::U32),
-        );
-        let mut body = Block::new();
-        let old = self.emit_load(&mut body, pointer);
-        let kept = self.bin(&mut body, BinaryOperator::And, old, keep);
-        let new = self.bin(&mut body, BinaryOperator::InclusiveOr, kept, bits);
-        let result = self.append(Expression::AtomicResult {
-            ty: cas_ty,
-            comparison: true,
+        self.cas_loop(out, pointer, |em, body, old| {
+            let kept = em.bin(body, BinaryOperator::And, old, keep);
+            em.bin(body, BinaryOperator::InclusiveOr, kept, bits)
         });
-        body.push(
-            Statement::Atomic {
-                pointer,
-                fun: AtomicFunction::Exchange { compare: Some(old) },
-                value: new,
-                result: Some(result),
-            },
-            Span::default(),
-        );
-        let exchanged = self.emit_expr(
-            &mut body,
-            Expression::AccessIndex {
-                base: result,
-                index: 1,
-            },
-        );
-        body.push(
-            Statement::If {
-                condition: exchanged,
-                accept: Block::from_vec(vec![Statement::Break]),
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-        out.push(
-            Statement::Loop {
-                body,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            Span::default(),
-        );
         Ok(())
     }
 }
