@@ -786,6 +786,16 @@ impl Extractor for LocalSearch {
     /// candidate enumeration is `fair_points`, the same walk
     /// `launch_variants` and `launch_variant_labels` offer from, so a label
     /// either of them names resolves here and no other does.
+    fn replan_extraction(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        ex: &mut Extraction,
+        cost: &dyn CostModel,
+    ) -> Result<Plan> {
+        self.replan(graph, roots, ex, cost, &mut NodeCache::new(graph.len()))
+    }
+
     fn replan_with_variants(
         &self,
         graph: &EGraph,

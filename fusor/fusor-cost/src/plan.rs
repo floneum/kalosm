@@ -209,8 +209,14 @@ pub fn derive_buffers(
             continue;
         }
         let facts = graph.facts(*id);
-        let theta = extraction.theta.get(id).copied();
-        let (layout, elements) = buffer_layout_for(facts, &graph.node(*id).op, theta)?;
+        // A group's value is its last member's store, in that member's layout.
+        let mut writer = *id;
+        while let Op::Launch(Launch::Group { members, .. }) = &graph.node(writer).op {
+            let Some(last) = members.last() else { break };
+            writer = *last;
+        }
+        let theta = extraction.theta.get(&writer).copied();
+        let (layout, elements) = buffer_layout_for(facts, &graph.node(writer).op, theta)?;
         out.push(BufferPlan {
             value: *id,
             elements,

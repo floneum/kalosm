@@ -240,3 +240,72 @@ fn permute_through(outer: &Layout, shape: &[Dim], inner: &Layout) -> Option<Layo
     }
     Layout::from_parts(inner.offset(), &dims, &strides).ok()
 }
+
+/// Post-extraction forwarding: `id` with every operand whose class `copy`
+/// accepts read through that copy's view instead, slab and group members
+/// rewritten in place. Every `(old, new)` pair minted lands in `minted`,
+/// `id`'s own last. Unlike the rules above this runs once over a chosen
+/// selection, so it mints one spelling per reader and never cascades.
+pub fn forward_views(
+    b: &mut Builder<'_>,
+    id: Id,
+    copy: &dyn Fn(&Builder<'_>, Id) -> bool,
+    minted: &mut Vec<(Id, Id)>,
+) -> Option<Id> {
+    let Op::Launch(op) = b.node(id).op.clone() else {
+        return None;
+    };
+    let mut changed = false;
+    let mut read = |b: &Builder<'_>, o: &Operand| -> Operand {
+        if copy(b, o.src)
+            && let Some(seen) = through_copy(b, o, false)
+        {
+            changed = true;
+            return seen;
+        }
+        o.clone()
+    };
+    let mut rewritten = op.clone();
+    match &mut rewritten {
+        Launch::Map { ops, .. } | Launch::Fold { ops, .. } => {
+            *ops = ops.iter().map(|o| read(b, o)).collect();
+        }
+        Launch::Contract { a, b: rhs, .. } => {
+            a.ops = a.ops.iter().map(|o| read(b, o)).collect();
+            rhs.ops = rhs.ops.iter().map(|o| read(b, o)).collect();
+        }
+        Launch::Slab { members, .. } | Launch::Group { members, .. } => {
+            let old = members.clone();
+            for (slot, m) in old.iter().enumerate() {
+                if let Some(new) = forward_views(b, *m, copy, minted) {
+                    members[slot] = new;
+                    changed = true;
+                }
+            }
+        }
+        _ => return None,
+    }
+    if !changed {
+        return None;
+    }
+    let before = b.len();
+    let new = b.add_launch(rewritten).ok()?;
+    // An existing node elsewhere would merge two selected classes, and one
+    // reading `id`'s own class would be its own producer.
+    // A slab or group lists its members among its children; each member was
+    // checked when it was minted.
+    let own = b.class_of(id);
+    let composite = matches!(
+        b.node(new).op,
+        Op::Launch(Launch::Slab { .. } | Launch::Group { .. })
+    );
+    if new == id
+        || (new.index() < before && b.class_of(new) != own)
+        || (!composite && b.node(new).children.iter().any(|c| b.class_of(*c) == own))
+    {
+        return None;
+    }
+    b.union(id, new).ok()?;
+    minted.push((id, new));
+    Some(new)
+}

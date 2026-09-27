@@ -63,6 +63,10 @@ pub struct EGraph {
     /// populated memo.
     memo: Arc<FxHashMap<NodeKey, Id>>,
     parent: Vec<Option<Id>>,
+    /// Unions that merged two classes. Only a union moves a class
+    /// representative, so a selection checked at one count is still keyed
+    /// by representatives at that count.
+    unions: u64,
     roots: Vec<Id>,
     next_sym: u32,
     sem: Arc<dyn Semantics>,
@@ -114,6 +118,7 @@ impl EGraph {
             facts: Vec::new(),
             memo: Arc::new(FxHashMap::default()),
             parent: Vec::new(),
+            unions: 0,
             roots: Vec::new(),
             next_sym: 0,
             sem,
@@ -274,7 +279,13 @@ impl EGraph {
         let u = self.add(Op::Union(lo, hi))?;
         self.parent[lo.index()] = Some(u);
         self.parent[hi.index()] = Some(u);
+        self.unions += 1;
         Ok(u)
+    }
+
+    /// See [`EGraph::unions`].
+    pub fn union_count(&self) -> u64 {
+        self.unions
     }
 
     pub fn class_of(&self, id: Id) -> ClassId {

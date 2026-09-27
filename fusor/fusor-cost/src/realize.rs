@@ -12,7 +12,7 @@ use fusor_ir::ir::kernel::{
     ArenaPlanner, MemoryLevel, ScalarElement, Tile, TileDecl, TileLayout, Tiles,
 };
 use fusor_ir::ir::launch::{
-    FoldStrat, IndexSpace, Launch, SchedPoint, ScheduleDomain, slab_lanes_per_row,
+    AccessPlan, FoldStrat, IndexSpace, Launch, SchedPoint, ScheduleDomain, slab_lanes_per_row,
     slab_subgroup_width,
 };
 use fusor_ir::ir::logical::{LeafKind, Logical};
@@ -939,13 +939,47 @@ pub fn tiles_for(
 /// is a ratio against it, so the exact figure matters less than having one.
 const LINE_BYTES: u64 = 128;
 
-/// How many times its useful bytes a fold's operand read moves through the
-/// memory pipe at `lane_group` lanes per row. A subgroup's lanes cover
-/// `contig` consecutive elements per load — the lane group's share of a row
-/// when the reduced axis is innermost, the adjacent rows the subgroup serves
-/// otherwise — and each such run costs whole lines.
+/// Element stride of an sgemv operand's innermost k axis. `trailing` is the
+/// extent of the axes after k: `1` for A (`[.., m, k]`), `n` for B
+/// (`[.., k, n]`).
+fn sgemv_k_stride(layout: &fusor_ir::shape::Layout, trailing: u64) -> u64 {
+    let shape = layout.shape();
+    let mut after = 1u64;
+    let mut axis = shape.len();
+    while axis > 0 && after < trailing {
+        axis -= 1;
+        after = after.saturating_mul(dim_extent(shape[axis]).max(1));
+    }
+    if after != trailing || axis == 0 {
+        return 1;
+    }
+    dim_extent(layout.strides()[axis - 1]).max(1)
+}
+
+/// How many times its useful bytes a dense row-major operand of a fold moves
+/// through the memory pipe. See [`operand_line_amplification`].
 pub fn fold_line_amplification(
     dims: &[u64],
+    axis: usize,
+    lane_group: u32,
+    caps: &Caps,
+    elem_bytes: u64,
+) -> u64 {
+    let mut strides = vec![1u64; dims.len()];
+    for i in (0..dims.len().saturating_sub(1)).rev() {
+        strides[i] = strides[i + 1].saturating_mul(dims[i + 1].max(1));
+    }
+    operand_line_amplification(dims, &strides, axis, lane_group, caps, elem_bytes)
+}
+
+/// How many times its useful bytes one operand read at a fold's iteration
+/// space moves through the memory pipe at `lane_group` lanes per row. One
+/// subgroup load covers `lane_group` consecutive k of each of
+/// `width / lane_group` consecutive output elements; each distinct line it
+/// touches costs a whole line. `strides` are the operand's own, over `dims`.
+pub fn operand_line_amplification(
+    dims: &[u64],
+    strides: &[u64],
     axis: usize,
     lane_group: u32,
     caps: &Caps,
@@ -954,19 +988,38 @@ pub fn fold_line_amplification(
     let Some(&k) = dims.get(axis) else {
         return 1;
     };
-    let inner: u64 = dims[axis + 1..].iter().product::<u64>().max(1);
+    let elem = elem_bytes.max(1);
+    let line_elems = (LINE_BYTES / elem).max(1);
     let sg = u64::from(caps.subgroup_width().max(1));
-    let lg = u64::from(lane_group.max(1)).min(sg);
-    let line_elems = (LINE_BYTES / elem_bytes.max(1)).max(1);
-    let contig = if inner == 1 {
-        lg.min(k.max(1))
-    } else {
-        (sg / lg).min(inner)
+    let lg = u64::from(lane_group.max(1)).min(sg).min(k.max(1));
+    let outputs: u64 = dims
+        .iter()
+        .enumerate()
+        .filter(|(i, _)| *i != axis)
+        .map(|(_, d)| (*d).max(1))
+        .product();
+    let rows = (sg / lg).min(outputs).max(1);
+    let mut lines: SmallVec<[u64; 64]> = SmallVec::new();
+    for r in 0..rows {
+        let mut rest = r;
+        let mut base = 0u64;
+        for i in (0..dims.len()).rev() {
+            if i == axis {
+                continue;
+            }
+            let d = dims[i].max(1);
+            base = base.saturating_add((rest % d).saturating_mul(strides[i]));
+            rest /= d;
+        }
+        for j in 0..lg {
+            let addr = base.saturating_add(j.saturating_mul(strides[axis]));
+            lines.push(addr.saturating_mul(elem) / LINE_BYTES);
+        }
     }
-    .max(1);
-    let runs = sg / contig.min(sg);
-    let lines = runs.max(1) * contig.div_ceil(line_elems);
-    (lines * line_elems / sg).clamp(1, line_elems)
+    let reads = lines.len() as u64;
+    lines.sort_unstable();
+    lines.dedup();
+    (lines.len() as u64 * line_elems / reads.max(1)).clamp(1, line_elems)
 }
 
 /// The longest dependent chain one workgroup of `root` runs at `theta`: for
@@ -1629,26 +1682,16 @@ fn build_component<'a>(
     // space pays the line amplification of its lane group. A slab pays it
     // per fold stage at that stage's lanes per row.
     let mut line_bytes = 0u64;
-    let amp_of = |m: Id, lane_group: u32| -> (u64, u64) {
-        let Op::Launch(Launch::Fold { space, axis, .. }) = &graph.node(m).op else {
-            return (1, 0);
-        };
-        let dims: Vec<u64> = space.dims.iter().map(|d| dim_extent(*d)).collect();
-        let elem = graph.facts(m).dtype.byte_size().max(1);
-        (
-            fold_line_amplification(&dims, *axis as usize, lane_group, caps, elem),
-            dims.iter().product(),
-        )
-    };
-    let stage_amp: Vec<(Id, u64, u64)> = match &graph.node(root).op {
-        Op::Launch(Launch::Fold { .. }) => vec![{
-            let (a, n) = amp_of(root, fold_lane_group(theta, caps));
-            (root, a, n)
-        }],
-        Op::Launch(Launch::Slab {
+    // Every fold the launch runs, with the lanes per row it runs at: the root
+    // fold, a slab's fold stages, or those of a group's members.
+    let slab_stages = |slab: Id, block: u32| -> Vec<(Id, u32)> {
+        let Op::Launch(Launch::Slab {
             slabs, members: sm, ..
-        }) => sm
-            .iter()
+        }) = &graph.node(slab).op
+        else {
+            return Vec::new();
+        };
+        sm.iter()
             .filter_map(|m| {
                 let Op::Launch(Launch::Fold {
                     space,
@@ -1662,13 +1705,26 @@ fn build_component<'a>(
                 let total = iterations_of(space);
                 let k = dim_extent(*space.dims.get(*axis as usize)?).max(1);
                 let rows = (total / k) / u64::from((*slabs).max(1));
-                let lpr = slab_subgroup_width(geom.block, rows, k, carrier, caps)
-                    .unwrap_or_else(|| slab_lanes_per_row(geom.block, rows, k));
-                let (a, n) = amp_of(*m, lpr);
-                Some((*m, a, n))
+                let lpr = slab_subgroup_width(block, rows, k, carrier, caps)
+                    .unwrap_or_else(|| slab_lanes_per_row(block, rows, k));
+                Some((*m, lpr))
             })
-            .collect(),
-        _ => Vec::new(),
+            .collect()
+    };
+    let stage_of = |m: Id, theta: Option<SchedPoint>, block: u32| -> Vec<(Id, u32)> {
+        match &graph.node(m).op {
+            Op::Launch(Launch::Fold { .. }) => vec![(m, fold_lane_group(theta, caps))],
+            Op::Launch(Launch::Slab { .. }) => slab_stages(m, block),
+            _ => Vec::new(),
+        }
+    };
+    let stages: Vec<(Id, u32)> = if group_geoms.is_empty() {
+        stage_of(root, theta, geom.block)
+    } else {
+        group_geoms
+            .iter()
+            .flat_map(|(m, g)| stage_of(*m, extraction.theta.get(m).copied(), g.block))
+            .collect()
     };
     // A cooperative contraction pulls each operand once per tile on the other
     // side: `M*N*K*(1/bn + 1/bm)` elements through the memory pipe, of which
@@ -1692,26 +1748,99 @@ fn build_component<'a>(
         let useful = batch * k * (m + n);
         line_bytes = line_bytes.saturating_add(pulled.saturating_sub(useful).saturating_mul(elem));
     }
-
-    if !stage_amp.is_empty() {
-        for m in &members {
-            // The fold whose iteration space walks this member's operands:
-            // the member itself when it is a stage, else the root.
-            let (amp, total) = stage_amp
-                .iter()
-                .find(|(s, _, _)| s == m)
-                .or_else(|| stage_amp.first())
-                .map_or((1, 0), |(_, a, n)| (*a, *n));
-            if amp <= 1 {
+    // An sgemv lane walks consecutive k, so an operand strided along k pulls
+    // a whole line per element on every one of its rereads.
+    if let Op::Launch(Launch::Contract { n, a, b, .. }) = &graph.node(root).op
+        && let Some(SchedPoint::Sgemv(_)) = theta
+    {
+        let n = dim_extent(*n).max(1);
+        let sides = a
+            .ops
+            .iter()
+            .map(|o| (o, 1))
+            .chain(b.ops.iter().map(|o| (o, n)));
+        for (o, trailing) in sides {
+            let facts = graph.facts(o.src);
+            if matches!(facts.dtype, Dtype::Q(_)) {
                 continue;
             }
-            for &c in operands(*m) {
-                let facts = graph.facts(c);
-                if owner(c) == own || elements_of(facts) != total {
-                    continue;
-                }
-                line_bytes = line_bytes.saturating_add(bytes_of(facts).saturating_mul(amp - 1));
+            let line = (LINE_BYTES / facts.dtype.byte_size().max(1)).max(1);
+            let amp = sgemv_k_stride(&o.layout, trailing).min(line);
+            let Some(&(_, bytes, reread)) = ext
+                .iter()
+                .find(|(id, _, _)| graph.class_of(*id) == graph.class_of(o.src))
+            else {
+                continue;
+            };
+            line_bytes = line_bytes.saturating_add(
+                bytes
+                    .saturating_mul(u64::from(reread))
+                    .saturating_mul(amp - 1),
+            );
+        }
+    }
+
+    for &m in &members {
+        let ops = match &graph.node(m).op {
+            Op::Launch(Launch::Fold { ops, .. } | Launch::Map { ops, .. }) => ops,
+            _ => continue,
+        };
+        // The fold whose iteration space walks this member's operands: the
+        // member itself when it is a stage, else the stage its reads span.
+        let spans = |stage: Id| match &graph.node(stage).op {
+            Op::Launch(Launch::Fold { space, .. }) => ops.iter().all(|op| {
+                op.layout.shape().len() == space.dims.len()
+                    && op
+                        .layout
+                        .shape()
+                        .iter()
+                        .zip(&space.dims)
+                        .all(|(a, b)| dim_extent(*a) == dim_extent(*b))
+            }),
+            _ => false,
+        };
+        let Some(&(stage, lane_group)) = stages
+            .iter()
+            .find(|(s, _)| *s == m)
+            .or_else(|| stages.iter().find(|(s, _)| spans(*s)))
+        else {
+            continue;
+        };
+        let Op::Launch(Launch::Fold { space, axis, .. }) = &graph.node(stage).op else {
+            continue;
+        };
+        let dims: SmallVec<[u64; 6]> = space.dims.iter().map(|d| dim_extent(*d)).collect();
+        let total: u64 = dims.iter().product();
+        for op in ops {
+            if owner(op.src) == own {
+                continue;
             }
+            let facts = graph.facts(op.src);
+            if matches!(facts.dtype, Dtype::Q(_)) {
+                continue;
+            }
+            let shape = op.layout.shape();
+            let strides: Option<SmallVec<[u64; 6]>> = (matches!(op.access, AccessPlan::Alias)
+                && shape.len() == dims.len()
+                && shape.iter().zip(&dims).all(|(d, e)| dim_extent(*d) == *e))
+            .then(|| op.layout.strides().iter().map(|s| dim_extent(*s)).collect());
+            let elem = facts.dtype.byte_size().max(1);
+            let amp = match strides {
+                Some(strides) => operand_line_amplification(
+                    &dims,
+                    &strides,
+                    *axis as usize,
+                    lane_group,
+                    caps,
+                    elem,
+                ),
+                None if elements_of(facts) == total => {
+                    fold_line_amplification(&dims, *axis as usize, lane_group, caps, elem)
+                }
+                None => 1,
+            };
+            line_bytes =
+                line_bytes.saturating_add(total.saturating_mul(elem).saturating_mul(amp - 1));
         }
     }
 
@@ -2807,6 +2936,12 @@ mod tests {
                     .map(|(bytes, scans)| bytes * u64::from(*scans))
                     .sum();
                 assert_eq!(loaded, batch * m * k * (a_scans + n) * 4);
+                // B is `[k, n]`: every element an sgemv lane loads along k is
+                // its own line.
+                assert_eq!(
+                    component.line_bytes,
+                    batch * k * n * 4 * m * (LINE_BYTES / 4 - 1)
+                );
                 costs.push(plan.cost);
             }
         }

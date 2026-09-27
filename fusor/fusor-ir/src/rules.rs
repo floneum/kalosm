@@ -91,6 +91,7 @@ pub static CORE_RULES: &[Rule] = &[
     absorb_view::ABSORB_BROADCAST_INTO_FOLD,
     group::FORM_GROUP_MAP,
     group::FORM_GROUP_FOLD,
+    group::FORM_GROUP_CONTRACT,
     group::FORM_GROUP_SLAB,
     scatter_fold::SCATTER_ADD_AS_FOLD,
 ];

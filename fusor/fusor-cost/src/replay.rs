@@ -35,8 +35,14 @@ struct Lru {
     plans: Vec<(ReplayKey, Entry)>,
 }
 
+/// The `(arena, unions)` stamp a replayed plan was last checked against.
+type Checked = Option<(u64, u64)>;
+
 struct Entry {
     plan: Arc<Plan>,
+    /// The `(arena, unions)` the plan was last checked against: a hit on the
+    /// same graph with no union since needs no recanonicalization.
+    checked: Checked,
 }
 
 impl Lru {
@@ -47,22 +53,35 @@ impl Lru {
         self.order.push(key);
     }
 
-    fn get(&mut self, key: ReplayKey) -> Option<Arc<Plan>> {
+    fn get(&mut self, key: ReplayKey) -> Option<(Arc<Plan>, Checked)> {
         let hit = self
             .plans
             .iter()
             .find(|(k, _)| *k == key)
-            .map(|(_, e)| Arc::clone(&e.plan))?;
+            .map(|(_, e)| (Arc::clone(&e.plan), e.checked))?;
         self.touch(key);
         Some(hit)
+    }
+
+    fn mark_checked(&mut self, key: ReplayKey, token: (u64, u64)) {
+        if let Some((_, e)) = self.plans.iter_mut().find(|(k, _)| *k == key) {
+            e.checked = Some(token);
+        }
     }
 
     fn insert(&mut self, key: ReplayKey, plan: Arc<Plan>) {
         match self.plans.iter_mut().find(|(k, _)| *k == key) {
             Some(slot) => {
                 slot.1.plan = plan;
+                slot.1.checked = None;
             }
-            None => self.plans.push((key, Entry { plan })),
+            None => self.plans.push((
+                key,
+                Entry {
+                    plan,
+                    checked: None,
+                },
+            )),
         }
         self.touch(key);
         while self.plans.len() > CAPACITY {
@@ -78,7 +97,7 @@ impl ReplayCache {
     }
 
     pub fn get(&self, key: ReplayKey) -> Option<Arc<Plan>> {
-        self.entries.lock().get(key)
+        self.entries.lock().get(key).map(|(plan, _)| plan)
     }
 
     pub fn insert(&self, key: ReplayKey, plan: Plan) {
@@ -103,12 +122,22 @@ impl ReplayCache {
         graph: &EGraph,
         f: impl FnOnce() -> Result<Plan>,
     ) -> Result<(Arc<Plan>, bool)> {
-        if let Some(hit) = self.get(key) {
+        let hit = self.entries.lock().get(key);
+        if let Some((hit, checked)) = hit {
+            let token = (graph.arena_id(), graph.union_count());
+            if checked == Some(token) {
+                return Ok((hit, true));
+            }
             match recanonicalize(graph, &hit) {
-                Canonical::Current => return Ok((hit, true)),
+                Canonical::Current => {
+                    self.entries.lock().mark_checked(key, token);
+                    return Ok((hit, true));
+                }
                 Canonical::Moved(plan) => {
                     let plan = Arc::new(*plan);
-                    self.entries.lock().insert(key, Arc::clone(&plan));
+                    let mut entries = self.entries.lock();
+                    entries.insert(key, Arc::clone(&plan));
+                    entries.mark_checked(key, token);
                     return Ok((plan, true));
                 }
                 // Fall through to a fresh extraction, which replaces the entry.
@@ -259,7 +288,21 @@ enum Canonical {
 }
 
 fn recanonicalize(graph: &EGraph, plan: &Plan) -> Canonical {
-    match recanonicalize_sigma(&plan.extraction.sigma, |id| graph.class_of(id)) {
+    let sigma = &plan.extraction.sigma;
+    let len = graph.len();
+    // One pass: a node this graph never minted (post-extraction forwarding
+    // ran on another graph) means extracting again here.
+    let mut moved = false;
+    for (class, member) in sigma {
+        if class.0.index() >= len || member.index() >= len {
+            return Canonical::Merged;
+        }
+        moved |= graph.class_of(class.0) != *class;
+    }
+    if !moved {
+        return Canonical::Current;
+    }
+    match recanonicalize_sigma(sigma, |id| graph.class_of(id)) {
         None => Canonical::Current,
         Some(None) => Canonical::Merged,
         Some(Some(sigma)) => {

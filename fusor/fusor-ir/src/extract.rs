@@ -255,6 +255,20 @@ pub trait Extractor: Send + Sync {
     /// is illegal, contributes nothing. `None` when nothing applied or the
     /// composed plan failed to build — the caller falls back to sequential
     /// adoption. The default is "no batch".
+    /// Construct the plan of a completed selection without searching.
+    fn replan_extraction(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        ex: &mut Extraction,
+        cost: &dyn CostModel,
+    ) -> Result<Plan> {
+        let _ = (graph, roots, ex, cost);
+        Err(crate::error::Error::Plan(
+            "this extractor cannot replan".into(),
+        ))
+    }
+
     fn replan_with_variants(
         &self,
         graph: &EGraph,

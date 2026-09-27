@@ -759,12 +759,34 @@ impl Session {
                             ExtractBudget::default(),
                         ),
                     })?;
+            // Readers of a selected view copy read through the view instead;
+            // the forwarded plan is what every later hit on this key replays.
+            let __t_fwd = Instant::now();
+            let plan = if missed {
+                let mut ex = plan.extraction.clone();
+                if fusor_cost::forward::forward_selected_views(
+                    &mut g, &caps, &roots, &plan, &mut ex,
+                ) {
+                    let forwarded = self.inner.extractor.replan_extraction(
+                        &g,
+                        &roots,
+                        &mut ex,
+                        self.inner.cost.as_ref(),
+                    )?;
+                    self.inner.replay.insert(key, forwarded.clone());
+                    Arc::new(forwarded)
+                } else {
+                    plan
+                }
+            } else {
+                plan
+            };
             *graph.state().extraction_seed.lock() = Some(Arc::clone(&plan));
             #[cfg(feature = "compiler-tests")]
-            self.inner.extractor.verify_plan(graph_ref, &plan)?;
+            self.inner.extractor.verify_plan(&g, &plan)?;
             if resolve_profile() {
                 eprintln!(
-                    "[profile] saturate{} {} us ({} -> {} nodes), extract {} us, replay {}",
+                    "[profile] saturate{} {} us ({} -> {} nodes), extract {} us (forward {} us), replay {}",
                     if __skipped {
                         " (skipped)"
                     } else if __replayed {
@@ -776,6 +798,7 @@ impl Session {
                     __pre_nodes,
                     g.len(),
                     __t_rest.elapsed().as_micros(),
+                    __t_fwd.elapsed().as_micros(),
                     if missed { "MISS" } else { "hit" },
                 );
             }

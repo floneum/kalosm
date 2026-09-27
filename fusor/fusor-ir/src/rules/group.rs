@@ -1,12 +1,13 @@
-//! `FORM_GROUP_*`: the independent chains a step ends in — one optimizer
-//! update per parameter — as one dispatch. A `Launch::Group` runs each
-//! member on its own range of workgroups; nothing synchronizes, since no
-//! member reads another. Minted on a root's launch spelling with every
-//! earlier root's best spelling before it, trimmed to the tail that fits
+//! `FORM_GROUP_*`: independent launches as one dispatch — the chains a step
+//! ends in (one optimizer update per parameter), and siblings reading a
+//! common input (the q/k/v projections, a gradient's two products). A
+//! `Launch::Group` runs each member on its own range of workgroups; nothing
+//! synchronizes, since no member reads another. Minted on a launch with every
+//! earlier candidate's best spelling before it, trimmed to the tail that fits
 //! the device's bindings.
 
 use crate::egraph::{Builder, ClassId, Facts, Id, RuleTag};
-use crate::ir::launch::{Launch, ScheduleDomain};
+use crate::ir::launch::{Family, Launch, ScheduleDomain};
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
 use crate::rules::slab::{Deps, copy_operands, is_contraction, stage_rank};
@@ -28,6 +29,13 @@ rule!(
     apply = form_group
 );
 rule!(
+    FORM_GROUP_CONTRACT,
+    level = Level::Launch,
+    head = OpTag::LaunchContract,
+    tag = RuleTag::Additive,
+    apply = form_group
+);
+rule!(
     FORM_GROUP_SLAB,
     level = Level::Launch,
     head = OpTag::LaunchSlab,
@@ -35,8 +43,8 @@ rule!(
     apply = form_group
 );
 
-/// A member whose block the group lowering can set: a map, a fold, or a
-/// slab of those. A tiled contraction fixes its own lane count.
+/// A member whose block the group lowering can set: a map, a fold, a slab
+/// of those, or a cooperative contraction, whose extra subgroups mirror.
 fn groupable(b: &Builder<'_>, m: Id) -> bool {
     let own = b.class_of(m);
     match &b.node(m).op {
@@ -46,6 +54,10 @@ fn groupable(b: &Builder<'_>, m: Id) -> bool {
             !is_contraction(b, m) && !b.node(m).children.iter().any(|c| b.class_of(*c) == own)
         }
         Op::Launch(Launch::Slab { .. }) => true,
+        Op::Launch(Launch::Contract {
+            family: Family::Coop,
+            ..
+        }) => true,
         _ => false,
     }
 }
@@ -64,6 +76,16 @@ fn slab_copies(b: &Builder<'_>, members: &[Id]) -> isize {
         .sum()
 }
 
+/// Copy-class operands a contraction spelling reads.
+fn contract_copies(b: &Builder<'_>, m: Id) -> usize {
+    match &b.node(m).op {
+        Op::Launch(Launch::Contract { a, b: rhs, .. }) => {
+            copy_operands(b, &a.ops) + copy_operands(b, &rhs.ops)
+        }
+        _ => usize::MAX,
+    }
+}
+
 /// The best groupable spelling of `class`: the slab reading the fewest
 /// copies, then the most members, then the latest; else the best-ranked
 /// stage.
@@ -79,6 +101,15 @@ fn best_spelling(b: &Builder<'_>, class: ClassId) -> Option<Id> {
                 let key = (-slab_copies(b, members), members.len());
                 if best_slab.is_none_or(|(k, _)| key >= k) {
                     best_slab = Some((key, m));
+                }
+            }
+            // The spelling reading the fewest copies: one that reads its
+            // views in place is a dispatch cheaper than one reading a copy.
+            Op::Launch(Launch::Contract { a, b: rhs, .. }) => {
+                let copies = copy_operands(b, &a.ops) + copy_operands(b, &rhs.ops);
+                let key = (copies, m);
+                if stage.is_none_or(|s| key < (contract_copies(b, s), s)) {
+                    stage = Some(m);
                 }
             }
             _ => {
@@ -168,20 +199,62 @@ pub fn form_group(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> O
         return None;
     }
     let class = b.class_of(id);
+    // A contraction class has many spellings (split-K, absorbed views); one
+    // group per class is minted, from the spelling a group would carry.
+    if matches!(node.op, Op::Launch(Launch::Contract { .. })) && best_spelling(b, class) != Some(id)
+    {
+        return None;
+    }
     let roots: Vec<Id> = b.roots().to_vec();
     let root_classes: FxHashSet<ClassId> = roots.iter().map(|r| b.class_of(*r)).collect();
+    // Earlier roots for a root map, fold or slab; earlier sibling
+    // contractions for a contraction. "Earlier" orders a set of members one
+    // way, so each group is minted once, from its last member.
     let head_root = roots
         .iter()
         .copied()
         .filter(|r| b.class_of(*r) == class)
-        .min()?;
-
-    let candidates: Vec<Id> = roots
-        .iter()
-        .copied()
-        .filter(|r| *r < head_root)
-        .filter_map(|r| {
-            let rc = b.class_of(r);
+        .min();
+    let mut classes: Vec<ClassId> = Vec::new();
+    // Siblings are contractions reading one of this contraction's inputs:
+    // the products one activation or one gradient feeds.
+    let contraction = |m: Id| matches!(b.node(m).op, Op::Launch(Launch::Contract { .. }));
+    if !contraction(id)
+        && let Some(head) = head_root
+    {
+        classes.extend(roots.iter().filter(|r| **r < head).map(|r| b.class_of(*r)));
+    } else if contraction(id) {
+        for c in node.children.iter() {
+            for reader in b.readers_of(*c) {
+                let rc = b.class_of(reader);
+                if rc < class && b.class_members(rc.0).into_iter().any(contraction) {
+                    classes.push(rc);
+                }
+            }
+        }
+    }
+    // A class one of whose spellings reads `id`'s value (a view of it), or
+    // that a spelling of `id`'s class reads (a split-K partial of it), is
+    // not independent of `id`: grouping it makes the group its own producer.
+    let read_by_head: FxHashSet<ClassId> = b
+        .class_members(class.0)
+        .into_iter()
+        .flat_map(|m| b.node(m).children.to_vec())
+        .map(|ch| b.class_of(ch))
+        .collect();
+    let mut seen = FxHashSet::default();
+    classes.retain(|c| {
+        *c != class
+            && seen.insert(*c)
+            && !read_by_head.contains(c)
+            && !b
+                .class_members(c.0)
+                .into_iter()
+                .any(|m| b.node(m).children.iter().any(|ch| b.class_of(*ch) == class))
+    });
+    let candidates: Vec<Id> = classes
+        .into_iter()
+        .filter_map(|rc| {
             (!covered_class(b, id, rc))
                 .then(|| best_spelling(b, rc))
                 .flatten()

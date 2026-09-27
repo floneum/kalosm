@@ -61,7 +61,7 @@ pub fn seed_facts_gpu(caps: &Caps) -> DeviceFacts {
         // step of tiny kernels leaves between GPU spans.
         launch_ps: 10_000_000,
         dram_bytes_per_us: 379_500,
-        llc_bytes: 8 << 20,
+        llc_bytes: 1 << 20,
         wg_bytes_per_us: 700_000,
         mac_per_us: gpu_mac_table(4_450_000, 17_800_000),
         trans_ps: 4,

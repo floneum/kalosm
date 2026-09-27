@@ -263,7 +263,9 @@ pub(crate) fn lower_coop(
     let a_coords = SideCoords::for_side(&ctx, a, a_rows, shape.k)?;
     let b_coords = SideCoords::for_side(&ctx, b, b_rows, shape.n)?;
 
-    let block = cs.lanes;
+    // A group member runs at the group's block: extra subgroups help stage
+    // the tiles and mirror an owning subgroup's fragments, storing nothing.
+    let block = cs.lanes.max(ctx.block_floor);
     let groups = shape
         .batch
         .saturating_mul(tiles_m)
@@ -304,7 +306,20 @@ pub(crate) fn lower_coop(
     let logical_row_base = a_row_base.clone();
 
     // Subgroup fragment origin inside the block.
-    let sg = ctx.b.builtin(Builtin::SubgroupId);
+    let sg_raw = ctx.b.builtin(Builtin::SubgroupId);
+    let owners = cs.lanes / ctx.caps.subgroup_width().max(1);
+    let owners_e = ctx.b.u32(owners.max(1));
+    let sg = if block > cs.lanes {
+        ctx.b.binary(
+            TileBinaryOp::Rem,
+            sg_raw.clone(),
+            owners_e.clone(),
+            NumericContract::RELAXED,
+        )
+    } else {
+        sg_raw.clone()
+    };
+    let owns = (block > cs.lanes).then(|| ctx.b.compare(TileCompareOp::Lt, sg_raw, owners_e));
     let cg_e = ctx.b.u32(geom.cg.max(1));
     let sg_row = ctx.b.binary(
         TileBinaryOp::Div,
@@ -376,7 +391,7 @@ pub(crate) fn lower_coop(
                 k_limit.clone(),
                 geom.bm,
                 geom.bk,
-                cs.lanes,
+                block,
                 &a.pre,
                 operand_elem,
             )?;
@@ -396,7 +411,7 @@ pub(crate) fn lower_coop(
                 n_limit.clone(),
                 geom.bk,
                 cs.bn_pass,
-                cs.lanes,
+                block,
                 &b.pre,
                 operand_elem,
             )?;
@@ -476,6 +491,7 @@ pub(crate) fn lower_coop(
         });
 
         let mut taken = locals.into_iter();
+        let mut stores: Vec<Stmt> = Vec::new();
         for r in 0..cs.frags_m {
             for c in 0..cs.frags_n {
                 let local = taken
@@ -487,7 +503,7 @@ pub(crate) fn lower_coop(
                 let frag_row = ctx.b.add(sg_row_base.clone(), r_off);
                 let frag_col = ctx.b.add(sg_col_base.clone(), c_off);
                 match &stage_tile {
-                    Some(tile) => body.push(Stmt::CoopStoreTile {
+                    Some(tile) => stores.push(Stmt::CoopStoreTile {
                         acc: value,
                         tile: tile.clone(),
                         row: frag_row,
@@ -496,7 +512,7 @@ pub(crate) fn lower_coop(
                     None => {
                         let row = ctx.b.add(out_row_base.clone(), frag_row);
                         let col = ctx.b.add(pass_col_base.clone(), frag_col);
-                        body.push(Stmt::CoopStore {
+                        stores.push(Stmt::CoopStore {
                             acc: value,
                             dst: out_view.clone(),
                             addr: Addr::Rc2 { row, col },
@@ -504,6 +520,14 @@ pub(crate) fn lower_coop(
                     }
                 }
             }
+        }
+        match &owns {
+            Some(owns) => body.push(Stmt::If {
+                condition: owns.clone(),
+                accept: stores,
+                reject: Vec::new(),
+            }),
+            None => body.extend(stores),
         }
 
         match &stage_tile {
@@ -518,7 +542,7 @@ pub(crate) fn lower_coop(
                     &lane,
                     geom.bm,
                     cs.bn_pass,
-                    cs.lanes,
+                    block,
                     |ctx, out, flat, local_row, local_col, active| {
                         let staged = ctx.b.load_tile(tile.clone(), flat);
                         let row = ctx.b.add(out_row_base.clone(), local_row.clone());
@@ -551,7 +575,7 @@ pub(crate) fn lower_coop(
                     &lane,
                     geom.bm,
                     cs.bn_pass,
-                    cs.lanes,
+                    block,
                     |ctx, out, _flat, local_row, local_col, active| {
                         let row = ctx.b.add(out_row_base.clone(), local_row.clone());
                         let col = ctx.b.add(pass_col_base.clone(), local_col);
