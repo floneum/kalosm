@@ -1,13 +1,5 @@
-//! `fusor-cost` — one scalar picosecond roofline parameterized on *measured*
-//! device facts, and the one extraction that resolves node selection,
-//! materialization and schedule point together against it.
-//!
-//! Not a lexicographic tuple: the reference's own unit test shows the tuple
-//! gives the wrong verdict, and its own doc concedes dispatches are 0.2% of
-//! modelled time while the tuple will pay unbounded bandwidth to remove one.
-//!
-//! Precision is **not** a cost term — it is a construction invariant
-//! (`NumericContract`), because a time-only model eliminates f32 everywhere.
+//! `fusor-cost`: one picosecond roofline over measured device facts, and the
+//! extraction that resolves selection, materialization and schedule against it.
 
 #![warn(unreachable_pub)]
 

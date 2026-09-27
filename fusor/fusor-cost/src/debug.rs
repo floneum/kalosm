@@ -1,11 +1,6 @@
-//! Environment-driven diagnostics, parsed once per process.
-//!
-//! `FUSOR_DUMP_PLAN` / `FUSOR_DUMP_EDGES` / `FUSOR_DUMP_CLASSES` dump each
-//! extracted plan, `FUSOR_CYCLE_LOG` traces seed cycle repair,
-//! `FUSOR_SEED_DEBUG=<class>` and `FUSOR_SIGMA_DEBUG=<class>` follow one
-//! class's seed keys and selection changes, `FUSOR_TUNE_DEBUG` names every
-//! dropped tuning variant. `FUSOR_NO_PRIVATE` and `FUSOR_NO_SEED_FLOOR`
-//! disable a pricing feature for bisecting.
+//! Environment-driven diagnostics, parsed once per process: plan dumps,
+//! cycle repair, one class's seed and selection trace, tuning drops, and two
+//! pricing features to disable for bisecting.
 
 use crate::nodes::{is_view_copy, resolved_children};
 use crate::realize::{self, Realized};
@@ -87,11 +82,8 @@ pub(crate) fn seed_members(
         return;
     }
     for m in realize::selectable(graph, class, caps) {
-        let show: String = format!("{:?}", graph.node(m).op)
-            .replace("ScalarExpr(ScalarNode { kind: ", "")
-            .chars()
-            .take(220)
-            .collect();
+        let show = show(graph, m, usize::MAX).replace("ScalarExpr(ScalarNode { kind: ", "");
+        let show: String = show.chars().take(220).collect();
         let excess: Vec<String> = match &graph.node(m).op {
             Op::Launch(Launch::Group { members, .. }) => members
                 .iter()
@@ -268,11 +260,8 @@ pub(crate) fn dump_plan(
     if f.dump_edges {
         for (i, l) in plan.launches.iter().enumerate() {
             let op = &graph.node(l.root).op;
-            let kind = match op {
-                Op::Launch(launch) => format!("{:?}", launch.tag()),
-                Op::Logical(_) => "Logical".into(),
-                Op::Union(..) => "Union".into(),
-            };
+            // A launch root is never a union, so this is the tune-cache tag.
+            let kind = crate::extract::tag_of(op);
             let srcs: Vec<u32> = l
                 .members
                 .iter()

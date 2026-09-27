@@ -1,12 +1,5 @@
-//! Plan derivation: buffers, bindings, symbols and the plan hash.
-//!
-//! Allocation is derived from the plan: for each node in `M`,
-//! `buffer_layout` gives the padded strides the selected geometry needs,
-//! including split-K scratch slices. A value not in `M` gets no buffer at all.
-//!
-//! The plan is the cache key. `Dim::Sym` and `LeafKind::Uniform` hash as
-//! the symbol's index, not its bound value, so one plan serves a whole
-//! shape family.
+//! Plan derivation: buffers for `M`, bindings, symbols and the plan hash,
+//! which hashes symbols by index so one plan serves a shape family.
 
 use crate::realize::{self, Component, Realized};
 use fusor_ir::Result;
@@ -26,8 +19,7 @@ use rustc_hash::FxHasher;
 use rustc_hash::{FxHashMap, FxHashSet};
 use std::hash::{Hash, Hasher};
 
-/// Everything derived from one realized extraction: buffers, launches,
-/// symbols, hash and cost.
+/// The plan one realized extraction denotes.
 pub(crate) fn derive_plan(
     graph: &EGraph,
     extraction: &Extraction,
@@ -58,8 +50,7 @@ pub(crate) fn derive_plan(
 
     let mut launches = Vec::with_capacity(realized.components.len());
     for c in &realized.components {
-        // A slab member kept in workgroup memory is read by nothing outside
-        // that slab; a launch binding one would read a buffer nothing wrote.
+        // A private slab member has no buffer to bind.
         if let Some(r) = c.external.iter().find(|r| private.contains(r)) {
             return Err(Error::Plan(format!(
                 "launch {} reads {r}, a slab member kept in workgroup memory",
@@ -99,10 +90,8 @@ pub(crate) fn derive_plan(
     })
 }
 
-/// Interval-color the step-local intermediates into one arena: each is
-/// live from the first launch binding it to the last, and two whose ranges
-/// are disjoint take the same bytes. A launch binds the arena once; typed
-/// views reinterpret values through that binding. Returns the arena's size.
+/// Interval-color step-local intermediates into one arena each launch binds
+/// once. Returns the arena's size.
 fn pack_arena(
     buffers: &mut [BufferPlan],
     launches: &mut [Dispatch],
@@ -138,8 +127,7 @@ fn pack_arena(
         items.push((*s, *e, bytes, i));
     }
     items.sort_unstable_by_key(|(s, e, bytes, i)| (*s, *e, std::cmp::Reverse(*bytes), *i));
-    // A launch binds the whole arena, so it must fit one storage binding:
-    // the largest values leave it (as their own buffers) until it does.
+    // The arena must fit one binding: evict the largest until it does.
     let (top, offsets) = loop {
         let sizes: Vec<_> = items
             .iter()
@@ -163,33 +151,32 @@ fn pack_arena(
         .filter(|b| b.arena.is_some())
         .map(|b| b.value)
         .collect();
-    // One binding per physical buffer. Multiple writable bindings spanning
-    // the same arena are invalid in WebGPU, even for different element types.
+    // One binding per physical buffer, as WebGPU requires.
     for l in launches.iter_mut() {
         let mut arena_binding = None;
         let mut next = 1u32;
         for b in &mut l.bindings {
             b.arena = in_arena.contains(&b.value);
-            b.binding = if b.arena {
+            if b.arena {
                 b.kind = BindKind::ReadWrite;
-                *arena_binding.get_or_insert_with(|| {
-                    let n = next;
+            }
+            b.binding = match arena_binding {
+                Some(shared) if b.arena => shared,
+                _ => {
                     next += 1;
-                    n
-                })
-            } else {
-                let n = next;
-                next += 1;
-                n
+                    if b.arena {
+                        arena_binding = Some(next - 1);
+                    }
+                    next - 1
+                }
             };
         }
     }
     Ok(top)
 }
 
-/// One [`BufferPlan`] per node in `m ∪ roots` outside workgroup memory, in
-/// realized order. Leaves are excluded: an external buffer is supplied, a
-/// constant is folded, and a uniform lives in binding 0.
+/// One [`BufferPlan`] per non-leaf node in `m ∪ roots` outside workgroup
+/// memory, in realized order.
 fn derive_buffers(
     graph: &EGraph,
     extraction: &Extraction,
@@ -225,9 +212,8 @@ fn derive_buffers(
     Ok(out)
 }
 
-/// Bindings of one launch, in binding-index order. **Binding 0 is reserved
-/// for the uniform block** and is never listed here; storage bindings start
-/// at 1, reads first sorted by value id, then writes.
+/// Bindings of one launch from 1 (0 is the uniform block): reads by value
+/// id, then writes.
 fn derive_bindings(
     graph: &EGraph,
     extraction: &Extraction,
@@ -253,35 +239,25 @@ fn derive_bindings(
     // An in-place value is bound once, read-write; it must not appear twice.
     reads.retain(|r| !writes.contains(r));
 
-    let mut out = Vec::with_capacity(reads.len() + writes.len());
-    let mut binding = 1u32;
-    for value in reads {
-        out.push(BindingPlan {
-            binding,
-            value,
-            kind: BindKind::Read,
-            arena: false,
-        });
-        binding += 1;
-    }
-    for value in writes {
-        let kind = match graph.semantics().effect(&graph.node(value).op) {
-            Effect::InPlace(_) => BindKind::ReadWrite,
-            Effect::Pure => BindKind::Write,
-        };
-        out.push(BindingPlan {
+    let write_kind = |value: Id| match graph.semantics().effect(&graph.node(value).op) {
+        Effect::InPlace(_) => BindKind::ReadWrite,
+        Effect::Pure => BindKind::Write,
+    };
+    let kinds = (reads.into_iter().map(|v| (v, BindKind::Read)))
+        .chain(writes.into_iter().map(|v| (v, write_kind(v))));
+    Ok(kinds
+        .zip(1u32..)
+        .map(|((value, kind), binding)| BindingPlan {
             binding,
             value,
             kind,
             arena: false,
-        });
-        binding += 1;
-    }
-    Ok(out)
+        })
+        .collect())
 }
 
-/// Logical strides and allocation extent for a selected node. Cooperative
-/// stores pad matrix groups, while retaining each group's logical axes.
+/// Logical strides and allocation extent for a selected node; cooperative
+/// stores pad matrix groups.
 pub fn buffer_layout_for(
     facts: &ValueFacts,
     op: &Op,
@@ -291,7 +267,8 @@ pub fn buffer_layout_for(
     let (Op::Launch(Launch::Contract { m, n, batch, .. }), Some(SchedPoint::Coop { geom, .. })) =
         (op, theta)
     else {
-        return Ok((Layout::contiguous(shape), layout_elements(shape)));
+        let elements = shape.iter().copied().fold(Dim::ONE, |a, b| a * b);
+        return Ok((Layout::contiguous(shape), elements));
     };
     let constant = |dim: Dim| {
         dim.as_const()
@@ -332,14 +309,7 @@ pub fn buffer_layout_for(
     ))
 }
 
-fn layout_elements(shape: &[Dim]) -> Dim {
-    shape.iter().copied().fold(Dim::ONE, |a, b| a * b)
-}
-
-/// Every `SymId` the uniform block must carry, split into `(dims, scalars)`:
-/// the extents, offsets and strides the kernels index by, and the runtime
-/// scalars they read. Each ascending; the uniform block binds dims first,
-/// matching `Uniforms::to_bytes`.
+/// Every `SymId` the uniform block carries, as ascending `(dims, scalars)`.
 fn classified_symbols_of(graph: &EGraph, realized: &Realized) -> (Vec<SymId>, Vec<SymId>) {
     let mut visitor = Symbols::default();
     for id in &realized.order {
@@ -374,18 +344,13 @@ fn classified_symbols_of(graph: &EGraph, realized: &Realized) -> (Vec<SymId>, Ve
     dims.sort_unstable();
     scalars.sort_unstable();
     scalars.dedup();
-    // A symbol used as an extent is bound as a dim; it must not also be
-    // emitted as a scalar.
+    // A symbol bound as a dim is not also a scalar.
     scalars.retain(|s| !dims.contains(s));
     (dims, scalars)
 }
 
-/// `hash(realized DAG term + M + theta + DeviceFacts::fingerprint)`.
-///
-/// Two `FxHasher` lanes under seeds 0 and 1, folded into a `u128`. Walk
-/// launches in order, then members in order; `Dim::Sym(s)` and
-/// `LeafKind::Uniform { sym }` hash as the symbol's index in `symbols`,
-/// never its bound value.
+/// `hash(realized DAG + M + theta + DeviceFacts::fingerprint)` over two
+/// seeded `FxHasher` lanes; symbols hash as their index in `symbols`.
 pub fn plan_hash(
     graph: &EGraph,
     extraction: &Extraction,

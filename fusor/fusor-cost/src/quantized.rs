@@ -28,23 +28,37 @@ thread_local! {
     static DECODE_CACHE: RefCell<FxHashMap<DecodeKey, (u64, u64)>> = RefCell::new(FxHashMap::default());
 }
 
+fn expr(kind: TileExprKind, element: ScalarElement) -> TileExpr {
+    TileExpr::new(kind, element.element())
+}
+
 fn u32_lit(v: u32) -> TileExpr {
-    TileExpr::new(
+    expr(
         TileExprKind::Literal(TileLiteral::U32(v)),
-        ScalarElement::U32.element(),
+        ScalarElement::U32,
     )
 }
 
-fn binary(op: TileBinaryOp, left: TileExpr, right: TileExpr) -> TileExpr {
-    TileExpr::new(
+fn binary_as(
+    element: ScalarElement,
+    op: TileBinaryOp,
+    left: TileExpr,
+    right: TileExpr,
+) -> TileExpr {
+    let numeric = NumericContract::RELAXED;
+    expr(
         TileExprKind::Binary {
             op,
             left,
             right,
-            numeric: NumericContract::RELAXED,
+            numeric,
         },
-        ScalarElement::U32.element(),
+        element,
     )
+}
+
+fn binary(op: TileBinaryOp, left: TileExpr, right: TileExpr) -> TileExpr {
+    binary_as(ScalarElement::U32, op, left, right)
 }
 
 /// Scalar instructions and word loads in one lane's SGEMV reduction. Full
@@ -65,23 +79,14 @@ pub(crate) fn decode_window(key: DecodeKey) -> Result<(u64, u64)> {
 }
 
 fn decode_window_uncached(key: DecodeKey) -> Result<(u64, u64)> {
-    use fusor_ir::scalar::BinOp::{Add, Div, Min, Mul, Rem};
+    use fusor_ir::scalar::BinOp::{Add, Div, LogicalAnd, Min, Mul, Rem};
     let p = key.params;
-    let variable = |v| TileExpr::new(TileExprKind::Builtin(v), ScalarElement::U32.element());
-    let boolean = |v| {
-        TileExpr::new(
-            TileExprKind::Literal(TileLiteral::Bool(v)),
-            ScalarElement::Bool.element(),
-        )
-    };
+    let variable = |v| expr(TileExprKind::Builtin(v), ScalarElement::U32);
     let less = |left, right| {
-        TileExpr::new(
-            TileExprKind::Compare {
-                op: fusor_ir::scalar::CmpOp::Lt,
-                left,
-                right,
-            },
-            ScalarElement::Bool.element(),
+        let op = fusor_ir::scalar::CmpOp::Lt;
+        expr(
+            TileExprKind::Compare { op, left, right },
+            ScalarElement::Bool,
         )
     };
     let wg = variable(Builtin::ProgramId(WorkgroupAxis::X));
@@ -117,7 +122,7 @@ fn decode_window_uncached(key: DecodeKey) -> Result<(u64, u64)> {
         offset: 0,
         layout: storage,
     };
-    let pass_work = |step, vector, contiguous, masked| -> Result<(u64, u64)> {
+    let pass_work = |step, vector, contiguous, masked: bool| -> Result<(u64, u64)> {
         let local = if contiguous || p.cols <= 1 || p.parts <= 1 {
             binary(Mul, lane.clone(), u32_lit(vector))
         } else {
@@ -146,27 +151,17 @@ fn decode_window_uncached(key: DecodeKey) -> Result<(u64, u64)> {
                     v / p.run() * p.gap + v % p.run()
                 };
                 let k = binary(Add, lane_base.clone(), u32_lit(off));
-                let mut mask = if masked {
-                    less(k.clone(), u32_lit(key.reduction))
-                } else {
-                    boolean(true)
+                let in_k = masked.then(|| less(k.clone(), u32_lit(key.reduction)));
+                let in_n = (!key.n.is_multiple_of(p.cols.max(1)))
+                    .then(|| less(column.clone(), u32_lit(key.n)));
+                let mask = match (in_k, in_n) {
+                    (Some(a), Some(b)) => binary_as(ScalarElement::Bool, LogicalAnd, a, b),
+                    (Some(m), None) | (None, Some(m)) => m,
+                    (None, None) => expr(
+                        TileExprKind::Literal(TileLiteral::Bool(true)),
+                        ScalarElement::Bool,
+                    ),
                 };
-                if !key.n.is_multiple_of(p.cols.max(1)) {
-                    let col_ok = less(column.clone(), u32_lit(key.n));
-                    mask = if masked {
-                        TileExpr::new(
-                            TileExprKind::Binary {
-                                op: fusor_ir::scalar::BinOp::LogicalAnd,
-                                left: mask,
-                                right: col_ok,
-                                numeric: NumericContract::RELAXED,
-                            },
-                            ScalarElement::Bool.element(),
-                        )
-                    } else {
-                        col_ok
-                    };
-                }
                 let mut flat = binary(
                     Add,
                     binary(Add, row.clone(), binary(Add, batch_base.clone(), k)),
@@ -183,9 +178,9 @@ fn decode_window_uncached(key: DecodeKey) -> Result<(u64, u64)> {
                     k_base: u32_lit(0),
                     col: flat,
                     mask,
-                    fill: TileExpr::new(
+                    fill: expr(
                         TileExprKind::Literal(TileLiteral::F32(0)),
-                        ScalarElement::F32.element(),
+                        ScalarElement::F32,
                     ),
                 };
                 let decoded = (fusor_gguf::block_spec(key.fmt, key.layout).decode.emit)(&args)?;
@@ -200,7 +195,7 @@ fn decode_window_uncached(key: DecodeKey) -> Result<(u64, u64)> {
         let index = Arc::new(LocalDecl::new(ScalarElement::U32.element()));
         let step = binary(
             Mul,
-            TileExpr::new(TileExprKind::LoadLocal(index), ScalarElement::U32.element()),
+            expr(TileExprKind::LoadLocal(index), ScalarElement::U32),
             u32_lit(pass),
         );
         let full = pass_work(step, p.vector.max(1), false, false)?;
@@ -243,17 +238,11 @@ fn count(expr: &TileExpr, seen: &mut FxHashSet<TileExpr>, work: &mut (u64, u64))
 #[cfg(test)]
 mod tests {
     use super::*;
-    use fusor_ir::device::{Caps, DeviceKind, Limits, SubgroupWidths};
-    use fusor_ir::dtype::Dtype;
-    use fusor_ir::egraph::EGraph;
+    use crate::realize::tests::{buffer, caps, contract, new_graph, selecting, sgemv, side};
     use fusor_ir::extract::Extraction;
     use fusor_ir::ir::Op;
-    use fusor_ir::ir::launch::{
-        AccessPlan, ContractSide, Family, IndexSpace, Launch, Operand, SchedPoint, ScheduleDomain,
-        SgemvDomain,
-    };
+    use fusor_ir::ir::launch::{AccessPlan, Family, Launch, SchedPoint};
     use fusor_ir::ir::logical::{BufferId, LeafKind, Logical};
-    use fusor_ir::scalar::ScalarExpr;
     use fusor_ir::shape::{Dim, Layout};
 
     #[test]
@@ -315,30 +304,11 @@ mod tests {
             assert_eq!(av.map(f32::to_bits), bv.map(f32::to_bits));
         }
 
-        let caps = Caps {
-            kind: DeviceKind::Gpu,
-            name: "quantized layout pricing".into(),
-            limits: Limits::default(),
-            subgroups: Some(SubgroupWidths { min: 32, max: 32 }),
-            f16: false,
-            bf16: false,
-            coop: Default::default(),
-            atomic_f32: false,
-            workgroup_alias: false,
-            mixed_precision_coop_store: false,
-            pipeline_cache: false,
-            timestamp_query: false,
-            simd_widths: Default::default(),
-            threads: 1,
-        };
+        let caps = caps();
         let arena = Arc::new(fusor_tile::Planner::new());
-        let mut graph = EGraph::new(fusor_ir::CoreSemantics::new(arena.clone()));
+        let mut graph = new_graph(&arena);
         let (n, k) = (Dim::Const(n.into()), Dim::Const(k.into()));
-        let x = graph.add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
-            name: BufferId(0),
-            dtype: Dtype::F32,
-            shape: [Dim::ONE, k].into_iter().collect(),
-        })))?;
+        let x = buffer(&mut graph, 0, &[Dim::ONE, k]);
         let mut variants = Vec::new();
         for params in [
             params,
@@ -360,56 +330,23 @@ mod tests {
                         layout,
                         shape: [n, k].into_iter().collect(),
                     })))?;
-                    let side = |src, layout| {
-                        ContractSide::one(
-                            ScalarExpr::arg(0, Dtype::F32),
-                            Operand {
-                                src,
-                                layout,
-                                access: AccessPlan::Alias,
-                            },
-                        )
-                    };
-                    let root = graph.add(Op::Launch(Launch::Contract {
-                        output: IndexSpace::new(if split == 1 {
-                            vec![Dim::ONE, n]
-                        } else {
-                            vec![batch, Dim::ONE, n]
-                        }),
-                        m: Dim::ONE,
-                        n,
-                        k: chunk,
-                        batch,
-                        family: Family::Sgemv,
-                        a: side(
-                            x,
-                            if split == 1 {
-                                Layout::contiguous(&[Dim::ONE, chunk])
-                            } else {
-                                Layout::contiguous(&[batch, Dim::ONE, chunk])
-                            },
-                        ),
-                        b: side(
+                    // An unsplit contraction drops the leading batch axis.
+                    let s = usize::from(split == 1);
+                    let root = graph.add(contract(
+                        &[batch, Dim::ONE, n][s..],
+                        [Dim::ONE, n, chunk, batch],
+                        Family::Sgemv,
+                        side(x, Layout::contiguous(&[batch, Dim::ONE, chunk][s..])),
+                        side(
                             weight,
-                            if split == 1 {
-                                Layout::from_parts(Dim::Const(0), &[chunk, n], &[Dim::ONE, k])?
-                            } else {
-                                Layout::from_parts(
-                                    Dim::Const(0),
-                                    &[batch, chunk, n],
-                                    &[chunk, Dim::ONE, k],
-                                )?
-                            },
+                            Layout::from_parts(
+                                Dim::Const(0),
+                                &[batch, chunk, n][s..],
+                                &[chunk, Dim::ONE, k][s..],
+                            )?,
                         ),
-                        acc: Dtype::F32,
-                        post: ScalarExpr::arg(0, Dtype::F32),
-                        sched: ScheduleDomain::Sgemv(
-                            SgemvDomain {
-                                params: [params].into_iter().collect(),
-                            }
-                            .into(),
-                        ),
-                    }))?;
+                        sgemv(params),
+                    ))?;
                     let mut packed = graph.node(root).op.clone();
                     let Op::Launch(Launch::Contract { b, .. }) = &mut packed else {
                         unreachable!()
@@ -434,10 +371,7 @@ mod tests {
                 let (weight, roots) = pair[index];
                 let root = roots[access];
                 let mut ex = Extraction {
-                    sigma: [x, weight, root]
-                        .into_iter()
-                        .map(|id| (graph.class_of(id), id))
-                        .collect(),
+                    sigma: selecting(&graph, [x, weight, root]),
                     m: Default::default(),
                     theta: [(root, SchedPoint::Sgemv(params))].into_iter().collect(),
                 };

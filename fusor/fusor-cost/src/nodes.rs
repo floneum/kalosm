@@ -1,5 +1,4 @@
-//! Read-only views of graph nodes shared by pricing, extraction and
-//! verification.
+//! Read-only node views shared by pricing, extraction and verification.
 
 use crate::realize::dim_extent;
 use fusor_ir::device::Caps;
@@ -46,9 +45,7 @@ pub(crate) fn domain_of(graph: &EGraph, id: Id) -> Option<&ScheduleDomain> {
     }
 }
 
-/// `id`'s operands as the selection resolves them, paired with the operand:
-/// a composite names its members by id, anything else reads its operand's
-/// selected member, `None` when that class has none.
+/// `id`'s operands with their selected members; a composite's are by id.
 pub(crate) fn resolved_children<'a>(
     graph: &'a EGraph,
     ex: &'a Extraction,
@@ -140,17 +137,14 @@ impl Tiling {
     }
 }
 
-/// Lanes of a one-column sgemv workgroup: `subgroups` subgroups, capped by
-/// the device.
+/// Lanes of a one-column sgemv workgroup, capped by the device.
 pub(crate) fn sgemv_block(p: SgemvParams, caps: &Caps) -> u32 {
     (p.subgroups.max(1) * caps.subgroup_width())
         .min(caps.limits.max_compute_invocations_per_workgroup)
         .max(1)
 }
 
-/// Lanes one sgemv output reduces its k across: multi-column schedules
-/// reduce each column within one subgroup, the one-column path across the
-/// block.
+/// Lanes one sgemv output reduces k across: a subgroup, else the block.
 pub(crate) fn sgemv_lanes(p: SgemvParams, caps: &Caps) -> u32 {
     if p.cols > 1 {
         caps.subgroup_width()
@@ -170,8 +164,7 @@ pub(crate) fn fold_theta(
         .or(theta)
 }
 
-/// The lane group a fold lowers at under `theta`. A point that is not a fold
-/// strategy takes the emitters' default, `emitted_block(1)`.
+/// The lane group a fold lowers at under `theta`, else `emitted_block(1)`.
 pub(crate) fn fold_lane_group(theta: Option<SchedPoint>, caps: &Caps) -> u32 {
     match theta {
         Some(SchedPoint::Fold(s)) => s.lane_group(caps.subgroup_width()),
