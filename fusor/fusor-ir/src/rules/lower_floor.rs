@@ -392,20 +392,6 @@ fn contract_operand(
         }
         u32::try_from(acc).ok()
     };
-    let label_extent = |l: Label| -> Option<u32> {
-        let d = spec
-            .a
-            .iter()
-            .position(|x| *x == l)
-            .and_then(|i| a_shape.get(i))
-            .or_else(|| {
-                spec.b
-                    .iter()
-                    .position(|x| *x == l)
-                    .and_then(|i| b_shape.get(i))
-            })?;
-        u32::try_from(d.as_const()?).ok()
-    };
 
     let mut groups: SmallVec<[AxisGroup; 4]> = SmallVec::new();
     for (axis, l) in spec.out.iter().copied().enumerate() {
@@ -415,7 +401,7 @@ fn contract_operand(
     let mut subs: SmallVec<[SubAxis; 2]> = SmallVec::new();
     for l in contracted {
         subs.push(SubAxis {
-            extent: label_extent(*l)?,
+            extent: u32::try_from(label_dim(*l, spec, a_shape, b_shape)?.as_const()?).ok()?,
             stride: stride_of(*l)?,
         });
     }
@@ -443,29 +429,28 @@ fn fold_extent(
     a: &[Dim],
     b: &[Dim],
 ) -> Option<Dim> {
-    let extent = |l: &Label| -> Option<Dim> {
-        spec.a
-            .iter()
-            .position(|x| x == l)
-            .and_then(|i| a.get(i).copied())
-            .or_else(|| {
-                spec.b
-                    .iter()
-                    .position(|x| x == l)
-                    .and_then(|i| b.get(i).copied())
-            })
-    };
     match contracted {
         [] => Some(Dim::ONE),
-        [one] => extent(one),
+        [one] => label_dim(*one, spec, a, b),
         many => {
             let mut product = 1u64;
             for l in many {
-                product = product.checked_mul(extent(l)?.as_const()?)?;
+                product = product.checked_mul(label_dim(*l, spec, a, b)?.as_const()?)?;
             }
             Some(Dim::Const(product))
         }
     }
+}
+
+/// The extent `l` labels: its first axis on `a`, else on `b`.
+fn label_dim(l: Label, spec: &crate::ir::logical::EinSpec, a: &[Dim], b: &[Dim]) -> Option<Dim> {
+    let at = |labels: &[Label], shape: &[Dim]| {
+        labels
+            .iter()
+            .position(|x| *x == l)
+            .and_then(|i| shape.get(i).copied())
+    };
+    at(&spec.a, a).or_else(|| at(&spec.b, b))
 }
 
 /// `Logical::Restride` -> a copying `Map` whose operand carries the composed

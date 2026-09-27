@@ -82,9 +82,7 @@ fn slab_copies(b: &Builder<'_>, members: &[Id]) -> isize {
 /// Copy-class operands a contraction spelling reads.
 fn contract_copies(b: &Builder<'_>, m: Id) -> usize {
     match &b.node(m).op {
-        Op::Launch(Launch::Contract { a, b: rhs, .. }) => {
-            copy_operands(b, &a.ops) + copy_operands(b, &rhs.ops)
-        }
+        Op::Launch(op @ Launch::Contract { .. }) => copy_operands(b, op.operands()),
         _ => usize::MAX,
     }
 }
@@ -108,9 +106,8 @@ fn best_spelling(b: &Builder<'_>, class: ClassId) -> Option<Id> {
             }
             // The spelling reading the fewest copies: one that reads its
             // views in place is a dispatch cheaper than one reading a copy.
-            Op::Launch(Launch::Contract { a, b: rhs, .. }) => {
-                let copies = copy_operands(b, &a.ops) + copy_operands(b, &rhs.ops);
-                let key = (copies, m);
+            Op::Launch(Launch::Contract { .. }) => {
+                let key = (contract_copies(b, m), m);
                 if stage.is_none_or(|s| key < (contract_copies(b, s), s)) {
                     stage = Some(m);
                 }

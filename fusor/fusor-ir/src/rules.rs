@@ -98,20 +98,6 @@ pub static CORE_RULES: &[Rule] = &[
     scatter_fold::SCATTER_ADD_AS_FOLD,
 ];
 
-/// Look a core rule up by the name its `rule!` declaration stringified.
-pub fn rule_id(name: &str) -> Option<RuleId> {
-    CORE_RULES
-        .iter()
-        .position(|r| r.name == name)
-        .map(|i| RuleId(i as u16))
-}
-
-/// The core rule at `id`. Panics when `id` is out of range, which can only
-/// happen if a caller mixes ids minted against a different slice.
-pub fn rule(id: RuleId) -> &'static Rule {
-    &CORE_RULES[id.0 as usize]
-}
-
 /// Bytes of private accumulator one invocation may hold: 256 (64 `f32`
 /// lanes, the widest shipped tile) for a carrier `PROMOTE` widens, 1024 for
 /// a `TUPLE` joint. `Caps` has no portable register-budget fact, so both are

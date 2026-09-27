@@ -53,7 +53,7 @@ pub fn sink_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -
     if !epilogue_preserves_accum(body.dtype(), *acc) {
         return None;
     }
-    *post = body.compose(&[post.clone()]);
+    *post = body.compose(std::slice::from_ref(post));
     let sunk = b.add_launch(sunk).ok()?;
     let cursor = crate::rules::rebuild_spine(b, &spine, sunk)?;
     b.union(id, cursor).ok()

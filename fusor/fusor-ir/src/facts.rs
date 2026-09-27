@@ -26,6 +26,36 @@ impl ValueFacts {
         }
     }
 
+    /// A step-lived single value whose contract is the meet over `ins`.
+    pub fn step(dtype: Dtype, shape: Dims, ins: &[ValueFacts]) -> Self {
+        Self {
+            dtype,
+            shape,
+            numeric: Self::meet(ins),
+            persistence: Persistence::Step,
+            outs: 1,
+        }
+    }
+
+    /// The meet of every operand's contract; `RELAXED` over none.
+    pub fn meet(ins: &[ValueFacts]) -> NumericContract {
+        ins.iter()
+            .map(|f| f.numeric)
+            .reduce(NumericContract::meet)
+            .unwrap_or(NumericContract::RELAXED)
+    }
+
+    /// This value re-viewed at `shape`: same dtype, contract and lifetime.
+    pub fn view(&self, shape: Dims) -> Self {
+        Self {
+            dtype: self.dtype,
+            shape,
+            numeric: self.numeric,
+            persistence: self.persistence,
+            outs: 1,
+        }
+    }
+
     pub fn rank(&self) -> usize {
         self.shape.len()
     }

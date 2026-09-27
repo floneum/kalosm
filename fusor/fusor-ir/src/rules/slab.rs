@@ -454,12 +454,18 @@ fn rank_stage(
 
 /// Operands that are copies of some other value and are read varyingly: a
 /// broadcast read of a copy class is a scalar, not a copy dispatch.
-pub(crate) fn copy_operands(b: &Builder<'_>, ops: &[Operand]) -> usize {
+pub(crate) fn copy_operands<'a>(
+    b: &Builder<'_>,
+    ops: impl IntoIterator<Item = &'a Operand>,
+) -> usize {
     count_copies(ops, |id| is_copy_class(b, id))
 }
 
-fn count_copies(ops: &[Operand], mut is_copy: impl FnMut(Id) -> bool) -> usize {
-    ops.iter()
+fn count_copies<'a>(
+    ops: impl IntoIterator<Item = &'a Operand>,
+    mut is_copy: impl FnMut(Id) -> bool,
+) -> usize {
+    ops.into_iter()
         .filter(|o| o.layout.strides().iter().any(|s| s.as_const() != Some(0)))
         .filter(|o| is_copy(o.src))
         .count()

@@ -2,6 +2,7 @@
 //!
 //! 1. Inference is total.
 //! 2. **No implicit broadcasting**: all `Map` operands share the output shape.
+//!    `infer_map` refuses anything else, so clause 1 enforces it.
 //! 3. `Fold`: `axis < rank`; the carrier's slot vectors agree; every identity
 //!    is a value of `acc`; every `Vector` slot extent is constant; and
 //!    `merge(identity, identity) == identity`.
@@ -103,9 +104,6 @@ pub fn verify_l0(cx: &VerifyCtx<'_>) -> Result<()> {
         ));
     }
 
-    // 2.
-    check_map_shapes(cx)?;
-
     match op {
         // 3.
         Logical::Fold {
@@ -198,30 +196,6 @@ pub fn verify_l0(cx: &VerifyCtx<'_>) -> Result<()> {
     // 8.
     check_work_varies(cx, op)?;
 
-    Ok(())
-}
-
-/// Invariant 2, split out because the frontend calls it directly before
-/// emitting the stride-0 `Restride` that replaces implicit broadcasting.
-pub(crate) fn check_map_shapes(cx: &VerifyCtx<'_>) -> Result<()> {
-    let Op::Logical(Logical::Map { .. }) = &cx.node.op else {
-        return Ok(());
-    };
-    let Some(first) = cx.operands.first() else {
-        return Ok(());
-    };
-    for (i, other) in cx.operands.iter().enumerate().skip(1) {
-        if other.shape != first.shape {
-            return Err(fail(
-                cx,
-                format!(
-                    "Map operand {i} has shape {:?} but operand 0 has {:?}; the frontend emits \
-                     Restride{{multiplier:0}} rather than broadcasting implicitly",
-                    other.shape, first.shape
-                ),
-            ));
-        }
-    }
     Ok(())
 }
 

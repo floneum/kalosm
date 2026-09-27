@@ -659,39 +659,16 @@ fn absorb_into_side(
         // splice: the contraction path has no later rule to fold it, so a
         // carried `Restride` class would materialize as its own launch. A
         // spine that does not compose to an offset-0 plain layout is left
-        // alone: the operand stays legal, just materialized.
+        // alone: the operand stays legal, just materialized. Only a dense
+        // read of the view composes by substitution, which `effective`
+        // checks against the operand's own extents.
         for p in inner.ops.iter_mut() {
-            if !matches!(p.access, AccessPlan::Alias) {
-                continue;
-            }
-            let spine = b.trace_pure_views(p.src);
-            if spine.views.len() != 1 {
-                continue;
-            }
-            // Only an identity read of the view composes by substitution:
-            // the operand's own strides must be the view value's dense
-            // row-major set, or the composed walk is not the view's.
-            if !p.layout.is_contiguous() || p.layout.shape() != &b.facts_of(p.src).shape[..] {
-                continue;
-            }
-            let Op::Logical(crate::ir::logical::Logical::Restride { specs, .. }) =
-                b.node(spine.views[0]).op.clone()
-            else {
-                continue;
-            };
-            let base_shape = b.facts_of(spine.base).shape.clone();
-            let Some(composed) = crate::rules::composed_layout(&specs, &base_shape) else {
-                continue;
-            };
+            let space = IndexSpace::new(p.layout.shape().iter().copied());
+            let (read, base) = crate::rules::rebase::effective(b, p, &space);
             // Clause 8: a Launch operand may not name a buffer offset.
-            if !composed.offset().known_eq(Dim::Const(0)) {
-                continue;
+            if base != p.src && read.layout.offset().known_eq(Dim::Const(0)) {
+                *p = read;
             }
-            *p = Operand {
-                src: spine.base,
-                layout: composed,
-                access: AccessPlan::Alias,
-            };
         }
         if !inner
             .ops

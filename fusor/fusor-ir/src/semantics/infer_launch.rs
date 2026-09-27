@@ -1,11 +1,10 @@
 //! Total inference for the Launch op family. A Launch node's result shape is its
 //! index space minus the reduced axes, and its dtype is the epilogue's.
 
-use crate::dtype::{Dtype, NumericContract, Persistence};
+use crate::dtype::{Dtype, Persistence};
 use crate::error::{Error, Result};
 use crate::facts::ValueFacts;
 use crate::ir::launch::Launch;
-use crate::shape::Dims;
 
 /// Infer the result facts of a Launch node from its operands' facts.
 pub fn infer_launch(op: &Launch, ins: &[ValueFacts]) -> Result<ValueFacts> {
@@ -24,7 +23,9 @@ pub fn infer_launch(op: &Launch, ins: &[ValueFacts]) -> Result<ValueFacts> {
             let (_, _, inputs) = stream_inputs(producer, fold, *operand, ins)?;
             infer_launch(fold, &inputs)
         }
-        Launch::Map { space, body, .. } => Ok(step(body.dtype(), space.dims.clone(), ins)),
+        Launch::Map { space, body, .. } => {
+            Ok(ValueFacts::step(body.dtype(), space.dims.clone(), ins))
+        }
 
         // The reduced axis leaves the shape and the carrier's lane count is
         // appended when it exceeds one — the convention slot readback is an
@@ -48,10 +49,12 @@ pub fn infer_launch(op: &Launch, ins: &[ValueFacts]) -> Result<ValueFacts> {
             let shape = space.fold_shape(*axis, vec_axes, carrier).ok_or_else(|| {
                 Error::Shape("a multi-slot carrier needs a constant Vector extent".into())
             })?;
-            Ok(step(*acc, shape, ins))
+            Ok(ValueFacts::step(*acc, shape, ins))
         }
 
-        Launch::Contract { output, post, .. } => Ok(step(post.dtype(), output.dims.clone(), ins)),
+        Launch::Contract { output, post, .. } => {
+            Ok(ValueFacts::step(post.dtype(), output.dims.clone(), ins))
+        }
         // `QuantizedRows` reads the quantized leaf but *decodes* every
         // element it gathers, so its value is float-typed and step-lived —
         // inheriting the leaf's `Q(fmt)` dtype is exactly the double-decode
@@ -61,13 +64,11 @@ pub fn infer_launch(op: &Launch, ins: &[ValueFacts]) -> Result<ValueFacts> {
             space,
             mode: crate::ir::launch::GatherMode::QuantizedRows,
             ..
-        } => Ok(step(Dtype::F32, space.dims.clone(), ins)),
+        } => Ok(ValueFacts::step(Dtype::F32, space.dims.clone(), ins)),
         Launch::Gather { space, .. } => Ok(ValueFacts {
             dtype: ins.first().map_or(Dtype::F32, |f| f.dtype),
-            shape: space.dims.clone(),
-            numeric: meet(ins),
             persistence: ins.first().map_or(Persistence::Step, |f| f.persistence),
-            outs: 1,
+            ..ValueFacts::step(Dtype::F32, space.dims.clone(), ins)
         }),
 
         // A scatter's value is its **base** with the updates applied, so its
@@ -79,13 +80,10 @@ pub fn infer_launch(op: &Launch, ins: &[ValueFacts]) -> Result<ValueFacts> {
         // already says `Scatter` returns the base facts; this has to agree.
         Launch::Scatter { space, .. } => match ins.first() {
             Some(base) => Ok(ValueFacts {
-                dtype: base.dtype,
-                shape: base.shape.clone(),
-                numeric: meet(ins),
-                persistence: base.persistence,
-                outs: 1,
+                numeric: ValueFacts::meet(ins),
+                ..base.view(base.shape.clone())
             }),
-            None => Ok(step(Dtype::F32, space.dims.clone(), ins)),
+            None => Ok(ValueFacts::step(Dtype::F32, space.dims.clone(), ins)),
         },
 
         // A slab is its last member's value; the children are the members in
@@ -125,22 +123,4 @@ pub fn stream_inputs(
     let mut inputs = ins[count..].to_vec();
     inputs.insert(operand as usize, produced.clone());
     Ok((count, produced, inputs))
-}
-
-/// A step-lived single value.
-fn step(dtype: Dtype, shape: Dims, ins: &[ValueFacts]) -> ValueFacts {
-    ValueFacts {
-        dtype,
-        shape,
-        numeric: meet(ins),
-        persistence: Persistence::Step,
-        outs: 1,
-    }
-}
-
-fn meet(ins: &[ValueFacts]) -> NumericContract {
-    ins.iter()
-        .map(|f| f.numeric)
-        .reduce(NumericContract::meet)
-        .unwrap_or(NumericContract::RELAXED)
 }

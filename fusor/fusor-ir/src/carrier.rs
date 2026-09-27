@@ -556,46 +556,7 @@ impl Carrier {
     /// that read each other disagree in extent, because clamping a position
     /// would silently compute the wrong element.
     pub fn merge_lanes(&self) -> Option<Vec<ScalarExpr>> {
-        let w = self.width();
-        let lanes = self.lane_slots()?;
-        let total = lanes.len();
-        let widths: Vec<u64> = self
-            .slots
-            .iter()
-            .map(|s| s.lanes())
-            .collect::<Option<_>>()?;
-        let bases: Vec<u64> = (0..w).map(|k| self.slot_offset(k)).collect::<Option<_>>()?;
-
-        let mut out = Vec::with_capacity(total);
-        for &(k, p) in &lanes {
-            // Refuse before rewriting: an out-of-range `Arg`, or a cross-slot
-            // read whose extent does not match this slot's.
-            let bad = std::cell::Cell::new(false);
-            let resolve = |a: u32| -> u32 {
-                let (j, right) = if (a as usize) < w {
-                    (a as usize, false)
-                } else {
-                    (a as usize - w, true)
-                };
-                if j >= w || a as usize >= 2 * w {
-                    bad.set(true);
-                    return 0;
-                }
-                if widths[j] != 1 && widths[j] != widths[k] {
-                    bad.set(true);
-                    return 0;
-                }
-                let pos = if widths[j] == 1 { 0 } else { p };
-                let lane = (bases[j] + pos) as u32;
-                if right { total as u32 + lane } else { lane }
-            };
-            let e = map_args(&self.merge[k], &resolve);
-            if bad.get() {
-                return None;
-            }
-            out.push(e);
-        }
-        Some(out)
+        self.resolve_lanes(&self.merge, 2)
     }
 
     /// One expression per **slot**, reading `Arg(0..width)`, expanded to one per
@@ -608,11 +569,18 @@ impl Carrier {
     /// of a `Scalar` slot to its single lane. `None` on the same
     /// disagreements `merge_lanes` refuses.
     pub fn expand_lanes(&self, per_slot: &[ScalarExpr]) -> Option<Vec<ScalarExpr>> {
-        let w = self.width();
-        if per_slot.len() != w {
+        if per_slot.len() != self.width() {
             return None;
         }
+        self.resolve_lanes(per_slot, 1)
+    }
+
+    /// One expression per slot over `sides` accumulators of `width` slots
+    /// each, expanded to one per lane over `sides` accumulators of `lanes`.
+    fn resolve_lanes(&self, per_slot: &[ScalarExpr], sides: usize) -> Option<Vec<ScalarExpr>> {
+        let w = self.width();
         let lanes = self.lane_slots()?;
+        let total = lanes.len() as u32;
         let widths: Vec<u64> = self
             .slots
             .iter()
@@ -622,15 +590,17 @@ impl Carrier {
 
         let mut out = Vec::with_capacity(lanes.len());
         for &(k, p) in &lanes {
+            // Refuse before rewriting: an out-of-range `Arg`, or a cross-slot
+            // read whose extent does not match this slot's.
             let bad = std::cell::Cell::new(false);
             let resolve = |a: u32| -> u32 {
-                let j = a as usize;
-                if j >= w || (widths[j] != 1 && widths[j] != widths[k]) {
+                let (side, j) = (a as usize / w.max(1), a as usize % w.max(1));
+                if side >= sides || j >= w || (widths[j] != 1 && widths[j] != widths[k]) {
                     bad.set(true);
                     return 0;
                 }
                 let pos = if widths[j] == 1 { 0 } else { p };
-                (bases[j] + pos) as u32
+                side as u32 * total + (bases[j] + pos) as u32
             };
             let e = map_args(&per_slot[k], &resolve);
             if bad.get() {
@@ -650,17 +620,6 @@ impl Carrier {
     pub fn eval_merge(&self, a: &[f32], b: &[f32]) -> Option<Vec<f32>> {
         let args: Vec<f32> = a.iter().chain(b).copied().collect();
         self.merge.iter().map(|e| eval(e, &args)).collect()
-    }
-
-    /// Absorb one element the way a sequential inner loop does.
-    pub fn absorb(&self, acc: &[f32], args: &[f32]) -> Option<Vec<f32>> {
-        let l = self.eval_lift(args)?;
-        self.eval_merge(acc, &l)
-    }
-
-    /// The identity, as host floats.
-    pub fn identity_f32(&self) -> Vec<f32> {
-        self.identity.iter().map(splat_f32).collect()
     }
 }
 
