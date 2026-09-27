@@ -24,8 +24,7 @@ const { chromium } = require('playwright');
         GPUDevice.prototype.createShaderModule = function(desc) {
           let code = desc.code;
           // Slab row collectives use this builtin to guard full occupancy.
-          // Fixed training programs have separate capability coverage.
-          if (code.includes('@builtin(num_subgroups)') && !code.includes('arena: array<u32>')) {
+          if (code.includes('@builtin(num_subgroups)')) {
             window.rowShaders++;
             const builtin = rowMode === 'permuted-lanes' ? 'local_invocation_index' : 'num_subgroups';
             const match = code.match(new RegExp(`@builtin\\(${builtin}\\)\\s+(\\w+)\\s*:\\s*u32`));

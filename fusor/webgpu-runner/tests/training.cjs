@@ -29,7 +29,7 @@ async function instrument(page, mask) {
     GPUDevice.prototype.createShaderModule = function(desc) {
       if (desc.code.includes('subgroupMatrixMultiplyAccumulate')) {
         audit.matrix++;
-        if (!desc.label?.includes('probe') && desc.label !== 'fusor fixed logical program') audit.generalMatrix++;
+        if (!desc.label?.includes('probe')) audit.generalMatrix++;
         if (mask === 'reject-matrix') desc = { ...desc, code: 'intentional invalid matrix shader' };
       }
       if (/subgroup(Add|Mul|Min|Max|Ballot)/.test(desc.code)) audit.subgroup++;
