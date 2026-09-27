@@ -1,13 +1,12 @@
 //! Reversible selection and schedule moves. Schedule estimates only order
 //! candidates; exact realized cost decides whether to keep them.
 
+use crate::nodes::{composite_members, domain_of};
 use crate::realize;
 use fusor_ir::cost::{CostModel, Picoseconds};
 use fusor_ir::egraph::{ClassId, EGraph, Id};
 use fusor_ir::extract::{Extraction, Move};
-use fusor_ir::facts::ValueFacts;
-use fusor_ir::ir::Op;
-use fusor_ir::ir::launch::{Launch, SchedPoint, ScheduleDomain};
+use fusor_ir::ir::launch::{SchedPoint, ScheduleDomain};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
@@ -48,7 +47,7 @@ impl Trail {
     pub(crate) fn select(&mut self, ex: &mut Extraction, class: ClassId, node: Id) {
         let was = ex.sigma.insert(class, node);
         if was != Some(node) {
-            crate::extract::sigma_debug(class, node, "select");
+            crate::debug::sigma(class, node, "select");
             self.0.push(Change::Select(class, was));
         }
     }
@@ -117,30 +116,15 @@ impl SchedCache {
         id: Id,
         cost: &dyn CostModel,
     ) -> &[SchedPoint] {
-        self.order.entry(id).or_insert_with(|| {
-            let node = graph.node(id);
-            let ins: SmallVec<[ValueFacts; 4]> = node
-                .children
-                .iter()
-                .map(|c| graph.facts(*c).clone())
-                .collect();
-            let out = graph.facts(id);
-            let domain = match &node.op {
-                Op::Launch(l1) => l1.schedule(),
-                _ => None,
-            };
-            let mut points: Vec<(Picoseconds, usize, SchedPoint)> = match domain {
+        self.order
+            .entry(id)
+            .or_insert_with(|| match domain_of(graph, id) {
                 None | Some(ScheduleDomain::Point) => Vec::new(),
-                Some(d) => d
-                    .iter()
-                    .enumerate()
-                    .map(|(i, theta)| (cost.node_math(node, &ins, out, Some(theta)), i, theta))
-                    .collect(),
-            };
-            // Ties break by domain index, so the order is total and stable.
-            points.sort_by_key(|(s, i, _)| (*s, *i));
-            points.into_iter().map(|(_, _, t)| t).collect()
-        })
+                Some(domain) => {
+                    let (ins, out) = crate::lower_bound::node_facts(graph, id);
+                    crate::lower_bound::ranked_points(graph.node(id), &ins, out, domain, cost)
+                }
+            })
     }
 }
 
@@ -160,7 +144,7 @@ pub(crate) fn frontier(graph: &EGraph, selected: &[Id]) -> Vec<Move> {
     selected.sort_unstable();
     selected.dedup();
     for id in selected {
-        if let Some(d) = domain(graph, id)
+        if let Some(d) = domain_of(graph, id)
             && d.len() > 1
         {
             out.push(Move::Reschedule(id));
@@ -222,21 +206,10 @@ pub(crate) fn candidates(
 /// Whether `class` is a middle member's class of a live composite.
 fn slab_pinned(graph: &EGraph, selected: &[Id], class: ClassId) -> bool {
     selected.iter().any(|sel| {
-        let Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) =
-            &graph.node(*sel).op
-        else {
-            return false;
-        };
-        let n = members.len();
-        members[..n.saturating_sub(1)]
-            .iter()
-            .any(|m| graph.class_of(*m) == class)
+        composite_members(graph, *sel).is_some_and(|members| {
+            members[..members.len().saturating_sub(1)]
+                .iter()
+                .any(|m| graph.class_of(*m) == class)
+        })
     })
-}
-
-fn domain(graph: &EGraph, id: Id) -> Option<&ScheduleDomain> {
-    match &graph.node(id).op {
-        Op::Launch(l1) => l1.schedule(),
-        _ => None,
-    }
 }

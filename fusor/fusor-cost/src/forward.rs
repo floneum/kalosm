@@ -7,13 +7,11 @@
 //! reader of every copy multiplies heads and extraction never settles. Here
 //! one spelling is minted per selected reader of a selected copy.
 
+use crate::nodes::is_view_copy;
 use fusor_ir::device::Caps;
 use fusor_ir::egraph::{ClassId, EGraph, Id};
 use fusor_ir::extract::{Extraction, Plan};
-use fusor_ir::ir::Op;
-use fusor_ir::ir::launch::{AccessPlan, Launch};
 use fusor_ir::rules::absorb_view::forward_views;
-use fusor_ir::scalar::ScalarKind;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 /// Rewrite `plan`'s selection into `ex` so no launch reads a view copy that
@@ -25,17 +23,13 @@ pub fn forward_selected_views(
     plan: &Plan,
     ex: &mut Extraction,
 ) -> bool {
-    let launched: FxHashSet<Id> = plan
-        .launches
-        .iter()
-        .flat_map(|l| std::iter::once(l.root).chain(l.members.iter().copied()))
-        .collect();
+    let launched: FxHashSet<Id> = crate::nodes::plan_values(plan).collect();
     let root_classes: FxHashSet<ClassId> = roots.iter().map(|r| graph.class_of(*r)).collect();
     let copies: FxHashSet<ClassId> = ex
         .sigma
         .iter()
         .filter(|(c, n)| {
-            launched.contains(n) && !root_classes.contains(c) && is_view_copy(graph, **n)
+            launched.contains(n) && !root_classes.contains(c) && is_view_copy(&graph.node(**n).op)
         })
         .map(|(c, _)| *c)
         .collect();
@@ -86,15 +80,4 @@ pub fn forward_selected_views(
         })
         .collect();
     true
-}
-
-/// An identity map reading one strided view of another value.
-fn is_view_copy(graph: &EGraph, id: Id) -> bool {
-    matches!(
-        &graph.node(id).op,
-        Op::Launch(Launch::Map { body, ops, .. })
-            if ops.len() == 1
-                && matches!(body.kind(), ScalarKind::Arg(0))
-                && matches!(ops[0].access, AccessPlan::Alias)
-    )
 }

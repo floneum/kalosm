@@ -1,25 +1,19 @@
 //! Per-node arithmetic estimates for initial selection and candidate ordering.
 //! Complete selected DAGs are compared through the realized cost model.
 
+use crate::nodes::{composite_members, domain_of, sgemv_lanes};
 use fusor_ir::cost::{CostModel, Picoseconds};
 use fusor_ir::device::Caps;
 use fusor_ir::egraph::{ClassId, EGraph, Id};
 use fusor_ir::facts::ValueFacts;
-use fusor_ir::ir::Op;
-use fusor_ir::ir::launch::{Launch, ScheduleDomain};
+use fusor_ir::ir::launch::{SchedPoint, ScheduleDomain};
 use fusor_ir::ir::logical::Logical;
+use fusor_ir::ir::{Node, Op};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
 /// Domain size past which a node earns a memo entry.
 const MEMO_THRESHOLD: usize = 8;
-
-fn domain_len(graph: &EGraph, id: Id) -> usize {
-    match &graph.node(id).op {
-        Op::Launch(l1) => l1.schedule().map_or(1, |d| d.len()),
-        _ => 1,
-    }
-}
 
 pub(crate) struct Bounds {
     pub costs: Vec<Picoseconds>,
@@ -59,13 +53,15 @@ fn bounds_over(graph: &EGraph, cost: Option<&dyn CostModel>, ids: &[Id]) -> Boun
                 bounds.launches[a.index()].min(bounds.launches[b.index()]),
             ),
             Op::Logical(Logical::Leaf(_)) => (Picoseconds(0), 0),
-            Op::Launch(Launch::Slab { members, .. } | Launch::Group { members, .. }) => {
-                let time = members.iter().fold(Picoseconds(launch_ps), |sum, m| {
-                    sum + Picoseconds(bounds.costs[m.index()].0.saturating_sub(launch_ps))
-                });
-                (time, 1)
-            }
-            _ => (math[id.index()] + Picoseconds(launch_ps), 1),
+            _ => match composite_members(graph, id) {
+                Some(members) => {
+                    let time = members.iter().fold(Picoseconds(launch_ps), |sum, m| {
+                        sum + Picoseconds(bounds.costs[m.index()].0.saturating_sub(launch_ps))
+                    });
+                    (time, 1)
+                }
+                None => (math[id.index()] + Picoseconds(launch_ps), 1),
+            },
         };
         bounds.costs[id.index()] = time;
         bounds.launches[id.index()] = launches;
@@ -93,54 +89,10 @@ pub(crate) fn argmin_member(
     if crate::realize::is_singleton(graph, class) {
         return class.0;
     }
-    // `FUSOR_SEED_DEBUG=<id>` prints every selectable member's seed key for
-    // that class.
-    if let Ok(want) = std::env::var("FUSOR_SEED_DEBUG")
-        && want == class.0.index().to_string()
-    {
-        for m in crate::realize::selectable(graph, class, caps) {
-            let show: String = format!("{:?}", graph.node(m).op)
-                .replace("ScalarExpr(ScalarNode { kind: ", "")
-                .chars()
-                .take(220)
-                .collect();
-            let excess: Vec<String> = match &graph.node(m).op {
-                Op::Launch(Launch::Group { members, .. }) => members
-                    .iter()
-                    .map(|x| {
-                        let c = graph.class_of(*x);
-                        format!(
-                            "{x}:c{}:+{}us:best={:?}",
-                            c.0.index(),
-                            lb[x.index()].0.saturating_sub(lb[c.0.index()].0) / 1_000_000,
-                            argmin_member_excluding(
-                                graph,
-                                lb,
-                                launches,
-                                c,
-                                caps,
-                                &Default::default()
-                            )
-                        )
-                    })
-                    .collect(),
-                _ => Vec::new(),
-            };
-            eprintln!(
-                "[seed] class {} member {m:?} lb={} launches={} excess={excess:?} op={show}",
-                class.0.index(),
-                lb[m.index()].0,
-                launches[m.index()],
-            );
-        }
-    }
+    crate::debug::seed_members(graph, lb, launches, class, caps);
     let chosen = argmin_member_excluding(graph, lb, launches, class, caps, &Default::default())
         .unwrap_or(class.0);
-    if let Ok(want) = std::env::var("FUSOR_SEED_DEBUG")
-        && want == class.0.index().to_string()
-    {
-        eprintln!("[seed] class {} chose {chosen:?}", class.0.index());
-    }
+    crate::debug::seed_chosen(class, chosen);
     chosen
 }
 
@@ -168,19 +120,17 @@ fn node_math_table(graph: &EGraph, cost: &dyn CostModel, ids: &[Id]) -> Vec<Pico
     let mut memo: FxHashMap<ShapeKey, Picoseconds> = FxHashMap::default();
     for id in ids {
         let id = *id;
-        let node = graph.node(id);
-        if matches!(node.op, Op::Union(..) | Op::Logical(Logical::Leaf(_))) {
+        if matches!(
+            graph.node(id).op,
+            Op::Union(..) | Op::Logical(Logical::Leaf(_))
+        ) {
             continue;
         }
         let slot = &mut out[id.index()];
         // Hashing operand facts costs about two `node_math` calls, so only a
         // domain wide enough to pay for it gets a memo entry.
-        if domain_len(graph, id) <= MEMO_THRESHOLD {
+        if domain_of(graph, id).map_or(1, |d| d.len()) <= MEMO_THRESHOLD {
             *slot = best_math(graph, cost, id);
-            if slot.0 >= u64::MAX / 4 && std::env::var_os("FUSOR_SEED_DEBUG").is_some() {
-                let show: String = format!("{:?}", node.op).chars().take(200).collect();
-                eprintln!("[lb] math saturated at {id:?}: {show}");
-            }
             continue;
         }
         let key = shape_key(graph, id);
@@ -193,20 +143,7 @@ fn node_math_table(graph: &EGraph, cost: &dyn CostModel, ids: &[Id]) -> Vec<Pico
             }
         };
     }
-    if let Ok(want) = std::env::var("FUSOR_SEED_DEBUG") {
-        for id in ids {
-            if want == graph.class_of(*id).0.index().to_string() {
-                let show: String = format!("{:?}", graph.node(*id).op)
-                    .chars()
-                    .take(120)
-                    .collect();
-                eprintln!(
-                    "[math] class {want} node {id} math={} {show}",
-                    out[id.index()].0
-                );
-            }
-        }
-    }
+    crate::debug::math_table(graph, ids, &out);
     out
 }
 
@@ -214,64 +151,104 @@ fn node_math_table(graph: &EGraph, cost: &dyn CostModel, ids: &[Id]) -> Vec<Pico
 /// `None`, as does any node without a domain.
 fn best_math(graph: &EGraph, cost: &dyn CostModel, id: Id) -> Picoseconds {
     let node = graph.node(id);
-    let ins: SmallVec<[ValueFacts; 4]> = node
+    let (ins, out) = node_facts(graph, id);
+    match domain_of(graph, id) {
+        None | Some(ScheduleDomain::Point) => cost.node_math(node, &ins, out, None),
+        Some(domain) => {
+            let mut best: Option<Picoseconds> = None;
+            priced_points(node, &ins, out, domain, cost, |_, v| {
+                best = Some(best.map_or(v, |b| b.min(v)));
+            });
+            best.unwrap_or(Picoseconds(0))
+        }
+    }
+}
+
+/// The first of `domain`'s points with the least `node_math`.
+pub(crate) fn cheapest_point(
+    node: &Node,
+    ins: &[ValueFacts],
+    out: &ValueFacts,
+    domain: &ScheduleDomain,
+    cost: &dyn CostModel,
+) -> Option<SchedPoint> {
+    let mut best: Option<(SchedPoint, Picoseconds)> = None;
+    priced_points(node, ins, out, domain, cost, |theta, v| {
+        if best.is_none_or(|(_, b)| v < b) {
+            best = Some((theta, v));
+        }
+    });
+    best.map(|(theta, _)| theta)
+}
+
+/// `domain`'s points, cheapest `node_math` first, ties by domain index.
+pub(crate) fn ranked_points(
+    node: &Node,
+    ins: &[ValueFacts],
+    out: &ValueFacts,
+    domain: &ScheduleDomain,
+    cost: &dyn CostModel,
+) -> Vec<SchedPoint> {
+    let mut points: Vec<(Picoseconds, usize, SchedPoint)> = Vec::with_capacity(domain.len());
+    priced_points(node, ins, out, domain, cost, |theta, v| {
+        points.push((v, points.len(), theta));
+    });
+    points.sort_by_key(|(v, i, _)| (*v, *i));
+    points.into_iter().map(|(_, _, theta)| theta).collect()
+}
+
+/// Every point of `domain` in order with its `node_math`. `node_math`
+/// depends on the point only through the MAC unit, the padded tile, the
+/// k-step floor and a fold's lane group, so it runs once per math-distinct
+/// point.
+fn priced_points(
+    node: &Node,
+    ins: &[ValueFacts],
+    out: &ValueFacts,
+    domain: &ScheduleDomain,
+    cost: &dyn CostModel,
+    mut visit: impl FnMut(SchedPoint, Picoseconds),
+) {
+    let caps = &cost.facts().caps;
+    let mut seen: SmallVec<[(MathKey, Picoseconds); 12]> = SmallVec::new();
+    for theta in domain.iter() {
+        let key = math_key(theta, caps);
+        let v = match seen.iter().find(|(k, _)| *k == key) {
+            Some((_, v)) => *v,
+            None => {
+                let v = cost.node_math(node, ins, out, Some(theta));
+                seen.push((key, v));
+                v
+            }
+        };
+        visit(theta, v);
+    }
+}
+
+/// What `node_math` reads off a point.
+type MathKey = (u8, u32, u32, u32);
+
+fn math_key(theta: SchedPoint, caps: &Caps) -> MathKey {
+    match theta {
+        // The k-step floor moves with `bk`, so it is part of the key.
+        SchedPoint::Coop { geom, .. } => (1, geom.bm, geom.bn, geom.bk),
+        SchedPoint::Sgemm(p) => (2, p.bm, p.bn, p.bk),
+        // A fold's floor moves with its lane group.
+        SchedPoint::Fold(s) => (3, s.lane_group(caps.subgroup_width()), 0, 0),
+        SchedPoint::Sgemv(p) => (4, sgemv_lanes(p, caps), 0, 0),
+        _ => (0, 0, 0, 0),
+    }
+}
+
+/// The facts of `id`'s operands, in child order, and of its value.
+pub(crate) fn node_facts(graph: &EGraph, id: Id) -> (SmallVec<[ValueFacts; 4]>, &ValueFacts) {
+    let ins = graph
+        .node(id)
         .children
         .iter()
         .map(|c| graph.facts(*c).clone())
         .collect();
-    let out = graph.facts(id);
-
-    let domain = match &node.op {
-        Op::Launch(l1) => l1.schedule(),
-        _ => None,
-    };
-    match domain {
-        None | Some(ScheduleDomain::Point) => cost.node_math(node, &ins, out, None),
-        Some(domain) => {
-            // `node_math` depends on the point only through the MAC unit and
-            // the padded tile, so a domain is scanned once per *math-distinct*
-            // point, not once per point.
-            let mut seen: SmallVec<[(u8, u32, u32); 12]> = SmallVec::new();
-            let mut best: Option<Picoseconds> = None;
-            for theta in domain.iter() {
-                let key = match theta {
-                    // The k-step floor moves with `bk` and the split count,
-                    // so those are part of the key.
-                    fusor_ir::ir::launch::SchedPoint::Coop { geom, .. } => {
-                        (1u8, geom.bm * 1024 + geom.bn, geom.bk)
-                    }
-                    fusor_ir::ir::launch::SchedPoint::Sgemm(p) => (2u8, p.bm * 1024 + p.bn, p.bk),
-                    // A fold's floor moves with its lane group.
-                    fusor_ir::ir::launch::SchedPoint::Fold(s) => {
-                        (3u8, s.lane_group(cost.facts().caps.subgroup_width()), 0)
-                    }
-                    fusor_ir::ir::launch::SchedPoint::Sgemv(p) => {
-                        let caps = &cost.facts().caps;
-                        let width = caps.subgroup_width();
-                        let lanes = if p.cols > 1 {
-                            width
-                        } else {
-                            (p.subgroups.max(1) * width)
-                                .min(caps.limits.max_compute_invocations_per_workgroup)
-                                .max(1)
-                        };
-                        (4u8, lanes, 0)
-                    }
-                    _ => (0u8, 0, 0),
-                };
-                if seen.contains(&key) {
-                    continue;
-                }
-                seen.push(key);
-                let v = cost.node_math(node, &ins, out, Some(theta));
-                best = Some(match best {
-                    Some(b) if b <= v => b,
-                    _ => v,
-                });
-            }
-            best.unwrap_or(Picoseconds(0))
-        }
-    }
+    (ins, graph.facts(id))
 }
 
 pub(crate) type ShapeKey = (Op, SmallVec<[ValueFacts; 4]>, ValueFacts);
@@ -283,16 +260,9 @@ pub(crate) fn shape_key(graph: &EGraph, id: Id) -> ShapeKey {
             operand.src = Id(0);
         }
     }
-    let node = graph.node(id);
-    let mut op = node.op.clone();
+    let mut op = graph.node(id).op.clone();
     // Arithmetic depends on operand facts and access maps, not their arena ids.
     op.visit_mut(&mut ArithmeticOperands);
-    (
-        op,
-        node.children
-            .iter()
-            .map(|c| graph.facts(*c).clone())
-            .collect(),
-        graph.facts(id).clone(),
-    )
+    let (ins, out) = node_facts(graph, id);
+    (op, ins, out.clone())
 }
