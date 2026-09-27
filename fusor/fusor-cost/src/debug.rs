@@ -82,11 +82,8 @@ pub(crate) fn seed_members(
         return;
     }
     for m in realize::selectable(graph, class, caps) {
-        let show: String = format!("{:?}", graph.node(m).op)
-            .replace("ScalarExpr(ScalarNode { kind: ", "")
-            .chars()
-            .take(220)
-            .collect();
+        let show = show(graph, m, usize::MAX).replace("ScalarExpr(ScalarNode { kind: ", "");
+        let show: String = show.chars().take(220).collect();
         let excess: Vec<String> = match &graph.node(m).op {
             Op::Launch(Launch::Group { members, .. }) => members
                 .iter()

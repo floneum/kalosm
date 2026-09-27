@@ -65,11 +65,6 @@ impl<T> IdMap<T> {
     }
 
     #[inline]
-    pub(crate) fn contains(&self, id: Id) -> bool {
-        self.get(id).is_some()
-    }
-
-    #[inline]
     pub(crate) fn insert(&mut self, id: Id, value: T) {
         if self.slots.len() <= id.index() {
             self.slots.resize(id.index() + 1, u32::MAX);
@@ -89,7 +84,7 @@ impl<T> IdMap<T> {
     where
         T: Default,
     {
-        if !self.contains(id) {
+        if self.get(id).is_none() {
             self.insert(id, T::default());
         }
         &mut self.values[self.slots[id.index()] as usize].1
@@ -612,8 +607,7 @@ pub fn exact_cost(
     extraction: &Extraction,
     cost: &dyn CostModel,
 ) -> Picoseconds {
-    let launches = realized.launches(extraction);
-    cost.total(&launches)
+    cost.total(&realized.launches(extraction))
 }
 
 /// Rebuild one ordinary launch over its selected inputs.
@@ -2220,6 +2214,45 @@ pub(crate) mod tests {
             .unwrap()
     }
 
+    fn sum() -> fusor_ir::carrier::Carrier {
+        use fusor_ir::carrier::Carrier;
+        use fusor_ir::scalar::BinOp;
+        let identity = Carrier::binop_identity(BinOp::Add, Dtype::F32).unwrap();
+        Carrier::binop(BinOp::Add, identity, Dtype::F32)
+    }
+
+    /// A fold of `src` over `shape`'s `axis`, its domain the one strategy
+    /// `theta` names, else a point.
+    fn fold(
+        shape: &[Dim],
+        axis: u32,
+        carrier: fusor_ir::carrier::Carrier,
+        src: Id,
+        theta: SchedPoint,
+    ) -> Op {
+        let sched = match theta {
+            SchedPoint::Fold(s) => ScheduleDomain::Fold(
+                fusor_ir::ir::launch::FoldDomain {
+                    strategies: [s].into_iter().collect(),
+                }
+                .into(),
+            ),
+            _ => ScheduleDomain::Point,
+        };
+        Op::Launch(Launch::Fold {
+            space: IndexSpace::new(shape.iter().copied()),
+            axis,
+            vec_axes: Default::default(),
+            post: (0..carrier.width())
+                .map(|i| ScalarExpr::arg(i as u32, Dtype::F32))
+                .collect(),
+            carrier,
+            acc: Dtype::F32,
+            ops: vec![alias(src, Layout::contiguous(shape))],
+            sched,
+        })
+    }
+
     fn composite(graph: &mut EGraph, slab: bool, members: [Id; 2]) -> Id {
         let members = members.into_iter().collect();
         let sched = ScheduleDomain::Point;
@@ -2423,7 +2456,7 @@ pub(crate) mod tests {
                 order,
                 mv,
                 &bounds,
-                &mut crate::moves::SchedCache::new(),
+                &mut crate::moves::SchedCache::default(),
                 &cost,
             )
         };
@@ -2466,18 +2499,9 @@ pub(crate) mod tests {
 
     #[test]
     fn point_folds_price_the_emitted_lanes_grid_and_scratch() {
-        use fusor_ir::carrier::{Carrier, oracle};
-        use fusor_ir::ir::launch::FoldDomain;
-        use fusor_ir::scalar::BinOp;
-
         let caps = caps();
         let arena = Arc::new(fusor_tile::Planner::new());
         let cost = crate::Roofline::new(crate::facts::seed_facts(&caps));
-        let sum = Carrier::binop(
-            BinOp::Add,
-            Carrier::binop_identity(BinOp::Add, Dtype::F32).unwrap(),
-            Dtype::F32,
-        );
         let mut cache = NodeCache::default();
         for (shape, axis, rows) in [([1, 1, 4096], 2, 1), ([5, 4096, 3], 1, 15)] {
             let mut graph = new_graph(&arena);
@@ -2485,47 +2509,16 @@ pub(crate) mod tests {
             let input = buffer(&mut graph, 0, &shape);
             let mut costs = Vec::new();
             let tree = SchedPoint::Fold(FoldStrat::WgTree { lane_group: 256 });
+            let subgroup = SchedPoint::Fold(FoldStrat::Subgroup);
+            let welford = fusor_ir::carrier::oracle::welford(Dtype::F32);
             for (carrier, theta, block, steps, scratch) in [
-                (sum.clone(), SchedPoint::Point, 32, 128, 0),
-                (
-                    sum.clone(),
-                    SchedPoint::Fold(FoldStrat::Subgroup),
-                    32,
-                    128,
-                    0,
-                ),
-                (sum.clone(), tree, 256, 16, 1024),
-                (
-                    oracle::welford(Dtype::F32),
-                    SchedPoint::Point,
-                    256,
-                    16,
-                    3072,
-                ),
+                (sum(), SchedPoint::Point, 32, 128, 0),
+                (sum(), subgroup, 32, 128, 0),
+                (sum(), tree, 256, 16, 1024),
+                (welford, SchedPoint::Point, 256, 16, 3072),
             ] {
-                let post = (0..carrier.width())
-                    .map(|i| ScalarExpr::arg(i as u32, Dtype::F32))
-                    .collect();
-                let sched = match theta {
-                    SchedPoint::Fold(s) => ScheduleDomain::Fold(
-                        FoldDomain {
-                            strategies: [s].into_iter().collect(),
-                        }
-                        .into(),
-                    ),
-                    _ => ScheduleDomain::Point,
-                };
                 let node = graph
-                    .add(Op::Launch(Launch::Fold {
-                        space: IndexSpace::new(shape),
-                        axis,
-                        vec_axes: Default::default(),
-                        carrier,
-                        acc: Dtype::F32,
-                        post,
-                        ops: vec![alias(input, Layout::contiguous(&shape))],
-                        sched,
-                    }))
+                    .add(fold(&shape, axis, carrier, input, theta))
                     .unwrap();
                 let mut ex = Extraction {
                     sigma: selecting(&graph, [input, node]),
@@ -2624,9 +2617,6 @@ pub(crate) mod tests {
 
     #[test]
     fn symbolic_attention_cost_matches_concrete_nominal_shapes() {
-        use fusor_ir::carrier::Carrier;
-        use fusor_ir::ir::launch::FoldDomain;
-        use fusor_ir::scalar::BinOp;
         use fusor_ir::shape::SymId;
 
         let caps = caps();
@@ -2666,27 +2656,8 @@ pub(crate) mod tests {
                             ([c8, len, c4], 1)
                         };
                         let source = buffer(&mut graph, 0, &shape);
-                        let strategy = FoldStrat::WgTree { lane_group: 256 };
-                        let op = Op::Launch(Launch::Fold {
-                            space: IndexSpace::new(shape),
-                            axis,
-                            vec_axes: Default::default(),
-                            carrier: Carrier::binop(
-                                BinOp::Add,
-                                Carrier::binop_identity(BinOp::Add, Dtype::F32).unwrap(),
-                                Dtype::F32,
-                            ),
-                            acc: Dtype::F32,
-                            post: [ScalarExpr::arg(0, Dtype::F32)].into_iter().collect(),
-                            ops: vec![alias(source, Layout::contiguous(&shape))],
-                            sched: ScheduleDomain::Fold(
-                                FoldDomain {
-                                    strategies: [strategy].into_iter().collect(),
-                                }
-                                .into(),
-                            ),
-                        });
-                        (op, SchedPoint::Fold(strategy))
+                        let theta = SchedPoint::Fold(FoldStrat::WgTree { lane_group: 256 });
+                        (fold(&shape, axis, sum(), source, theta), theta)
                     };
                     let node = graph.add(op).unwrap();
                     let mut ex = Extraction {

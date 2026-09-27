@@ -22,21 +22,19 @@ pub(crate) struct Bounds {
 }
 
 pub(crate) fn lower_bound(graph: &EGraph, cost: &dyn CostModel) -> Vec<Picoseconds> {
-    let ids: Vec<Id> = (0..graph.len()).map(|i| Id(i as u32)).collect();
-    bounds_over(graph, Some(cost), &ids).costs
+    let mut all = fixedbitset::FixedBitSet::with_capacity(graph.len());
+    all.insert_range(..);
+    bounds_scoped(graph, Some(cost), &all).costs
 }
 
-/// Unmasked slots stay zero; all selected candidate plans are priced separately.
+/// Bounds over the masked ids; unmasked slots stay zero.
 pub(crate) fn bounds_scoped(
     graph: &EGraph,
     cost: Option<&dyn CostModel>,
     mask: &fixedbitset::FixedBitSet,
 ) -> Bounds {
     let ids: Vec<Id> = mask.ones().map(|i| Id(i as u32)).collect();
-    bounds_over(graph, cost, &ids)
-}
-
-fn bounds_over(graph: &EGraph, cost: Option<&dyn CostModel>, ids: &[Id]) -> Bounds {
+    let ids = &ids;
     let mut bounds = Bounds {
         costs: vec![Picoseconds(0); graph.len()],
         launches: vec![0; graph.len()],

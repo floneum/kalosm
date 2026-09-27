@@ -267,7 +267,8 @@ pub fn buffer_layout_for(
     let (Op::Launch(Launch::Contract { m, n, batch, .. }), Some(SchedPoint::Coop { geom, .. })) =
         (op, theta)
     else {
-        return Ok((Layout::contiguous(shape), layout_elements(shape)));
+        let elements = shape.iter().copied().fold(Dim::ONE, |a, b| a * b);
+        return Ok((Layout::contiguous(shape), elements));
     };
     let constant = |dim: Dim| {
         dim.as_const()
@@ -306,10 +307,6 @@ pub fn buffer_layout_for(
         Layout::from_parts(Dim::Const(0), shape, &strides)?,
         elements,
     ))
-}
-
-fn layout_elements(shape: &[Dim]) -> Dim {
-    shape.iter().copied().fold(Dim::ONE, |a, b| a * b)
 }
 
 /// Every `SymId` the uniform block carries, as ascending `(dims, scalars)`.

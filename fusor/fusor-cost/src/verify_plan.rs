@@ -214,7 +214,6 @@ pub(crate) fn check_bind_groups(plan: &Plan, caps: &Caps) -> Result<()> {
 /// Clause 1: every selected non-leaf node is at Launch — nothing skipped a level.
 pub(crate) fn check_levels(graph: &EGraph, plan: &Plan) -> Result<()> {
     for id in selected(plan) {
-        // The same predicate the seed and the move generator select against.
         if !realize::is_runnable(graph, id) {
             return Err(Error::Plan(format!(
                 "selected {id} is at {} but only Launch nodes are runnable",

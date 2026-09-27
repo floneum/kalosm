@@ -10,8 +10,7 @@ use fusor_ir::ir::launch::{SchedPoint, ScheduleDomain};
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-/// One concrete state change a [`Move`] can produce. A `Move` names the
-/// dimension; a `Candidate` names the value.
+/// One concrete state change a [`Move`] can produce.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) enum Candidate {
     Select { class: ClassId, node: Id },
@@ -104,12 +103,7 @@ pub(crate) struct SchedCache {
 }
 
 impl SchedCache {
-    pub(crate) fn new() -> Self {
-        Self::default()
-    }
-
-    /// Points of `id`'s domain, cheapest `node_math` first. The full domain
-    /// is always returned; ordering never gates.
+    /// Every point of `id`'s domain, cheapest `node_math` first.
     pub(crate) fn ordered(
         &mut self,
         graph: &EGraph,
@@ -128,8 +122,7 @@ impl SchedCache {
     }
 }
 
-/// Every move worth offering at this state, in a deterministic order:
-/// classes ascending, then nodes ascending.
+/// Every move worth offering, classes then nodes ascending.
 pub(crate) fn frontier(graph: &EGraph, selected: &[Id]) -> Vec<Move> {
     let mut out = Vec::new();
     let mut classes: Vec<_> = selected.iter().map(|id| graph.class_of(*id)).collect();

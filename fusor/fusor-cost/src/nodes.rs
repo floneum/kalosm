@@ -45,8 +45,7 @@ pub(crate) fn domain_of(graph: &EGraph, id: Id) -> Option<&ScheduleDomain> {
     }
 }
 
-/// `id`'s operands paired with their selected members; a composite names its
-/// members by id.
+/// `id`'s operands with their selected members; a composite's are by id.
 pub(crate) fn resolved_children<'a>(
     graph: &'a EGraph,
     ex: &'a Extraction,
@@ -138,16 +137,14 @@ impl Tiling {
     }
 }
 
-/// Lanes of a one-column sgemv workgroup: `subgroups` subgroups, capped by
-/// the device.
+/// Lanes of a one-column sgemv workgroup, capped by the device.
 pub(crate) fn sgemv_block(p: SgemvParams, caps: &Caps) -> u32 {
     (p.subgroups.max(1) * caps.subgroup_width())
         .min(caps.limits.max_compute_invocations_per_workgroup)
         .max(1)
 }
 
-/// Lanes one sgemv output reduces k across: a subgroup per column, else the
-/// block.
+/// Lanes one sgemv output reduces k across: a subgroup, else the block.
 pub(crate) fn sgemv_lanes(p: SgemvParams, caps: &Caps) -> u32 {
     if p.cols > 1 {
         caps.subgroup_width()

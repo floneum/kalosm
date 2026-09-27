@@ -24,7 +24,6 @@ pub struct ReplayCache {
     entries: Mutex<Lru>,
 }
 
-/// The architecture document's name for the same type.
 pub type ReplayMemo = ReplayCache;
 
 /// Entries, most recently used last.
@@ -131,18 +130,6 @@ impl ReplayCache {
         let plan = Arc::new(fresh);
         self.entries.lock().insert(key, Arc::clone(&plan));
         Ok((plan, unchanged))
-    }
-
-    pub fn clear(&self) {
-        self.entries.lock().0.clear();
-    }
-
-    pub fn len(&self) -> usize {
-        self.entries.lock().0.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len() == 0
     }
 
     fn newest_hash(&self) -> Option<PlanHash> {

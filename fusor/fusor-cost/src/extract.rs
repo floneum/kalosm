@@ -43,14 +43,6 @@ impl LocalSearch {
         Self { arena, caps }
     }
 
-    pub fn caps(&self) -> &Caps {
-        &self.caps
-    }
-
-    pub fn arena(&self) -> &Arc<dyn ArenaPlanner> {
-        &self.arena
-    }
-
     fn search<'a>(
         &'a self,
         graph: &'a EGraph,
@@ -310,20 +302,12 @@ impl Search<'_> {
             .realized
             .components
             .iter()
-            .filter(|component| {
-                reused.get(&graph.class_of(component.root)) != Some(&component.root)
-            })
-            .map(|component| graph.class_of(component.root))
+            .map(|c| (graph.class_of(c.root), c.root))
+            .filter(|(class, root)| reused.get(class) != Some(root))
+            .map(|(class, _)| class)
             .collect();
         let ordinary = |id| matches!(graph.node(id).op, Op::Launch(_)) && !is_composite(graph, id);
-        let inputs = |id: Id| -> Vec<ClassId> {
-            graph
-                .node(id)
-                .children
-                .iter()
-                .map(|child| graph.class_of(*child))
-                .collect()
-        };
+        let inputs = |id: Id| graph.node(id).children.iter().map(|c| graph.class_of(*c));
         for class in classes {
             let mut members = realize::selectable(graph, class, self.caps);
             members.sort_by_key(|member| (order_costs[member.index()], *member));
@@ -344,7 +328,7 @@ impl Search<'_> {
                 let same_inputs = component.members.as_slice() == [current]
                     && ordinary(current)
                     && ordinary(candidate)
-                    && inputs(current) == inputs(candidate);
+                    && inputs(current).eq(inputs(candidate));
                 let mut trail = Trail::default();
                 trail.select(&mut at.ex, class, candidate);
                 // A same-inputs swap is screened on its own launch first.
@@ -384,7 +368,7 @@ impl Search<'_> {
         cache: &mut NodeCache,
         trace: &mut SearchTrace,
     ) {
-        let mut sched = SchedCache::new();
+        let mut sched = SchedCache::default();
         'search: loop {
             let mut improved = false;
             for mv in moves::frontier(self.graph, &at.realized.order) {
