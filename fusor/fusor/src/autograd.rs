@@ -428,14 +428,7 @@ macro_rules! same_scalar {
 }
 
 same_scalar!(
-    add_scalar,
-    sub_scalar,
-    mul_scalar,
-    div_scalar,
-    pow_scalar,
-    max_scalar,
-    min_scalar,
-    lte_scalar,
+    add_scalar, sub_scalar, mul_scalar, div_scalar, pow_scalar, max_scalar, min_scalar, lte_scalar,
     gte_scalar,
 );
 

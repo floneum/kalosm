@@ -58,6 +58,34 @@ struct FixedState {
     sym_name: String,
 }
 
+impl FixedState {
+    /// The `u32` write slots of the next `added` tokens, as bytes: a ring
+    /// wraps at its window.
+    fn slots(&self, added: u64) -> Vec<u8> {
+        (0..added)
+            .flat_map(|i| {
+                let abs = self.len + i;
+                let slot = match self.window {
+                    Some(w) => abs % w,
+                    None => abs,
+                };
+                u32::try_from(slot)
+                    .expect("capacity fits a u32")
+                    .to_le_bytes()
+            })
+            .collect()
+    }
+
+    /// Count `added` more tokens and return the readable length.
+    fn advance(&mut self, added: u64) -> u64 {
+        self.len += added;
+        match self.window {
+            Some(w) => self.len.min(w),
+            None => self.len,
+        }
+    }
+}
+
 /// A growable append-only tensor cache along one axis.
 ///
 /// `R` is the rank of the values it holds and `T` their element type.
@@ -86,19 +114,16 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
     /// buffer and the current value is a symbolic-length narrow. `capacity`
     /// is the initial slot count; it grows by doubling when exceeded.
     pub fn fixed(axis: u32, capacity: u64) -> Self {
-        Self::fixed_named(axis, capacity, fresh_sym_name())
+        Self::fixed_named(axis, capacity, fresh_sym_name(), None)
     }
 
-    /// [`TensorCache::fixed`] with a caller-supplied length-symbol name;
-    /// two caches sharing one name share one symbol.
-    pub(crate) fn fixed_named(axis: u32, capacity: u64, sym_name: String) -> Self {
+    /// [`TensorCache::fixed`] with a caller-supplied length-symbol name (two
+    /// caches sharing one name share one symbol) and an optional ring window.
+    fn fixed_named(axis: u32, capacity: u64, sym_name: String, window: Option<u64>) -> Self {
         Self {
-            data: None,
-            axis,
-            len: Dim::Const(0),
             fixed: Some(FixedState {
                 capacity: capacity.max(1),
-                window: None,
+                window,
                 len: 0,
                 store: None,
                 out: None,
@@ -107,6 +132,7 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
                 sym: None,
                 sym_name,
             }),
+            ..Self::new(axis)
         }
     }
 
@@ -305,17 +331,6 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
             .clone()
             .unwrap_or_else(|| f.store.as_ref().expect("minted above").0.clone());
 
-        // Write positions for this chunk.
-        let positions: Vec<u32> = (0..added)
-            .map(|i| {
-                let abs = f.len + i;
-                let slot = match f.window {
-                    Some(w) => abs % w,
-                    None => abs,
-                };
-                u32::try_from(slot).expect("capacity fits a u32")
-            })
-            .collect();
         let idx = match f.idx.get(&added) {
             Some(t) => t.clone(),
             None => {
@@ -324,15 +339,10 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
                 t
             }
         };
-        idx.set_bytes(positions.iter().flat_map(|v| v.to_le_bytes()).collect())?;
+        idx.set_bytes(f.slots(added))?;
 
         let out = store.scatter_set(axis, &idx, value, true)?;
-        f.len += added;
-        let total = match f.window {
-            Some(w) => f.len.min(w),
-            None => f.len,
-        };
-        graph.bind_dim(sym, total);
+        graph.bind_dim(sym, f.advance(added));
 
         let view = readable(&out, axis, Dim::Sym(sym))?;
 
@@ -382,24 +392,8 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         let sym = f.sym.expect("checked by can_replay");
         let idx = f.idx.get(&added).cloned().expect("checked by can_replay");
 
-        let positions: Vec<u32> = (0..added)
-            .map(|i| {
-                let abs = f.len + i;
-                let slot = match f.window {
-                    Some(w) => abs % w,
-                    None => abs,
-                };
-                u32::try_from(slot).expect("capacity fits a u32")
-            })
-            .collect();
-        idx.set_bytes(positions.iter().flat_map(|v| v.to_le_bytes()).collect())?;
-
-        f.len += added;
-        let total = match f.window {
-            Some(w) => f.len.min(w),
-            None => f.len,
-        };
-        out.graph().bind_dim(sym, total);
+        idx.set_bytes(f.slots(added))?;
+        out.graph().bind_dim(sym, f.advance(added));
         f.out = Some(out);
         self.len = Dim::Sym(sym);
         view.clear_device_buf();
@@ -619,25 +613,20 @@ impl<const R: usize, T: Element> KvCache<R, T> {
     /// Both halves share one length symbol: attention contracts K's and V's
     /// length axes against each other.
     pub fn with_capacity(axis: u32, capacity: u64) -> Self {
-        let name = fresh_sym_name();
-        Self {
-            k: TensorCache::fixed_named(axis, capacity, name.clone()),
-            v: TensorCache::fixed_named(axis, capacity, name),
-        }
+        Self::fixed_pair(axis, capacity, None)
     }
 
     /// Ring of the newest `window` tokens.
     pub fn windowed(axis: u32, window: u64) -> Self {
+        Self::fixed_pair(axis, window.max(1), Some(window.max(1)))
+    }
+
+    fn fixed_pair(axis: u32, capacity: u64, window: Option<u64>) -> Self {
         let name = fresh_sym_name();
-        let mut k = TensorCache::fixed_named(axis, window.max(1), name.clone());
-        let mut v = TensorCache::fixed_named(axis, window.max(1), name);
-        if let Some(f) = k.fixed.as_mut() {
-            f.window = Some(window.max(1));
+        Self {
+            k: TensorCache::fixed_named(axis, capacity, name.clone(), window),
+            v: TensorCache::fixed_named(axis, capacity, name, window),
         }
-        if let Some(f) = v.fixed.as_mut() {
-            f.window = Some(window.max(1));
-        }
-        Self { k, v }
     }
 
     /// Whether appends write into preallocated storage.
@@ -691,14 +680,6 @@ impl<const R: usize, T: Element> KvCache<R, T> {
         }
     }
 
-    /// Adopt both halves' resolved outputs. Call once per step, after the
-    /// resolve that included [`KvCache::pending_into`]'s tensors.
-    #[track_caller]
-    pub fn commit(&mut self) {
-        self.k.commit();
-        self.v.commit();
-    }
-
     /// Append one step's keys and values; returns the full cached pair.
     #[track_caller]
     pub fn append(&mut self, k: &Tensor<R, T>, v: &Tensor<R, T>) -> (Tensor<R, T>, Tensor<R, T>) {
@@ -721,31 +702,10 @@ impl<const R: usize, T: Element> KvCache<R, T> {
         self.k.keep_last(len).zip(self.v.keep_last(len))
     }
 
-    /// Keep the first `len` entries of both committed fixed caches.
-    pub fn truncate(&mut self, len: u64) -> Result<()> {
-        self.k.truncate(len)?;
-        self.v.truncate(len)
-    }
-
-    /// Replace both cached values with detached leaves after they resolve.
-    pub fn detach(&mut self) {
-        self.k.detach();
-        self.v.detach();
-    }
-
     /// Whether [`KvCache::replay_append`] would rebuild the last append's nodes
     /// exactly. See [`TensorCache::can_replay`].
     pub fn can_replay(&self, added: u64) -> bool {
         self.k.can_replay(added) && self.v.can_replay(added)
-    }
-
-    /// Advance both halves without touching the graph. See
-    /// [`TensorCache::replay_append`]; the caller must have checked
-    /// [`KvCache::can_replay`], which covers both halves so neither can half-
-    /// advance.
-    pub fn replay_append(&mut self, added: u64) -> Result<()> {
-        self.k.replay_append(added)?;
-        self.v.replay_append(added)
     }
 
     /// The cached keys, or `None` before the first append.
@@ -768,12 +728,45 @@ impl<const R: usize, T: Element> KvCache<R, T> {
     pub fn is_empty(&self) -> bool {
         self.k.is_empty()
     }
+}
 
+/// [`KvCache`] methods that apply the [`TensorCache`] one to both halves,
+/// keys first; a fallible one stops at the first error.
+macro_rules! both_halves {
+    ($($(#[$m:meta])* fn $name:ident($($a:ident: $t:ty),*) $(-> $ret:ty)?;)*) => {
+        impl<const R: usize, T: Element> KvCache<R, T> {$(
+            $(#[$m])*
+            pub fn $name(&mut self, $($a: $t),*) $(-> $ret)? {
+                both_halves!(@call self $name ($($a),*) $($ret)?)
+            }
+        )*}
+    };
+    (@call $s:ident $name:ident ($($a:ident),*)) => {{
+        $s.k.$name($($a),*);
+        $s.v.$name($($a),*);
+    }};
+    (@call $s:ident $name:ident ($($a:ident),*) $ret:ty) => {{
+        $s.k.$name($($a),*)?;
+        $s.v.$name($($a),*)
+    }};
+}
+
+both_halves! {
+    /// Adopt both halves' resolved outputs. Call once per step, after the
+    /// resolve that included [`KvCache::pending_into`]'s tensors.
+    #[track_caller]
+    fn commit();
+    /// Keep the first `len` entries of both committed fixed caches.
+    fn truncate(len: u64) -> Result<()>;
+    /// Replace both cached values with detached leaves after they resolve.
+    fn detach();
+    /// Advance both halves without touching the graph. See
+    /// [`TensorCache::replay_append`]; the caller must have checked
+    /// [`KvCache::can_replay`], which covers both halves so neither can
+    /// half-advance.
+    fn replay_append(added: u64) -> Result<()>;
     /// Clear both halves while retaining reusable fixed buffers.
-    pub fn reset(&mut self) {
-        self.k.reset();
-        self.v.reset();
-    }
+    fn reset();
 }
 
 #[cfg(all(test, feature = "cpu"))]
@@ -782,13 +775,8 @@ mod tests {
     use crate::Device;
 
     fn device() -> Device {
-        if std::env::var_os("FUSOR_CONFORMANCE_REQUIRE_GPU").is_some() {
-            #[cfg(feature = "gpu")]
-            return Device::gpu_blocking().expect("GPU backend required");
-            #[cfg(not(feature = "gpu"))]
-            panic!("GPU feature required");
-        }
-        Device::try_cpu().unwrap()
+        let session = crate::Session::new(crate::session::test_backend()).unwrap();
+        Device::of_graph(crate::Graph::new(&session).handle())
     }
 
     fn commit(device: &Device, caches: &mut [KvCache<3>]) {

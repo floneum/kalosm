@@ -3,7 +3,7 @@
 use fusor_gguf::VarBuilder;
 use smallvec::SmallVec;
 
-use crate::device::ok;
+use crate::device::{fail, ok};
 use crate::tensor::typed::Element;
 use crate::{Result, Tensor};
 
@@ -68,13 +68,7 @@ impl<const W: usize, T: Element> ConvNd<W, T> {
             weight,
             "a conv weight is [out_ch, in_ch / groups, ...kernel]",
         )?;
-        let bias = if bias {
-            let b = crate::layers::load_dense(vb, graph, "bias")?;
-            let b = crate::layers::as_vector(b, "bias")?;
-            Some(crate::layers::as_typed::<1, T>(b, "bias")?)
-        } else {
-            None
-        };
+        let bias = crate::layers::load_bias(vb, graph, bias)?;
         Ok(Self::new(weight, bias))
     }
 
@@ -87,11 +81,11 @@ impl<const W: usize, T: Element> ConvNd<W, T> {
     pub fn forward<const R: usize>(&self, x: &Tensor<R, T>) -> Tensor<R, T> {
         let spatial = match W.checked_sub(2) {
             Some(s) => s,
-            None => ok(
+            None => fail(
                 "ConvNd::forward",
-                Err(crate::Error::Shape(format!(
+                crate::Error::Shape(format!(
                     "a conv weight is [out_ch, in_ch / groups, ...kernel]; got rank {W}"
-                ))),
+                )),
             ),
         };
         for (what, v) in [
@@ -100,12 +94,12 @@ impl<const W: usize, T: Element> ConvNd<W, T> {
             ("dilation", &self.dilation),
         ] {
             if v.len() != spatial {
-                ok::<()>(
+                fail(
                     "ConvNd::forward",
-                    Err(crate::Error::Shape(format!(
+                    crate::Error::Shape(format!(
                         "a {spatial}-d convolution needs {spatial} {what} entries, got {}",
                         v.len()
-                    ))),
+                    )),
                 );
             }
         }

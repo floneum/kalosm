@@ -21,7 +21,8 @@ fn custom_backward_preserves_broadcast_reduction_and_loss_scaling() {
         ));
         let quantized = weight.raw().gte_scalar(0.5) - weight.raw().lte_scalar(-0.5);
         let slot = weight.slot();
-        let quantized = graph.constant(quantized)
+        let quantized = graph
+            .constant(quantized)
             .with_backwards([weight.parent()], move |gradient| {
                 Ok(vec![BackwardTarget::to(slot, gradient)])
             });

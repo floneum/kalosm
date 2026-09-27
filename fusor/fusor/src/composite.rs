@@ -67,7 +67,11 @@ pub(crate) fn index_leaf(graph: &GraphRef, values: &[u32]) -> Result<Id> {
 }
 
 /// A rank-1 float leaf holding `values` encoded at `dtype`.
-pub(crate) fn float_leaf(graph: &GraphRef, dtype: fusor_ir::dtype::Dtype, values: &[f32]) -> Result<Id> {
+pub(crate) fn float_leaf(
+    graph: &GraphRef,
+    dtype: fusor_ir::dtype::Dtype,
+    values: &[f32],
+) -> Result<Id> {
     let bytes = crate::tensor::construction::encode_f32(dtype, values);
     graph.constant_leaf(dtype, &[Dim::Const(values.len() as u64)], bytes)
 }

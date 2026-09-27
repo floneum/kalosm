@@ -53,7 +53,7 @@ impl Tensor {
         let t = leaf_buffer_node(graph, dtype, shape)?;
         let persistence = graph.facts(t.id).persistence;
         let buf = graph.session().device().upload(data, persistence)?;
-        graph.set_device_buf(t.id, buf);
+        graph.bind_leaf(t.id, buf, None);
         Ok(t)
     }
 

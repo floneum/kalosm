@@ -9,7 +9,7 @@ use fusor_ir::dtype::Dtype;
 use fusor_ir::shape::Dim;
 
 use crate::composite::rope::base_inverse_frequency;
-use crate::device::ok;
+use crate::device::fail;
 use crate::graph::Graph;
 use crate::tensor::Dyn;
 use crate::tensor::typed::Element;
@@ -90,13 +90,13 @@ impl<T: Element> RopeCache<T> {
     #[track_caller]
     pub fn slice(&self, offset: u64, len: u64) -> (Tensor<2, T>, Tensor<2, T>) {
         if offset + len > self.rows {
-            ok::<()>(
+            fail(
                 "RopeCache::slice",
-                Err(Error::Shape(format!(
+                Error::Shape(format!(
                     "rope rows {offset}..{} exceed the {}-row table; call ensure first",
                     offset + len,
                     self.rows
-                ))),
+                )),
             );
         }
         (

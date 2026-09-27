@@ -49,15 +49,8 @@ impl Session {
         base: Arc<Plan>,
         values: &[Tensor],
     ) -> Result<Arc<Plan>> {
-        {
-            let g = graph.state().egraph.lock();
-            if base.launches.iter().any(|l| {
-                l.members
-                    .iter()
-                    .any(|m| g.semantics().effect(&g.node(*m).op) != Effect::Pure)
-            }) {
-                return Ok(base);
-            }
+        if has_in_place_launch(graph, &base) {
+            return Ok(base);
         }
         let read = || -> Result<Vec<(Dtype, Vec<u8>)>> {
             values
@@ -118,6 +111,51 @@ impl Session {
             )));
         }
         Ok(base)
+    }
+}
+
+impl Session {
+    /// `FUSOR_VERIFY_FAMILIES`: plan a shape-family member concretely and
+    /// compare every output byte-for-byte with what its twin produced. A twin
+    /// computing something its member does not is a symbolic-lowering bug.
+    pub(super) fn verify_family(
+        &self,
+        resolving: &ResolveGuard<'_>,
+        graph: &GraphRef,
+        values: &[Tensor],
+        key: FamilyKey,
+    ) -> Result<()> {
+        let mut from_twin = Vec::with_capacity(values.len());
+        for value in values {
+            from_twin.push(self.read_bytes_locked(resolving, graph, value.id)?);
+            graph.clear_class_device_buf(value.id);
+        }
+        let saved = self.inner.families.lock().remove(&key);
+        self.resolve_locked(resolving, values)?;
+        if let Some(saved) = saved {
+            self.inner.families.lock().insert(key, saved);
+        }
+        for (o, (value, twin_bytes)) in values.iter().zip(&from_twin).enumerate() {
+            let concrete = self.read_bytes_locked(resolving, graph, value.id)?;
+            let dtype = graph.facts(value.id).dtype;
+            if !agrees(dtype, &concrete, twin_bytes) {
+                let detail = first_mismatch(dtype, &concrete, twin_bytes)
+                    .map_or_else(String::new, |(i, p, q, w)| {
+                        format!(" (elem {i}: concrete {p} vs twin {q}, worst |d| {w})")
+                    });
+                return Err(Error::Plan(format!(
+                    "shape family twin disagrees with its member on output {o} ({} vs {} \
+                     bytes){detail}",
+                    concrete.len(),
+                    twin_bytes.len()
+                )));
+            }
+        }
+        eprintln!(
+            "[verify] shape family twin agrees on {} output(s)",
+            values.len()
+        );
+        Ok(())
     }
 }
 

@@ -7,8 +7,8 @@
 //! reading garbage.
 
 use fusor::composite::{
-    attention, attention_causal, attention_grads, attention_lse, attention_masked,
-    RopeLayout, RopePos, attention_with_lse, base_inverse_frequency, rope, rope_pair, rotate_half,
+    RopeLayout, RopePos, attention, attention_causal, attention_grads, attention_lse,
+    attention_masked, attention_with_lse, base_inverse_frequency, rope, rope_pair, rotate_half,
 };
 use fusor::graph::GraphRef;
 use fusor::tensor::Dyn as Tensor;
@@ -649,15 +649,7 @@ pub fn cases() -> Cases {
         "rope_interleaved",
         ROPE_SPEC,
         async move |s: &Session, shape: &[u64], seed: u32| {
-            rope_case(
-                s,
-                seed,
-                "rope_interleaved",
-                rope_dims(shape),
-                true,
-                0,
-            )
-            .await
+            rope_case(s, seed, "rope_interleaved", rope_dims(shape), true, 0).await
         },
     ));
     cases.push_case(fuzz_case(
@@ -668,15 +660,7 @@ pub fn cases() -> Cases {
             // The offset is sampled apart from the shape stream, and nonzero
             // so the case never degenerates into plain `rope`.
             let offset = Rng::new(seed ^ 0x5eed).range(1, 6);
-            rope_case(
-                s,
-                seed,
-                "rope_offset",
-                rope_dims(shape),
-                false,
-                offset,
-            )
-            .await
+            rope_case(s, seed, "rope_offset", rope_dims(shape), false, offset).await
         },
     ));
     cases.push_case(fuzz_case(
@@ -692,14 +676,7 @@ pub fn cases() -> Cases {
         "rope_interleaved_pair",
         ROPE_SPEC,
         async move |s: &Session, shape: &[u64], seed: u32| {
-            rope_pair_case(
-                s,
-                seed,
-                "rope_interleaved_pair",
-                rope_dims(shape),
-                true,
-            )
-            .await
+            rope_pair_case(s, seed, "rope_interleaved_pair", rope_dims(shape), true).await
         },
     ));
     cases.push_case(fuzz_case(
@@ -707,14 +684,8 @@ pub fn cases() -> Cases {
         "rope_pair_with_position",
         ROPE_SPEC,
         async move |s: &Session, shape: &[u64], seed: u32| {
-            rope_position_pair_case(
-                s,
-                seed,
-                "rope_pair_with_position",
-                rope_dims(shape),
-                false,
-            )
-            .await
+            rope_position_pair_case(s, seed, "rope_pair_with_position", rope_dims(shape), false)
+                .await
         },
     ));
     cases.push_case(fuzz_case(
@@ -737,14 +708,7 @@ pub fn cases() -> Cases {
         "rope_with_position",
         ROPE_SPEC,
         async move |s: &Session, shape: &[u64], seed: u32| {
-            rope_position_case(
-                s,
-                seed,
-                "rope_with_position",
-                rope_dims(shape),
-                false,
-            )
-            .await
+            rope_position_case(s, seed, "rope_with_position", rope_dims(shape), false).await
         },
     ));
     cases.push_case(fuzz_case(
@@ -1134,8 +1098,8 @@ async fn rope_case(
     let graph = graph_of(session);
     let (ct, st, cos, sin) = upload_tables(graph.handle(), d.dh, d.l + offset as usize)?;
     let x = upload(graph.handle(), &dims(&d.shape()), &x_data)?;
-    let y =
-        rope(&x, &ct, &st, layout(interleaved), RopePos::Offset(offset)).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
+    let y = rope(&x, &ct, &st, layout(interleaved), RopePos::Offset(offset))
+        .map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
     let expected = host_rope(&x_data, &cos, &sin, d, offset as usize, interleaved);
     expect_values(session, &d.shape(), Dtype::F32, &read(&y).await?, &expected).await?;
@@ -1157,8 +1121,8 @@ async fn rope_pair_case(
     let (ct, st, cos, sin) = upload_tables(graph.handle(), d.dh, d.l)?;
     let q = upload(graph.handle(), &dims(&d.shape()), &q_data)?;
     let k = upload(graph.handle(), &dims(&d.shape()), &k_data)?;
-    let (rq, rk) =
-        rope_pair(&q, &k, &ct, &st, layout(interleaved), RopePos::Offset(0)).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
+    let (rq, rk) = rope_pair(&q, &k, &ct, &st, layout(interleaved), RopePos::Offset(0))
+        .map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
     let want_q = host_rope(&q_data, &cos, &sin, d, 0, interleaved);
     let want_k = host_rope(&k_data, &cos, &sin, d, 0, interleaved);
@@ -1218,7 +1182,8 @@ async fn rope_position_case(
     let (ct, st, cos, sin) = upload_tables(graph.handle(), d.dh, max_len)?;
     let x = upload(graph.handle(), &dims(&d.shape()), &x_data)?;
     let p = from_u32(graph.handle(), &dims(&[d.l as u64]), &positions)?;
-    let y = rope(&x, &ct, &st, layout(interleaved), RopePos::Positions(&p)).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
+    let y = rope(&x, &ct, &st, layout(interleaved), RopePos::Positions(&p))
+        .map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
     let expected = host_rope_at(&x_data, &cos, &sin, &positions, d, interleaved);
     expect_values(session, &d.shape(), Dtype::F32, &read(&y).await?, &expected).await?;
@@ -1241,8 +1206,15 @@ async fn rope_position_pair_case(
     let q = upload(graph.handle(), &dims(&d.shape()), &q_data)?;
     let k = upload(graph.handle(), &dims(&d.shape()), &k_data)?;
     let p = from_u32(graph.handle(), &dims(&[d.l as u64]), &positions)?;
-    let (rq, rk) =
-        rope_pair(&q, &k, &ct, &st, layout(interleaved), RopePos::Positions(&p)).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
+    let (rq, rk) = rope_pair(
+        &q,
+        &k,
+        &ct,
+        &st,
+        layout(interleaved),
+        RopePos::Positions(&p),
+    )
+    .map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
     for (data, got) in [(&q_data, &rq), (&k_data, &rk)] {
         let expected = host_rope_at(data, &cos, &sin, &positions, d, interleaved);

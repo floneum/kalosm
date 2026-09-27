@@ -47,11 +47,9 @@ impl<T: Element> Embedding<T> {
     #[track_caller]
     pub fn forward<const R: usize, const O: usize>(&self, ids: &Tensor<R, u32>) -> Tensor<O, T> {
         if R == 0 {
-            crate::device::ok::<()>(
+            crate::device::fail(
                 "Embedding::forward",
-                Err(Error::Shape(
-                    "an embedding lookup needs at least a rank-1 index".into(),
-                )),
+                Error::Shape("an embedding lookup needs at least a rank-1 index".into()),
             );
         }
         self.table.embedding(ids)

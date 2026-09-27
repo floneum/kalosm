@@ -301,10 +301,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         if shape.len() != R {
             fail(
                 "Tensor::extents",
-                Error::Shape(format!(
-                    "extents: value has rank {}, not {R}",
-                    shape.len()
-                )),
+                Error::Shape(format!("extents: value has rank {}, not {R}", shape.len())),
             );
         }
         std::array::from_fn(|i| shape[i])

@@ -288,7 +288,7 @@ impl GraphRef {
                 self.clear_class_device_buf(id);
             }
         }
-        if std::env::var_os("FUSOR_REAP_DEBUG").is_some() {
+        if crate::session::flags().reap_debug {
             eprintln!(
                 "[reap] zombies {} (live handles {}, bound {})",
                 zombies.len(),
@@ -315,6 +315,24 @@ impl GraphRef {
             dtype,
             shape: shape.iter().copied().collect(),
         }))
+    }
+
+    /// A fresh block-quantized `[rows, cols]` leaf holding `bytes`.
+    pub(crate) fn quantized_leaf(
+        &self,
+        fmt: QFmt,
+        layout: QLayout,
+        shape: [Dim; 2],
+        bytes: Vec<u8>,
+    ) -> Result<Id> {
+        let id = self.add_logical(Logical::Leaf(LeafKind::Quantized {
+            name: self.fresh_buffer_id(),
+            fmt,
+            layout,
+            shape: shape.into_iter().collect(),
+        }))?;
+        self.set_leaf_bytes(id, bytes);
+        Ok(id)
     }
 
     /// An immutable rank-N leaf holding `bytes`, named by its content.
@@ -401,14 +419,13 @@ impl GraphRef {
                 &bytes,
                 &mut repacked,
             )?;
-            let id = self.add_logical(Logical::Leaf(LeafKind::Quantized {
-                name: self.fresh_buffer_id(),
+            let shape = [shape[0], shape[1]];
+            Ok(Some(self.quantized_leaf(
                 fmt,
-                layout: QLayout::F32Scales,
+                QLayout::F32Scales,
                 shape,
-            }))?;
-            self.set_leaf_bytes(id, repacked);
-            Ok(Some(id))
+                repacked,
+            )?))
         };
         let out = mint()?;
         self.state.repack_leaves.lock().insert(src, out);
@@ -453,32 +470,14 @@ impl GraphRef {
         self.state.symbols.lock().scalars.get(&sym).copied()
     }
 
-    /// Every `(sym, value)` runtime scalar declared so far.
+    /// Every `(sym, value)` runtime scalar declared so far, by symbol.
     pub(crate) fn uniform_scalars(&self) -> Vec<(SymId, f32)> {
-        let mut out: Vec<(SymId, f32)> = self
-            .state
-            .symbols
-            .lock()
-            .scalars
-            .iter()
-            .map(|(s, v)| (*s, *v))
-            .collect();
-        out.sort_by_key(|(s, _)| *s);
-        out
+        sorted(&self.state.symbols.lock().scalars)
     }
 
-    /// Every `(sym, extent)` dim binding declared so far.
+    /// Every `(sym, extent)` dim binding declared so far, by symbol.
     pub(crate) fn dim_bindings(&self) -> Vec<(SymId, u64)> {
-        let mut out: Vec<(SymId, u64)> = self
-            .state
-            .symbols
-            .lock()
-            .dims
-            .iter()
-            .map(|(s, v)| (*s, *v))
-            .collect();
-        out.sort_by_key(|(s, _)| *s);
-        out
+        sorted(&self.state.symbols.lock().dims)
     }
 
     /// Attach host bytes to an external leaf.
@@ -538,16 +537,7 @@ impl GraphRef {
             let g = self.state.egraph.lock();
             ids.iter()
                 .copied()
-                .filter(|id| {
-                    matches!(
-                        &g.node(*id).op,
-                        Op::Logical(Logical::Leaf(
-                            LeafKind::Buffer { .. }
-                                | LeafKind::Param { .. }
-                                | LeafKind::Quantized { .. }
-                        ))
-                    )
-                })
+                .filter(|id| is_external_leaf(&g.node(*id).op))
                 .collect()
         };
         let store = self.state.leaves.lock();
@@ -573,11 +563,6 @@ impl GraphRef {
         for m in members.iter() {
             store.device.remove(m);
         }
-    }
-
-    pub(crate) fn set_device_buf(&self, id: Id, buf: Buf) {
-        let mut store = self.state.leaves.lock();
-        store.device.insert(id, (buf, None));
     }
 
     #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
@@ -607,8 +592,6 @@ impl GraphRef {
         }
     }
 
-    /// Register each `(value, buffer, layout)` under every id of the value's
-    /// e-class, for the whole batch under one lock apiece.
     /// Every computed (non-leaf) value that currently carries a device
     /// buffer: what a later resolve may read as an input instead of
     /// recomputing.
@@ -626,6 +609,8 @@ impl GraphRef {
         self.state.leaves.lock().device.insert(id, (buf, layout));
     }
 
+    /// Register each `(value, buffer, layout)` under every id of the value's
+    /// e-class, for the whole batch under one lock apiece.
     pub(crate) fn bind_classes(&self, items: &[(Id, Buf, Option<Arc<fusor_ir::shape::Layout>>)]) {
         let classes: Vec<Arc<[Id]>> = {
             let mut g = self.state.egraph.lock();
@@ -793,13 +778,9 @@ impl Graph {
         shape: [Dim; 2],
         bytes: &[u8],
     ) -> Result<Tensor> {
-        let id = self.inner.add_logical(Logical::Leaf(LeafKind::Quantized {
-            name: self.inner.fresh_buffer_id(),
-            fmt,
-            layout,
-            shape: shape.into_iter().collect(),
-        }))?;
-        self.inner.set_leaf_bytes(id, bytes.to_vec());
+        let id = self
+            .inner
+            .quantized_leaf(fmt, layout, shape, bytes.to_vec())?;
         Ok(self.inner.tensor(id))
     }
 
@@ -948,6 +929,22 @@ impl Gradients {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+}
+
+fn sorted<V: Copy>(map: &FxHashMap<SymId, V>) -> Vec<(SymId, V)> {
+    let mut out: Vec<(SymId, V)> = map.iter().map(|(s, v)| (*s, *v)).collect();
+    out.sort_by_key(|(s, _)| *s);
+    out
+}
+
+/// Whether `op` is a leaf whose bytes the caller supplies.
+pub(crate) fn is_external_leaf(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::Logical(Logical::Leaf(
+            LeafKind::Buffer { .. } | LeafKind::Param { .. } | LeafKind::Quantized { .. }
+        ))
+    )
 }
 
 /// A parent declaration for a custom backward.

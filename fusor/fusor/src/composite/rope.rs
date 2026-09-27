@@ -295,7 +295,11 @@ mod tests {
         let table = tape.zeros_shaped(Dtype::F32, &[Dim::Const(131072), Dim::Const(64)])?;
         let expand = tape.zeros_shaped(Dtype::U32, &[Dim::Const(128)])?;
         let positions = tape.zeros_shaped(Dtype::U32, &[Dim::Const(3)])?;
-        for rows in [RopePos::Offset(0), RopePos::Offset(7), RopePos::Positions(positions)] {
+        for rows in [
+            RopePos::Offset(0),
+            RopePos::Offset(7),
+            RopePos::Positions(positions),
+        ] {
             let first = tape.graph().len();
             let result = table_rows(
                 &mut tape,

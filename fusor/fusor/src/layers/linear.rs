@@ -29,13 +29,7 @@ impl<T: Element> Linear<T> {
     pub fn load(vb: &VarBuilder, graph: &crate::graph::GraphRef, bias: bool) -> Result<Self> {
         let w = crate::layers::load_dense(vb, graph, "weight")?;
         let weight = crate::layers::as_typed::<2, T>(w, "a Linear weight is [out, in]")?;
-        let bias = if bias {
-            let b = crate::layers::load_dense(vb, graph, "bias")?;
-            let b = crate::layers::as_vector(b, "bias")?;
-            Some(crate::layers::as_typed::<1, T>(b, "bias")?)
-        } else {
-            None
-        };
+        let bias = crate::layers::load_bias(vb, graph, bias)?;
         Ok(Self { weight, bias })
     }
 

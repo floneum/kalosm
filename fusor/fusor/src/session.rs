@@ -59,13 +59,22 @@ const TUNE_MARGIN: f64 = 0.08;
 #[cfg(feature = "compiler-tests")]
 mod testing;
 #[cfg(feature = "compiler-tests")]
-use testing::{agrees, first_mismatch};
-#[cfg(feature = "compiler-tests")]
 pub use testing::{set_verify_members, verify_members, wrong_member_count};
 #[cfg(all(not(feature = "compiler-tests"), feature = "gpu"))]
 fn verify_members() -> bool {
     false
 }
+
+/// `eprintln!` behind one of the [`Flags`] switches.
+macro_rules! log_if {
+    ($flag:ident, $($arg:tt)*) => {
+        if $crate::session::flags().$flag {
+            eprintln!($($arg)*);
+        }
+    };
+}
+#[cfg(feature = "gpu")]
+pub(crate) use log_if;
 
 /// Proof that the holder owns a graph's `resolve_lock`.
 pub(crate) type ResolveGuard<'a> = parking_lot::MutexGuard<'a, ()>;
@@ -566,19 +575,8 @@ impl Session {
         resolving: &ResolveGuard<'_>,
         values: &[Tensor],
     ) -> Result<()> {
-        self.resolve_locked_plan(resolving, values).map(|_| ())
-    }
-
-    /// [`Self::resolve_locked`], also handing back the plan when the values
-    /// were planned and run here (`None` when a memo or a restatement ran
-    /// them instead).
-    fn resolve_locked_plan(
-        &self,
-        resolving: &ResolveGuard<'_>,
-        values: &[Tensor],
-    ) -> Result<Option<Arc<Plan>>> {
         if values.is_empty() {
-            return Ok(None);
+            return Ok(());
         }
         let graph = values[0].graph.clone();
         for v in values {
@@ -591,7 +589,7 @@ impl Session {
 
         // Every requested value already has a device buffer: nothing to plan.
         if values.iter().all(|v| graph.device_buf(v.id).is_some()) {
-            return Ok(None);
+            return Ok(());
         }
 
         // Release dead values before allocating a new execution's buffers.
@@ -624,13 +622,12 @@ impl Session {
         }
         let replays = self.replay_would_hit(&graph, values);
         if !replays && let Some(cut) = self.cut_at_bound(&graph, values)? {
-            if resolve_profile() {
-                eprintln!(
-                    "[profile] cut at bound values: {:?} -> {:?}",
-                    values.iter().map(|v| v.id).collect::<Vec<_>>(),
-                    cut.iter().map(|v| v.id).collect::<Vec<_>>()
-                );
-            }
+            log_if!(
+                resolve_profile,
+                "[profile] cut at bound values: {:?} -> {:?}",
+                values.iter().map(|v| v.id).collect::<Vec<_>>(),
+                cut.iter().map(|v| v.id).collect::<Vec<_>>()
+            );
             self.resolve_locked(resolving, &cut)?;
             for (value, root) in values.iter().zip(&cut) {
                 if let Some(buf) = graph.device_buf(root.id) {
@@ -638,7 +635,7 @@ impl Session {
                     graph.bind_classes(&[(value.id, buf, layout)]);
                 }
             }
-            return Ok(None);
+            return Ok(());
         }
 
         // Inference frontends rebuild the same expression with fresh
@@ -657,14 +654,14 @@ impl Session {
             && let Some(term) = {
                 let roots: Vec<Id> = values.iter().map(|v| v.id).collect();
                 let term = canonical_family(&graph, &roots);
-                if resolve_profile() && term.is_none() {
+                if flags().resolve_profile && term.is_none() {
                     eprintln!("[profile] shape family: term not canonicalizable");
                 }
                 term
             }
             && self.family_step(resolving, &graph, values, term)?
         {
-            return Ok(None);
+            return Ok(());
         }
 
         let caps = self.caps();
@@ -784,24 +781,23 @@ impl Session {
             *graph.state().extraction_seed.lock() = Some(Arc::clone(&plan));
             #[cfg(feature = "compiler-tests")]
             self.inner.extractor.verify_plan(&g, &plan)?;
-            if resolve_profile() {
-                eprintln!(
-                    "[profile] saturate{} {} us ({} -> {} nodes), extract {} us (forward {} us), replay {}",
-                    if __skipped {
-                        " (skipped)"
-                    } else if __replayed {
-                        " (replayed)"
-                    } else {
-                        ""
-                    },
-                    __sat_us,
-                    __pre_nodes,
-                    g.len(),
-                    __t_rest.elapsed().as_micros(),
-                    __t_fwd.elapsed().as_micros(),
-                    if missed { "MISS" } else { "hit" },
-                );
-            }
+            log_if!(
+                resolve_profile,
+                "[profile] saturate{} {} us ({} -> {} nodes), extract {} us (forward {} us), replay {}",
+                if __skipped {
+                    " (skipped)"
+                } else if __replayed {
+                    " (replayed)"
+                } else {
+                    ""
+                },
+                __sat_us,
+                __pre_nodes,
+                g.len(),
+                __t_rest.elapsed().as_micros(),
+                __t_fwd.elapsed().as_micros(),
+                if missed { "MISS" } else { "hit" },
+            );
             (plan, roots, key, missed)
         };
 
@@ -837,7 +833,7 @@ impl Session {
         // Dumps the launch and incumbent signatures of the plan that actually
         // executes when `FUSOR_DUMP_EXEC` is set, once per distinct plan
         // hash.
-        if dump_exec() {
+        if flags().dump_exec {
             use std::collections::HashSet;
             use std::sync::{Mutex as StdMutex, OnceLock};
             static SEEN: OnceLock<StdMutex<HashSet<u128>>> = OnceLock::new();
@@ -868,13 +864,12 @@ impl Session {
             // clock drops (its drop clears the last profile).
             self.explore_record(sel);
         }
-        if resolve_profile() {
-            eprintln!(
-                "[profile] run {} us ({} launches)",
-                __t_run.elapsed().as_micros(),
-                launched
-            );
-        }
+        log_if!(
+            resolve_profile,
+            "[profile] run {} us ({} launches)",
+            __t_run.elapsed().as_micros(),
+            launched
+        );
         self.inner
             .launches
             .fetch_add(launched as u64, Ordering::Relaxed);
@@ -888,7 +883,7 @@ impl Session {
         }
         #[cfg(not(feature = "cpu"))]
         let _ = executable;
-        Ok(Some(plan))
+        Ok(())
     }
 
     /// Submit whatever is encoded without waiting.
@@ -1001,9 +996,11 @@ impl Session {
                     _ => id,
                 }
             } else if !is_root && !is_leaf && bound.contains(&id) && dense_bound(graph, id) {
-                if resolve_profile() {
-                    eprintln!("[profile]   cutting {id} ({:?})", node.op.tag());
-                }
+                log_if!(
+                    resolve_profile,
+                    "[profile]   cutting {id} ({:?})",
+                    node.op.tag()
+                );
                 let facts = g.facts(id).clone();
                 let leaf = g.add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
                     name: graph.fresh_buffer_id(),
@@ -1085,13 +1082,12 @@ impl Session {
                 blocked: false,
             });
             if is_new {
-                if resolve_profile() {
-                    eprintln!(
-                        "[profile] shape family: first sighting ({} slots, {} families)",
-                        term.consts.len(),
-                        fams.len()
-                    );
-                }
+                log_if!(
+                    resolve_profile,
+                    "[profile] shape family: first sighting ({} slots, {} families)",
+                    term.consts.len(),
+                    fams.len()
+                );
                 return Ok(false);
             }
             // These values are a recorded twin's own roots: plan them directly.
@@ -1110,13 +1106,12 @@ impl Session {
                     fam.concrete.remove(0);
                 }
                 fam.concrete.push(own_nodes());
-                if resolve_profile() {
-                    eprintln!(
-                        "[profile] shape family: new shape ({} of {} concrete)",
-                        fam.concrete.len(),
-                        CONCRETE_SHAPES
-                    );
-                }
+                log_if!(
+                    resolve_profile,
+                    "[profile] shape family: new shape ({} of {} concrete)",
+                    fam.concrete.len(),
+                    CONCRETE_SHAPES
+                );
                 return Ok(false);
             } else {
                 // Shapes keep changing: the symbolic twin. Slots that have
@@ -1155,9 +1150,7 @@ impl Session {
                     match self.build_twin(graph, &term, &fam.varying, &fam.group) {
                         Ok(twin) => fam.symbolic = Some(twin),
                         Err(err) => {
-                            if resolve_profile() {
-                                eprintln!("[profile] shape family blocked: {err}");
-                            }
+                            log_if!(resolve_profile, "[profile] shape family blocked: {err}");
                             fam.blocked = true;
                             fam.symbolic = None;
                             fam.concrete.push(own_nodes());
@@ -1205,9 +1198,10 @@ impl Session {
         // that fails is dropped.
         if let Err(err) = self.resolve_locked(resolving, &twin_values) {
             {
-                if resolve_profile() {
-                    eprintln!("[profile] shape family blocked at planning: {err}");
-                }
+                log_if!(
+                    resolve_profile,
+                    "[profile] shape family blocked at planning: {err}"
+                );
                 for root in &twin.roots {
                     graph.clear_class_device_buf(*root);
                 }
@@ -1240,51 +1234,16 @@ impl Session {
         }
         drop(bindings_scope);
         graph.bind_classes(&outputs);
-        if resolve_profile() {
-            eprintln!(
-                "[profile] shape family hit: {} ({} symbol(s), {} us)",
-                if symbolic { "symbolic" } else { "concrete" },
-                twin.syms.iter().flatten().count(),
-                __t.elapsed().as_micros()
-            );
-        }
-        // `FUSOR_VERIFY_FAMILIES`: also plan this member concretely and
-        // compare every output byte-for-byte. A twin computing something
-        // its member does not is a compiler bug in symbolic lowering.
+        log_if!(
+            resolve_profile,
+            "[profile] shape family hit: {} ({} symbol(s), {} us)",
+            if symbolic { "symbolic" } else { "concrete" },
+            twin.syms.iter().flatten().count(),
+            __t.elapsed().as_micros()
+        );
         #[cfg(feature = "compiler-tests")]
-        if verify_families() {
-            let mut from_twin = Vec::with_capacity(values.len());
-            for value in values {
-                from_twin.push(self.read_bytes_locked(resolving, graph, value.id)?);
-                graph.clear_class_device_buf(value.id);
-            }
-            let saved = self.inner.families.lock().remove(&key);
-            self.resolve_locked(resolving, values)?;
-            if let Some(saved) = saved {
-                self.inner.families.lock().insert(key, saved);
-            }
-            for (o, (value, twin_bytes)) in values.iter().zip(&from_twin).enumerate() {
-                let concrete = self.read_bytes_locked(resolving, graph, value.id)?;
-                let dtype = graph.facts(value.id).dtype;
-                if !agrees(dtype, &concrete, twin_bytes) {
-                    let detail = first_mismatch(dtype, &concrete, twin_bytes).map_or_else(
-                        String::new,
-                        |(i, p, q, w)| {
-                            format!(" (elem {i}: concrete {p} vs twin {q}, worst |d| {w})")
-                        },
-                    );
-                    return Err(Error::Plan(format!(
-                        "shape family twin disagrees with its member on output {o} ({} vs {} \
-                         bytes){detail}",
-                        concrete.len(),
-                        twin_bytes.len()
-                    )));
-                }
-            }
-            eprintln!(
-                "[verify] shape family twin agrees on {} output(s)",
-                values.len()
-            );
+        if flags().verify_families {
+            self.verify_family(resolving, graph, values, key)?;
         }
         Ok(true)
     }
@@ -1498,25 +1457,6 @@ impl Session {
         plan.extraction.selected(class).unwrap_or(id)
     }
 
-    /// Register `buf` under every id in `id`'s e-class, `Union` spine
-    /// included.
-    ///
-    /// A handle may name any member, including a union created by a rewrite.
-    fn bind_class(
-        &self,
-        graph: &GraphRef,
-        id: Id,
-        buf: &Buf,
-        layout: Option<&fusor_ir::shape::Layout>,
-    ) {
-        let members = {
-            let g = graph.state().egraph.lock();
-            g.class_ids(g.class_of(id))
-        };
-        let layout = layout.cloned().map(Arc::new);
-        graph.set_device_buf_class(&members, buf, layout.as_ref());
-    }
-
     fn run(
         &self,
         graph: &GraphRef,
@@ -1604,31 +1544,8 @@ impl Session {
             if !wanted.contains(&buffer.value) && !in_place_roots.contains(&buffer.value) {
                 continue;
             }
-            let elements = resolve_dim(buffer.elements, graph)?;
-            let bytes = (elements * buffer.dtype.byte_size()).max(4);
-            #[cfg(feature = "cpu")]
-            if self.inner.device.is_cpu()
-                && let Some(existing) = graph.device_buf(buffer.value)
-                && existing
-                    .downcast_ref::<fusor_cpu::AlignedBuf>()
-                    .is_some_and(|buf| buf.len() as u64 >= bytes)
-            {
-                supplied.insert(buffer.value, existing);
-                continue;
-            }
-            let buf = self
-                .inner
-                .device
-                .target()
-                .alloc(bytes, buffer.persistence)?;
-            // Only a requested value keeps its buffer bound to the graph. A
-            // launch root that is merely an intermediate of this resolve
-            // gets scratch that returns to the pool with the plan; binding
-            // it too would pin every intermediate of every resolve for the
-            // life of the graph — a 32-block vision tower held 22 GB of
-            // hidden states that way. A later read of an intermediate
-            // recomputes it.
-            if wanted.contains(&buffer.value) || in_place_roots.contains(&buffer.value) {
+            let (buf, fresh) = self.plan_buffer(graph, buffer)?;
+            if fresh {
                 to_bind.push((
                     buffer.value,
                     buf.clone(),
@@ -1656,7 +1573,7 @@ impl Session {
                     None => continue,
                 },
             };
-            self.bind_class(graph, *selected, &buf, None);
+            graph.bind_classes(&[(*selected, buf, None)]);
         }
 
         match &self.inner.device {
@@ -1692,6 +1609,33 @@ impl Session {
         }
     }
 
+    /// The buffer a plan buffer runs in, and whether it is freshly allocated:
+    /// on the CPU a value whose bound buffer is still large enough runs in
+    /// place.
+    fn plan_buffer(
+        &self,
+        graph: &GraphRef,
+        buffer: &fusor_ir::extract::BufferPlan,
+    ) -> Result<(Buf, bool)> {
+        let elements = resolve_dim(buffer.elements, graph)?;
+        let bytes = (elements * buffer.dtype.byte_size()).max(4);
+        #[cfg(feature = "cpu")]
+        if self.inner.device.is_cpu()
+            && let Some(existing) = graph.device_buf(buffer.value)
+            && existing
+                .downcast_ref::<fusor_cpu::AlignedBuf>()
+                .is_some_and(|buf| buf.len() as u64 >= bytes)
+        {
+            return Ok((existing, false));
+        }
+        let buf = self
+            .inner
+            .device
+            .target()
+            .alloc(bytes, buffer.persistence)?;
+        Ok((buf, true))
+    }
+
     /// The generic runner: one `lower -> emit -> launch` per plan launch, in
     /// plan order. The GPU takes `GpuTarget::resolve` instead, which adds the
     /// plan cache, the parallel build cohort and one encoder per resolve.
@@ -1711,17 +1655,8 @@ impl Session {
             if supplied.contains_key(&buffer.value) {
                 continue;
             }
-            let elements = resolve_dim(buffer.elements, graph)?;
-            let bytes = (elements * buffer.dtype.byte_size()).max(4);
-            if let Some(existing) = graph.device_buf(buffer.value)
-                && existing
-                    .downcast_ref::<fusor_cpu::AlignedBuf>()
-                    .is_some_and(|buf| buf.len() as u64 >= bytes)
-            {
-                supplied.insert(buffer.value, existing);
-                continue;
-            }
-            supplied.insert(buffer.value, target.alloc(bytes, buffer.persistence)?);
+            let (buf, _) = self.plan_buffer(graph, buffer)?;
+            supplied.insert(buffer.value, buf);
         }
 
         let executable = if let Some(cached) = cached {
@@ -1770,7 +1705,7 @@ impl Session {
             // lowering indexed the body against. When they disagree the
             // kernel silently computes a prefix of its output.
             target.launch(&launch.artifact, launch.grid, &binds, &uniforms)?;
-            if std::env::var_os("FUSOR_DEBUG_CPU_NAN").is_some() {
+            if flags().debug_cpu_nan {
                 let root = plan.launches[launch_ix].root;
                 if let Some(buffer) = supplied
                     .get(&root)
@@ -1866,7 +1801,7 @@ impl Session {
             bytes.extend_from_slice(&unit);
         }
         let buf = self.inner.device.upload(&bytes, facts.persistence)?;
-        graph.set_device_buf(id, buf.clone());
+        graph.bind_leaf(id, buf.clone(), None);
         Ok(Some(buf))
     }
 
@@ -1902,65 +1837,38 @@ impl Session {
         if verify_members() {
             return self.check_members(_guard, graph, roots, base, values);
         }
-        let min_macs = autotune_min_macs();
-        let log = std::env::var_os("FUSOR_AUTOTUNE_LOG").is_some();
+        let min_macs = flags().autotune_min_macs;
 
         // Timing a plan re-runs it, and an in-place node makes a re-run
         // destructive, so an impure plan is never raced. It is still tuned:
         // the production explorer substitutes one candidate exactly once, in
         // place of the incumbent's own dispatch.
-        {
-            let g = graph.state().egraph.lock();
-            if base.launches.iter().any(|l| {
-                l.members
-                    .iter()
-                    .any(|m| g.semantics().effect(&g.node(*m).op) != Effect::Pure)
-            }) {
-                if log {
-                    eprintln!("[tune] not raced: the plan has an in-place launch");
-                }
-                return Ok(base);
-            }
+        if has_in_place_launch(graph, &base) {
+            log_if!(
+                autotune_log,
+                "[tune] not raced: the plan has an in-place launch"
+            );
+            return Ok(base);
         }
 
         // One probe pass over the base plan. `launch_variants` holds the work
         // gate, so "every launch offered nothing" is "not worth tuning".
-        let probe: Vec<Vec<(String, Plan)>> = {
-            let g = graph.state().egraph.lock();
-            (0..base.launches.len())
-                .map(|ix| {
-                    self.inner.extractor.launch_variants(
-                        &g,
-                        roots,
-                        &base,
-                        ix,
-                        self.inner.cost.as_ref(),
-                        min_macs,
-                    )
-                })
-                .collect()
-        };
+        let probe: Vec<Vec<(String, Plan)>> = (0..base.launches.len())
+            .map(|ix| self.launch_variants(graph, roots, &base, ix, min_macs))
+            .collect();
         if probe.iter().all(Vec::is_empty) {
-            if log {
-                eprintln!(
-                    "[tune] not raced: no launch of {} offers a variant above {min_macs} macs",
-                    base.launches.len()
-                );
-            }
+            log_if!(
+                autotune_log,
+                "[tune] not raced: no launch of {} offers a variant above {min_macs} macs",
+                base.launches.len()
+            );
             return Ok(base);
         }
 
         // The plan's identity across processes: every launch signature in
         // order. A cached combination is only replayable onto the same plan
         // shape, so this is what it is keyed on.
-        let plan_sig: String = {
-            let g = graph.state().egraph.lock();
-            base.launches
-                .iter()
-                .map(|l| fusor_cost::extract::launch_signature(&g, l))
-                .collect::<Vec<_>>()
-                .join(";")
-        };
+        let plan_sig = launch_sigs(graph, &base).join(";");
         // A combination this machine has already raced to a verdict is
         // applied as recorded, not raced again: the race costs seconds per
         // plan shape (every candidate is built, compiled and timed several
@@ -1968,7 +1876,7 @@ impl Session {
         // every first transcription or embedding. Production sampling keeps
         // exploring from there. The member sweep must measure everything.
         if let Some(picks) = self.inner.tune.combo(&plan_sig)
-            && let Some(plan) = self.apply_combo(graph, roots, &base, &picks, min_macs, log)?
+            && let Some(plan) = self.apply_combo(graph, roots, &base, &picks, min_macs)?
         {
             return Ok(plan);
         }
@@ -1990,18 +1898,17 @@ impl Session {
         // differs from the incumbent at exactly one launch, so the launch's
         // own span — not the sum — is the term `TUNE_MARGIN` belongs on.
         let mut best_spans: Option<Vec<f64>> = reference.gpu_us.clone();
-        if log {
-            eprintln!(
-                "[tune] base {best_ns:.0} ns ({} ns wall), {} launches, {}",
-                reference.nanos,
-                best.launches.len(),
-                if reference.gpu_us.is_some() {
-                    "per-kernel gpu timestamps"
-                } else {
-                    "wall clock only"
-                }
-            );
-        }
+        log_if!(
+            autotune_log,
+            "[tune] base {best_ns:.0} ns ({} ns wall), {} launches, {}",
+            reference.nanos,
+            best.launches.len(),
+            if reference.gpu_us.is_some() {
+                "per-kernel gpu timestamps"
+            } else {
+                "wall clock only"
+            }
+        );
 
         for (ix, probed) in probe.into_iter().enumerate() {
             if probed.is_empty() {
@@ -2013,15 +1920,7 @@ impl Session {
             let variants = if Arc::ptr_eq(&best, &base) {
                 probed
             } else {
-                let g = graph.state().egraph.lock();
-                self.inner.extractor.launch_variants(
-                    &g,
-                    roots,
-                    &best,
-                    ix,
-                    self.inner.cost.as_ref(),
-                    min_macs,
-                )
+                self.launch_variants(graph, roots, &best, ix, min_macs)
             };
             // What this machine already knows about this launch decides where
             // the time goes: re-confirm a known incumbent, explore a bounded
@@ -2049,7 +1948,7 @@ impl Session {
                     // authoritative only once every candidate for the launch
                     // has been measured.
                     let (run, skipped) = self.inner.tune.plan_candidates(sig, &names);
-                    if log && !skipped.is_empty() {
+                    if flags().autotune_log && !skipped.is_empty() {
                         eprintln!(
                             "[tune]   L{ix} skipping {} variant(s) this device has \
                              already ruled out",
@@ -2090,18 +1989,17 @@ impl Session {
                         self.inner.tune.observe(sig, &label, ns);
                     }
                 }
-                if log {
-                    eprintln!(
-                        "[tune]   L{ix} {sample_ns:.0} ns  (own {} ns, {} ns wall)  {label}{}",
-                        launch_ns(&sample, ix).map_or_else(|| "-".to_string(), |ns| ns.to_string()),
-                        sample.nanos,
-                        if aligned {
-                            ""
-                        } else {
-                            "  PERTURBED: >1 launch differs"
-                        }
-                    );
-                }
+                log_if!(
+                    autotune_log,
+                    "[tune]   L{ix} {sample_ns:.0} ns  (own {} ns, {} ns wall)  {label}{}",
+                    launch_ns(&sample, ix).map_or_else(|| "-".to_string(), |ns| ns.to_string()),
+                    sample.nanos,
+                    if aligned {
+                        ""
+                    } else {
+                        "  PERTURBED: >1 launch differs"
+                    }
+                );
                 // Only launch `ix` differs, so the launch's own span is what
                 // `TUNE_MARGIN` applies to; on the plan sum, a launch under
                 // the margin fraction of the total could never be adopted.
@@ -2110,12 +2008,12 @@ impl Session {
                     (Some(prev), Some(now))
                         if aligned && prev.len() == now.len() && ix < prev.len() =>
                     {
-                        now[ix] < prev[ix] * (1.0 - TUNE_MARGIN)
+                        beats(now[ix], prev[ix])
                     }
                     // No device timer, or `replan` moved the launches: the
                     // whole-plan number is all there is, and is what the host
                     // clock always had.
-                    _ => sample_ns < best_ns * (1.0 - TUNE_MARGIN),
+                    _ => beats(sample_ns, best_ns),
                 };
                 if improved {
                     best_ns = sample_ns;
@@ -2139,9 +2037,7 @@ impl Session {
         // One write per tuning pass, atomic, and a no-op when nothing new was
         // measured — a fully-learned shape costs zero IO.
         self.inner.tune.save();
-        if log {
-            eprintln!("[tune] winner {best_ns:.0} ns");
-        }
+        log_if!(autotune_log, "[tune] winner {best_ns:.0} ns");
         let arena = graph.state().egraph.lock().arena_id();
         self.inner.device.release_candidates(arena, &raced, &best);
         Ok(best)
@@ -2159,7 +2055,6 @@ impl Session {
         base: &Arc<Plan>,
         picks: &[Option<String>],
         min_macs: u64,
-        log: bool,
     ) -> Result<Option<Arc<Plan>>> {
         if picks.len() != base.launches.len() {
             return Ok(None);
@@ -2170,23 +2065,12 @@ impl Session {
             let Some(name) = pick else {
                 continue;
             };
-            let variants = {
-                let g = graph.state().egraph.lock();
-                self.inner.extractor.launch_variants(
-                    &g,
-                    roots,
-                    &best,
-                    ix,
-                    self.inner.cost.as_ref(),
-                    min_macs,
-                )
-            };
+            let variants = self.launch_variants(graph, roots, &best, ix, min_macs);
             let Some((_, plan)) = variants.into_iter().find(|(n, _)| n == name) else {
-                if log {
-                    eprintln!(
-                        "[tune] recorded pick `{name}` for launch {ix} no longer exists; racing"
-                    );
-                }
+                log_if!(
+                    autotune_log,
+                    "[tune] recorded pick `{name}` for launch {ix} no longer exists; racing"
+                );
                 return Ok(None);
             };
             best = Arc::new(plan);
@@ -2197,13 +2081,32 @@ impl Session {
             let g = graph.state().egraph.lock();
             self.inner.extractor.verify_plan(&g, &best)?;
         }
-        if log {
-            eprintln!(
-                "[tune] applied the recorded combination: {applied} of {} launches substituted",
-                picks.len()
-            );
-        }
+        log_if!(
+            autotune_log,
+            "[tune] applied the recorded combination: {applied} of {} launches substituted",
+            picks.len()
+        );
         Ok(Some(best))
+    }
+
+    /// Launch `ix`'s alternatives in `plan`, under the graph lock.
+    fn launch_variants(
+        &self,
+        graph: &GraphRef,
+        roots: &[Id],
+        plan: &Plan,
+        ix: usize,
+        min_macs: u64,
+    ) -> Vec<(String, Plan)> {
+        let g = graph.state().egraph.lock();
+        self.inner.extractor.launch_variants(
+            &g,
+            roots,
+            plan,
+            ix,
+            self.inner.cost.as_ref(),
+            min_macs,
+        )
     }
 
     /// Run `plan` repeatedly and retain timings. No output readback or
@@ -2240,15 +2143,7 @@ impl Session {
 
     /// The device buffer of an external leaf, uploading it on first use.
     fn leaf_buffer(&self, graph: &GraphRef, id: Id) -> Result<Option<Buf>> {
-        let is_external = {
-            let g = graph.state().egraph.lock();
-            matches!(
-                &g.node(id).op,
-                Op::Logical(Logical::Leaf(
-                    LeafKind::Buffer { .. } | LeafKind::Param { .. } | LeafKind::Quantized { .. }
-                ))
-            )
-        };
+        let is_external = crate::graph::is_external_leaf(&graph.state().egraph.lock().node(id).op);
         if !is_external {
             return Ok(None);
         }
@@ -2266,42 +2161,65 @@ impl Session {
                 self.inner.device.target().alloc(bytes, facts.persistence)?
             }
         };
-        graph.set_device_buf(id, buf.clone());
+        graph.bind_leaf(id, buf.clone(), None);
         Ok(Some(buf))
     }
 }
 
-/// The launch-work gate below which nothing is measured, env-overridable.
-/// Shared by the cold race and the online explorer so "worth tuning" means
-/// one thing.
-pub(crate) fn autotune_min_macs() -> u64 {
-    std::env::var("FUSOR_AUTOTUNE_MIN_MACS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(AUTOTUNE_MIN_MACS)
+/// The process's `FUSOR_*` debugging and tuning switches, each read once:
+/// `resolve` is the hot path and an env lookup is a per-call allocation.
+pub(crate) struct Flags {
+    /// `FUSOR_RESOLVE_PROFILE`: per-resolve phase timings on stderr.
+    pub(crate) resolve_profile: bool,
+    /// `FUSOR_DUMP_EXEC`: the launch and incumbent signatures of each
+    /// distinct executed plan, to join a span profile to its kernels.
+    pub(crate) dump_exec: bool,
+    /// `FUSOR_NO_SAT_MEMO`: disable the saturation memo.
+    pub(crate) no_saturation_memo: bool,
+    /// `FUSOR_AUTOTUNE_LOG`: narrate the cold race and the explorer.
+    pub(crate) autotune_log: bool,
+    /// `FUSOR_DEBUG_CPU_NAN`: dump every CPU launch's output.
+    #[cfg(feature = "cpu")]
+    pub(crate) debug_cpu_nan: bool,
+    /// `FUSOR_REAP_DEBUG`: report retained dead buffers at each reap.
+    pub(crate) reap_debug: bool,
+    /// `FUSOR_AUTOTUNE_MIN_MACS`: the launch-work gate below which nothing
+    /// is measured, shared by the cold race and the explorer.
+    pub(crate) autotune_min_macs: u64,
+    /// `FUSOR_EXPLORE_EPS`: one in this many replay hits explores; `0` off.
+    #[cfg(feature = "gpu")]
+    pub(crate) explore_eps: u64,
+    /// `FUSOR_VERIFY_FAMILIES`: cross-check every shape-family hit against a
+    /// concrete plan of the same member.
+    #[cfg(feature = "compiler-tests")]
+    pub(crate) verify_families: bool,
 }
 
-/// Whether `FUSOR_RESOLVE_PROFILE` is set. Read once: `resolve` is the hot
-/// path and an env lookup per call is a per-resolve allocation.
-/// Whether `FUSOR_VERIFY_FAMILIES` is set: every shape-family hit is
-/// cross-checked against a concrete plan of the same member.
-#[cfg(feature = "compiler-tests")]
-fn verify_families() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FUSOR_VERIFY_FAMILIES").is_some())
-}
-
-fn resolve_profile() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FUSOR_RESOLVE_PROFILE").is_some())
-}
-
-/// Whether `FUSOR_DUMP_EXEC` is set. Prints the launch and incumbent
-/// signatures of each distinct executed plan, so a per-dispatch span profile
-/// can be joined to the kernel that actually ran.
-fn dump_exec() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FUSOR_DUMP_EXEC").is_some())
+pub(crate) fn flags() -> &'static Flags {
+    static FLAGS: std::sync::OnceLock<Flags> = std::sync::OnceLock::new();
+    FLAGS.get_or_init(|| {
+        let on = |name: &str| std::env::var_os(name).is_some();
+        let num = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        Flags {
+            resolve_profile: on("FUSOR_RESOLVE_PROFILE"),
+            dump_exec: on("FUSOR_DUMP_EXEC"),
+            no_saturation_memo: on("FUSOR_NO_SAT_MEMO"),
+            autotune_log: on("FUSOR_AUTOTUNE_LOG"),
+            #[cfg(feature = "cpu")]
+            debug_cpu_nan: on("FUSOR_DEBUG_CPU_NAN"),
+            reap_debug: on("FUSOR_REAP_DEBUG"),
+            autotune_min_macs: num("FUSOR_AUTOTUNE_MIN_MACS", AUTOTUNE_MIN_MACS),
+            #[cfg(feature = "gpu")]
+            explore_eps: num("FUSOR_EXPLORE_EPS", explore::EXPLORE_EPSILON),
+            #[cfg(feature = "compiler-tests")]
+            verify_families: on("FUSOR_VERIFY_FAMILIES"),
+        }
+    })
 }
 
 /// `op` over `children`, with every extent-carrying field passed through
@@ -2486,9 +2404,11 @@ fn canonicalize(graph: &GraphRef, roots: &[Id], abstract_consts: bool) -> Option
             other => match rebuild_op(other, &children, &mut slot) {
                 Some(op) => op,
                 None => {
-                    if resolve_profile() {
-                        eprintln!("[profile]   not canonicalizable: {id} is {:?}", other.tag());
-                    }
+                    log_if!(
+                        resolve_profile,
+                        "[profile]   not canonicalizable: {id} is {:?}",
+                        other.tag()
+                    );
                     return None;
                 }
             },
@@ -2527,11 +2447,6 @@ fn dims_hash(graph: &GraphRef) -> u64 {
     h.finish()
 }
 
-fn saturation_memo_disabled() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FUSOR_NO_SAT_MEMO").is_some())
-}
-
 /// Recorded saturations, bounded and FIFO-evicted.
 ///
 /// [`EGraph::replay_saturation`] checks the whole pre-state by value, so this
@@ -2552,7 +2467,7 @@ impl SaturationMemo {
     /// Replay a recording onto `graph` if one was taken against exactly this
     /// pre-state. `false` means the caller must saturate for real.
     fn replay(&self, graph: &mut EGraph) -> bool {
-        if saturation_memo_disabled() {
+        if flags().no_saturation_memo {
             return false;
         }
         // Cloned out of the lock: `replay_saturation` needs `&mut EGraph`
@@ -2587,6 +2502,32 @@ impl SaturationMemo {
     }
 }
 
+/// `launch_signature` per launch of `plan`, plan order.
+fn launch_sigs(graph: &GraphRef, plan: &Plan) -> Vec<String> {
+    let g = graph.state().egraph.lock();
+    plan.launches
+        .iter()
+        .map(|l| fusor_cost::extract::launch_signature(&g, l))
+        .collect()
+}
+
+/// Whether any launch of `plan` writes through an operand: re-running such a
+/// plan is destructive, so it is never raced.
+fn has_in_place_launch(graph: &GraphRef, plan: &Plan) -> bool {
+    let g = graph.state().egraph.lock();
+    plan.launches.iter().any(|l| {
+        l.members
+            .iter()
+            .any(|m| g.semantics().effect(&g.node(*m).op) != Effect::Pure)
+    })
+}
+
+/// Whether `a` improves on `b` by more than [`TUNE_MARGIN`]: the hysteresis
+/// every adoption, cold or online, is held to.
+fn beats(a: f64, b: f64) -> bool {
+    a < b * (1.0 - TUNE_MARGIN)
+}
+
 /// One candidate's timing measurements.
 struct TuneSample {
     /// Wall clock around the whole `run`, in nanoseconds. Includes buffer
@@ -2604,6 +2545,14 @@ struct TuneSample {
 /// that guarantee: a launch is its root *and* its members, grid and block. A
 /// candidate that fails this is compared at whole-plan granularity instead.
 fn plans_align(candidate: &Plan, incumbent: &Plan, ix: usize) -> bool {
+    aligned_except(candidate, incumbent, |j| j == ix)
+}
+
+/// Whether `candidate` matches `incumbent` launch for launch everywhere
+/// `swapped` does not name: same root, grid, block and member *set* (member
+/// order is a realization detail; `launch_signature` sorts for the same
+/// reason).
+fn aligned_except(candidate: &Plan, incumbent: &Plan, swapped: impl Fn(usize) -> bool) -> bool {
     candidate.launches.len() == incumbent.launches.len()
         && candidate
             .launches
@@ -2611,11 +2560,8 @@ fn plans_align(candidate: &Plan, incumbent: &Plan, ix: usize) -> bool {
             .zip(&incumbent.launches)
             .enumerate()
             .all(|(j, (c, b))| {
-                j == ix
+                swapped(j)
                     || (c.root == b.root && c.grid == b.grid && c.block == b.block && {
-                        // Member *order* is a realization detail —
-                        // `launch_signature` sorts for the same reason —
-                        // but the member set is the work.
                         let mut cm: Vec<Id> = c.members.to_vec();
                         let mut bm: Vec<Id> = b.members.to_vec();
                         cm.sort_unstable();
@@ -2623,21 +2569,6 @@ fn plans_align(candidate: &Plan, incumbent: &Plan, ix: usize) -> bool {
                         cm == bm
                     })
             })
-}
-
-/// [`plans_align`] over a *set* of swapped launches: `candidate` must differ
-/// from `incumbent` at most at the swapped indices — the check a batched
-/// prior adoption holds its composed replan to before trusting per-launch
-/// windows measured against single swaps.
-#[cfg(feature = "gpu")]
-fn batch_aligns(candidate: &Plan, incumbent: &Plan, swaps: &[(usize, String)]) -> bool {
-    candidate.launches.len() == incumbent.launches.len()
-        && candidate
-            .launches
-            .iter()
-            .zip(&incumbent.launches)
-            .enumerate()
-            .all(|(j, (c, b))| swaps.iter().any(|(s, _)| *s == j) || launch_key(c) == launch_key(b))
 }
 
 /// One launch's identity for plan diffing, hashed: the same fields
@@ -2898,1139 +2829,18 @@ fn resolve_elements(shape: &[Dim], graph: &GraphRef) -> Result<u64> {
     Ok(acc.max(1))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::graph::Graph;
-
-    #[test]
-    #[cfg(all(feature = "cpu", not(target_arch = "wasm32")))]
-    fn streamed_reductions_execute_without_the_producer_buffer() {
-        use fusor_cost::realize::NodeCache;
-        use fusor_ir::extract::Extraction;
-        use fusor_ir::ir::launch::Launch;
-
-        let backend = if std::env::var_os("FUSOR_CONFORMANCE_REQUIRE_GPU").is_some() {
-            #[cfg(feature = "gpu")]
-            {
-                Backend::gpu_blocking().expect("GPU backend required")
-            }
-            #[cfg(not(feature = "gpu"))]
-            {
-                panic!("GPU feature required")
-            }
-        } else {
-            Backend::cpu().unwrap()
-        };
-        let session = Session::new(backend).unwrap();
-        for producer_axis in [1, 2] {
-            let graph = Graph::new(&session);
-            let h = graph.handle();
-            let symbols = [h.fresh_sym(), h.fresh_sym(), h.fresh_sym()];
-            for (sym, value) in symbols.iter().zip([2, 17, 33]) {
-                h.bind_dim(*sym, value);
-            }
-            let shape = if producer_axis == 2 {
-                symbols
-            } else {
-                [symbols[0], symbols[2], symbols[1]]
-            };
-            let input = graph
-                .leaf("x", &shape.map(Dim::Sym), crate::Dtype::F32)
-                .unwrap();
-            let out = input
-                .sum(producer_axis)
-                .unwrap()
-                .add_scalar(0.125)
-                .unwrap()
-                .sqr()
-                .unwrap()
-                .sum(1)
-                .unwrap();
-            let plan = {
-                let mut g = h.state().egraph.lock();
-                g.add_root(out.id);
-                Driver::new()
-                    .saturate(
-                        &mut g,
-                        &session.caps(),
-                        &session.inner.rules,
-                        Default::default(),
-                    )
-                    .unwrap();
-                let stream = g
-                    .members(g.class_of(out.id))
-                    .into_iter()
-                    .find(|id| {
-                        matches!(g.node(*id).op, Op::Launch(Launch::StreamFold { .. }))
-                            && g.node(*id).children.iter().all(|child| *child == input.id)
-                    })
-                    .expect("ordinary nested reductions must offer a streaming candidate");
-                let mut extraction = Extraction::default();
-                extraction.sigma.insert(g.class_of(input.id), input.id);
-                extraction.sigma.insert(g.class_of(out.id), stream);
-                let Op::Launch(op) = &g.node(stream).op else {
-                    unreachable!()
-                };
-                extraction
-                    .theta
-                    .insert(stream, op.schedule().unwrap().iter().next().unwrap());
-                LocalSearch::new(Arc::new(Planner::new()), session.caps())
-                    .replan(
-                        &g,
-                        &[out.id],
-                        &mut extraction,
-                        session.inner.cost.as_ref(),
-                        &mut NodeCache::new(g.len()),
-                    )
-                    .unwrap()
-            };
-            assert_eq!(plan.launches.len(), 1);
-            let resolving = h.state().resolve_lock.lock();
-            for (step, [rows, columns, width]) in [[2, 1, 17], [3, 17, 1], [2, 65, 33], [1, 17, 65]]
-                .into_iter()
-                .enumerate()
-            {
-                for (sym, value) in symbols.iter().zip([rows, columns, width]) {
-                    h.bind_dim(*sym, value);
-                }
-                let values: Vec<f32> = (0..rows * columns * width)
-                    .map(|i| ((i * 13 + step as u64 * 7) % 61) as f32 / 32.0 - 1.0)
-                    .collect();
-                input
-                    .set_bytes(bytemuck::cast_slice(&values).to_vec())
-                    .unwrap();
-                session.run(h, &plan, std::slice::from_ref(&out)).unwrap();
-                let bytes = session.read_bytes_locked(&resolving, h, out.id).unwrap();
-                let actual = bytemuck::cast_slice::<u8, f32>(&bytes);
-                assert_eq!(actual.len(), rows as usize);
-                for (row, got) in actual.iter().enumerate() {
-                    let expected: f64 = (0..columns)
-                        .map(|column| {
-                            let sum: f64 = (0..width)
-                                .map(|k| {
-                                    let offset = if producer_axis == 2 {
-                                        column * width + k
-                                    } else {
-                                        k * columns + column
-                                    };
-                                    f64::from(
-                                        values[row * (columns * width) as usize + offset as usize],
-                                    )
-                                })
-                                .sum();
-                            (sum + 0.125).powi(2)
-                        })
-                        .sum();
-                    assert!(
-                        (f64::from(*got) - expected).abs() < 2e-5 * expected.abs().max(1.0),
-                        "shape=[{rows},{columns},{width}] row={row}: {got} != {expected}"
-                    );
-                }
-            }
-        }
+/// The backend a test runs on: the GPU under
+/// `FUSOR_CONFORMANCE_REQUIRE_GPU`, the CPU otherwise.
+#[cfg(all(test, feature = "cpu"))]
+pub(crate) fn test_backend() -> Backend {
+    if std::env::var_os("FUSOR_CONFORMANCE_REQUIRE_GPU").is_some() {
+        #[cfg(feature = "gpu")]
+        return Backend::gpu_blocking().expect("GPU backend required");
+        #[cfg(not(feature = "gpu"))]
+        panic!("GPU feature required");
     }
-
-    #[test]
-    #[cfg(all(feature = "cpu", not(target_arch = "wasm32")))]
-    fn ordinary_attention_discovers_and_executes_a_streamed_weighted_reduction() {
-        use fusor_cost::realize::NodeCache;
-        use fusor_ir::carrier::SlotTy;
-        use fusor_ir::extract::Extraction;
-        use fusor_ir::ir::launch::Launch;
-
-        let backend = if std::env::var_os("FUSOR_CONFORMANCE_REQUIRE_GPU").is_some() {
-            #[cfg(feature = "gpu")]
-            {
-                Backend::gpu_blocking().expect("GPU backend required")
-            }
-            #[cfg(not(feature = "gpu"))]
-            {
-                panic!("GPU feature required")
-            }
-        } else {
-            Backend::cpu().unwrap()
-        };
-        let session = Session::new(backend).unwrap();
-        let graph = Graph::new(&session);
-        let h = graph.handle();
-        let seq = h.fresh_sym();
-        h.bind_dim(seq, 7);
-        let q = graph
-            .leaf("q", &[Dim::Const(2), Dim::Const(4)], crate::Dtype::F32)
-            .unwrap();
-        let k = graph
-            .leaf("k", &[Dim::Sym(seq), Dim::Const(4)], crate::Dtype::F32)
-            .unwrap();
-        let v = graph
-            .leaf("v", &[Dim::Sym(seq), Dim::Const(4)], crate::Dtype::F32)
-            .unwrap();
-        let out = q
-            .matmul_t(&k)
-            .unwrap()
-            .softmax_last_dim()
-            .unwrap()
-            .matmul(&v)
-            .unwrap();
-        let (stream, plan) = {
-            let mut g = h.state().egraph.lock();
-            g.add_root(out.id);
-            Driver::new()
-                .saturate(
-                    &mut g,
-                    &session.caps(),
-                    &session.inner.rules,
-                    Default::default(),
-                )
-                .unwrap();
-            let reachable = g.reachable_from_roots();
-            let stream = reachable
-                .ones()
-                .map(|i| Id(i as u32))
-                .find(|id| {
-                    let Op::Launch(Launch::StreamFold { producer, fold, .. }) = &g.node(*id).op
-                    else {
-                        return false;
-                    };
-                    let Launch::Fold { carrier, .. } = fold.as_ref() else {
-                        return false;
-                    };
-                    let Launch::Fold { ops, .. } = producer.as_ref() else {
-                        return false;
-                    };
-                    carrier.slots.as_slice()
-                        == [
-                            SlotTy::Scalar,
-                            SlotTy::Scalar,
-                            SlotTy::Vector(Dim::Const(4)),
-                        ]
-                        && ops.iter().any(|o| o.src == q.id)
-                        && ops.iter().any(|o| o.src == k.id)
-                        && g.node(*id)
-                            .children
-                            .iter()
-                            .copied()
-                            .collect::<FxHashSet<_>>()
-                            == [q.id, k.id, v.id].into_iter().collect()
-                })
-                .expect(
-                    "ordinary QK, softmax and PV must derive a single streamed weighted reduction",
-                );
-            g.clear_roots();
-            g.add_root(stream);
-            let mut extraction = Extraction::default();
-            for input in [q.id, k.id, v.id, stream] {
-                extraction.sigma.insert(g.class_of(input), input);
-            }
-            let Op::Launch(op) = &g.node(stream).op else {
-                unreachable!()
-            };
-            extraction
-                .theta
-                .insert(stream, op.schedule().unwrap().iter().next().unwrap());
-            let plan = LocalSearch::new(Arc::new(Planner::new()), session.caps())
-                .replan(
-                    &g,
-                    &[stream],
-                    &mut extraction,
-                    session.inner.cost.as_ref(),
-                    &mut NodeCache::new(g.len()),
-                )
-                .unwrap();
-            (stream, plan)
-        };
-        assert_eq!(plan.launches.len(), 1);
-        let state = h.tensor(stream);
-        let queries = [1.0f32, 0.25, 0.5, 0.75, 0.5, 0.75, 0.25, 1.0];
-        q.set_bytes(bytemuck::cast_slice(&queries).to_vec())
-            .unwrap();
-        let resolving = h.state().resolve_lock.lock();
-        for (length, nonfinite) in [
-            (7, 0),
-            (7, 1),
-            (7, 2),
-            (7, 3),
-            (7, 4),
-            (1, 0),
-            (0, 0),
-            (9, 0),
-        ] {
-            h.bind_dim(seq, length);
-            let mut keys: Vec<f32> = (0..length * 4)
-                .map(|i| (i * 11 % 19) as f32 / 13.0 - 0.5)
-                .collect();
-            let values: Vec<f32> = (0..length * 4)
-                .map(|i| (i * 7 % 23) as f32 / 11.0 - 0.75)
-                .collect();
-            for row in 0..length as usize {
-                if nonfinite == 2 || nonfinite == 1 && row % 2 == 0 {
-                    keys[row * 4] = f32::NEG_INFINITY;
-                }
-            }
-            if nonfinite == 3 {
-                keys[0] = f32::INFINITY;
-            }
-            if nonfinite == 4 {
-                keys[0] = f32::NAN;
-            }
-            k.set_bytes(bytemuck::cast_slice(&keys).to_vec()).unwrap();
-            v.set_bytes(bytemuck::cast_slice(&values).to_vec()).unwrap();
-            session.run(h, &plan, std::slice::from_ref(&state)).unwrap();
-            let bytes = session.read_bytes_locked(&resolving, h, stream).unwrap();
-            let actual = bytemuck::cast_slice::<u8, f32>(&bytes);
-            assert_eq!(actual.len(), 12);
-            for row in 0..2 {
-                let scores: Vec<f64> = keys
-                    .as_chunks::<4>()
-                    .0
-                    .iter()
-                    .map(|key| {
-                        (0..4)
-                            .map(|d| f64::from(queries[row * 4 + d]) * f64::from(key[d]))
-                            .sum()
-                    })
-                    .collect();
-                let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-                let weights: Vec<_> = scores.iter().map(|s| (s - max).exp()).collect();
-                let sum: f64 = weights.iter().sum();
-                for d in 0..4 {
-                    let expected: f64 = weights
-                        .iter()
-                        .enumerate()
-                        .map(|(i, w)| w / sum * f64::from(values[i * 4 + d]))
-                        .sum();
-                    let got = if length == 0 {
-                        assert_eq!(actual[row * 6 + 1], 0.0);
-                        actual[row * 6 + 2 + d]
-                    } else {
-                        actual[row * 6 + 2 + d] / actual[row * 6 + 1]
-                    };
-                    assert!(
-                        expected.is_nan() && got.is_nan()
-                            || (f64::from(got) - expected).abs() < 3e-5 * expected.abs().max(1.0),
-                        "length={length} nonfinite={nonfinite} row={row} d={d}: {got} != {expected}"
-                    );
-                }
-            }
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "cpu")]
-    fn shape_family_replay_preserves_inputs_and_prior_results() {
-        let session = Session::new(Backend::cpu().unwrap()).unwrap();
-        let graph = Graph::new(&session);
-        let x = graph
-            .leaf("x", &[Dim::Const(2)], crate::Dtype::F32)
-            .unwrap();
-        let y = graph
-            .leaf("y", &[Dim::Const(2)], crate::Dtype::F32)
-            .unwrap();
-        x.set_bytes(bytemuck::cast_slice(&[1.0f32, 3.0]).to_vec())
-            .unwrap();
-        y.set_bytes(bytemuck::cast_slice(&[10.0f32, 20.0]).to_vec())
-            .unwrap();
-        let first = x.sub(&y).unwrap();
-        assert_eq!(first.to_vec_f32().unwrap(), [-9.0, -17.0]);
-        let swapped = y.sub(&x).unwrap();
-        assert_eq!(swapped.to_vec_f32().unwrap(), [9.0, 17.0]);
-        assert_eq!(first.to_vec_f32().unwrap(), [-9.0, -17.0]);
-        assert_eq!(x.to_vec_f32().unwrap(), [1.0, 3.0]);
-        assert_eq!(y.to_vec_f32().unwrap(), [10.0, 20.0]);
-    }
-
-    #[test]
-    #[cfg(feature = "cpu")]
-    fn dead_input_buffers_live_until_their_last_reader_drops() {
-        let session = Session::new(Backend::cpu().unwrap()).unwrap();
-        let graph = Graph::new(&session);
-        let h = graph.handle();
-        let input = Tensor::from_elements(h, &[Dim::Const(2)], &[1.0f32, 2.0]).unwrap();
-        session.upload_leaf(&input).unwrap();
-        let input_id = input.id;
-        let reader = input.add_scalar(1.0).unwrap();
-        let descendant = reader.add_scalar(2.0).unwrap();
-        assert!(h.device_buf(reader.id).is_none());
-        assert!(h.device_buf(descendant.id).is_none());
-        drop(input);
-        h.reap_dead();
-        assert!(h.device_buf(input_id).is_some());
-        h.reap_dead();
-        assert!(h.device_buf(input_id).is_some());
-        drop(reader);
-        h.reap_dead();
-        assert!(h.device_buf(input_id).is_some());
-        drop(descendant);
-        h.reap_dead();
-        assert!(h.device_buf(input_id).is_none());
-    }
-
-    #[test]
-    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-    fn symbolic_contractions_reuse_pipelines_across_tile_boundaries() {
-        use fusor_cost::realize::NodeCache;
-        use fusor_ir::dtype::Dtype;
-        use fusor_ir::extract::Extraction;
-        use fusor_ir::ir::launch::{Family, Launch, SchedPoint};
-        use fusor_tile::rules::contract::{lower_coop, lower_sgemm, lower_sgemv};
-
-        let backend = match Backend::gpu_blocking() {
-            Ok(backend) => backend,
-            Err(error) => {
-                let required = std::env::var("FUSOR_CONFORMANCE_REQUIRE_GPU").is_ok_and(|value| {
-                    !matches!(value.trim(), "" | "0") && !value.trim().eq_ignore_ascii_case("false")
-                });
-                assert!(!required, "GPU regression is required: {error}");
-                eprintln!("symbolic contraction regression skipped: {error}");
-                return;
-            }
-        };
-        let session = Session::new(backend).unwrap();
-        let target = match &session.inner.device {
-            Backend::Gpu(target) => target,
-            #[cfg(feature = "cpu")]
-            Backend::Cpu(_) => unreachable!(),
-        };
-        let caps = session.caps();
-        eprintln!("symbolic contraction regression on {}", caps.name);
-        let mut executions = 0;
-        for (family, varying_k, columns, kv_cache) in [
-            (Family::Sgemm, false, false, false),
-            (Family::Sgemm, true, false, false),
-            (Family::Sgemv, false, false, false),
-            (Family::Sgemv, false, true, false),
-            (Family::Sgemv, true, false, false),
-            (Family::Sgemv, true, true, false),
-            (Family::Coop, true, false, false),
-            (Family::Sgemv, false, false, true),
-            (Family::Sgemv, false, true, true),
-            (Family::Sgemv, true, false, true),
-            (Family::Sgemv, true, true, true),
-            (Family::Coop, true, false, true),
-        ] {
-            if (family == Family::Coop && caps.coop_for(Dtype::F32, Dtype::F32).is_none())
-                || (columns && !caps.subgroups.is_some_and(|s| s.is_fixed()))
-            {
-                continue;
-            }
-            let graph = Graph::new(&session);
-            let h = graph.handle();
-            let sym = h.fresh_sym();
-            h.bind_dim(sym, 1);
-            let (batch, rows, fixed_n, fixed_k) = if kv_cache {
-                (8, 4, 128, 128)
-            } else {
-                (2, 3, 7, 19)
-            };
-            let capacity_sym = h.fresh_sym();
-            h.bind_dim(capacity_sym, 64);
-            let capacity_dim = Dim::Sym(capacity_sym);
-            let n = if varying_k {
-                Dim::Const(fixed_n)
-            } else {
-                Dim::Sym(sym)
-            };
-            let k = if varying_k {
-                Dim::Sym(sym)
-            } else {
-                Dim::Const(fixed_k)
-            };
-            let a = graph
-                .leaf("a", &[Dim::Const(batch), Dim::Const(rows), k], Dtype::F32)
-                .unwrap();
-            let b_shape = if kv_cache {
-                [Dim::Const(batch), capacity_dim, Dim::Const(128)]
-            } else {
-                [Dim::Const(batch), n, k]
-            };
-            let b = graph.leaf("b", &b_shape, Dtype::F32).unwrap();
-            let viewed = kv_cache.then(|| {
-                use fusor_ir::shape::StrideSpec;
-                b.restride(&[
-                    StrideSpec::dim(0, Dim::Const(batch)),
-                    StrideSpec::dim(1, Dim::Sym(sym)),
-                    StrideSpec::dim(2, Dim::Const(128)),
-                ])
-                .unwrap()
-            });
-            let out = if let Some(viewed) = &viewed {
-                if varying_k {
-                    a.matmul(viewed).unwrap()
-                } else {
-                    a.matmul_t(viewed).unwrap()
-                }
-            } else {
-                a.matmul_t(&b).unwrap()
-            };
-            let plan = {
-                let mut g = h.state().egraph.lock();
-                let node = g.node(out.id).clone();
-                let facts = g.facts_view(out.id, &caps);
-                let lower = match family {
-                    Family::Sgemm => lower_sgemm,
-                    Family::Sgemv => lower_sgemv,
-                    Family::Coop => lower_coop,
-                };
-                let mut variant = lower(&mut g.builder(&caps), out.id, &node, &facts)
-                    .unwrap_or_else(|| {
-                        panic!("no {family:?} varying_k={varying_k} kv_cache={kv_cache}")
-                    });
-                if kv_cache {
-                    // Read the live KV prefix at its physical head stride.
-                    let mut op = g.node(variant).op.clone();
-                    let Op::Launch(Launch::Contract { b: side, .. }) = &mut op else {
-                        unreachable!()
-                    };
-                    side.ops[0].src = b.id;
-                    side.ops[0].layout = fusor_ir::shape::Layout::from_parts(
-                        Dim::Const(0),
-                        &[Dim::Const(batch), k, n],
-                        &[
-                            capacity_dim * Dim::Const(128),
-                            Dim::Const(if varying_k { 128 } else { 1 }),
-                            Dim::Const(if varying_k { 1 } else { 128 }),
-                        ],
-                    )
-                    .unwrap();
-                    variant = g.add(op).unwrap();
-                    g.union(out.id, variant).unwrap();
-                }
-                let Op::Launch(Launch::Contract { sched, .. }) = &g.node(variant).op else {
-                    unreachable!()
-                };
-                let point = sched
-                    .iter()
-                    .find(|point| match point {
-                        SchedPoint::Sgemv(p) if kv_cache => {
-                            *p == if columns {
-                                fusor_ir::ir::launch::SgemvParams {
-                                    vector: 32,
-                                    subgroups: 2,
-                                    cols: 4,
-                                    parts: 4,
-                                    gap: 32,
-                                }
-                            } else {
-                                fusor_ir::ir::launch::SgemvParams {
-                                    vector: 16,
-                                    subgroups: 4,
-                                    cols: 1,
-                                    parts: 1,
-                                    gap: 0,
-                                }
-                            }
-                        }
-                        SchedPoint::Sgemv(p) => p.cols == if columns { 4 } else { 1 },
-                        SchedPoint::Sgemm(p) => p.tn > 1,
-                        _ => true,
-                    })
-                    .unwrap();
-                let mut extraction = Extraction::default();
-                for id in [a.id, b.id, variant] {
-                    extraction.sigma.insert(g.class_of(id), id);
-                }
-                extraction.theta.insert(variant, point);
-                LocalSearch::new(Arc::new(Planner::new()), session.caps())
-                    .replan(
-                        &g,
-                        &[out.id],
-                        &mut extraction,
-                        session.inner.cost.as_ref(),
-                        &mut NodeCache::new(g.len()),
-                    )
-                    .unwrap()
-            };
-            assert_eq!(plan.launches.len(), 1);
-            let resolving = h.state().resolve_lock.lock();
-            h.bind_dim(sym, 33);
-            let dispatches = target.launcher().dispatch_count();
-            let before = target.launcher().pipeline_compiles();
-            let compiled = before + 1;
-            let lengths = [33, 1, 15, 16, 17, 65]
-                .into_iter()
-                .chain([512].into_iter().filter(|_| kv_cache))
-                .chain(
-                    [1024, 2048, 2049]
-                        .into_iter()
-                        .filter(|_| family == Family::Sgemv && varying_k && !kv_cache),
-                );
-            for len in lengths {
-                h.bind_dim(sym, len);
-                let capacity = len.next_power_of_two().max(64);
-                h.bind_dim(capacity_sym, capacity);
-                let (n, k) = if varying_k {
-                    (fixed_n, len)
-                } else {
-                    (len, fixed_k)
-                };
-                let mut av: Vec<f32> = (0..batch * rows * k)
-                    .map(|i| ((i * 7 % 17) as f32 - 8.0) / 8.0)
-                    .collect();
-                let b_elements = if kv_cache {
-                    batch * capacity * 128
-                } else {
-                    batch * n * k
-                };
-                let bv: Vec<f32> = (0..b_elements)
-                    .map(|i| ((i * 11 % 19) as f32 - 9.0) / 8.0)
-                    .collect();
-                a.set_bytes(bytemuck::cast_slice(&av).to_vec()).unwrap();
-                b.set_bytes(bytemuck::cast_slice(&bv).to_vec()).unwrap();
-                if len == 33 {
-                    let a_bytes = h.leaf_bytes_shared(a.id).unwrap();
-                    let b_bytes = h.leaf_bytes_shared(b.id).unwrap();
-                    let buffers = target
-                        .prepare_resources(
-                            &plan,
-                            &h.state().egraph.lock(),
-                            &h.dim_bindings(),
-                            &[0],
-                            vec![Arc::clone(&a_bytes), Arc::clone(&b_bytes)],
-                        )
-                        .unwrap()
-                        .unwrap()
-                        .join()
-                        .unwrap()
-                        .unwrap();
-                    assert_eq!(target.launcher().pipeline_compiles(), compiled);
-                    assert_eq!(target.launcher().dispatch_count(), dispatches);
-                    h.bind_prepared_leaf(a.id, &a_bytes, buffers[0].clone());
-                    h.bind_prepared_leaf(b.id, &b_bytes, buffers[1].clone());
-                    assert_eq!(h.device_buf(a.id).unwrap().addr(), buffers[0].addr());
-                    assert_eq!(h.device_buf(b.id).unwrap().addr(), buffers[1].addr());
-                    if family == Family::Sgemm && !varying_k {
-                        av[0] += 1.0;
-                        a.set_bytes(bytemuck::cast_slice(&av).to_vec()).unwrap();
-                        h.bind_prepared_leaf(a.id, &a_bytes, buffers[0].clone());
-                        assert!(h.device_buf(a.id).is_none());
-                        h.bind_prepared_leaf(b.id, &b_bytes, buffers[0].clone());
-                        assert_eq!(h.device_buf(b.id).unwrap().addr(), buffers[1].addr());
-                    }
-                }
-                session.run(h, &plan, std::slice::from_ref(&out)).unwrap_or_else(|error| {
-                    panic!("{family:?} varying_k={varying_k} columns={columns} kv_cache={kv_cache} length={len}: {error}")
-                });
-                let bytes = session.read_bytes_locked(&resolving, h, out.id).unwrap();
-                let actual = bytemuck::cast_slice::<u8, f32>(&bytes);
-                let (batch, rows, n, k, capacity) = (
-                    batch as usize,
-                    rows as usize,
-                    n as usize,
-                    k as usize,
-                    capacity as usize,
-                );
-                assert_eq!(actual.len(), batch * rows * n);
-                for row in 0..batch * rows {
-                    for col in 0..n {
-                        let expected: f32 = (0..k)
-                            .map(|i| {
-                                let b_index = if kv_cache {
-                                    (row / rows) * capacity * 128
-                                        + if varying_k {
-                                            i * 128 + col
-                                        } else {
-                                            col * 128 + i
-                                        }
-                                } else {
-                                    ((row / rows) * n + col) * k + i
-                                };
-                                av[row * k + i] * bv[b_index]
-                            })
-                            .sum();
-                        assert!(
-                            (actual[row * n + col] - expected).abs() < 1e-4,
-                            "{family:?} k={k} n={n} at [{row}, {col}]: {} != {expected}",
-                            actual[row * n + col]
-                        );
-                    }
-                }
-                executions += 1;
-                let count = target.launcher().pipeline_compiles();
-                assert_eq!(compiled, count, "{family:?} recompiled at length {len}");
-            }
-        }
-        eprintln!("verified {executions} matrix executions and pipeline reuse");
-
-        // A persisted winner must be the first compiled production plan.
-        let graph = Graph::new(&session);
-        let h = graph.handle();
-        let a =
-            Tensor::from_elements(h, &[Dim::ONE, Dim::Const(521)], &vec![0.125f32; 521]).unwrap();
-        let b = Tensor::from_elements(
-            h,
-            &[Dim::Const(1009), Dim::Const(521)],
-            &vec![0.25f32; 1009 * 521],
-        )
-        .unwrap();
-        let out = a.matmul_t(&b).unwrap();
-        let (base, key, field, base_label, winner) = {
-            use fusor_cost::extract::{incumbent_signature, launch_signature};
-            let mut g = h.state().egraph.lock();
-            let node = g.node(out.id).clone();
-            let facts = g.facts_view(out.id, &caps);
-            let variant = lower_sgemv(&mut g.builder(&caps), out.id, &node, &facts).unwrap();
-            let Op::Launch(Launch::Contract { sched, .. }) = &g.node(variant).op else {
-                unreachable!()
-            };
-            let mut extraction = Extraction::default();
-            for id in [a.id, b.id, variant] {
-                extraction.sigma.insert(g.class_of(id), id);
-            }
-            extraction
-                .theta
-                .insert(variant, sched.iter().next().unwrap());
-            let base = Arc::new(
-                LocalSearch::new(Arc::new(Planner::new()), caps.clone())
-                    .replan(
-                        &g,
-                        &[out.id],
-                        &mut extraction,
-                        session.inner.cost.as_ref(),
-                        &mut NodeCache::new(g.len()),
-                    )
-                    .unwrap(),
-            );
-            let field = launch_signature(&g, &base.launches[0]);
-            let label = incumbent_signature(&g, &base, 0).unwrap();
-            let winner = session
-                .inner
-                .extractor
-                .launch_variant_labels(
-                    &g,
-                    &[out.id],
-                    &base,
-                    0,
-                    session.inner.cost.as_ref(),
-                    autotune_min_macs(),
-                )
-                .into_iter()
-                .next()
-                .unwrap()
-                .0;
-            let key = ReplayKey {
-                l0_term: fusor_cost::replay::l0_term_hash(&g, &[out.id]),
-                device: session.inner.cost.facts().fingerprint(),
-            };
-            (base, key, field, label, winner)
-        };
-        for _ in 0..2 {
-            session.inner.tune.observe(&field, &base_label, 100);
-            session.inner.tune.observe(&field, &winner, 1);
-        }
-        let before = target.launcher().pipeline_compiles();
-        let selected = session.explore_prior(h, &[out.id], key, base);
-        assert_eq!(target.launcher().pipeline_compiles(), before);
-        assert_eq!(
-            fusor_cost::extract::incumbent_signature(&h.state().egraph.lock(), &selected, 0),
-            Some(winner)
-        );
-        let resolving = h.state().resolve_lock.lock();
-        session
-            .run(h, &selected, std::slice::from_ref(&out))
-            .unwrap();
-        let bytes = session.read_bytes_locked(&resolving, h, out.id).unwrap();
-        assert_eq!(bytemuck::cast_slice::<u8, f32>(&bytes), &[16.28125; 1009]);
-        assert_eq!(target.launcher().pipeline_compiles(), before + 1);
-        eprintln!("verified persisted winner executes with one pipeline compile");
-    }
-
-    #[test]
-    #[cfg(feature = "cpu")]
-    fn saturation_budget_ignores_completed_graph_history() {
-        let mut applications = Vec::new();
-        for budget in [
-            SaturationBudget {
-                node_slope: 2,
-                node_slack: 0,
-                ..Default::default()
-            },
-            SaturationBudget {
-                node_slope: 256,
-                max_applications: 0,
-                application_slope: 1,
-                ..Default::default()
-            },
-            SaturationBudget {
-                max_applications: 0,
-                ..Default::default()
-            },
-        ] {
-            let mut expansions = Vec::new();
-            for history in [0, 32] {
-                let session = Session::new(Backend::cpu().unwrap()).unwrap();
-                let graph = Graph::new(&session);
-                let h = graph.handle();
-                if history > 0 {
-                    let input = Tensor::from_elements(h, &[Dim::ONE], &[2.0f32]).unwrap();
-                    let old: Vec<_> = (0..history)
-                        .map(|i| input.add_scalar(i as f32).unwrap())
-                        .collect();
-                    let mut g = h.state().egraph.lock();
-                    for value in &old {
-                        g.add_root(value.id);
-                    }
-                    Driver::new()
-                        .saturate(
-                            &mut g,
-                            &session.caps(),
-                            &session.inner.rules,
-                            Default::default(),
-                        )
-                        .unwrap();
-                }
-                let a = Tensor::from_elements(
-                    h,
-                    &[Dim::Const(2), Dim::Const(3)],
-                    &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
-                )
-                .unwrap();
-                let b = Tensor::from_elements(
-                    h,
-                    &[Dim::Const(3), Dim::Const(2)],
-                    &[7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0],
-                )
-                .unwrap();
-                let out = a
-                    .matmul(&b)
-                    .unwrap()
-                    .add_scalar(1.0)
-                    .unwrap()
-                    .sum(1)
-                    .unwrap();
-                let resolving = h.state().resolve_lock.lock();
-                let plan = {
-                    let mut g = h.state().egraph.lock();
-                    g.clear_roots();
-                    g.add_root(out.id);
-                    let report = Driver::new()
-                        .saturate(&mut g, &session.caps(), &session.inner.rules, budget)
-                        .unwrap();
-                    assert!(!report.saturated);
-                    expansions.push((
-                        report.final_nodes - report.initial_nodes,
-                        report.applications,
-                    ));
-                    session
-                        .inner
-                        .extractor
-                        .extract(
-                            &g,
-                            &[out.id],
-                            session.inner.cost.as_ref(),
-                            ExtractBudget::default(),
-                        )
-                        .unwrap()
-                };
-                session.run(h, &plan, std::slice::from_ref(&out)).unwrap();
-                let bytes = session.read_bytes_locked(&resolving, h, out.id).unwrap();
-                assert_eq!(bytemuck::cast_slice::<u8, f32>(&bytes), [124.0, 295.0]);
-            }
-            assert_eq!(expansions[0], expansions[1]);
-            applications.push(expansions[0].1);
-        }
-        assert!(applications[1] > applications[2]);
-    }
-
-    #[test]
-    #[cfg(feature = "cpu")]
-    fn exhausted_saturation_still_executes_the_lowering_floor() {
-        let session = Session::new(Backend::cpu().unwrap()).unwrap();
-        let graph = Graph::new(&session);
-        let h = graph.handle();
-        let a = Tensor::from_elements(
-            h,
-            &[Dim::Const(2), Dim::Const(3)],
-            &[1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0],
-        )
-        .unwrap();
-        let b = Tensor::from_elements(
-            h,
-            &[Dim::Const(3), Dim::Const(2)],
-            &[7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0],
-        )
-        .unwrap();
-        let out = a
-            .matmul(&b)
-            .unwrap()
-            .add_scalar(1.0)
-            .unwrap()
-            .sum(1)
-            .unwrap();
-        let unrelated = a.add_scalar(5.0).unwrap();
-        let resolving = h.state().resolve_lock.lock();
-        let execute_floor = |out: &Tensor| {
-            let plan = {
-                let mut g = h.state().egraph.lock();
-                g.clear_roots();
-                g.add_root(out.id);
-                let report = Driver::new()
-                    .saturate(
-                        &mut g,
-                        &session.caps(),
-                        &session.inner.rules,
-                        SaturationBudget {
-                            max_applications: 0,
-                            ..SaturationBudget::default()
-                        },
-                    )
-                    .unwrap();
-                assert!(!report.saturated);
-                session
-                    .inner
-                    .extractor
-                    .extract(
-                        &g,
-                        &[out.id],
-                        session.inner.cost.as_ref(),
-                        ExtractBudget::default(),
-                    )
-                    .unwrap()
-            };
-            session.run(h, &plan, std::slice::from_ref(out)).unwrap();
-            let bytes = session.read_bytes_locked(&resolving, h, out.id).unwrap();
-            bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
-        };
-        assert_eq!(execute_floor(&out), [124.0, 295.0]);
-        {
-            let mut g = h.state().egraph.lock();
-            g.add_root(a.id);
-            let before = g.len();
-            let report = Driver::new()
-                .saturate(
-                    &mut g,
-                    &session.caps(),
-                    &session.inner.rules,
-                    SaturationBudget::default(),
-                )
-                .unwrap();
-            assert_eq!(
-                report.applications, 0,
-                "revisited an exhausted root closure"
-            );
-            assert_eq!(g.len(), before);
-        }
-        assert_eq!(execute_floor(&unrelated), [6.0, 7.0, 8.0, 9.0, 10.0, 11.0]);
-    }
-
-    /// The same expression rebuilt over a fresh input leaf must run the
-    /// recorded plan again rather than extract another: the graph grew, so
-    /// the replay key cannot hit, and the structural memo is what remains.
-    fn a_fresh_step_leaf_reuses_the_plan(session: Session) {
-        let graph = Graph::new(&session);
-        let run = |values: &[f32]| {
-            let x =
-                Tensor::from_elements(graph.handle(), &[Dim::Const(values.len() as u64)], values)
-                    .unwrap();
-            let y = x.add_scalar(1.0).unwrap();
-            let bytes = graph.handle().read_back(y.id).unwrap();
-            bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
-        };
-
-        assert_eq!(run(&[1.0, 2.0, 3.0]), vec![2.0, 3.0, 4.0]);
-        assert_eq!(session.inner.families.lock().len(), 1);
-
-        assert_eq!(run(&[10.0, 11.0, 12.0]), vec![11.0, 12.0, 13.0]);
-        assert_eq!(
-            session.inner.families.lock().len(),
-            1,
-            "a replay hit must not extract and record another plan"
-        );
-    }
-
-    /// A `Coop` contraction pads its output to whole blocks, and a view of
-    /// that output is served by cutting the graph at the bound buffer. The
-    /// cut mints an external leaf, which carries no `BufferPlan` for
-    /// `repad_index` to correct the read with, so the view must not be cut
-    /// there — it read the padding as data.
-    #[test]
-    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-    fn a_view_of_a_padded_contraction_reads_the_value_not_its_padding() {
-        let Ok(backend) = Backend::gpu_blocking() else {
-            return;
-        };
-        let session = Session::new(backend).unwrap();
-        let graph = Graph::new(&session);
-        let h = graph.handle();
-        // `n = 130` is not a multiple of any block width, so every geometry
-        // the extractor can pick pads it; the extents are large enough that
-        // it picks a cooperative one.
-        const T: u64 = 512;
-        const K: u64 = 512;
-        const N: u64 = 130;
-        let xs: Vec<f32> = (0..T * K)
-            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 50.0)
-            .collect();
-        let ws: Vec<f32> = (0..N * K)
-            .map(|i| ((i * 53 % 97) as f32 - 48.0) / 48.0)
-            .collect();
-        let x = Tensor::from_elements(h, &[Dim::Const(T), Dim::Const(K)], &xs).unwrap();
-        let w = Tensor::from_elements(h, &[Dim::Const(N), Dim::Const(K)], &ws).unwrap();
-        let y = x.matmul_t(&w).unwrap();
-        let flat = y
-            .reshape_dims(&[Dim::Const(1), Dim::Const(T), Dim::Const(N)])
-            .unwrap();
-
-        let full = h.read_back(y.id).unwrap();
-        let full = bytemuck::cast_slice::<u8, f32>(&full).to_vec();
-        let view = h.read_back(flat.id).unwrap();
-        let view = bytemuck::cast_slice::<u8, f32>(&view).to_vec();
-        assert_eq!(full.len(), view.len());
-        let worst = full
-            .iter()
-            .zip(&view)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
-        assert!(worst < 1e-4, "a view of the contraction differs by {worst}");
-    }
-
-    /// A model step rebuilt with a longer cache every call (a `cat` onto a
-    /// re-leafed cache, a view at a moving offset, a contraction over the
-    /// cache length): from the second call on the session plans a symbolic
-    /// twin, and every call's values must equal the host's.
-    #[test]
-    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-    fn a_shape_family_twin_computes_what_its_members_do() {
-        let Ok(backend) = Backend::gpu_blocking() else {
-            return;
-        };
-        let session = Session::new(backend).unwrap();
-        let graph = Graph::new(&session);
-        let h = graph.handle();
-        const D: usize = 8;
-        let w_host: Vec<f32> = (0..D * D)
-            .map(|i| ((i * 7) % 11) as f32 * 0.1 - 0.4)
-            .collect();
-        let w = Tensor::from_elements(h, &[Dim::Const(D as u64), Dim::Const(D as u64)], &w_host)
-            .unwrap();
-        let mut cache_host: Vec<f32> = Vec::new();
-        for step in 0..(CONCRETE_SHAPES + 4) {
-            let new_row: Vec<f32> = (0..D).map(|j| (step * D + j) as f32 * 0.05 - 0.3).collect();
-            // The step: cache' = cat(cache, row); q = row @ w; scores =
-            // q @ cache'^T (contraction over D, N = len); s = softmax(scores);
-            // out = s @ cache' (contraction over len); tail = cache' narrowed
-            // at the moving offset `step`.
-            let row =
-                Tensor::from_elements(h, &[Dim::Const(1), Dim::Const(D as u64)], &new_row).unwrap();
-            let cache = if cache_host.is_empty() {
-                row.clone()
-            } else {
-                let prev = Tensor::from_elements(
-                    h,
-                    &[
-                        Dim::Const((cache_host.len() / D) as u64),
-                        Dim::Const(D as u64),
-                    ],
-                    &cache_host,
-                )
-                .unwrap();
-                Tensor::cat(&[prev, row.clone()], 0).unwrap()
-            };
-            cache_host.extend_from_slice(&new_row);
-            let len = cache_host.len() / D;
-            let q = row.matmul(&w).unwrap();
-            let scores = q.matmul(&cache.t().unwrap()).unwrap();
-            let s = scores.softmax(1).unwrap();
-            let out = s.matmul(&cache).unwrap();
-            let tail = cache.narrow(0, step, 1).unwrap();
-            let got_out: Vec<f32> = bytemuck::cast_slice(&h.read_back(out.id).unwrap()).to_vec();
-            let got_tail: Vec<f32> = bytemuck::cast_slice(&h.read_back(tail.id).unwrap()).to_vec();
-            let got_cache: Vec<f32> =
-                bytemuck::cast_slice(&h.read_back(cache.id).unwrap()).to_vec();
-
-            // Host reference.
-            let q_h: Vec<f32> = (0..D)
-                .map(|j| (0..D).map(|k| new_row[k] * w_host[k * D + j]).sum())
-                .collect();
-            let sc: Vec<f32> = (0..len)
-                .map(|r| (0..D).map(|k| q_h[k] * cache_host[r * D + k]).sum())
-                .collect();
-            let m = sc.iter().cloned().fold(f32::MIN, f32::max);
-            let e: Vec<f32> = sc.iter().map(|v| (v - m).exp()).collect();
-            let z: f32 = e.iter().sum();
-            let out_h: Vec<f32> = (0..D)
-                .map(|j| (0..len).map(|r| e[r] / z * cache_host[r * D + j]).sum())
-                .collect();
-            let close = |a: &[f32], b: &[f32]| {
-                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-4)
-            };
-            assert!(
-                close(&got_cache, &cache_host),
-                "step {step}: cache {got_cache:?}"
-            );
-            assert!(
-                close(&got_tail, &cache_host[step * D..(step + 1) * D]),
-                "step {step}: tail {got_tail:?}"
-            );
-            assert!(
-                close(&got_out, &out_h),
-                "step {step}: out {got_out:?} vs {out_h:?}"
-            );
-        }
-        assert!(
-            session
-                .inner
-                .families
-                .lock()
-                .values()
-                .any(|f| f.symbolic.is_some()),
-            "the step's shape family never went symbolic"
-        );
-    }
-
-    /// The smallest moving-offset view: a fresh `[len, D]` leaf narrowed at
-    /// row `step`. The twin's view offset is a derived symbol.
-    fn shape_family_symbolic_offset(session: Session) {
-        let graph = Graph::new(&session);
-        let h = graph.handle();
-        const D: usize = 4;
-        for step in 0..(CONCRETE_SHAPES + 4) {
-            let len = step + 2;
-            let host: Vec<f32> = (0..len * D).map(|i| i as f32).collect();
-            let x =
-                Tensor::from_elements(h, &[Dim::Const(len as u64), Dim::Const(D as u64)], &host)
-                    .unwrap();
-            let tail = x.narrow(0, step, 1).unwrap().add_scalar(0.0).unwrap();
-            let got: Vec<f32> = bytemuck::cast_slice(&h.read_back(tail.id).unwrap()).to_vec();
-            assert_eq!(got, host[step * D..(step + 1) * D], "step {step}");
-        }
-        assert!(
-            session
-                .inner
-                .families
-                .lock()
-                .values()
-                .any(|family| family.symbolic.is_some() && !family.blocked),
-            "symbolic offsets must execute without falling back to concrete plans"
-        );
-    }
-
-    #[test]
-    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-    fn a_shape_family_twin_reads_a_view_at_a_symbolic_offset() {
-        let Ok(backend) = Backend::gpu_blocking() else {
-            return;
-        };
-        shape_family_symbolic_offset(Session::new(backend).unwrap());
-    }
-
-    #[test]
-    #[cfg(feature = "cpu")]
-    fn a_shape_family_twin_reads_a_cpu_view_at_a_symbolic_offset() {
-        shape_family_symbolic_offset(Session::new(Backend::cpu().unwrap()).unwrap());
-    }
-
-    #[test]
-    #[cfg(feature = "cpu")]
-    fn a_fresh_step_leaf_reuses_the_cpu_plan_and_executable() {
-        a_fresh_step_leaf_reuses_the_plan(Session::new(Backend::cpu().unwrap()).unwrap());
-    }
-
-    #[test]
-    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-    fn a_fresh_step_leaf_reuses_the_gpu_plan() {
-        let Ok(backend) = Backend::gpu_blocking() else {
-            return;
-        };
-        a_fresh_step_leaf_reuses_the_plan(Session::new(backend).unwrap());
-    }
+    Backend::cpu().unwrap()
 }
+
+#[cfg(test)]
+mod tests;

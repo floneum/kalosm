@@ -15,7 +15,7 @@ pub use rms_norm::RmsNorm;
 
 use fusor_gguf::VarBuilder;
 use fusor_ir::dtype::Dtype;
-use fusor_ir::ir::logical::{LeafKind, Logical};
+use fusor_ir::ir::logical::Logical;
 use fusor_ir::shape::Dim;
 
 use crate::graph::GraphRef;
@@ -93,24 +93,28 @@ pub(crate) fn load_dense(vb: &VarBuilder, graph: &GraphRef, name: &str) -> Resul
             )));
         }
     }
-    let leaf = Tensor::emit(
-        graph,
-        Logical::Leaf(LeafKind::Quantized {
-            name: graph.fresh_buffer_id(),
-            fmt,
-            layout: raw.layout,
-            shape: [rows, cols].into_iter().collect(),
-        }),
-    )?;
-    graph.set_leaf_bytes(leaf.id(), raw.bytes.to_vec());
+    let leaf = graph.quantized_leaf(fmt, raw.layout, [rows, cols], raw.bytes.to_vec())?;
     Tensor::emit(
         graph,
         Logical::Dequant {
             fmt,
             layout: raw.layout,
-            x: leaf.id(),
+            x: leaf,
         },
     )
+}
+
+/// A layer's `[out]` bias, when it has one.
+pub(crate) fn load_bias<T: Element>(
+    vb: &VarBuilder,
+    graph: &GraphRef,
+    bias: bool,
+) -> Result<Option<crate::Tensor<1, T>>> {
+    if !bias {
+        return Ok(None);
+    }
+    let b = as_vector(load_dense(vb, graph, "bias")?, "bias")?;
+    as_typed::<1, T>(b, "bias").map(Some)
 }
 
 /// [`load_dense`], or `None` when the key is absent. A missing key is the

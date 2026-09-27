@@ -45,7 +45,10 @@ pub type CustomRegistry = FxHashMap<Val, CustomBackward>;
 /// parent's whole subgraph would starve, and the walk's final check would
 /// report the symptom rather than the cause.
 pub fn validate_parents(parents: &[Parent], covered: impl Fn(Val) -> bool) -> Result<()> {
-    match parents.iter().find(|p| p.requires_grad && !covered(p.value)) {
+    match parents
+        .iter()
+        .find(|p| p.requires_grad && !covered(p.value))
+    {
         Some(p) => Err(Error::Plan(format!(
             "a custom backward rule returned no gradient for parent {}, which requires one",
             p.value
