@@ -375,20 +375,25 @@ pub(crate) fn own_buffer(b: &Builder<'_>, class: ClassId, roots: &FxHashSet<Clas
         })
 }
 
-/// Whether `id`'s class also has a `Contract` spelling: the value is a
-/// contraction, and its fold spelling is the fallback for devices without
-/// a tiled family. A slab stage runs it as one lane per output walking the
+/// Whether `id`'s class also has a matrix-shaped `Contract` spelling: the
+/// value is a contraction, and its fold spelling is the fallback for devices
+/// without a tiled family. A slab stage runs it as one lane per output walking the
 /// reduced axis, which is what tiling exists to avoid; the tiled kernel
 /// stays its own dispatch and the stages fuse around it.
 pub(crate) fn is_contraction(b: &Builder<'_>, id: Id) -> bool {
     has_contract_spelling(b, id) && !small_fold(b, id)
 }
 
-/// Whether `id`'s class has a `Contract` spelling.
+/// Whether `id`'s class has a matrix-shaped `Contract` spelling. A batched
+/// dot (`m = n = 1`, a sum of squares) reuses no operand, so tiling buys it
+/// nothing and its fold spelling is an ordinary stage.
 pub(crate) fn has_contract_spelling(b: &Builder<'_>, id: Id) -> bool {
-    b.class_members(id)
-        .iter()
-        .any(|m| matches!(b.node(*m).op, Op::Launch(Launch::Contract { .. })))
+    b.class_members(id).iter().any(|m| match &b.node(*m).op {
+        Op::Launch(Launch::Contract { m, n, .. }) => {
+            m.as_const() != Some(1) || n.as_const() != Some(1)
+        }
+        _ => false,
+    })
 }
 
 /// A fold over a short axis — the sum of split-K partials — is one lane

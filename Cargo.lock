@@ -2602,6 +2602,7 @@ name = "fusor-tile"
 version = "0.1.0"
 dependencies = [
  "fusor-ir",
+ "half",
  "parking_lot",
  "rustc-hash 2.1.2",
  "smallvec 1.15.1",
