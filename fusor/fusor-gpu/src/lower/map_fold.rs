@@ -16,12 +16,8 @@ use fusor_tile::build::FoldLanes;
 use crate::lower::{Ctx, grid_for, scalar_element};
 use fusor_tile::domains::emitted_block;
 
-/// Lower a `Map` at a [`MapTiling`].
-///
-/// `dim: None` is the untiled body: one output per lane. Otherwise each lane
-/// computes `tm` outputs along `dim` and every operand that does *not* vary
-/// with `dim` is hoisted into a `Local` before the loop, so it is read once
-/// per lane instead of `tm` times.
+/// Lower a `Map` at a [`MapTiling`]: one output per lane, or `tm` along
+/// `dim` with every operand invariant in `dim` hoisted into a `Local`.
 pub(crate) fn lower_kmap(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Result<KernelIr> {
     let Launch::Map {
         space, body, ops, ..
@@ -84,8 +80,7 @@ pub(crate) fn lower_kmap(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Result
                     space.rank()
                 )));
             }
-            // A thread-local run along the innermost axis breaks inter-thread
-            // store coalescing, which is why the fold domain never offers it.
+            // A per-lane run along the innermost axis breaks coalescing.
             if axis + 1 == space.rank() {
                 return Err(Error::Plan(
                     "map tiling on the innermost axis destroys store coalescing".into(),
@@ -126,9 +121,8 @@ pub(crate) fn lower_kmap(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Result
     Ok(ctx.finish("kmap", grid, block, stmts))
 }
 
-/// An operand is loop-invariant along `axis` when its layout gives that axis
-/// stride 0 or extent 1 — `layout_index` drops both, so the address does not
-/// move as the tiled coordinate advances.
+/// Whether an operand's address is invariant along `axis` (stride 0 or
+/// extent 1).
 fn operand_is_invariant(operand: &Operand, axis: usize) -> bool {
     let layout = &operand.layout;
     axis >= layout.rank()
@@ -168,8 +162,7 @@ pub(crate) fn lower_kfold(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resul
         .flatten();
     let axis = *axis as usize;
     let lanes = FoldLanes::of(carrier, post, space.rank(), axis, vec_axes, Error::Plan)?;
-    // A promoted nest: the accumulator-resident axes are a contiguous block
-    // immediately before the reduced axis, so one output row spans
+    // Promoted axes sit just before the reduced axis: one output row spans
     // `vec_extent * axis_extent` consecutive elements.
     let vec_extent: u64 = vec_axes
         .iter()
@@ -185,8 +178,7 @@ pub(crate) fn lower_kfold(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resul
     let block = ctx.block(schedule.block);
     let b = &ctx.b;
 
-    // Output rows are `space` minus the reduced axis and every promoted axis:
-    // a promoted extent lives in the carrier's lanes, not in the write map.
+    // Output rows are `space` minus the reduced and promoted axes.
     let mut row_space = space.clone();
     row_space.dims.remove(axis);
     for i in vec_axes.iter().rev() {
@@ -207,8 +199,7 @@ pub(crate) fn lower_kfold(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resul
     let lg_e = b.u32(lane_group);
     let (row, lane) = b.divrem(ctx.global_index(block), lg_e.clone());
     let row_live = b.lt(row.clone(), rows);
-    // One output row spans every promoted position of every reduced element,
-    // so its stride carries `vec_extent`.
+    // A row's stride carries every promoted position.
     let pos_stride = b.mul(inner.clone(), axis_extent.clone());
     let row_stride = match fast {
         Some(_) => pos_stride.clone(),
@@ -217,13 +208,8 @@ pub(crate) fn lower_kfold(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resul
     let row_base = b.row_base(row.clone(), inner.clone(), row_stride);
 
     // One lifted value per lane at element `k`, each guarded to its own
-    // identity outside the reduced extent: a lane past the extent must
-    // contribute nothing to every slot (Welford's constant `1` lift would
-    // count a padding lane under a shared identity).
-    //
-    // A `Vector` slot is `vec_extent` registers, and lane `(slot, p)` reads
-    // every operand at promoted position `p`; an operand invariant in the
-    // promoted axes is hash-consed back to one read reused across positions.
+    // identity past the extent (Welford's constant `1` lift must not count a
+    // padding lane). Lane `(slot, p)` reads operands at promoted position `p`.
     let lift_at = |k: &TileExpr, body: &mut Vec<Stmt>| -> Result<Vec<TileExpr>> {
         let in_range = b.lt(k.clone(), axis_extent.clone());
         let mut per_pos: Vec<(Vec<TileExpr>, Vec<TileExpr>)> =
@@ -261,8 +247,7 @@ pub(crate) fn lower_kfold(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resul
                     _ => ctx.load_mapped(operand, idx.clone(), space_total)?,
                 });
             }
-            // `IndexOf` on this node names an ITERATION axis; resolve it
-            // through `iter_axes` rather than against `space` directly.
+            // `IndexOf` names an iteration axis, resolved via `iter_axes`.
             let full = ctx.coords_from_linear(idx, space)?;
             let coords = lanes.iter_axes.iter().map(|i| full[*i].clone()).collect();
             per_pos.push((args, coords));
@@ -288,8 +273,7 @@ pub(crate) fn lower_kfold(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resul
     let partials: Vec<TileExpr> = if one_pass {
         lift_at(&lane, &mut stmts)?
     } else {
-        // The per-lane strided loop, carrying `lanes` SSA accumulators seeded
-        // from the carrier's identities and absorbed with its own `merge`.
+        // The per-lane strided loop over identity-seeded accumulators.
         let index = b.local(ScalarElement::U32.element());
         let k = b.add(
             b.mul(b.load_local(index.clone()), lg_e.clone()),
@@ -330,10 +314,8 @@ pub(crate) fn lower_kfold(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resul
         reads
     };
 
-    // The cross-lane close: one scratch tile per lane, one merge per lane.
-    // Skipped at a one-lane group: that invocation already reduced the whole
-    // axis for its own row and there is no partner to merge with.
-    // `fold_scratch_bytes` reports 0 here; the two must agree.
+    // The cross-lane close, skipped for a one-lane group (which
+    // `fold_scratch_bytes` must agree prices at 0).
     let reduced: Vec<TileExpr> = match fast {
         Some(op) => {
             let value = partials[0].clone();

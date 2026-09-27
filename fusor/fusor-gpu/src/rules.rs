@@ -1,10 +1,5 @@
 //! GPU-exclusive lowering rules: the ones that mention lane or subgroup
-//! geometry. Logical rules are inherited from `fusor-ir`, schedule-domain
-//! rules from `fusor-tile`.
-//!
-//! Every guard reads [`Facts`] alone — device capabilities, shapes and dtypes.
-//! A rule that would not pay still fires; `fusor-cost` rejects it on
-//! realized-DAG cost.
+//! geometry. Guards read [`Facts`] alone; `fusor-cost` rejects what won't pay.
 
 use fusor_ir::egraph::{Builder, Facts, Id, Rule, RuleTag};
 use fusor_ir::ir::launch::{Launch, ScatterMode};
@@ -23,9 +18,7 @@ rule!(
 );
 
 /// Mint `Scatter{Atomic}`.
-///
-/// The only legality question is whether the device has `atomicAdd` on f32 in
-/// storage.
+/// The only legality question is f32 `atomicAdd` in storage.
 fn gpu_scatter_atomic(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     if !f.caps().atomic_f32 {
         return None;

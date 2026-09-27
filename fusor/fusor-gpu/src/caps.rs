@@ -1,34 +1,24 @@
-//! Capability probing. Every performance feature is probed with a working
-//! fallback: SUBGROUP -> `WgTree` folds, SHADER_F16 -> f32,
-//! EXPERIMENTAL_COOPERATIVE_MATRIX -> `Family::Sgemm`, PIPELINE_CACHE -> cold
-//! compile, TIMESTAMP_QUERY -> no profiling.
-//!
-//! Limits are the **WebGPU baseline**, never `adapter.limits()`, ensuring plans
-//! remain legal across all devices. A caller widens exactly the fields a selected
-//! kernel proves it needs, and a widening the adapter cannot supply is an error
-//! rather than a silent clamp downwards.
+//! Capability probing. Every performance feature has a working fallback
+//! (SUBGROUP, SHADER_F16, cooperative matrix, TIMESTAMP_QUERY). Limits are the
+//! WebGPU baseline, widened only where a selected kernel proves it needs it;
+//! a widening the adapter cannot supply is an error.
 
 use fusor_ir::device::{Caps, CoopKind, DeviceKind, Limits, SubgroupWidths};
 use fusor_ir::dtype::Dtype;
 use fusor_ir::error::{Error, Result};
 use smallvec::SmallVec;
 
-/// `true` only under the `fork-metal` cargo feature, which contributes
-/// exactly two capabilities: workgroup-alias byte-arena packing and
-/// mixed-precision cooperative store. Their absence costs `ArenaMode::Regions`
-/// packing and a staging tile — footprint, never correctness.
+/// `true` only under `fork-metal`: workgroup-alias byte arenas and the
+/// mixed-precision cooperative store. Their absence costs footprint only.
 #[cfg(feature = "fork-metal")]
 pub(crate) const FORK_METAL: bool = true;
 /// See the `fork-metal` arm.
 #[cfg(not(feature = "fork-metal"))]
 pub(crate) const FORK_METAL: bool = false;
 
-/// The WebGPU baseline. **Not** `adapter.limits()`.
-///
-/// Starts from wgpu's own spec defaults and then overwrites, field for field,
-/// the six limits the compiler actually reads from
-/// [`fusor_ir::device::Limits::default()`], so the wgpu request and the IR's
-/// legality model cannot drift apart.
+/// The WebGPU baseline, **not** `adapter.limits()`: wgpu's spec defaults with
+/// the six limits the compiler reads taken from
+/// [`fusor_ir::device::Limits::default()`].
 pub(crate) fn baseline_limits() -> wgpu::Limits {
     let ir = Limits::default();
     wgpu::Limits {
@@ -77,11 +67,7 @@ pub(crate) fn widen_limits(
     Ok(base)
 }
 
-/// The wgpu features to request, given what the adapter supports. Each is
-/// optional and independently fallback-covered.
-///
-/// Native `TIMESTAMP_QUERY` supports the synchronous tuner. Browser timing
-/// remains disabled until that tuner can resolve queries asynchronously.
+/// The wgpu features to request; each is optional and fallback-covered.
 pub(crate) fn requested_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     let available = adapter.features();
     let mut wanted = wgpu::Features::empty();
@@ -94,25 +80,18 @@ pub(crate) fn requested_features(adapter: &wgpu::Adapter) -> wgpu::Features {
     want(wgpu::Features::SUBGROUP);
     want(wgpu::Features::SHADER_F16);
     want(wgpu::Features::PIPELINE_CACHE);
-    // wasm32 never requests timestamps: the tuner's clock reads its query
-    // set back synchronously right after the resolve, and a browser can only
-    // deliver a buffer map from its event loop, so holding the bit would
-    // deadlock the page on the first timed resolve. Without the bit
-    // `timestamp_query_set` is `None` and every consumer takes its
-    // "not timed" path.
+    // wasm32 never requests timestamps: the tuner reads its query set back
+    // synchronously, which would deadlock a browser page.
     #[cfg(not(target_arch = "wasm32"))]
     if available.contains(wgpu::Features::TIMESTAMP_QUERY) {
         want(wgpu::Features::TIMESTAMP_QUERY);
         want(wgpu::Features::TIMESTAMP_QUERY_INSIDE_PASSES);
     }
-    // Cooperative matrices are experimental: requesting the bit additionally
-    // needs `unsafe ExperimentalFeatures::enabled()` on the descriptor, which
-    // `device::request_device` supplies. The web backend maps Dawn's extension.
+    // Cooperative matrices are experimental; `device::request_device` supplies
+    // the `ExperimentalFeatures` token.
     want(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX);
-    // The second experimental bit, EXPERIMENTAL_WORKGROUP_MEMORY_ALIAS, exists
-    // only on the wgpu fork; released wgpu 29 does not define it. The
-    // byte-arena emitter does not depend on it (see `emit::types`), so its
-    // absence costs packing density, not correctness.
+    // EXPERIMENTAL_WORKGROUP_MEMORY_ALIAS exists only on the wgpu fork; the
+    // byte-arena emitter does not need it.
     wanted
 }
 
@@ -121,19 +100,15 @@ pub(crate) fn needs_experimental(features: wgpu::Features) -> bool {
     features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
 }
 
-/// Apple GPUs advertise a *range* of subgroup sizes even though every shipping
-/// part runs 32-wide. A ranged width makes [`SubgroupWidths::is_fixed`] false,
-/// which disables every cooperative tile and the qgemv fast path.
+/// Apple GPUs advertise a subgroup-size range but run 32-wide; a ranged
+/// width would disable every cooperative tile and the qgemv fast path.
 fn apple_fixed_subgroup_size(backend: wgpu::Backend, name: &str) -> Option<SubgroupWidths> {
     (backend == wgpu::Backend::Metal && name.starts_with("Apple"))
         .then_some(SubgroupWidths { min: 32, max: 32 })
 }
 
-/// Accept a cooperative-matrix property only in the one shape the lowerer can
-/// emit: `m == n == k == 8 && !saturating_accumulation`, F32/F32 always and
-/// F16/F16 only with `SHADER_F16`. Mixed F16-operand / F32-accumulator is
-/// rejected even where the fork's MSL backend supports it, so a plan cannot
-/// depend on a fork-only numeric behaviour.
+/// Accept a cooperative-matrix property only in the shape the lowerer emits:
+/// 8x8x8, non-saturating, F32/F32, or F16/F16 with `SHADER_F16`.
 pub(crate) fn coop_kinds(
     features: wgpu::Features,
     props: &[wgpu::CooperativeMatrixProperties],
@@ -233,10 +208,7 @@ pub(crate) fn build_caps(
         // storage dtype widened to f32 for compute by the `widen-compute` rule.
         bf16: false,
         coop: coop_kinds(features, coop_props),
-        // `atomicAdd` on f32 is emitted as a bitcast compare-exchange loop
-        // (see `emit::stmt`), which every WebGPU backend supports. That loop is
-        // what makes `ScatterMode::Atomic` a live candidate for the embedding
-        // gradient.
+        // f32 `atomicAdd` is a bitcast compare-exchange loop every backend supports.
         atomic_f32: kind == DeviceKind::Gpu,
         workgroup_alias: fork,
         mixed_precision_coop_store: fork,

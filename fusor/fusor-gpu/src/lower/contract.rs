@@ -1,10 +1,7 @@
 //! Dense contraction: the cooperative-matrix, SGEMM and SGEMV bodies.
 //!
-//! All families coexist in one e-class, so nothing here routes: the arm
-//! that runs is the one extraction selected. `pre_a`/`pre_b`/`post` fuse into
-//! the k-loop prologue and epilogue; when the device cannot host a
-//! mixed-precision cooperative store the accumulator stages through a
-//! workgroup tile with a per-lane cast — footprint, never correctness.
+//! The arm that runs is the one extraction selected. `pre_a`/`pre_b`/`post`
+//! fuse into the k-loop prologue and epilogue.
 
 use fusor_ir::Result;
 use fusor_ir::error::Error;
@@ -21,9 +18,7 @@ use fusor_ir::shape::Dim;
 
 use crate::lower::{Ctx, StagedSource, distribute_workgroups, scalar_element};
 
-/// Dispatch on the selected family. The family is a property of *this
-/// lowering*, never of the Logical node, so a gemv-shaped contraction cannot pick
-/// Coop, have a tile scorer decline, and silently run a third path.
+/// Dispatch on the family this lowering was selected at.
 pub(crate) fn lower_contract(
     ctx: Ctx<'_>,
     op: &Launch,
@@ -72,11 +67,8 @@ struct Side<'o> {
     coords: Option<SideCoords>,
 }
 
-/// What every family reads off a `Contract` node before building its body.
-///
-/// The operands are presented as 2-D matrices in their own strides: A is
-/// `[batch * m, k]` and B is `[batch * k, n]`, whatever ranks those extents
-/// are spread across. A transposed rhs is a stride swap, never a copy.
+/// What every family reads off a `Contract` node: A as `[batch * m, k]` and
+/// B as `[batch * k, n]` in their own strides; a transposed rhs is a stride swap.
 struct Contract<'o> {
     shape: Shape,
     post: &'o ScalarExpr,
@@ -187,10 +179,8 @@ impl Side<'_> {
     }
 }
 
-/// A masked-out k lane contributes a zero, not `pre(0)`. The loads fill 0,
-/// but `pre` is an arbitrary scalar program over them: `exp(s*scale - m) / l`
-/// turns an all-zero fill into `inf`, and `fma(inf, 0, acc)` is NaN into the
-/// whole k-sum.
+/// A masked-out k lane contributes a zero, not `pre(0)`: `pre` may turn the
+/// zero fill into `inf`, and `fma(inf, 0, acc)` poisons the k-sum.
 fn zero_unless(
     ctx: &Ctx<'_>,
     masked: bool,
@@ -263,9 +253,8 @@ struct CoopShape {
 }
 
 impl CoopShape {
-    /// `CoopGeom::legal` plus whole-fragment K tiles and N passes, spelled as
-    /// an error rather than a silent truncation: a geometry whose fragment
-    /// grid does not tile its block would drop the remainder rows.
+    /// `CoopGeom::legal` plus whole-fragment K tiles and N passes; a fragment
+    /// grid that does not tile its block is an error, not a truncation.
     fn of(geom: CoopGeom, width: u32, max_lanes: u32) -> Result<Self> {
         let dim = CoopGeom::COOP_DIM;
         if !geom.legal(width, max_lanes)
@@ -293,17 +282,10 @@ impl CoopShape {
 
 /// `CoopLoad` / `CoopMma` / `CoopStore`.
 ///
-/// One workgroup per `(split, batch, m_block, n_block)`, `n_passes` column
-/// sub-passes, a `frags_m x frags_n` accumulator grid per subgroup, and a k
-/// loop that stages `staging` K tiles per iteration between two barriers.
-/// `pre_a` / `pre_b` fuse into the staging copy and are forced to zero past
-/// the logical extents, so `pre(0)` cannot leak into an edge tile. `post`
-/// fuses into the epilogue: into the per-lane pass when the accumulator
-/// stages through a tile, and otherwise into an in-place pass over this
-/// workgroup's own output block, which is disjoint from every other
-/// workgroup's.
-///
-/// Split-K is represented by separate partial and combine graph nodes.
+/// One workgroup per `(split, batch, m_block, n_block)`; the k loop stages
+/// `staging` K tiles per iteration between two barriers. `pre` is zeroed past
+/// the logical extents; `post` fuses into the epilogue over this workgroup's
+/// own disjoint output block.
 fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Result<KernelIr> {
     let shape = c.shape;
     let n = bound_u32(&ctx, shape.n)?.max(1);
@@ -333,10 +315,8 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
     };
     let out_elem = out_view.buffer.element;
 
-    // Operand staging tiles: `staging` buffers stacked inside one
-    // declaration — the footprint `verify_launch::coop_tiles` admitted the
-    // geometry on (`depth * bm * bk` plus `depth * bk * bn_pass`), and what
-    // the k loop's `depth`-strided addressing below is written against.
+    // Operand staging tiles: `staging` buffers stacked in one declaration, the
+    // footprint `verify_launch::coop_tiles` admitted.
     let a_tile = b.tile(
         "coop_a",
         operand_elem.element(),
@@ -367,9 +347,7 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
     let row_block = b.mul(m_tile, b.u32(geom.bm.max(1)));
     let col_block = b.mul(n_tile, b.u32(geom.bn.max(1)));
 
-    // Operand row origins of this batch element. The logical row base is
-    // what a `post` body's `IndexOf` reads: `row` counts `(batch, m)`,
-    // exactly as the register-tiled families pass it.
+    // Operand row origins of this batch element; `row` counts `(batch, m)`.
     let m_e = b.u32(shape.m.max(1));
     let k_e = ctx.dim_expr(shape.k)?;
     let a_batch_base = b.mul(batch_index.clone(), m_e.clone());
@@ -426,10 +404,8 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
     for pass in 0..geom.n_passes {
         let pass_col_base = b.add(col_block.clone(), b.u32(pass.saturating_mul(cs.bn_pass)));
 
-        // The k loop. `Stmt::Loop` runs `body` before the accumulator updates,
-        // so the two barriers around the staging copy separate the previous
-        // iteration's fragment reads from this iteration's tile writes and
-        // then publish them.
+        // The k loop: two barriers around the staging copy separate the previous
+        // iteration's fragment reads from this iteration's tile writes.
         let mut loop_body: Vec<Stmt> = vec![Stmt::Barrier];
         let k_index = b.local(ScalarElement::U32.element());
         let iter_base = b.mul(
@@ -587,11 +563,8 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
                 epilogue(&mut body, &|flat, _, _, _| b.load_tile(tile.clone(), flat))?;
                 body.push(Stmt::Barrier);
             }
-            // Fragments are opaque to scalar code, so a fused `post` reads them
-            // back: store, make the writes visible inside the workgroup, then
-            // map `post` over this workgroup's own block in place. That block
-            // is disjoint from every other workgroup's, so the
-            // read-modify-write races with nothing.
+            // Fragments are opaque to scalar code, so a fused `post` stores, barriers,
+            // then maps `post` in place over this workgroup's disjoint block.
             None if !post_is_identity => {
                 body.push(Stmt::StorageBarrier);
                 epilogue(&mut body, &|_, row, col, active| {
@@ -610,14 +583,9 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
     Ok(ctx.finish("coop_matmul", grid, block, body))
 }
 
-/// The flat workgroup index of this launch, linearized against **this** grid
-/// rather than against the per-dimension cap — `distribute_workgroups` sizes
-/// `x` to the slab, so the cap is not the x extent.
-///
-/// A cooperative op needs uniform control flow, so an overhang workgroup
-/// cannot return early: it is clamped onto the last block, recomputes it and
-/// stores the same values. The clamp is emitted only when the grid
-/// over-covers.
+/// The flat workgroup index, linearized against this grid. A cooperative op
+/// needs uniform control flow, so an overhang workgroup is clamped onto the
+/// last block (only when the grid over-covers) and stores the same values.
 fn workgroup_index(ctx: &Ctx<'_>, grid: [u32; 3], groups: u32) -> TileExpr {
     let id = ctx.linear_workgroup();
     let covered = u64::from(grid[0]) * u64::from(grid[1]) * u64::from(grid[2]);
@@ -655,12 +623,9 @@ fn split_const(ctx: &Ctx<'_>, index: TileExpr, extent: u32, stride: u32) -> (Til
     }
 }
 
-/// `local_tile -> (m_tile, n_tile)`, walked in super-blocks of `group` M lines
-/// M-fastest, so a resident wavefront shares one B column slab while touching
-/// only `group` A row slabs. A bijection on `[0, tiles_m * tiles_n)`: the
-/// ragged tail of `tiles_m % group` M lines walks in the same order.
-/// Degenerate grids keep the plain row-major decomposition, which is also what
-/// `group == 1` reduces to.
+/// `local_tile -> (m_tile, n_tile)`, walked in super-blocks of `group` M
+/// lines M-fastest so a wavefront shares one B column slab. A bijection on
+/// `[0, tiles_m * tiles_n)`; `group == 1` is plain row-major.
 fn swizzle_tile(
     ctx: &Ctx<'_>,
     local_tile: TileExpr,
@@ -698,15 +663,9 @@ fn swizzle_tile(
     )
 }
 
-/// The coordinate vector one contraction side hands its `pre`.
-///
-/// An absorbed producer's body may read its own loop coordinates, and after
-/// absorption those axes name the operand's axes. The side's staging loops
-/// know only the flattened `(row, col)` pair, so this splits it back: `row`
-/// enumerates the leading `split` axes row-major and `col` the rest — the
-/// factorization `matrix_split_for` proved exists.
-///
-/// Built only when the side's `pre` names a coordinate.
+/// The coordinate vector one contraction side hands its `pre`: `(row, col)`
+/// split back into the operand's axes at `split`. Built only when `pre` names
+/// a coordinate.
 struct SideCoords {
     extents: Vec<Dim>,
     split: usize,
@@ -751,9 +710,8 @@ impl SideCoords {
     }
 }
 
-/// The element a staging load of this source yields — the buffer's own for a
-/// plain storage read, f32 for a decode. Must agree with `Kernel::load`,
-/// which types the resulting expression the same way.
+/// The element a staging load yields: the buffer's own, or f32 for a decode.
+/// Must agree with `Kernel::load`.
 fn source_element(src: &Source) -> ScalarElement {
     match src {
         Source::Storage(v) => match v.buffer.element {
@@ -764,10 +722,8 @@ fn source_element(src: &Source) -> ScalarElement {
     }
 }
 
-/// One load per buffer a side reads, all at the same `(row, col)`; `pre` is
-/// written over `Arg(0..sources.len())` in operand order. Each out-of-range
-/// fill takes its own source's element type: a decode reads `u32` words and
-/// only becomes the staged element after `pre` has run.
+/// One load per buffer a side reads, all at the same `(row, col)`; `pre` reads
+/// `Arg(0..sources.len())`. Each fill takes its own source's element type.
 fn load_staged(
     ctx: &Ctx<'_>,
     sources: &[StagedSource],
@@ -836,14 +792,8 @@ struct StageNest<'e> {
 
 impl StageNest<'_> {
     /// Copy a `rows x cols` window at `origin` of one side into `tile` from
-    /// element `tile_base`, `block` elements per pass, applying `pre` on the
-    /// way in.
-    ///
-    /// The source may be block-quantized: a [`Source::Quantized`] runs the
-    /// format's decode program at `(row, col)` and yields f32, so the staging
-    /// tile holds decoded values and everything downstream is identical to
-    /// the dense path. Past `limit` the tile holds a zero, not `pre(0)`: an
-    /// edge tile's padding must not enter the contraction.
+    /// `tile_base`, `block` elements per pass, applying `pre` on the way in. A
+    /// quantized source decodes to f32; past `limit` the tile holds a zero.
     #[allow(clippy::too_many_arguments)]
     fn copy(
         &self,
@@ -923,15 +873,10 @@ impl StageNest<'_> {
     }
 }
 
-/// Walk a `rows x cols` block one workgroup owns, `lanes` elements per step,
-/// handing the builder `(flat, local_row, local_col, active)`.
-///
-/// A counted loop, not an unrolled sequence, and that is load-bearing:
-/// `Emitter`'s hash-cons memo is scoped to a block and is not invalidated by
-/// a barrier, so an identical `LoadTile(tile, flat)` emitted twice at the top
-/// level of one kernel resolves to the first one's SSA value. A loop body is
-/// a nested scope and its index is a fresh identity-bearing `Local`, so each
-/// call mints its own read.
+/// Walk a `rows x cols` block, `lanes` elements per step, handing the builder
+/// `(flat, local_row, local_col, active)`. A counted loop, not unrolled: the
+/// emitter's block-scoped memo would otherwise merge two identical `LoadTile`s
+/// across a barrier.
 fn per_lane_block(
     ctx: &Ctx<'_>,
     body: &mut Vec<Stmt>,
@@ -965,16 +910,9 @@ fn per_lane_block(
 }
 
 /// SGEMM with a per-thread `tn`-wide register accumulator: one lane owns `tn`
-/// adjacent output columns of one output row and reuses the A element across
-/// them, which is the register-reuse term `SgemmParams` prices. The emitted
-/// kernel reads A and B straight from storage, one lane per
-/// `(row, column tile)` of the output with a k loop over `tn` accumulators,
-/// and the batch index is recovered from the output row rather than from a
-/// third grid axis.
-///
-/// The output is contiguous: `plan::buffer_layout_for` pads nothing at these
-/// schedule points, and every store below is masked, so the address is the
-/// flat row-major index `row * n + col` of `[batch.., m.., n..]`.
+/// adjacent output columns of one row and reuses the A element across them.
+/// The output is contiguous and every store masked, so the address is
+/// `row * n + col`.
 fn lower_sgemm(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemmParams) -> Result<KernelIr> {
     let shape = c.shape;
     let b = &ctx.b;
@@ -1034,9 +972,7 @@ fn lower_sgemm(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemmParams) -> Result<KernelI
     }];
     let n_e = ctx.dim_expr(shape.n)?;
     for (local, (col, ok)) in locals.into_iter().zip(cols) {
-        // `row` counts `(batch, m)` and `col` counts `n`, so `row * n + col` is
-        // the flat row-major index of a `[batch.., m.., n..]` output — for any
-        // number of axes on each side.
+        // `row * n + col` is the flat row-major index of `[batch.., m.., n..]`.
         let addr = Addr::Linear(b.add(b.mul(row.clone(), n_e.clone()), col.clone()));
         let total = b.load_local(local);
         body.push(c.store_post(&ctx, &out, total, row.clone(), col, addr, ok)?);
@@ -1044,11 +980,9 @@ fn lower_sgemm(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemmParams) -> Result<KernelI
     Ok(ctx.finish("sgemm", grid, block, body))
 }
 
-/// Full vector passes followed by the remaining contiguous K slices. A runtime
-/// extent keeps the tail loop uniform while masking only its final slice.
-///
-/// `pass_at(step, masked, from, vector, contiguous)` is one pass's updates,
-/// continuing `from`.
+/// Full vector passes then the remaining contiguous K slices; only the final
+/// slice of a runtime extent is masked. `pass_at(step, masked, from, vector,
+/// contiguous)` is one pass's updates.
 fn gemv_partials(
     ctx: &Ctx<'_>,
     body: &mut Vec<Stmt>,
@@ -1150,9 +1084,7 @@ fn gemv_partials(
     Ok(locals)
 }
 
-/// `(row, column)` of workgroup `wg` over `per_row` column groups per output
-/// row, the row clamped onto the last one (an overhang workgroup recomputes
-/// it).
+/// `(row, column)` of workgroup `wg`, the row clamped onto the last one.
 fn row_col(ctx: &Ctx<'_>, wg: TileExpr, per_row: TileExpr, rows: u32) -> (TileExpr, TileExpr) {
     let (row, col) = ctx.b.divrem(wg, per_row);
     (ctx.b.min(row, ctx.b.u32(rows - 1)), col)
@@ -1169,11 +1101,8 @@ fn lower_sgemv(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> Result<KernelI
         .max(1);
     let out = ctx.linear_view(ctx.output()?)?;
     let lane = b.builtin(Builtin::Lane);
-    // One workgroup per output element, not per output row: the grid covers
-    // `rows * n` and B is addressed at `(k, col)`. The flat workgroup index
-    // is linearized against the dispatch grid — never raw `ProgramId(X)`,
-    // because past the per-dimension cap `distribute_workgroups` folds the
-    // dispatch onto a second slab.
+    // One workgroup per output element, linearized against the dispatch grid
+    // (`distribute_workgroups` may fold it onto a second slab).
     let rows = c.rows();
     let grid = crate::lower::grid_for(
         &IndexSpace::new([Dim::Const(u64::from(rows)), shape.n]),
@@ -1182,24 +1111,16 @@ fn lower_sgemv(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> Result<KernelI
         &ctx.caps.limits,
     )?;
     let wg = column_workgroup_index(&ctx, grid, rows, shape.n, 1)?;
-    // `wg` enumerates `[batch, m, n]` row-major: `row` is the A matrix row
-    // (`batch * m + m_idx` — exactly the flat `wg / n`), and B's row is the
-    // batch's k block plus the loop's own k.
+    // `wg` enumerates `[batch, m, n]` row-major; B's row is the batch's k block
+    // plus the loop's k.
     let (row, col) = row_col(&ctx, wg.clone(), ctx.dim_expr(shape.n)?, rows);
     let (batch, b_row_base) = c.batch_of(&ctx, &row)?;
     let locals = vec![b.local(c.acc.element())];
 
-    // One pass of the k loop starting at `step`: the lane's partial,
-    // continued from its accumulator. `masked` bounds each element against
-    // k; only the tail past the last full pass needs it. A constant-true
-    // mask routes dense loads to the unclamped straight-line path and
-    // quantized loads to the direct decode — the clamp `Min` a mask forces
-    // is opaque to the aligned-window algebra, so masking every pass of an
-    // inexact k cost one decode per element on a block-quantized operand.
-    //
-    // Each lane owns `vector` consecutive elements of k: overlapping lanes
-    // would double-count the window, and contiguous ownership lets a
-    // quantized operand amortize its block decode across the window.
+    // One k-loop pass from `step`, continuing the lane's accumulator. Only the
+    // tail pass is masked: a mask's clamp defeats the aligned-window decode.
+    // Each lane owns `vector` consecutive k elements so a quantized operand
+    // amortizes its block decode.
     let pass_at = |step: TileExpr,
                    masked: bool,
                    from: &[Local],
@@ -1244,21 +1165,11 @@ fn lower_sgemv(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> Result<KernelI
     Ok(ctx.finish("sgemv", grid, block, body))
 }
 
-/// The `cols > 1` SGEMV structure: `p.cols` output columns per workgroup,
-/// each subgroup owning `cols / subgroups` of them end-to-end.
-///
-/// All `width` lanes of one subgroup cooperate on each of its columns, so a
-/// pass covers `width * vector` consecutive k elements — at `vector = 8` on a
-/// 32-lane device that is exactly one 256-element quant super-block. The
-/// pass's activation window is evaluated once per lane and reused across the
-/// subgroup's columns (the A loads never mention the column, so they
-/// hash-cons to a single evaluation; only the B loads and FMAs repeat), and
-/// the reduction is a subgroup sum — no workgroup scratch, no barrier.
-///
-/// The grid is `rows * ceil(n / cols)` workgroups decomposed as
-/// `(row, column group)` so `row` is uniform across the workgroup — a flat
-/// `element / cols` split would straddle row boundaries and give each column
-/// its own `row` expression, forfeiting the shared activation window.
+/// The `cols > 1` SGEMV: `p.cols` output columns per workgroup, each subgroup
+/// owning `cols / subgroups` of them. A pass covers `width * vector` k, the
+/// activation window hash-conses to one evaluation shared across columns, and
+/// the reduction is a subgroup sum. The grid is decomposed as
+/// `(row, column group)` so `row` is workgroup-uniform.
 fn lower_sgemv_subgroup_cols(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> Result<KernelIr> {
     let shape = c.shape;
     let b = &ctx.b;
@@ -1318,15 +1229,9 @@ fn lower_sgemv_subgroup_cols(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> 
                    vector: u32,
                    contiguous: bool|
      -> Result<Vec<TileExpr>> {
-        // Each lane owns `vector` elements of the subgroup's pass. At
-        // `parts == 1` they are consecutive — the same contiguous-ownership
-        // contract as the whole-workgroup path. At `parts > 1` the window is
-        // `parts` runs of `run` consecutive elements spaced `gap` apart:
-        // `gap / run` adjacent lanes pack their runs into each gap, and a
-        // lane's runs interleave across `parts` gaps, so the pass still
-        // covers exactly `width * vector` consecutive k. A window that
-        // revisits a bit-packed word at each of its k offsets makes the word
-        // loads hash-cons to one evaluation instead of one per run.
+        // Each lane owns `vector` elements of the pass: consecutive at `parts == 1`,
+        // else `parts` runs of `run` spaced `gap` apart, still covering exactly
+        // `width * vector` consecutive k so packed-word loads hash-cons.
         let split = !contiguous && parts > 1;
         let lane_base = match split {
             false => b.add(step, b.mul(sg_lane.clone(), b.u32(vector))),
@@ -1340,9 +1245,8 @@ fn lower_sgemv_subgroup_cols(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> 
             }
         };
 
-        // The pass's activation window, evaluated once and reused by every
-        // column this subgroup owns. Element `v` sits `(v / run) * gap +
-        // v % run` from the lane base, which is `v` when unsplit.
+        // The pass's activation window, shared by every column this subgroup owns;
+        // element `v` sits `(v / run) * gap + v % run` from the lane base.
         let mut a_vals: Vec<(TileExpr, TileExpr, TileExpr)> = Vec::with_capacity(vector as usize);
         for v in 0..vector {
             let off = if split {

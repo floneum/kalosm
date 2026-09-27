@@ -1,8 +1,7 @@
 //! `KernelIr` -> naga `Module`.
 //!
-//! One up-front [`Analysis`] walk decides every capability the module will
-//! declare *before* a single expression is lowered. Gating f16 up front is
-//! what makes an f16 handle on a non-f16 adapter fail with
+//! One up-front [`Analysis`] walk decides every capability the module declares,
+//! so an f16 handle on a non-f16 adapter fails as
 //! [`EmitError::MissingCapability`] instead of mis-lowering.
 
 pub(crate) mod coop;
@@ -21,8 +20,6 @@ use fusor_ir::ir::kernel::{
 use fusor_ir::target::EmitError;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::bindings::{BindingDesc, bindings_from_module};
-
 /// `@builtin(local_invocation_index)`, always argument 0.
 pub(crate) const LOCAL_INVOCATION_INDEX_ARG: u32 = 0;
 /// `@builtin(workgroup_id)`, always argument 1.
@@ -36,52 +33,26 @@ pub(crate) const MEM_SPACES: [MemReads; 3] = [MemReads::STORAGE, MemReads::TILE,
 /// One write counter per entry of [`MEM_SPACES`].
 pub(crate) type MemStamp = [u32; MEM_SPACES.len()];
 
-/// A validated module plus everything the launcher needs and cannot re-derive.
+/// A validated module and the info its WGSL serialization needs.
 #[derive(Debug)]
 pub struct EmittedModule {
     pub module: naga::Module,
     pub info: naga::valid::ModuleInfo,
-    /// Derived from the module's storage globals — the *only* source of
-    /// binding order in this crate.
-    pub bindings: Vec<BindingDesc>,
-    pub workgroup_size: [u32; 3],
-    /// Whether the WGSL serialization needs `enable subgroups;`.
-    pub subgroups: bool,
 }
 
-/// Emit one kernel. The result is validated before
-/// `create_shader_module_trusted` is allowed anywhere near it.
-///
-/// The workgroup-arena plan comes from the *same* memoized `arena_plan` the Launch
-/// footprint check and the occupancy term read, never a local estimator — that
-/// identity is what makes "extraction commits a plan that fails Kernel
-/// verification" unstateable.
+/// Emit one kernel, validated before `create_shader_module_trusted` sees it.
+/// The arena plan is the same memoized `arena_plan` the Launch footprint check
+/// reads.
 pub fn emit(ir: &KernelIr, caps: &Caps) -> Result<EmittedModule, EmitError> {
     let planner = fusor_tile::Planner::shared();
     let plan = <dyn fusor_ir::ir::kernel::ArenaPlanner>::arena_plan(&*planner, ir, caps)
         .map_err(|e| EmitError::Unsupported(format!("arena_plan: {e}")))?;
-    emit_module(ir, caps, &plan)
+    Emitter::new(ir, caps, &plan)?.finish()
 }
 
-/// Emit with a plan the caller already has, which must not be recomputed.
-pub(crate) fn emit_module(
-    ir: &KernelIr,
-    caps: &Caps,
-    plan: &ArenaPlan,
-) -> Result<EmittedModule, EmitError> {
-    Emitter::new(ir, caps, plan)?.finish()
-}
-
-/// Whether a `ReduceKind::Workgroup` tree at `group_size` on a `block`-lane
-/// kernel is emitted as the subgroup two-stage (one collective per subgroup,
-/// partials staged through scratch, two barriers) instead of the barrier
-/// tree (`2 + log2(block)` barriers). `width` is the *fixed* subgroup width,
-/// `None` when the device has none: a varying width would make `block/width`
-/// a guess, and a guessed slot count is a race, not a reduction.
-///
-/// Grouped trees (`group_size < block`) and non-scalar/bool elements keep
-/// the tree — the collective reduces the whole subgroup, which crosses group
-/// boundaries, and `subgroupAdd` on bool is undefined.
+/// Whether a `ReduceKind::Workgroup` tree is emitted as the subgroup
+/// two-stage instead of the barrier tree. Needs a fixed subgroup `width`, a
+/// whole-block group and a non-bool scalar element.
 pub(crate) fn collective_tree(
     width: Option<u32>,
     block: u32,
@@ -94,9 +65,8 @@ pub(crate) fn collective_tree(
         && crate::reduction::CollectivePlan::new(block, w).is_some()
 }
 
-/// One walk of the whole body, run before any expression is lowered. Everything
-/// the module declares — types, entry-point arguments, atomic buffer types and
-/// the validation capability set — is decided here.
+/// One walk of the whole body before any expression is lowered: types,
+/// entry-point arguments, atomic buffer types and capabilities are decided here.
 #[derive(Debug, Default)]
 pub(crate) struct Analysis {
     pub uses_f16: bool,
@@ -117,9 +87,7 @@ pub(crate) struct Analysis {
     pub buffers: Vec<Buffer>,
     pub tiles: Vec<Tile>,
     pub locals: Vec<Local>,
-    /// The device's fixed subgroup width, when it has one — what decides
-    /// whether a workgroup tree upgrades to the subgroup two-stage
-    /// ([`collective_tree`]), so the walk flags the builtins that path reads.
+    /// The device's fixed subgroup width, which decides [`collective_tree`].
     fixed_width: Option<u32>,
     /// The kernel's workgroup size, for the same decision.
     block: u32,
@@ -159,9 +127,8 @@ impl Analysis {
         a
     }
 
-    /// A workgroup tree the emitter will upgrade to the subgroup two-stage
-    /// reads the collective and — past one subgroup — the subgroup id and
-    /// lane, none of which appear in the IR itself.
+    /// A tree upgraded to the subgroup two-stage reads the collective and the
+    /// subgroup id and lane, none of which appear in the IR.
     fn note_tree(&mut self, group_size: u32, element: ElementType) {
         if collective_tree(self.fixed_width, self.block, group_size, element) {
             self.uses_subgroup_collective = true;
@@ -216,19 +183,16 @@ impl Analysis {
                 addr,
                 value,
                 mask,
-            } => {
-                self.note_buffer(&dst.buffer, seen);
-                self.addr(addr, seen);
-                self.expr(value, seen);
-                self.expr(mask, seen);
             }
-            Stmt::AtomicAdd {
+            | Stmt::AtomicAdd {
                 dst,
                 addr,
                 value,
                 mask,
             } => {
-                self.atomic_buffers.insert(dst.buffer.binding);
+                if matches!(stmt, Stmt::AtomicAdd { .. }) {
+                    self.atomic_buffers.insert(dst.buffer.binding);
+                }
                 self.note_buffer(&dst.buffer, seen);
                 self.addr(addr, seen);
                 self.expr(value, seen);
@@ -315,9 +279,8 @@ impl Analysis {
                 if matches!(&**kind, ReduceKind::Subgroup) {
                     self.uses_subgroup_collective = true;
                 }
-                // A single-slot fold with a hardware operator takes the
-                // expression path (see `Stmt::Reduce` emission), so the same
-                // two-stage upgrade applies to it.
+                // A single-slot fold with a hardware operator takes the expression path,
+                // so the same upgrade applies.
                 if values.len() == 1 && fast.is_some() {
                     match &**kind {
                         ReduceKind::Workgroup { group_size, .. } => {
@@ -407,9 +370,8 @@ impl Analysis {
 
     fn quantized(&mut self, q: &fusor_ir::ir::kernel::QuantizedView, seen: &mut Seen) {
         self.note_buffer(&q.data.buffer, seen);
-        // Native-layout scales are half floats read out of a u32 word with
-        // `Unpack2x16Float`; that needs SHADER_FLOAT16_IN_FLOAT32, not
-        // SHADER_F16.
+        // Native-layout scales unpack via `Unpack2x16Float`, which needs
+        // SHADER_FLOAT16_IN_FLOAT32, not SHADER_F16.
         if q.layout == fusor_ir::dtype::QLayout::Native {
             self.unpacks_f16 = true;
         }
@@ -457,29 +419,14 @@ pub(crate) struct Emitter<'a> {
     pub(crate) local_handles: FxHashMap<usize, naga::Handle<naga::LocalVariable>>,
     pub(crate) scratch:
         FxHashMap<(ScratchKind, ElementType, u32), naga::Handle<naga::LocalVariable>>,
-    /// Expressions to force into a named temporary, drained into
-    /// [`naga::Function::named_expressions`] by [`Emitter::finish`].
-    ///
-    /// A backend inlines a single-use expression into its consumer, so a run
-    /// of them nests one inside the next and Metal's front end refuses past
-    /// 256 brackets. Naming one emits `const auto _n = <expr>;` — an SSA
-    /// binding, not a memory round trip.
+    /// Expressions forced into a named temporary (drained by [`Emitter::finish`]),
+    /// so inlined single-use chains stay under Metal's 256-bracket limit.
     pub(crate) forced_names: Vec<(naga::Handle<naga::Expression>, String)>,
-    /// Hash-consed expression memo. `TileExpr: Hash + Eq` is O(1) through its
-    /// cached structural hash, so two identical subtrees built separately
-    /// merge here.
-    ///
-    /// Each entry carries the [`Self::mem_epoch`] it was created at. A key
-    /// that reads memory is a hit only while every space it reads is still at
-    /// that epoch — see [`Emitter::expr`].
+    /// Hash-consed expression memo. Each entry carries the [`Self::mem_epoch`]
+    /// it was created at; a memory read hits only while its spaces are unchanged.
     pub(crate) memo: FxHashMap<TileExpr, (naga::Handle<naga::Expression>, MemStamp)>,
-    /// Write counter per memory space, indexed by [`MEM_SPACES`] order:
-    /// storage, workgroup tile, private local.
-    ///
-    /// **Monotonic, and not part of [`expr::Scope`].** A store
-    /// inside an `If` or a loop body must invalidate the *enclosing* block's
-    /// memoized reads as well, and restoring a saved counter on scope exit
-    /// would resurrect exactly the stale entries the store invalidated.
+    /// Write counter per memory space (storage, tile, local). Monotonic and not
+    /// part of [`expr::Scope`]: a nested store must invalidate enclosing reads.
     pub(crate) mem_epoch: MemStamp,
     /// Latest SSA value of each cooperative accumulator local: one `Load`,
     /// N MMAs, one `Store` per scope.
@@ -518,16 +465,7 @@ impl<'a> Emitter<'a> {
             return Err(EmitError::MissingCapability("subgroups"));
         }
 
-        let workgroup_invocations = if ir.block > 0 {
-            ir.block
-        } else {
-            DEFAULT_WORKGROUP_INVOCATIONS
-        };
-        if ir.block != 0 && ir.block != workgroup_invocations {
-            return Err(EmitError::Unsupported(
-                "kernel block must match the workgroup size".into(),
-            ));
-        }
+        let workgroup_invocations = analysis.block;
         if workgroup_invocations > caps.limits.max_compute_invocations_per_workgroup {
             return Err(EmitError::LimitExceeded(format!(
                 "block {workgroup_invocations} exceeds max_compute_invocations_per_workgroup {}",
@@ -624,13 +562,11 @@ impl<'a> Emitter<'a> {
             function.named_expressions.insert(handle, name);
         }
 
-        let workgroup_size = self.workgroup_size;
-        let subgroups = self.analysis.uses_subgroups();
         self.module.entry_points.push(naga::EntryPoint {
             name: "main".into(),
             stage: naga::ShaderStage::Compute,
             early_depth_test: None,
-            workgroup_size,
+            workgroup_size: self.workgroup_size,
             workgroup_size_overrides: None,
             function,
             mesh_info: None,
@@ -639,19 +575,14 @@ impl<'a> Emitter<'a> {
         });
 
         let info = self.module_info()?;
-        let bindings = bindings_from_module(&self.module);
         Ok(EmittedModule {
             module: self.module,
             info,
-            bindings,
-            workgroup_size,
-            subgroups,
         })
     }
 
-    /// Naga's backend requires ModuleInfo even when verification is disabled.
-    /// Production computes that analysis with no validation flags; compiler
-    /// tests additionally run all of Naga's independent invariant checks.
+    /// Naga's backend needs ModuleInfo even unvalidated; compiler tests also run
+    /// naga's invariant checks.
     pub(crate) fn module_info(&self) -> Result<naga::valid::ModuleInfo, EmitError> {
         use naga::valid::Capabilities as C;
         let mut caps = C::empty();

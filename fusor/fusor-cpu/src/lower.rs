@@ -11,7 +11,7 @@ use fusor_ir::egraph::Id;
 use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
     Addr, BufferAccess, BufferDecl, Builtin, ElementType, KernelIr, MemoryLevel, QuantizedView,
-    ScalarElement, Source, StorageView, TileExpr, TileExprKind, TileLayout, WorkgroupAxis,
+    ScalarElement, Source, Stmt, StorageView, TileExpr, TileExprKind, TileLayout, WorkgroupAxis,
 };
 use fusor_ir::ir::launch::{AddressMap, Family, Launch, Operand, SchedPoint};
 use fusor_ir::ir::{Node, Op};
@@ -151,7 +151,7 @@ fn compose(
         }
         if kernel.grid[0] < grid[0] {
             let pid = b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
-            stmts = vec![fusor_ir::ir::kernel::Stmt::If {
+            stmts = vec![Stmt::If {
                 condition: b.lt(pid, b.u32(kernel.grid[0])),
                 accept: stmts,
                 reject: Vec::new(),
@@ -160,25 +160,13 @@ fn compose(
         body.extend(stmts);
     }
 
-    Ok(KernelIr {
-        buffers: binds.buffers,
-        grid,
-        block,
-        body,
-        byte_arena: None,
-        name,
-    })
+    Ok(binds.finish(name, grid, block, body))
 }
 
 /// Point every store aimed at `from` (the launch root's buffer) at `view`
 /// instead, leaving addresses, masks and values alone. With `from` absent —
 /// the root owns no buffer — every store moves.
-fn redirect_stores(
-    stmts: &mut [fusor_ir::ir::kernel::Stmt],
-    from: Option<&Arc<BufferDecl>>,
-    view: &StorageView,
-) {
-    use fusor_ir::ir::kernel::Stmt;
+fn redirect_stores(stmts: &mut [Stmt], from: Option<&Arc<BufferDecl>>, view: &StorageView) {
     Stmt::walk_mut(stmts, &mut |s| {
         if let Stmt::Store { dst, .. } | Stmt::AtomicAdd { dst, .. } | Stmt::CoopStore { dst, .. } =
             s
@@ -306,6 +294,41 @@ impl Binds {
             }));
         }
         Ok(Self { buffers, by_value })
+    }
+
+    /// The kernel over this buffer table.
+    pub(crate) fn finish(
+        self,
+        name: &'static str,
+        grid: [u32; 3],
+        block: u32,
+        body: Vec<Stmt>,
+    ) -> KernelIr {
+        KernelIr {
+            buffers: self.buffers,
+            grid,
+            block,
+            body,
+            byte_arena: None,
+            name,
+        }
+    }
+
+    /// [`Translate`] `e` with this table's uniform block (binding 0).
+    pub(crate) fn translate(
+        &self,
+        b: &Kernel,
+        args: &[TileExpr],
+        coords: &[TileExpr],
+        e: &ScalarExpr,
+    ) -> Result<TileExpr> {
+        Translate {
+            b,
+            args,
+            coords,
+            uniforms: self.buffers.first().cloned(),
+        }
+        .run(e)
     }
 
     pub(crate) fn of(&self, value: Id) -> Result<Arc<BufferDecl>> {

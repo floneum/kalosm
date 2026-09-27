@@ -1,18 +1,8 @@
-//! `Slab`: a chain of launches as the stages of one kernel, one workgroup
-//! per slab of the leading rows they all keep independent.
-//!
-//! Workgroup `s` runs every stage over slab `s` of that stage's index space,
-//! with the workgroup's lanes striding the slab's elements — or, for a fold,
-//! a group of lanes per output row striding the reduced axis and closing
-//! over a subgroup collective or workgroup tree — and a barrier between stages, since a
-//! stage reads only what this workgroup wrote. Every stage but the last
-//! stores into its member's own buffer; the last stores into the slab's.
-//! The block is [`slab_block`] of the widest stage's share of one slab.
-//!
-//! The stages are the plain per-element and per-row loops of a map and a
-//! fold: no tiling, no cooperative loads. What a slab buys is the dispatch
-//! count, which at the shapes where the extractor chooses it is most of what
-//! the chain costs.
+//! `Slab`: a chain of map/fold launches as the stages of one kernel. Workgroup
+//! `s` runs every stage over slab `s` of its space (lanes striding elements,
+//! or lane groups per fold row), with a barrier between stages since a stage
+//! reads only what this workgroup wrote. The last stage stores into the
+//! slab's buffer. No tiling: a slab buys dispatch count.
 
 use fusor_ir::Result;
 use fusor_ir::egraph::ClassId;
@@ -30,17 +20,15 @@ use rustc_hash::FxHashMap;
 use crate::lower::map_fold::merge_body;
 use crate::lower::{Ctx, distribute_workgroups, scalar_element};
 
-/// One workgroup's coordinates: which slab it owns and which lane this is,
-/// and the scratch its fold stages close over, one tile per carrier slot,
-/// shared by every stage.
+/// One workgroup's slab and lane, plus the fold scratch (one tile per carrier
+/// slot) shared by every stage.
 struct Lanes {
     slab: TileExpr,
     lane: TileExpr,
     block: u32,
     scratch: Vec<Tile>,
     /// Members kept in workgroup memory, by class: the tile and this slab's
-    /// share of the member's elements, so a member-space index `i` lands at
-    /// `i - slab * share`.
+    /// share, so member-space index `i` lands at `i - slab * share`.
     private: FxHashMap<ClassId, (Tile, u32)>,
 }
 
@@ -111,8 +99,8 @@ impl Dst {
     }
 }
 
-/// One operand of a stage at flat index `index` of the stage's space: from
-/// the member's tile when the slab keeps it, else through the buffer.
+/// A stage operand at flat index `index`: from the member's tile when the slab
+/// keeps it, else the buffer.
 fn load(
     ctx: &Ctx<'_>,
     lanes: &Lanes,
@@ -168,8 +156,7 @@ pub(crate) fn lower_kslab(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resul
     let mut body: Vec<Stmt> = Vec::new();
     for m in members.iter().copied() {
         let stage = stage(m)?;
-        // A middle member the plan gave no buffer lives in a tile of this
-        // slab's share of it.
+        // A middle member with no buffer lives in a tile of this slab's share.
         let dst = if m == last {
             Dst::Buffer(ctx.linear_view(out)?)
         } else if ctx.has_buffer(m) {
@@ -271,9 +258,8 @@ fn map_stage(
     Ok(())
 }
 
-/// A fold stage: `lpr` lanes per output row stride the slab's rows, each
-/// lane walking every `lpr`th element of the reduced axis with the
-/// carrier's lift and merge, then closing with a collective or a tree.
+/// A fold stage: `lpr` lanes per output row walk the reduced axis with the
+/// carrier's lift and merge, then close with a collective or a tree.
 fn fold_stage(
     ctx: &Ctx<'_>,
     body: &mut Vec<Stmt>,
@@ -297,10 +283,8 @@ fn fold_stage(
         let per = per_slab(rows, slabs)?;
         if let Some(width) = slab_subgroup_width(lanes.block, u64::from(per), k, carrier, ctx.caps)
         {
-            // Local invocation indices have no specified subgroup mapping.
-            // Assign rows using actual subgroup IDs and lanes. Only use this
-            // path when every slot is occupied; otherwise the original tree
-            // covers the workgroup's contiguous local invocation indices.
+            // Local invocation indices have no specified subgroup mapping, so
+            // rows follow subgroup ids, only when every slot is occupied.
             let full = ctx.b.eq(
                 ctx.b.builtin(Builtin::NumSubgroups),
                 ctx.b.u32(lanes.block / width),
@@ -394,9 +378,8 @@ fn fold_stage_impl(
         .iter()
         .map(|operand| load(ctx, lanes, operand, index.clone(), total))
         .collect::<Result<Vec<_>>>()?;
-    // One accumulator per slot. `merge` reads the accumulators as its first
-    // `width` arguments and the lifted element as the next `width`; a
-    // sub-lane past the axis lifts the identity.
+    // `merge` reads the accumulators then the lifted elements; a sub-lane past
+    // the axis lifts the identity.
     let acc_elem = scalar_element(*acc);
     let acc_ty = ElementType::Scalar(acc_elem);
     let mut lifted = Vec::with_capacity(width);
@@ -428,17 +411,14 @@ fn fold_stage_impl(
         body: Vec::new(),
     }];
 
-    // The cross-lane close over each row's `lpr` lanes: one scratch tile
-    // per slot, shared across the kernel's fold stages. A one-lane group
-    // already holds its row.
+    // Cross-lane close over each row's `lpr` lanes; one scratch tile per slot.
     let reduced: Vec<TileExpr> = if lpr <= 1 {
         partials
     } else if subgroup.is_some() {
         let op = fusor_ir::ir::kernel::fast_reduce_op(carrier)
             .expect("subgroup admission checked the scalar carrier");
-        // Evaluate the collective before the leader-only store. A tile
-        // destination wraps its value in an If, where a lazy reduction would
-        // run on only the leader and lose the other lanes' contributions.
+        // Evaluate the collective before the leader-only store: inside the
+        // tile store's If it would run on the leader alone.
         let total = b.local(acc_ty);
         stmts.push(Stmt::StoreLocal {
             dst: total.clone(),
@@ -459,9 +439,7 @@ fn fold_stage_impl(
         outs
     };
 
-    // A post lands at `row * posts + slot`: the axis the fold's facts append
-    // to its shape when there is more than one. The group's first lane
-    // stores.
+    // Post `slot` lands at `row * posts + slot`; the group's first lane stores.
     let mask = b.and(live, b.eq(sub, b.u32(0)));
     let base = b.mul(row.clone(), b.u32(post.len() as u32));
     for (slot, post) in post.iter().enumerate() {

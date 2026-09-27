@@ -1,24 +1,10 @@
-//! Workgroup-tile liveness over an Kernel statement list. Feeds arena packing (two
-//! tiles whose ranges do not overlap may share bytes) and the barrier argmin.
-//!
-//! Two workgroup tiles may share one allocation when their live ranges are
-//! disjoint *and* a uniform workgroup barrier orders every thread's last touch
-//! of the earlier tile before any thread's first touch of the later one.
-//! Threads of a workgroup are not in lockstep, so plain program-order
-//! disjointness is not enough.
-//!
-//! Loops add a wrap-around hazard: when both tiles live inside a common loop,
-//! the later tile's last touch of iteration `i` races the earlier tile's first
-//! touch of iteration `i + 1`. [`LivenessInfo`] folds that in by widening every
-//! range to cover each loop body it intersects, so two tiles sharing a loop
-//! always overlap and plain interval disjointness plus one forward barrier is
-//! sound. [`TileLiveness::scoped`] recovers the in-loop sharing case
-//! separately, requiring barriers on both the forward edge and the wrap.
-//!
-//! Barriers inside `If` blocks are never recorded — uniformity is established
-//! by [`crate::uniformity`], and a conditional barrier is not uniform by
-//! construction here. Barriers inside loops that may break, return, or run a
-//! dynamic number of iterations are recorded but not `guaranteed`.
+//! Workgroup-tile liveness over a Kernel statement list, feeding arena packing
+//! and the barrier argmin. Two tiles may share bytes when their ranges are
+//! disjoint and a uniform barrier orders every thread's last touch of one
+//! before any first touch of the other. Ranges widen over each loop they touch
+//! (the back edge is a hazard); [`TileLiveness::scoped`] recovers in-loop
+//! sharing with barriers on both the forward edge and the wrap. Barriers under
+//! `If` are never recorded; ones in skippable loops are not `guaranteed`.
 
 use std::sync::Arc;
 
@@ -28,10 +14,8 @@ use fusor_ir::ir::kernel::{
 };
 use rustc_hash::{FxHashMap, FxHashSet};
 
-/// Identity of one tile declaration. Declarations are never interned, so two
-/// same-shaped tiles stay distinct and the arena knows they are two
-/// allocations; `Arc::as_ptr` is that identity. Stored as `usize` so
-/// [`LivenessInfo`] stays `Send`/`Sync`.
+/// Identity of one tile declaration (`Arc::as_ptr` as `usize`, keeping
+/// [`LivenessInfo`] `Send`/`Sync`).
 pub(crate) type TileKeyPtr = usize;
 
 /// The identity key of a tile declaration.
@@ -84,8 +68,7 @@ pub(crate) struct TileAccess {
 /// Everything the packer and the verifier know about one tile.
 #[derive(Clone, Debug)]
 pub(crate) struct TileLiveness {
-    /// The declaration itself, so a [`fusor_ir::ir::kernel::Placement`] can
-    /// name it without a second lookup.
+    /// The declaration itself.
     pub tile: Tile,
     /// Live range after loop expansion.
     pub range: LiveRange,
@@ -95,21 +78,18 @@ pub(crate) struct TileLiveness {
     /// Every touch in walk order, at raw (pre-expansion) positions.
     pub accesses: Vec<TileAccess>,
     /// When every access lies inside one innermost loop: that loop and the
-    /// tile's per-iteration phase (raw positions expanded over loops nested
-    /// inside it). Enables sharing between in-loop tiles whose phases are
-    /// barrier-separated both forward and across the back edge.
+    /// tile's per-iteration phase, for barrier-separated in-loop sharing.
     pub scoped: Option<(u32, LiveRange)>,
-    /// Consumed as a raw cooperative-matrix pointer (`CoopLoad` /
-    /// `CoopStoreTile`): the emitted array type must equal the tile's element,
-    /// so its region never widens to a canonical type.
+    /// Consumed as a raw cooperative-matrix pointer, so its region keeps the
+    /// tile's own element type.
     pub coop: bool,
 }
 
 /// One loop's span and early-exit facts.
 #[derive(Clone, Debug)]
 pub(crate) struct LoopInfo {
-    /// Positions spanned by the loop: `first` is the `Loop` statement itself,
-    /// `last` the synthetic position after the body.
+    /// Positions spanned: the `Loop` statement through the synthetic
+    /// position after the body.
     pub span: LiveRange,
     /// A `Break` statement is attributed to this loop (innermost frame).
     pub has_break: bool,
@@ -120,11 +100,8 @@ pub(crate) struct LoopInfo {
 }
 
 impl LoopInfo {
-    /// Whether every dynamic execution of this loop runs the full body at
-    /// least once: a positive static-literal count with no early exit. A
-    /// dynamic count may be zero at runtime, and a `Break`/`Return` can skip
-    /// the tail of the body — either way a barrier inside the loop is not
-    /// guaranteed to execute.
+    /// Every execution runs the full body at least once: a positive literal
+    /// count and no early exit.
     pub(crate) fn guaranteed_once(&self) -> bool {
         self.static_count.is_some_and(|count| count > 0) && !self.has_break && !self.has_return
     }
@@ -136,8 +113,7 @@ pub(crate) struct BarrierInfo {
     pub position: u32,
     /// Enclosing loop indices, outermost first.
     pub enclosing_loops: Vec<u32>,
-    /// Every enclosing loop is [`LoopInfo::guaranteed_once`], so every thread
-    /// passes this barrier on every full pass of the enclosing body.
+    /// Every enclosing loop is [`LoopInfo::guaranteed_once`].
     pub guaranteed: bool,
 }
 
@@ -145,8 +121,8 @@ pub(crate) struct BarrierInfo {
 #[derive(Debug, Default)]
 pub(crate) struct LivenessInfo {
     pub tiles: FxHashMap<TileKeyPtr, TileLiveness>,
-    /// First-touch order of workgroup tiles. **Always iterate this, never the
-    /// map**: pointer keys are not stable across runs, `order` is.
+    /// First-touch order of workgroup tiles. Iterate this, never the map:
+    /// pointer keys are not stable across runs.
     pub order: Vec<TileKeyPtr>,
     /// Uniform workgroup barriers, in position order.
     pub barriers: Vec<BarrierInfo>,
@@ -155,8 +131,7 @@ pub(crate) struct LivenessInfo {
 }
 
 impl LivenessInfo {
-    /// One walk over `ir`'s body, then loop expansion, then the guaranteed
-    /// flags, then the per-iteration phases.
+    /// One walk over the body, then loop expansion, guaranteed flags and phases.
     pub(crate) fn compute(ir: &KernelIr) -> Self {
         let mut walk = Walk::default();
         walk.visit_stmts(&ir.body);
@@ -203,10 +178,7 @@ impl LivenessInfo {
     }
 
     /// Every loop enclosing `barrier` strictly below `scope` completes every
-    /// pass, so the barrier executes on every full pass of `scope`'s body.
-    /// `Break` in `scope` itself does not disqualify: taking the back edge
-    /// means the full body executed, and after an exit the loop's tiles are
-    /// touched no more.
+    /// pass. A `Break` in `scope` itself is fine: past it the tiles are dead.
     pub(crate) fn guaranteed_below(&self, barrier: &BarrierInfo, scope: u32) -> bool {
         match barrier
             .enclosing_loops
@@ -234,9 +206,7 @@ impl LivenessInfo {
                 scoped.push((key, None));
                 continue;
             };
-            // Expand the phase over loops nested inside the home loop, to
-            // fixpoint: a touch inside a nested loop recurs every nested
-            // iteration.
+            // Expand the phase over nested loops to fixpoint.
             let home_span = self.loops[home as usize].span;
             let mut phase = LiveRange { first, last };
             loop {
@@ -275,31 +245,27 @@ impl LivenessInfo {
         })
     }
 
-    /// A guaranteed uniform barrier strictly after `after` and at or before
-    /// `at`. Barriers inside loops that may break, return, or run zero
-    /// iterations are skippable at runtime and never separate.
+    /// A guaranteed uniform barrier in `(after, at]`; barriers in skippable
+    /// loops never separate.
     pub(crate) fn separating_barrier(&self, after: u32, at: u32) -> bool {
         self.barriers
             .iter()
             .any(|barrier| barrier.guaranteed && barrier.position > after && barrier.position <= at)
     }
 
-    /// Whether `later` may reuse memory whose previous occupant was `earlier`:
-    /// disjoint expanded ranges with a uniform barrier ordering every thread's
-    /// last touch of `earlier` before any first touch of `later`.
+    /// Whether `later` may reuse `earlier`'s memory: disjoint expanded ranges
+    /// with a uniform barrier between them.
     pub(crate) fn can_follow(&self, earlier: LiveRange, later: LiveRange) -> bool {
         earlier.last < later.first && self.separating_barrier(earlier.last, later.first)
     }
 
-    /// Both arms of the reuse predicate: the plain interval arm, and the
-    /// loop-phase arm for two tiles living only inside one common loop.
+    /// Both arms of the reuse predicate: plain interval, and loop phase.
     pub(crate) fn can_follow_tiles(&self, earlier: &TileLiveness, later: &TileLiveness) -> bool {
         if self.can_follow(earlier.range, later.range) {
             return true;
         }
-        // Phase arm: both tiles live only inside one common loop, with
-        // disjoint per-iteration phases, a barrier between the phases, and a
-        // barrier covering the wrap back to the earlier phase.
+        // Phase arm: disjoint phases in one common loop, a barrier between them
+        // and one covering the wrap.
         let (Some((home_a, phase_a)), Some((home_b, phase_b))) = (earlier.scoped, later.scoped)
         else {
             return false;
@@ -323,8 +289,7 @@ pub(crate) fn analyze(ir: &KernelIr) -> LivenessInfo {
     LivenessInfo::compute(ir)
 }
 
-/// Every tile an expression node touches directly, with how it touches it.
-/// Shared with uniformity and the Kernel verifier.
+/// Every tile an expression node touches directly, and how.
 pub(crate) fn for_each_tile(kind: &TileExprKind, f: &mut dyn FnMut(&Tile, TileUse)) {
     match kind {
         TileExprKind::LoadTile { tile, .. } => f(tile, TileUse::Read),
@@ -349,9 +314,8 @@ struct Walk {
     access_kind: AccessKind,
     /// `If` nesting depth: barriers below a conditional are not recorded.
     conditional_depth: u32,
-    /// Nodes already visited in the operand expression in progress. Cleared
-    /// per root expression, so a node shared by two statements is recorded
-    /// at both positions. See [`Walk::visit_expr`].
+    /// Nodes visited in the current root expression, cleared per root so a
+    /// node shared by two statements records at both positions.
     seen: FxHashSet<usize>,
 }
 
@@ -403,12 +367,7 @@ impl Walk {
     }
 
     /// Record every tile one operand expression touches at the current
-    /// position.
-    ///
-    /// The expression is a DAG, so a naive walk is exponential in the sharing
-    /// depth. Every visit of a node at one position records the same
-    /// `(tile, position, kind)` and duplicate accesses inform nothing
-    /// downstream, so visiting each node once is the same analysis.
+    /// position, visiting each DAG node once (duplicates inform nothing).
     fn visit_expr(&mut self, expr: &TileExpr) {
         self.seen.clear();
         self.visit_expr_once(expr);
@@ -505,8 +464,7 @@ impl Walk {
                     body,
                     ..
                 } => {
-                    // Count and accumulator inits run once, before the loop:
-                    // header position, outside the span.
+                    // Count and inits run once, before the loop.
                     if let Some(count) = count {
                         self.visit_expr(count);
                     }
@@ -522,9 +480,7 @@ impl Walk {
                     });
                     self.loop_stack.push(loop_index);
                     self.visit_stmts(body);
-                    // Accumulator updates run at the end of EVERY iteration —
-                    // after any in-loop barrier — so their tile touches are
-                    // attributed inside the span and expand over the loop.
+                    // Updates run at the end of every iteration, so they count inside the span.
                     if !accumulators.is_empty() {
                         self.position += 1;
                         for Accumulator { update, .. } in accumulators {
@@ -535,10 +491,7 @@ impl Walk {
                     self.loop_stack.pop().expect("loop frame pushed above");
                     self.loops[loop_index as usize].span.last = self.position;
                 }
-                // One scratch tile per accumulator lane, all read-modify-written
-                // by the same tree. `verify_arena`'s all-pairs recheck therefore
-                // sees N tiles per reduction and separates them with the same
-                // guaranteed-uniform barrier rule as one.
+                // One scratch tile per lane, all read-modify-written by one tree.
                 Stmt::Reduce {
                     values, scratch, ..
                 } => {
@@ -566,8 +519,7 @@ impl Walk {
                         self.barriers.push(BarrierInfo {
                             position: self.position,
                             enclosing_loops: self.loop_stack.clone(),
-                            // Finalized after the walk, once every enclosing
-                            // loop's break/return/count facts are complete.
+                            // Finalized after the walk, once loop facts are complete.
                             guaranteed: false,
                         });
                     }
@@ -577,10 +529,8 @@ impl Walk {
         }
     }
 
-    /// Expand every tile's range to cover each loop body it intersects, to
-    /// fixpoint across nesting. A touch inside a loop recurs every iteration,
-    /// so for hazard purposes the tile is live across the whole body —
-    /// including the back edge.
+    /// Expand every tile's range over each loop body it intersects, to fixpoint:
+    /// a touch in a loop recurs every iteration, back edge included.
     fn expand_ranges_over_loops(&mut self) {
         loop {
             let mut changed = false;

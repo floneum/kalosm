@@ -1,10 +1,5 @@
-//! Kernel `tile` — one kernel body. Structural sharing is the hash-cons, so two
-//! identical subtrees built separately merge. [`Stmt::AtomicAdd`] is supported.
-//! Element type is runtime data, never a marker type.
-//!
-//! Kernel is produced *after* extraction and is not part of the e-graph. Barrier
-//! elision and arena packing stay closed-form argmins here with an independent
-//! verifier — an honest exclusion, marked as such.
+//! Kernel `tile` — one kernel body, hash-consed so identical subtrees merge.
+//! Produced after extraction, outside the e-graph; element type is runtime data.
 
 use crate::dtype::{NumericContract, QFmt, QLayout};
 use crate::error::Result;
@@ -77,9 +72,8 @@ impl ElementType {
         }
     }
 
-    /// Array stride in a workgroup allocation, or `None` for elements that
-    /// cannot back one. The single source of stride truth: arena packing
-    /// and module emission both read this, so they cannot disagree.
+    /// Array stride in a workgroup allocation, or `None` if it cannot back one.
+    /// Arena packing and emission both read this, so they cannot disagree.
     pub const fn workgroup_array_stride(self) -> Option<u32> {
         match self {
             Self::Scalar(ScalarElement::Bool) | Self::CoopMatrix { .. } => None,
@@ -118,9 +112,7 @@ impl ElementType {
 // Memory
 // ---------------------------------------------------------------------------
 
-/// Exactly two memory spaces. Nothing fusor emits needs uniform buffers,
-/// push constants, textures, samplers, or (outside [`Stmt::AtomicAdd`])
-/// atomics.
+/// Exactly two memory spaces; nothing fusor emits needs any other.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum MemoryLevel {
     Storage,
@@ -164,10 +156,8 @@ impl TileLayout {
     }
 }
 
-/// A storage buffer declaration. `binding` is the one externally meaningful
-/// name; declarations with the same binding are typed views of one buffer.
-/// Read-only-ness is what the derived bind group reads back out of the
-/// emitted module.
+/// A storage buffer declaration. Declarations sharing a `binding` are typed
+/// views of one buffer.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BufferDecl {
     pub binding: u32,
@@ -176,15 +166,8 @@ pub struct BufferDecl {
     pub access: BufferAccess,
 }
 
-/// A workgroup tile declaration.
-///
-/// **Identity-bearing**, for the same reason [`LocalDecl`] is. Two tiles of
-/// the same element, shape and name are two *allocations*, which the arena
-/// may place at two different offsets and which a barrier may separate. Under
-/// structural equality they were one value to the Kernel term memo, so a
-/// `LoadTile`/`CoopLoad` off the second folded into the first — a lowering
-/// that staged into two same-shaped buffers (double buffering, `staging: 2`)
-/// read one of them twice and never touched the other.
+/// A workgroup tile declaration. Identity-bearing: two same-shaped tiles are
+/// two allocations (e.g. double buffering), so equality keys on `id`.
 #[derive(Clone, Debug, Eq)]
 pub struct TileDecl {
     pub element: ElementType,
@@ -194,18 +177,12 @@ pub struct TileDecl {
 }
 
 thread_local! {
-    /// Decl ids are unique **within a kernel build** — that is the whole
-    /// contract (the Kernel term memo is per builder, the arena per kernel).
-    /// They are thread-local and resettable rather than process-global so
-    /// that two identical lowerings mint identical ids: the pipeline cache
-    /// deduplicates compiled kernels on body identity, and a globally-unique
-    /// id would make every relower of the same kernel hash differently —
-    /// measured as one Metal compile per launch per decode step.
+    /// Decl ids, unique within one kernel build. Resettable so identical
+    /// lowerings mint identical ids and the pipeline cache dedups them.
     static NEXT_DECL_ID: std::cell::Cell<u64> = const { std::cell::Cell::new(1) };
 }
 
-/// Restart decl numbering. Called at each kernel-lowering entry point so a
-/// rebuilt kernel is byte-identical to its first build.
+/// Restart decl numbering, so a rebuilt kernel matches its first build.
 pub fn reset_decl_ids() {
     NEXT_DECL_ID.with(|c| c.set(1));
 }
@@ -245,14 +222,8 @@ impl Hash for TileDecl {
     }
 }
 
-/// A private per-invocation local.
-///
-/// **Identity-bearing.** Two locals of the same element type are two
-/// registers, so `id` — not `element` — is what equality and hashing key on.
-/// Without it the Kernel term memo folded `LoadLocal(a)` into `LoadLocal(b)`
-/// whenever they had the same type, and every kernel carrying more than one
-/// same-typed accumulator (a `tn`-wide register tile, a multi-slot fold
-/// carrier, a coop accumulator pair) read one register `tn` times.
+/// A private per-invocation local. Identity-bearing: two same-typed locals
+/// are two registers, so equality and hashing key on `id`.
 #[derive(Clone, Debug, Eq)]
 pub struct LocalDecl {
     pub element: ElementType,
@@ -284,8 +255,7 @@ impl Hash for LocalDecl {
     }
 }
 
-/// Shared handle to a storage buffer. `Arc`, not `Rc`: kernel building runs
-/// on worker threads.
+/// Shared handle to a storage buffer (`Arc`: kernels build on worker threads).
 pub type Buffer = Arc<BufferDecl>;
 /// Shared handle to a workgroup tile.
 pub type Tile = Arc<TileDecl>;
@@ -335,13 +305,8 @@ pub type TileBinaryOp = crate::scalar::BinOp;
 /// The 6 comparisons.
 pub type TileCompareOp = crate::scalar::CmpOp;
 
-/// Cross-lane reduction operators.
-///
-/// This is the **hardware fast path**, not the general reduction algebra: the
-/// four operators a subgroup collective and a shared-memory tree can be spelled
-/// with directly. Everything wider goes through [`Stmt::Reduce`]'s
-/// [`MergeBody`]. `TileReduceOp` survives because the single-slot path carries
-/// every fold in the system and must keep emitting byte-identical code.
+/// Cross-lane reduction operators with a direct hardware spelling. Anything
+/// wider goes through [`Stmt::Reduce`]'s [`MergeBody`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum TileReduceOp {
     Sum,
@@ -351,8 +316,7 @@ pub enum TileReduceOp {
 }
 
 impl TileReduceOp {
-    /// The binary operator this folds with — used by both loop-fold
-    /// desugaring and the cross-lane tree lowerer.
+    /// The binary operator this folds with.
     pub const fn binary(self) -> TileBinaryOp {
         match self {
             Self::Sum => TileBinaryOp::Add,
@@ -376,11 +340,8 @@ impl TileReduceOp {
 }
 
 /// The hardware collective a carrier reduces with, or `None` for anything the
-/// N-ary [`Stmt::Reduce`] has to carry.
-///
-/// **One decision, in one place.** Both emitters read this, so the fast path
-/// cannot drift between them and a carrier can never be silently truncated to
-/// its first slot on one backend and refused on the other.
+/// N-ary [`Stmt::Reduce`] has to carry. Both emitters read this so the fast
+/// path cannot drift between them.
 pub fn fast_reduce_op(c: &crate::carrier::Carrier) -> Option<TileReduceOp> {
     if !matches!(c.slots.as_slice(), [crate::carrier::SlotTy::Scalar]) {
         return None;
@@ -393,10 +354,8 @@ pub fn fast_reduce_op(c: &crate::carrier::Carrier) -> Option<TileReduceOp> {
 pub enum Builtin {
     Lane,
     ProgramId(WorkgroupAxis),
-    /// One extent of the dispatched grid (`@builtin(num_workgroups)`).
-    /// This is how a kernel linearizes its workgroup coordinate without
-    /// baking the grid into its body — the body stays one compiled pipeline
-    /// across every sequence length.
+    /// One extent of the dispatched grid (`@builtin(num_workgroups)`), so the
+    /// body never bakes the grid in.
     NumWorkgroups(WorkgroupAxis),
     SubgroupId,
     SubgroupLane,
@@ -422,13 +381,8 @@ pub enum Source {
     Quantized(QuantizedView),
 }
 
-/// A quantized matrix bound as a plain u32 storage buffer.
-///
-/// The decode program addresses the block stream from `data` and the
-/// `(k_base, col)` the load supplies; the matrix extents are not among its
-/// inputs (`BlockDecodeArgs` has no row or column count), so they are not
-/// carried here. A reader that needs a bound computes it where the bound is
-/// used, not from the view.
+/// A quantized matrix bound as a plain u32 storage buffer. Carries no
+/// extents: the decode never reads them, so a bound is computed by its user.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct QuantizedView {
     pub data: StorageView,
@@ -456,8 +410,7 @@ impl Addr {
     }
 }
 
-/// Cross-lane reduction strategy. One node with the strategy as a
-/// parameter, so it stays a late capability-driven choice.
+/// Cross-lane reduction strategy, a late capability-driven choice.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ReduceKind {
     Subgroup,
@@ -477,9 +430,7 @@ pub struct CoopSrc {
 // Expressions
 // ---------------------------------------------------------------------------
 
-/// A hash-consed Kernel value. Structural sharing *is* the hash-cons: two
-/// identical subtrees built separately merge, which pointer-keyed
-/// memoization cannot do. `ty` and `hash` are cached at construction.
+/// A hash-consed Kernel value; `ty` and `hash` are cached at construction.
 #[derive(Clone, Debug)]
 pub struct TileExpr(Arc<TileNode>);
 
@@ -489,22 +440,14 @@ pub struct TileNode {
     pub kind: TileExprKind,
     pub ty: ElementType,
     pub hash: u64,
-    /// Which memory spaces this tree reads. See [`TileExpr::mem_reads`]; the
-    /// set is folded up from the children at construction so a consumer's
-    /// memo invalidation is O(1) per entry rather than a re-walk.
+    /// Which memory spaces this tree reads, folded up at construction.
     pub mem_reads: MemReads,
     /// Collective results depend on which invocations reach the expression.
     pub scope_dependent: bool,
 }
 
-/// The memory spaces a [`TileExpr`] reads.
-///
-/// A backend that hash-conses expressions is only sound while the memory its
-/// keys read is unchanged: `LoadTile(t, i)` before a write to `t` and after
-/// it are two different values that compare equal. This set is what lets an
-/// emitter drop *exactly* the affected entries — a private-local store does
-/// not invalidate a workgroup tile read, and a workgroup barrier does not
-/// invalidate a private local read.
+/// The memory spaces a [`TileExpr`] reads: lets a hash-consing emitter drop
+/// exactly the memo entries a write or barrier makes stale.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct MemReads(u8);
 
@@ -523,8 +466,7 @@ impl MemReads {
     pub const fn union(self, other: Self) -> Self {
         Self(self.0 | other.0)
     }
-    /// True when the two sets name at least one space in common — the test a
-    /// memo invalidation makes against the spaces a statement writes.
+    /// True when the two sets share a space.
     pub const fn intersects(self, other: Self) -> bool {
         self.0 & other.0 != 0
     }
@@ -609,14 +551,8 @@ pub enum TileExprKind {
         value: TileExpr,
     },
     // cooperative matrix
-    /// An all-zero cooperative-matrix fragment.
-    ///
-    /// A `CoopMatrix` accumulator has to start somewhere, and a scalar zero is
-    /// not that somewhere: `Stmt::Loop` requires `init.element() ==
-    /// local.element`, so `lower_coop` initializing its C fragment with an
-    /// `f32` literal failed `verify_kernel` on every device that selected the
-    /// cooperative family. There is no arithmetic that produces a zero
-    /// fragment from a scalar, so it is a leaf.
+    /// An all-zero cooperative-matrix fragment: a coop accumulator's init must
+    /// have the fragment type, and no arithmetic makes one from a scalar.
     CoopZero {
         role: CoopMatrixRole,
         scalar: ScalarElement,
@@ -727,15 +663,8 @@ impl TileExpr {
         self.0.hash
     }
 
-    /// This node's identity, as the address of its shared allocation.
-    ///
-    /// A body is a **DAG**, not a tree: the builder hands the same
-    /// `TileExpr` to every consumer of a value, so a node is reached once
-    /// per edge into it and a naive recursive walk is exponential in the
-    /// sharing depth. A walk memoizes on this — exactly, unlike
-    /// [`Self::structural_hash`], and for free — and `PartialEq` is the
-    /// same test, so two pointers agree iff the subtrees are the same
-    /// object.
+    /// This node's identity, as the address of its shared allocation. A body
+    /// is a DAG; walks memoize on this to stay linear.
     pub fn node_ptr(&self) -> usize {
         Arc::as_ptr(&self.0) as *const () as usize
     }
@@ -744,13 +673,7 @@ impl TileExpr {
         matches!(&self.0.kind, TileExprKind::Literal(TileLiteral::Bool(true)))
     }
 
-    /// Which memory spaces this tree reads, anywhere inside it — i.e. what
-    /// its value is a function of besides its own operands.
-    ///
-    /// A backend that hash-conses expressions must drop exactly the entries
-    /// whose set intersects the spaces a statement writes (or a barrier makes
-    /// another invocation's writes visible in). The set is folded up at
-    /// construction, so the test is a field read.
+    /// Which memory spaces this tree reads anywhere inside it.
     pub fn mem_reads(&self) -> MemReads {
         self.0.mem_reads
     }
@@ -760,11 +683,8 @@ impl TileExpr {
     }
 }
 
-/// Fold the memory-read set for one node from its children.
-///
-/// Exhaustive on purpose: a new `TileExprKind` must state which spaces it
-/// reads rather than inherit [`MemReads::NONE`] from a wildcard and silently
-/// join the pure half of a backend memo.
+/// Fold the memory-read set for one node from its children. Exhaustive so a
+/// new kind must state what it reads.
 fn kind_mem_reads(kind: &TileExprKind) -> MemReads {
     use TileExprKind as K;
     let direct = match kind {
@@ -821,17 +741,9 @@ pub struct Accumulator {
     pub update: TileExpr,
 }
 
-/// The merge of two partial accumulators, one expression per **lane**.
-///
-/// A lane is one scalar accumulator: a `SlotTy::Scalar` slot is one lane and a
-/// `SlotTy::Vector(d)` slot is `d` of them, so `body.len()` is the carrier's
-/// `lanes()`, never its `width()`.
-///
-/// **Cross-lane reads are required, not forbidden.** `body[1]` may read
-/// `lhs[0]`: flash's running sum and its output accumulator both read the
-/// running max. What `verify_kernel` rejects is a read of anything *outside*
-/// `lhs`/`rhs` — a merge that reads a `Tile`, a `Builtin` or a lane id is not a
-/// merge, and a per-lane-independent merge would be the wrong abstraction.
+/// The merge of two partial accumulators, one expression per scalar lane
+/// (`body.len()` is the carrier's `lanes()`). Lanes may read each other's
+/// `lhs`/`rhs` (flash reads the running max); nothing outside them.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct MergeBody {
     /// Formal parameters for the left partial, one `Local` per lane.
@@ -846,18 +758,14 @@ impl MergeBody {
     pub fn lanes(&self) -> usize {
         self.body.len()
     }
-    /// Arity agreement across the three vectors — the clause that makes the
-    /// `accs[0]` bug unrepresentable.
+    /// Arity agreement across the three vectors.
     pub fn is_arity_consistent(&self) -> bool {
         self.lhs.len() == self.body.len() && self.rhs.len() == self.body.len()
     }
 }
 
-/// One ordered Kernel statement. `FillTile` is not sugar: it is the only form
-/// whose vectorized and guard-free variants the lowerer can select.
-/// `CoopStore` is subgroup-collective, never a per-lane store;
-/// `CoopStoreTile` is the staging step attention needs between fragment
-/// math and a per-lane softmax over the same values.
+/// One ordered Kernel statement. `CoopStore` is subgroup-collective;
+/// `CoopStoreTile` stages fragments for per-lane math (attention softmax).
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Stmt {
     Store {
@@ -909,23 +817,9 @@ pub enum Stmt {
         accumulators: Vec<Accumulator>,
         body: Vec<Stmt>,
     },
-    /// The **N-ary cross-lane reduction**, beside [`TileExprKind::Reduce`] and
-    /// not in place of it.
-    ///
-    /// `values` is one partial per accumulator lane and `outs` one `Local` per
-    /// lane; `merge` folds two partials. There is no single `TileReduceOp` to
-    /// resolve for the whole fold, so `Fold{(max, sum)}` cannot compute `max(x)`
-    /// and discard the sum: there is nowhere to discard it to.
-    ///
-    /// `fast` is set by the canonical constructor **iff** `values.len() == 1`
-    /// and `merge.body[0]` is exactly `binary(op.binary(), load(lhs[0]),
-    /// load(rhs[0]))`. It is computed, never author-supplied, so it cannot drift
-    /// from `merge`; both emitters open their arm with it and take the existing
-    /// collective path unchanged.
-    ///
-    /// `scratch` holds one workgroup tile per lane for the `Workgroup`
-    /// kind and is empty for `Subgroup`. `kind`'s own scratch is `scratch[0]`,
-    /// so a one-lane reduction is exactly the node it is today.
+    /// The N-ary cross-lane reduction: one partial and one `outs` local per
+    /// lane, folded by `merge`. `fast` is set iff it is one lane of a plain
+    /// hardware op. `scratch` is one tile per lane (`Workgroup` only).
     Reduce {
         kind: Box<ReduceKind>,
         values: SmallVec<[TileExpr; 4]>,
@@ -1030,16 +924,9 @@ impl Stmt {
         }
     }
 
-    /// The memory spaces this statement makes stale for a reader.
-    ///
-    /// Either because it writes them, or — for the two barriers — because it
-    /// makes *another invocation's* writes to them visible. A backend that
-    /// hash-conses expressions must retire every memoized value whose
-    /// [`TileExpr::mem_reads`] intersects this set once the statement is
-    /// emitted; see `fusor-gpu`'s `Emitter::invalidate_mem`.
-    ///
-    /// `If` and `Loop` name nothing themselves: their bodies are emitted
-    /// statement by statement and each names its own.
+    /// The memory spaces this statement makes stale: those it writes, or for
+    /// a barrier those whose other-invocation writes it publishes. `If` and
+    /// `Loop` name nothing; their bodies name their own.
     pub fn writes(&self) -> MemReads {
         match self {
             Self::Store { .. } | Self::AtomicAdd { .. } | Self::CoopStore { .. } => {
@@ -1049,15 +936,9 @@ impl Stmt {
             Self::StoreTile { .. } | Self::FillTile { .. } | Self::CoopStoreTile { .. } => {
                 MemReads::TILE
             }
-            // The scratch tiles it stages through and the `outs` locals it
-            // lands in. The one-lane `fast` path only writes the local, but
-            // naming the tile as well costs a re-emit and never a wrong value.
+            // Its scratch tiles and `outs` locals.
             Self::Reduce { .. } => MemReads::TILE.union(MemReads::LOCAL),
-            // A barrier publishes other invocations' writes. Conservatively
-            // both shared spaces: `Stmt::Barrier` is emitted to order
-            // workgroup staging, but nothing stops a lowering from using it
-            // to order storage traffic inside one workgroup, and a private
-            // local is never another invocation's to write.
+            // Conservatively both shared spaces.
             Self::Barrier | Self::StorageBarrier => MemReads::STORAGE.union(MemReads::TILE),
             Self::If { .. } | Self::Loop { .. } | Self::Break | Self::Return => MemReads::NONE,
         }
@@ -1112,10 +993,8 @@ pub struct Tiles {
     pub decls: SmallVec<[Tile; 8]>,
 }
 
-/// The result of workgroup-arena planning. `arena_plan` is a **pure
-/// memoized function** of `(geom, dtype, caps)` and the *same* function
-/// `verify_launch` admits against and the Kernel emitter lays out with. `total_bytes`
-/// feeds both the footprint check and the occupancy term.
+/// The result of workgroup-arena planning: a pure memoized function shared by
+/// `verify_launch` admission and the emitter's layout.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ArenaPlan {
     pub mode: ArenaMode,
@@ -1145,9 +1024,8 @@ pub trait ArenaPlanner: Send + Sync {
 
     fn barrier_suggestions(&self, ir: &KernelIr) -> Vec<BarrierSuggestion>;
 
-    /// Independent all-pairs recheck: every byte-overlapping tile pair must
-    /// be separated by a *guaranteed uniform* barrier. Fails lowering
-    /// rather than racing.
+    /// All-pairs recheck: every byte-overlapping tile pair must be separated
+    /// by a guaranteed-uniform barrier.
     fn verify_arena(&self, ir: &KernelIr, plan: &ArenaPlan) -> Result<()>;
 
     /// A `Barrier` may not appear under an `If` whose predicate is
@@ -1252,20 +1130,9 @@ fn lit_u32(e: &TileExpr) -> Option<u32> {
     }
 }
 
-/// Upper bound on `e mod 2^s` (`s <= 32`), computed structurally.
-///
-/// Where [`known_zero_low_bits`] only sees power-of-two alignment, this is a
-/// mod-interval: `Rem(x, 8) * 4` has just two zero low bits, but its residue
-/// mod 256 is at most 28, and `Div(x, 8) * 128` contributes at most 128 —
-/// so a base built from both provably cannot carry into bit 8 under any
-/// window offset below 100. That is exactly the fact a *split* lane window
-/// needs: its runs add offsets that are far beyond the base's alignment yet
-/// still provably carry-free at the cut the shift or mask cares about.
-///
-/// Sound under wrapping u32 arithmetic because reduction mod `2^s` is a ring
-/// homomorphism of the wrapping ops (`Add`/`Mul`/`Shl`), and every other arm
-/// either bounds the value globally (`Rem`, `Div`, `BitAnd` by a literal) or
-/// gives up with the cap.
+/// Upper bound on `e mod 2^s` (`s <= 32`), computed structurally: proves a
+/// split window's offsets carry-free where alignment alone cannot. Sound under
+/// wrapping u32 since mod `2^s` is a ring homomorphism of Add/Mul/Shl.
 fn low_max(e: &TileExpr, s: u32) -> u128 {
     let s = s.min(32);
     if s == 0 {
@@ -1334,9 +1201,8 @@ fn low_max(e: &TileExpr, s: u32) -> u128 {
     bound.min(cap)
 }
 
-/// `Some((base, c))` when `e` is a top-level `base + c` with a literal `c` —
-/// no alignment claim, unlike [`carry_free_add`]; the mod-interval laws
-/// establish carry-freedom themselves at whatever cut they need.
+/// `Some((base, c))` when `e` is a top-level `base + c` with a literal `c`,
+/// with no alignment claim.
 fn top_literal_add(e: &TileExpr) -> Option<(TileExpr, u32)> {
     let TileExprKind::Binary {
         op: TileBinaryOp::Add,
@@ -1356,14 +1222,8 @@ fn top_literal_add(e: &TileExpr) -> Option<(TileExpr, u32)> {
 
 /// `Some((aligned, c))` when `e` is `aligned + c` with the addition provably
 /// carry-free: `c` is a literal strictly below `2^t` for `t` the aligned
-/// side's known zero low bits. The two halves then occupy disjoint bits, so
-/// every shift, mask and exact division distributes over them.
-///
-/// A literal that straddles the alignment boundary still splits: its
-/// `t`-aligned high part folds into the base (the sum of two `t`-aligned
-/// values is `t`-aligned) and only the low part is peeled. `c_lo == 0`
-/// peels nothing and returns `None`, which is also what keeps the callers'
-/// rebuild-then-resimplify recursion terminating.
+/// side's known zero low bits. A straddling literal's aligned high part folds
+/// into the base; peeling nothing returns `None`, which ends the recursion.
 fn carry_free_add(e: &TileExpr) -> Option<(TileExpr, u32)> {
     let TileExprKind::Binary {
         op: TileBinaryOp::Add,
@@ -1400,24 +1260,9 @@ fn carry_free_add(e: &TileExpr) -> Option<(TileExpr, u32)> {
     Some((base, c_lo))
 }
 
-/// Rewrite the index arithmetic of `e` under aligned-window algebra.
-///
-/// The one law: when `a` has `t` known-zero low bits and `c < 2^t`, the sum
-/// `a + c` is `a | c` — no carry anywhere — so
-///
-/// - `(a + c) >> s`  =  `(a >> s) + (c >> s)`
-/// - `(a + c) &  m`  =  `(a & m) + (c & m)`
-/// - `(a + c) /  d`  =  `a / d`   and   `(a + c) % d  =  (a % d) + c`
-///   whenever additionally `2^t` is a multiple of `d`'s power-of-two part
-///   covering `c` — kept to the `c < d`, `d | 2^t`-compatible case below.
-///
-/// This is not a peephole for any data format. It is what makes the address
-/// expressions of *consecutive elements of an aligned window* structurally
-/// equal wherever they agree — `(base + 0) >> 3` and `(base + 7) >> 3`
-/// become the same node — so the emitter's structural memo shares the loads
-/// between them. A packed-word decode (GGUF blocks, f16 pairs, bit fields)
-/// collapses to one word load per window as a *consequence*; the rewrite
-/// itself never heard of any of them.
+/// Rewrite index arithmetic under aligned-window algebra: when `a + c` cannot
+/// carry, shifts, masks and power-of-two div/rem distribute over it. Makes
+/// consecutive window elements' addresses structurally equal so loads share.
 pub fn simplify_index(e: &TileExpr) -> TileExpr {
     simplify_index_cached(e, &mut rustc_hash::FxHashMap::default())
 }
@@ -1503,10 +1348,8 @@ fn rewrite_index(e: &TileExpr, memo: &mut rustc_hash::FxHashMap<TileExpr, TileEx
             },
             e.element(),
         ),
-        // A missing container arm silently fences the rewrite out of the
-        // whole subtree: the f16 scale decode rides `VecComponent(Unpack(..))`
-        // and skipping it left every element of a window recomputing its own
-        // block base — and re-loading the scale words the memo should share.
+        // Container arms matter: a missing one fences the rewrite out of the
+        // subtree (the f16 scale decode rides `VecComponent`).
         TileExprKind::Vec {
             scalar,
             lanes,
@@ -1599,16 +1442,8 @@ fn rewrite_index(e: &TileExpr, memo: &mut rustc_hash::FxHashMap<TileExpr, TileEx
     };
     match op {
         TileBinaryOp::Add => {
-            // Literal-to-top normalization: flatten the whole Add chain,
-            // fold every literal into one constant, and re-emit as
-            // `(sum of non-literal terms) + c`. Wrapping u32 addition is
-            // associative and commutative, so this is unconditionally
-            // sound; its point is that `carry_free_add` only matches a
-            // literal that is an immediate operand of the *top-level* Add,
-            // and lowering builds sums in whatever order the address math
-            // arrived. Without this, `(base + (k + v)) + col*stride` never
-            // splits its window literal `v` off, and consecutive elements
-            // of an aligned window never share their word loads.
+            // Hoist every literal of the Add chain to the top as one
+            // constant, so `carry_free_add` can peel it (always sound).
             fn flatten(e: &TileExpr, terms: &mut Vec<TileExpr>, c: &mut u32) {
                 match e.kind() {
                     TileExprKind::Binary {
@@ -1654,10 +1489,7 @@ fn rewrite_index(e: &TileExpr, memo: &mut rustc_hash::FxHashMap<TileExpr, TileEx
                 });
                 return simplify_index_cached(&add(shifted, c >> s.min(31)), memo);
             }
-            // Mod-interval second chance: the literal is far beyond the
-            // base's alignment (a split window's run offset), but the base's
-            // residue below the cut is bounded and the sum still cannot
-            // carry across bit `s` — so the shift distributes anyway.
+            // Mod-interval second chance: no carry across bit `s`.
             if let (Some((a, c)), Some(s)) = (top_literal_add(left), lit_u32(right)) {
                 let s = s.min(31);
                 let cap = (1u128 << s) - 1;
@@ -1678,8 +1510,7 @@ fn rewrite_index(e: &TileExpr, memo: &mut rustc_hash::FxHashMap<TileExpr, TileEx
                 (_, Some(m)) => (right, m),
                 _ => return rebuilt,
             };
-            // Every set bit of the mask sits below the value's known-zero
-            // low bits: the AND is identically zero.
+            // The mask lies inside the known-zero low bits.
             if m >> known_zero_low_bits(masked).min(31) == 0 {
                 return lit(0);
             }
@@ -1692,8 +1523,7 @@ fn rewrite_index(e: &TileExpr, memo: &mut rustc_hash::FxHashMap<TileExpr, TileEx
                 });
                 return simplify_index_cached(&add(anded, c & m), memo);
             }
-            // Mod-interval second chance for a low mask: no carry across
-            // the mask's top, so the AND distributes over the sum.
+            // Mod-interval second chance for a low mask.
             if m < u32::MAX && (m + 1).is_power_of_two() {
                 let s = (m + 1).trailing_zeros();
                 if let Some((a, c)) = top_literal_add(masked)
@@ -1711,9 +1541,7 @@ fn rewrite_index(e: &TileExpr, memo: &mut rustc_hash::FxHashMap<TileExpr, TileEx
         }
         TileBinaryOp::Div => {
             if let (Some((a, c)), Some(d)) = (carry_free_add(left), lit_u32(right)) {
-                // Carry-freedom gives `a`'s low `t` bits zero and `c < 2^t`;
-                // splitting a division needs `d` to divide the alignment,
-                // i.e. `d` a power of two no larger than `2^t`.
+                // Splits only when `d` divides the alignment `2^t`.
                 if d.is_power_of_two() && u64::from(d) <= (1u64 << known_zero_low_bits(&a)) {
                     let divided = with(TileExprKind::Binary {
                         op: TileBinaryOp::Div,

@@ -23,15 +23,11 @@ use fusor_ir::target::LowerCtx;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-/// The largest finite f32 WGSL parses back identically; the infinities of a
-/// GPU kernel are spelled as its negation and itself.
+/// The largest finite f32 WGSL parses back identically; stands in for ±inf.
 pub const SAFE_F32_MAX: f32 = 3.40282e38;
 
-/// Clamp an infinite literal to the largest finite value WGSL can spell.
-///
-/// WGSL has no infinite literal and naga rejects a module holding one;
-/// `exp(x - m)` underflows to zero against the sentinel exactly as it would
-/// against a real infinity.
+/// Clamp an infinite literal finite (WGSL cannot spell one; `exp(x - m)`
+/// underflows the same) and a NaN to zero.
 pub fn finite_f32(v: f32) -> f32 {
     if v.is_infinite() {
         if v.is_sign_negative() {
@@ -46,8 +42,7 @@ pub fn finite_f32(v: f32) -> f32 {
     }
 }
 
-/// [`finite_f32`] on the f16 bit pattern: 65504 is the largest finite
-/// magnitude.
+/// [`finite_f32`] on the f16 bit pattern.
 pub fn finite_f16(bits: u16) -> u16 {
     let v = half::f16::from_bits(bits);
     if v.is_infinite() || v.is_nan() {
@@ -64,8 +59,7 @@ pub fn finite_f16(bits: u16) -> u16 {
     }
 }
 
-/// [`finite_f32`] on the bf16 bit pattern. `from_f32(-3.40282e38)` rounds
-/// back to -inf in bf16, so bf16's own finite extremes are taken.
+/// [`finite_f32`] on the bf16 bit pattern, at bf16's own finite extremes.
 pub fn finite_bf16(bits: u16) -> u16 {
     let v = half::bf16::from_bits(bits);
     if v.is_nan() {
@@ -82,8 +76,7 @@ pub fn finite_bf16(bits: u16) -> u16 {
 }
 
 /// The identity of a reduction over `elem`, finite where the type has
-/// infinities: WGSL cannot spell one, and `exp(x - m)` underflows to zero
-/// against the finite extreme exactly as against an infinity.
+/// infinities.
 pub fn reduce_identity(op: TileReduceOp, elem: ScalarElement) -> TileLiteral {
     use TileReduceOp::{Max, Min, Product, Sum};
     let f16 = |v: f32| TileLiteral::F16(half::f16::from_f32(v).to_bits());
@@ -134,8 +127,7 @@ pub fn finite_literal(s: Splat) -> TileLiteral {
     }
 }
 
-/// Logical dtype to Kernel element. Quantized weights bind as `u32` words;
-/// their decode is arithmetic over them, never a buffer type.
+/// Logical dtype to Kernel element; quantized weights bind as `u32` words.
 pub const fn scalar_element(dtype: Dtype) -> ScalarElement {
     match dtype {
         Dtype::F32 => ScalarElement::F32,
@@ -152,8 +144,7 @@ pub fn quantized_words(fmt: QFmt, layout: QLayout, elements: u64) -> u64 {
     (blocks * u64::from(fmt.block_bytes(layout))).div_ceil(4)
 }
 
-/// The storage layout a quantized value carries, read off its `LeafKind`:
-/// layout is a priced operand attribute, never a device branch.
+/// The storage layout a quantized value carries, read off its `LeafKind`.
 pub fn qlayout_of(cx: &LowerCtx<'_>, value: Id) -> Option<QLayout> {
     let class = cx.graph.class_of(value);
     cx.graph
@@ -165,8 +156,7 @@ pub fn qlayout_of(cx: &LowerCtx<'_>, value: Id) -> Option<QLayout> {
         })
 }
 
-/// The splat a `Leaf::Const` operand folds to, if it is one. The plan binds
-/// no buffer for it.
+/// The splat a `Leaf::Const` operand folds to, if it is one.
 pub fn const_splat(cx: &LowerCtx<'_>, src: Id) -> Option<Splat> {
     match &cx.graph.node(cx.selected(src)).op {
         Op::Logical(Logical::Leaf(LeafKind::Const { value, .. })) => Some(*value),
@@ -174,9 +164,7 @@ pub fn const_splat(cx: &LowerCtx<'_>, src: Id) -> Option<Splat> {
     }
 }
 
-/// Hash-consing Kernel term builder: two identical subtrees built separately
-/// return the same `Arc`. Interior mutability lets a nested call build its
-/// operands inline.
+/// Hash-consing Kernel term builder: identical subtrees share one `Arc`.
 #[derive(Default)]
 pub struct Kernel {
     memo: RefCell<FxHashMap<u64, SmallVec<[TileExpr; 2]>>>,
@@ -223,8 +211,7 @@ impl Kernel {
         self.lit(TileLiteral::Bool(v))
     }
 
-    /// The zero of an element type, used as a load fill and an accumulator
-    /// init.
+    /// The zero of an element type.
     pub fn zero(&self, elem: ScalarElement) -> TileExpr {
         match elem {
             ScalarElement::F32 => self.f32(0.0),
@@ -247,9 +234,7 @@ impl Kernel {
         }
     }
 
-    /// The finite "smaller than anything real" sentinel a max starts from:
-    /// the same values as the emitted reduce identities, so both agree bit
-    /// for bit.
+    /// The finite `Max` identity, bit-equal to the emitted reduce identity.
     pub fn neg_inf(&self, elem: ScalarElement) -> TileExpr {
         self.extreme(TileReduceOp::Max, elem)
     }
@@ -384,8 +369,7 @@ impl Kernel {
     pub fn divrem(&self, a: TileExpr, b: TileExpr) -> (TileExpr, TileExpr) {
         (self.div(a.clone(), b.clone()), self.rem(a, b))
     }
-    /// `a * b + c` with contraction permitted, the fused-multiply-add the
-    /// emitter is free to issue as one instruction.
+    /// `a * b + c`, contractible to one fma.
     pub fn fma(&self, a: TileExpr, b: TileExpr, c: TileExpr) -> TileExpr {
         self.add(self.mul(a, b), c)
     }
@@ -393,9 +377,8 @@ impl Kernel {
     pub fn at(&self, base: TileExpr, index: TileExpr, stride: TileExpr) -> TileExpr {
         self.add(base, self.mul(index, stride))
     }
-    /// `(x / inner) * span + x % inner`: where row `x` of a space with
-    /// `inner` elements past its reduced (or tiled) axis starts, one outer
-    /// step spanning `span` elements.
+    /// `(x / inner) * span + x % inner`: where row `x` starts when `inner`
+    /// elements follow its reduced axis and one outer step spans `span`.
     pub fn row_base(&self, x: TileExpr, inner: TileExpr, span: TileExpr) -> TileExpr {
         self.add(
             self.mul(self.div(x.clone(), inner.clone()), span),
@@ -547,8 +530,7 @@ impl Kernel {
         Arc::new(LocalDecl::new(element))
     }
 
-    /// A workgroup tile. Also identity-bearing: two tiles with the same shape
-    /// are two allocations the arena may or may not overlap.
+    /// A workgroup tile; identity-bearing, like a local.
     pub fn tile(&self, name: &'static str, element: ElementType, extents: &[u32]) -> Tile {
         Arc::new(TileDecl::new(
             element,
@@ -599,10 +581,8 @@ impl Kernel {
         acc.unwrap_or_else(|| self.u32(0))
     }
 
-    /// The N-ary cross-lane close of a carrier: one scratch tile, one partial
-    /// and one output local per lane, with `merge` building the merge body
-    /// from the `lhs ++ rhs` lane reads. Returns the statement and the reads
-    /// of its outputs.
+    /// The N-ary cross-lane close of a carrier, `merge` building the body
+    /// from `lhs ++ rhs` lane reads; returns the statement and output reads.
     pub fn merge_tree(
         &self,
         scratch: SmallVec<[Tile; 4]>,
@@ -637,10 +617,8 @@ impl Kernel {
     }
 }
 
-/// A scatter's destination geometry, read off the **base operand** rather
-/// than off `space`, which is minted as the output space by the floor rule
-/// and as the update space by the tile rule. The base operand's layout gives
-/// the destination and the index operand's the update count either way.
+/// A scatter's destination geometry, read off the base and index operands
+/// (`space` differs between the floor and tile rules).
 pub struct ScatterGeometry {
     /// Product of the base extents before the scattered axis.
     pub outer: u32,
@@ -700,23 +678,20 @@ impl ScatterGeometry {
     }
 }
 
-/// A fold's carrier expanded to one expression per accumulator lane, checked
-/// against the nest both backends lower it through.
+/// A fold's carrier expanded to one expression per accumulator lane.
 pub struct FoldLanes {
     pub merges: Vec<ScalarExpr>,
     pub posts: Vec<ScalarExpr>,
     /// `(slot, promoted position)` of each lane.
     pub slots: Vec<(usize, u64)>,
     pub identities: Vec<Splat>,
-    /// Iteration axis `j` is space axis `iter_axes[j]`: every `ScalarExpr`
-    /// on the node is written against the iteration space.
+    /// Iteration axis `j` is space axis `iter_axes[j]`.
     pub iter_axes: Vec<usize>,
 }
 
 impl FoldLanes {
-    /// `space` is `free.. ++ vec.. ++ [reduced]` for a promoted nest, which
-    /// `verify_launch` establishes; a promoted fold whose reduced axis is not
-    /// last is refused, as is a `Vector` slot with no promoted axis.
+    /// `space` is `free.. ++ vec.. ++ [reduced]` for a promoted nest; refuses
+    /// a promoted fold not reducing last and a `Vector` slot unpromoted.
     pub fn of(
         carrier: &Carrier,
         post: &[ScalarExpr],

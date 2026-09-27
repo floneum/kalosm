@@ -13,30 +13,19 @@ const BLOCK_CHOICES: [u32; 4] = [32, 64, 128, 256];
 /// How many strategies survive; the cap keeps the lowest seed rank first.
 pub const MAX_STRATEGIES: usize = 32;
 
-/// The workgroup width both emitters allocate scratch over; `verify_launch`
-/// admits strategies against the same number.
+/// The workgroup width emitters allocate scratch over and `verify_launch`
+/// admits against.
 pub use fusor_ir::ir::launch::{emitted_block, fold_scratch_bytes};
 
-/// Every legal reduction strategy for an axis of extent `k` on this device,
-/// for a single-lane f32 accumulator.
-///
-/// [`fold_domain_for`] is the general form.
+/// Every legal reduction strategy for an axis of extent `k`, single-lane f32
+/// accumulator. See [`fold_domain_for`].
 pub fn fold_domain(k: Dim, cx: &DomainCtx<'_>) -> FoldDomain {
     fold_domain_for(k, 1, 4, cx)
 }
 
-/// Every legal reduction strategy for an axis of extent `k` carrying `lanes`
-/// accumulator lanes of `acc_bytes` each.
-///
-/// [`FoldStrat::Subgroup`] appears only when the device reports a fixed
-/// subgroup width — a ranged width makes a subgroup collective unusable.
-///
-/// A strategy whose cross-lane close needs
-/// `lanes * emitted_block * acc_bytes` bytes of workgroup storage is dropped:
-/// both emitters allocate one scratch tile of `block` elements per
-/// accumulator lane, and `verify_launch` reads the same number from the same
-/// arena function, so a strategy over the cap would assert, not merely run
-/// slow. A wide enough carrier can empty the domain.
+/// Every legal reduction strategy for `lanes` accumulators of `acc_bytes`.
+/// [`FoldStrat::Subgroup`] needs a fixed subgroup width. Strategies whose
+/// `lanes * block * acc_bytes` scratch exceeds workgroup storage are dropped.
 pub fn fold_domain_for(k: Dim, lanes: u64, acc_bytes: u64, cx: &DomainCtx<'_>) -> FoldDomain {
     let caps = cx.caps;
     let max_block = caps
@@ -78,8 +67,7 @@ pub fn fold_domain_for(k: Dim, lanes: u64, acc_bytes: u64, cx: &DomainCtx<'_>) -
                 push(FoldStrat::WgTree { lane_group }, &mut out);
                 if let Some(k) = k.as_const() {
                     let iterations = k.div_ceil(u64::from(lane_group));
-                    // One iteration is a plain tree; the loop prologue only
-                    // exists when a lane strides the axis more than once.
+                    // One iteration is a plain tree, no loop prologue.
                     if iterations >= 2 {
                         let iterations = u32::try_from(iterations).unwrap_or(u32::MAX);
                         push(
@@ -104,9 +92,8 @@ pub fn fold_domain_for(k: Dim, lanes: u64, acc_bytes: u64, cx: &DomainCtx<'_>) -
     }
 }
 
-/// Move-ordering seed: a subgroup collective when one is available, then a
-/// tree over a full-width workgroup, then a per-lane loop whose trip count
-/// sits inside the register budget.
+/// Move-ordering seed: subgroup collective, then a full-width tree, then a
+/// per-lane loop within the register budget.
 pub(crate) fn seed_rank(s: FoldStrat) -> u8 {
     const STAGE_BUDGET: u32 = 4;
     match s {

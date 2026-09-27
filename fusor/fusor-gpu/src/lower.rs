@@ -1,13 +1,6 @@
-//! Launch node + `SchedPoint` -> `KernelIr`, one module per node family.
-//!
-//! Everything shared by the six family lowerings lives here: the grid fold,
-//! the 2-D matrix flattening of an N-D strided operand, the hash-consing Kernel
-//! term builder, and the [`Ctx`] that turns `Plan`-carried buffer layouts into
-//! Kernel storage views.
-//!
-//! **Operand layouts are never re-derived.** Every layout comes from
-//! `Plan::buffers[..].layout`, which the extractor established; a mismatch
-//! is a broken plan ([`Error::Plan`]).
+//! Launch node + `SchedPoint` -> `KernelIr`, one module per node family,
+//! and the [`Ctx`] they share. Operand layouts come from `Plan::buffers`,
+//! never re-derived; a mismatch is a broken plan ([`Error::Plan`]).
 
 pub(crate) mod contract;
 pub(crate) mod gather_scatter;
@@ -52,6 +45,8 @@ pub(crate) enum StagedSource {
         rows_per_batch: Dim,
     },
 }
+
+/// The plan's layout and dtype for `value`; a leaf is dense over its facts.
 pub(crate) fn bound_layout(cx: &LowerCtx<'_>, value: Id) -> (Layout, Dtype) {
     let value = cx.selected(value);
     match cx.plan.buffers.iter().find(|b| b.value == value) {
@@ -62,19 +57,10 @@ pub(crate) fn bound_layout(cx: &LowerCtx<'_>, value: Id) -> (Layout, Dtype) {
         }
     }
 }
-/// The step-invariant decl extent: constants multiply, symbolic dims count
-/// as 1. Storage globals are runtime-sized arrays, in-range masks are built
-/// from the plan layout's `Dim`s, and the emitter's clamp reads
-/// `arrayLength`, so nothing consumes this number for a symbolic buffer —
-/// and resolving it would bake the sequence length into the kernel's
-/// identity. An *unmasked* load through a symbolic view still fails
-/// `verify_kernel` loudly, as it must.
+/// The step-invariant decl extent `shape[0] * strides[0]` (padding lives in
+/// the strides), symbolic dims counting as 1: nothing reads it for a symbolic
+/// buffer, and resolving it would bake the sequence length into the kernel.
 fn decl_elements(layout: &Layout) -> u64 {
-    // Padding lives in the strides: the extent of the plan's row-major
-    // layouts is `shape[0] * strides[0]`, and the shape product undercounts
-    // a padded buffer. A non-const stride slot 0 is the `row_major_strides`
-    // placeholder, which implies no padding — the product of the remaining
-    // extents is exactly what it derives to.
     let (Some(first), Some(stride0)) = (layout.shape().first(), layout.strides().first()) else {
         return 1;
     };
@@ -88,25 +74,15 @@ fn decl_elements(layout: &Layout) -> u64 {
     outer.saturating_mul(stride0).max(1)
 }
 
-/// Runtime extents for the plan's symbols. A plan is compiled once for a whole
-/// shape family, so the *grid* reads this and the *kernel body* reads binding 0
-/// — never the other way round.
-///
-/// Every read is recorded: the set of symbols a lowering consulted is exactly
-/// the set whose values its `KernelIr` (grid included) can depend on, so the
-/// artifact cache keys a built kernel on those values alone. A kernel that
-/// never reads a symbol is shared across every binding, which is what makes
-/// a decode step's length change recompile nothing.
+/// Runtime extents for the plan's symbols: the grid reads these, the kernel
+/// body reads binding 0. Every read is recorded so the artifact cache keys a
+/// kernel on exactly the symbols it consulted.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct DimBinding {
     values: FxHashMap<SymId, u64>,
     consulted: std::sync::Arc<parking_lot::Mutex<rustc_hash::FxHashSet<SymId>>>,
-    /// Symbols read *only* to fold the dispatch grid, and the
-    /// `(space, block, inner_tile)` grids those reads served. The grid is not the body:
-    /// a symbol that moved only the workgroup count leaves the emitted
-    /// module byte-identical, so it must not force a rebuild. Recording the
-    /// derivation lets the artifact cache recompute the grid at the new
-    /// binding instead — see [`DimBinding::grid_derivation`].
+    /// Symbols read only to fold the dispatch grid: they leave the module
+    /// byte-identical, so the cache replays the grid instead of rebuilding.
     grid: std::sync::Arc<parking_lot::Mutex<GridReads>>,
 }
 
@@ -114,16 +90,12 @@ pub(crate) struct DimBinding {
 #[derive(Clone, Debug, Default)]
 struct GridReads {
     symbols: rustc_hash::FxHashSet<SymId>,
-    /// Every distinct dispatch grid requested by the lowering. More
-    /// than one and the lowering's committed grid is ambiguous from here, so
-    /// nothing is replayable and the reads fall back to `consulted`.
+    /// Every grid requested; more than one distinct makes none replayable.
     specs: Vec<GridSpec>,
 }
 
-/// The index space, innermost-axis tile and workgroup width of a dispatch.
-///
-/// This is the whole of a dispatch grid's dependence on the binding: replaying
-/// it at another binding is exactly what re-lowering would have computed.
+/// The index space, innermost-axis tile and workgroup width of a dispatch:
+/// all of its grid's dependence on the binding.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct GridSpec {
     pub space: IndexSpace,
@@ -164,16 +136,13 @@ impl DimBinding {
         }
     }
 
-    /// Concrete extent, or `Error::Plan`. Grid computation cannot proceed on
-    /// an unbound symbol and must not guess one.
+    /// Concrete extent, or `Error::Plan` for an unbound symbol.
     pub(crate) fn require(&self, dim: Dim) -> Result<u64> {
         self.resolve(dim)
             .ok_or_else(|| Error::Plan(format!("dim {dim} is unbound at dispatch")))
     }
 
-    /// Concrete extent for a *grid* fold. The read lands in the grid record,
-    /// not in `consulted`: it cannot reach the emitted module, only the
-    /// workgroup count.
+    /// Concrete extent for a grid fold, recorded as a grid read only.
     fn require_for_grid(&self, dim: Dim) -> Result<u64> {
         let value = dim.evaluate(&mut |s| {
             let hit = self.values.get(&s).copied();
@@ -185,13 +154,8 @@ impl DimBinding {
         value.ok_or_else(|| Error::Plan(format!("dim {dim} is unbound at dispatch")))
     }
 
-    /// The one grid derivation this lowering committed to, when it has one:
-    /// a single [`grid_for`] call whose replay reproduces `grid`.
-    ///
-    /// `None` — several distinct folds, none at all, or a fold that does not
-    /// reproduce the grid the lowering finished with — means the grid is not
-    /// replayable from here, and [`Self::consulted`] then reports the grid's
-    /// symbols too so the cache keys on them.
+    /// The single [`grid_for`] call whose replay reproduces `grid`, if the
+    /// lowering made exactly one.
     pub(crate) fn grid_derivation(&self, grid: [u32; 3], limits: &Limits) -> Option<GridSpec> {
         let spec = {
             let g = self.grid.lock();
@@ -205,11 +169,8 @@ impl DimBinding {
         (spec.grid(self, limits).ok()? == grid).then_some(spec)
     }
 
-    /// Every symbol whose value the emitted module can depend on.
-    ///
-    /// Grid-only reads are excluded exactly when [`Self::grid_derivation`]
-    /// yields a replay for them; otherwise they are folded back in, because a
-    /// grid nobody can recompute must be rebuilt.
+    /// Every symbol the emitted module can depend on; grid-only reads count
+    /// unless the grid is replayable.
     pub(crate) fn body_consulted(&self, replayable: bool) -> Vec<SymId> {
         let mut out: rustc_hash::FxHashSet<SymId> = self.consulted.lock().clone();
         if !replayable {
@@ -278,21 +239,9 @@ pub(crate) struct MatrixView {
     pub layout: TileLayout,
 }
 
-/// Flatten a strided layout into a 2-D matrix view: `shape[..row_dims]`
-/// flattens to rows, `shape[row_dims..]` to columns.
-///
-/// Sides whose dims merge affinely use a plain strided layout; anything else
-/// (a conv im2col window, a non-affine batch prefix) becomes a
-/// [`MultiFlattenMap`] whose sub-axes divmod the flat coordinate back apart
-/// per load. Extent-1 axes are dropped from the decomposition, saving a
-/// divmod per load.
-///
-/// The plan guarantees these strides, so a failure is [`Error::Plan`].
-///
-/// `row_dims` may be `0` or `rank`: a contraction whose `n` (or `k`) extent
-/// is 1 has *no* axes on that side, and its operand is a one-column (or
-/// one-row) matrix. An empty side contributes a single index of 0, so its
-/// stride never enters an address.
+/// Flatten a strided layout into a 2-D matrix view: `shape[..row_dims]` to
+/// rows, the rest to columns. A side that does not merge affinely becomes a
+/// [`MultiFlattenMap`] divmodded per load; an empty side is a single index 0.
 pub(crate) fn flatten_matrix_layout_split(
     layout: &Layout,
     row_dims: usize,
@@ -346,8 +295,7 @@ pub(crate) fn flatten_matrix_layout_split(
         let group = |lo: usize, hi: usize| -> Result<AxisGroup> {
             let mut sub_axes: SmallVec<[SubAxis; 2]> = SmallVec::new();
             for axis in lo..hi {
-                // Extent-1 axes contribute nothing to the flat coordinate
-                // decomposition; dropping them saves a divmod per load.
+                // Extent-1 axes would only cost a divmod per load.
                 if shape[axis] == 1 {
                     continue;
                 }
@@ -383,17 +331,9 @@ pub(crate) fn flatten_matrix_layout_split(
     })
 }
 
-/// The axis split that presents `layout` as exactly `rows` by `cols`
-/// elements.
-///
-/// [`Launch::Contract`](fusor_ir::ir::launch::Launch::Contract) records four
-/// *extents* — `m`, `n`, `k`, `batch` — and not the label partition they came
-/// from, so the number of trailing `k` (resp. `n`) axes is not on the node.
-/// It is recoverable, because `canonical_for_mnk` admits only
-/// `a = [batch.., m.., k..]` and `b = [batch.., k.., n..]`: the split is the
-/// position whose prefix multiplies to `rows` and whose suffix multiplies to
-/// `cols`. The longest qualifying prefix is taken, which pins the choice when
-/// an extent-1 axis makes two positions equivalent.
+/// The axis split presenting `layout` as `rows` by `cols`: canonical operands
+/// are `[batch.., m.., k..]`, so the split is where the prefix product is
+/// `rows`; the longest such prefix wins ties from extent-1 axes.
 pub(crate) fn matrix_split_for(
     layout: &Layout,
     binding: &DimBinding,
@@ -444,39 +384,40 @@ pub(crate) struct Ctx<'a> {
 }
 
 impl<'a> Ctx<'a> {
-    /// Build the buffer table for one launch with the plan's binding-0 word
-    /// layout supplied.
-    ///
-    /// The pack is a function of the plan alone, so a caller that lowers more
-    /// than one launch of one plan derives it once and hands it down.
+    /// Build the buffer table for one launch over the plan's binding-0 pack.
     pub(crate) fn with_pack(
         caps: &'a Caps,
         cx: &'a LowerCtx<'a>,
         binding: DimBinding,
         pack: std::sync::Arc<UniformPack>,
     ) -> Result<Self> {
-        // Deterministic decl numbering per kernel build: a relower of the
-        // same launch mints the same ids, so the pipeline cache's body-hash
-        // dedup actually hits.
+        // A relower mints the same decl ids, so the body-hash dedup hits.
         fusor_ir::ir::kernel::reset_decl_ids();
         Self::with_pack_in(caps, cx, binding, pack)
     }
 
-    /// [`Self::with_pack`] without restarting decl numbering: a group
-    /// member's decls must not collide with its siblings'.
+    /// [`Self::with_pack`] continuing decl numbering, for a group member.
     pub(crate) fn with_pack_in(
         caps: &'a Caps,
         cx: &'a LowerCtx<'a>,
         binding: DimBinding,
         pack: std::sync::Arc<UniformPack>,
     ) -> Result<Self> {
+        let decl = |binding, dtype, extent: u32, access| {
+            Arc::new(BufferDecl {
+                binding,
+                element: ElementType::Scalar(scalar_element(dtype)),
+                layout: TileLayout::contiguous(MemoryLevel::Storage, &[extent.max(1)]),
+                access,
+            })
+        };
         let uniform_words = (pack.byte_len() / 4).max(1) as u32;
-        let mut buffers: Vec<Buffer> = vec![Arc::new(BufferDecl {
-            binding: UNIFORM_BINDING,
-            element: ElementType::Scalar(ScalarElement::U32),
-            layout: TileLayout::contiguous(MemoryLevel::Storage, &[uniform_words]),
-            access: BufferAccess::Read,
-        })];
+        let mut buffers: Vec<Buffer> = vec![decl(
+            UNIFORM_BINDING,
+            Dtype::U32,
+            uniform_words,
+            BufferAccess::Read,
+        )];
 
         let mut ordered: Vec<_> = cx.launch.bindings.iter().collect();
         ordered.sort_by_key(|b| b.binding);
@@ -487,8 +428,7 @@ impl<'a> Ctx<'a> {
         for plan_binding in ordered.iter() {
             let (layout, dtype) = bound_layout(cx, plan_binding.value);
             let class = cx.graph.class_of(plan_binding.value);
-            // Typed views share one physical arena binding. The emitter
-            // declares it once and reinterprets mixed types at each access.
+            // Typed views share one physical arena binding.
             if plan_binding.arena {
                 let bytes = cx
                     .plan
@@ -507,12 +447,12 @@ impl<'a> Ctx<'a> {
                 } else {
                     let extent = u32::try_from(cx.plan.arena_bytes / elem)
                         .map_err(|_| Error::Plan("arena element count exceeds a u32".into()))?;
-                    buffers.push(Arc::new(BufferDecl {
-                        binding: plan_binding.binding,
-                        element: ElementType::Scalar(scalar_element(dtype)),
-                        layout: TileLayout::contiguous(MemoryLevel::Storage, &[extent.max(1)]),
-                        access: BufferAccess::ReadWrite,
-                    }));
+                    buffers.push(decl(
+                        plan_binding.binding,
+                        dtype,
+                        extent,
+                        BufferAccess::ReadWrite,
+                    ));
                     let slot = buffers.len() - 1;
                     arena_views.insert(dtype, slot);
                     slot
@@ -524,8 +464,7 @@ impl<'a> Ctx<'a> {
                 continue;
             }
             let elements = decl_elements(&layout);
-            // A quantized buffer holds blocks, not elements: it binds as the
-            // `u32` word stream the decode program addresses.
+            // A quantized buffer binds as its `u32` block word stream.
             let elements = match dtype {
                 Dtype::Q(fmt) => {
                     let qlayout = qlayout_of(cx, plan_binding.value).unwrap_or(QLayout::Native);
@@ -539,19 +478,12 @@ impl<'a> Ctx<'a> {
                 fusor_ir::extract::BindKind::Read => BufferAccess::Read,
                 _ => BufferAccess::ReadWrite,
             };
-            // Keyed by every id in the value's class, not only by the
-            // selected one: an `Operand::src` names whichever id the rule
-            // author wrote, and they all denote the same buffer. `class_ids`
-            // includes the `Union` spine, which macro ops hand their callers.
+            // Keyed by every id in the class (`Union` spine included): an
+            // `Operand::src` may name any of them.
             for member in cx.graph.class_ids(class) {
                 slot_of.insert(member, buffers.len());
             }
-            buffers.push(Arc::new(BufferDecl {
-                binding: plan_binding.binding,
-                element: ElementType::Scalar(scalar_element(dtype)),
-                layout: TileLayout::contiguous(MemoryLevel::Storage, &[extent.max(1)]),
-                access,
-            }));
+            buffers.push(decl(plan_binding.binding, dtype, extent, access));
         }
 
         Ok(Self {
@@ -568,8 +500,7 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// The lanes a lowering that wants `want` runs at: a group member runs at
-    /// no fewer than its group's block.
+    /// Lanes for a lowering that wants `want`: never below a group's block.
     pub(crate) fn block(&self, want: u32) -> u32 {
         want.max(self.block_floor)
     }
@@ -579,8 +510,7 @@ impl<'a> Ctx<'a> {
         self.arena_offset.get(&value).copied().unwrap_or(0)
     }
 
-    /// This workgroup's linear index against the dispatch grid — or, for a
-    /// group member, within the member's own range.
+    /// This workgroup's linear index (within its range, for a group member).
     pub(crate) fn linear_workgroup(&self) -> TileExpr {
         use fusor_ir::ir::kernel::WorkgroupAxis;
         if let Some(w) = &self.workgroup {
@@ -588,9 +518,7 @@ impl<'a> Ctx<'a> {
         }
         let b = &self.b;
         let id = |axis| b.builtin(Builtin::ProgramId(axis));
-        // group = gx + gy*X + gz*X*Y, exactly as the grid fold laid it out —
-        // with X and Y read from `@builtin(num_workgroups)`, never baked, so
-        // the extents never enter the body.
+        // gx + gy*X + gz*X*Y, with X and Y read from `num_workgroups`.
         let x = b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::X));
         let y = b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::Y));
         b.add(
@@ -599,13 +527,13 @@ impl<'a> Ctx<'a> {
         )
     }
 
-    /// The bound buffer for a plan value.
-    /// Whether this launch binds a buffer for `value`. A slab member kept in
+    /// Whether this launch binds a buffer for `value`; a slab member kept in
     /// workgroup memory has none.
     pub(crate) fn has_buffer(&self, value: Id) -> bool {
         self.slot_of.contains_key(&value)
     }
 
+    /// The bound buffer for a plan value.
     pub(crate) fn buffer(&self, value: Id) -> Result<Buffer> {
         let slot = self
             .slot_of
@@ -629,8 +557,7 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// A 2-D matrix view of an operand, split at `row_dims`, built from the
-    /// plan's layout.
+    /// A 2-D matrix view of an operand split at `row_dims`.
     pub(crate) fn matrix_view(
         &self,
         operand: &Operand,
@@ -648,8 +575,8 @@ impl<'a> Ctx<'a> {
         }))
     }
 
-    /// Restate an affine operand over its producer's padded allocation. An
-    /// axis spanning padding needs the general logical-index mapping instead.
+    /// Restate an affine operand over its producer's padded allocation;
+    /// `None` when an axis spans padding.
     fn repad_operand_layout(&self, operand: &Operand) -> Result<Option<Layout>> {
         let selected = self.cx.selected(operand.src);
         let Some(plan) = self.cx.plan.buffers.iter().find(|b| b.value == selected) else {
@@ -702,14 +629,8 @@ impl<'a> Ctx<'a> {
         Layout::from_parts(operand.layout.offset(), operand.layout.shape(), &strides).map(Some)
     }
 
-    /// The [`Source`] a contraction stages one operand from.
-    ///
-    /// Dense operands read storage. A block-quantized operand reads
-    /// [`Source::Quantized`], whose decode program the Kernel emitter runs at the
-    /// `(row, col)` the staging fill already computes — so a quantized weight
-    /// costs the decode math on the way into shared memory and nothing else.
-    /// The staging tile, the fragments, the MMA and the arena footprint are the
-    /// dense ones.
+    /// The [`Source`] a contraction stages one operand from: storage, or a
+    /// quantized decode run at the staging fill's `(row, col)`.
     pub(crate) fn contract_stage_source(
         &self,
         operand: &Operand,
@@ -726,15 +647,9 @@ impl<'a> Ctx<'a> {
         }))
     }
 
-    /// Every buffer one contraction side reads, as a staging source apiece.
-    ///
-    /// A side is a list because an absorbed producer brings its own edges —
-    /// the GGUF block decode arrives with the quant plane, the block scale,
-    /// the block minimum and the group scales, each a `Restride` of the same
-    /// block stream at its own offset. They share the side's `(rows, cols)`
-    /// index and differ only in strides, so each gets its own view and all of
-    /// them are loaded at the same coordinate before the side's `pre` runs
-    /// over the results.
+    /// Every buffer one contraction side reads, as a staging source apiece:
+    /// an absorbed producer (a GGUF block decode's planes and scales) brings
+    /// several edges, all loaded at the side's `(rows, cols)` before `pre`.
     pub(crate) fn contract_side_sources(
         &self,
         side: &ContractSide,
@@ -746,9 +661,7 @@ impl<'a> Ctx<'a> {
         side.ops
             .iter()
             .map(|o| {
-                // A `Const` leaf is folded into the kernel — no buffer, no
-                // binding — exactly as `load_operand` treats it. Absorbed
-                // producers bring these: a layer norm's `1/N`, an epsilon.
+                // A `Const` leaf folds into the kernel, as in `load_operand`.
                 if let Some(lit) = self.const_operand(o.src) {
                     return Ok(StagedSource::Const(lit));
                 }
@@ -838,8 +751,8 @@ impl<'a> Ctx<'a> {
         )
     }
 
-    /// A `u32` expression for a dim: a literal when constant, a binding-0 word
-    /// when symbolic. A sequence length is a word, never a baked constant.
+    /// A `u32` expression for a dim: a literal, or a binding-0 word when
+    /// symbolic so a length change recompiles nothing.
     pub(crate) fn dim_expr(&self, dim: Dim) -> Result<TileExpr> {
         match dim {
             Dim::Const(v) => {
@@ -864,8 +777,7 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// An `f32` expression for a runtime scalar: `m * lr` reads a word, so a
-    /// learning-rate change recompiles nothing.
+    /// An `f32` expression for a runtime scalar, read from binding 0.
     pub(crate) fn scalar_expr(&self, sym: SymId) -> Result<TileExpr> {
         let slot = self
             .pack
@@ -876,9 +788,7 @@ impl<'a> Ctx<'a> {
             .bitcast(self.uniform_word(slot), ScalarElement::F32.element()))
     }
 
-    /// The global linear element index this invocation owns: the workgroup
-    /// index linearized against the dispatched grid (read from
-    /// `num_workgroups`, never baked), times `block`, plus the lane.
+    /// The global linear element index: workgroup * `block` + lane.
     pub(crate) fn global_index(&self, block: u32) -> TileExpr {
         let lane = self.b.builtin(Builtin::Lane);
         self.b
@@ -908,8 +818,7 @@ impl<'a> Ctx<'a> {
     }
 
     /// Per-axis coordinates of a flat index over `space`, most-significant
-    /// axis first. One divmod per axis past the innermost, exactly as the
-    /// index-op cost term prices.
+    /// first: one divmod per axis past the innermost.
     pub(crate) fn coords_from_linear(
         &self,
         linear: TileExpr,
@@ -930,12 +839,9 @@ impl<'a> Ctx<'a> {
         Ok(coords)
     }
 
-    /// Translate a [`fusor_ir::scalar::ScalarExpr`] body into Kernel.
-    ///
-    /// `args` are the already-loaded operand values; `coords` are the index
-    /// space coordinates `IndexOf` reads. Comparisons return 1.0/0.0 in the
-    /// operand's own dtype, matching Logical semantics — Kernel's `Bool` exists only
-    /// between the compare and the select.
+    /// Translate a [`fusor_ir::scalar::ScalarExpr`] body into Kernel over
+    /// loaded `args` and `IndexOf` `coords`. Comparisons yield 1/0 in the
+    /// operand's dtype, as at Logical.
     pub(crate) fn eval_scalar(
         &self,
         expr: &fusor_ir::scalar::ScalarExpr,
@@ -944,6 +850,7 @@ impl<'a> Ctx<'a> {
     ) -> Result<TileExpr> {
         use fusor_ir::scalar::ScalarKind as K;
         let relaxed = NumericContract::RELAXED;
+        let ev = |e| self.eval_scalar(e, args, coords);
         Ok(match expr.kind() {
             K::Arg(i) => args.get(*i as usize).cloned().ok_or_else(|| {
                 Error::Plan(format!("body reads Arg({i}) with {} operands", args.len()))
@@ -961,56 +868,40 @@ impl<'a> Ctx<'a> {
                 })?;
                 self.b.cast(c, ElementType::Scalar(ScalarElement::U32))
             }
-            K::Un { op, x } => {
-                let v = self.eval_scalar(x, args, coords)?;
-                self.b.unary(*op, v, relaxed)
-            }
+            K::Un { op, x } => self.b.unary(*op, ev(x)?, relaxed),
             K::Bin { op, a, b } => {
-                let l = self.eval_scalar(a, args, coords)?;
-                let r = self.eval_scalar(b, args, coords)?;
-                self.b.binary(*op, l, r, relaxed)
+                let l = ev(a)?;
+                self.b.binary(*op, l, ev(b)?, relaxed)
             }
             K::Cmp { op, a, b } => {
-                let l = self.eval_scalar(a, args, coords)?;
-                let r = self.eval_scalar(b, args, coords)?;
+                let l = ev(a)?;
                 let elem = l.element();
-                let c = self.b.compare(*op, l, r);
+                let c = self.b.compare(*op, l, ev(b)?);
                 // `f32(cmp)`, never `select(0, 1, cmp)`: WARP's DXIL JIT
-                // removes the device on a select between float constants
-                // feeding an fma (fusor-gpu/tests/warp_probe.rs), and the
-                // cast is the same value on every backend.
+                // removes the device on the select (tests/warp_probe.rs).
                 self.b.cast(c, elem)
             }
             K::Select { c, t, f } => {
-                let cv = self.eval_scalar(c, args, coords)?;
-                let tv = self.eval_scalar(t, args, coords)?;
-                let fv = self.eval_scalar(f, args, coords)?;
+                let cv = ev(c)?;
+                let (tv, fv) = (ev(t)?, ev(f)?);
                 let zero = self.b.zero_of(cv.element());
                 let nonzero = self.b.compare(TileCompareOp::Ne, cv, zero);
                 self.b.select(nonzero, tv, fv)
             }
-            K::Cast { to, x } => {
-                let v = self.eval_scalar(x, args, coords)?;
-                self.b.cast(v, ElementType::Scalar(scalar_element(*to)))
-            }
-            K::Bitcast { to, x } => {
-                let v = self.eval_scalar(x, args, coords)?;
-                self.b.bitcast(v, ElementType::Scalar(scalar_element(*to)))
-            }
-            // `Round` is its own Kernel node, so there is no arithmetic
-            // identity for Metal's default fast math to fold away and QAT
-            // cannot be silently disabled.
-            K::Round { mode, x } => {
-                let v = self.eval_scalar(x, args, coords)?;
-                self.b.round(*mode, v)
-            }
+            K::Cast { to, x } => self
+                .b
+                .cast(ev(x)?, ElementType::Scalar(scalar_element(*to))),
+            K::Bitcast { to, x } => self
+                .b
+                .bitcast(ev(x)?, ElementType::Scalar(scalar_element(*to))),
+            // Its own node, so fast math cannot fold QAT's rounding away.
+            K::Round { mode, x } => self.b.round(*mode, ev(x)?),
             K::Dot { a, b } => {
-                let l = self.eval_scalar(a, args, coords)?;
-                let r = self.eval_scalar(b, args, coords)?;
-                self.b.dot(l, r)
+                let l = ev(a)?;
+                self.b.dot(l, ev(b)?)
             }
             K::Splat { lanes, x } => {
-                let v = self.eval_scalar(x, args, coords)?;
+                let v = ev(x)?;
                 let scalar = match v.element() {
                     ElementType::Scalar(s) => s,
                     ElementType::Vector { scalar, .. } => scalar,
@@ -1021,14 +912,8 @@ impl<'a> Ctx<'a> {
         })
     }
 
-    /// Load one operand at the reading kernel's **flat space index**, running
-    /// it through the edge's [`fusor_ir::ir::launch::AddressMap`] first.
-    ///
-    /// [`Ctx::load_operand`] is the raw form, for readers that have already
-    /// computed a storage index themselves (gather, scatter, the contraction
-    /// nests). Everything whose index *is* the space coordinate must come
-    /// through here: a stride-0 broadcast axis, a transposed view, a narrowed
-    /// slice and a conv window all disagree with the bare flat index.
+    /// Load one operand at the reading kernel's flat space index, through
+    /// the edge's address map; [`Ctx::load_operand`] takes a storage index.
     pub(crate) fn load_mapped(
         &self,
         operand: &Operand,
@@ -1047,23 +932,15 @@ impl<'a> Ctx<'a> {
         space_total: u64,
     ) -> Result<TileExpr> {
         let Some(map) = operand.address_map() else {
-            // A symbolic extent (or a stride past one) has no compile-time
-            // `AddressMap`; the address is computed with binding-0 words
-            // instead of literals, so a length change recompiles nothing.
+            // Symbolic: computed from binding-0 words instead.
             return self.symbolic_operand_address(operand, flat);
         };
         Ok(self.b.address(&map, flat, space_total))
     }
 
-    /// [`Ctx::operand_address`] for a layout no compile-time [`AddressMap`]
-    /// can express: at least one extent (or a stride past one) is symbolic.
-    ///
-    /// Emits `offset + Σ_axis ((flat / Π extents-right-of-axis) % extent) *
-    /// stride` with every symbolic quantity read from binding 0 via
-    /// [`Ctx::dim_expr`]. Axes with stride 0 (broadcast) or extent 1 contribute
-    /// no term but still advance the divisor. The most significant axis skips
-    /// its `%`: `flat` is masked below the space total by the caller, so the
-    /// quotient is already in range.
+    /// [`Ctx::operand_address`] for a symbolic layout: `offset + Σ ((flat /
+    /// Π right extents) % extent) * stride`, the leading axis skipping its `%`
+    /// since `flat` is masked below the space total.
     fn symbolic_operand_address(&self, operand: &Operand, flat: TileExpr) -> Result<TileExpr> {
         if matches!(
             operand.access,
@@ -1110,18 +987,9 @@ impl<'a> Ctx<'a> {
         Ok(acc.unwrap_or_else(|| self.b.u32(0)))
     }
 
-    /// Re-address a **logical** dense element index of `src` into the buffer
-    /// the plan actually laid out for it.
-    ///
-    /// `Plan::buffers` is authoritative about storage, and
-    /// `fusor_cost::plan::buffer_layout_for` pads a `Coop` contraction's
-    /// output to whole `bm x bn` blocks, while every other reader of that
-    /// value names its elements densely over the logical shape. Without this
-    /// step a `[16, 1]` contraction padded to `[16, 16]` is read as the first
-    /// sixteen elements of row 0.
-    ///
-    /// Identity — and emitted as nothing — whenever the plan's layout is the
-    /// logical dense one, which is every value the extractor did not pad.
+    /// Re-address a logical dense element index of `src` into the buffer the
+    /// plan laid out (a `Coop` output padded to whole blocks); identity for an
+    /// unpadded value.
     fn repad_index(&self, src: Id, index: TileExpr) -> Result<TileExpr> {
         let selected = self.cx.selected(src);
         let Some(plan) = self
@@ -1169,25 +1037,15 @@ impl<'a> Ctx<'a> {
         Ok(acc.unwrap_or_else(|| self.b.u32(0)))
     }
 
-    /// Load one operand at an already-computed **storage** element index. The
-    /// mask is the plan's runtime bounds obligation; a load is never emitted
-    /// unmasked unless the extent is a compile-time multiple of the block.
+    /// Load one operand at an already-computed logical element index, masked
+    /// by the buffer's extent.
     pub(crate) fn load_operand(&self, operand: &Operand, index: TileExpr) -> Result<TileExpr> {
-        // A `Leaf::Const` is folded into the kernel: no buffer, no binding,
-        // no traffic. That is exactly what `LeafRole::Free` means in the
-        // plan, so `derive_bindings` never emits one and loading it would
-        // look up a binding that deliberately does not exist.
+        // A `Leaf::Const` folds into the kernel and has no binding.
         if let Some(lit) = self.const_operand(operand.src) {
             return Ok(lit);
         }
-        // An `Operand`'s index arithmetic is stated over the producer's
-        // logical dense element space; the buffer it lands in is whatever
-        // the plan laid out. Those differ exactly when the producer's
-        // schedule point padded it.
         let index = self.repad_index(operand.src, index)?;
-        // A block-quantized operand has no dense element to load: reading
-        // element `i` runs the format's decode program at flat index `i`.
-        // The dense table is never materialized.
+        // A quantized operand runs its decode program at flat index `i`.
         if let Dtype::Q(fmt) = self.plan_dtype(operand.src)? {
             let qlayout = qlayout_of(self.cx, operand.src).unwrap_or(QLayout::Native);
             let facts = self.cx.graph.facts(self.cx.selected(operand.src));
@@ -1216,16 +1074,10 @@ impl<'a> Ctx<'a> {
                 self.b.f32(0.0),
             ));
         }
-        // `index` is a storage element index, so the bound is the buffer's
-        // own extent, built from the plan layout's `Dim`s — never from the
-        // resolved decl extents, which would bake this dispatch's sequence
-        // length into the body.
+        // The bound is the plan layout's `shape[0] * strides[0]` over `Dim`s
+        // (padding lives in the strides), never a resolved decl extent.
         let view = self.linear_view(operand.src)?;
         let elem = view.buffer.element;
-        // The buffer's extent is not the shape product: padding lives in the
-        // strides, so the shape product undercounts a padded buffer. For the
-        // row-major layouts the plan emits (offset 0), the extent is
-        // `shape[0] * strides[0]`.
         let (plan_layout, _) = bound_layout(self.cx, operand.src);
         let bound = match (plan_layout.shape().first(), plan_layout.strides().first()) {
             (Some(&outer), Some(&stride0)) => {
@@ -1255,8 +1107,7 @@ impl<'a> Ctx<'a> {
         ))
     }
 
-    /// The literal a `Leaf::Const` operand folds to, if it is one.
-    /// Clamped like any body literal: WGSL cannot spell an infinity.
+    /// The literal a `Leaf::Const` operand folds to, clamped finite for WGSL.
     pub(crate) fn const_operand(&self, src: Id) -> Option<TileExpr> {
         const_splat(self.cx, src).map(|s| self.b.lit(finite_literal(s)))
     }
@@ -1285,10 +1136,6 @@ impl<'a> Ctx<'a> {
 }
 
 /// Lower one selected Launch node at one schedule point.
-///
-/// One match over `Launch` into the family entry points. Every arm gets a
-/// real body: there is no "unsupported, fall back" path, because the extractor
-/// already proved the node selectable on this target.
 pub(crate) fn lower_node(
     caps: &Caps,
     node: &Node,
@@ -1300,9 +1147,8 @@ pub(crate) fn lower_node(
     lower_launch(Ctx::with_pack(caps, cx, binding, pack)?, node, theta, false)
 }
 
-/// [`lower_node`] for one member of a group: decl numbering continues from
-/// the siblings', the workgroup index is `workgroup`, and the body runs at
-/// no fewer than `block_floor` lanes.
+/// [`lower_node`] for a group member: continued decl numbering, workgroup
+/// index `workgroup`, at least `block_floor` lanes, the group's buffer table.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn lower_member(
     caps: &Caps,
@@ -1316,8 +1162,6 @@ pub(crate) fn lower_member(
     buffers: &[Buffer],
 ) -> Result<KernelIr> {
     let mut ctx = Ctx::with_pack_in(caps, cx, binding, pack)?;
-    // One buffer table for the whole kernel: a member's own decls would
-    // bind the same slots a second time.
     ctx.buffers = buffers.to_vec();
     ctx.workgroup = Some(workgroup);
     ctx.block_floor = block_floor;
@@ -1346,8 +1190,7 @@ fn lower_launch(ctx: Ctx<'_>, node: &Node, theta: SchedPoint, member: bool) -> R
     }
 }
 
-/// Dispatch one selected Launch node to its family lowering, at a fresh
-/// binding and the plan's own uniform pack.
+/// [`lower_node`] at a fresh binding and the plan's own uniform pack.
 pub(crate) fn lower(
     caps: &Caps,
     node: &Node,

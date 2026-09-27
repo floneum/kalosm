@@ -1,9 +1,6 @@
-//! The cooperative-matrix schedule domain: supported `(geometry, staging)` pairs,
-//! carried whole on the node and resolved by extraction.
-//!
-//! Every `(bm, bn, bk, subgroups, n_passes)` whose closed-form subgroup
-//! split exists, whose lanes fit, and whose exact arena footprint fits is
-//! a candidate.
+//! The cooperative-matrix schedule domain: every `(geometry, staging)` whose
+//! subgroup split exists and whose lanes and arena footprint fit, carried on
+//! the node and resolved by extraction.
 
 use fusor_ir::device::Caps;
 use fusor_ir::dtype::Dtype;
@@ -22,20 +19,17 @@ const BN_CHOICES: [u32; 6] = [16, 32, 64, 128, 256, 512];
 const BK_CHOICES: [u32; 3] = [8, 16, 32];
 /// Subgroups per workgroup worth generating.
 const SUBGROUP_CHOICES: [u32; 6] = [1, 2, 4, 8, 16, 32];
-/// A cooperative fragment side. One `n_pass` covers at least this many
-/// columns, which bounds `n_passes` at `bn / 16`.
+/// A cooperative fragment side; bounds `n_passes` at `bn / 16`.
 const MIN_PASS_COLS: u32 = 16;
 
-/// Delegates to [`coop_domain`] with `batch = 1` and the crate-default
-/// planner.
+/// [`coop_domain`] with `batch = 1` and the crate-default planner.
 pub fn legal(m: Dim, n: Dim, k: Dim, operand: Dtype, acc: Dtype, caps: &Caps) -> CoopDomain {
     let cx = DomainCtx::new(caps, crate::domains::default_planner());
     coop_domain(m, n, k, Dim::Const(1), operand, acc, &cx)
 }
 
-/// Every supported `(geom, staging)` for this contraction on this
-/// device. Empty when the device reports no usable cooperative configuration;
-/// callers then decline to construct the `Coop` alternative.
+/// Every supported `(geom, staging)` for this contraction on this device;
+/// empty when the device has no usable cooperative configuration.
 pub fn coop_domain(
     m: Dim,
     n: Dim,
@@ -45,14 +39,8 @@ pub fn coop_domain(
     acc: Dtype,
     cx: &DomainCtx<'_>,
 ) -> CoopDomain {
-    // `m`, `n` and `batch` price the domain; they do not filter it by value.
-    // Edge tiles fill zero past the logical extents, so no concrete shape is
-    // illegal for any geometry.
-    //
-    // A symbolic `m` or `n` empties the domain: the whole-block cooperative
-    // store requires an output padded to the geometry's tile, and a padding
-    // of `Sym(s)` to a tile multiple is not expressible as a `Dim`. Symbolic
-    // `k`/`batch` stay legal — they never enter the padded layout.
+    // Extents price the domain, they do not filter it (edge tiles fill zero).
+    // A symbolic `m`/`n` empties it: the padded output layout is inexpressible.
     let _ = batch;
     if m.as_const().is_none() || n.as_const().is_none() {
         return CoopDomain::default();
@@ -139,9 +127,8 @@ fn generate_schedules(operand: Dtype, cx: &DomainCtx<'_>) -> SmallVec<[CoopSched
     out
 }
 
-/// One geometry, or `None` when no `(rg, cg)` factorization keeps both
-/// fragment sides whole multiples of [`CoopGeom::COOP_DIM`]; an
-/// unsplittable geometry is simply not a candidate.
+/// One geometry, or `None` when no `(rg, cg)` split keeps both fragment sides
+/// whole multiples of [`CoopGeom::COOP_DIM`].
 fn geom_of(bm: u32, bn: u32, bk: u32, n_passes: u32, subgroups: u32) -> Option<CoopGeom> {
     let (rg, cg) = CoopGeom::subgroup_split(bm, bn, n_passes, subgroups)?;
     Some(CoopGeom {
@@ -155,8 +142,7 @@ fn geom_of(bm: u32, bn: u32, bk: u32, n_passes: u32, subgroups: u32) -> Option<C
     })
 }
 
-/// Workgroup element the operand stages through: f16 operands stage as f16,
-/// everything else as f32.
+/// Workgroup element the operand stages through: f16 as f16, else f32.
 pub const fn stage_element(operand: Dtype) -> ScalarElement {
     match operand {
         Dtype::F16 => ScalarElement::F16,

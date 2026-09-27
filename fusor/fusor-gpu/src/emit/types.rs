@@ -1,12 +1,8 @@
-//! Kernel [`ElementType`] -> naga types, and the workgroup/storage address-space
-//! declarations.
-//!
-//! Types are interned in a fixed order so the module's type arena is
-//! deterministic: emitting the same IR twice must produce byte-identical
-//! debug output.
+//! Kernel [`ElementType`] -> naga types, and the workgroup/storage
+//! declarations. Types intern in a fixed order so emission is deterministic.
 
 use fusor_ir::ir::kernel::{
-    ArenaMode, BufferAccess, BufferDecl, ElementType, ScalarElement, TileDecl,
+    ArenaMode, BufferAccess, BufferDecl, CoopMatrixRole, ElementType, ScalarElement, TileDecl,
 };
 use fusor_ir::target::EmitError;
 use naga::{
@@ -17,9 +13,8 @@ use rustc_hash::FxHashMap;
 
 use super::{Analysis, Emitter, key};
 
-/// How one workgroup tile is backed. Access is always
-/// `global[base_index + tile_index]`, with the value bitcast between
-/// `canonical` and the tile's own element when a region is heterogeneous.
+/// How one workgroup tile is backed: `global[base_index + tile_index]`, bitcast
+/// between `canonical` and the tile's element in a heterogeneous region.
 #[derive(Copy, Clone, Debug)]
 pub(crate) struct TileBacking {
     pub global: Handle<GlobalVariable>,
@@ -34,11 +29,8 @@ pub(crate) struct Prelude {
     pub u32_vec3_ty: Handle<Type>,
 }
 
-/// The naga scalar for one Kernel scalar element.
-///
-/// `BF16` has no naga 29 representation: it is a storage-only dtype whose
-/// compute form the `widen-compute` Launch rule produces, so it must never reach
-/// Kernel as a value type.
+/// The naga scalar for one Kernel scalar element. `BF16` is storage-only and
+/// never reaches Kernel as a value type.
 pub(crate) fn scalar_of(scalar: ScalarElement) -> Result<Scalar, EmitError> {
     Ok(match scalar {
         ScalarElement::F32 => Scalar::F32,
@@ -65,7 +57,7 @@ fn vector_size(lanes: u32) -> Result<VectorSize, EmitError> {
     })
 }
 
-fn cooperative_size(size: u32) -> Result<naga::CooperativeSize, EmitError> {
+pub(crate) fn cooperative_size(size: u32) -> Result<naga::CooperativeSize, EmitError> {
     Ok(match size {
         8 => naga::CooperativeSize::Eight,
         16 => naga::CooperativeSize::Sixteen,
@@ -75,6 +67,14 @@ fn cooperative_size(size: u32) -> Result<naga::CooperativeSize, EmitError> {
             )));
         }
     })
+}
+
+pub(crate) fn naga_role(role: CoopMatrixRole) -> naga::CooperativeRole {
+    match role {
+        CoopMatrixRole::A => naga::CooperativeRole::A,
+        CoopMatrixRole::B => naga::CooperativeRole::B,
+        CoopMatrixRole::C => naga::CooperativeRole::C,
+    }
 }
 
 fn type_inner(element: ElementType) -> Result<TypeInner, EmitError> {
@@ -93,11 +93,7 @@ fn type_inner(element: ElementType) -> Result<TypeInner, EmitError> {
             columns: cooperative_size(cols)?,
             rows: cooperative_size(rows)?,
             scalar: scalar_of(scalar)?,
-            role: match role {
-                fusor_ir::ir::kernel::CoopMatrixRole::A => naga::CooperativeRole::A,
-                fusor_ir::ir::kernel::CoopMatrixRole::B => naga::CooperativeRole::B,
-                fusor_ir::ir::kernel::CoopMatrixRole::C => naga::CooperativeRole::C,
-            },
+            role: naga_role(role),
         },
     })
 }
@@ -116,90 +112,65 @@ pub(crate) fn element_type(
     Ok(insert(module, type_inner(element)?))
 }
 
-/// Intern the prelude in a fixed order: f32, f32x2/3/4, i32, i32x4, u32,
-/// u32x2/3/4, bool, boolx2/3/4, then the f16 quad only when the analysis says
-/// it is used, then every cooperative-matrix element the locals list mentions.
+/// Intern the prelude in a fixed order; the f16 quad and cooperative-matrix
+/// elements only when used.
 pub(crate) fn intern_prelude(
     module: &mut naga::Module,
     analysis: &Analysis,
 ) -> Result<Prelude, EmitError> {
-    insert(module, TypeInner::Scalar(Scalar::F32));
-    for lanes in [2u32, 3, 4] {
-        insert(
-            module,
-            TypeInner::Vector {
-                size: vector_size(lanes)?,
-                scalar: Scalar::F32,
-            },
-        );
-    }
+    // A scalar and its vec2/3/4, in that order.
+    let with_vectors = |module: &mut naga::Module, scalar| {
+        [
+            None,
+            Some(VectorSize::Bi),
+            Some(VectorSize::Tri),
+            Some(VectorSize::Quad),
+        ]
+        .map(|size| {
+            let inner = match size {
+                None => TypeInner::Scalar(scalar),
+                Some(size) => TypeInner::Vector { size, scalar },
+            };
+            insert(module, inner)
+        })
+    };
+    with_vectors(module, Scalar::F32);
     insert(module, TypeInner::Scalar(Scalar::I32));
+    let size = VectorSize::Quad;
     insert(
         module,
         TypeInner::Vector {
-            size: VectorSize::Quad,
+            size,
             scalar: Scalar::I32,
         },
     );
-    let u32_ty = insert(module, TypeInner::Scalar(Scalar::U32));
-    let mut u32_vec = [None; 3];
-    for (slot, lanes) in [2u32, 3, 4].into_iter().enumerate() {
-        u32_vec[slot] = Some(insert(
-            module,
-            TypeInner::Vector {
-                size: vector_size(lanes)?,
-                scalar: Scalar::U32,
-            },
-        ));
-    }
-    insert(module, TypeInner::Scalar(Scalar::BOOL));
-    for lanes in [2u32, 3, 4] {
-        insert(
-            module,
-            TypeInner::Vector {
-                size: vector_size(lanes)?,
-                scalar: Scalar::BOOL,
-            },
-        );
-    }
+    let u32s = with_vectors(module, Scalar::U32);
+    with_vectors(module, Scalar::BOOL);
     if analysis.uses_f16 {
-        insert(module, TypeInner::Scalar(Scalar::F16));
-        for lanes in [2u32, 3, 4] {
-            insert(
-                module,
-                TypeInner::Vector {
-                    size: vector_size(lanes)?,
-                    scalar: Scalar::F16,
-                },
-            );
-        }
+        with_vectors(module, Scalar::F16);
     }
-    // Cooperative-matrix types up front, in locals-list order.
-    let mut seen: FxHashMap<ElementType, Handle<Type>> = FxHashMap::default();
+    // Cooperative-matrix types up front, in locals-list order; re-interning
+    // an existing type is a no-op.
     for local in &analysis.locals {
-        if matches!(local.element, ElementType::CoopMatrix { .. })
-            && !seen.contains_key(&local.element)
-        {
-            let handle = element_type(module, local.element)?;
-            seen.insert(local.element, handle);
+        if matches!(local.element, ElementType::CoopMatrix { .. }) {
+            element_type(module, local.element)?;
         }
     }
     Ok(Prelude {
-        u32_ty,
-        u32_vec3_ty: u32_vec[1].expect("u32x3 interned above"),
+        u32_ty: u32s[0],
+        u32_vec3_ty: u32s[2],
     })
 }
 
-/// Array stride for a workgroup/storage array of `element`. The single source
-/// of stride truth: arena packing and module emission both read
-/// [`ElementType::workgroup_array_stride`], so they cannot disagree.
+/// Array stride for a workgroup/storage array of `element`, from
+/// [`ElementType::workgroup_array_stride`] as arena packing reads it.
 fn array_stride(element: ElementType) -> Result<u32, EmitError> {
     element
         .workgroup_array_stride()
         .ok_or_else(|| EmitError::Unsupported(format!("{element:?} cannot back an array")))
 }
 
-fn array_type(
+pub(crate) fn array_type(
     module: &mut naga::Module,
     element: ElementType,
     size: ArraySize,
@@ -213,9 +184,8 @@ fn atomic_array_type(
     module: &mut naga::Module,
     element: ElementType,
 ) -> Result<Handle<Type>, EmitError> {
-    // `AtomicAdd` on f32 runs a bitcast compare-exchange loop over a u32
-    // atomic, so an f32 buffer is typed `array<atomic<u32>>` and the value is
-    // bitcast at each step.
+    // f32 `AtomicAdd` is a bitcast compare-exchange loop, so the buffer is
+    // `array<atomic<u32>>`.
     let scalar = match element {
         ElementType::Scalar(ScalarElement::I32) => Scalar::I32,
         ElementType::Scalar(ScalarElement::U32 | ScalarElement::F32) => Scalar::U32,
@@ -236,11 +206,8 @@ fn atomic_array_type(
     ))
 }
 
-/// Declare a storage buffer global. Read-only-ness comes from
-/// [`BufferDecl::access`] and is what [`crate::bindings`] reads back out.
-///
-/// The array is typed `array<atomic<..>>` when the analysis found a
-/// [`fusor_ir::ir::kernel::Stmt::AtomicAdd`] on this binding.
+/// Declare a storage buffer global; read-only-ness from [`BufferDecl::access`],
+/// atomic typing when the analysis found an `AtomicAdd` on the binding.
 pub(crate) fn storage_global_with(
     module: &mut naga::Module,
     decl: &BufferDecl,
@@ -271,30 +238,28 @@ pub(crate) fn storage_global_with(
     ))
 }
 
-/// Declare a workgroup tile global sized for its own extent.
-///
-/// `byte_offset` is accepted for signature compatibility with the packed-arena
-/// caller; a standalone tile always starts at zero.
-pub(crate) fn workgroup_global(
+/// A workgroup global of type `ty`.
+pub(crate) fn workgroup_var(module: &mut naga::Module, ty: Handle<Type>) -> Handle<GlobalVariable> {
+    let var = GlobalVariable {
+        name: None,
+        space: AddressSpace::WorkGroup,
+        binding: None,
+        ty,
+        init: None,
+        memory_decorations: naga::MemoryDecorations::empty(),
+    };
+    module.global_variables.append(var, Span::default())
+}
+
+/// A workgroup tile global sized for its own extent.
+fn workgroup_global(
     module: &mut naga::Module,
     decl: &TileDecl,
-    byte_offset: u32,
 ) -> Result<Handle<GlobalVariable>, EmitError> {
-    debug_assert_eq!(byte_offset, 0, "standalone tiles are not aliased");
     let count = std::num::NonZeroU32::new(decl.layout.element_count() as u32)
         .ok_or_else(|| EmitError::Unsupported("empty workgroup tile".into()))?;
     let ty = array_type(module, decl.element, ArraySize::Constant(count))?;
-    Ok(module.global_variables.append(
-        GlobalVariable {
-            name: None,
-            space: AddressSpace::WorkGroup,
-            binding: None,
-            ty,
-            init: None,
-            memory_decorations: naga::MemoryDecorations::empty(),
-        },
-        Span::default(),
-    ))
+    Ok(workgroup_var(module, ty))
 }
 
 /// Buffers in binding order, so the global-variable arena is independent
@@ -353,19 +318,10 @@ pub(crate) fn create_storage_globals(em: &mut Emitter<'_>) -> Result<(), EmitErr
 
 /// Workgroup tiles, laid out from the plan.
 ///
-/// `ArenaMode::Regions` groups placements by byte offset — tiles that share an
-/// allocation share an offset — and emits one global per group, typed with the
-/// group's canonical element; a heterogeneous group bitcasts the *value* at
-/// each access, never the address, which is legal only between 32-bit scalars.
-///
-/// `ArenaMode::ByteArena` emits one `array<u32>` arena and indexes each tile
-/// from its packed byte offset. Released naga has no `WorkgroupAlias`
-/// decoration, so aliasing is expressed as index arithmetic, which restricts
-/// a byte-arena tile to 4-byte scalar elements; a kernel that needs more
-/// falls back to `Regions`.
-///
-/// A tile with no placement gets its own allocation. An empty or partial plan
-/// is therefore always emittable, just larger.
+/// `ArenaMode::Regions` emits one global per shared byte offset, bitcasting
+/// values (32-bit scalars only) in a heterogeneous group. `ArenaMode::ByteArena`
+/// emits one `array<u32>` indexed by packed byte offset. An unplaced tile gets
+/// its own allocation.
 pub(crate) fn create_workgroup_globals(em: &mut Emitter<'_>) -> Result<(), EmitError> {
     let tiles = em.analysis.tiles.clone();
     // `FUSOR_NO_TILE_ALIAS` gives every tile its own allocation: the
@@ -389,17 +345,7 @@ pub(crate) fn create_workgroup_globals(em: &mut Emitter<'_>) -> Result<(), EmitE
                 ElementType::Scalar(ScalarElement::U32),
                 ArraySize::Constant(words),
             )?;
-            let arena = em.module.global_variables.append(
-                GlobalVariable {
-                    name: None,
-                    space: AddressSpace::WorkGroup,
-                    binding: None,
-                    ty: arena_ty,
-                    init: None,
-                    memory_decorations: naga::MemoryDecorations::empty(),
-                },
-                Span::default(),
-            );
+            let arena = workgroup_var(&mut em.module, arena_ty);
             for tile in &tiles {
                 match placements.get(&key(tile)) {
                     Some(&(byte_offset, _)) => {
@@ -449,17 +395,7 @@ pub(crate) fn create_workgroup_globals(em: &mut Emitter<'_>) -> Result<(), EmitE
                 let count = std::num::NonZeroU32::new(elements)
                     .ok_or_else(|| EmitError::Unsupported("empty workgroup region".into()))?;
                 let ty = array_type(&mut em.module, canonical, ArraySize::Constant(count))?;
-                let global = em.module.global_variables.append(
-                    GlobalVariable {
-                        name: None,
-                        space: AddressSpace::WorkGroup,
-                        binding: None,
-                        ty,
-                        init: None,
-                        memory_decorations: naga::MemoryDecorations::empty(),
-                    },
-                    Span::default(),
-                );
+                let global = workgroup_var(&mut em.module, ty);
                 for tile in members {
                     em.tile_backing.insert(
                         key(tile),
@@ -480,7 +416,7 @@ pub(crate) fn create_workgroup_globals(em: &mut Emitter<'_>) -> Result<(), EmitE
 }
 
 fn standalone(em: &mut Emitter<'_>, tile: &fusor_ir::ir::kernel::Tile) -> Result<(), EmitError> {
-    let global = workgroup_global(&mut em.module, tile, 0)?;
+    let global = workgroup_global(&mut em.module, tile)?;
     em.tile_backing.insert(
         key(tile),
         TileBacking {
@@ -492,9 +428,8 @@ fn standalone(em: &mut Emitter<'_>, tile: &fusor_ir::ir::kernel::Tile) -> Result
     Ok(())
 }
 
-/// The element a shared region is typed with. A homogeneous region keeps its
-/// own element; a heterogeneous one goes class-neutral u32 and bitcasts values
-/// at each access.
+/// The element a shared region is typed with: its own when homogeneous, else
+/// u32 with per-access bitcasts.
 fn canonical_element(members: &[&fusor_ir::ir::kernel::Tile]) -> Result<ElementType, EmitError> {
     let first = members[0].element;
     if members.iter().all(|t| t.element == first) {
@@ -533,9 +468,7 @@ impl Emitter<'_> {
     /// naga's `UniqueArena`, so this both reuses and registers.
     pub(crate) fn element_type(&mut self, element: ElementType) -> Result<Handle<Type>, EmitError> {
         if element.uses_f16() && !self.analysis.uses_f16 {
-            // Unreachable: the analysis raises `uses_f16` for every f16 that
-            // appears anywhere. Kept as an assertion against a future emitter
-            // that synthesizes an f16 value out of thin air.
+            // Unreachable: the analysis raises `uses_f16` for every f16.
             return Err(EmitError::MissingCapability("shader-f16"));
         }
         element_type(&mut self.module, element)

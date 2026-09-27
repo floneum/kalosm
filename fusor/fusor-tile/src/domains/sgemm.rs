@@ -12,14 +12,11 @@ const BN_CHOICES: [u32; 5] = [16, 32, 64, 128, 256];
 const BK_CHOICES: [u32; 4] = [8, 16, 32, 64];
 const T_CHOICES: [u32; 4] = [1, 2, 4, 8];
 
-/// How many tilings survive into the domain. Bounds the move frontier's
-/// size; the cap keeps the [`SEED_LEAVES`] members first, so it never
-/// removes a measured winner.
+/// How many tilings survive; the cap keeps [`SEED_LEAVES`] first.
 pub const MAX_PARAMS: usize = 64;
 
-/// Measured-winner tilings, used **only** to order the local search's move
-/// frontier. Every seed must be reachable by the generator's grid: a seed
-/// that cannot be generated would order a frontier that does not contain it.
+/// Measured-winner tilings, used only to order the move frontier. Every seed
+/// must be generable.
 pub static SEED_LEAVES: &[SgemmParams] = &[
     p(false, 32, 32, 32, 2, 2),
     p(true, 16, 64, 32, 2, 2),
@@ -69,8 +66,7 @@ pub fn sgemm_domain(elem_bytes: u32, cx: &DomainCtx<'_>) -> SgemmDomain {
     PARAM_MEMO.get_or_insert(&key, || generate_params(elem_bytes, cx))
 }
 
-/// `(caps, element bytes, planner identity) -> tilings`. 3,200 candidates
-/// per call, none of them shape-dependent.
+/// `(caps, element bytes, planner identity) -> tilings`; shape-free.
 static PARAM_MEMO: crate::domains::DomainMemo<(Caps, u32, usize), SgemmDomain> =
     crate::domains::DomainMemo::new();
 

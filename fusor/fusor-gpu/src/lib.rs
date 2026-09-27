@@ -1,11 +1,6 @@
-//! `fusor-gpu` — the wgpu [`Target`](fusor_ir::target::Target) end to end.
-//!
-//! Adapter/capability probing against **WebGPU baseline limits** with
-//! per-kernel widening, Launch+`SchedPoint` -> `KernelIr` lowering for every Launch
-//! node family, `KernelIr` -> naga `Module` emission with **derived** bind
-//! groups and a storage `Uniforms` block at binding 0, the pooled allocator
-//! with a platform memory ceiling, compiled pipeline caches, and an encoder/submission model
-//! whose only host syncs are readback, explicit wait and the allocator retry.
+//! `fusor-gpu` — the wgpu [`Target`](fusor_ir::target::Target) end to end:
+//! baseline-limit probing, Launch lowering, naga emission with derived bind
+//! groups, the pooled allocator and the encoder/submission model.
 
 #![warn(unreachable_pub)]
 

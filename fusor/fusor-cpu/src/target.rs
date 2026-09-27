@@ -14,7 +14,7 @@ use parking_lot::Mutex;
 use rustc_hash::FxHashMap;
 
 use crate::alloc::AlignedBuf;
-use crate::emit::{CpuArtifact, CpuKernel};
+use crate::emit::CpuKernel;
 
 /// The native CPU backend.
 pub struct CpuTarget {
@@ -34,14 +34,6 @@ impl CpuTarget {
             pool: Mutex::new(FxHashMap::default()),
         })
     }
-
-    /// Compile without going through the opaque [`Artifact`] wrapper.
-    ///
-    /// No arena planner is attached: the emitter's sequential packing is
-    /// always legal here because thread-local scratch aliases freely.
-    pub fn compile(&self, ir: &KernelIr) -> std::result::Result<CpuArtifact, EmitError> {
-        crate::emit::compile(ir, &self.caps, None)
-    }
 }
 
 /// The shipped rate table for a CPU, derived from [`Caps`].
@@ -53,10 +45,8 @@ fn seed_facts(caps: &Caps) -> DeviceFacts {
     DeviceFacts {
         coop_step_ps: 0,
         lane_step_ps: 0,
-        // The generic CPU runner lowers, binds, and dispatches each selected
-        // launch. BERT's one-workgroup maps measure in the 10--20 us range,
-        // so pricing them as a 1 us function call causes the extractor to
-        // materialize hundreds of avoidable micro-kernels.
+        // One-workgroup maps measure 10--20 us through the generic runner; pricing
+        // them lower materializes hundreds of avoidable micro-kernels.
         launch_ps: 20_000_000,
         dram_bytes_per_us: 30_000,
         llc_bytes: crate::caps::CpuCaps::llc_bytes(),
@@ -98,13 +88,7 @@ impl Target for CpuTarget {
     }
 
     fn emit(&self, ir: &KernelIr) -> std::result::Result<Artifact, EmitError> {
-        let artifact = self.compile(ir)?;
-        Ok(Artifact::new(CpuKernel {
-            name: artifact.name,
-            block: artifact.block,
-            vector_width: artifact.prog.width,
-            artifact,
-        }))
+        Ok(Artifact::new(crate::emit::emit(ir, &self.caps)?))
     }
 
     fn launch(
@@ -121,9 +105,7 @@ impl Target for CpuTarget {
     }
 
     fn alloc(&self, bytes: u64, _persistence: Persistence) -> Result<Buf> {
-        // Every load reads a `u32` word, so a buffer whose length is not a
-        // whole number of words has an unreadable tail. Native quantized
-        // blocks are 18, 22, 34 and 210 bytes, so this is not a corner case.
+        // Loads read `u32` words, so round up: quantized blocks are 18/22/34/210 bytes.
         let bytes = bytes.next_multiple_of(4);
         let mut pool = self.pool.lock();
         if let Some(bucket) = pool.get_mut(&bytes)
@@ -150,18 +132,15 @@ impl Target for CpuTarget {
         let target = dst
             .downcast_ref::<AlignedBuf>()
             .ok_or_else(|| Error::Device("copy target is not an AlignedBuf".into()))?;
-        // SAFETY: `alloc` rounds up, so `target` is at least `source.len()`
-        // bytes; the two are distinct allocations; and a buffer the pool has
-        // just handed out has no other user. `as_mut_ptr` is the allocator's
-        // documented write path (see `alloc.rs`).
+        // SAFETY: `target` is a distinct, fresh allocation of at least `source.len()`
+        // bytes, written through `as_mut_ptr`.
         unsafe {
             std::ptr::copy_nonoverlapping(source.as_ptr(), target.as_mut_ptr(), source.len());
         }
         Ok(dst)
     }
 
-    /// No-op: [`crate::pool::WorkerPool::parallel_for`] joins synchronously, so
-    /// every dispatch has already retired when `launch` returns.
+    /// No-op: `parallel_for` joins, so every dispatch has retired.
     fn wait(&self) -> Result<()> {
         Ok(())
     }
@@ -181,9 +160,7 @@ impl PoolBucket {
             let index = self.cursor % len;
             self.cursor = (index + 1) % len;
             if self.buffers[index].refcount() == 1 {
-                // The pool retains its handle. While the returned clone is in
-                // use the strong count is two; once released, the same
-                // allocation can be reused again without reallocation.
+                // The pool keeps a handle; strong count back to one means reusable.
                 return Some(self.buffers[index].clone());
             }
         }

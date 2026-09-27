@@ -1,26 +1,17 @@
 //! Cooperative-matrix fragment load, MMA and store.
 //!
-//! Accumulators are held **transposed internally**: Metal's simdgroup matrix
-//! orientation makes row-major A/B fragments multiply as `B * A`, so keeping
-//! the fragments transposed preserves the logical `A * B`. That is why a
-//! transposed tile load swaps the fragment origin and sets
-//! `row_major: transposed`, and why a cooperative store inverts the
-//! destination layout's flag.
-//!
-//! Without the `fork-metal` mixed-precision cooperative store, an
-//! f32-accumulated f16-output kernel pays a staging tile plus a per-lane cast:
-//! footprint and a staging pass, never correctness.
+//! Accumulators are held transposed: Metal's simdgroup orientation multiplies
+//! row-major fragments as `B * A`. A transposed tile load therefore swaps the
+//! fragment origin, and a cooperative store inverts the layout flag.
 
 use fusor_ir::ir::kernel::{
     Addr, CoopMatrixRole, CoopSrc, ElementType, ScalarElement, StorageView, Tile, TileExpr,
     TileLayout, cooperative_store_layout_supported,
 };
 use fusor_ir::target::EmitError;
-use naga::{
-    AddressSpace, ArraySize, Barrier, Block, CooperativeData, CooperativeRole, Expression,
-    GlobalVariable, Handle, Span, Statement,
-};
+use naga::{ArraySize, Block, CooperativeData, Expression, GlobalVariable, Handle, Statement};
 
+use super::expr::{barrier, push};
 use super::{Emitter, key};
 
 /// A workgroup tile's `[rows, cols]`.
@@ -35,10 +26,7 @@ pub(crate) fn tile_shape(tile: &Tile) -> Result<[u32; 2], EmitError> {
 
 /// A workgroup tile's row stride, requiring a row-major affine layout.
 pub(crate) fn row_major_tile_stride(tile: &Tile) -> Result<u32, EmitError> {
-    layout_row_major_stride(&tile.layout)
-}
-
-fn layout_row_major_stride(layout: &TileLayout) -> Result<u32, EmitError> {
+    let layout = &tile.layout;
     if !layout.is_affine() || layout.indexing.groups.len() != 2 {
         return Err(EmitError::Unsupported(
             "a workgroup tile must be a rank-2 affine layout".into(),
@@ -93,21 +81,13 @@ fn fragment_scalar_matches(
     )))
 }
 
-fn naga_role(role: CoopMatrixRole) -> CooperativeRole {
-    match role {
-        CoopMatrixRole::A => CooperativeRole::A,
-        CoopMatrixRole::B => CooperativeRole::B,
-        CoopMatrixRole::C => CooperativeRole::C,
-    }
-}
-
-fn cooperative_size(size: u32) -> Result<naga::CooperativeSize, EmitError> {
-    match size {
-        8 => Ok(naga::CooperativeSize::Eight),
-        16 => Ok(naga::CooperativeSize::Sixteen),
-        _ => Err(EmitError::Unsupported(format!(
-            "cooperative-matrix size must be 8 or 16, got {size}"
-        ))),
+/// A cooperative store's row and column, which only a rank-2 address has.
+fn rc2(addr: &Addr) -> Result<(&TileExpr, &TileExpr), EmitError> {
+    match addr {
+        Addr::Rc2 { row, col } => Ok((row, col)),
+        Addr::Linear(_) => Err(EmitError::Unsupported(
+            "a cooperative store needs a rank-2 address".into(),
+        )),
     }
 }
 
@@ -123,19 +103,17 @@ impl Emitter<'_> {
         cols: u32,
         src: &CoopSrc,
     ) -> Result<Handle<Expression>, EmitError> {
-        let role = naga_role(role);
-        let columns = cooperative_size(cols)?;
-        let rows_size = cooperative_size(rows)?;
+        let role = super::types::naga_role(role);
+        let columns = super::types::cooperative_size(cols)?;
+        let rows_size = super::types::cooperative_size(rows)?;
         let CoopSrc {
             tile,
             row,
             col,
             transposed,
         } = src;
-        // A `CoopLoad{scalar: F32}` off an f16 tile reads the right
-        // addresses at twice the width and comes back with plausible
-        // garbage, so the scalars are checked here where both are in
-        // hand.
+        // An f32 fragment off an f16 tile reads plausible garbage, so the scalars
+        // are checked here.
         fragment_scalar_matches(scalar, tile.element, "a workgroup tile")?;
         let stride_u = row_major_tile_stride(tile)?;
         let row_h = self.expr(row, out)?;
@@ -178,9 +156,8 @@ impl Emitter<'_> {
         Ok(self.emit_expr(out, Expression::CooperativeMultiplyAdd { a, b, c }))
     }
 
-    /// Write every live accumulator SSA value back to its local. Iterates the
-    /// analysis's first-use-ordered locals rather than the pointer-keyed map,
-    /// so the emitted order is deterministic.
+    /// Write every live accumulator SSA value back to its local, in the
+    /// analysis's deterministic first-use order.
     pub(crate) fn flush_coop_acc(&mut self, out: &mut Block) {
         if self.coop_acc.is_empty() {
             return;
@@ -205,8 +182,7 @@ impl Emitter<'_> {
         }
     }
 
-    /// `CoopStore` -> a subgroup-collective store, never a per-lane store.
-    /// `row_major` is **inverted** relative to the destination layout because
+    /// `CoopStore` -> a subgroup-collective store; `row_major` is inverted since
     /// accumulators are held transposed.
     pub(crate) fn coop_store(
         &mut self,
@@ -245,38 +221,36 @@ impl Emitter<'_> {
         }
 
         let (stride_u, row_major) = cooperative_store_layout(&dst.layout)?;
-        let (row, col) = match addr {
-            Addr::Rc2 { row, col } => (row.clone(), col.clone()),
-            Addr::Linear(_) => {
-                return Err(EmitError::Unsupported(
-                    "a cooperative store needs a rank-2 address".into(),
-                ));
-            }
-        };
+        let (row, col) = rc2(addr)?;
         let target = self.expr(acc, out)?;
-        let row_h = self.expr(&row, out)?;
-        let col_h = self.expr(&col, out)?;
+        let row_h = self.expr(row, out)?;
+        let col_h = self.expr(col, out)?;
         let index = self.storage_index_from_coords(out, dst, &[row_h, col_h])?;
         let pointer = self.storage_dynamic_pointer(out, dst, index)?;
-        let stride = self.u32_lit(stride_u);
-        out.push(
-            Statement::CooperativeStore {
-                target,
-                data: CooperativeData {
-                    pointer,
-                    stride,
-                    row_major: !row_major,
-                },
-            },
-            Span::default(),
-        );
+        self.push_coop_store(out, target, pointer, stride_u, !row_major);
         Ok(())
     }
 
-    /// `CoopStoreTile` -> a cooperative store into a workgroup tile: the
-    /// staging step attention needs between fragment math and a per-lane
-    /// softmax over the same values. Workgroup tiles are row-major, so the
-    /// inverted flag is `false`.
+    /// `coopStore(target, pointer, stride)`; the stride literal is appended here.
+    fn push_coop_store(
+        &mut self,
+        out: &mut Block,
+        target: Handle<Expression>,
+        pointer: Handle<Expression>,
+        stride: u32,
+        row_major: bool,
+    ) {
+        let stride = self.u32_lit(stride);
+        let data = CooperativeData {
+            pointer,
+            stride,
+            row_major,
+        };
+        push(out, Statement::CooperativeStore { target, data });
+    }
+
+    /// `CoopStoreTile` -> a cooperative store into a row-major workgroup tile
+    /// (inverted flag `false`).
     pub(crate) fn coop_store_tile(
         &mut self,
         acc: &TileExpr,
@@ -291,28 +265,13 @@ impl Emitter<'_> {
         let col_h = self.expr(col, out)?;
         let index = self.tile_matrix_index(out, row_h, col_h, stride_u);
         let pointer = self.tile_dynamic_pointer(out, tile, index)?;
-        let stride = self.u32_lit(stride_u);
-        out.push(
-            Statement::CooperativeStore {
-                target,
-                data: CooperativeData {
-                    pointer,
-                    stride,
-                    row_major: false,
-                },
-            },
-            Span::default(),
-        );
+        self.push_coop_store(out, target, pointer, stride_u, false);
         Ok(())
     }
 
-    /// The mixed-precision fallback: a private staging tile typed with the
-    /// accumulator's own scalar, a cooperative store into it, then a per-lane
-    /// cast-and-store into the narrower destination.
-    ///
-    /// The staging tile is *not* part of the arena plan, so it costs its own
-    /// allocation. That is the documented price of building without
-    /// `fork-metal`.
+    /// The mixed-precision fallback without `fork-metal`: cooperative store into a
+    /// private staging tile of the accumulator's scalar (outside the arena plan),
+    /// then a per-lane cast-and-store.
     #[allow(clippy::too_many_arguments)]
     fn staged_coop_store(
         &mut self,
@@ -324,14 +283,7 @@ impl Emitter<'_> {
         rows: u32,
         cols: u32,
     ) -> Result<(), EmitError> {
-        let (row, col) = match addr {
-            Addr::Rc2 { row, col } => (row.clone(), col.clone()),
-            Addr::Linear(_) => {
-                return Err(EmitError::Unsupported(
-                    "a cooperative store needs a rank-2 address".into(),
-                ));
-            }
-        };
+        let (row, col) = rc2(addr)?;
         let element = ElementType::Scalar(acc_scalar);
         let (staging, offset) = self.subgroup_staging(out, element, rows * cols)?;
 
@@ -345,32 +297,25 @@ impl Emitter<'_> {
             },
         );
         let stride = self.u32_lit(cols);
-        out.push(
-            Statement::ControlBarrier(Barrier::WORK_GROUP),
-            Span::default(),
-        );
-        out.push(
-            Statement::CooperativeStore {
-                target,
-                data: CooperativeData {
-                    pointer,
-                    stride,
-                    row_major: false,
-                },
-            },
-            Span::default(),
-        );
-        out.push(
-            Statement::ControlBarrier(Barrier::WORK_GROUP),
-            Span::default(),
-        );
+        barrier(out);
+        let data = CooperativeData {
+            pointer,
+            stride,
+            row_major: false,
+        };
+        push(out, Statement::CooperativeStore { target, data });
+        barrier(out);
 
-        let row_h = self.expr(&row, out)?;
-        let col_h = self.expr(&col, out)?;
+        let row_h = self.expr(row, out)?;
+        let col_h = self.expr(col, out)?;
         let dst = dst.clone();
         let dst_element = dst.buffer.element;
         let total = rows * cols;
-        self.staged_copy(out, total, cols, move |em, block, i, j| {
+        let lanes = self.caps.subgroup_width();
+        let lane_arg = self.subgroup_args[1].expect("cooperative subgroup lane");
+        self.copy_passes(out, total, lanes, lane_arg, move |em, block, flat| {
+            let i = em.div_literal_u32(block, flat, cols.max(1));
+            let j = em.mod_literal_u32(block, flat, cols.max(1));
             let base = em.global_var(staging);
             let index = em.tile_matrix_index(block, i, j, cols);
             let index = em.add_u32(block, offset, index);
@@ -382,10 +327,7 @@ impl Emitter<'_> {
             let flat = em.storage_index_from_coords(block, &dst, &[global_row, global_col])?;
             em.store_storage_value(block, &dst, flat, value)
         })?;
-        out.push(
-            Statement::ControlBarrier(Barrier::WORK_GROUP),
-            Span::default(),
-        );
+        barrier(out);
         Ok(())
     }
 
@@ -411,75 +353,8 @@ impl Emitter<'_> {
         elements: u32,
     ) -> Result<Handle<GlobalVariable>, EmitError> {
         let count = std::num::NonZeroU32::new(elements.max(1)).expect("max(1) is non-zero");
-        let base = self.element_type(element)?;
-        let stride = element
-            .workgroup_array_stride()
-            .ok_or_else(|| EmitError::Unsupported("staging element cannot back an array".into()))?;
-        let ty = self.module.types.insert(
-            naga::Type {
-                name: None,
-                inner: naga::TypeInner::Array {
-                    base,
-                    size: ArraySize::Constant(count),
-                    stride,
-                },
-            },
-            Span::default(),
-        );
-        Ok(self.module.global_variables.append(
-            GlobalVariable {
-                name: None,
-                space: AddressSpace::WorkGroup,
-                binding: None,
-                ty,
-                init: None,
-                memory_decorations: naga::MemoryDecorations::empty(),
-            },
-            Span::default(),
-        ))
-    }
-
-    fn staged_copy(
-        &mut self,
-        out: &mut Block,
-        total: u32,
-        cols: u32,
-        mut build: impl FnMut(
-            &mut Self,
-            &mut Block,
-            Handle<Expression>,
-            Handle<Expression>,
-        ) -> Result<(), EmitError>,
-    ) -> Result<(), EmitError> {
-        let lanes = self.caps.subgroup_width();
-        let passes = total.div_ceil(lanes);
-        for pass in 0..passes {
-            let full = (pass + 1) * lanes <= total;
-            let lane = self.function_arg(self.subgroup_args[1].expect("cooperative subgroup lane"));
-            let flat = self.add_literal_u32(out, lane, pass * lanes);
-            let condition = if full {
-                None
-            } else {
-                let limit = self.u32_lit(total);
-                Some(self.bin(out, naga::BinaryOperator::Less, flat, limit))
-            };
-            let (accept, ()) = self.nested(|em, accept| {
-                let i = em.div_literal_u32(accept, flat, cols.max(1));
-                let j = em.mod_literal_u32(accept, flat, cols.max(1));
-                build(em, accept, i, j)
-            })?;
-            match condition {
-                Some(c) => out.push(
-                    Statement::If {
-                        condition: c,
-                        accept,
-                        reject: Block::new(),
-                    },
-                    Span::default(),
-                ),
-                None => out.push(Statement::Block(accept), Span::default()),
-            }
-        }
-        Ok(())
+        let size = ArraySize::Constant(count);
+        let ty = super::types::array_type(&mut self.module, element, size)?;
+        Ok(super::types::workgroup_var(&mut self.module, ty))
     }
 }

@@ -1,9 +1,6 @@
-//! `Group`: independent launches as one dispatch. Member `i` owns the
-//! workgroups `[off_i, off_i + n_i)` of the grid, `n_i` being what its own
-//! lowering would have dispatched, and runs that lowering's body with the
-//! workgroup index restated as `linear - off_i`. Every member runs at the
-//! widest member's block; a slab accepts a wider block, a map or fold is
-//! already at the device's default.
+//! `Group`: independent launches as one dispatch. Member `i` owns workgroups
+//! `[off_i, off_i + n_i)` and runs its own lowering's body with the workgroup
+//! index restated as `linear - off_i`, at the widest member's block.
 
 use fusor_ir::Result;
 use fusor_ir::error::Error;
@@ -32,8 +29,7 @@ pub(crate) fn lower_kgroup(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resu
                     local: fusor_ir::ir::kernel::TileExpr,
                     floor: u32|
      -> Result<KernelIr> {
-        // The last member's value is the group's: its store lands in the
-        // launch root's buffer. Every other member writes its own.
+        // The last member's store lands in the launch root's buffer.
         let root = if m == last { cx.launch.root } else { m };
         let dispatch = Dispatch {
             root,
@@ -65,9 +61,8 @@ pub(crate) fn lower_kgroup(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resu
             &ctx.buffers,
         )
     };
-    // Find the common block before assigning workgroup ranges. Widening a
-    // subgroup reduction packs more rows into each workgroup and changes its
-    // grid, so offsets must use the widened grid, never the probe's grid.
+    // Find the common block first: widening changes a member's grid, so
+    // offsets must use the widened grid.
     let mut block = 1;
     for m in members.iter().copied() {
         block = block.max(lower_at(m, linear.clone(), 0)?.block);
@@ -91,9 +86,7 @@ pub(crate) fn lower_kgroup(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resu
             .checked_add(n)
             .ok_or_else(|| Error::Plan("a group's grid overflows a u32".into()))?;
         let inside = ctx.b.lt(local, ctx.b.u32(n));
-        // A uniform barrier between members lets the arena alias their
-        // tiles: a workgroup runs one member, but the planner shares bytes
-        // only across a barrier it can see.
+        // A uniform barrier between members lets the arena alias their tiles.
         if !body.is_empty() {
             body.push(Stmt::Barrier);
         }
