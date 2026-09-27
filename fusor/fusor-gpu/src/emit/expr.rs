@@ -25,7 +25,6 @@ use super::{
     Emitter, LOCAL_INVOCATION_INDEX_ARG, MEM_SPACES, MemStamp, ScratchKind, WORKGROUP_ID_ARG, key,
 };
 
-
 /// Whether a finite f32 has to be spelled through its bit pattern.
 ///
 /// `±f32::MAX` prints as `3.4028235e38`, which as an exact decimal lies
