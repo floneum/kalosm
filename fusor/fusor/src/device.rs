@@ -207,12 +207,7 @@ impl Device {
 
     /// The backend name, either `"cpu"` or `"gpu"`.
     pub fn name(&self) -> &'static str {
-        match self {
-            #[cfg(feature = "cpu")]
-            Self::Cpu(_) => "cpu",
-            #[cfg(feature = "gpu")]
-            Self::Gpu(_) => "gpu",
-        }
+        self.backend().name()
     }
 
     /// The backend selector this device was built from.

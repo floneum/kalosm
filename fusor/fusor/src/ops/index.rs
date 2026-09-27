@@ -209,17 +209,6 @@ impl Tensor {
         written.reshape_dims(&shape)
     }
 
-    /// Concatenate along `dim`: one `Leaf(Const)` fill plus one
-    /// `Scatter{Set}` per part.
-    pub fn cat(parts: &[Tensor], dim: usize) -> Result<Tensor> {
-        cat(parts, dim)
-    }
-
-    /// Insert a new axis at `dim` and concatenate along it.
-    pub fn stack(parts: &[Tensor], dim: usize) -> Result<Tensor> {
-        stack(parts, dim)
-    }
-
     /// Zero-pad one axis by `left` before and `right` after: a `Scatter{Set}`
     /// of `self` into a `Const` zero fill at a strictly increasing index run.
     pub fn pad_with_zeros(&self, axis: usize, left: usize, right: usize) -> Result<Tensor> {
@@ -270,7 +259,7 @@ impl Tensor {
                 continue;
             }
             let parts: Vec<Tensor> = std::iter::repeat_n(cur.clone(), count).collect();
-            cur = cat(&parts, axis)?;
+            cur = Tensor::cat(&parts, axis)?;
         }
         Ok(cur)
     }
@@ -429,63 +418,65 @@ pub(crate) fn region_flat_indices(shape: &[Dim], ranges: &[Range<usize>]) -> Res
     Ok(out)
 }
 
-/// Concatenate rank-R tensors along `dim`.
-pub fn cat(parts: &[Tensor], dim: usize) -> Result<Tensor> {
-    let Some(first) = parts.first() else {
-        return Err(Error::Shape("cat needs at least one tensor".into()));
-    };
-    let rank = first.rank();
-    if dim >= rank {
-        return Err(Error::Shape(format!(
-            "cat axis {dim} out of range for rank {rank}"
-        )));
-    }
-    let mut total = 0u64;
-    for p in parts {
-        if p.rank() != rank {
-            return Err(Error::Shape("cat operands differ in rank".into()));
+impl Tensor {
+    /// Concatenate along `dim`: one `Leaf(Const)` fill plus one
+    /// `Scatter{Set}` per part.
+    pub fn cat(parts: &[Tensor], dim: usize) -> Result<Tensor> {
+        let Some(first) = parts.first() else {
+            return Err(Error::Shape("cat needs at least one tensor".into()));
+        };
+        let rank = first.rank();
+        if dim >= rank {
+            return Err(Error::Shape(format!(
+                "cat axis {dim} out of range for rank {rank}"
+            )));
         }
-        if p.dtype() != first.dtype() {
-            return Err(Error::Dtype("cat operands differ in dtype".into()));
-        }
-        for i in 0..rank {
-            if i != dim && !p.dim(i).known_eq(first.dim(i)) {
-                return Err(Error::Shape(format!(
-                    "cat operands disagree on axis {i}: {} vs {}",
-                    p.dim(i),
-                    first.dim(i)
-                )));
+        let mut total = 0u64;
+        for p in parts {
+            if p.rank() != rank {
+                return Err(Error::Shape("cat operands differ in rank".into()));
             }
+            if p.dtype() != first.dtype() {
+                return Err(Error::Dtype("cat operands differ in dtype".into()));
+            }
+            for i in 0..rank {
+                if i != dim && !p.dim(i).known_eq(first.dim(i)) {
+                    return Err(Error::Shape(format!(
+                        "cat operands disagree on axis {i}: {} vs {}",
+                        p.dim(i),
+                        first.dim(i)
+                    )));
+                }
+            }
+            total += p.dim(dim).as_const().ok_or_else(|| {
+                Error::Shape("cat needs a constant extent on the joined axis".into())
+            })?;
         }
-        total += p
-            .dim(dim)
-            .as_const()
-            .ok_or_else(|| Error::Shape("cat needs a constant extent on the joined axis".into()))?;
-    }
-    if parts.len() == 1 {
-        return Ok(first.clone());
+        if parts.len() == 1 {
+            return Ok(first.clone());
+        }
+
+        let mut shape: Vec<Dim> = first.shape().to_vec();
+        shape[dim] = Dim::Const(total);
+        let mut out = Tensor::zeros(&first.graph, first.dtype(), &shape)?;
+        let mut offset = 0usize;
+        for p in parts {
+            let len = p.dim(dim).as_const().unwrap_or(0) as usize;
+            let ranges = full_ranges_with(&shape, dim, offset..offset + len)?;
+            out = out.slice_assign(&ranges, p)?;
+            offset += len;
+        }
+        Ok(out)
     }
 
-    let mut shape: Vec<Dim> = first.shape().to_vec();
-    shape[dim] = Dim::Const(total);
-    let mut out = Tensor::zeros(&first.graph, first.dtype(), &shape)?;
-    let mut offset = 0usize;
-    for p in parts {
-        let len = p.dim(dim).as_const().unwrap_or(0) as usize;
-        let ranges = full_ranges_with(&shape, dim, offset..offset + len)?;
-        out = out.slice_assign(&ranges, p)?;
-        offset += len;
+    /// Insert a new axis at `dim` in every part and concatenate along it.
+    pub fn stack(parts: &[Tensor], dim: usize) -> Result<Tensor> {
+        let lifted: Vec<Tensor> = parts
+            .iter()
+            .map(|p| p.unsqueeze(dim))
+            .collect::<Result<_>>()?;
+        Tensor::cat(&lifted, dim)
     }
-    Ok(out)
-}
-
-/// Insert a new axis at `dim` in every part and concatenate along it.
-pub fn stack(parts: &[Tensor], dim: usize) -> Result<Tensor> {
-    let lifted: Vec<Tensor> = parts
-        .iter()
-        .map(|p| p.unsqueeze(dim))
-        .collect::<Result<_>>()?;
-    cat(&lifted, dim)
 }
 
 /// One component of an [`Tensor::i`] index tuple.

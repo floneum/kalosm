@@ -11,7 +11,6 @@
 //!   key axis — is genuinely rectangular and needs a tensor, which is what
 //!   [`MaskCache::materialized`] builds and what `entries` memoizes.
 
-use fusor_ir::dtype::Dtype;
 use fusor_ir::ir::launch::MaskKind;
 use fusor_ir::shape::Dim;
 use rustc_hash::FxHashMap;
@@ -146,19 +145,8 @@ impl<T: Element> MaskCache<T> {
                 }
             }
         }
-        let dense = graph.tensor(
-            Dtype::F32,
-            &[Dim::Const(q), Dim::Const(k)],
-            bytemuck::cast_slice(&data),
-        )?;
-        // The triangle is built in f32 on the host — `-inf` is exact in every
-        // float width — and cast once per shape, not per step.
-        let dense = if T::DTYPE == Dtype::F32 {
-            dense
-        } else {
-            dense.cast(T::DTYPE)?
-        };
-        let tensor = Tensor::<2, T>::try_from_dyn(dense)?;
+        // Cast once per shape, not per step.
+        let tensor = crate::cache::f32_table::<T>(graph, [Dim::Const(q), Dim::Const(k)], &data)?;
         self.entries.insert(key, tensor.clone());
         Ok(AttentionMask::Tensor(tensor))
     }

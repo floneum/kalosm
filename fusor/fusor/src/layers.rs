@@ -34,12 +34,8 @@ pub(crate) fn as_typed<const R: usize, T: Element>(
     t: Tensor,
     what: &str,
 ) -> Result<crate::Tensor<R, T>> {
-    let t = if t.dtype() == T::DTYPE {
-        t
-    } else {
-        t.cast(T::DTYPE)?
-    };
-    crate::Tensor::<R, T>::try_from_dyn(t).map_err(|e| Error::Shape(format!("{what}: {e}")))
+    crate::Tensor::<R, T>::try_from_dyn(t.into_dtype(T::DTYPE)?)
+        .map_err(|e| Error::Shape(format!("{what}: {e}")))
 }
 
 /// One GGUF tensor as a dense `F32` value in `graph`.
@@ -57,11 +53,7 @@ pub(crate) fn load_dense(vb: &VarBuilder, graph: &GraphRef, name: &str) -> Resul
     let shape: Vec<Dim> = raw.shape.iter().map(|d| Dim::Const(*d)).collect();
 
     let Dtype::Q(fmt) = raw.fmt else {
-        let dense = Tensor::from_slice(graph, raw.fmt, &shape, &raw.bytes)?;
-        return match raw.fmt {
-            Dtype::F32 => Ok(dense),
-            _ => dense.cast(Dtype::F32),
-        };
+        return Tensor::from_slice(graph, raw.fmt, &shape, &raw.bytes)?.into_dtype(Dtype::F32);
     };
 
     // A quantized leaf is `[rows, cols]`: the block stream runs along the

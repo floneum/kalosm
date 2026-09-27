@@ -39,6 +39,15 @@ impl Tensor {
         self.map1(ScalarExpr::cast(to, self.arg0()))
     }
 
+    /// `self` at `dtype`: itself when it already is, one cast otherwise.
+    pub(crate) fn into_dtype(self, dtype: Dtype) -> Result<Tensor> {
+        if self.dtype() == dtype {
+            Ok(self)
+        } else {
+            self.cast(dtype)
+        }
+    }
+
     /// Convert elements to `f32`.
     pub fn to_f32(&self) -> Result<Tensor> {
         self.cast(Dtype::F32)

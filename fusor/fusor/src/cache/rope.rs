@@ -5,13 +5,12 @@
 //! [`base_inverse_frequency`] is shared with the rope op itself, so the table
 //! and the kernel cannot drift apart.
 
-use fusor_ir::dtype::Dtype;
 use fusor_ir::shape::Dim;
 
+use crate::cache::f32_table;
 use crate::composite::rope::base_inverse_frequency;
 use crate::device::fail;
 use crate::graph::Graph;
-use crate::tensor::Dyn;
 use crate::tensor::typed::Element;
 use crate::{Error, Result, Tensor};
 
@@ -122,22 +121,13 @@ fn build<T: Element>(
             // The angle is accumulated in f64: at position 100k a f32 product
             // has already lost the low bits of the fastest frequency.
             let angle = pos as f64 * *f as f64;
-            sin.push((angle.sin() as f32).to_le_bytes());
-            cos.push((angle.cos() as f32).to_le_bytes());
+            sin.push(angle.sin() as f32);
+            cos.push(angle.cos() as f32);
         }
     }
     let shape = [Dim::Const(rows), Dim::Const(half as u64)];
-    let flat = |v: Vec<[u8; 4]>| -> Vec<u8> { v.into_iter().flatten().collect() };
-    // The sines are computed in f64 and stored as f32 regardless of `T`, then
-    // cast once per upload.
-    let upload = |bytes: Vec<u8>| -> Result<Tensor<2, T>> {
-        let dense: Dyn = graph.tensor(Dtype::F32, &shape, &bytes)?;
-        let dense = if T::DTYPE == Dtype::F32 {
-            dense
-        } else {
-            dense.cast(T::DTYPE)?
-        };
-        Tensor::<2, T>::try_from_dyn(dense)
-    };
-    Ok((upload(flat(sin))?, upload(flat(cos))?))
+    Ok((
+        f32_table(graph, shape, &sin)?,
+        f32_table(graph, shape, &cos)?,
+    ))
 }

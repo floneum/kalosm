@@ -106,28 +106,27 @@ impl TensorSlice {
                 self.rank()
             )));
         }
-        if self.dtype != D::DTYPE {
-            return Err(Error::Dtype(format!(
-                "TensorSlice has dtype {:?}, not {:?}",
-                self.dtype,
-                D::DTYPE
-            )));
-        }
+        self.check_dtype::<D>()?;
         Ok(Ranked(self, PhantomData))
     }
 
     /// Element 0 of a rank-0 (or single-element) value.
     pub fn scalar<D: Element>(&self) -> Result<D> {
-        if D::DTYPE != self.dtype {
-            return Err(Error::Dtype(format!(
-                "TensorSlice has dtype {:?}, not {:?}",
-                self.dtype,
-                D::DTYPE
-            )));
-        }
+        self.check_dtype::<D>()?;
         let zeros = vec![0usize; self.rank()];
         self.get::<D>(&zeros)
             .ok_or_else(|| Error::Shape("TensorSlice is empty or has an unbound extent".into()))
+    }
+
+    fn check_dtype<D: Element>(&self) -> Result<()> {
+        if D::DTYPE == self.dtype {
+            return Ok(());
+        }
+        Err(Error::Dtype(format!(
+            "TensorSlice has dtype {:?}, not {:?}",
+            self.dtype,
+            D::DTYPE
+        )))
     }
 
     /// Extents as `usize`, or an error when one is still symbolic.
@@ -146,13 +145,7 @@ impl TensorSlice {
     /// Row-major copy of every element, ignoring the layout's own order.
     pub fn to_flat<D: Element>(&self) -> Result<Vec<D>> {
         let shape = self.const_shape()?;
-        if D::DTYPE != self.dtype {
-            return Err(Error::Dtype(format!(
-                "TensorSlice has dtype {:?}, not {:?}",
-                self.dtype,
-                D::DTYPE
-            )));
-        }
+        self.check_dtype::<D>()?;
         let n: usize = shape.iter().product();
         if self.layout.is_contiguous() {
             let raw = n

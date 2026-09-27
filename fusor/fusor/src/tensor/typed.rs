@@ -164,10 +164,10 @@ fn dims_of<const N: usize>(shape: [usize; N]) -> Vec<Dim> {
 /// reinterpretation.
 fn narrow_acc<T: Element>(r: Result<Dyn>) -> Result<Dyn> {
     let v = r?;
-    if v.dtype() == T::DTYPE || v.dtype() != T::DTYPE.compute_dtype() {
+    if v.dtype() != T::DTYPE.compute_dtype() {
         return Ok(v);
     }
-    v.cast(T::DTYPE)
+    v.into_dtype(T::DTYPE)
 }
 /// Forwards each listed method to the runtime-rank op of the same name (or
 /// `= path`, called with the value first), converting arguments by tag: `ax`
@@ -799,7 +799,7 @@ where
     I: IntoIterator<Item = Tensor<R, T>>,
 {
     let parts: Vec<Dyn> = parts.into_iter().map(Tensor::into_dyn).collect();
-    Tensor::<R, T>::wrap("stack", crate::ops::index::stack(&parts, dim))
+    Tensor::<R, T>::wrap("stack", Dyn::stack(&parts, dim))
 }
 
 impl<const R: usize, T: Element> Tensor<R, T> {
@@ -810,7 +810,7 @@ impl<const R: usize, T: Element> Tensor<R, T> {
         I: IntoIterator<Item = Tensor<R, T>>,
     {
         let parts: Vec<Dyn> = parts.into_iter().map(Tensor::into_dyn).collect();
-        Self::wrap("cat", crate::ops::index::cat(&parts, dim))
+        Self::wrap("cat", Dyn::cat(&parts, dim))
     }
 }
 

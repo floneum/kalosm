@@ -164,22 +164,6 @@ impl Tensor {
     }
 }
 
-/// Free-function spelling of [`Tensor::arange`].
-pub fn arange(graph: &GraphRef, dtype: Dtype, start: f64, end: f64) -> Result<Tensor> {
-    Tensor::arange(graph, dtype, start, end)
-}
-
-/// Free-function spelling of [`Tensor::arange_step`].
-pub fn arange_step(
-    graph: &GraphRef,
-    dtype: Dtype,
-    start: f64,
-    end: f64,
-    step: f64,
-) -> Result<Tensor> {
-    Tensor::arange_step(graph, dtype, start, end, step)
-}
-
 /// Element count times element size, or an error under a symbolic extent.
 fn byte_len(dtype: Dtype, shape: &[Dim]) -> Result<u64> {
     if dtype.is_quantized() {
@@ -260,13 +244,6 @@ impl<D: Element> FromArray for [D] {
     }
 }
 
-impl<D: Element, const N: usize> FromArray for [D; N] {
-    type Elem = D;
-    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
-        Ok((vec![Dim::Const(N as u64)], self.to_vec()))
-    }
-}
-
 impl<T: FromArray + ?Sized> FromArray for &T {
     type Elem = T::Elem;
     fn to_parts(&self) -> Result<(Vec<Dim>, Vec<T::Elem>)> {
@@ -274,152 +251,64 @@ impl<T: FromArray + ?Sized> FromArray for &T {
     }
 }
 
-impl<D: Element, const M: usize, const N: usize> FromArray for [[D; M]; N] {
-    type Elem = D;
-    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
-        let mut flat = Vec::with_capacity(N * M);
-        for row in self {
-            flat.extend_from_slice(row);
-        }
-        Ok((vec![Dim::Const(N as u64), Dim::Const(M as u64)], flat))
-    }
-}
-
-impl<D: Element, const K: usize, const M: usize, const N: usize> FromArray for [[[D; K]; M]; N] {
-    type Elem = D;
-    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
-        let mut flat = Vec::with_capacity(N * M * K);
-        for a in self {
-            for b in a {
-                flat.extend_from_slice(b);
-            }
-        }
-        Ok((
-            vec![
-                Dim::Const(N as u64),
-                Dim::Const(M as u64),
-                Dim::Const(K as u64),
-            ],
-            flat,
-        ))
-    }
-}
-
-impl<D: Element, const J: usize, const K: usize, const M: usize, const N: usize> FromArray
-    for [[[[D; J]; K]; M]; N]
-{
-    type Elem = D;
-    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
-        let mut flat = Vec::with_capacity(N * M * K * J);
-        for a in self {
-            for b in a {
-                for c in b {
-                    flat.extend_from_slice(c);
-                }
-            }
-        }
-        Ok((
-            vec![
-                Dim::Const(N as u64),
-                Dim::Const(M as u64),
-                Dim::Const(K as u64),
-                Dim::Const(J as u64),
-            ],
-            flat,
-        ))
-    }
-}
-
 impl<D: Element> FromArray for Vec<D> {
     type Elem = D;
     fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
-        Ok((vec![Dim::Const(self.len() as u64)], self.clone()))
+        self.as_slice().to_parts()
     }
 }
 
-impl<D: Element> FromArray for Vec<Vec<D>> {
-    type Elem = D;
-    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
-        let inner = self.first().map_or(0, Vec::len);
-        let mut flat = Vec::with_capacity(self.len() * inner);
-        for row in self {
-            if row.len() != inner {
-                return Err(ragged());
-            }
-            flat.extend_from_slice(row);
-        }
-        Ok((
-            vec![Dim::Const(self.len() as u64), Dim::Const(inner as u64)],
-            flat,
-        ))
-    }
-}
-
-impl<D: Element> FromArray for Vec<Vec<Vec<D>>> {
-    type Elem = D;
-    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
-        let mid = self.first().map_or(0, Vec::len);
-        let inner = self.first().and_then(|r| r.first()).map_or(0, Vec::len);
-        let mut flat = Vec::new();
-        for a in self {
-            if a.len() != mid {
-                return Err(ragged());
-            }
-            for b in a {
-                if b.len() != inner {
-                    return Err(ragged());
-                }
-                flat.extend_from_slice(b);
+/// Fixed-size arrays: the extents are the const parameters, outermost first,
+/// and the data is one flattening.
+macro_rules! arrays {
+    ($([$($n:ident),*] $ty:ty => |$s:ident| $flat:expr;)*) => {$(
+        impl<D: Element, $(const $n: usize),*> FromArray for $ty {
+            type Elem = D;
+            fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
+                let $s = self;
+                Ok((vec![$(Dim::Const($n as u64)),*], $flat.to_vec()))
             }
         }
-        Ok((
-            vec![
-                Dim::Const(self.len() as u64),
-                Dim::Const(mid as u64),
-                Dim::Const(inner as u64),
-            ],
-            flat,
-        ))
-    }
+    )*};
 }
 
-impl<D: Element> FromArray for Vec<Vec<Vec<Vec<D>>>> {
-    type Elem = D;
-    fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
-        let d1 = self.first().map_or(0, Vec::len);
-        let d2 = self.first().and_then(|a| a.first()).map_or(0, Vec::len);
-        let d3 = self
-            .first()
-            .and_then(|a| a.first())
-            .and_then(|b| b.first())
-            .map_or(0, Vec::len);
-        let mut flat = Vec::new();
-        for a in self {
-            if a.len() != d1 {
-                return Err(ragged());
-            }
-            for b in a {
-                if b.len() != d2 {
-                    return Err(ragged());
-                }
-                for c in b {
-                    if c.len() != d3 {
+arrays! {
+    [N] [D; N] => |a| a;
+    [N, M] [[D; M]; N] => |a| a.as_flattened();
+    [N, M, K] [[[D; K]; M]; N] => |a| a.as_flattened().as_flattened();
+    [N, M, K, J] [[[[D; J]; K]; M]; N] => |a| a.as_flattened().as_flattened().as_flattened();
+}
+
+/// Nested `Vec`s: every row must have the same shape, stacked along a new
+/// leading axis; no rows at all is `rank` zero extents.
+macro_rules! nested_vecs {
+    ($($ty:ty => $rank:literal;)*) => {$(
+        impl<D: Element> FromArray for Vec<$ty> {
+            type Elem = D;
+            fn to_parts(&self) -> Result<(Vec<Dim>, Vec<D>)> {
+                let Some(first) = self.first() else {
+                    return Ok((vec![Dim::Const(0); $rank], Vec::new()));
+                };
+                let (inner, mut flat) = first.to_parts()?;
+                for row in &self[1..] {
+                    let (shape, data) = row.to_parts()?;
+                    if shape != inner {
                         return Err(ragged());
                     }
-                    flat.extend_from_slice(c);
+                    flat.extend(data);
                 }
+                let mut shape = vec![Dim::Const(self.len() as u64)];
+                shape.extend(inner);
+                Ok((shape, flat))
             }
         }
-        Ok((
-            vec![
-                Dim::Const(self.len() as u64),
-                Dim::Const(d1 as u64),
-                Dim::Const(d2 as u64),
-                Dim::Const(d3 as u64),
-            ],
-            flat,
-        ))
-    }
+    )*};
+}
+
+nested_vecs! {
+    Vec<D> => 2;
+    Vec<Vec<D>> => 3;
+    Vec<Vec<Vec<D>>> => 4;
 }
 
 fn ragged() -> Error {
