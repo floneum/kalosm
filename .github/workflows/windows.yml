@@ -166,7 +166,10 @@ jobs:
           # keep them serialized to avoid backend aborts.
           cargo nextest run --archive-file root-tests.tar.zst --workspace-remap . --extract-to . --extract-overwrite --test-threads 1 \
             -E 'not (package(rbert) | package(rwhisper) | package(kalosm-parse-macro))'
-          cargo nextest run --archive-file fusor-tests.tar.zst --workspace-remap fusor --extract-to fusor --extract-overwrite --test-threads 1
+          # The 400-step training test outlives the stall limit on WARP;
+          # macOS runs it on a hardware adapter.
+          cargo nextest run --archive-file fusor-tests.tar.zst --workspace-remap fusor --extract-to fusor --extract-overwrite --test-threads 1 \
+            -E 'not test(training_improves_held_out_loss_and_preserves_causal_attention)'
 
   conformance:
     needs: build
@@ -180,8 +183,16 @@ jobs:
           - { name: core, suites: "smoke:: elementwise:: reductions:: multi_slot:: views:: indexing_scatter:: dtypes::", args: "" }
           - { name: matmul, suites: "matmul:: conv_pool::", args: "" }
           - { name: norm-layers, suites: "normalization:: layers::", args: "" }
-          - { name: attention-backward, suites: "attention_rope:: backward::", args: "" }
-          - { name: quantized, suites: "quantized::", args: "" }
+          # WARP compiles every member-sweep variant through DXC; these
+          # suites exceed the job timeout unsharded.
+          - { name: attention-0, suites: "attention_rope::", args: "--shard=0/2" }
+          - { name: attention-1, suites: "attention_rope::", args: "--shard=1/2" }
+          - { name: backward-0, suites: "backward::", args: "--shard=0/2" }
+          - { name: backward-1, suites: "backward::", args: "--shard=1/2" }
+          - { name: quantized-0, suites: "quantized::", args: "--shard=0/4" }
+          - { name: quantized-1, suites: "quantized::", args: "--shard=1/4" }
+          - { name: quantized-2, suites: "quantized::", args: "--shard=2/4" }
+          - { name: quantized-3, suites: "quantized::", args: "--shard=3/4" }
           - { name: sampling-0, suites: "sampling::", args: "--shard=0/8" }
           - { name: sampling-1, suites: "sampling::", args: "--shard=1/8" }
           - { name: sampling-2, suites: "sampling::", args: "--shard=2/8" }

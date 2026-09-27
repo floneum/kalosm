@@ -1,15 +1,15 @@
 //! The browser's model trained natively, without UI dependencies.
-//! `cargo run --release --example train_small -- [steps]`
+//! `cargo run --release -p fusor --example train_small -- [steps]`
 #![allow(dead_code)]
-#[path = "../src/lm/config.rs"]
+#[path = "../../webgpu-runner/src/lm/config.rs"]
 mod config;
-#[path = "../src/lm/corpus.rs"]
+#[path = "../../webgpu-runner/src/lm/corpus.rs"]
 mod corpus;
-#[path = "../src/lm/model.rs"]
+#[path = "../../webgpu-runner/src/lm/model.rs"]
 mod model;
-#[path = "../src/lm/rng.rs"]
+#[path = "../../webgpu-runner/src/lm/rng.rs"]
 mod rng;
-#[path = "../src/lm/tokenizer.rs"]
+#[path = "../../webgpu-runner/src/lm/tokenizer.rs"]
 mod tokenizer;
 
 fn main() -> fusor::Result<()> {
