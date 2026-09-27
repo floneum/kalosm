@@ -1,5 +1,5 @@
 use super::{LlamaConfig, RopePosition, RopeScalingConfig};
-use fusor::composite::{RopeLayout, RopePos, base_inverse_frequency};
+use fusor::composite::{base_inverse_frequency, RopeLayout, RopePos};
 use fusor::{Device, Tensor};
 use std::f32::consts::PI;
 

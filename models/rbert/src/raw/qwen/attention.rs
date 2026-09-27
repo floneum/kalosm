@@ -95,14 +95,13 @@ impl QwenSelfAttention {
 
         // Apply RoPE to Q and K (Qwen uses the non-interleaved half layout).
         // One node rotating both, which is what `rope_normal_pair_fused` was.
-        let (query_states, key_states) =
-            query_states.rope_pair(
-                &key_states,
-                &rope.cos,
-                &rope.sin,
-                RopeLayout::Halves,
-                RopePos::Offset(0),
-            );
+        let (query_states, key_states) = query_states.rope_pair(
+            &key_states,
+            &rope.cos,
+            &rope.sin,
+            RopeLayout::Halves,
+            RopePos::Offset(0),
+        );
 
         // Scaled dot-product attention. Grouped-query attention is handled
         // structurally by the composite: no K/V head expansion here.
