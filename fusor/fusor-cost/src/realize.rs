@@ -1022,16 +1022,29 @@ pub fn node_serial_steps(op: &Op, theta: Option<SchedPoint>, caps: &Caps) -> (u6
                 _ => (0, k),
             }
         }
-        Op::Launch(op @ Launch::Fold { space, axis, .. }) => {
+        Op::Launch(
+            op @ Launch::Fold {
+                space,
+                axis,
+                vec_axes,
+                ..
+            },
+        ) => {
             let theta = fold_theta(op, theta, caps);
-            let k = space
-                .dims
-                .get(*axis as usize)
-                .and_then(|d| d.as_const())
-                .unwrap_or(1);
+            let extent = |a: u32| {
+                space
+                    .dims
+                    .get(a as usize)
+                    .and_then(|d| d.as_const())
+                    .unwrap_or(1)
+            };
+            // A lane walks k once per position of its vectorized axes.
+            let per_lane: u64 = vec_axes.iter().map(|a| extent(*a)).product();
             (
                 0,
-                k.div_ceil(u64::from(fold_lane_group(theta, caps).max(1))),
+                extent(*axis)
+                    .div_ceil(u64::from(fold_lane_group(theta, caps).max(1)))
+                    .saturating_mul(per_lane.max(1)),
             )
         }
         // A dense scatter walks every update per output lane.
@@ -1520,15 +1533,26 @@ fn build_component<'a>(
             .collect(),
         _ => smallvec::smallvec![(root, theta, member_geometry(graph, extraction, root, caps))],
     };
-    // A group dispatches its members' workgroups at the widest block.
+    // A group dispatches its members' workgroups at the widest block; a
+    // cooperative member packs one tile per slice of it.
+    let group_block = units.iter().map(|(_, _, g)| g.block).max().unwrap_or(1);
+    let slots = |m: Id, theta: Option<SchedPoint>, g: &Geometry| match theta {
+        Some(SchedPoint::Coop { .. })
+            if is_group(graph, root)
+                && matches!(graph.node(m).op, Op::Launch(Launch::Contract { .. })) =>
+        {
+            fusor_ir::ir::launch::CoopGeom::slots(g.block, group_block)
+        }
+        _ => 1,
+    };
     let geom = if is_group(graph, root) {
         Geometry {
-            block: units.iter().map(|(_, _, g)| g.block).max().unwrap_or(1),
+            block: group_block,
             workgroups: units
                 .iter()
-                .map(|(_, _, g)| {
+                .map(|(m, t, g)| {
                     let d = distribute_workgroups(
-                        g.workgroups,
+                        g.workgroups.div_ceil(u64::from(slots(*m, *t, g))),
                         caps.limits.max_compute_workgroups_per_dimension,
                     );
                     u64::from(d[0]) * u64::from(d[1]) * u64::from(d[2])
@@ -1539,7 +1563,17 @@ fn build_component<'a>(
     } else {
         units[0].2
     };
+    let group = is_group(graph, root);
     let mut wg_bytes = tile_bytes(graph, root, theta, caps, arena)? as u64;
+    // A group lays its members' tiles side by side.
+    if group {
+        for (m, t, g) in &units {
+            if !is_composite(graph, *m) {
+                wg_bytes += u64::from(tile_bytes(graph, *m, *t, caps, arena)?)
+                    * u64::from(slots(*m, *t, g));
+            }
+        }
+    }
 
     // Uncoalesced reads pay line amplification at each fold's lanes per row.
     let mut line_bytes = 0u64;
@@ -1684,8 +1718,18 @@ fn build_component<'a>(
         for m in &p {
             writes = writes.saturating_sub(bytes_of(graph.facts(*m)));
         }
-        wg_bytes = wg_bytes.max(used);
+        wg_bytes = if group {
+            wg_bytes + used
+        } else {
+            wg_bytes.max(used)
+        };
         private.extend(p);
+    }
+    if wg_bytes > u64::from(caps.limits.max_compute_workgroup_storage_size) {
+        return Err(Error::Plan(format!(
+            "composite needs {wg_bytes} workgroup bytes, the device allows {}",
+            caps.limits.max_compute_workgroup_storage_size
+        )));
     }
 
     Ok(Component {
@@ -1722,6 +1766,23 @@ fn member_geometry(graph: &EGraph, extraction: &Extraction, m: Id, caps: &Caps) 
             block: slab_block_of(graph, *slabs, members, caps),
             workgroups: u64::from(*slabs).max(1),
         },
+        // A wide scatter runs one workgroup per destination row.
+        Some(Launch::Scatter { axis, ops, .. })
+            if caps.kind == fusor_ir::device::DeviceKind::Gpu
+                && let Ok(shape) = fusor_ir::ir::launch::ScatterGeometry::of(
+                    ops,
+                    *axis as usize,
+                    |d| Ok(dim_extent(d)),
+                    Error::Plan,
+                )
+                && let Some(block) =
+                    shape.row_block(caps.limits.max_compute_invocations_per_workgroup) =>
+        {
+            Geometry {
+                block,
+                workgroups: u64::from(shape.rows()).max(1),
+            }
+        }
         Some(
             op @ Launch::Fold {
                 space,

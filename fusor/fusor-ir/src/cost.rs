@@ -97,6 +97,9 @@ pub struct DeviceFacts {
     pub coop_step_ps: u64,
     /// Latency of one dependent step of a per-lane loop.
     pub lane_step_ps: u64,
+    /// Floor per launched lane, idle or not: an over-launched grid pays for
+    /// every invocation it schedules.
+    pub lane_launch_ps: u64,
     pub caps: Caps,
 }
 

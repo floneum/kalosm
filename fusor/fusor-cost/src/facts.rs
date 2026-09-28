@@ -32,6 +32,8 @@ pub(crate) fn seed_facts_gpu(caps: &Caps) -> DeviceFacts {
         // Measured on an unhidden k=1024 fragment chain.
         coop_step_ps: 450_000,
         lane_step_ps: 150_000,
+        // 65k-workgroup batched sgemv: 155 us for 4.2M lanes.
+        lane_launch_ps: 30,
         // The gap tiny kernels leave between GPU spans on Metal.
         launch_ps: 10_000_000,
         dram_bytes_per_us: 379_500,
@@ -54,6 +56,7 @@ pub(crate) fn seed_facts_cpu(caps: &Caps) -> DeviceFacts {
     DeviceFacts {
         coop_step_ps: 0,
         lane_step_ps: 0,
+        lane_launch_ps: 0,
         launch_ps: 0,
         dram_bytes_per_us: 40_000,
         llc_bytes: 16 << 20,

@@ -761,20 +761,28 @@ impl Session {
             let __t_fwd = Instant::now();
             let plan = if missed {
                 let mut ex = plan.extraction.clone();
+                let mut next = plan;
                 if fusor_cost::forward::forward_selected_views(
-                    &mut g, &caps, &roots, &plan, &mut ex,
+                    &mut g, &caps, &roots, &next, &mut ex,
                 ) {
-                    let forwarded = self.inner.extractor.replan_extraction(
+                    next = Arc::new(self.inner.extractor.replan_extraction(
                         &g,
                         &roots,
                         &mut ex,
                         self.inner.cost.as_ref(),
-                    )?;
-                    self.inner.replay.insert(key, forwarded.clone());
-                    Arc::new(forwarded)
-                } else {
-                    plan
+                    )?);
                 }
+                // Independent launches of one dependency level share a dispatch.
+                let grouped =
+                    fusor_cost::wavefront::group_wavefronts(&mut g, &caps, &next, &mut |g, ex| {
+                        self.inner
+                            .extractor
+                            .replan_extraction(g, &roots, ex, self.inner.cost.as_ref())
+                            .ok()
+                    });
+                next = Arc::new(grouped);
+                self.inner.replay.insert(key, (*next).clone());
+                next
             } else {
                 plan
             };

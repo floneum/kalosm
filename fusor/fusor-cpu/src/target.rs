@@ -45,6 +45,7 @@ fn seed_facts(caps: &Caps) -> DeviceFacts {
     DeviceFacts {
         coop_step_ps: 0,
         lane_step_ps: 0,
+        lane_launch_ps: 0,
         // One-workgroup maps measure 10--20 us through the generic runner; pricing
         // them lower materializes hundreds of avoidable micro-kernels.
         launch_ps: 20_000_000,

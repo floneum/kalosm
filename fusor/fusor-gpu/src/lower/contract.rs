@@ -317,29 +317,63 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
 
     // Operand staging tiles: `staging` buffers stacked in one declaration, the
     // footprint `verify_launch::coop_tiles` admitted.
+    // A group member runs at the group's block. When that is a multiple of
+    // this geometry's lanes each slice owns its own tile (and tile storage);
+    // otherwise extra subgroups help stage and mirror an owner, storing nothing.
+    let block = ctx.block(cs.lanes);
+    let slots = CoopGeom::slots(cs.lanes, block);
     let a_tile = b.tile(
         "coop_a",
         operand_elem.element(),
-        &[depth.saturating_mul(geom.bm), geom.bk],
+        &[slots * depth.saturating_mul(geom.bm), geom.bk],
     );
     let b_tile = b.tile(
         "coop_b",
         operand_elem.element(),
-        &[depth.saturating_mul(geom.bk), cs.bn_pass],
+        &[slots * depth.saturating_mul(geom.bk), cs.bn_pass],
     );
-
-    // A group member runs at the group's block: extra subgroups help stage
-    // the tiles and mirror an owning subgroup's fragments, storing nothing.
-    let block = ctx.block(cs.lanes);
     let groups = shape
         .batch
         .saturating_mul(tiles_m)
         .saturating_mul(tiles_n)
         .max(1);
-    let grid = distribute_workgroups(groups, ctx.caps.limits.max_compute_workgroups_per_dimension);
+    let grid = distribute_workgroups(
+        groups.div_ceil(slots),
+        ctx.caps.limits.max_compute_workgroups_per_dimension,
+    );
 
-    let lane = b.builtin(Builtin::Lane);
-    let tile_id = workgroup_index(&ctx, grid, groups);
+    let lane_raw = b.builtin(Builtin::Lane);
+    let (lane, slot) = match slots > 1 {
+        true => {
+            let (slot, lane) = b.divrem(lane_raw, b.u32(cs.lanes));
+            (lane, Some(slot))
+        }
+        false => (lane_raw, None),
+    };
+    // A slot past the last tile computes the last tile again and stores nothing.
+    let (tile_id, live) = match &slot {
+        Some(slot) => {
+            let raw = b.add(
+                b.mul(
+                    workgroup_index(&ctx, grid, groups.div_ceil(slots)),
+                    b.u32(slots),
+                ),
+                slot.clone(),
+            );
+            let live = b.lt(raw.clone(), b.u32(groups));
+            (b.min(raw, b.u32(groups - 1)), Some(live))
+        }
+        None => (workgroup_index(&ctx, grid, groups), None),
+    };
+    // Element offsets of this slot's tiles, and its row offset in each.
+    let slot_rows = |rows: u32| slot.as_ref().map(|s| b.mul(s.clone(), b.u32(rows)));
+    let a_slot_rows = slot_rows(depth.saturating_mul(geom.bm));
+    let b_slot_rows = slot_rows(depth.saturating_mul(geom.bk));
+    let acc_slot_rows = slot_rows(geom.bm);
+    let with_rows = |base: TileExpr, rows: &Option<TileExpr>| match rows {
+        Some(r) => b.add(r.clone(), base),
+        None => base,
+    };
     let per_batch = tiles_m.saturating_mul(tiles_n).max(1);
     let (batch_index, local_tile) = split_const(&ctx, tile_id, shape.batch, per_batch);
     let group_m = swizzle_group_m(geom, n);
@@ -368,7 +402,10 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
         true => b.rem(sg_raw.clone(), owners.clone()),
         false => sg_raw.clone(),
     };
-    let owns = (block > cs.lanes).then(|| b.lt(sg_raw, owners));
+    let owns = match &live {
+        Some(live) => Some(live.clone()),
+        None => (block > cs.lanes).then(|| b.lt(sg_raw, owners)),
+    };
     let (sg_row, sg_col) = b.divrem(sg, b.u32(geom.cg));
     let sg_row_base = b.mul(sg_row, b.u32(cs.sg_rows));
     let sg_col_base = b.mul(sg_col, b.u32(cs.sg_cols));
@@ -388,16 +425,21 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
         .any(|buffer| buffer.binding == out_view.buffer.binding && buffer.element != out_elem);
     let needs_stage =
         mixed_binding || (!ctx.caps.mixed_precision_coop_store && acc_elem.element() != out_elem);
-    let stage_tile: Option<Tile> = (needs_stage
-        || !cooperative_store_layout_supported(&out_view.layout))
-    .then(|| b.tile("coop_acc", acc_elem.element(), &[geom.bm, cs.bn_pass]));
+    let stage_tile: Option<Tile> =
+        (needs_stage || !cooperative_store_layout_supported(&out_view.layout)).then(|| {
+            b.tile(
+                "coop_acc",
+                acc_elem.element(),
+                &[slots * geom.bm, cs.bn_pass],
+            )
+        });
 
     let k_limit = ctx.dim_expr(shape.k)?;
     let n_limit = b.u32(n);
     let stage = StageNest {
         lane: &lane,
         batch: &batch_index,
-        block,
+        block: if slots > 1 { cs.lanes } else { block },
         elem: operand_elem,
     };
     let mut body: Vec<Stmt> = Vec::new();
@@ -419,6 +461,9 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
                 &mut loop_body,
                 &c.a,
                 &a_tile,
+                a_slot_rows
+                    .as_ref()
+                    .map(|r| b.mul(r.clone(), b.u32(geom.bk))),
                 d.saturating_mul(geom.bm).saturating_mul(geom.bk),
                 [a_row_base.clone(), k_base.clone()],
                 [a_row_limit.clone(), k_limit.clone()],
@@ -429,6 +474,9 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
                 &mut loop_body,
                 &c.b,
                 &b_tile,
+                b_slot_rows
+                    .as_ref()
+                    .map(|r| b.mul(r.clone(), b.u32(cs.bn_pass))),
                 d.saturating_mul(geom.bk).saturating_mul(cs.bn_pass),
                 [b.add(b_batch_base.clone(), k_base), pass_col_base.clone()],
                 [b_row_limit.clone(), n_limit.clone()],
@@ -460,13 +508,16 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
                 });
                 let mut update = b.load_local(local.clone());
                 for d in 0..depth {
-                    let a_row_d = b.add(b.u32(d.saturating_mul(geom.bm)), a_row.clone());
+                    let a_row_d = with_rows(
+                        b.add(b.u32(d.saturating_mul(geom.bm)), a_row.clone()),
+                        &a_slot_rows,
+                    );
                     let b_buf = d.saturating_mul(geom.bk);
                     for step in 0..cs.kk_steps {
                         let offset = step.saturating_mul(dim);
                         let a_frag =
                             frag(CoopMatrixRole::A, &a_tile, a_row_d.clone(), b.u32(offset));
-                        let b_row = b.u32(b_buf.saturating_add(offset));
+                        let b_row = with_rows(b.u32(b_buf.saturating_add(offset)), &b_slot_rows);
                         let b_frag = frag(CoopMatrixRole::B, &b_tile, b_row, b_col.clone());
                         update = b.coop_mma(a_frag, b_frag, update);
                     }
@@ -497,7 +548,7 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
                 Some(tile) => Stmt::CoopStoreTile {
                     acc,
                     tile: tile.clone(),
-                    row: frag_row,
+                    row: with_rows(frag_row, &acc_slot_rows),
                     col: frag_col,
                 },
                 None => Stmt::CoopStore {
@@ -532,8 +583,12 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
                     &lane,
                     rows,
                     cols,
-                    block,
+                    if slots > 1 { cs.lanes } else { block },
                     |out, flat, lr, lc, active| {
+                        let active = match &live {
+                            Some(live) => b.and(active, live.clone()),
+                            None => active,
+                        };
                         let row = b.add(out_row_base.clone(), lr.clone());
                         let col = b.add(pass_col_base.clone(), lc);
                         let value = value_at(flat, &row, &col, &active);
@@ -560,7 +615,12 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
             // `post` costs nothing extra there.
             Some(tile) => {
                 body.push(Stmt::Barrier);
-                epilogue(&mut body, &|flat, _, _, _| b.load_tile(tile.clone(), flat))?;
+                let acc_base = acc_slot_rows
+                    .as_ref()
+                    .map(|r| b.mul(r.clone(), b.u32(cs.bn_pass)));
+                epilogue(&mut body, &|flat, _, _, _| {
+                    b.load_tile(tile.clone(), with_rows(flat, &acc_base))
+                })?;
                 body.push(Stmt::Barrier);
             }
             // Fragments are opaque to scalar code, so a fused `post` stores, barriers,
@@ -801,6 +861,7 @@ impl StageNest<'_> {
         body: &mut Vec<Stmt>,
         side: &Side<'_>,
         tile: &Tile,
+        slot_base: Option<TileExpr>,
         tile_base: u32,
         [row_base, col_base]: [TileExpr; 2],
         [row_limit, col_limit]: [TileExpr; 2],
@@ -854,9 +915,15 @@ impl StageNest<'_> {
             let value = side.value(ctx, &row, &col, &active, self.batch, self.elem)?;
             let store = Stmt::StoreTile {
                 dst: tile.clone(),
-                index: match tile_base {
-                    0 => tile_index,
-                    _ => b.add(b.u32(tile_base), tile_index),
+                index: {
+                    let index = match tile_base {
+                        0 => tile_index,
+                        _ => b.add(b.u32(tile_base), tile_index),
+                    };
+                    match &slot_base {
+                        Some(base) => b.add(base.clone(), index),
+                        None => index,
+                    }
                 },
                 value: b.select(active, value, b.zero(self.elem)),
             };

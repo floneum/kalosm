@@ -79,7 +79,6 @@ pub static CORE_RULES: &[Rule] = &[
     split_k::SPLIT_K,
     absorb_view::ABSORB_VIEW_INTO_CONTRACT,
     absorb_view::ABSORB_BROADCAST,
-    group::FORM_GROUP,
     scatter_fold::SCATTER_ADD_AS_FOLD,
 ];
 

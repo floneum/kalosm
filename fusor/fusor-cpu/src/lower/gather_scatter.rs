@@ -6,11 +6,12 @@ use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
     Accumulator, Addr, KernelIr, ScalarElement, Stmt, TileExpr, TileExprKind,
 };
+use fusor_ir::ir::launch::ScatterGeometry;
 use fusor_ir::ir::launch::{IndexSpace, Launch, Operand, SchedPoint};
 use fusor_ir::ir::logical::ScatterCombine;
 use fusor_ir::ir::{Node, Op};
 use fusor_ir::target::LowerCtx;
-use fusor_tile::build::{Kernel, ScatterGeometry};
+use fusor_tile::build::Kernel;
 
 use super::{Binds, DEFAULT_BLOCK, const_extents, global_lane, grid_for, operand_src, view};
 

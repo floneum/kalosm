@@ -796,6 +796,16 @@ impl CoopGeom {
         self.rg * self.cg * subgroup_width
     }
 
+    /// Tiles one workgroup of `block` lanes runs side by side when a group
+    /// widens this contraction's `lanes`: each `lanes`-wide slice owns a tile.
+    pub const fn slots(lanes: u32, block: u32) -> u32 {
+        if lanes > 0 && block > lanes && block.is_multiple_of(lanes) {
+            block / lanes
+        } else {
+            1
+        }
+    }
+
     /// Structural legality, independent of workgroup-memory footprint.
     pub const fn legal(&self, subgroup_width: u32, max_wg_lanes: u32) -> bool {
         self.n_passes != 0
@@ -1088,5 +1098,77 @@ pub fn coop_tiles(
             tile("coop_b", elem, &[depth * geom.bk, bn_pass]),
             tile("coop_acc", ScalarElement::F32, &[geom.bm, bn_pass]),
         ],
+    }
+}
+
+/// A scatter's destination geometry, read off the base and index operands
+/// (`space` differs between the floor and tile rules).
+pub struct ScatterGeometry {
+    /// Product of the base extents before the scattered axis.
+    pub outer: u32,
+    /// Extent of the scattered axis in the base — the destination bins.
+    pub bins: u32,
+    /// Product of the base extents after the scattered axis.
+    pub inner: u32,
+    /// Index count.
+    pub updates: u32,
+}
+
+impl ScatterGeometry {
+    /// `ops` is `(base, idx, upd)`; `resolve` binds an extent.
+    pub fn of(
+        ops: &[Operand],
+        axis: usize,
+        resolve: impl Fn(Dim) -> crate::error::Result<u64>,
+        error: fn(String) -> crate::error::Error,
+    ) -> crate::error::Result<Self> {
+        let [base, idx, ..] = ops else {
+            return Err(error("a scatter needs base and index operands".into()));
+        };
+        let dest = base
+            .layout
+            .shape()
+            .iter()
+            .map(|d| {
+                u32::try_from(resolve(*d)?)
+                    .map_err(|_| error("scatter extent exceeds a u32".into()))
+            })
+            .collect::<crate::error::Result<Vec<u32>>>()?;
+        if axis >= dest.len() {
+            return Err(error(format!(
+                "scatter axis {axis} is outside a rank-{} base",
+                dest.len()
+            )));
+        }
+        let mut updates = 1u64;
+        for d in idx.layout.shape() {
+            updates = updates.saturating_mul(resolve(*d)?);
+        }
+        Ok(Self {
+            outer: dest[..axis].iter().product::<u32>().max(1),
+            bins: dest[axis].max(1),
+            inner: dest[axis + 1..].iter().product::<u32>().max(1),
+            updates: u32::try_from(updates)
+                .map_err(|_| error("scatter update count exceeds a u32".into()))?
+                .max(1),
+        })
+    }
+
+    /// Destination rows: every `(outer, bin)` pair.
+    pub fn rows(&self) -> u32 {
+        self.outer.saturating_mul(self.bins)
+    }
+
+    /// Lanes per workgroup when each workgroup owns one destination row and
+    /// scans the indices once, or `None` for the one-lane-per-element nest.
+    pub fn row_block(&self, max_block: u32) -> Option<u32> {
+        (self.inner >= 16).then(|| self.inner.next_multiple_of(32).min(max_block.min(256)))
+    }
+
+    /// Elements of the destination.
+    pub fn total(&self) -> u64 {
+        u64::from(self.outer)
+            .saturating_mul(u64::from(self.bins))
+            .saturating_mul(u64::from(self.inner))
     }
 }

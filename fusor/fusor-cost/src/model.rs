@@ -103,7 +103,8 @@ impl CostModel for Roofline {
         );
         // What one workgroup cannot finish faster than: its dependent chain.
         let serial = terms::serial_ps(f, launch.coop_steps, launch.lane_steps);
-        Picoseconds(f.launch_ps) + dram.max(issue).max(serial) + drain
+        let lanes = Picoseconds(launch.resident_lanes.saturating_mul(f.lane_launch_ps));
+        Picoseconds(f.launch_ps) + dram.max(issue).max(serial).max(lanes) + drain
     }
 
     fn node_math(

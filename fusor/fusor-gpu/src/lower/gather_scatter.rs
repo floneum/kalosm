@@ -4,11 +4,10 @@
 use fusor_ir::Result;
 use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
-    Accumulator, Addr, ElementType, KernelIr, ScalarElement, Stmt, TileExpr,
+    Accumulator, Addr, Builtin, ElementType, KernelIr, ScalarElement, Stmt, TileExpr,
 };
-use fusor_ir::ir::launch::{Launch, MapTiling, SchedPoint};
+use fusor_ir::ir::launch::{Launch, MapTiling, ScatterGeometry, SchedPoint};
 use fusor_ir::ir::logical::ScatterCombine;
-use fusor_tile::build::ScatterGeometry;
 
 use crate::lower::{Ctx, distribute_workgroups};
 use fusor_tile::domains::emitted_block;
@@ -180,6 +179,10 @@ pub(crate) fn lower_kgather(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Res
     Ok(ctx.finish("kgather", grid, block, body))
 }
 
+fn total_of(shape: &ScatterGeometry) -> u64 {
+    shape.total().max(1)
+}
+
 /// `out = base` with `out[.., idx[u], ..] (combine)= upd[.., u, ..]`: one lane
 /// per output element, a counted loop over the updates. The output buffer does
 /// not hold the base, so this nest reads it; one writer per element keeps the
@@ -211,6 +214,116 @@ pub(crate) fn lower_kscatter(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Re
         _ => ScalarElement::F32,
     }
     .element();
+    let max_block = ctx.caps.limits.max_compute_invocations_per_workgroup;
+    if let Some(row_block) = shape.row_block(max_block) {
+        let block = ctx.block(row_block);
+        let rows = shape.rows();
+        let grid =
+            distribute_workgroups(rows, ctx.caps.limits.max_compute_workgroups_per_dimension);
+        let row = ctx.linear_workgroup();
+        let lane = b.builtin(Builtin::Lane);
+        let bins_e = b.u32(shape.bins);
+        let inner_e = b.u32(shape.inner);
+        let updates = shape.updates;
+        let (o, bin) = b.divrem(row.clone(), bins_e);
+        let live_row = b.lt(row.clone(), b.u32(rows));
+
+        // Each lane owns every `block`-th column of its row; a column past
+        // the row reads its last element and never stores.
+        let slots = shape.inner.div_ceil(block);
+        let mut init = Vec::new();
+        let mut stores = Vec::new();
+        let mut columns = Vec::new();
+        for slot in 0..slots {
+            let col = b.add(lane.clone(), b.u32(slot * block));
+            let live = b.and(live_row.clone(), b.lt(col.clone(), inner_e.clone()));
+            let clamped = b.min(col, b.u32(shape.inner - 1));
+            let flat = b.add(b.mul(row.clone(), inner_e.clone()), clamped.clone());
+            let acc = b.local(acc_ty);
+            init.push(Stmt::StoreLocal {
+                dst: acc.clone(),
+                value: b.cast(
+                    ctx.load_mapped(base, flat.clone(), total_of(&shape))?,
+                    acc_ty,
+                ),
+            });
+            stores.push(Stmt::Store {
+                dst: out.clone(),
+                addr: Addr::Linear(flat),
+                value: b.cast(b.load_local(acc.clone()), out_elem),
+                mask: live,
+            });
+            columns.push((acc, clamped));
+        }
+
+        // Stage `block` indices, then walk them in update order; a lane
+        // loads an update only for a match, so the sum order is the dense
+        // nest's and the result is bit-identical.
+        let bins_tile = b.tile("scatter_bins", ScalarElement::U32.element(), &[block]);
+        let chunk_local = b.local(ScalarElement::U32.element());
+        let chunk_base = b.mul(b.load_local(chunk_local.clone()), b.u32(block));
+        let u = b.add(chunk_base.clone(), lane.clone());
+        let picked = b.cast(
+            ctx.load_operand(idx, b.min(u.clone(), b.u32(updates - 1)))?,
+            ScalarElement::U32.element(),
+        );
+        let j_local = b.local(ScalarElement::U32.element());
+        let j = b.load_local(j_local.clone());
+        let at = b.add(chunk_base, j.clone());
+        let mut hit = Vec::new();
+        for (acc, col) in &columns {
+            let upd_index = b.add(
+                b.mul(
+                    b.add(b.mul(o.clone(), b.u32(updates)), at.clone()),
+                    inner_e.clone(),
+                ),
+                col.clone(),
+            );
+            let v = b.cast(ctx.load_operand(upd, upd_index)?, acc_ty);
+            let value = match combine {
+                ScatterCombine::Add => b.add(b.load_local(acc.clone()), v),
+                ScatterCombine::Set => v,
+            };
+            hit.push(Stmt::StoreLocal {
+                dst: acc.clone(),
+                value,
+            });
+        }
+        let scan = Stmt::Loop {
+            count: Some(b.min(
+                b.u32(block),
+                b.sub(
+                    b.u32(updates),
+                    b.mul(b.load_local(chunk_local.clone()), b.u32(block)),
+                ),
+            )),
+            index: Some(j_local),
+            accumulators: Vec::new(),
+            body: vec![Stmt::If {
+                condition: b.eq(b.load_tile(bins_tile.clone(), j), bin),
+                accept: hit,
+                reject: Vec::new(),
+            }],
+        };
+        let mut body = init;
+        body.push(Stmt::Loop {
+            count: Some(b.u32(updates.div_ceil(block))),
+            index: Some(chunk_local),
+            accumulators: Vec::new(),
+            body: vec![
+                Stmt::Barrier,
+                Stmt::StoreTile {
+                    dst: bins_tile,
+                    index: lane,
+                    value: b.select(b.lt(u, b.u32(updates)), picked, b.u32(u32::MAX)),
+                },
+                Stmt::Barrier,
+                scan,
+            ],
+        });
+        body.extend(stores);
+        return Ok(ctx.finish("scatter_rows", grid, block, body));
+    }
     let block = ctx.block(emitted_block(1, ctx.caps));
     let total = shape.total().max(1);
 

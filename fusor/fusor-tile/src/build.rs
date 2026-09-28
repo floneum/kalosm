@@ -15,10 +15,9 @@ use fusor_ir::ir::kernel::{
     ReduceKind, ScalarElement, Source, Stmt, Tile, TileBinaryOp, TileCompareOp, TileDecl, TileExpr,
     TileExprKind, TileLayout, TileLiteral, TileReduceOp, TileUnaryOp,
 };
-use fusor_ir::ir::launch::{AddressMap, Operand};
+use fusor_ir::ir::launch::AddressMap;
 use fusor_ir::ir::logical::{LeafKind, Logical};
 use fusor_ir::scalar::ScalarExpr;
-use fusor_ir::shape::Dim;
 use fusor_ir::target::LowerCtx;
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
@@ -614,67 +613,6 @@ impl Kernel {
             scratch,
         };
         Ok((stmt, reads))
-    }
-}
-
-/// A scatter's destination geometry, read off the base and index operands
-/// (`space` differs between the floor and tile rules).
-pub struct ScatterGeometry {
-    /// Product of the base extents before the scattered axis.
-    pub outer: u32,
-    /// Extent of the scattered axis in the base — the destination bins.
-    pub bins: u32,
-    /// Product of the base extents after the scattered axis.
-    pub inner: u32,
-    /// Index count.
-    pub updates: u32,
-}
-
-impl ScatterGeometry {
-    /// `ops` is `(base, idx, upd)`; `resolve` binds an extent.
-    pub fn of(
-        ops: &[Operand],
-        axis: usize,
-        resolve: impl Fn(Dim) -> Result<u64>,
-        error: fn(String) -> Error,
-    ) -> Result<Self> {
-        let [base, idx, ..] = ops else {
-            return Err(error("a scatter needs base and index operands".into()));
-        };
-        let dest = base
-            .layout
-            .shape()
-            .iter()
-            .map(|d| {
-                u32::try_from(resolve(*d)?)
-                    .map_err(|_| error("scatter extent exceeds a u32".into()))
-            })
-            .collect::<Result<Vec<u32>>>()?;
-        if axis >= dest.len() {
-            return Err(error(format!(
-                "scatter axis {axis} is outside a rank-{} base",
-                dest.len()
-            )));
-        }
-        let mut updates = 1u64;
-        for d in idx.layout.shape() {
-            updates = updates.saturating_mul(resolve(*d)?);
-        }
-        Ok(Self {
-            outer: dest[..axis].iter().product::<u32>().max(1),
-            bins: dest[axis].max(1),
-            inner: dest[axis + 1..].iter().product::<u32>().max(1),
-            updates: u32::try_from(updates)
-                .map_err(|_| error("scatter update count exceeds a u32".into()))?
-                .max(1),
-        })
-    }
-
-    /// Elements of the destination.
-    pub fn total(&self) -> u64 {
-        u64::from(self.outer)
-            .saturating_mul(u64::from(self.bins))
-            .saturating_mul(u64::from(self.inner))
     }
 }
 

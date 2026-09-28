@@ -19,6 +19,7 @@ mod terms;
 pub mod tune_cache;
 #[cfg(feature = "compiler-tests")]
 mod verify_plan;
+pub mod wavefront;
 
 pub use extract::LocalSearch;
 pub use model::Roofline;

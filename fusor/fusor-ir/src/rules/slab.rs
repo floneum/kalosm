@@ -393,15 +393,6 @@ pub(crate) fn stage_rank(
     (-copies, ops.len(), splits, -(m.0 as isize))
 }
 
-/// Operands read varyingly from a copy class (a broadcast read is a scalar,
-/// not a copy dispatch).
-pub(crate) fn copy_operands<'a>(
-    b: &Builder<'_>,
-    ops: impl IntoIterator<Item = &'a Operand>,
-) -> usize {
-    count_copies(ops, |id| is_copy_class(b, id))
-}
-
 fn count_copies<'a>(
     ops: impl IntoIterator<Item = &'a Operand>,
     mut is_copy: impl FnMut(Id) -> bool,
