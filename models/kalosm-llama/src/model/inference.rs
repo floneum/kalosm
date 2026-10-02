@@ -58,6 +58,11 @@ impl LlamaModel {
             let new_token = text_stream
                 .sample_token(&mut cpu_sampler, logits, stop_on.as_deref(), sample_top_k)
                 .map_err(LlamaModelError::TokenOutputStreamError)?;
+            session
+                .cache
+                .write()
+                .map_err(|err| LlamaModelError::Session(err.to_string()))?
+                .pending_token = Some(new_token);
             if new_token == stop_token {
                 tracing::trace!("Stopping on stop token");
                 break;
@@ -128,7 +133,7 @@ impl LlamaModel {
                 Self::forward_top_k(
                     &self.model,
                     &self.device,
-                    &[new_token],
+                    &[],
                     &[],
                     Some(&mut session_lock),
                     &self.tokenizer,

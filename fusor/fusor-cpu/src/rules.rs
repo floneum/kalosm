@@ -1,12 +1,8 @@
-//! CPU-specific graph rewrites.
-//!
-//! Scheduling and access selection belong to the native emitter now. The only
-//! graph rewrite needed by this backend widens narrow storage values to f32
-//! compute and narrows once at the output boundary.
+//! CPU graph rewrites: widen narrow storage to f32 compute, narrow at the output.
 
 use fusor_ir::dtype::Dtype;
 use fusor_ir::egraph::{Builder, Facts, Id, Rule, RuleTag};
-use fusor_ir::ir::launch::{Launch, Operand, ScheduleDomain};
+use fusor_ir::ir::launch::Launch;
 use fusor_ir::ir::{Level, Node, Op, OpTag};
 use fusor_ir::rule;
 use fusor_ir::scalar::ScalarExpr;
@@ -22,39 +18,21 @@ rule!(
 /// Every rule this backend contributes; the order carries no semantics.
 pub static CPU_RULES: &[Rule] = &[WIDEN_COMPUTE];
 
-fn map_parts(node: &Node) -> Option<(&Vec<Operand>, &ScheduleDomain, &ScalarExpr)> {
-    match &node.op {
-        Op::Launch(Launch::Map {
-            ops, sched, body, ..
-        }) => Some((ops, sched, body)),
-        _ => None,
-    }
-}
-
-fn rebuild(
-    node: &Node,
-    ops: Vec<Operand>,
-    sched: ScheduleDomain,
-    body: ScalarExpr,
-) -> Option<Launch> {
-    match &node.op {
-        Op::Launch(Launch::Map { space, .. }) => Some(Launch::Map {
-            space: space.clone(),
-            body,
-            ops,
-            sched,
-        }),
-        _ => None,
-    }
-}
-
 pub(crate) fn widen_compute(
     builder: &mut Builder<'_>,
     id: Id,
     node: &Node,
     facts: &Facts<'_>,
 ) -> Option<Id> {
-    let (ops, sched, body) = map_parts(node)?;
+    let Op::Launch(Launch::Map {
+        space,
+        ops,
+        sched,
+        body,
+    }) = &node.op
+    else {
+        return None;
+    };
     let narrow = |dtype: Dtype| matches!(dtype, Dtype::F16 | Dtype::BF16);
     let output = facts.own().dtype;
     if !narrow(output) && !(0..ops.len()).any(|index| facts.dtype(index).is_some_and(narrow)) {
@@ -78,7 +56,12 @@ pub(crate) fn widen_compute(
     } else {
         body
     };
-    let alternative = rebuild(node, ops.clone(), sched.clone(), body)?;
+    let alternative = Launch::Map {
+        space: space.clone(),
+        body,
+        ops: ops.clone(),
+        sched: sched.clone(),
+    };
     let alternative = builder.add_launch(alternative).ok()?;
     builder.union(id, alternative).ok()
 }

@@ -1,20 +1,15 @@
-//! [`Planner`] — the one [`ArenaPlanner`] implementation.
-//!
-//! `arena_plan` is a **pure memoized function** of the ordered tile
-//! declaration list, the barrier and loop structure of the body, and
-//! `caps.fingerprint()`. `workgroup_bytes` synthesizes a minimal body over a
-//! candidate geometry's tiles and runs the *same* function, so `verify_launch`'s
-//! admission test, the Launch occupancy term and the Kernel emitter's layout are
-//! provably the same number.
+//! [`Planner`] — the one [`ArenaPlanner`] implementation. `arena_plan` is a
+//! pure memoized function; `workgroup_bytes` runs it on a synthesized body,
+//! so admission, occupancy and emitted layout agree exactly.
 
 use std::sync::{Arc, OnceLock};
 
 use fusor_ir::Result;
 use fusor_ir::device::Caps;
 use fusor_ir::ir::kernel::{
-    Addr, ArenaMode, ArenaPlan, ArenaPlanner, BarrierSuggestion, Buffer, CoopSrc, ElementType,
-    KernelIr, Local, MergeBody, QuantizedView, ReduceKind, ScalarElement, Source, Stmt,
-    StorageView, Tile, TileExpr, TileExprKind, TileLiteral, Tiles,
+    Addr, ArenaMode, ArenaPlan, ArenaPlanner, BarrierSuggestion, Buffer, ElementType, KernelIr,
+    Local, MergeBody, QuantizedView, ReduceKind, ScalarElement, Source, Stmt, StorageView, Tile,
+    TileExpr, TileExprKind, TileLiteral, Tiles,
 };
 use parking_lot::RwLock;
 use rustc_hash::{FxHashMap, FxHasher};
@@ -22,14 +17,12 @@ use smallvec::SmallVec;
 use std::hash::{Hash, Hasher};
 
 use crate::arena;
-use crate::liveness::{LivenessInfo, analyze, for_each_addr_expr, for_each_child};
+use crate::liveness::{LivenessInfo, analyze};
 
 /// Memo key: everything `arena_plan`'s result depends on.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct PlanKey {
-    /// The tile declaration list, the barrier/loop skeleton, and the body
-    /// term itself. The body term is a superset of the first two, which keeps
-    /// the key exact at the cost of a few memo misses.
+    /// The tile list, barrier/loop skeleton, and the body term itself.
     pub body_hash: u64,
     pub caps_fingerprint: u64,
 }
@@ -41,8 +34,7 @@ pub struct TilesKey {
     pub caps_fingerprint: u64,
 }
 
-/// The shared arena planner. The memo is behind an `RwLock` because kernel
-/// building runs on worker threads.
+/// The shared arena planner, memo behind an `RwLock`.
 #[derive(Default)]
 pub struct Planner {
     memo: RwLock<FxHashMap<PlanKey, ArenaPlan>>,
@@ -61,8 +53,7 @@ impl Planner {
         Arc::new(Self::new())
     }
 
-    /// The process-wide planner, so `verify_kernel` and the emitters share one
-    /// memo instead of re-deriving every plan.
+    /// The process-wide planner, so every caller shares one memo.
     pub fn global() -> &'static Self {
         GLOBAL.get_or_init(Self::new)
     }
@@ -78,10 +69,8 @@ impl Planner {
     }
 }
 
-/// Everything the plan depends on, hashed. The liveness digest is the
-/// architecture's stated key (tile declarations in order, plus the barrier and
-/// loop structure); the raw body term is folded in as well so a memo hit can
-/// never cross two bodies that merely happen to have the same skeleton.
+/// Everything the plan depends on, hashed: tile declarations, barrier and
+/// loop structure, and the raw body term.
 fn plan_key(ir: &KernelIr, live: &LivenessInfo, caps: &Caps) -> PlanKey {
     let mut h = FxHasher::default();
     // Ordered tile declaration list: element type, layout, allocation extent.
@@ -104,14 +93,8 @@ fn plan_key(ir: &KernelIr, live: &LivenessInfo, caps: &Caps) -> PlanKey {
         info.span.hash(&mut h);
         info.guaranteed_once().hash(&mut h);
     }
-    // The body term itself — barrier insertion candidates depend on the root
-    // statement list, not only on the skeleton above.
-    //
-    // Hashed structurally, not via `Stmt`'s derived `Hash`: `StorageView`
-    // hashes the buffer's address and `LocalDecl`/`TileDecl` hash their `id`,
-    // so two separately-built copies of the same kernel would never agree.
-    // `BodyHasher` substitutes each declaration's first-use ordinal for its
-    // address and is otherwise exact.
+    // The body term, hashed structurally: derived `Hash` folds in addresses
+    // and decl ids, so separately built copies would never agree.
     BodyHasher::default().body(&ir.body, &mut h);
     PlanKey {
         body_hash: h.finish(),
@@ -120,12 +103,8 @@ fn plan_key(ir: &KernelIr, live: &LivenessInfo, caps: &Caps) -> PlanKey {
 }
 
 /// A pointer-free identity for a whole kernel: name, block, arena token,
-/// declared buffers (by binding and contents) and the body up to renaming of
-/// its buffer, tile and local declarations.
-///
-/// `TileExpr`'s cached digest — and therefore any hash derived from `Stmt` —
-/// folds in `Arc` addresses: two byte-identical lowerings never agree, and a
-/// recycled allocation can make two different kernels agree.
+/// buffers and body up to renaming of declarations. Derived `Stmt` hashes fold
+/// in `Arc` addresses, so they cannot serve.
 pub fn kernel_identity(ir: &KernelIr) -> u128 {
     let mut lanes = [0u64; 2];
     for (seed, lane) in lanes.iter_mut().enumerate() {
@@ -154,18 +133,10 @@ struct BodyHasher {
     buffers: FxHashMap<usize, u32>,
     tiles: FxHashMap<usize, u32>,
     locals: FxHashMap<usize, u32>,
-    /// Per-node sub-hash, keyed by [`TileExpr::node_ptr`]. A body is a DAG,
-    /// so expanding it as a tree is exponential in the sharing depth; the
-    /// memo makes the identity a Merkle fold, one hash per distinct node.
-    ///
-    /// Exact: ordinals are assigned on first visit and stable afterwards, so
-    /// recomputing at the second occurrence would reproduce the memoized
-    /// value. Multiplicity survives because the parent folds the sub-hash in
-    /// once per edge.
+    /// Per-node sub-hash keyed by [`TileExpr::node_ptr`]: a Merkle fold, one
+    /// hash per distinct DAG node. Exact, since ordinals are stable once assigned.
     memo: FxHashMap<usize, u64>,
-    /// Lane seed, mixed into every sub-hash so the two lanes of
-    /// [`kernel_identity`] stay independent 64-bit hashes rather than
-    /// agreeing on every shared subtree.
+    /// Lane seed, keeping the two lanes of [`kernel_identity`] independent.
     seed: u64,
 }
 
@@ -181,8 +152,7 @@ impl BodyHasher {
 
     fn buffer(&mut self, b: &Buffer, h: &mut FxHasher) {
         Self::ordinal(&mut self.buffers, ptr_of(b)).hash(h);
-        // The decl's own contents still matter: two buffers may be distinct
-        // allocations of different element types.
+        // Contents too: distinct buffers may differ in element type.
         b.element.hash(h);
         b.layout.hash(h);
         b.access.hash(h);
@@ -222,7 +192,7 @@ impl BodyHasher {
 
     fn addr(&mut self, a: &Addr, h: &mut FxHasher) {
         std::mem::discriminant(a).hash(h);
-        for_each_addr_expr(a, &mut |e| self.expr(e, h));
+        a.for_each_expr(&mut |e| self.expr(e, h));
     }
 
     fn reduce_kind(&mut self, k: &ReduceKind, h: &mut FxHasher) {
@@ -236,23 +206,10 @@ impl BodyHasher {
                 self.tile(scratch, h);
                 group_size.hash(h);
             }
-            ReduceKind::Loop {
-                iterations,
-                index,
-                scratch,
-                group_size,
-            } => {
-                iterations.hash(h);
-                self.local(index, h);
-                self.tile(scratch, h);
-                group_size.hash(h);
-            }
         }
     }
 
-    /// The per-node payload: everything that is neither a child expression
-    /// (walked by `for_each_child`) nor an identity already folded in above.
-    /// Fold `e`'s identity into `h`, computing it once per distinct node.
+    /// Fold `e`'s identity into `h`, once per distinct node.
     fn expr(&mut self, e: &TileExpr, h: &mut FxHasher) {
         let ptr = e.node_ptr();
         if let Some(cached) = self.memo.get(&ptr) {
@@ -319,23 +276,15 @@ impl BodyHasher {
                 scalar.hash(h);
                 rows.hash(h);
                 cols.hash(h);
-                std::mem::discriminant(src.as_ref()).hash(h);
-                match src.as_ref() {
-                    CoopSrc::TileRegion {
-                        tile, transposed, ..
-                    } => {
-                        self.tile(tile, h);
-                        transposed.hash(h);
-                    }
-                    CoopSrc::BroadcastCol { src, .. } => self.view(src, h),
-                }
+                self.tile(&src.tile, h);
+                src.transposed.hash(h);
             }
             // No payload beyond the children.
             TileExprKind::Select { .. }
             | TileExprKind::Dot { .. }
             | TileExprKind::CoopMma { .. } => {}
         }
-        for_each_child(kind, &mut |c| self.expr(c, h));
+        kind.visit_children(&mut |c| self.expr(c, h));
     }
 
     fn merge(&mut self, m: &MergeBody, h: &mut FxHasher) {
@@ -467,10 +416,8 @@ impl BodyHasher {
     }
 }
 
-/// A memoized plan is stored with placements in liveness order and no tile
-/// identity of its own; retrieval rebinds them onto the caller's tiles. Two
-/// same-shaped tiles are distinct allocations, so identity must come from the
-/// caller's IR, never from whichever IR first populated the memo.
+/// A memoized plan stores placements in liveness order without tile
+/// identity; retrieval rebinds them onto the caller's own tiles.
 fn rebind(template: &ArenaPlan, live: &LivenessInfo) -> ArenaPlan {
     let mut plan = template.clone();
     for (placement, tile) in plan.placements.iter_mut().zip(live.iter()) {
@@ -514,8 +461,7 @@ impl Planner {
                 let plan = match mode {
                     ArenaMode::Regions => arena::regions(&live),
                     ArenaMode::ByteArena => {
-                        // The arena only wins when cross-stride reuse actually
-                        // fires; without it 16-byte rounding is a strict loss.
+                        // The arena only wins when cross-stride reuse fires.
                         if !caps.workgroup_alias
                             || !arena::all_packable(&live)
                             || !arena::mixes_stride_widths(&live)
@@ -596,10 +542,8 @@ impl ArenaPlanner for Planner {
     }
 }
 
-/// The minimal body a declared tile set implies: every tile written, one
-/// barrier, every tile written again. Each tile's live range then spans the
-/// barrier, so no two can share and the footprint is the geometry's
-/// simultaneous demand — which is exactly what `verify_launch` must admit against.
+/// The minimal body a tile set implies: every tile written, one barrier,
+/// every tile written again, so no two share: the simultaneous demand.
 pub fn synth_ir(tiles: &Tiles) -> KernelIr {
     let mut body: Vec<Stmt> = Vec::with_capacity(tiles.decls.len() * 2 + 1);
     let mut writes: Vec<Stmt> = Vec::with_capacity(tiles.decls.len());

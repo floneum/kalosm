@@ -7,10 +7,12 @@ use fusor_conformance::bench::{
 use web_time::{Duration, Instant};
 
 mod components;
+mod lm;
 use components::badge::{Badge, BadgeVariant};
 use components::button::{Button, ButtonVariant};
 use components::card::{Card, CardContent, CardDescription, CardHeader, CardTitle};
 use components::separator::Separator;
+use lm::ui::Train;
 
 const MAX_RENDERED_STEPS: usize = 80;
 const DETAIL_SWEEP_CONFIG: BenchmarkConfig = BenchmarkConfig::new(2, 10, 9);
@@ -32,6 +34,8 @@ enum Route {
     Benchmarks {},
     #[route("/benchmarks/:case")]
     BenchmarkDetail { case: String },
+    #[route("/train")]
+    Train {},
     #[route("/:..route")]
     NotFound { route: Vec<String> },
 }
@@ -48,9 +52,9 @@ fn App() -> Element {
     // a `#` means every URL asks the host for the one page that exists.
     #[cfg(target_arch = "wasm32")]
     use_hook(|| {
-        dioxus::history::provide_history_context(std::rc::Rc::new(
-            dioxus::web::HashHistory::new(true),
-        ))
+        dioxus::history::provide_history_context(std::rc::Rc::new(dioxus::web::HashHistory::new(
+            true,
+        )))
     });
 
     rsx! {
@@ -68,6 +72,11 @@ fn AppShell() -> Element {
     };
     let benchmarks_class = if matches!(route, Route::Benchmarks {} | Route::BenchmarkDetail { .. })
     {
+        "nav-link active"
+    } else {
+        "nav-link"
+    };
+    let train_class = if matches!(route, Route::Train {}) {
         "nav-link active"
     } else {
         "nav-link"
@@ -96,6 +105,11 @@ fn AppShell() -> Element {
                             class: benchmarks_class,
                             to: Route::Benchmarks {},
                             "Benchmarks"
+                        }
+                        Link {
+                            class: train_class,
+                            to: Route::Train {},
+                            "Train"
                         }
                     }
                 }

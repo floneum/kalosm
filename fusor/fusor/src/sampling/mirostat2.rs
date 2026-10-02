@@ -47,8 +47,7 @@ impl Mirostat2Sampler {
         let (token, next_mu) = self.draw(logits)?;
         // Resolve only the new mu. This forces the draw to be computed, but
         // nothing wider than one f32 crosses back.
-        self.mu = next_mu.to_vec_f32()?.first().copied().unwrap_or(self.mu);
-        self.step = self.step.wrapping_add(1);
+        self.advance(next_mu.to_vec_f32()?);
         Ok(token)
     }
 
@@ -56,14 +55,13 @@ impl Mirostat2Sampler {
     /// is the only host sync, so this is the form a browser can use.
     pub async fn sample_async(&mut self, logits: &Tensor) -> Result<GpuSampledToken> {
         let (token, next_mu) = self.draw(logits)?;
-        self.mu = next_mu
-            .to_vec_f32_async()
-            .await?
-            .first()
-            .copied()
-            .unwrap_or(self.mu);
-        self.step = self.step.wrapping_add(1);
+        self.advance(next_mu.to_vec_f32_async().await?);
         Ok(token)
+    }
+
+    fn advance(&mut self, next_mu: Vec<f32>) {
+        self.mu = next_mu.first().copied().unwrap_or(self.mu);
+        self.step = self.step.wrapping_add(1);
     }
 
     /// Build the draw and the next `mu` on the device; nothing is resolved.

@@ -1,5 +1,5 @@
-//! The KV cache. Sequence length is a `Dim::Sym` bound at dispatch, so growing
-//! the cache does not recompile anything and there are no length buckets.
+//! The KV cache. Sequence length and storage capacity are symbolic extents,
+//! so growing storage preserves the cached append graph.
 //!
 //! Two modes:
 //!
@@ -18,13 +18,12 @@
 //!   the uncommitted output, and [`TensorCache::detach`] commits for it.
 
 use fusor_ir::dtype::Dtype;
-use fusor_ir::ir::logical::{LeafKind, Logical};
 use fusor_ir::shape::{Dim, StrideSpec};
 use rustc_hash::FxHashMap;
 
 use crate::device::ok;
-use crate::graph::GraphRef;
 use crate::tensor::Dyn;
+use crate::tensor::construction::leaf_buffer_node;
 use crate::tensor::typed::Element;
 use crate::{Error, Result, Tensor};
 
@@ -39,15 +38,15 @@ struct FixedState {
     window: Option<u64>,
     /// Tokens appended so far (absolute count, not clamped to the window).
     len: u64,
-    /// The capacity leaf. Recreated only on growth.
-    store: Option<Dyn>,
+    /// The persistent capacity leaf and its readable prefix view.
+    store: Option<(Dyn, Dyn)>,
     /// This step's scatter output, until [`TensorCache::commit`] adopts it.
     out: Option<Dyn>,
-    /// The last append's `(chunk width, scatter output)`, retained past the
+    /// The last append's `(chunk width, scatter output, readable view)`, retained past the
     /// commit that cleared `out`. An append of the same width against the same
     /// store rebuilds exactly these nodes, so [`TensorCache::replay_append`]
-    /// re-arms them instead. Dropped on growth, which mints a new store leaf.
-    arm: Option<(u64, Dyn)>,
+    /// re-arms them instead.
+    arm: Option<(u64, Dyn, Dyn)>,
     /// `u32` write-index leaves, one per appended-chunk width, reused across
     /// steps with fresh bytes.
     idx: FxHashMap<u64, Dyn>,
@@ -57,6 +56,34 @@ struct FixedState {
     /// K and V views carry the same symbol — attention contracts their
     /// length axes against each other.
     sym_name: String,
+}
+
+impl FixedState {
+    /// The `u32` write slots of the next `added` tokens, as bytes: a ring
+    /// wraps at its window.
+    fn slots(&self, added: u64) -> Vec<u8> {
+        (0..added)
+            .flat_map(|i| {
+                let abs = self.len + i;
+                let slot = match self.window {
+                    Some(w) => abs % w,
+                    None => abs,
+                };
+                u32::try_from(slot)
+                    .expect("capacity fits a u32")
+                    .to_le_bytes()
+            })
+            .collect()
+    }
+
+    /// Count `added` more tokens and return the readable length.
+    fn advance(&mut self, added: u64) -> u64 {
+        self.len += added;
+        match self.window {
+            Some(w) => self.len.min(w),
+            None => self.len,
+        }
+    }
 }
 
 /// A growable append-only tensor cache along one axis.
@@ -85,22 +112,18 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
 
     /// A fixed-capacity cache: appends scatter into a persistent device
     /// buffer and the current value is a symbolic-length narrow. `capacity`
-    /// is the initial slot count; it grows by doubling (a new shape family)
-    /// when exceeded.
+    /// is the initial slot count; it grows by doubling when exceeded.
     pub fn fixed(axis: u32, capacity: u64) -> Self {
-        Self::fixed_named(axis, capacity, fresh_sym_name())
+        Self::fixed_named(axis, capacity, fresh_sym_name(), None)
     }
 
-    /// [`TensorCache::fixed`] with a caller-supplied length-symbol name;
-    /// two caches sharing one name share one symbol.
-    pub(crate) fn fixed_named(axis: u32, capacity: u64, sym_name: String) -> Self {
+    /// [`TensorCache::fixed`] with a caller-supplied length-symbol name (two
+    /// caches sharing one name share one symbol) and an optional ring window.
+    fn fixed_named(axis: u32, capacity: u64, sym_name: String, window: Option<u64>) -> Self {
         Self {
-            data: None,
-            axis,
-            len: Dim::Const(0),
             fixed: Some(FixedState {
                 capacity: capacity.max(1),
-                window: None,
+                window,
                 len: 0,
                 store: None,
                 out: None,
@@ -109,6 +132,7 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
                 sym: None,
                 sym_name,
             }),
+            ..Self::new(axis)
         }
     }
 
@@ -139,9 +163,11 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         let Some(f) = self.fixed.as_mut() else {
             return;
         };
-        if let (Some(store), Some(out)) = (f.store.as_ref(), f.out.take()) {
+        if let (Some((store, view)), Some(out)) = (f.store.as_ref(), f.out.take()) {
             ok("TensorCache::commit", store.adopt_buffer(&out));
             out.clear_device_buf();
+            view.clear_device_buf();
+            self.data = Some(Tensor::from_dyn(view.clone()));
         }
     }
 
@@ -267,17 +293,15 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
             .ok_or_else(|| Error::Shape("a fixed cache appends host-known chunks".into()))?;
         let f = self.fixed.as_mut().expect("checked by append");
 
-        // Capacity: a ring never grows; a plain cache doubles (new shape
-        // family) and migrates the committed tokens on device.
+        // A ring never grows; a plain cache doubles and migrates its prefix.
         if let Some(w) = f.window {
             if added > w {
                 return Err(Error::Shape(format!(
                     "an append of {added} exceeds the {w}-token window"
                 )));
             }
-        } else if f.len + added > f.capacity {
-            let needed = f.len + added;
-            grow(f, &graph, value, axis, needed)?;
+        } else {
+            reserve(std::iter::once((&mut *f, axis)), added)?;
         }
 
         // The store leaf, minted on first use. No host bytes: wgpu (and the
@@ -285,10 +309,18 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         // ever read.
         if f.store.is_none() {
             let mut shape = value.shape().to_vec();
-            shape[axis] = Dim::Const(f.capacity);
-            let store = external_leaf(&graph, &shape, value.dtype())?;
-            f.sym = Some(graph.named_sym(&f.sym_name));
-            f.store = Some(store);
+            shape[axis] = if f.window.is_some() {
+                Dim::Const(f.capacity)
+            } else {
+                let capacity = graph.named_sym(&format!("{}:capacity", f.sym_name));
+                graph.bind_dim(capacity, f.capacity);
+                Dim::Sym(capacity)
+            };
+            let store = leaf_buffer_node(&graph, value.dtype(), &shape)?;
+            let sym = graph.named_sym(&f.sym_name);
+            let view = readable(&store, axis, Dim::Sym(sym))?;
+            f.sym = Some(sym);
+            f.store = Some((store, view));
         }
         let sym = f.sym.expect("minted with the store");
         // An append before the last one's commit writes through that output,
@@ -297,54 +329,24 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         let store = f
             .out
             .clone()
-            .unwrap_or_else(|| f.store.clone().expect("minted above"));
+            .unwrap_or_else(|| f.store.as_ref().expect("minted above").0.clone());
 
-        // Write positions for this chunk.
-        let positions: Vec<u32> = (0..added)
-            .map(|i| {
-                let abs = f.len + i;
-                let slot = match f.window {
-                    Some(w) => abs % w,
-                    None => abs,
-                };
-                u32::try_from(slot).expect("capacity fits a u32")
-            })
-            .collect();
         let idx = match f.idx.get(&added) {
             Some(t) => t.clone(),
             None => {
-                let t = external_leaf(&graph, &[Dim::Const(added)], Dtype::U32)?;
+                let t = leaf_buffer_node(&graph, Dtype::U32, &[Dim::Const(added)])?;
                 f.idx.insert(added, t.clone());
                 t
             }
         };
-        idx.set_bytes(positions.iter().flat_map(|v| v.to_le_bytes()).collect())?;
+        idx.set_bytes(f.slots(added))?;
 
         let out = store.scatter_set(axis, &idx, value, true)?;
-        f.len += added;
-        let total = match f.window {
-            Some(w) => f.len.min(w),
-            None => f.len,
-        };
-        graph.bind_dim(sym, total);
+        graph.bind_dim(sym, f.advance(added));
 
-        // The readable cache: `[.., total, ..]` of the scatter output.
-        let specs: Vec<StrideSpec> = out
-            .shape()
-            .iter()
-            .copied()
-            .enumerate()
-            .map(|(i, d)| {
-                if i == axis {
-                    StrideSpec::dim(i as u32, Dim::Sym(sym))
-                } else {
-                    StrideSpec::dim(i as u32, d)
-                }
-            })
-            .collect();
-        let view = out.restride(&specs)?;
+        let view = readable(&out, axis, Dim::Sym(sym))?;
 
-        f.arm = Some((added, out.clone()));
+        f.arm = Some((added, out.clone(), view.clone()));
         f.out = Some(out);
         self.len = Dim::Sym(sym);
         self.data = Some(Tensor::try_from_dyn(view.clone())?);
@@ -352,16 +354,16 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
     }
 
     /// Whether [`TensorCache::replay_append`] would rebuild the last append's
-    /// nodes exactly: same store, same index leaf, same chunk width, and no
-    /// growth in between.
+    /// nodes exactly: same store, same index leaf, same chunk width, and
+    /// enough storage for the next chunk.
     pub fn can_replay(&self, added: u64) -> bool {
         let Some(f) = self.fixed.as_ref() else {
             return false;
         };
-        if self.data.is_none() || f.store.is_none() || f.sym.is_none() {
+        if f.store.is_none() || f.sym.is_none() {
             return false;
         }
-        if f.arm.as_ref().is_none_or(|(w, _)| *w != added) {
+        if f.arm.as_ref().is_none_or(|(w, _, _)| *w != added) {
             return false;
         }
         if !f.idx.contains_key(&added) {
@@ -381,35 +383,49 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         if !self.can_replay(added) {
             return Err(Error::Shape(
                 "replay_append needs a fixed cache whose last append had the same width and \
-                 whose store has not grown since; check can_replay first"
+                 whose storage has enough room; check can_replay first"
                     .into(),
             ));
         }
         let f = self.fixed.as_mut().expect("checked by can_replay");
-        let (_, out) = f.arm.clone().expect("checked by can_replay");
+        let (_, out, view) = f.arm.clone().expect("checked by can_replay");
         let sym = f.sym.expect("checked by can_replay");
         let idx = f.idx.get(&added).cloned().expect("checked by can_replay");
 
-        let positions: Vec<u32> = (0..added)
-            .map(|i| {
-                let abs = f.len + i;
-                let slot = match f.window {
-                    Some(w) => abs % w,
-                    None => abs,
-                };
-                u32::try_from(slot).expect("capacity fits a u32")
-            })
-            .collect();
-        idx.set_bytes(positions.iter().flat_map(|v| v.to_le_bytes()).collect())?;
-
-        f.len += added;
-        let total = match f.window {
-            Some(w) => f.len.min(w),
-            None => f.len,
-        };
-        out.graph().bind_dim(sym, total);
+        idx.set_bytes(f.slots(added))?;
+        out.graph().bind_dim(sym, f.advance(added));
         f.out = Some(out);
         self.len = Dim::Sym(sym);
+        view.clear_device_buf();
+        self.data = Some(Tensor::try_from_dyn(view)?);
+        Ok(())
+    }
+
+    /// Keep the first `len` entries of a committed fixed cache, retaining its
+    /// storage and append arm. Ring caches cannot discard an absolute suffix.
+    pub fn truncate(&mut self, len: u64) -> Result<()> {
+        let f = self
+            .fixed
+            .as_mut()
+            .ok_or_else(|| Error::Shape("truncate requires a fixed cache".into()))?;
+        if f.window.is_some() || f.out.is_some() {
+            return Err(Error::Shape(
+                "truncate requires a committed, non-ring cache".into(),
+            ));
+        }
+        if len > f.len {
+            return Err(Error::Shape("truncate cannot extend a cache".into()));
+        }
+        f.len = len;
+        if let Some((_, view)) = &f.store {
+            let sym = f.sym.expect("store has a length symbol");
+            view.graph().bind_dim(sym, len);
+            view.clear_device_buf();
+        }
+        if len == 0 {
+            self.data = None;
+            self.len = Dim::Const(0);
+        }
         Ok(())
     }
 
@@ -454,9 +470,7 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
     }
 }
 
-/// A process-unique name for a cache's length symbol. Growth keeps the
-/// name: the family changes through the store leaf's shape, and reusing the
-/// symbol keeps every dependent binding coherent.
+/// A process-unique name for a cache's length and capacity symbols.
 fn fresh_sym_name() -> String {
     static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
     format!(
@@ -465,55 +479,103 @@ fn fresh_sym_name() -> String {
     )
 }
 
-/// An external leaf minted directly on the graph handle (the `Graph` facade
-/// is not reachable from a tensor).
-fn external_leaf(graph: &GraphRef, shape: &[Dim], dtype: Dtype) -> Result<Dyn> {
-    let id = graph.add_logical(Logical::Leaf(LeafKind::Buffer {
-        name: graph.fresh_buffer_id(),
-        dtype,
-        shape: shape.iter().copied().collect(),
-    }))?;
-    Ok(graph.tensor(id))
+fn readable(value: &Dyn, axis: usize, len: Dim) -> Result<Dyn> {
+    let specs: Vec<_> = value
+        .shape()
+        .iter()
+        .enumerate()
+        .map(|(i, &dim)| StrideSpec::dim(i as u32, if i == axis { len } else { dim }))
+        .collect();
+    value.restride(&specs)
 }
 
-/// Double the store until `needed` fits and migrate the committed tokens on
-/// device: one `slice_assign` resolve, then the new leaf adopts its buffer.
-/// A new capacity is a new leaf shape and therefore a new shape family.
-fn grow(f: &mut FixedState, graph: &GraphRef, like: &Dyn, axis: usize, needed: u64) -> Result<()> {
-    let mut capacity = f.capacity.max(1);
-    while capacity < needed {
-        capacity *= 2;
+fn reserve<'a>(
+    states: impl IntoIterator<Item = (&'a mut FixedState, usize)>,
+    additional: u64,
+) -> Result<()> {
+    struct Growth<'a> {
+        state: &'a mut FixedState,
+        axis: usize,
+        capacity: u64,
+        moved: Option<Dyn>,
     }
-    if capacity == f.capacity && f.store.is_some() {
-        return Ok(());
-    }
-    let old = f.store.take();
-    let mut shape = like.shape().to_vec();
-    shape[axis] = Dim::Const(capacity);
-    let store = external_leaf(graph, &shape, like.dtype())?;
-    if let (Some(old_store), len @ 1..) = (old, f.len) {
-        let mut ranges = Vec::with_capacity(shape.len());
-        for (i, d) in shape.iter().enumerate() {
-            let extent = if i == axis {
-                len
-            } else {
-                d.as_const()
-                    .ok_or_else(|| Error::Shape("a cache store has constant extents".into()))?
-            };
-            ranges.push(0..extent as usize);
+    let mut growth = Vec::new();
+    for (state, axis) in states {
+        if state.window.is_some() {
+            continue;
         }
-        let kept = old_store.narrow(axis, 0, len as usize)?;
-        let moved = store.slice_assign(&ranges, &kept)?;
-        graph.session().resolve(std::slice::from_ref(&moved))?;
-        store.adopt_buffer(&moved)?;
-        moved.clear_device_buf();
+        let needed = state
+            .len
+            .checked_add(additional)
+            .ok_or_else(|| Error::Shape("cache length overflows u64".into()))?;
+        if needed <= state.capacity {
+            continue;
+        }
+        let mut capacity = state.capacity;
+        while capacity < needed {
+            capacity = capacity
+                .checked_mul(2)
+                .ok_or_else(|| Error::Shape("cache capacity overflows u64".into()))?;
+        }
+        let moved = match state
+            .out
+            .as_ref()
+            .or_else(|| state.store.as_ref().map(|(store, _)| store))
+        {
+            Some(source) if state.len != 0 => {
+                let graph = source.graph();
+                let mut shape = source.shape().to_vec();
+                shape[axis] = Dim::Const(capacity);
+                let store = leaf_buffer_node(graph, source.dtype(), &shape)?;
+                let kept = source.narrow(axis, 0, state.len as usize)?;
+                let idx = Dyn::arange(graph, Dtype::U32, 0., state.len as f64)?;
+                Some(store.scatter_set(axis, &idx, &kept, true)?)
+            }
+            _ => None,
+        };
+        growth.push(Growth {
+            state,
+            axis,
+            capacity,
+            moved,
+        });
     }
-    f.sym = Some(graph.named_sym(&f.sym_name));
-    f.capacity = capacity;
-    f.store = Some(store);
-    f.out = None;
-    f.arm = None;
-    f.idx.clear();
+    let roots: Vec<Dyn> = growth.iter().filter_map(|g| g.moved.clone()).collect();
+    if let Some(root) = roots.first() {
+        root.graph().session().resolve(&roots)?;
+    }
+    for Growth {
+        state,
+        axis,
+        capacity,
+        moved,
+    } in growth
+    {
+        state.capacity = capacity;
+        if let Some((store, view)) = &state.store {
+            if let Some(moved) = moved {
+                let buffer = moved.graph().device_buf(moved.id()).ok_or_else(|| {
+                    Error::Plan("cache migration did not produce a buffer".into())
+                })?;
+                store
+                    .graph()
+                    .set_device_buf_class(&[store.id()], &buffer, None);
+                moved.clear_device_buf();
+            } else {
+                store.clear_device_buf();
+            }
+            let Dim::Sym(capacity_sym) = store.dim(axis) else {
+                unreachable!("growable stores have symbolic capacity")
+            };
+            store.graph().bind_dim(capacity_sym, capacity);
+            view.clear_device_buf();
+        }
+        state.out = None;
+        if let Some((_, out, view)) = &state.arm {
+            out.clear_device_buf();
+            view.clear_device_buf();
+        }
+    }
     Ok(())
 }
 
@@ -551,25 +613,20 @@ impl<const R: usize, T: Element> KvCache<R, T> {
     /// Both halves share one length symbol: attention contracts K's and V's
     /// length axes against each other.
     pub fn with_capacity(axis: u32, capacity: u64) -> Self {
-        let name = fresh_sym_name();
-        Self {
-            k: TensorCache::fixed_named(axis, capacity, name.clone()),
-            v: TensorCache::fixed_named(axis, capacity, name),
-        }
+        Self::fixed_pair(axis, capacity, None)
     }
 
     /// Ring of the newest `window` tokens.
     pub fn windowed(axis: u32, window: u64) -> Self {
+        Self::fixed_pair(axis, window.max(1), Some(window.max(1)))
+    }
+
+    fn fixed_pair(axis: u32, capacity: u64, window: Option<u64>) -> Self {
         let name = fresh_sym_name();
-        let mut k = TensorCache::fixed_named(axis, window.max(1), name.clone());
-        let mut v = TensorCache::fixed_named(axis, window.max(1), name);
-        if let Some(f) = k.fixed.as_mut() {
-            f.window = Some(window.max(1));
+        Self {
+            k: TensorCache::fixed_named(axis, capacity, name.clone(), window),
+            v: TensorCache::fixed_named(axis, capacity, name, window),
         }
-        if let Some(f) = v.fixed.as_mut() {
-            f.window = Some(window.max(1));
-        }
-        Self { k, v }
     }
 
     /// Whether appends write into preallocated storage.
@@ -582,6 +639,37 @@ impl<const R: usize, T: Element> KvCache<R, T> {
         self.k.is_ring()
     }
 
+    /// Reserve space for `additional` tokens in every fixed cache, migrating
+    /// existing values in one resolve. Empty stores remain unallocated and
+    /// ring windows retain their configured capacity.
+    pub fn reserve_all(caches: &mut [Self], additional: u64) -> Result<()> {
+        reserve(
+            caches
+                .iter_mut()
+                .flat_map(|cache| [&mut cache.k, &mut cache.v])
+                .filter_map(|cache| {
+                    cache
+                        .fixed
+                        .as_mut()
+                        .map(|state| (state, cache.axis as usize))
+                }),
+            additional,
+        )?;
+        for cache in caches
+            .iter_mut()
+            .flat_map(|cache| [&mut cache.k, &mut cache.v])
+        {
+            if let Some(state) = &cache.fixed
+                && state.out.is_none()
+                && cache.data.is_some()
+                && let Some((_, view)) = &state.store
+            {
+                cache.data = Some(Tensor::try_from_dyn(view.clone())?);
+            }
+        }
+        Ok(())
+    }
+
     /// Push this step's scatter outputs into a resolve batch.
     pub fn pending_into(&self, batch: &mut Vec<Dyn>) {
         if let Some(k) = self.k.pending() {
@@ -592,17 +680,20 @@ impl<const R: usize, T: Element> KvCache<R, T> {
         }
     }
 
-    /// Adopt both halves' resolved outputs. Call once per step, after the
-    /// resolve that included [`KvCache::pending_into`]'s tensors.
-    #[track_caller]
-    pub fn commit(&mut self) {
-        self.k.commit();
-        self.v.commit();
-    }
-
     /// Append one step's keys and values; returns the full cached pair.
     #[track_caller]
     pub fn append(&mut self, k: &Tensor<R, T>, v: &Tensor<R, T>) -> (Tensor<R, T>, Tensor<R, T>) {
+        if let Some(added) = k
+            .as_dyn()
+            .shape()
+            .get(self.k.axis as usize)
+            .and_then(|d| d.as_const())
+        {
+            ok(
+                "KvCache::append",
+                Self::reserve_all(std::slice::from_mut(self), added),
+            );
+        }
         (self.k.append(k), self.v.append(v))
     }
 
@@ -611,25 +702,10 @@ impl<const R: usize, T: Element> KvCache<R, T> {
         self.k.keep_last(len).zip(self.v.keep_last(len))
     }
 
-    /// Replace both cached values with detached leaves after they resolve.
-    pub fn detach(&mut self) {
-        self.k.detach();
-        self.v.detach();
-    }
-
     /// Whether [`KvCache::replay_append`] would rebuild the last append's nodes
     /// exactly. See [`TensorCache::can_replay`].
     pub fn can_replay(&self, added: u64) -> bool {
         self.k.can_replay(added) && self.v.can_replay(added)
-    }
-
-    /// Advance both halves without touching the graph. See
-    /// [`TensorCache::replay_append`]; the caller must have checked
-    /// [`KvCache::can_replay`], which covers both halves so neither can half-
-    /// advance.
-    pub fn replay_append(&mut self, added: u64) -> Result<()> {
-        self.k.replay_append(added)?;
-        self.v.replay_append(added)
     }
 
     /// The cached keys, or `None` before the first append.
@@ -652,10 +728,230 @@ impl<const R: usize, T: Element> KvCache<R, T> {
     pub fn is_empty(&self) -> bool {
         self.k.is_empty()
     }
+}
 
+/// [`KvCache`] methods that apply the [`TensorCache`] one to both halves,
+/// keys first; a fallible one stops at the first error.
+macro_rules! both_halves {
+    ($($(#[$m:meta])* fn $name:ident($($a:ident: $t:ty),*) $(-> $ret:ty)?;)*) => {
+        impl<const R: usize, T: Element> KvCache<R, T> {$(
+            $(#[$m])*
+            pub fn $name(&mut self, $($a: $t),*) $(-> $ret)? {
+                both_halves!(@call self $name ($($a),*) $($ret)?)
+            }
+        )*}
+    };
+    (@call $s:ident $name:ident ($($a:ident),*)) => {{
+        $s.k.$name($($a),*);
+        $s.v.$name($($a),*);
+    }};
+    (@call $s:ident $name:ident ($($a:ident),*) $ret:ty) => {{
+        $s.k.$name($($a),*)?;
+        $s.v.$name($($a),*)
+    }};
+}
+
+both_halves! {
+    /// Adopt both halves' resolved outputs. Call once per step, after the
+    /// resolve that included [`KvCache::pending_into`]'s tensors.
+    #[track_caller]
+    fn commit();
+    /// Keep the first `len` entries of both committed fixed caches.
+    fn truncate(len: u64) -> Result<()>;
+    /// Replace both cached values with detached leaves after they resolve.
+    fn detach();
+    /// Advance both halves without touching the graph. See
+    /// [`TensorCache::replay_append`]; the caller must have checked
+    /// [`KvCache::can_replay`], which covers both halves so neither can
+    /// half-advance.
+    fn replay_append(added: u64) -> Result<()>;
     /// Clear both halves while retaining reusable fixed buffers.
-    pub fn reset(&mut self) {
-        self.k.reset();
-        self.v.reset();
+    fn reset();
+}
+
+#[cfg(all(test, feature = "cpu"))]
+mod tests {
+    use super::*;
+    use crate::Device;
+
+    fn device() -> Device {
+        let session = crate::Session::new(crate::session::test_backend()).unwrap();
+        Device::of_graph(crate::Graph::new(&session).handle())
+    }
+
+    fn commit(device: &Device, caches: &mut [KvCache<3>]) {
+        let mut roots = Vec::new();
+        for cache in &*caches {
+            cache.pending_into(&mut roots);
+        }
+        device.session().resolve(&roots).unwrap();
+        for cache in caches {
+            cache.commit();
+        }
+    }
+
+    fn check(caches: &[KvCache<3>], total: usize) {
+        for (layer, cache) in caches.iter().enumerate() {
+            let expected: Vec<f32> = (0..2)
+                .flat_map(|row| {
+                    (0..total).flat_map(move |step| {
+                        (0..2).map(move |col| {
+                            (layer * 100 + step.min(2) * 10 + row * 2 + col + 1) as f32
+                        })
+                    })
+                })
+                .collect();
+            assert_eq!(cache.k().unwrap().narrow(1, 0, total).to_flat(), expected);
+            assert_eq!(
+                cache.v().unwrap().narrow(1, 0, total).to_flat(),
+                expected.iter().map(|x| x * 2.).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn growing_fixed_caches_preserves_pending_appends() {
+        let nodes = |caches: &[KvCache<3>]| {
+            caches
+                .iter()
+                .flat_map(|cache| [&cache.k, &cache.v])
+                .map(|cache| {
+                    let state = cache.fixed.as_ref().unwrap();
+                    (
+                        state.store.as_ref().unwrap().0.id(),
+                        state.arm.as_ref().map(|(_, out, _)| out.id()),
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        for reserved in [false, true] {
+            let device = device();
+            let capacity = if reserved { 1 } else { 2 };
+            let mut caches = [
+                KvCache::<3>::with_capacity(1, capacity),
+                KvCache::with_capacity(1, capacity),
+            ];
+            if reserved {
+                KvCache::reserve_all(&mut caches, 2).unwrap();
+                for cache in &caches {
+                    assert!(cache.k.fixed.as_ref().unwrap().store.is_none());
+                    assert!(cache.v.fixed.as_ref().unwrap().store.is_none());
+                }
+            }
+            let total = if reserved { 8 } else { 4 };
+            for step in 0..total {
+                for (layer, cache) in caches.iter_mut().enumerate() {
+                    if step >= 3 {
+                        cache.replay_append(1).unwrap();
+                    } else {
+                        let base = (layer * 100 + step * 10) as f32;
+                        let k = Tensor::from_slice(
+                            &device,
+                            [2, 1, 2],
+                            &[base + 1., base + 2., base + 3., base + 4.],
+                        );
+                        cache.append(&k, &k.mul_scalar(2.));
+                    }
+                }
+                if step == 1 {
+                    if reserved {
+                        let before = nodes(&caches);
+                        KvCache::reserve_all(&mut caches, 6).unwrap();
+                        assert_eq!(nodes(&caches), before);
+                        assert!(caches.iter().all(|cache| cache.can_replay(1)));
+                        check(&caches, 2);
+                    }
+                } else {
+                    commit(&device, &mut caches);
+                    if step == 0 && reserved {
+                        assert!(caches.iter().all(|cache| cache.can_replay(1)));
+                        let before = nodes(&caches);
+                        KvCache::reserve_all(&mut caches, 3).unwrap();
+                        assert_eq!(nodes(&caches), before);
+                        assert!(caches.iter().all(|cache| cache.can_replay(1)));
+                        check(&caches, 1);
+                    }
+                }
+            }
+            check(&caches, total);
+        }
+    }
+
+    #[test]
+    fn reserving_a_ring_preserves_its_window() {
+        let device = device();
+        let mut caches = [KvCache::<3>::windowed(1, 2)];
+        for step in 0..3 {
+            KvCache::reserve_all(&mut caches, 100).unwrap();
+            let value = Tensor::from_slice(&device, [2, 1, 1], &[step as f32, (step + 10) as f32]);
+            caches[0].append(&value, &value);
+            commit(&device, &mut caches);
+        }
+        assert_eq!(
+            caches[0].k().unwrap().narrow(1, 0, 2).to_flat(),
+            [2., 1., 12., 11.]
+        );
+        assert_eq!(
+            caches[0].v().unwrap().narrow(1, 0, 2).to_flat(),
+            [2., 1., 12., 11.]
+        );
+    }
+
+    #[test]
+    fn truncating_a_fixed_cache_replays_from_the_retained_prefix() {
+        let device = device();
+        let mut caches = [KvCache::<3>::with_capacity(1, 32)];
+        let input = Tensor::<3>::leaf(&device, [Dim::Const(2), Dim::Const(16), Dim::Const(2)]);
+        let values = input.mul_scalar(2.);
+        let read = |tensor: &Tensor<3>| {
+            tensor
+                .as_dyn()
+                .to_bytes()
+                .unwrap()
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .map(|bytes| f32::from_le_bytes(*bytes))
+                .collect::<Vec<_>>()
+        };
+        let mut expected = [Vec::new(), Vec::new()];
+        for (step, keep) in [5, 13].into_iter().enumerate() {
+            let data: Vec<f32> = (0..64).map(|i| (step * 100 + i) as f32).collect();
+            input.set_elements(&data);
+            if step == 0 {
+                caches[0].append(&input, &values);
+            } else {
+                caches[0].replay_append(16).unwrap();
+            }
+            assert!(caches[0].truncate(keep).is_err());
+            commit(&device, &mut caches);
+            read(caches[0].k().unwrap());
+            read(caches[0].v().unwrap());
+            caches[0].truncate(keep).unwrap();
+            for (row, prefix) in expected.iter_mut().enumerate() {
+                prefix.extend_from_slice(&data[row * 32..(row + 1) * 32]);
+                prefix.truncate(keep as usize * 2);
+            }
+            let expected: Vec<f32> = expected.iter().flatten().copied().collect();
+            assert_eq!(read(caches[0].k().unwrap()), expected);
+            assert_eq!(
+                read(caches[0].v().unwrap()),
+                expected.iter().map(|x| x * 2.).collect::<Vec<_>>()
+            );
+            assert!(caches[0].can_replay(16));
+        }
+        caches[0].truncate(0).unwrap();
+        assert!(caches[0].is_empty());
+        KvCache::reserve_all(&mut caches, 64).unwrap();
+        caches[0].replay_append(16).unwrap();
+        commit(&device, &mut caches);
+        caches[0].truncate(3).unwrap();
+        assert_eq!(
+            read(caches[0].k().unwrap()),
+            (100..106)
+                .chain(132..138)
+                .map(|x| x as f32)
+                .collect::<Vec<_>>()
+        );
     }
 }

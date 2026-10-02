@@ -1,22 +1,9 @@
-//! Workgroup arena packing, in both modes.
-//!
-//! - [`ArenaMode::Regions`] (portable): tiles pack into per-stride-class typed
-//!   arrays. A region holding two element types is emitted with a
-//!   class-neutral u32 type and every access bitcasts the *value*, never the
-//!   address — legal only for 32-bit scalars, so `f16`/`bf16` tiles never join
-//!   a 4-byte region and no sub-word read-modify-write hazard exists.
-//! - [`ArenaMode::ByteArena`] (needs `caps.workgroup_alias`): one byte arena,
-//!   tiles at byte offsets via interval strip packing, so tiles of *different*
-//!   strides (f16 staging next to f32 accumulators) reuse the same bytes.
-//!
-//! In **both** modes a [`Placement`]'s `[byte_offset, byte_offset + byte_len)`
-//! means "these bytes": in `Regions` every tile of region `k` reports region
-//! `k`'s base and full length, so [`crate::verify_arena`] needs no synthetic
-//! offsets and one overlap test covers both modes.
-//!
-//! Sharing legality is [`LivenessInfo::can_follow_tiles`]. Both packers check
-//! **every** prior occupant, not just the most recent: the loop-phase arm does
-//! not compose transitively.
+//! Workgroup arena packing. [`ArenaMode::Regions`] packs tiles into typed
+//! per-stride-class arrays (mixed types bitcast values, 32-bit scalars only);
+//! [`ArenaMode::ByteArena`] (needs `workgroup_alias`) strip-packs byte offsets
+//! so different strides share bytes. In both, a [`Placement`]'s byte interval
+//! means "these bytes". Both packers check every prior occupant against
+//! [`LivenessInfo::can_follow_tiles`]: the loop-phase arm is not transitive.
 
 use fusor_ir::Result;
 use fusor_ir::device::Caps;
@@ -26,9 +13,7 @@ use smallvec::SmallVec;
 
 use crate::liveness::{LivenessInfo, TileLiveness};
 
-/// A stride-compatibility class. `lanes` is part of the key so vec3 (12 B of
-/// data, 16 B of stride) never mixes with vec4 and value bitcasts stay
-/// per-component.
+/// A stride-compatibility class; `lanes` keeps vec3 apart from vec4.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct StrideClass {
     pub stride: u32,
@@ -53,10 +38,8 @@ pub(crate) fn scalar_of(element: ElementType) -> Option<ScalarElement> {
     }
 }
 
-/// Whether tiles of elements `a` and `b` may occupy one typed region: equal
-/// types always; otherwise the same stride class with a value-level bitcast
-/// between them. Only 4-byte scalars qualify, so a 2-byte `f16`/`bf16` tile
-/// never joins a 4-byte region.
+/// Whether tiles of `a` and `b` may share a typed region: equal types, or
+/// 4-byte scalars of one stride class.
 pub(crate) fn bitcast_compatible(a: ElementType, b: ElementType) -> bool {
     if a == b {
         return true;
@@ -69,8 +52,7 @@ pub(crate) fn bitcast_compatible(a: ElementType, b: ElementType) -> bool {
         && scalar_of(b).is_some_and(|s| s.byte_size() == 4)
 }
 
-/// The canonical emission type for a heterogeneous region of this class: the
-/// u32-shaped type.
+/// The u32-shaped emission type for a heterogeneous region.
 pub(crate) fn neutral(class: StrideClass) -> ElementType {
     if class.lanes == 1 {
         ElementType::Scalar(ScalarElement::U32)
@@ -93,8 +75,7 @@ fn element_stride(element: ElementType) -> u32 {
         .unwrap_or_else(|| element.byte_size() as u32)
 }
 
-/// Whether the kernel mixes array stride widths. Without that, the byte
-/// arena's 16-byte rounding makes it a strict loss.
+/// Whether the kernel mixes array strides; else the byte arena loses.
 pub(crate) fn mixes_stride_widths(live: &LivenessInfo) -> bool {
     let mut strides: SmallVec<[u32; 4]> = SmallVec::new();
     for tile in live.iter() {
@@ -123,16 +104,13 @@ impl Region {
     }
 }
 
-/// One allocation per stride class, tiles sharing a region when their live
-/// ranges are barrier-separated. The universal fallback: needs no capability
-/// and no aliasing proof.
+/// One allocation per stride class, tiles sharing a region when
+/// barrier-separated. Needs no capability.
 pub(crate) fn regions(live: &LivenessInfo) -> ArenaPlan {
     let mut regions: Vec<Region> = Vec::new();
-    // Check every occupant per region: the loop-phase arm does not compose —
-    // A->B and B->C do not imply the C->A wrap is covered.
+    // Check every occupant: the loop-phase arm does not compose.
     let mut occupants: Vec<Vec<usize>> = Vec::new();
-    // A coop-consumed occupant pins the region's type: widening the canonical
-    // would retype the raw pointer its cooperative load/store sees.
+    // A coop-consumed occupant pins the region's type.
     let mut region_coop: Vec<bool> = Vec::new();
     let mut assigned: Vec<usize> = Vec::with_capacity(live.order.len());
 
@@ -174,8 +152,7 @@ pub(crate) fn regions(live: &LivenessInfo) -> ArenaPlan {
         assigned.push(index);
     }
 
-    // Region k's base is the sum of the byte lengths of regions 0..k, so
-    // "byte intervals overlap" means "same bytes" in Regions mode too.
+    // Region k's base is the sum of earlier lengths.
     let mut bases: Vec<u32> = Vec::with_capacity(regions.len());
     let mut base = 0u32;
     for region in &regions {
@@ -209,57 +186,34 @@ pub(crate) fn byte_arena(live: &LivenessInfo) -> Option<ArenaPlan> {
     if !all_packable(live) {
         return None;
     }
-    struct Placed {
-        start: u32,
-        end: u32,
-        position: usize,
-    }
-    let mut placed: Vec<Placed> = Vec::new();
-    let mut placements: SmallVec<[Placement; 8]> = SmallVec::new();
-    let mut arena_end = 0u32;
-
-    for (position, &key) in live.order.iter().enumerate() {
-        let tile = &live.tiles[&key];
-        // Stride doubles as alignment: every supported element's array stride
-        // is a power of two at least as large as its alignment (vec3 is
-        // already padded to the vec4 stride).
-        let align = element_stride(tile.element);
-        let extent = tile_bytes(tile);
-        let align_up = |value: u32| value.div_ceil(align.max(1)) * align.max(1);
-        let mut candidates: Vec<u32> = std::iter::once(0)
-            .chain(placed.iter().map(|entry| align_up(entry.end)))
-            .collect();
-        candidates.sort_unstable();
-        candidates.dedup();
-        let offset = candidates
-            .into_iter()
-            .find(|&offset| {
-                // Full history, not just the most recent occupant.
-                placed
-                    .iter()
-                    .filter(|entry| entry.start < offset + extent && entry.end > offset)
-                    .all(|entry| {
-                        live.can_follow_tiles(&live.tiles[&live.order[entry.position]], tile)
-                    })
-            })
-            .expect("the offset past every placement always fits");
-        let end = offset + extent;
-        placed.push(Placed {
-            start: offset,
-            end,
-            position,
-        });
-        arena_end = arena_end.max(end);
-        placements.push(Placement {
+    let requests: Vec<_> = live
+        .iter()
+        .map(|tile| {
+            (
+                u64::from(tile_bytes(tile)),
+                u64::from(element_stride(tile.element)),
+            )
+        })
+        .collect();
+    let (extent, offsets) =
+        fusor_ir::packing::pack_interference(&requests, fusor_ir::packing::Fit::First, |a, b| {
+            !live.can_follow_tiles(&live.tiles[&live.order[b]], &live.tiles[&live.order[a]])
+        })
+        .ok()?;
+    let total_bytes = u32::try_from(extent.div_ceil(16) * 16).ok()?;
+    let placements = live
+        .iter()
+        .zip(offsets)
+        .map(|(tile, offset)| Placement {
             tile: tile.tile.clone(),
-            byte_offset: offset,
-            byte_len: extent,
-        });
-    }
+            byte_offset: offset as u32,
+            byte_len: tile_bytes(tile),
+        })
+        .collect();
 
     Some(ArenaPlan {
         mode: ArenaMode::ByteArena,
-        total_bytes: arena_end.div_ceil(16) * 16,
+        total_bytes,
         placements,
         barriers_inserted: SmallVec::new(),
     })

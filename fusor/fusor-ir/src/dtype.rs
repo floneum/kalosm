@@ -11,8 +11,7 @@ pub enum Dtype {
     BF16,
     U32,
     I32,
-    /// A block-quantized weight format. Only ever the dtype of a
-    /// `LeafKind::Quantized` leaf or an `Logical::Dequant` input.
+    /// A block-quantized weight format: a quantized leaf or a `Dequant` input.
     Q(QFmt),
 }
 
@@ -48,8 +47,7 @@ impl Dtype {
         matches!(self, Self::Q(_))
     }
 
-    /// What a storage-only narrow float widens to for compute — the type
-    /// side of the `widen-compute` lowering rule.
+    /// What a storage-only narrow float widens to for compute.
     pub const fn compute_dtype(self) -> Self {
         match self {
             Self::F16 | Self::BF16 => Self::F32,
@@ -58,8 +56,7 @@ impl Dtype {
     }
 }
 
-/// The six GGUF block formats fusor ingests end to end, on both backends.
-/// Adding one is a `BlockSpec` row plus a `BlockProgram`, never a kernel.
+/// The GGUF block formats fusor ingests on both backends.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 #[allow(non_camel_case_types)]
 pub enum QFmt {
@@ -107,17 +104,14 @@ impl QFmt {
     }
 }
 
-/// On-device byte layout of a quantized matrix. Both are legal inputs
-/// *everywhere*; moving between them is the priced `qrepack` rewrite, not a
-/// decision frozen at upload.
+/// On-device byte layout of a quantized matrix; both are legal everywhere.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum QLayout {
     Native,
     F32Scales,
 }
 
-/// Rounding mode carried on `ScalarKind::Round`. `HalfAwayFromZero` is what
-/// MSQ1 export idempotence depends on.
+/// Rounding mode carried on `ScalarKind::Round`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum RoundMode {
     HalfToEven,
@@ -127,27 +121,20 @@ pub enum RoundMode {
     Trunc,
 }
 
-/// What a value's numerics permit. **Monotone**: no rewrite may lower
-/// `min_accum_bits` or `min_operand_bits`, nor enable `reassoc`/`contract`
-/// where a value forbids it. This makes `fold_split` sound, survives to WGSL
-/// as an emitter obligation against Metal fast math, and stops an epilogue
-/// fusion from narrowing a cooperative kernel's f32 accumulator.
+/// What a value's numerics permit. Monotone: no rewrite may lower the bit
+/// floors or enable `reassoc`/`contract` where a value forbids it.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct NumericContract {
     pub min_accum_bits: u8,
-    /// Narrowest **operand** a rewrite may substitute for this value's
-    /// inputs, in bits. `32` — the default — means the operands stay f32.
-    ///
-    /// A separate permission from `reassoc`/`contract`: re-encoding an
-    /// operand onto a coarser grid is not exact-to-rounding.
+    /// Narrowest operand a rewrite may substitute for this value's inputs,
+    /// in bits; `32` keeps operands f32.
     pub min_operand_bits: u8,
     pub reassoc: bool,
     pub contract: bool,
 }
 
 impl NumericContract {
-    /// f32 accumulation, f32 operands, reassociation and contraction
-    /// allowed. The default every value carries.
+    /// f32 accumulation and operands, reassociation and contraction allowed.
     pub const RELAXED: Self = Self {
         min_accum_bits: 32,
         min_operand_bits: 32,
@@ -155,8 +142,7 @@ impl NumericContract {
         contract: true,
     };
 
-    /// f32 accumulation, f32 operands, no reassociation, no contraction. QAT
-    /// fake-quant rounding and the MSQ1 export path carry this.
+    /// f32 accumulation and operands, no reassociation or contraction.
     pub const STRICT: Self = Self {
         min_accum_bits: 32,
         min_operand_bits: 32,
@@ -164,13 +150,8 @@ impl NumericContract {
         contract: false,
     };
 
-    /// [`Self::RELAXED`] plus permission to re-encode operands onto an 8-bit
-    /// grid: what would license an int8-activation dot.
-    ///
-    /// Weaker than `RELAXED` — `RELAXED.allows(RELAXED_OPERANDS)` — so it
-    /// cannot be reached by [`Self::meet`] from values that do not already
-    /// carry it. Nothing in the tree mints it, so the int8 path is offered
-    /// nowhere.
+    /// [`Self::RELAXED`] plus 8-bit operand re-encoding; unreachable by
+    /// [`Self::meet`] from values that do not already carry it.
     pub const RELAXED_OPERANDS: Self = Self {
         min_operand_bits: 8,
         ..Self::RELAXED
@@ -203,16 +184,14 @@ impl NumericContract {
     }
 }
 
-/// How long a value lives. Lets a quantized repack amortize against a
-/// weight's lifetime, and tells the extractor what it may recompute.
+/// How long a value lives.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum Persistence {
     Step,
     Persistent,
 }
 
-/// A typed constant. `PartialEq`/`Hash` are bitwise so the e-graph memo is
-/// exact: `-0.0` and `0.0` are distinct, `NaN` hash-conses with itself.
+/// A typed constant, compared and hashed bitwise so the memo is exact.
 #[derive(Copy, Clone, Debug)]
 pub enum Splat {
     F32(f32),
@@ -230,6 +209,17 @@ impl Splat {
             Self::BF16(_) => Dtype::BF16,
             Self::U32(_) => Dtype::U32,
             Self::I32(_) => Dtype::I32,
+        }
+    }
+
+    /// The value as `f64`, exact for every variant.
+    pub fn to_f64(self) -> f64 {
+        match self {
+            Self::F32(v) => f64::from(v),
+            Self::F16(b) => half::f16::from_bits(b).to_f64(),
+            Self::BF16(b) => half::bf16::from_bits(b).to_f64(),
+            Self::U32(v) => f64::from(v),
+            Self::I32(v) => f64::from(v),
         }
     }
 

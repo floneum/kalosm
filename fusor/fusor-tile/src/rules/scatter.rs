@@ -7,6 +7,7 @@ use fusor_ir::ir::{Level, Node, Op, OpTag};
 use fusor_ir::rule;
 
 use crate::domains::{DomainCtx, default_planner, map_domain};
+use crate::rules::adopt;
 use crate::rules::contract::alias;
 
 rule!(
@@ -71,18 +72,13 @@ fn mint(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>, mode: ScatterMo
         mode,
         combine: p.combine,
         ops: vec![alias(p.base, base), alias(p.idx, idx), alias(p.upd, upd)],
-        sched: ScheduleDomain::Map(map_domain(&upd.shape, &accesses, &cx)),
+        sched: ScheduleDomain::Map(map_domain(&upd.shape, &accesses, &cx).into()),
     };
-    let new = b.add_launch(op).ok()?;
-    b.union(id, new).ok()?;
-    Some(new)
+    adopt(b, id, op)
 }
 
-/// One in-place write per update. `Add` needs `atomicAdd` on f32 in
-/// storage; `Set` on caller-proved-unique indices is an ordinary store and
-/// needs no capability. Carries `Effect::InPlace`, so extraction pins it in
-/// the materialized set — without that, inlining it into two consumers
-/// applies the atomics twice.
+/// One in-place write per update (`Add` needs f32 `atomicAdd`). Carries
+/// `Effect::InPlace`, so extraction never inlines it into two consumers.
 pub fn scatter_atomic(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let p = parts(node)?;
     let legal = match p.combine {
@@ -95,9 +91,7 @@ pub fn scatter_atomic(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -
     mint(b, id, node, f, ScatterMode::Atomic)
 }
 
-/// Sort the updates by destination, then reduce each segment. Always
-/// legal — it needs no device capability and no bound on the destination
-/// extent.
+/// Sort the updates by destination, then reduce each segment. Always legal.
 pub fn scatter_sort_segment(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     parts(node)?;
     mint(b, id, node, f, ScatterMode::SortSegment)

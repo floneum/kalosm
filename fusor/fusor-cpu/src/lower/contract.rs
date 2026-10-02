@@ -3,29 +3,20 @@
 use std::sync::Arc;
 
 use fusor_ir::Result;
-use fusor_ir::device::Caps;
 use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
-    Accumulator, Addr, BufferDecl, ElementType, KernelIr, LocalDecl, ScalarElement, Stmt,
-    StorageView, TileExpr, TileExprKind,
+    Accumulator, Addr, BufferDecl, ElementType, KernelIr, ScalarElement, Stmt, TileExpr,
 };
-use fusor_ir::ir::launch::{ContractSide, Launch, SchedPoint};
+use fusor_ir::ir::launch::{ContractSide, Launch};
 use fusor_ir::ir::{Node, Op};
-use fusor_ir::scalar::{BinOp, CmpOp, ScalarExpr, ScalarKind};
+use fusor_ir::scalar::{ScalarExpr, ScalarKind};
 use fusor_ir::shape::{Dim, Layout};
 use fusor_ir::target::LowerCtx;
+use fusor_tile::build::Kernel;
 
-use super::{
-    Binds, OperandSrc, Translate, bin, cmp, default_block, global_lane, grid_for, lit_f32, lit_u32,
-    u32_ty,
-};
+use super::{Binds, DEFAULT_BLOCK, OperandSrc, global_lane, grid_for, view};
 
-pub(crate) fn lower(
-    caps: &Caps,
-    node: &Node,
-    _theta: SchedPoint,
-    cx: &LowerCtx<'_>,
-) -> Result<KernelIr> {
+pub(crate) fn lower(node: &Node, cx: &LowerCtx<'_>) -> Result<KernelIr> {
     let Op::Launch(Launch::Contract {
         m,
         n,
@@ -48,8 +39,7 @@ pub(crate) fn lower(
     ];
     let binds = Binds::build(cx)?;
     let out = binds.of(cx.launch.root)?;
-    // The platform GEMM is Accelerate, so it exists on macOS only; everywhere
-    // else every contraction takes the Cranelift SIMD path below.
+    // The platform GEMM is Accelerate (macOS only); elsewhere the Cranelift path.
     let platform = if cfg!(target_os = "macos") {
         side(cx, &binds, a, [batch, m, k])
             .zip(side(cx, &binds, b, [batch, k, n]))
@@ -57,22 +47,14 @@ pub(crate) fn lower(
                 gemm_name(
                     m, n, k, batch, &out, &bound_a, &bound_b, &a.pre, &b.pre, post,
                 )
-                .ok()
             })
     } else {
         None
     };
     if let Some(name) = platform {
-        return Ok(KernelIr {
-            buffers: binds.buffers,
-            grid: [1, 1, 1],
-            block: 1,
-            body: Vec::new(),
-            byte_arena: None,
-            name,
-        });
+        return Ok(binds.finish(name, [1, 1, 1], 1, Vec::new()));
     }
-    lower_jit(caps, cx, binds, out, [batch, m, n, k], a, b, post, *acc)
+    lower_jit(cx, binds, out, [batch, m, n, k], a, b, post, *acc)
 }
 
 type BoundSide = Vec<(Arc<BufferDecl>, [u32; 3])>;
@@ -86,7 +68,11 @@ fn side(
     side.ops
         .iter()
         .map(|operand| {
-            if crate::lower::const_operand(cx, operand.src).is_some() {
+            if fusor_tile::build::const_splat(cx, operand.src).is_some() {
+                return None;
+            }
+            // A GEMM reads from the buffer start; an offset layout goes to the JIT.
+            if super::resolved_layout(cx, &operand.layout).ok()?.0 != 0 {
                 return None;
             }
             let strides = collapsed_strides(cx, &operand.layout, groups)?;
@@ -95,108 +81,103 @@ fn side(
         .collect()
 }
 
-/// A contraction is more general than matrix multiplication: attention masks,
-/// sampling rows, absorbed producers and fused epilogues all use the same
-/// launch node. Only the small subset recognized above is a BLAS call. This
-/// kernel is the native Cranelift path for the rest: one output per lane and a
-/// private accumulator across `k`.
+/// The native path for every contraction that is not a recognized BLAS call
+/// (masks, absorbed producers, epilogues): one output per lane, private `k` accumulator.
 #[allow(clippy::too_many_arguments)]
 fn lower_jit(
-    caps: &Caps,
     cx: &LowerCtx<'_>,
     binds: Binds,
-    out: Arc<BufferDecl>,
+    out: std::sync::Arc<BufferDecl>,
     [batch, m, n, k]: [u32; 4],
     a: &ContractSide,
-    b: &ContractSide,
+    b_side: &ContractSide,
     post: &ScalarExpr,
     acc: fusor_ir::dtype::Dtype,
 ) -> Result<KernelIr> {
-    let block = default_block(caps);
+    let b = Kernel::new();
+    let block = DEFAULT_BLOCK;
     let total = u64::from(batch) * u64::from(m) * u64::from(n);
     let total_u32 = u32::try_from(total)
         .map_err(|_| Error::Legality("CPU JIT contraction output exceeds u32 indexing".into()))?;
     let grid = grid_for(total, block);
-    let flat = global_lane(block);
-    let valid = cmp(CmpOp::Lt, flat.clone(), lit_u32(total_u32));
-    let col = bin(BinOp::Rem, flat.clone(), lit_u32(n), u32_ty());
-    let rest = bin(BinOp::Div, flat.clone(), lit_u32(n), u32_ty());
-    let row = bin(BinOp::Rem, rest.clone(), lit_u32(m), u32_ty());
-    let batch_idx = bin(BinOp::Div, rest, lit_u32(m), u32_ty());
-    let k_local = Arc::new(LocalDecl::new(u32_ty()));
-    let k_idx = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(&k_local)), u32_ty());
-    let uniforms = binds.buffers.first().cloned();
+    let flat = global_lane(&b, block);
+    let valid = b.lt(flat.clone(), b.u32(total_u32));
+    let (rest, col) = b.divrem(flat.clone(), b.u32(n));
+    let (batch_idx, row) = b.divrem(rest, b.u32(m));
+    let k_local = b.local(ScalarElement::U32.element());
+    let k_idx = b.load_local(k_local.clone());
 
-    let a_srcs = jit_side(cx, &binds, a, [batch, m, k])?;
-    let b_srcs = jit_side(cx, &binds, b, [batch, k, n])?;
+    let a_srcs = jit_side(&b, cx, &binds, a, [batch, m, k])?;
+    let b_srcs = jit_side(&b, cx, &binds, b_side, [batch, k, n])?;
     let a_value = side_value(
+        &b,
         cx,
         a,
         &a_srcs,
         [batch, m, k],
         [&batch_idx, &row, &k_idx],
         valid.clone(),
-        uniforms.clone(),
+        &binds,
     )?;
     let b_value = side_value(
+        &b,
         cx,
-        b,
+        b_side,
         &b_srcs,
         [batch, k, n],
         [&batch_idx, &k_idx, &col],
         valid.clone(),
-        uniforms.clone(),
+        &binds,
     )?;
     let acc_ty = ElementType::Scalar(super::elem_of(acc)?);
-    let a_value = cast_to(a_value, acc_ty);
-    let b_value = cast_to(b_value, acc_ty);
-    let local = Arc::new(LocalDecl::new(acc_ty));
-    let previous = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(&local)), acc_ty);
-    let product = bin(BinOp::Mul, a_value, b_value, acc_ty);
-    let update = bin(BinOp::Add, previous, product, acc_ty);
-    let zero = cast_to(lit_f32(0.0), acc_ty);
-    let accumulated = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(&local)), acc_ty);
-    let value = Translate {
-        args: &[accumulated],
-        coords: &[],
-        uniforms,
-    }
-    .run(post)?;
+    let local = b.local(acc_ty);
+    let previous = b.load_local(local.clone());
+    let update = b.add(
+        previous.clone(),
+        b.mul(b.cast(a_value, acc_ty), b.cast(b_value, acc_ty)),
+    );
+    let value = binds.translate(&b, &[previous], &[], post)?;
     let body = vec![
         Stmt::Loop {
-            count: Some(lit_u32(k)),
+            count: Some(b.u32(k)),
             index: Some(k_local),
             accumulators: vec![Accumulator {
                 local,
-                init: zero,
+                init: b.cast(b.f32(0.0), acc_ty),
                 update,
             }],
             body: Vec::new(),
         },
         Stmt::Store {
-            dst: StorageView {
-                layout: out.layout.clone(),
-                buffer: out,
-                offset: 0,
-            },
+            dst: view(&out),
             addr: Addr::Linear(flat),
             value,
             mask: valid,
         },
     ];
-    Ok(KernelIr {
-        buffers: binds.buffers,
-        grid,
-        block,
-        body,
-        byte_arena: None,
-        name: "cpu_contract_jit",
-    })
+    Ok(binds.finish("cpu_contract_jit", grid, block, body))
 }
 
-type JitSide = Vec<(OperandSrc, [u32; 3])>;
+/// One operand's source and how `(batch, row, col)` reach an element: three
+/// collapsed strides when each group is one dense run, else per-axis strides.
+struct JitOperand {
+    src: OperandSrc,
+    offset: u32,
+    addressing: Addressing,
+}
+
+enum Addressing {
+    Collapsed([u32; 3]),
+    Axes {
+        extents: Vec<u32>,
+        strides: Vec<u32>,
+    },
+}
+
+type JitSide = Vec<JitOperand>;
 
 fn jit_side(
+    b: &Kernel,
     cx: &LowerCtx<'_>,
     binds: &Binds,
     side: &ContractSide,
@@ -205,58 +186,143 @@ fn jit_side(
     side.ops
         .iter()
         .map(|operand| {
-            let strides = collapsed_strides(cx, &operand.layout, groups).ok_or_else(|| {
-                Error::Legality(format!(
-                    "CPU JIT contraction cannot collapse layout {:?}",
-                    operand.layout
-                ))
-            })?;
-            Ok((super::operand_src(cx, binds, operand.src)?, strides))
+            let (offset, extents, strides) = super::resolved_layout(cx, &operand.layout)?;
+            let addressing = match collapse_resolved(&extents, &strides, groups) {
+                Some(c) => Addressing::Collapsed(c),
+                None => {
+                    // The axes must partition into the groups.
+                    if group_axes(&extents, groups).is_none() {
+                        return Err(Error::Legality(format!(
+                            "CPU JIT contraction cannot partition layout {:?} into its groups",
+                            operand.layout
+                        )));
+                    }
+                    Addressing::Axes { extents, strides }
+                }
+            };
+            Ok(JitOperand {
+                src: super::operand_src(b, cx, binds, operand.src)?,
+                offset,
+                addressing,
+            })
         })
         .collect()
 }
 
+/// Each group's axis range, row-major, and how many leading axes were consumed.
+fn group_ranges(extents: &[u32], groups: [u32; 3]) -> Option<([(usize, usize); 3], usize)> {
+    let mut out = [(0, 0); 3];
+    let mut axis = 0;
+    for (group, wanted) in groups.into_iter().map(|v| v.max(1)).enumerate() {
+        let start = axis;
+        let mut product = 1u64;
+        while product < u64::from(wanted) && axis < extents.len() {
+            product = product.saturating_mul(u64::from(extents[axis]));
+            axis += 1;
+        }
+        if product != u64::from(wanted) {
+            return None;
+        }
+        out[group] = (start, axis);
+    }
+    Some((out, axis))
+}
+
+/// [`group_ranges`] over every axis, extent-0 axes counting as 1.
+fn group_axes(extents: &[u32], groups: [u32; 3]) -> Option<[(usize, usize); 3]> {
+    let extents: Vec<u32> = extents.iter().map(|e| (*e).max(1)).collect();
+    group_ranges(&extents, groups).and_then(|(r, used)| (used == extents.len()).then_some(r))
+}
+
+/// `offset + Σ coord * stride` over the layout's axes.
+fn axes_index(
+    b: &Kernel,
+    extents: &[u32],
+    strides: &[u32],
+    groups: [u32; 3],
+    indices: [&TileExpr; 3],
+    offset: u32,
+) -> TileExpr {
+    let ranges = group_axes(extents, groups).unwrap_or([(0, 0); 3]);
+    let mut terms: Vec<TileExpr> = Vec::new();
+    if offset != 0 {
+        terms.push(b.u32(offset));
+    }
+    for (group, (start, end)) in ranges.into_iter().enumerate() {
+        let mut rest = indices[group].clone();
+        for i in (start..end).rev() {
+            let extent = extents[i].max(1);
+            let coord = match i == start {
+                true => rest.clone(),
+                false => b.rem(rest.clone(), b.u32(extent)),
+            };
+            match strides[i] {
+                0 => {}
+                1 => terms.push(coord),
+                stride => terms.push(b.mul(coord, b.u32(stride))),
+            }
+            if i != start {
+                rest = b.div(rest, b.u32(extent));
+            }
+        }
+    }
+    terms
+        .into_iter()
+        .reduce(|l, r| b.add(l, r))
+        .unwrap_or_else(|| b.u32(0))
+}
+
+#[allow(clippy::too_many_arguments)]
 fn side_value(
+    b: &Kernel,
     cx: &LowerCtx<'_>,
     side: &ContractSide,
     sources: &JitSide,
     groups: [u32; 3],
     indices: [&TileExpr; 3],
     mask: TileExpr,
-    uniforms: Option<Arc<BufferDecl>>,
+    binds: &Binds,
 ) -> Result<TileExpr> {
     let args = sources
         .iter()
-        .map(|(source, strides)| source.at(strided_index(indices, *strides), mask.clone()))
+        .map(|o| {
+            let index = match &o.addressing {
+                Addressing::Collapsed(strides) => {
+                    let base = strided_index(b, indices, *strides);
+                    match o.offset {
+                        0 => base,
+                        offset => b.add(b.u32(offset), base),
+                    }
+                }
+                Addressing::Axes { extents, strides } => {
+                    axes_index(b, extents, strides, groups, indices, o.offset)
+                }
+            };
+            o.src.at(b, index, mask.clone())
+        })
         .collect::<Vec<_>>();
-    let coords = side_coords(cx, side, groups, indices).ok_or_else(|| {
+    let coords = side_coords(b, cx, side, groups, indices).ok_or_else(|| {
         Error::Legality("CPU JIT contraction cannot state side coordinates".into())
     })?;
-    Translate {
-        args: &args,
-        coords: &coords,
-        uniforms,
-    }
-    .run(&side.pre)
+    binds.translate(b, &args, &coords, &side.pre)
 }
 
-fn strided_index(indices: [&TileExpr; 3], strides: [u32; 3]) -> TileExpr {
+fn strided_index(b: &Kernel, indices: [&TileExpr; 3], strides: [u32; 3]) -> TileExpr {
     indices
         .into_iter()
         .zip(strides)
         .filter(|(_, stride)| *stride != 0)
-        .map(|(index, stride)| {
-            if stride == 1 {
-                index.clone()
-            } else {
-                bin(BinOp::Mul, index.clone(), lit_u32(stride), u32_ty())
-            }
+        .map(|(index, stride)| match stride {
+            1 => index.clone(),
+            _ => b.mul(index.clone(), b.u32(stride)),
         })
-        .reduce(|left, right| bin(BinOp::Add, left, right, u32_ty()))
-        .unwrap_or_else(|| lit_u32(0))
+        .reduce(|left, right| b.add(left, right))
+        .unwrap_or_else(|| b.u32(0))
 }
 
+/// Per-axis coordinates a side's `pre` reads.
 fn side_coords(
+    b: &Kernel,
     cx: &LowerCtx<'_>,
     side: &ContractSide,
     groups: [u32; 3],
@@ -265,43 +331,26 @@ fn side_coords(
     if !side.pre.reads_index_of() {
         return Some(Vec::new());
     }
-    let extents = super::const_extents(cx, side.primary().layout.shape()).ok()?;
-    let mut coords = vec![lit_u32(0); extents.len()];
-    let mut axis = 0;
-    for (group, wanted) in groups.into_iter().enumerate() {
-        let start = axis;
-        let mut product = 1u64;
-        while product < u64::from(wanted.max(1)) && axis < extents.len() {
-            product = product.saturating_mul(u64::from(extents[axis].max(1)));
-            axis += 1;
-        }
-        if product != u64::from(wanted.max(1)) {
-            return None;
-        }
-        let mut rest = indices[group].clone();
-        for i in (start..axis).rev() {
-            let extent = lit_u32(extents[i].max(1));
-            coords[i] = bin(BinOp::Rem, rest.clone(), extent.clone(), u32_ty());
-            rest = bin(BinOp::Div, rest, extent, u32_ty());
+    let extents: Vec<u32> = super::const_extents(cx, side.primary().layout.shape())
+        .ok()?
+        .into_iter()
+        .map(|e| e.max(1))
+        .collect();
+    let (ranges, _) = group_ranges(&extents, groups)?;
+    let mut coords = vec![b.u32(0); extents.len()];
+    for ((start, end), index) in ranges.into_iter().zip(indices) {
+        let mut rest = index.clone();
+        for i in (start..end).rev() {
+            let extent = b.u32(extents[i]);
+            coords[i] = b.rem(rest.clone(), extent.clone());
+            rest = b.div(rest, extent);
         }
     }
     Some(coords)
 }
 
-fn cast_to(value: TileExpr, to: ElementType) -> TileExpr {
-    if value.element() == to {
-        value
-    } else {
-        TileExpr::new(
-            TileExprKind::Cast {
-                value: value.clone(),
-                to,
-            },
-            to,
-        )
-    }
-}
-
+/// The platform GEMM call for an f32 contraction with no epilogue, or with the
+/// bias-GELU input transform fused into A; the name encodes the call.
 #[allow(clippy::too_many_arguments)]
 fn gemm_name(
     m: u32,
@@ -314,107 +363,69 @@ fn gemm_name(
     a_pre: &ScalarExpr,
     b_pre: &ScalarExpr,
     post: &ScalarExpr,
-) -> Result<&'static str> {
-    let identity = |expr: &ScalarExpr| matches!(expr.kind(), ScalarKind::Arg(0));
-    let f32_storage = ElementType::Scalar(ScalarElement::F32);
-    let [(abuf, astrides)] = a.as_slice() else {
-        return gelu_gemm_name(m, n, k, batch, out, a, b, a_pre, b_pre, post);
+) -> Option<&'static str> {
+    let arg0 = |e: &ScalarExpr| matches!(e.kind(), ScalarKind::Arg(0));
+    let f32s = ElementType::Scalar(ScalarElement::F32);
+    let key = |(buf, s): &(Arc<BufferDecl>, [u32; 3])| {
+        format!("{},{},{},{}", buf.binding, s[0], s[1], s[2])
     };
-    let [(bbuf, bstrides)] = b.as_slice() else {
-        return Err(Error::Legality("CPU GEMM needs one B operand".into()));
+    let [(_, bstrides)] = b.as_slice() else {
+        return None;
     };
-    if out.element != f32_storage || abuf.element != f32_storage || bbuf.element != f32_storage {
-        return Err(Error::Legality(
-            "CPU GEMM currently requires f32 storage".into(),
-        ));
+    if !arg0(b_pre)
+        || !arg0(post)
+        || out.element != f32s
+        || a.iter().chain(b).any(|(buf, _)| buf.element != f32s)
+        || !compatible(*bstrides, [k, n], [1, 0])
+    {
+        return None;
     }
-    if !identity(a_pre) || !identity(b_pre) || !identity(post) {
-        return Err(Error::Legality(
-            "CPU GEMM requires its epilogue as a separate Cranelift map".into(),
-        ));
-    }
-    compatible(*astrides, [m, k], [0, 1])?;
-    compatible(*bstrides, [k, n], [1, 0])?;
-    Ok(leak(format!(
-        "cpu_contract_blas:{m},{n},{k},{batch},{},{},{},{},{},{},{},{},{}",
+    let (kind, a_key) = match a.as_slice() {
+        [(_, s)] if arg0(a_pre) && compatible(*s, [m, k], [0, 1]) => ("blas", key(&a[0])),
+        [(_, s), (_, bias)]
+            if *a_pre == tanh_gelu_of_bias() && *s == [0, k, 1] && *bias == [0, 0, 1] =>
+        {
+            ("gelu_blas", format!("{},{}", key(&a[0]), key(&a[1])))
+        }
+        _ => return None,
+    };
+    Some(leak(format!(
+        "cpu_contract_{kind}:{m},{n},{k},{batch},{},{a_key},{}",
         out.binding,
-        abuf.binding,
-        astrides[0],
-        astrides[1],
-        astrides[2],
-        bbuf.binding,
-        bstrides[0],
-        bstrides[1],
-        bstrides[2]
+        key(&b[0])
     )))
 }
 
-#[allow(clippy::too_many_arguments)]
-fn gelu_gemm_name(
-    m: u32,
-    n: u32,
-    k: u32,
-    batch: u32,
-    out: &BufferDecl,
-    a: &BoundSide,
-    b: &BoundSide,
-    a_pre: &ScalarExpr,
-    b_pre: &ScalarExpr,
-    post: &ScalarExpr,
-) -> Result<&'static str> {
-    let [(abuf, astrides), (bias, bias_strides)] = a.as_slice() else {
-        return Err(Error::Legality("CPU GEMM needs one A operand".into()));
-    };
-    let [(bbuf, bstrides)] = b.as_slice() else {
-        return Err(Error::Legality("CPU GEMM needs one B operand".into()));
-    };
-    if a_pre.structural_hash() != 17_166_440_295_432_690_555
-        || !matches!(b_pre.kind(), ScalarKind::Arg(0))
-        || !matches!(post.kind(), ScalarKind::Arg(0))
-    {
-        return Err(Error::Legality(
-            "CPU GEMM requires its epilogue as a separate Cranelift map".into(),
-        ));
-    }
-    let f32_storage = ElementType::Scalar(ScalarElement::F32);
-    if [out, abuf.as_ref(), bias.as_ref(), bbuf.as_ref()]
-        .iter()
-        .any(|buffer| buffer.element != f32_storage)
-        || *astrides != [0, k, 1]
-        || *bias_strides != [0, 0, 1]
-    {
-        return Err(Error::Legality("unsupported fused CPU GEMM input".into()));
-    }
-    compatible(*bstrides, [k, n], [1, 0])?;
-    Ok(leak(format!(
-        "cpu_contract_gelu_blas:{m},{n},{k},{batch},{},{},{},{},{},{},{},{},{},{},{},{},{}",
-        out.binding,
-        abuf.binding,
-        astrides[0],
-        astrides[1],
-        astrides[2],
-        bias.binding,
-        bias_strides[0],
-        bias_strides[1],
-        bias_strides[2],
-        bbuf.binding,
-        bstrides[0],
-        bstrides[1],
-        bstrides[2]
-    )))
+/// The frontend's f32 tanh GELU over `Arg(0) + Arg(1)`: the fusable bias-GELU.
+fn tanh_gelu_of_bias() -> ScalarExpr {
+    use fusor_ir::dtype::{Dtype, Splat};
+    use fusor_ir::scalar::{BinOp, UnOp};
+    let lit = |v: f32| ScalarExpr::lit(Splat::F32(v));
+    let bin = ScalarExpr::bin;
+    let clamp = |x, lo: f32, hi: f32| bin(BinOp::Min, bin(BinOp::Max, x, lit(lo)), lit(hi));
+    let x = bin(
+        BinOp::Add,
+        ScalarExpr::arg(0, Dtype::F32),
+        ScalarExpr::arg(1, Dtype::F32),
+    );
+    let x3 = bin(BinOp::Mul, x.clone(), bin(BinOp::Mul, x.clone(), x.clone()));
+    let cubic = bin(BinOp::Add, x.clone(), bin(BinOp::Mul, lit(0.044_715), x3));
+    let inner = clamp(bin(BinOp::Mul, lit(0.797_884_6), cubic), -15.0, 15.0);
+    let p = ScalarExpr::un(UnOp::Exp, inner.clone());
+    let n = ScalarExpr::un(UnOp::Exp, ScalarExpr::un(UnOp::Neg, inner));
+    let tanh = bin(
+        BinOp::Div,
+        bin(BinOp::Sub, p.clone(), n.clone()),
+        bin(BinOp::Add, p, n),
+    );
+    let one_plus = clamp(bin(BinOp::Add, lit(1.0), clamp(tanh, -1.0, 1.0)), 0.0, 2.0);
+    bin(BinOp::Mul, bin(BinOp::Mul, lit(0.5), x), one_plus)
 }
 
-fn compatible(strides: [u32; 3], [rows, cols]: [u32; 2], broadcast: [u32; 2]) -> Result<()> {
-    if (strides[2] == 1 && strides[1] >= cols)
+fn compatible(strides: [u32; 3], [rows, cols]: [u32; 2], broadcast: [u32; 2]) -> bool {
+    (strides[2] == 1 && strides[1] >= cols)
         || (strides[1] == 1 && strides[2] >= rows)
         || strides[1..] == broadcast
-    {
-        Ok(())
-    } else {
-        Err(Error::Legality(format!(
-            "CPU GEMM cannot address strides {strides:?}"
-        )))
-    }
 }
 
 fn leak(value: String) -> &'static str {
@@ -438,62 +449,46 @@ fn collapse_resolved(extents: &[u32], strides: &[u32], groups: [u32; 3]) -> Opti
         .zip(strides.iter().copied())
         .filter(|(extent, _)| *extent != 1)
         .collect();
+    let sizes: Vec<u32> = axes.iter().map(|(extent, _)| *extent).collect();
+    let (ranges, used) = group_ranges(&sizes, groups)?;
+    if used != axes.len() {
+        return None;
+    }
     let mut out = [0; 3];
-    let mut axis = 0;
-    for (group, wanted) in groups.into_iter().map(|value| value.max(1)).enumerate() {
-        let start = axis;
-        let mut product = 1u64;
-        while product < wanted as u64 && axis < axes.len() {
-            product *= axes[axis].0 as u64;
-            axis += 1;
-        }
-        if product != wanted as u64 {
-            return None;
-        }
-        if axis == start {
+    for (group, (start, end)) in ranges.into_iter().enumerate() {
+        if start == end {
             continue;
         }
-        if axes[start..axis]
+        if axes[start..end]
             .windows(2)
             .any(|pair| pair[0].1 as u64 != pair[1].1 as u64 * pair[1].0 as u64)
         {
             return None;
         }
-        out[group] = axes[axis - 1].1;
+        out[group] = axes[end - 1].1;
     }
-    (axis == axes.len()).then_some(out)
+    Some(out)
 }
 
-// Kept out of the public interface; tests cover layout collapsing and the
-// platform GEMM adapter covers execution.
+// Private; tests cover layout collapsing.
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn collapses_dense_and_unit_axes() {
-        let dense = Layout::contiguous(&[Dim::Const(3), Dim::Const(8), Dim::Const(5)]);
         assert_eq!(
             collapse_resolved(&[3, 8, 5], &[40, 5, 1], [3, 8, 5]),
             Some([40, 5, 1])
         );
-        let unit = Layout::contiguous(&[Dim::Const(16), Dim::Const(1)]);
         assert_eq!(
             collapse_resolved(&[16, 1], &[1, 1], [1, 16, 1]),
             Some([0, 1, 0])
         );
-        let _ = (dense, unit);
     }
 
     #[test]
     fn rejects_a_gapped_layout() {
-        let layout = Layout::from_parts(
-            Dim::Const(0),
-            &[Dim::Const(4), Dim::Const(4)],
-            &[Dim::Const(8), Dim::Const(1)],
-        )
-        .unwrap();
         assert_eq!(collapse_resolved(&[4, 4], &[8, 1], [1, 16, 1]), None);
-        let _ = layout;
     }
 }

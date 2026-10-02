@@ -1,6 +1,4 @@
-//! Dispatching a compiled [`CpuKernel`](crate::emit::CpuKernel) over the
-//! worker pool. Every production kernel must have either a native Cranelift
-//! artifact or a platform GEMM contract.
+//! Dispatching a compiled [`CpuKernel`](crate::emit::CpuKernel) over the pool.
 
 use fusor_ir::Result;
 use fusor_ir::error::Error;
@@ -42,29 +40,22 @@ pub(crate) fn run(
     })?;
 
     let pool = WorkerPool::global();
-    // A kernel that accumulates atomically runs on one worker, which keeps the
-    // accumulation order fixed and therefore the result bit-reproducible.
+    // Atomic kernels run on one worker, keeping the result bit-reproducible.
     let grain = if prog.has_atomic || total <= pool.num_threads() as u64 {
         total
     } else {
         grain_for(total, pool.num_threads())
     };
-    let arena = kernel.artifact.arena_bytes.max(64) as usize;
 
     let bufs_ref: &[RawBuf] = bufs;
-    // Dispatches attributable to *this* launch, so the count is grid
-    // independent and a concurrent launch on another host thread cannot
-    // inflate it.
+    // Dispatches attributable to this launch alone.
     let dispatches = std::sync::atomic::AtomicU64::new(0);
     let body = |span: std::ops::Range<u64>| {
-        pool.with_scratch(arena, |scratch| {
-            let _scratch = scratch;
-            dispatches.fetch_add(1, Ordering::Relaxed);
-            for linear in span {
-                let gid = unlinearize(linear, grid);
-                jit.run(bufs_ref, gid, grid);
-            }
-        });
+        dispatches.fetch_add(1, Ordering::Relaxed);
+        for linear in span {
+            let gid = unlinearize(linear, grid);
+            jit.run(bufs_ref, gid, grid);
+        }
     };
 
     pool.parallel_for(0..total, grain, &body);
@@ -73,8 +64,7 @@ pub(crate) fn run(
 }
 
 struct BoundBuffers {
-    // Retain the immutable cached uniform allocation for as long as `raw` can
-    // be used.
+    // Keep the cached uniform allocation alive while `raw` is used.
     _uniform: Option<Arc<AlignedBuf>>,
     raw: SmallVec<[RawBuf; 8]>,
 }
@@ -160,14 +150,8 @@ fn unlinearize(linear: u64, grid: [u32; 3]) -> [u32; 3] {
     ]
 }
 
-/// Chunk size handed to `parallel_for`, chosen so one chunk amortizes
-/// `thread_wake_ps`.
-///
-/// This is the whole of the "should we parallelize?" question on CPU, and it
-/// is a *cost* question, which is why `PARALLEL_THRESHOLD = 16_777_216` does
-/// not appear anywhere in this crate: the extractor prices an outer tile loop
-/// marked parallel against the measured pool-wake cost, and the launcher only
-/// has to pick a grain that keeps every worker fed.
+/// Chunk size for `parallel_for`, so one chunk amortizes `thread_wake_ps`; the
+/// extractor already priced whether to parallelize at all.
 pub(crate) fn grain_for(total: u64, threads: u32) -> u64 {
     let threads = threads.max(1) as u64;
     if threads == 1 {
@@ -220,7 +204,6 @@ mod tests {
             regs: 0,
             locals: 0,
             tiles: Vec::new(),
-            maps: Vec::new(),
             buffer_elements: Vec::new(),
             arena_bytes: 0,
             block: 1,
@@ -229,16 +212,11 @@ mod tests {
         });
         let kernel = CpuKernel {
             name: "missing_native_test",
-            block: 1,
-            vector_width: 4,
             artifact: crate::emit::CpuArtifact {
                 prog,
                 contract: None,
                 jit: None,
-                grid: [1, 1, 1],
-                block: 1,
                 name: "missing_native_test",
-                arena_bytes: 0,
             },
         };
 

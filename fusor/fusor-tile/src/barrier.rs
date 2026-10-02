@@ -1,26 +1,7 @@
-//! Barrier elision and insertion.
-//!
-//! **Elision** never judges absolute correctness — lane-ownership discipline
-//! is the kernel author's, and the analysis cannot see it. It preserves the
-//! *separation structure* instead: a barrier is removable only when every
-//! conservatively-hazardous access pair it currently separates is also
-//! separated by a surviving barrier. Removal can then never introduce a race
-//! the original ordering excluded.
-//!
-//! Hazard pairs are enumerated two ways:
-//! - *Forward*: accesses `x < y` (any two tiles or one tile, at least one
-//!   write). A barrier separates the pair when it sits in `(x, y]` and every
-//!   loop between the barrier and the pair's innermost common loop is
-//!   guaranteed to complete.
-//! - *Back edge*: accesses `x`, `y` inside a loop `L` race from iteration
-//!   `i`'s later access to iteration `i + 1`'s earlier one. A barrier inside
-//!   `L` separates the wrap when it covers `(y, L.end) ∪ (L.start, x]`;
-//!   `Break` does not invalidate it, because taking the back edge means the
-//!   full body executed.
-//!
-//! **Insertion** is the other direction: one uniform barrier at a root
-//! boundary can *shrink* the arena by separating two tiles' live ranges.
-//! [`crate::planner::Planner::arena_plan`] computes and uses this delta.
+//! Barrier elision and insertion. Elision preserves separation structure: a
+//! barrier is removable only when every hazard pair it separates (forward, or
+//! across a loop back edge) is also separated by a surviving barrier.
+//! Insertion places one uniform root barrier where it shrinks the arena.
 
 use fusor_ir::Result;
 use fusor_ir::error::Error;
@@ -29,9 +10,8 @@ use fusor_ir::ir::kernel::{BarrierSuggestion, KernelIr, Stmt};
 use crate::arena;
 use crate::liveness::{LivenessInfo, analyze};
 
-/// Workgroup bytes the arena needs, taking the smaller of the two packings.
-/// Mode availability is a device question the planner answers; a suggestion
-/// only has to *order* candidates.
+/// Workgroup bytes the arena needs, the smaller of the two packings; only
+/// used to order suggestions.
 pub(crate) fn pack_bytes(live: &LivenessInfo) -> u32 {
     let regions = arena::regions(live).total_bytes;
     if arena::mixes_stride_widths(live)
@@ -42,9 +22,8 @@ pub(crate) fn pack_bytes(live: &LivenessInfo) -> u32 {
     regions
 }
 
-/// Candidate root-level statement indices at which inserting one uniform
-/// barrier shrinks the arena, best `bytes_saved` first. Root boundaries are
-/// uniform by construction — every thread reaches them.
+/// Root-level indices where one inserted barrier shrinks the arena, best
+/// first. Root boundaries are uniform by construction.
 pub(crate) fn barrier_suggestions(ir: &KernelIr) -> Vec<BarrierSuggestion> {
     let live = analyze(ir);
     suggestions(ir, &live)
@@ -70,8 +49,7 @@ pub(crate) fn suggestions(ir: &KernelIr, live: &LivenessInfo) -> Vec<BarrierSugg
     out
 }
 
-/// Insert barriers at the given root-level indices. Indices name positions in
-/// the *original* body; they are applied in ascending order.
+/// Insert barriers at root-level indices of the original body, ascending.
 pub(crate) fn insert(ir: &KernelIr, at: &[u32]) -> Result<KernelIr> {
     let mut indices: Vec<u32> = at.to_vec();
     indices.sort_unstable();

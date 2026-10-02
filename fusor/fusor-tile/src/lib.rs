@@ -1,18 +1,14 @@
-//! `fusor-tile` — everything that reasons about one kernel body and about the
-//! schedule-parameter space of one node.
-//!
-//! Owns the Kernel algorithms (liveness, workgroup arena packing, barrier
-//! insertion argmin, all-pairs arena verification, uniformity analysis, and
-//! full Kernel type-checking.
-//! Also owns the schedule-domain generators and the Launch lowering rules that
-//! consult them, because a rule whose legality filter is exact workgroup bytes
-//! must live with the function that computes them.
+//! `fusor-tile` — the algorithms over one kernel body (liveness, arena
+//! packing, barriers, uniformity, verification) plus the schedule-domain
+//! generators and the rules that need exact workgroup bytes.
 
 #![warn(unreachable_pub)]
 
 mod arena;
 mod barrier;
+pub mod build;
 pub mod domains;
+mod flags;
 mod liveness;
 pub mod planner;
 pub mod rules;

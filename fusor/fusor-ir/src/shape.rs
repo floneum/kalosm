@@ -5,9 +5,7 @@ use crate::error::{Error, Result};
 use smallvec::SmallVec;
 use std::fmt;
 
-/// A symbolic quantity bound at dispatch, never at compile. Sequence
-/// lengths, batch sizes and tile counts are `SymId`s; they hash as symbols,
-/// so one extracted plan serves a whole shape family.
+/// A symbolic quantity bound at dispatch, so one plan serves a shape family.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct SymId(pub u32);
 
@@ -58,15 +56,9 @@ impl Dim {
     pub const ONE: Dim = Dim::Const(1);
 }
 
-/// Symbolic dim arithmetic. A product or sum that does not fold to a
-/// constant becomes a *derived symbol*: a `SymId` standing for this
-/// expression over other dims, interned process-wide so equal expressions
-/// are one symbol and `known_eq` stays structural. A derived symbol has no
-/// binding of its own; [`Dim::evaluate`] computes it from the bindings of
-/// the symbols it reaches, and the backends materialize it into the uniform
-/// block at dispatch like any other dim. This is what lets a view at a
-/// symbolic offset, or a stride past a symbolic extent, stay exact instead
-/// of collapsing to a placeholder the lowering cannot read.
+/// Symbolic dim arithmetic: a sum or product that does not fold becomes a
+/// derived symbol, interned process-wide so `known_eq` stays structural, and
+/// evaluated at dispatch by [`Dim::evaluate`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DimExpr {
     Add(Dim, Dim),
@@ -237,12 +229,9 @@ impl fmt::Display for Dim {
 /// const-generic rank.
 pub type Dims = SmallVec<[Dim; 6]>;
 
-/// A per-axis view spec, composed **relative to the current strides**.
-/// `out_stride[i] = if multiplier == 0 { 0 } else { in_stride[input_dim] *
-/// multiplier }`, `out_shape[i] = size`, offset gains
-/// `offset * in_stride[input_dim]`. Every reshape, transpose, permute,
-/// slice, narrow, broadcast, squeeze, unsqueeze and flatten is a vector of
-/// these.
+/// A per-axis view spec relative to the current strides:
+/// `out_stride = in_stride[input_dim] * multiplier`, `out_shape = size`, and
+/// the offset gains `offset * in_stride[input_dim]`. Every view is a vector of these.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct StrideSpec {
     pub input_dim: u32,
@@ -291,9 +280,8 @@ impl StrideSpec {
     }
 }
 
-/// One windowed axis of an `Logical::Window`. Kept separate from [`StrideSpec`]
-/// because the adjoint needs `window` and `step` as *integers*: under
-/// `Dim::Sym`, injectivity of a relative stride composition is undecidable.
+/// One windowed axis of a `Logical::Window`, with integer `window` and `step`
+/// so the adjoint can decide overlap.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SlidingWindow {
     pub axis: u32,
@@ -306,8 +294,7 @@ impl SlidingWindow {
         Self { axis, window, step }
     }
 
-    /// Non-overlapping. The verifier turns this into "the adjoint is an
-    /// elementwise mask-and-broadcast, not a scatter".
+    /// Non-overlapping: the adjoint is an elementwise mask, not a scatter.
     pub const fn is_non_overlapping(self) -> bool {
         self.step >= self.window
     }
@@ -353,10 +340,8 @@ impl Layout {
         })
     }
 
-    /// Row-major strides. A stride past a `Sym` axis is the product of the
-    /// extents inside it as a derived symbol (`Dim * Dim`), materialized
-    /// into the uniform block at dispatch; only overflow leaves the opaque
-    /// placeholder.
+    /// Row-major strides; past a `Sym` axis a stride is a derived symbol, and
+    /// only overflow leaves the opaque placeholder.
     pub fn row_major_strides(shape: &[Dim]) -> SmallVec<[Dim; 6]> {
         let mut out: SmallVec<[Dim; 6]> = smallvec::smallvec![Dim::Const(1); shape.len()];
         let mut acc = Dim::Const(1);
@@ -365,6 +350,22 @@ impl Layout {
             acc = acc * shape[axis];
         }
         out
+    }
+
+    pub fn visit_dims_mut(&mut self, f: &mut impl FnMut(&mut Dim)) {
+        let mut changed = false;
+        for dim in std::iter::once(&mut self.offset)
+            .chain(&mut self.shape)
+            .chain(&mut self.strides)
+        {
+            let before = *dim;
+            f(dim);
+            changed |= before != *dim;
+        }
+        if changed {
+            self.contiguous = self.offset == Dim::Const(0)
+                && self.strides == Self::row_major_strides(&self.shape);
+        }
     }
 
     pub const fn offset(&self) -> Dim {
@@ -386,6 +387,28 @@ impl Layout {
     pub fn overlaps(&self) -> bool {
         self.strides.iter().any(|s| s.known_eq(Dim::Const(0)))
     }
+
+    /// One single-sub-axis [`AxisGroup`] per axis, or `None` when an extent
+    /// or stride is symbolic or overflows `u32`.
+    pub fn affine_groups(&self) -> Option<SmallVec<[AxisGroup; 4]>> {
+        self.shape
+            .iter()
+            .zip(&self.strides)
+            .map(|(d, s)| {
+                Some(AxisGroup::affine(
+                    u32::try_from(d.as_const()?).ok()?,
+                    u32::try_from(s.as_const()?).ok()?,
+                ))
+            })
+            .collect()
+    }
+}
+
+/// Element count of `shape`, or `None` under a symbolic extent or overflow.
+pub fn const_elements(shape: &[Dim]) -> Option<u64> {
+    shape
+        .iter()
+        .try_fold(1u64, |acc, d| acc.checked_mul(d.as_const()?))
 }
 
 /// One sub-axis of a logical axis. Strides may be zero (broadcast) or
@@ -469,9 +492,8 @@ pub fn const_row_major(shape: &[Dim]) -> Option<Vec<u64>> {
     Some(out)
 }
 
-/// The `StrideSpec` for an inserted size-1 axis: multiplier 1 against a
-/// neighbouring input dim, or a stride-0 axis when the input is rank 0 and
-/// there is no neighbour to name.
+/// The `StrideSpec` for an inserted size-1 axis: a neighbouring input dim,
+/// or stride 0 on a rank-0 input.
 pub fn singleton_spec(in_rank: usize, next_src: usize) -> StrideSpec {
     if in_rank == 0 {
         StrideSpec::broadcast(Dim::Const(1))
@@ -481,14 +503,9 @@ pub fn singleton_spec(in_rank: usize, next_src: usize) -> StrideSpec {
     }
 }
 
-/// Derive the spec vector for a reshape from `in_shape` to `out_shape`.
-///
-/// The two shapes are walked in lockstep and split into minimal groups of
-/// equal product. A one-to-one group is a plain `dim` spec, so a symbolic
-/// extent that passes through unchanged costs nothing. A many-to-one (merge)
-/// or one-to-many (split) group names the group's innermost input axis and
-/// multiplies its stride by the output axis's stride *within the group* —
-/// exactly `Layout::contiguous(new_shape)` when the group is contiguous.
+/// The spec vector for a reshape: the shapes split into minimal groups of
+/// equal product; each merge/split group names its innermost input axis
+/// scaled by the output axis's row-major stride within the group.
 pub fn reshape_specs(in_shape: &[Dim], out_shape: &[Dim]) -> Result<SmallVec<[StrideSpec; 6]>> {
     let mut specs: SmallVec<[StrideSpec; 6]> = SmallVec::with_capacity(out_shape.len());
     let (in_len, out_len) = (in_shape.len(), out_shape.len());
@@ -568,11 +585,9 @@ fn reshape_symbolic(in_shape: &[Dim], out_shape: &[Dim]) -> Error {
     ))
 }
 
-/// The one broadcast rule, applied by the frontend before ingestion.
-/// Right-aligned: a source dim is consumed when it equals the target or is
-/// 1 (stride 0); unmatched target dims are inserted with stride 0 at **any**
-/// position; an unconsumed source dim is an error. There is no implicit
-/// broadcasting inside the IR.
+/// The one broadcast rule, applied by the frontend: right-aligned, a source
+/// dim is consumed when equal or 1, unmatched target dims get stride 0, and
+/// an unconsumed source dim is an error.
 pub fn broadcast_specs(src: &[Dim], dst: &[Dim]) -> Result<SmallVec<[StrideSpec; 6]>> {
     if dst.len() < src.len() {
         return Err(Error::Shape(format!(
@@ -632,9 +647,8 @@ pub fn broadcast_shapes(a: &[Dim], b: &[Dim]) -> Result<Dims> {
     Ok(out)
 }
 
-/// Whether a restride's bounds are decidable at compile time. `Const` dims
-/// are checked statically; a `Sym` records a runtime mask obligation on the
-/// node, discharged by codegen.
+/// Whether a restride's bounds are decidable at compile time, or need a
+/// runtime mask from codegen.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum BoundsProof {
     Static,

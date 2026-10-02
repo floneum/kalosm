@@ -6,31 +6,13 @@
 
 use fusor_autograd::tape::{GraphTape, TapeExt};
 use fusor_ir::autograd::{Tape, Val};
-use fusor_ir::dtype::Dtype;
-use fusor_ir::egraph::Id;
 use fusor_ir::scalar::BinOp;
 use fusor_ir::shape::Dim;
 use fusor_ir::{Error, Result};
 use smallvec::SmallVec;
 
-use crate::composite::{MacroAttr, MacroOp, const_dim, index_leaf, macro_op};
-use crate::graph::GraphRef;
+use crate::composite::{const_dim, core_op, float_leaf, index_leaf};
 use crate::tensor::Tensor;
-
-/// A rank-1 `f32` weight leaf.
-fn weight_leaf(graph: &GraphRef, dtype: Dtype, values: &[f32]) -> Result<Id> {
-    let mut bytes = Vec::with_capacity(values.len() * 4);
-    for v in values {
-        match dtype {
-            Dtype::F16 => bytes.extend_from_slice(&half::f16::from_f32(*v).to_bits().to_le_bytes()),
-            Dtype::BF16 => {
-                bytes.extend_from_slice(&half::bf16::from_f32(*v).to_bits().to_le_bytes())
-            }
-            _ => bytes.extend_from_slice(&v.to_le_bytes()),
-        }
-    }
-    graph.constant_leaf(dtype, &[Dim::Const(values.len() as u64)], bytes)
-}
 
 /// Nearest-neighbour source index for each output position.
 fn nearest_indices(input: u64, output: u64) -> Vec<u32> {
@@ -63,7 +45,7 @@ pub fn upsample_nearest2d(x: &Tensor, scale_h: u32, scale_w: u32) -> Result<Tens
         Dim::Const(h * scale_h as u64),
         Dim::Const(w * scale_w as u64),
     ];
-    upsample_nearest_axes(x, &size, 2, &[scale_h, scale_w])
+    upsample_nearest_axes(x, &size, 2)
 }
 
 /// Nearest upsampling of the trailing `size.len()` axes to the given extents.
@@ -72,19 +54,10 @@ pub fn upsample_nearest(x: &Tensor, size: &[Dim]) -> Result<Tensor> {
     let first = rank
         .checked_sub(size.len())
         .ok_or_else(|| Error::Shape("upsample names more axes than the value has".into()))?;
-    let scales: SmallVec<[u32; 3]> = size
-        .iter()
-        .enumerate()
-        .map(|(i, d)| {
-            let src = const_dim(x.graph.facts(x.id).shape[first + i], "upsample source")?;
-            let dst = const_dim(*d, "upsample target")?;
-            Ok((dst / src.max(1)) as u32)
-        })
-        .collect::<Result<_>>()?;
-    upsample_nearest_axes(x, size, first as u32, &scales)
+    upsample_nearest_axes(x, size, first as u32)
 }
 
-fn upsample_nearest_axes(x: &Tensor, size: &[Dim], first: u32, scales: &[u32]) -> Result<Tensor> {
+fn upsample_nearest_axes(x: &Tensor, size: &[Dim], first: u32) -> Result<Tensor> {
     let graph = &x.graph;
     let facts = graph.facts(x.id);
     let mut index_ids = Vec::with_capacity(size.len());
@@ -100,13 +73,8 @@ fn upsample_nearest_axes(x: &Tensor, size: &[Dim], first: u32, scales: &[u32]) -
         index_ids.push((axis as u32, index_leaf(graph, &nearest_indices(src, dst))?));
     }
 
-    let mut ops = vec![x.id];
-    ops.extend(index_ids.iter().map(|(_, id)| *id));
     let xid = x.id;
-    let attrs = MacroAttr::Upsample {
-        scales: scales.iter().copied().collect(),
-    };
-    macro_op(graph, MacroOp::Upsample, attrs, &ops, move |t| {
+    core_op(graph, move |t| {
         let mut v = xid;
         for (axis, idx) in index_ids {
             v = t.gather(axis, v, idx)?;
@@ -147,15 +115,11 @@ pub fn upsample_bilinear(x: &Tensor, size: &[Dim], align_corners: bool) -> Resul
     let y1 = index_leaf(graph, &y1)?;
     let x0 = index_leaf(graph, &x0)?;
     let x1 = index_leaf(graph, &x1)?;
-    let wy = weight_leaf(graph, dtype, &wy)?;
-    let wx = weight_leaf(graph, dtype, &wx)?;
+    let wy = float_leaf(graph, dtype, &wy)?;
+    let wx = float_leaf(graph, dtype, &wx)?;
 
     let xid = x.id;
-    let ops = vec![xid, y0, y1, x0, x1, wy, wx];
-    let attrs = MacroAttr::Upsample {
-        scales: smallvec::smallvec![(dh / sh.max(1)) as u32, (dw / sw.max(1)) as u32],
-    };
-    macro_op(graph, MacroOp::Upsample, attrs, &ops, move |t| {
+    core_op(graph, move |t| {
         // Interpolate rows first, then columns: two 2-tap blends rather than
         // one 4-tap, which is the same value and half the gathers.
         let top = t.gather(ay, xid, y0)?;

@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use crate::chat_template::HuggingFaceChatTemplate;
@@ -11,7 +12,7 @@ use attention_layer::GroupedAttention;
 use attention_layer::LlamaFeedForward;
 use attention_layer::PhiFeedForward;
 use attention_layer::SeparateAttention;
-use fusor::cache::{MaskCache, MaskKind};
+use fusor::cache::{KvCache, MaskCache, MaskKind};
 use fusor::layers::RmsNorm;
 use fusor::{Device, Dim, Dtype, Graph, Result, Tensor};
 use fusor_gguf::{GgufValue, RawTensorBytes, ShardedVarBuilder};
@@ -20,6 +21,8 @@ use weight::Weight;
 mod attention_layer;
 pub mod cache;
 mod rope;
+#[cfg(all(test, feature = "cpu"))]
+mod tests;
 #[cfg(feature = "vision")]
 mod vision;
 mod weight;
@@ -94,10 +97,8 @@ pub struct Model {
     output: Weight,
     /// Memoizes the materialized (rectangular / windowed) masks.
     masks: Mutex<MaskCache>,
-    /// The decode loop's persistent input leaves: the token id and its
-    /// absolute position, both `[1]` `u32`. Only their *bytes* change per
-    /// step, so every step reuses one graph and replays one plan.
-    step_inputs: std::sync::OnceLock<(Tensor<1, u32>, Tensor<1, u32>)>,
+    /// Token, position, and output-row leaves retained for each chunk width.
+    step_inputs: Mutex<HashMap<usize, StepInputs>>,
     /// The embedding-row step's persistent leaves: one `[1, 1, hidden]`
     /// embedding and its `[1, head_dim / 2]` cos and sin rows. Only their
     /// bytes change per step, so an image prompt's tokens all replay one
@@ -106,6 +107,8 @@ pub struct Model {
     #[cfg(feature = "vision")]
     vision_encoder: Option<vision::QwenVisionTransformer>,
 }
+
+type StepInputs = (Tensor<1, u32>, Tensor<1, u32>, Tensor<1, u32>);
 
 /// Each image's token range in the expanded prompt and its embeddings.
 type ImageEmbeds = Vec<(std::ops::Range<usize>, Tensor<2>)>;
@@ -484,7 +487,7 @@ impl Model {
             norm,
             output,
             masks: Mutex::new(MaskCache::new()),
-            step_inputs: std::sync::OnceLock::new(),
+            step_inputs: Mutex::new(HashMap::new()),
             embed_inputs: std::sync::OnceLock::new(),
             #[cfg(feature = "vision")]
             vision_encoder,
@@ -699,27 +702,40 @@ impl Model {
         Ok((MaskKind::QkMask, mask.tensor().cloned()))
     }
 
-    /// The last token's logits as `[1, vocab]`. Deliberately NOT reshaped to
-    /// rank 1: the reshape is a pure `Restride` view, and a view cannot be
-    /// the root of a resolve on its own (nothing would land in a buffer).
-    /// The row-major bytes are identical either way.
-    /// The fixed-cache token loop: every id is one replayed decode step.
+    /// Prompt chunks and single-token decode share persistent KV buffers.
     fn forward_fixed_tokens(
         &self,
         tokens: &[u32],
         device: &Device,
         cache: &mut LlamaCache,
     ) -> Result<Tensor<2>> {
-        let (steps, _index_pos) = self.plan_tokens(tokens, Some(cache));
+        let (steps, index_pos) = self.plan_tokens(tokens, Some(cache));
         let n = steps.len();
         let mut logits = None;
         let base = cache.rope_position as usize;
         cache.rope_position += n as u32;
-        for (i, tok) in steps.iter().enumerate() {
-            let want_logits = i + 1 == n;
-            let out = self.decode_step(*tok, base + i, device, cache, want_logits);
+        let width = if n == 1 || cache.blocks.iter().any(KvCache::is_ring) {
+            // A ring overwrite would discard keys still needed by earlier queries.
+            1
+        } else {
+            16
+        };
+        KvCache::reserve_all(&mut cache.blocks, (n.div_ceil(width) * width) as u64)?;
+        let mut i = 0;
+        while i < n {
+            let chunk_width = if n - i < width / 2 { 1 } else { width };
+            let chunk = &steps[i..(i + chunk_width).min(n)];
+            let want_logits = i + chunk.len() == n || width > 1;
+            let out = self.decode_step(chunk, chunk_width, base + i, device, cache, want_logits);
             self.commit_step(out.as_ref(), device, cache)?;
+            if chunk.len() < chunk_width {
+                // Causal attention hides trailing padding from the real rows.
+                for block in &mut cache.blocks {
+                    block.truncate((index_pos + i + chunk.len()) as u64)?;
+                }
+            }
             logits = out.or(logits);
+            i += chunk.len();
         }
         logits.ok_or_else(|| fusor::Error::Shape("forward of no tokens".into()))
     }
@@ -743,6 +759,7 @@ impl Model {
         let encoded = self.encode_tokens(tokens, images, device, Some(cache))?;
         let rope = &self.layers[0].rope_cache;
         let n = encoded.seq_len;
+        KvCache::reserve_all(&mut cache.blocks, n as u64)?;
         let positions: Vec<RopePosition> = match encoded.positions {
             Some(p) => p,
             None => (0..n)
@@ -769,15 +786,7 @@ impl Model {
         logits.ok_or_else(|| fusor::Error::Shape("forward of no tokens".into()))
     }
 
-    /// Resolve one step's outputs and commit the caches, the fixed-cache
-    /// step protocol: this step's KV writes (always) plus the logits on the
-    /// sampled step, then every cache adopts its written buffer so the
-    /// *same* graph runs the next step.
-    ///
-    /// The batch is the one genuinely rank-heterogeneous list here: a
-    /// `[1, vocab]` logits row beside `[1, kv_heads, len, dim]` cache
-    /// writes. That is what `resolve` takes and why the caches hand their
-    /// pending roots over as `Dyn`.
+    /// Resolve requested logits and KV writes, then commit the cache buffers.
     fn commit_step(
         &self,
         out: Option<&Tensor<2>>,
@@ -805,81 +814,99 @@ impl Model {
         device: &Device,
         mut cache: Option<&mut LlamaCache>,
     ) -> Result<Tensor<2>> {
-        if cache
-            .as_ref()
-            .is_some_and(|c| c.blocks.first().is_some_and(|b| b.is_fixed()))
-        {
-            let cache = cache.as_deref_mut().expect("checked above");
-            if !images.is_empty() {
-                return self.forward_fixed_embeds(tokens, images, device, cache);
+        let tokens = cache.as_ref().map_or_else(
+            || std::borrow::Cow::Borrowed(tokens),
+            |cache| cache.input_tokens(tokens),
+        );
+        let result = (|| {
+            if cache
+                .as_ref()
+                .is_some_and(|c| c.blocks.first().is_some_and(|b| b.is_fixed()))
+            {
+                let cache = cache.as_deref_mut().expect("checked above");
+                if !images.is_empty() {
+                    return self.forward_fixed_embeds(&tokens, images, device, cache);
+                }
+                return self.forward_fixed_tokens(&tokens, device, cache);
             }
-            return self.forward_fixed_tokens(tokens, device, cache);
+            let hidden =
+                self.forward_last_hidden_f32(&tokens, images, device, cache.as_deref_mut())?;
+            Ok(self.output.mat_mul(&hidden))
+        })();
+        if result.is_ok() {
+            if let Some(cache) = cache {
+                cache.pending_token = None;
+            }
         }
-        let hidden = self.forward_last_hidden_f32(tokens, images, device, cache)?;
-        Ok(self.output.mat_mul(&hidden))
+        result
     }
 
-    /// One decode-shaped step: token `token` at absolute `position`, one
-    /// query against the (symbolic-length) caches. The graph this builds is
-    /// **identical** across steps — same leaves, same nodes — so from step
-    /// two on, saturation and extraction are replays and the plan is reused;
-    /// only leaf bytes and the length bindings change.
-    ///
-    /// Because it is identical, it is built once. `cache.decode_graph` holds
-    /// the root and every later step re-arms the blocks' appends
-    /// ([`fusor::cache::KvCache::replay_append`]) instead of re-deriving the
-    /// nodes that produced them. A rebuild is still what happens whenever the
-    /// nodes would genuinely differ — a grown store, a reset cache, a first
-    /// step — and it re-establishes the memo.
-    ///
-    /// `None` is a prefill step: its product is the KV writes it left in the
-    /// caches, and the head is not run.
+    /// Replay the current chunk graph when its width and cache stores agree.
     fn decode_step(
         &self,
-        token: u32,
+        tokens: &[u32],
+        width: usize,
         position: usize,
         device: &Device,
         cache: &mut LlamaCache,
         want_logits: bool,
     ) -> Option<Tensor<2>> {
-        let (ids, pos) = self.step_inputs.get_or_init(|| {
-            (
-                Tensor::leaf(device, [Dim::Const(1)]),
-                Tensor::leaf(device, [Dim::Const(1)]),
-            )
-        });
-        ids.set_elements(&[token]);
-        pos.set_elements(&[position as u32]);
+        let (ids, pos, last) = self
+            .step_inputs
+            .lock()
+            .unwrap()
+            .entry(width)
+            .or_insert_with(|| {
+                let shape = [Dim::Const(width as u64)];
+                (
+                    Tensor::leaf(device, shape),
+                    Tensor::leaf(device, shape),
+                    Tensor::leaf(device, [Dim::ONE]),
+                )
+            })
+            .clone();
+        if tokens.len() == width {
+            ids.set_elements(tokens);
+        } else {
+            let mut padded = vec![0; width];
+            padded[..tokens.len()].copy_from_slice(tokens);
+            ids.set_elements(&padded);
+        }
+        last.set_elements(&[(tokens.len() - 1) as u32]);
+        pos.set_elements(
+            &(position..position + width)
+                .map(|p| p.min(position + tokens.len() - 1) as u32)
+                .collect::<Vec<_>>(),
+        );
 
         if let Some(logits) = cache.decode_graph.clone() {
             // Every block or none: a half-advanced cache would silently
             // disagree with the graph about its own length.
-            if cache.blocks.iter().all(|block| block.can_replay(1)) {
+            if cache
+                .blocks
+                .iter()
+                .all(|block| block.can_replay(width as u64))
+            {
                 for block in &mut cache.blocks {
                     block
-                        .replay_append(1)
+                        .replay_append(width as u64)
                         .expect("can_replay was checked for every block");
                 }
                 return want_logits.then_some(logits);
             }
         }
-        // The nodes below may not be the memoized ones (a grown store mints a
-        // new leaf), so the memo dies here and is re-established only by a
-        // step that actually builds the head. The embedding-row memo dies
-        // with it: the appends this step arms are not its.
+        // A different chunk width or input kind needs different append nodes.
         cache.decode_graph = None;
         cache.embed_graph = None;
 
-        let mut layer_in = self.tok_embeddings.rows_at(ids).unsqueeze(0);
+        let mut layer_in = self.tok_embeddings.rows_at(&ids).unsqueeze(0);
         if let Some(scale) = self.tok_embedding_scale {
             layer_in = layer_in.mul_scalar(scale);
         }
-        let at = RopeAt::Leaf(pos);
-        let logits = self.decode_layers(layer_in, at, cache, want_logits);
-        if let Some(logits) = &logits {
-            cache.decode_graph = Some(logits.clone());
-        }
-        logits
+        let at = RopeAt::Leaf(&pos);
+        let logits = self.decode_layers(layer_in, at, cache, (width > 1).then_some(&last));
+        cache.decode_graph = Some(logits.clone());
+        want_logits.then_some(logits)
     }
 
     /// [`Self::decode_step`] for an embedding row at explicit rope rows: the
@@ -922,28 +949,29 @@ impl Model {
             cos: cos_slot,
             sin: sin_slot,
         };
-        let logits = self.decode_layers(emb.clone(), at, cache, want_logits);
-        if let Some(logits) = &logits {
-            cache.embed_graph = Some(logits.clone());
-        }
-        logits
+        let logits = self.decode_layers(emb.clone(), at, cache, None);
+        cache.embed_graph = Some(logits.clone());
+        want_logits.then_some(logits)
     }
 
-    /// One `[1, 1, hidden]` embedding through every layer against the
-    /// fixed caches, and the head when `want_logits`.
+    /// A chunk's embeddings through the layers, returning the selected logits row.
     fn decode_layers(
         &self,
         mut layer_in: Tensor<3>,
         at: RopeAt<'_>,
         cache: &mut LlamaCache,
-        want_logits: bool,
-    ) -> Option<Tensor<2>> {
+        last: Option<&Tensor<1, u32>>,
+    ) -> Tensor<2> {
+        let seq_len = layer_in.shape()[1];
+        let mask = if seq_len == 1 {
+            MaskKind::None
+        } else {
+            MaskKind::Causal
+        };
         for (i, layer) in self.layers.iter().enumerate() {
             let residual = layer_in.clone();
             let x = layer.attention_norm.forward(&layer_in);
-            // One query sees every cached key: structurally maskless.
-            let mut attn =
-                layer.forward(&x, (MaskKind::None, None), at, Some(&mut cache.blocks[i]));
+            let mut attn = layer.forward(&x, (mask, None), at, Some(&mut cache.blocks[i]));
             if let Some(post_attention_norm) = &layer.post_attention_norm {
                 attn = post_attention_norm.forward(&attn);
             }
@@ -963,12 +991,12 @@ impl Model {
             }
             layer_in = x.add(&attn).add(&residual);
         }
-        if !want_logits {
-            return None;
-        }
-        let x = self.norm.forward(&layer_in);
-        let hidden = x.reshape_dims([Dim::Const(1), x.extent(2)]);
-        Some(self.output.mat_mul(&hidden))
+        let row = match last {
+            Some(last) => layer_in.index_select(1, last),
+            None => layer_in.narrow(1, seq_len - 1, 1),
+        };
+        let hidden = row.reshape_dims([Dim::ONE, row.extent(2)]);
+        self.output.mat_mul(&self.norm.forward(&hidden))
     }
 
     pub(crate) fn forward_last_hidden_f32(

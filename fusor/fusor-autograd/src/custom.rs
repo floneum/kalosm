@@ -5,7 +5,7 @@
 //! pinning every cached activation for the process lifetime. Here the rule
 //! is a plain `fn` pointer, so the hazard is unrepresentable.
 
-use fusor_ir::autograd::{AdjointFn, BackwardTarget, GradientSlot, Grads, Parent, Tape, Val};
+use fusor_ir::autograd::{AdjointFn, Grads, Parent, Tape, Val};
 use fusor_ir::ir::Node;
 use fusor_ir::{Error, Result};
 use rustc_hash::FxHashMap;
@@ -30,87 +30,29 @@ impl CustomBackward {
         out: Val,
     ) -> Result<Grads> {
         let grads = (self.rule)(tape, node, grad, ins, out)?;
-        let targets: SmallVec<[BackwardTarget; 4]> = ins
-            .iter()
-            .enumerate()
-            .filter_map(|(slot, v)| {
-                grads.get(slot).copied().flatten().map(|g| BackwardTarget {
-                    slot: GradientSlot(*v),
-                    gradient: g,
-                })
-            })
-            .collect();
-        validate_parents(&self.parents, &targets)?;
+        validate_parents(&self.parents, |p| {
+            ins.iter().zip(&grads).any(|(v, g)| *v == p && g.is_some())
+        })?;
         Ok(grads)
     }
 }
 
-/// Side table of user-supplied backwards, keyed by the node they belong to.
-/// Consulted by the reverse walk **before** [`crate::ADJOINTS`].
-#[derive(Clone, Debug, Default)]
-pub struct CustomRegistry {
-    rules: FxHashMap<Val, CustomBackward>,
-}
+/// User-supplied adjoints, consulted before the built-in adjoint table.
+pub type CustomRegistry = FxHashMap<Val, CustomBackward>;
 
-impl CustomRegistry {
-    pub fn new() -> Self {
-        Self::default()
+/// Every requires-grad parent must receive a gradient; `covered` says which
+/// did. A rule that omits one is an error, not a silent zero: the omitted
+/// parent's whole subgraph would starve, and the walk's final check would
+/// report the symptom rather than the cause.
+pub fn validate_parents(parents: &[Parent], covered: impl Fn(Val) -> bool) -> Result<()> {
+    match parents
+        .iter()
+        .find(|p| p.requires_grad && !covered(p.value))
+    {
+        Some(p) => Err(Error::Plan(format!(
+            "a custom backward rule returned no gradient for parent {}, which requires one",
+            p.value
+        ))),
+        None => Ok(()),
     }
-
-    pub fn get(&self, value: Val) -> Option<&CustomBackward> {
-        self.rules.get(&value)
-    }
-
-    pub fn len(&self) -> usize {
-        self.rules.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.rules.is_empty()
-    }
-
-    /// Register `rule` for `value`. Returns the previous entry, if any.
-    pub fn insert(&mut self, value: Val, entry: CustomBackward) -> Option<CustomBackward> {
-        self.rules.insert(value, entry)
-    }
-}
-
-/// Register a user-supplied backward for `value`, declaring its parents.
-///
-/// The rule is a bare `fn`; the gradients it returns are slot-aligned to the
-/// node's operands, exactly as [`crate::ADJOINTS`] rules are. After it runs,
-/// every `Parent { requires_grad: true }` must appear among its targets.
-pub fn with_backwards(
-    registry: &mut CustomRegistry,
-    value: Val,
-    parents: &[Parent],
-    rule: AdjointFn,
-) -> Result<Val> {
-    registry.insert(
-        value,
-        CustomBackward {
-            parents: parents.iter().copied().collect(),
-            rule,
-        },
-    );
-    Ok(value)
-}
-
-/// Every requires-grad parent must receive a gradient. A custom rule that
-/// omits one is an error, not a silent zero: the omitted parent's whole
-/// subgraph would starve, and the walk's final check would report the
-/// symptom rather than the cause.
-pub fn validate_parents(parents: &[Parent], targets: &[BackwardTarget]) -> Result<()> {
-    for parent in parents {
-        if !parent.requires_grad {
-            continue;
-        }
-        if !targets.iter().any(|t| t.slot.0 == parent.value) {
-            return Err(Error::Plan(format!(
-                "custom backward omitted a gradient for a parent that requires grad: {}",
-                parent.value
-            )));
-        }
-    }
-    Ok(())
 }

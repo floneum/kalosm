@@ -105,13 +105,7 @@ impl QMatrix {
                 )));
             }
         }
-        let id = graph.add_logical(Logical::Leaf(LeafKind::Quantized {
-            name: graph.fresh_buffer_id(),
-            fmt,
-            layout,
-            shape: shape.into_iter().collect(),
-        }))?;
-        graph.set_leaf_bytes(id, bytes.to_vec());
+        let id = graph.quantized_leaf(fmt, layout, shape, bytes.to_vec())?;
         Ok(Self {
             tensor: graph.tensor(id),
             fmt,
@@ -174,11 +168,7 @@ impl QMatrix {
         let Some(defn) = crate::composite::quantized::dequant_defn(self)? else {
             return Ok(graph.tensor(sugar));
         };
-        graph.with_egraph(|g| {
-            g.mark_defn(defn);
-            Ok(())
-        })?;
-        // See `composite::macro_op`: a stable first-union root, so a decode
+        // See `GraphRef::union_stable`: a stable first-union root, so a decode
         // loop's rebuild keeps one name.
         let root = graph.union_stable(sugar, defn)?;
         Ok(graph.tensor(root))

@@ -2,206 +2,38 @@
 //! pending-children counter, dispatching each node through [`crate::ADJOINTS`]
 //! and accumulating into a per-value gradient slot.
 //!
-//! The walk needs the primal's topology, which [`Tape`] does not expose — a
-//! tape only writes. [`Reverse`] carries a snapshot taken with
-//! [`Reverse::over`]; [`backward_into`] is the one-call form.
-
 use crate::adjoints::adjoint_of;
 use crate::custom::CustomRegistry;
 use crate::structural::structural_adjoint;
 use crate::tape::GraphTape;
-use fusor_ir::autograd::{Adjoint, AdjointKind, Autograd, Grads, Tape, Val};
-use fusor_ir::device::Caps;
-use fusor_ir::dtype::{Dtype, NumericContract};
+use fusor_ir::autograd::{AdjointKind, Grads, Tape, Val};
 use fusor_ir::egraph::{EGraph, Id};
 use fusor_ir::ir::logical::{LeafKind, Logical};
 use fusor_ir::ir::{Children, Node, Op};
 use fusor_ir::{Error, Result};
 use rustc_hash::FxHashMap;
 use std::collections::VecDeque;
-use std::sync::Arc;
 
-/// A read-only snapshot of the primal graph's structure.
-///
-/// Ids are dense and monotone and the graph is append-only, so a snapshot
-/// taken before the backward is still valid while the backward appends: the
-/// nodes it describes never move and never change.
-#[derive(Clone, Debug, Default)]
-pub struct Topology {
-    nodes: Vec<Node>,
-    numeric: Vec<NumericContract>,
-    is_param: Vec<bool>,
-    dtype: Vec<Dtype>,
-}
-impl Topology {
-    pub fn of(graph: &EGraph) -> Self {
-        let n = graph.len();
-        let mut nodes = Vec::with_capacity(n);
-        let mut numeric = Vec::with_capacity(n);
-        let mut dtype = Vec::with_capacity(n);
-        let mut is_param = vec![false; n];
-        for (i, slot) in is_param.iter_mut().enumerate() {
-            let id = Id(i as u32);
-            let node = graph.node(id);
-            let external = matches!(
-                &node.op,
-                Op::Logical(Logical::Leaf(
-                    LeafKind::Param { .. } | LeafKind::Buffer { .. }
-                ))
-            );
-            // Only a float leaf is differentiable. An index buffer is `U32`
-            // and `Gather`'s adjoint correctly hands it `None`; marking it
-            // requires-grad would starve it and turn every embedding
-            // backward into an error.
-            *slot = external && graph.facts(id).dtype.is_float();
-            nodes.push(node.clone());
-            numeric.push(graph.facts(id).numeric);
-            dtype.push(graph.facts(id).dtype);
-        }
-        Self {
-            nodes,
-            numeric,
-            is_param,
-            dtype,
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.nodes.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.nodes.is_empty()
-    }
-
-    pub fn node(&self, id: Val) -> &Node {
-        &self.nodes[id.index()]
-    }
-
-    pub fn numeric(&self, id: Val) -> NumericContract {
-        self.numeric[id.index()]
-    }
-
-    pub fn dtype(&self, id: Val) -> Dtype {
-        self.dtype[id.index()]
-    }
-
-    /// An externally supplied leaf is where `requires_grad` originates;
-    /// everything else is derived, never annotated.
-    ///
-    /// A float `Buffer` or `Param` qualifies; a `Leaf::Const` does not. An
-    /// integer leaf is an index, never a differentiable value.
-    pub fn is_param(&self, id: Val) -> bool {
-        self.is_param[id.index()]
-    }
-
-    /// Operands the adjoint walk descends into.
-    ///
-    /// A `Union` in the forward means a macro op's `defn` was unioned with
-    /// its sugar at construction. Autograd runs pre-saturation, so it
-    /// descends into operand 0 only — the adjoint is taken once, over one
-    /// member of the class.
-    pub fn operands(&self, id: Val) -> Children {
-        let node = &self.nodes[id.index()];
-        match node.op {
-            Op::Union(..) => node.children.iter().take(1).copied().collect(),
-            _ => node.children.clone(),
-        }
-    }
-}
-/// The shipped autograd.
-#[derive(Default, Debug, Clone)]
-pub struct Reverse {
-    topo: Option<Arc<Topology>>,
-    custom: Option<Arc<CustomRegistry>>,
-}
-
-impl Reverse {
-    /// A `Reverse` with no topology. [`Autograd::backward`] on it reports
-    /// that it needs one; use [`Reverse::over`] or [`backward_into`].
-    pub const fn new() -> Self {
-        Self {
-            topo: None,
-            custom: None,
-        }
-    }
-
-    /// Snapshot `graph`'s structure so the walk can descend it.
-    pub fn over(graph: &EGraph) -> Self {
-        Self {
-            topo: Some(Arc::new(Topology::of(graph))),
-            custom: None,
-        }
+// Equivalent class members contribute the same gradient; visit only one.
+fn operands(graph: &EGraph, id: Id) -> Children {
+    let node = graph.node(id);
+    match node.op {
+        Op::Union(..) => node.children.iter().take(1).copied().collect(),
+        _ => node.children.clone(),
     }
 }
 
-impl Autograd for Reverse {
-    fn adjoints(&self) -> &'static [Adjoint] {
-        crate::adjoints::ADJOINTS
-    }
-
-    fn backward(
-        &self,
-        tape: &mut dyn Tape,
-        root: Val,
-        seed: Val,
-        wrt: &[Val],
-    ) -> Result<Vec<Option<Val>>> {
-        let topo = self.topo.as_deref().ok_or_else(|| {
-            Error::Plan(
-                "Reverse needs the primal topology: `Tape` exposes no children, \
-                 so build it with Reverse::over(&graph) or call backward_into"
-                    .into(),
-            )
-        })?;
-        walk(topo, self.custom.as_deref(), tape, root, seed, wrt)
-    }
-}
-
-/// Build the backward for `root` into the same graph the forward lives in,
-/// and return one gradient per entry of `wrt`.
-///
-/// Every returned entry is `Some`: a `wrt` that receives no gradient is an
-/// `Err` naming it, never a `None` the caller has to interpret. The `Option`
-/// survives only because [`Autograd::backward`] is declared with it.
-///
-/// The caller then calls `graph.add_root(g)` for every produced gradient:
-/// forward and backward are one graph with one root set, which is what makes
-/// "save this activation" versus "recompute it" the extractor's
-/// materialization bit rather than a checkpointing pass anybody writes.
+/// Append the backward graph and return a gradient for every requested value.
+/// An unreachable value or a missing adjoint is an error.
 pub fn backward_into(
     graph: &mut EGraph,
-    caps: &Caps,
-    root: Id,
-    seed: Id,
-    wrt: &[Id],
-) -> Result<Vec<Option<Id>>> {
-    backward_into_with(graph, caps, root, seed, wrt, &CustomRegistry::default())
-}
-
-/// [`backward_into`] with a registry of user-supplied backwards.
-pub fn backward_into_with(
-    graph: &mut EGraph,
-    _caps: &Caps,
     root: Id,
     seed: Id,
     wrt: &[Id],
     custom: &CustomRegistry,
-) -> Result<Vec<Option<Id>>> {
-    let topo = Topology::of(graph);
-    let mut tape = GraphTape::new(graph);
-    walk(&topo, Some(custom), &mut tape, root, seed, wrt)
-}
-
-fn walk(
-    topo: &Topology,
-    custom: Option<&CustomRegistry>,
-    tape: &mut dyn Tape,
-    root: Val,
-    seed: Val,
-    wrt: &[Val],
-) -> Result<Vec<Option<Val>>> {
-    let n = topo.len();
+) -> Result<Vec<Id>> {
+    // Backward only appends nodes. The original prefix remains the primal.
+    let n = graph.len();
     if root.index() >= n {
         return Err(Error::Plan(format!(
             "backward root {root} is not in the graph"
@@ -219,7 +51,7 @@ fn walk(
             continue;
         }
         reach[id.index()] = true;
-        for c in topo.operands(id) {
+        for c in operands(graph, id) {
             stack.push(c);
         }
     }
@@ -232,7 +64,7 @@ fn walk(
         if w.index() < n
             && reach[w.index()]
             && !matches!(
-                &topo.node(*w).op,
+                &graph.node(*w).op,
                 Op::Logical(Logical::Leaf(
                     LeafKind::Const { .. } | LeafKind::Uniform { .. }
                 ))
@@ -246,7 +78,14 @@ fn walk(
             continue;
         }
         let id = Id(i as u32);
-        if needs[i] || topo.is_param(id) || topo.operands(id).iter().any(|c| needs[c.index()]) {
+        let parameter = graph.facts(id).dtype.is_float()
+            && matches!(
+                graph.node(id).op,
+                Op::Logical(Logical::Leaf(
+                    LeafKind::Param { .. } | LeafKind::Buffer { .. }
+                ))
+            );
+        if needs[i] || parameter || operands(graph, id).iter().any(|c| needs[c.index()]) {
             needs[i] = true;
         }
     }
@@ -254,7 +93,7 @@ fn walk(
         // Nothing on the tape from any `wrt` to the root. That is never a
         // silent empty answer: every requested value is reported by name.
         return Err(
-            first_missing(topo, &reach, &needs, wrt, &FxHashMap::default()).unwrap_or_else(|| {
+            first_missing(graph, &reach, &needs, wrt, &FxHashMap::default()).unwrap_or_else(|| {
                 Error::Plan(format!(
                     "backward from {root} reached no requires-grad value"
                 ))
@@ -269,7 +108,7 @@ fn walk(
         if !reach[i] || !needs[i] {
             continue;
         }
-        for c in topo.operands(Id(i as u32)) {
+        for c in operands(graph, Id(i as u32)) {
             if needs[c.index()] {
                 pending[c.index()] += 1;
             }
@@ -287,8 +126,10 @@ fn walk(
         let grad = *grads
             .get(&id)
             .ok_or_else(|| Error::Plan(format!("node {id} fired without an adjoint")))?;
-        let operands = topo.operands(id);
-        let targets = adjoint_of_node(topo, custom, tape, id, grad, &operands)?;
+        let operands = operands(graph, id);
+        let node = graph.node(id).clone();
+        let mut tape = GraphTape::new(graph);
+        let targets = adjoint_of_node(&node, custom, &mut tape, id, grad, &operands)?;
 
         for (slot, child) in operands.iter().copied().enumerate() {
             if !needs[child.index()] {
@@ -311,7 +152,7 @@ fn walk(
     // 5. Every requested value must have received a gradient, and a missing
     //    one is reported by name: a `None` cannot distinguish "not on the
     //    tape" from "a rule dropped this operand".
-    if let Some(e) = first_missing(topo, &reach, &needs, wrt, &grads) {
+    if let Some(e) = first_missing(graph, &reach, &needs, wrt, &grads) {
         return Err(e);
     }
 
@@ -324,13 +165,13 @@ fn walk(
         }
     }
 
-    Ok(wrt.iter().map(|v| grads.get(v).copied()).collect())
+    Ok(wrt.iter().map(|v| grads[v]).collect())
 }
 
 /// The first requested value that received no gradient, as the error naming
 /// it and saying why. `None` when every entry of `wrt` has one.
 fn first_missing(
-    topo: &Topology,
+    graph: &EGraph,
     reach: &[bool],
     needs: &[bool],
     wrt: &[Val],
@@ -339,13 +180,13 @@ fn first_missing(
     let w = *wrt.iter().find(|w| !grads.contains_key(w))?;
     Some(Error::Plan(format!(
         "no gradient for {w}: {}",
-        why_no_gradient(topo, reach, needs, w)
+        why_no_gradient(graph, reach, needs, w)
     )))
 }
 
 /// Why `w` has no gradient, in the caller's terms.
-fn why_no_gradient(topo: &Topology, reach: &[bool], needs: &[bool], w: Val) -> String {
-    if w.index() >= topo.len() {
+fn why_no_gradient(graph: &EGraph, reach: &[bool], needs: &[bool], w: Val) -> String {
+    if w.index() >= reach.len() {
         return "it is not a value in this graph".into();
     }
     if !reach[w.index()] {
@@ -354,14 +195,14 @@ fn why_no_gradient(topo: &Topology, reach: &[bool], needs: &[bool], w: Val) -> S
             .into();
     }
     if let Op::Logical(Logical::Leaf(LeafKind::Const { .. } | LeafKind::Uniform { .. })) =
-        &topo.node(w).op
+        &graph.node(w).op
     {
         return "it is a constant leaf; only Param and Buffer leaves carry a gradient".into();
     }
-    if !topo.dtype(w).is_float() {
+    if !graph.facts(w).dtype.is_float() {
         return format!(
             "it has dtype {:?}, which is an index or a mask, not a differentiable value",
-            topo.dtype(w)
+            graph.facts(w).dtype
         );
     }
     if !needs[w.index()] {
@@ -373,22 +214,18 @@ fn why_no_gradient(topo: &Topology, reach: &[bool], needs: &[bool], w: Val) -> S
 }
 
 fn adjoint_of_node(
-    topo: &Topology,
-    custom: Option<&CustomRegistry>,
+    node: &Node,
+    custom: &CustomRegistry,
     tape: &mut dyn Tape,
     id: Val,
     grad: Val,
     operands: &[Val],
 ) -> Result<Grads> {
-    let node = topo.node(id);
-
-    if let Some(entry) = custom.and_then(|c| c.get(id)) {
+    if let Some(entry) = custom.get(&id) {
         return entry.invoke(tape, node, grad, operands, id);
     }
 
     match &node.op {
-        // The sugar and its `defn` are one class; the adjoint is taken once,
-        // over operand 0.
         Op::Union(..) => Ok(smallvec::smallvec![Some(grad)]),
 
         Op::Launch(_) => Err(Error::Plan(format!(

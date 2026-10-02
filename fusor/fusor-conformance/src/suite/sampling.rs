@@ -1,4 +1,4 @@
-//! Top-k and the two samplers, entering through `Launch::Ext`.
+//! Top-k and the two samplers.
 //!
 //! Sampling is the one area whose output is not a function of its input alone,
 //! so every case here pins something that *is* deterministic: the top-k
@@ -11,7 +11,9 @@ use fusor::sampling::{Mirostat2Sampler, StandardSamplerParams, sample_async, top
 use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
 
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fill_indices, fuzz_case};
+use crate::harness::{
+    CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fill_indices, member_sweep,
+};
 use crate::suite::support::{Domain, expect_values, graph_of, read, upload};
 
 /// The fixed vocabulary of the hand-authored tie table.
@@ -58,104 +60,68 @@ fn upload_logits(session: &Session, values: &[f32]) -> Result<(fusor::Graph, Ten
 }
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
-    cases.push_case(fuzz_case(
-        "sampling",
-        "top_k_pairs_k1",
-        TOP_K_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            top_k_case(s, shape[0] as usize, 1, seed).await
-        },
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    let mut cases = Cases::new("sampling");
+    cases.fuzz("top_k_pairs_k1", TOP_K_SPEC, async move |s, shape, seed| {
+        top_k_case(s, shape[0] as usize, 1, seed).await
+    });
+    cases.fuzz(
         "top_k_pairs_sampled_k",
         TOP_K_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
+        async move |s, shape, seed| {
             let vocab = shape[0] as usize;
             let k = Rng::new(seed ^ 0x5eed).range(1, vocab as u64) as usize;
             top_k_case(s, vocab, k, seed).await
         },
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    );
+    cases.fuzz(
         "top_k_pairs_full_vocabulary",
         TOP_K_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            top_k_case(s, shape[0] as usize, shape[0] as usize, seed).await
-        },
-    ));
-    cases.push(
-        "sampling",
-        "top_k_pairs_breaks_ties_by_larger_token_id",
-        tie_rule,
+        async move |s, shape, seed| top_k_case(s, shape[0] as usize, shape[0] as usize, seed).await,
     );
-    cases.push_case(fuzz_case(
-        "sampling",
-        "sample_standard_token",
-        VOCAB_SPEC,
-        standard_case,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    cases.push("top_k_pairs_breaks_ties_by_larger_token_id", tie_rule);
+    cases.fuzz("sample_standard_token", VOCAB_SPEC, standard_case);
+    cases.fuzz(
         "sample_standard_token_at_zero_temperature_is_the_argmax",
         VOCAB_SPEC,
         greedy_case,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    );
+    cases.fuzz(
         "sample_standard_token_respects_top_k",
         VOCAB_SPEC,
         top_k_filter,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    );
+    cases.fuzz(
         "sample_standard_token_respects_top_p",
         VOCAB_SPEC,
         top_p_filter,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    );
+    cases.fuzz(
         "sample_standard_token_respects_min_p",
         VOCAB_SPEC,
         min_p_filter,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    );
+    cases.fuzz(
         "sample_standard_token_applies_the_repetition_penalty",
         VOCAB_SPEC,
         repetition_case,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    );
+    cases.fuzz(
         "sample_standard_token_is_seed_deterministic",
         SEED_SPEC,
         seed_case,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
-        "sample_mirostat2_token",
-        VOCAB_SPEC,
-        mirostat_case,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
-        "sample_mirostat2_token_updates_mu",
-        VOCAB_SPEC,
-        mirostat_mu,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    );
+    cases.fuzz("sample_mirostat2_token", VOCAB_SPEC, mirostat_case);
+    cases.fuzz("sample_mirostat2_token_updates_mu", VOCAB_SPEC, mirostat_mu);
+    cases.fuzz(
         "sample_standard_token_pending_stays_on_device",
         VOCAB_SPEC,
         pending_standard,
-    ));
-    cases.push_case(fuzz_case(
-        "sampling",
+    );
+    cases.fuzz(
         "sample_mirostat2_token_pending_stays_on_device",
         VOCAB_SPEC,
         pending_mirostat,
-    ));
+    );
     cases
 }
 
@@ -197,7 +163,7 @@ async fn tie_rule(session: &Session) -> CaseResult {
     values[3] = 2.0;
     values[9] = 2.0;
     let (_graph, t) = upload_logits(session, &values)?;
-    let (_, indices) = top_k_pairs(&t, 2).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let (_, indices) = top_k_pairs(&t, 2)?;
     let got = read(&indices).await?;
     if got.first().copied() != Some(9.0) || got.get(1).copied() != Some(3.0) {
         return Err(format!(
@@ -219,12 +185,7 @@ async fn standard_case(session: &Session, shape: &[u64], seed: u32) -> CaseResul
         seed: 42,
         ..Default::default()
     };
-    let token = sample_async(&t, params)
-        .await
-        .map_err(|e| -> CaseError { e.to_string().into() })?
-        .to_u32_async()
-        .await
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let token = sample_async(&t, params).await?.to_u32_async().await?;
     if token as usize >= vocab {
         return Err(format!("sampled token {token} is outside a vocabulary of {vocab}").into());
     }
@@ -251,12 +212,7 @@ async fn greedy_case(session: &Session, shape: &[u64], data_seed: u32) -> CaseRe
             seed,
             ..Default::default()
         };
-        let token = sample_async(&t, params)
-            .await
-            .map_err(|e| -> CaseError { e.to_string().into() })?
-            .to_u32_async()
-            .await
-            .map_err(|e| -> CaseError { e.to_string().into() })?;
+        let token = sample_async(&t, params).await?.to_u32_async().await?;
         if token != argmax {
             return Err(format!(
                 "temperature 0 with seed {seed} sampled {token}, not the argmax {argmax}"
@@ -276,18 +232,14 @@ async fn top_k_filter(session: &Session, shape: &[u64], data_seed: u32) -> CaseR
     let allowed: Vec<u32> = host_top_k(&values, k).into_iter().map(|(_, i)| i).collect();
     let (_graph, t) = upload_logits(session, &values)?;
     for seed in 0..16u64 {
+        let _sweep = member_sweep(seed == 0);
         let params = StandardSamplerParams {
             temperature: 1.5,
             top_k: k as u32,
             seed,
             ..Default::default()
         };
-        let token = sample_async(&t, params)
-            .await
-            .map_err(|e| -> CaseError { e.to_string().into() })?
-            .to_u32_async()
-            .await
-            .map_err(|e| -> CaseError { e.to_string().into() })?;
+        let token = sample_async(&t, params).await?.to_u32_async().await?;
         if !allowed.contains(&token) {
             return Err(format!(
                 "top_k = {k} sampled {token}, which is not in the surviving set {allowed:?}"
@@ -307,18 +259,14 @@ async fn top_p_filter(session: &Session, shape: &[u64], data_seed: u32) -> CaseR
     let allowed = nucleus(&values, P);
     let (_graph, t) = upload_logits(session, &values)?;
     for seed in 0..16u64 {
+        let _sweep = member_sweep(seed == 0);
         let params = StandardSamplerParams {
             temperature: 1.0,
             top_p: P,
             seed,
             ..Default::default()
         };
-        let token = sample_async(&t, params)
-            .await
-            .map_err(|e| -> CaseError { e.to_string().into() })?
-            .to_u32_async()
-            .await
-            .map_err(|e| -> CaseError { e.to_string().into() })?;
+        let token = sample_async(&t, params).await?.to_u32_async().await?;
         if !allowed.contains(&token) {
             return Err(format!(
                 "top_p = {P} sampled {token}, which is outside the nucleus {allowed:?}"
@@ -366,18 +314,14 @@ async fn min_p_filter(session: &Session, shape: &[u64], data_seed: u32) -> CaseR
 
     let (_graph, t) = upload_logits(session, &values)?;
     for seed in 0..16u64 {
+        let _sweep = member_sweep(seed == 0);
         let params = StandardSamplerParams {
             temperature: 1.0,
             min_p: MIN_P,
             seed,
             ..Default::default()
         };
-        let token = sample_async(&t, params)
-            .await
-            .map_err(|e| -> CaseError { e.to_string().into() })?
-            .to_u32_async()
-            .await
-            .map_err(|e| -> CaseError { e.to_string().into() })?;
+        let token = sample_async(&t, params).await?.to_u32_async().await?;
         if !allowed.contains(&token) {
             return Err(format!(
                 "min_p = {MIN_P} sampled {token}, which is below {MIN_P} * p_max; the \
@@ -409,12 +353,7 @@ async fn repetition_case(session: &Session, shape: &[u64], seed: u32) -> CaseRes
         seed: 5,
         ..Default::default()
     };
-    let first = sample_async(&t, plain)
-        .await
-        .map_err(|e| -> CaseError { e.to_string().into() })?
-        .to_u32_async()
-        .await
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let first = sample_async(&t, plain).await?.to_u32_async().await?;
     if first != seen as u32 {
         return Err(format!("the unpenalized argmax is {first}, want {seen}").into());
     }
@@ -425,12 +364,7 @@ async fn repetition_case(session: &Session, shape: &[u64], seed: u32) -> CaseRes
         seed: 5,
         ..Default::default()
     };
-    let second = sample_async(&t, penalized)
-        .await
-        .map_err(|e| -> CaseError { e.to_string().into() })?
-        .to_u32_async()
-        .await
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let second = sample_async(&t, penalized).await?.to_u32_async().await?;
     if second == first {
         return Err(format!(
             "a repetition penalty of 4 left the argmax at {first}; the penalty must divide \
@@ -454,13 +388,13 @@ async fn seed_case(session: &Session, shape: &[u64], data_seed: u32) -> CaseResu
             ..Default::default()
         };
         sample_async(&t, params)
-            .await
-            .map_err(|e| -> CaseError { e.to_string().into() })?
+            .await?
             .to_u32_async()
             .await
-            .map_err(|e| -> CaseError { e.to_string().into() })
+            .map_err(Into::into)
     };
     let a = draw(99).await?;
+    let _sweep = member_sweep(false);
     let b = draw(99).await?;
     if a != b {
         return Err(format!("the same seed drew {a} then {b}").into());
@@ -489,13 +423,7 @@ async fn mirostat_case(session: &Session, shape: &[u64], seed: u32) -> CaseResul
     let (_graph, t) = upload_logits(session, &values)?;
     let mut sampler = Mirostat2Sampler::new(5.0, 0.1);
     for _ in 0..4 {
-        let token = sampler
-            .sample_async(&t)
-            .await
-            .map_err(|e| -> CaseError { e.to_string().into() })?
-            .to_u32_async()
-            .await
-            .map_err(|e| -> CaseError { e.to_string().into() })?;
+        let token = sampler.sample_async(&t).await?.to_u32_async().await?;
         if token as usize >= vocab {
             return Err(format!("mirostat sampled the out-of-range token {token}").into());
         }
@@ -515,10 +443,7 @@ async fn mirostat_mu(session: &Session, shape: &[u64], seed: u32) -> CaseResult 
         return Err(format!("mu starts at {start}, want 2 * tau = 6").into());
     }
     for _ in 0..8 {
-        sampler
-            .sample_async(&t)
-            .await
-            .map_err(|e| -> CaseError { e.to_string().into() })?;
+        sampler.sample_async(&t).await?;
     }
     if (sampler.mu - start).abs() < 1e-6 {
         return Err(format!(
@@ -544,8 +469,7 @@ async fn pending_standard(session: &Session, shape: &[u64], seed: u32) -> CaseRe
             ..Default::default()
         },
     )
-    .await
-    .map_err(|e| -> CaseError { e.to_string().into() })?;
+    .await?;
     check_pending(&pending.value).await
 }
 
@@ -553,10 +477,7 @@ async fn pending_mirostat(session: &Session, shape: &[u64], seed: u32) -> CaseRe
     let values = fuzzed_logits(seed, shape[0] as usize).await;
     let (_graph, t) = upload_logits(session, &values)?;
     let mut sampler = Mirostat2Sampler::new(5.0, 0.1);
-    let pending = sampler
-        .sample_async(&t)
-        .await
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let pending = sampler.sample_async(&t).await?;
     check_pending(&pending.value).await
 }
 

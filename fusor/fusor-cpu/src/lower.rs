@@ -11,45 +11,39 @@ use fusor_ir::egraph::Id;
 use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
     Addr, BufferAccess, BufferDecl, Builtin, ElementType, KernelIr, MemoryLevel, QuantizedView,
-    ScalarElement, Source, StorageView, TileExpr, TileExprKind, TileLayout, TileLiteral,
-    WorkgroupAxis,
+    ScalarElement, Source, Stmt, StorageView, TileExpr, TileExprKind, TileLayout, WorkgroupAxis,
 };
-use fusor_ir::ir::launch::{
-    AccessPlan, AddressMap, AddressTerm, Family, Launch, Operand, SchedPoint,
-};
+use fusor_ir::ir::launch::{AddressMap, Family, Launch, Operand, SchedPoint};
 use fusor_ir::ir::{Node, Op};
-use fusor_ir::scalar::{BinOp, ScalarExpr, ScalarKind};
-use fusor_ir::shape::{AxisGroup, Dim, Layout, SymId};
+use fusor_ir::scalar::{ScalarExpr, ScalarKind};
+use fusor_ir::shape::{Dim, Layout};
 use fusor_ir::target::LowerCtx;
-use smallvec::SmallVec;
+use fusor_tile::build::{
+    Kernel, const_splat, qlayout_of, quantized_words, scalar_element, splat_literal,
+};
 use std::sync::Arc;
 
 /// Lanes per workgroup for a node whose schedule point names no lane group.
 /// One grid point is one workgroup; `block` lanes are walked in chunks of the
-/// register width.
-pub(crate) fn default_block(caps: &Caps) -> u32 {
-    // A CPU "block" is an internal native loop chunk, not a GPU workgroup
-    // capability. Keeping it here avoids exposing 256 GPU-style schedule
-    // alternatives merely to let one Cranelift call process 256 elements.
-    let _ = caps;
-    256
-}
+/// register width. A CPU "block" is an internal native loop chunk, not a GPU
+/// workgroup capability, so no schedule alternative spans it.
+pub(crate) const DEFAULT_BLOCK: u32 = 256;
 
 pub(crate) fn lower(
     caps: &Caps,
     node: &Node,
-    id: Id,
     theta: SchedPoint,
     cx: &LowerCtx<'_>,
 ) -> Result<KernelIr> {
-    let _ = id;
     let Op::Launch(op) = &node.op else {
         return Err(Error::Legality(
             "the CPU target can only lower Launch nodes".into(),
         ));
     };
     match op {
-        Launch::Map { .. } | Launch::Fold { .. } => map_fold::lower(caps, node, theta, cx),
+        Launch::Map { .. } | Launch::Fold { .. } | Launch::StreamFold { .. } => {
+            map_fold::lower(caps, node, theta, cx)
+        }
         Launch::Contract { family, .. } => {
             if *family == Family::Coop {
                 // Caps report no cooperative config, so this alternative is never selectable
@@ -57,13 +51,13 @@ pub(crate) fn lower(
                     "Family::Coop is not lowerable on the CPU target".into(),
                 ));
             }
-            contract::lower(caps, node, theta, cx)
+            contract::lower(node, cx)
         }
-        Launch::Gather { .. } | Launch::Scatter { .. } => {
-            gather_scatter::lower(caps, node, theta, cx)
-        }
-        Launch::Region { members, .. } => compose(caps, members, theta, cx, "cpu_region"),
-        Launch::Ext { def, .. } => ext::lower(*def, node, theta),
+        Launch::Gather { .. } | Launch::Scatter { .. } => gather_scatter::lower(node, theta, cx),
+        // Members are read by id: the last one shares the slab's class, and
+        // selecting it would lower the slab again.
+        Launch::Slab { members, .. } => compose(caps, members, theta, cx, "cpu_slab"),
+        Launch::Group { members, .. } => compose(caps, members, theta, cx, "cpu_group"),
     }
 }
 
@@ -104,7 +98,7 @@ fn compose(
     let binds = Binds::build(cx)?;
     let mut kernels = Vec::with_capacity(members.len());
     for m in members {
-        let selected = cx.selected(*m);
+        let selected = *m;
         let node = cx.graph.node(selected);
         // Each member is scheduled at its own point, not the composite's.
         let member_theta = cx
@@ -114,7 +108,7 @@ fn compose(
             .get(&selected)
             .copied()
             .unwrap_or(SchedPoint::Point);
-        kernels.push((*m, lower(caps, node, selected, member_theta, cx)?));
+        kernels.push((*m, lower(caps, node, member_theta, cx)?));
     }
     if kernels
         .iter()
@@ -145,26 +139,20 @@ fn compose(
     // Only a store aimed at the launch root is redirected: a member that
     // writes several distinct buffers keeps every one of them.
     let root_buffer = binds.of(cx.launch.root).ok();
+    let b = Kernel::new();
     let mut body = Vec::new();
     for (id, kernel) in kernels {
         // A member with no buffer of its own stands for the composite's value
         // and keeps writing the launch root's buffer.
-        let own = binds.of(id).ok().map(|b| StorageView {
-            layout: b.layout.clone(),
-            buffer: b,
-            offset: 0,
-        });
+        let own = binds.of(id).ok().map(|buffer| view(&buffer));
         let mut stmts = kernel.body;
         if let Some(view) = own {
             redirect_stores(&mut stmts, root_buffer.as_ref(), &view);
         }
         if kernel.grid[0] < grid[0] {
-            let pid = TileExpr::new(
-                TileExprKind::Builtin(Builtin::ProgramId(WorkgroupAxis::X)),
-                u32_ty(),
-            );
-            stmts = vec![fusor_ir::ir::kernel::Stmt::If {
-                condition: cmp(fusor_ir::scalar::CmpOp::Lt, pid, lit_u32(kernel.grid[0])),
+            let pid = b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
+            stmts = vec![Stmt::If {
+                condition: b.lt(pid, b.u32(kernel.grid[0])),
                 accept: stmts,
                 reject: Vec::new(),
             }];
@@ -172,176 +160,47 @@ fn compose(
         body.extend(stmts);
     }
 
-    Ok(KernelIr {
-        buffers: binds.buffers,
-        grid,
-        block,
-        body,
-        byte_arena: None,
-        name,
-    })
+    Ok(binds.finish(name, grid, block, body))
 }
 
 /// Point every store aimed at `from` (the launch root's buffer) at `view`
 /// instead, leaving addresses, masks and values alone. With `from` absent —
 /// the root owns no buffer — every store moves.
-fn redirect_stores(
-    stmts: &mut [fusor_ir::ir::kernel::Stmt],
-    from: Option<&Arc<BufferDecl>>,
-    view: &StorageView,
-) {
-    use fusor_ir::ir::kernel::Stmt;
-    let hits = |dst: &StorageView| match from {
-        Some(root) => Arc::ptr_eq(&dst.buffer, root),
-        None => true,
-    };
-    for s in stmts {
-        match s {
-            Stmt::Store { dst, .. } | Stmt::AtomicAdd { dst, .. } | Stmt::CoopStore { dst, .. } => {
-                if hits(dst) {
-                    *dst = view.clone();
-                }
-            }
-            Stmt::If { accept, reject, .. } => {
-                redirect_stores(accept, from, view);
-                redirect_stores(reject, from, view);
-            }
-            Stmt::Loop { body, .. } => redirect_stores(body, from, view),
-            _ => {}
+fn redirect_stores(stmts: &mut [Stmt], from: Option<&Arc<BufferDecl>>, view: &StorageView) {
+    Stmt::walk_mut(stmts, &mut |s| {
+        if let Stmt::Store { dst, .. } | Stmt::AtomicAdd { dst, .. } | Stmt::CoopStore { dst, .. } =
+            s
+            && from.is_none_or(|root| Arc::ptr_eq(&dst.buffer, root))
+        {
+            *dst = view.clone();
         }
+    });
+}
+
+/// A storage view of a whole bound buffer.
+pub(crate) fn view(buffer: &Arc<BufferDecl>) -> StorageView {
+    StorageView {
+        buffer: Arc::clone(buffer),
+        offset: 0,
+        layout: buffer.layout.clone(),
     }
 }
 
-/// `Launch::Ext` lowering: the one escape hatch out of the closed `Logical`/`Launch` enums.
-pub(crate) mod ext {
-    use super::*;
-    use fusor_ir::ir::{OpDefId, OpDefRegistry};
-    use std::sync::RwLock;
-
-    /// The registry `Launch::Ext` lowering resolves `OpDefId` against.
-    ///
-    /// The embedder installs the same registry here that it installed on the
-    /// e-graph's semantics. Registration order is id order and must match.
-    static DEFS: RwLock<Option<OpDefRegistry>> = RwLock::new(None);
-
-    /// The installed registry, if the embedder installed one.
-    pub(crate) fn installed() -> Option<OpDefRegistry> {
-        DEFS.read()
-            .expect("the OpDef registry lock is poisoned")
-            .clone()
-    }
-
-    /// Lower one registered extension op through its `"cpu"` row.
-    pub(crate) fn lower(def: OpDefId, node: &Node, theta: SchedPoint) -> Result<KernelIr> {
-        let registry = installed().ok_or_else(|| {
-            Error::Legality(format!(
-                "{def:?} is an extension op, but no OpDefRegistry is installed on the \
-                 CPU target; call fusor_cpu::lower::ext::install"
-            ))
-        })?;
-        let entry = registry
-            .get(def)
-            .ok_or_else(|| Error::Legality(format!("no OpDef is registered as {def:?}")))?;
-        let lower = entry
-            .lower_per_target
-            .iter()
-            .find(|(target, _)| *target == "cpu")
-            .map(|(_, f)| *f)
-            .ok_or_else(|| {
-                Error::Legality(format!(
-                    "OpDef \"{}\" declares no \"cpu\" lowering; its \
-                     lower_per_target names {:?}",
-                    entry.name,
-                    entry
-                        .lower_per_target
-                        .iter()
-                        .map(|(t, _)| *t)
-                        .collect::<Vec<_>>()
-                ))
-            })?;
-        lower(node, &theta)
-    }
-}
-
-pub(crate) fn u32_ty() -> ElementType {
-    ElementType::Scalar(ScalarElement::U32)
-}
-pub(crate) fn bool_ty() -> ElementType {
-    ElementType::Scalar(ScalarElement::Bool)
-}
-
+/// A logical dtype's dense element; a quantized value has none.
 pub(crate) fn elem_of(d: Dtype) -> Result<ScalarElement> {
-    Ok(match d {
-        Dtype::F32 => ScalarElement::F32,
-        Dtype::F16 => ScalarElement::F16,
-        Dtype::BF16 => ScalarElement::BF16,
-        Dtype::U32 => ScalarElement::U32,
-        Dtype::I32 => ScalarElement::I32,
-        Dtype::Q(_) => {
-            return Err(Error::Legality(
-                "a quantized value has no dense element type".into(),
-            ));
-        }
-    })
-}
-
-pub(crate) fn lit_u32(v: u32) -> TileExpr {
-    TileExpr::new(TileExprKind::Literal(TileLiteral::U32(v)), u32_ty())
-}
-
-pub(crate) fn lit_true() -> TileExpr {
-    TileExpr::new(TileExprKind::Literal(TileLiteral::Bool(true)), bool_ty())
-}
-
-pub(crate) fn lit_f32(v: f32) -> TileExpr {
-    TileExpr::new(
-        TileExprKind::Literal(TileLiteral::F32(v.to_bits())),
-        ElementType::Scalar(ScalarElement::F32),
-    )
-}
-
-pub(crate) fn bin(
-    op: fusor_ir::scalar::BinOp,
-    a: TileExpr,
-    b: TileExpr,
-    ty: ElementType,
-) -> TileExpr {
-    TileExpr::new(
-        TileExprKind::Binary {
-            op,
-            left: a,
-            right: b,
-            numeric: NumericContract::RELAXED,
-        },
-        ty,
-    )
-}
-
-pub(crate) fn cmp(op: fusor_ir::scalar::CmpOp, a: TileExpr, b: TileExpr) -> TileExpr {
-    TileExpr::new(
-        TileExprKind::Compare {
-            op,
-            left: a,
-            right: b,
-        },
-        bool_ty(),
-    )
+    match d {
+        Dtype::Q(_) => Err(Error::Legality(
+            "a quantized value has no dense element type".into(),
+        )),
+        d => Ok(scalar_element(d)),
+    }
 }
 
 /// The global element index this lane owns:
 /// `program_id.x * BLOCK + lane`.
-pub(crate) fn global_lane(block: u32) -> TileExpr {
-    let pid = TileExpr::new(
-        TileExprKind::Builtin(Builtin::ProgramId(WorkgroupAxis::X)),
-        u32_ty(),
-    );
-    let lane = TileExpr::new(TileExprKind::Builtin(Builtin::Lane), u32_ty());
-    bin(
-        fusor_ir::scalar::BinOp::Add,
-        bin(fusor_ir::scalar::BinOp::Mul, pid, lit_u32(block), u32_ty()),
-        lane,
-        u32_ty(),
-    )
+pub(crate) fn global_lane(b: &Kernel, block: u32) -> TileExpr {
+    let pid = b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
+    b.add(b.mul(pid, b.u32(block)), b.builtin(Builtin::Lane))
 }
 
 /// Hand back the same `Arc` for two structurally equal buffer decls.
@@ -385,7 +244,7 @@ impl Binds {
         let mut buffers = Vec::with_capacity(bindings.len() + 1);
         buffers.push(intern_decl(BufferDecl {
             binding: 0,
-            element: u32_ty(),
+            element: ScalarElement::U32.element(),
             layout: TileLayout::contiguous(
                 MemoryLevel::Storage,
                 &[(cx.symbols.len().max(1)) as u32],
@@ -407,9 +266,8 @@ impl Binds {
                     let layout = qlayout_of(cx, b.value).unwrap_or(QLayout::Native);
                     let extents = const_extents(cx, &facts.shape)?;
                     let elems: u64 = extents.iter().map(|e| *e as u64).product();
-                    let blocks = elems.div_ceil(u64::from(fmt.block_elements()).max(1));
-                    let words = (blocks * u64::from(fmt.block_bytes(layout))).div_ceil(4);
-                    (u32_ty(), vec![words as u32])
+                    let words = quantized_words(fmt, layout, elems);
+                    (ScalarElement::U32.element(), vec![words as u32])
                 }
                 d => {
                     let extents = const_extents(cx, &facts.shape)?;
@@ -438,6 +296,41 @@ impl Binds {
         Ok(Self { buffers, by_value })
     }
 
+    /// The kernel over this buffer table.
+    pub(crate) fn finish(
+        self,
+        name: &'static str,
+        grid: [u32; 3],
+        block: u32,
+        body: Vec<Stmt>,
+    ) -> KernelIr {
+        KernelIr {
+            buffers: self.buffers,
+            grid,
+            block,
+            body,
+            byte_arena: None,
+            name,
+        }
+    }
+
+    /// [`Translate`] `e` with this table's uniform block (binding 0).
+    pub(crate) fn translate(
+        &self,
+        b: &Kernel,
+        args: &[TileExpr],
+        coords: &[TileExpr],
+        e: &ScalarExpr,
+    ) -> Result<TileExpr> {
+        Translate {
+            b,
+            args,
+            coords,
+            uniforms: self.buffers.first().cloned(),
+        }
+        .run(e)
+    }
+
     pub(crate) fn of(&self, value: Id) -> Result<Arc<BufferDecl>> {
         let idx = self
             .by_value
@@ -455,25 +348,17 @@ impl Binds {
     }
 }
 
-const DERIVED_STRIDE: SymId = SymId(u32::MAX);
-
 /// Resolve a dimension at the concrete binding this CPU artifact is compiled
 /// for. The executable cache includes these values, so embedding them in the
 /// native loop nest cannot reuse code for a different shape.
 pub(crate) fn resolve_dim(cx: &LowerCtx<'_>, dim: Dim) -> Result<u32> {
-    let value = match dim {
-        Dim::Const(value) => value,
-        Dim::Sym(symbol) if symbol != DERIVED_STRIDE => cx
-            .dim_bindings
-            .iter()
-            .find_map(|(bound, value)| (*bound == symbol).then_some(*value))
-            .ok_or_else(|| Error::Legality(format!("dim {symbol} is unbound at CPU lowering")))?,
-        Dim::Sym(_) => {
-            return Err(Error::Legality(
-                "a derived row-major stride is not a standalone extent".into(),
-            ));
-        }
-    };
+    let value = dim
+        .evaluate(&mut |symbol| {
+            cx.dim_bindings
+                .iter()
+                .find_map(|(bound, value)| (*bound == symbol).then_some(*value))
+        })
+        .ok_or_else(|| Error::Legality(format!("dim {dim} is unbound at CPU lowering")))?;
     u32::try_from(value)
         .map_err(|_| Error::Legality(format!("CPU dimension {value} exceeds u32 indexing")))
 }
@@ -482,73 +367,42 @@ pub(crate) fn const_extents(cx: &LowerCtx<'_>, shape: &[Dim]) -> Result<Vec<u32>
     shape.iter().map(|dim| resolve_dim(cx, *dim)).collect()
 }
 
-/// Concrete offset, extents and strides for the current artifact. Contiguous
-/// layouts use `DERIVED_STRIDE` after a symbolic axis; derive those strides
-/// from the now-concrete following extents just as session allocation does.
+/// Concrete offset, extents and strides for the current artifact.
 pub(crate) fn resolved_layout(
     cx: &LowerCtx<'_>,
     layout: &Layout,
 ) -> Result<(u32, Vec<u32>, Vec<u32>)> {
     let offset = resolve_dim(cx, layout.offset())?;
     let extents = const_extents(cx, layout.shape())?;
-    let strides = layout
-        .strides()
-        .iter()
-        .enumerate()
-        .map(|(axis, stride)| match stride {
-            Dim::Sym(symbol) if *symbol == DERIVED_STRIDE => extents[axis + 1..]
-                .iter()
-                .try_fold(1u32, |product, extent| product.checked_mul(*extent))
-                .ok_or_else(|| Error::Legality("CPU derived stride exceeds u32 indexing".into())),
-            other => resolve_dim(cx, *other),
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let strides = const_extents(cx, layout.strides())?;
     Ok((offset, extents, strides))
 }
 
-/// A masked load of operand `slot` at `index`.
-pub(crate) fn load(buffer: Arc<BufferDecl>, index: TileExpr, mask: TileExpr) -> TileExpr {
-    let element = buffer.element;
-    let layout = buffer.layout.clone();
-    let fill = match element {
-        ElementType::Scalar(ScalarElement::U32) | ElementType::Scalar(ScalarElement::I32) => {
-            lit_u32(0)
-        }
-        _ => lit_f32(0.0),
-    };
-    TileExpr::new(
-        TileExprKind::Load {
-            src: Source::Storage(StorageView {
-                buffer,
-                offset: 0,
-                layout,
-            }),
-            addr: Box::new(Addr::Linear(index)),
-            mask,
-            fill,
-        },
-        element,
-    )
-}
-
-/// One operand's value at `index`.
-///
-/// A `Leaf::Const` is folded into the kernel: `derive_bindings` never emits a
-/// binding for one.
-pub(crate) fn operand_value(
-    cx: &LowerCtx<'_>,
-    binds: &Binds,
-    src: Id,
+/// A masked load of a whole bound buffer at `index`.
+pub(crate) fn load(
+    b: &Kernel,
+    buffer: Arc<BufferDecl>,
     index: TileExpr,
     mask: TileExpr,
-) -> Result<TileExpr> {
-    Ok(operand_src(cx, binds, src)?.at(index, mask))
+) -> TileExpr {
+    let fill = match buffer.element {
+        ElementType::Scalar(ScalarElement::U32) | ElementType::Scalar(ScalarElement::I32) => {
+            b.u32(0)
+        }
+        _ => b.f32(0.0),
+    };
+    b.load(
+        Source::Storage(view(&buffer)),
+        Addr::Linear(index),
+        mask,
+        fill,
+    )
 }
 
 /// One operand's value at the reading kernel's flat space index, mapped
-/// through the edge's `layout`/`access`. [`operand_value`] is the raw form for
-/// readers that have already computed a storage index themselves.
+/// through the edge's `layout`/`access`.
 pub(crate) fn operand_at(
+    b: &Kernel,
     cx: &LowerCtx<'_>,
     binds: &Binds,
     operand: &Operand,
@@ -556,154 +410,42 @@ pub(crate) fn operand_at(
     space_total: u64,
     mask: TileExpr,
 ) -> Result<TileExpr> {
-    operand_value(
-        cx,
-        binds,
-        operand.src,
-        address_of(cx, operand, flat, space_total)?,
-        mask,
-    )
+    let index = address_of(b, cx, operand, flat, space_total)?;
+    Ok(operand_src(b, cx, binds, operand.src)?.at(b, index, mask))
 }
 
-/// A scatter's four extents, read off the base operand.
-///
-/// `Scatter::space` is the update iteration domain; the destination geometry
-/// has to come from the base operand's own layout, or a scatter into a
-/// 1024-row table from 300 tokens would size itself 300 rows.
-pub(crate) struct ScatterGeometry {
-    /// Product of the base extents before the scattered axis.
-    pub outer: u32,
-    /// Extent of the scattered axis in the base — the destination bins.
-    pub bins: u32,
-    /// Product of the base extents after the scattered axis.
-    pub inner: u32,
-    /// Index count.
-    pub updates: u32,
-}
-
-pub(crate) fn scatter_geometry(
-    cx: &LowerCtx<'_>,
-    space: &fusor_ir::ir::launch::IndexSpace,
-    axis: u32,
-    ops: &[Operand],
-) -> Result<ScatterGeometry> {
-    let axis = axis as usize;
-    let base = ops
-        .first()
-        .ok_or_else(|| Error::Legality("a scatter needs a base operand".into()))?;
-    let dest = const_extents(cx, base.layout.shape())?;
-    if axis >= dest.len() {
-        return Err(Error::Legality(format!(
-            "scatter axis {axis} is outside a rank-{} base",
-            dest.len()
-        )));
-    }
-    // The index operand is rank 1 and its element count is the update count;
-    // reading it there keeps this correct whether `space` is the output space
-    // or the update space.
-    let idx = ops
-        .get(1)
-        .ok_or_else(|| Error::Legality("a scatter needs an index operand".into()))?;
-    let updates = const_extents(cx, idx.layout.shape())?
-        .iter()
-        .product::<u32>();
-    let _ = space;
-    Ok(ScatterGeometry {
-        outer: dest[..axis].iter().product::<u32>().max(1),
-        bins: dest[axis].max(1),
-        inner: dest[axis + 1..].iter().product::<u32>().max(1),
-        updates: updates.max(1),
-    })
-}
-
-/// `flat` run through one operand's [`AddressMap`].
+/// `flat` run through one operand's address map, at this artifact's
+/// concrete binding.
 pub(crate) fn address_of(
+    b: &Kernel,
     cx: &LowerCtx<'_>,
     operand: &Operand,
     flat: TileExpr,
     space_total: u64,
 ) -> Result<TileExpr> {
-    let map = resolved_address_map(cx, operand)?;
-    if map.is_identity_over(space_total) {
-        return Ok(flat);
-    }
-    let mut acc: Option<TileExpr> = (map.offset != 0).then(|| lit_u32(map.offset));
-    for (i, t) in map.terms.iter().enumerate() {
-        let mut e = flat.clone();
-        if t.divisor > 1 {
-            e = bin(BinOp::Div, e, lit_u32(t.divisor), u32_ty());
-        }
-        if map.needs_modulo(i, space_total) {
-            e = bin(BinOp::Rem, e, lit_u32(t.modulus), u32_ty());
-        }
-        if t.stride != 1 {
-            e = bin(BinOp::Mul, e, lit_u32(t.stride), u32_ty());
-        }
-        acc = Some(match acc {
-            Some(a) => bin(BinOp::Add, a, e, u32_ty()),
-            None => e,
-        });
-    }
-    Ok(acc.unwrap_or_else(|| lit_u32(0)))
+    Ok(b.address(&resolved_address_map(cx, operand)?, flat, space_total))
 }
 
+/// The edge's address map at this artifact's concrete binding.
 fn resolved_address_map(cx: &LowerCtx<'_>, operand: &Operand) -> Result<AddressMap> {
     let (offset, extents, strides) = resolved_layout(cx, &operand.layout)?;
-    let groups: SmallVec<[AxisGroup; 4]> = match &operand.access {
-        AccessPlan::Unflatten(map) => map.groups.clone(),
-        _ => extents
-            .into_iter()
-            .zip(strides)
-            .map(|(extent, stride)| AxisGroup::affine(extent, stride))
-            .collect(),
+    let dims = |v: Vec<u32>| {
+        v.into_iter()
+            .map(|e| Dim::Const(u64::from(e)))
+            .collect::<Vec<_>>()
     };
-
-    let mut terms: SmallVec<[AddressTerm; 4]> = SmallVec::new();
-    let mut div_after = 1u64;
-    for group in groups.iter().rev() {
-        let mut below = 1u64;
-        for axis in group.sub_axes.iter().rev() {
-            let divisor = div_after
-                .checked_mul(below)
-                .and_then(|value| u32::try_from(value).ok())
-                .ok_or_else(|| Error::Legality("CPU operand divisor exceeds u32".into()))?;
-            terms.push(AddressTerm {
-                divisor,
-                modulus: axis.extent,
-                stride: axis.stride,
-            });
-            below = below
-                .checked_mul(u64::from(axis.extent))
-                .ok_or_else(|| Error::Legality("CPU operand extent product overflows".into()))?;
-        }
-        div_after = div_after
-            .checked_mul(below)
-            .ok_or_else(|| Error::Legality("CPU operand extent product overflows".into()))?;
+    let layout = Layout::from_parts(
+        Dim::Const(u64::from(offset)),
+        &dims(extents),
+        &dims(strides),
+    )?;
+    Operand {
+        src: operand.src,
+        layout,
+        access: operand.access.clone(),
     }
-    terms.retain(|term| term.modulus > 1 && term.stride != 0);
-    terms.sort_unstable_by_key(|term| std::cmp::Reverse(term.divisor));
-    coalesce_address_terms(&mut terms);
-    Ok(AddressMap { offset, terms })
-}
-
-fn coalesce_address_terms(terms: &mut SmallVec<[AddressTerm; 4]>) {
-    let mut index = 0;
-    while index + 1 < terms.len() {
-        let (high, low) = (terms[index], terms[index + 1]);
-        let joins = u64::from(low.divisor) * u64::from(low.modulus) == u64::from(high.divisor)
-            && u64::from(low.stride) * u64::from(low.modulus) == u64::from(high.stride);
-        if joins && low.modulus.checked_mul(high.modulus).is_some() {
-            terms[index] = AddressTerm {
-                divisor: low.divisor,
-                modulus: low.modulus * high.modulus,
-                stride: low.stride,
-            };
-            terms.remove(index + 1);
-            index = index.saturating_sub(1);
-        } else {
-            index += 1;
-        }
-    }
+    .address_map()
+    .ok_or_else(|| Error::Legality("CPU operand address exceeds u32 indexing".into()))
 }
 
 /// Where one operand's elements come from: a bound buffer, or a constant the
@@ -719,78 +461,44 @@ pub(crate) enum OperandSrc {
 }
 
 impl OperandSrc {
-    pub(crate) fn at(&self, index: TileExpr, mask: TileExpr) -> TileExpr {
+    pub(crate) fn at(&self, b: &Kernel, index: TileExpr, mask: TileExpr) -> TileExpr {
         match self {
-            Self::Buffer(b) => load(Arc::clone(b), index, mask),
+            Self::Buffer(buffer) => load(b, Arc::clone(buffer), index, mask),
             Self::Const(v) => v.clone(),
-            Self::Quantized(view) => TileExpr::new(
-                TileExprKind::Load {
-                    src: Source::Quantized(view.clone()),
-                    addr: Box::new(Addr::Linear(index)),
-                    mask,
-                    fill: lit_f32(0.0),
-                },
-                ElementType::Scalar(ScalarElement::F32),
+            Self::Quantized(view) => b.load(
+                Source::Quantized(view.clone()),
+                Addr::Linear(index),
+                mask,
+                b.f32(0.0),
             ),
         }
     }
 }
 
-pub(crate) fn operand_src(cx: &LowerCtx<'_>, binds: &Binds, src: Id) -> Result<OperandSrc> {
-    if let Some(lit) = const_operand(cx, src) {
-        return Ok(OperandSrc::Const(lit));
+pub(crate) fn operand_src(
+    b: &Kernel,
+    cx: &LowerCtx<'_>,
+    binds: &Binds,
+    src: Id,
+) -> Result<OperandSrc> {
+    if let Some(splat) = const_splat(cx, src) {
+        return Ok(OperandSrc::Const(b.lit(splat_literal(splat))));
     }
     let buffer = binds.of(src)?;
     let facts = cx.graph.facts(src);
     if let Dtype::Q(fmt) = facts.dtype {
         let layout = qlayout_of(cx, src).unwrap_or(QLayout::Native);
-        let data = StorageView {
-            layout: buffer.layout.clone(),
-            buffer,
-            offset: 0,
-        };
+        let data = view(&buffer);
         return Ok(OperandSrc::Quantized(QuantizedView { data, fmt, layout }));
     }
     Ok(OperandSrc::Buffer(buffer))
 }
 
-/// The storage layout a quantized value carries, read off its `LeafKind`.
-pub(crate) fn qlayout_of(cx: &LowerCtx<'_>, value: Id) -> Option<QLayout> {
-    let class = cx.graph.class_of(value);
-    cx.graph
-        .class_ids(class)
-        .into_iter()
-        .find_map(|m| match &cx.graph.node(m).op {
-            Op::Logical(fusor_ir::ir::logical::Logical::Leaf(
-                fusor_ir::ir::logical::LeafKind::Quantized { layout, .. },
-            )) => Some(*layout),
-            _ => None,
-        })
-}
-
-pub(crate) fn const_operand(cx: &LowerCtx<'_>, src: Id) -> Option<TileExpr> {
-    let fusor_ir::ir::Op::Logical(fusor_ir::ir::logical::Logical::Leaf(
-        fusor_ir::ir::logical::LeafKind::Const { value, .. },
-    )) = &cx.graph.node(cx.selected(src)).op
-    else {
-        return None;
-    };
-    let (lit, elem) = match *value {
-        fusor_ir::dtype::Splat::F32(v) => (TileLiteral::F32(v.to_bits()), ScalarElement::F32),
-        fusor_ir::dtype::Splat::F16(v) => (TileLiteral::F16(v), ScalarElement::F16),
-        fusor_ir::dtype::Splat::BF16(v) => (TileLiteral::BF16(v), ScalarElement::BF16),
-        fusor_ir::dtype::Splat::U32(v) => (TileLiteral::U32(v), ScalarElement::U32),
-        fusor_ir::dtype::Splat::I32(v) => (TileLiteral::I32(v), ScalarElement::I32),
-    };
-    Some(TileExpr::new(
-        TileExprKind::Literal(lit),
-        ElementType::Scalar(elem),
-    ))
-}
-
 /// Translate one `ScalarExpr` body into Kernel, with `args[i]` supplying operand
-/// `i` and `coords` supplying `IndexOf(axis)`.
+/// `i` and `coords` supplying `IndexOf(axis)`. Every node takes the body's own
+/// dtype, and a comparison consumed as a value selects 1/0 in it.
 pub(crate) struct Translate<'a> {
+    pub b: &'a Kernel,
     pub args: &'a [TileExpr],
     pub coords: &'a [TileExpr],
     pub uniforms: Option<Arc<BufferDecl>>,
@@ -798,23 +506,16 @@ pub(crate) struct Translate<'a> {
 
 impl Translate<'_> {
     pub(crate) fn run(&self, e: &ScalarExpr) -> Result<TileExpr> {
+        let b = self.b;
         let ty = ElementType::Scalar(elem_of(e.dtype()).unwrap_or(ScalarElement::F32));
+        let node = |kind| TileExpr::new(kind, ty);
         Ok(match e.kind() {
             ScalarKind::Arg(i) => self
                 .args
                 .get(*i as usize)
                 .cloned()
                 .ok_or_else(|| Error::Legality(format!("Arg({i}) has no operand")))?,
-            ScalarKind::Lit(l) => TileExpr::new(
-                TileExprKind::Literal(match l.0 {
-                    fusor_ir::dtype::Splat::F32(v) => TileLiteral::F32(v.to_bits()),
-                    fusor_ir::dtype::Splat::F16(v) => TileLiteral::F16(v),
-                    fusor_ir::dtype::Splat::BF16(v) => TileLiteral::BF16(v),
-                    fusor_ir::dtype::Splat::U32(v) => TileLiteral::U32(v),
-                    fusor_ir::dtype::Splat::I32(v) => TileLiteral::I32(v),
-                }),
-                ty,
-            ),
+            ScalarKind::Lit(l) => node(TileExprKind::Literal(splat_literal(l.0))),
             // A runtime scalar is read from the uniform block, never baked
             // into the kernel, so changing it does not recompile.
             ScalarKind::Uniform(sym) => {
@@ -822,122 +523,83 @@ impl Translate<'_> {
                     .uniforms
                     .clone()
                     .ok_or_else(|| Error::Legality("no uniform block bound".into()))?;
-                let raw = load(ub, lit_u32(sym.0), lit_true());
-                TileExpr::new(TileExprKind::Bitcast { value: raw, to: ty }, ty)
+                let raw = load(b, ub, b.u32(sym.0), b.bool(true));
+                node(TileExprKind::Bitcast { value: raw, to: ty })
             }
             ScalarKind::IndexOf(axis) => self
                 .coords
                 .get(*axis as usize)
                 .cloned()
                 .ok_or_else(|| Error::Legality(format!("IndexOf({axis}) is out of range")))?,
-            ScalarKind::Un { op, x } => TileExpr::new(
-                TileExprKind::Unary {
-                    op: *op,
-                    value: self.run(x)?,
-                    numeric: NumericContract::RELAXED,
-                },
-                ty,
-            ),
-            ScalarKind::Bin { op, a, b } => bin(*op, self.run(a)?, self.run(b)?, ty),
-            ScalarKind::Cmp { op, a, b } => {
-                // Booleans are 1.0/0.0 in the operand dtype at Logical, so a
-                // comparison consumed as a value materializes here.
-                let m = cmp(*op, self.run(a)?, self.run(b)?);
-                TileExpr::new(
-                    TileExprKind::Select {
-                        condition: m,
-                        accept: one_of(ty),
-                        reject: zero_of(ty),
-                    },
-                    ty,
-                )
-            }
+            ScalarKind::Un { op, x } => node(TileExprKind::Unary {
+                op: *op,
+                value: self.run(x)?,
+                numeric: NumericContract::RELAXED,
+            }),
+            ScalarKind::Bin { op, a, b: r } => node(TileExprKind::Binary {
+                op: *op,
+                left: self.run(a)?,
+                right: self.run(r)?,
+                numeric: NumericContract::RELAXED,
+            }),
+            // Booleans are 1.0/0.0 in the operand dtype at Logical, so a
+            // comparison consumed as a value materializes here.
+            ScalarKind::Cmp { op, a, b: r } => node(TileExprKind::Select {
+                condition: b.compare(*op, self.run(a)?, self.run(r)?),
+                accept: self.literal(ty, 1),
+                reject: self.literal(ty, 0),
+            }),
             ScalarKind::Select { c, t, f } => {
-                let cond = cmp(fusor_ir::scalar::CmpOp::Ne, self.run(c)?, zero_of(ty));
-                TileExpr::new(
-                    TileExprKind::Select {
-                        condition: cond,
-                        accept: self.run(t)?,
-                        reject: self.run(f)?,
-                    },
-                    ty,
-                )
+                let zero = self.literal(ty, 0);
+                node(TileExprKind::Select {
+                    condition: b.compare(fusor_ir::scalar::CmpOp::Ne, self.run(c)?, zero),
+                    accept: self.run(t)?,
+                    reject: self.run(f)?,
+                })
             }
-            ScalarKind::Cast { to, x } => TileExpr::new(
-                TileExprKind::Cast {
-                    value: self.run(x)?,
-                    to: ElementType::Scalar(elem_of(*to)?),
-                },
-                ty,
-            ),
-            ScalarKind::Bitcast { to, x } => TileExpr::new(
-                TileExprKind::Bitcast {
-                    value: self.run(x)?,
-                    to: ElementType::Scalar(elem_of(*to)?),
-                },
-                ty,
-            ),
-            ScalarKind::Round { mode, x } => TileExpr::new(
-                TileExprKind::Round {
-                    mode: *mode,
-                    value: self.run(x)?,
-                },
-                ty,
-            ),
-            ScalarKind::Dot { a, b } => TileExpr::new(
-                TileExprKind::Dot {
-                    left: self.run(a)?,
-                    right: self.run(b)?,
-                },
-                ty,
-            ),
+            ScalarKind::Cast { to, x } => node(TileExprKind::Cast {
+                value: self.run(x)?,
+                to: ElementType::Scalar(elem_of(*to)?),
+            }),
+            ScalarKind::Bitcast { to, x } => node(TileExprKind::Bitcast {
+                value: self.run(x)?,
+                to: ElementType::Scalar(elem_of(*to)?),
+            }),
+            ScalarKind::Round { mode, x } => node(TileExprKind::Round {
+                mode: *mode,
+                value: self.run(x)?,
+            }),
+            ScalarKind::Dot { a, b: r } => node(TileExprKind::Dot {
+                left: self.run(a)?,
+                right: self.run(r)?,
+            }),
             ScalarKind::Splat { lanes, x } => {
                 let v = self.run(x)?;
-                TileExpr::new(
-                    TileExprKind::Vec {
-                        scalar: elem_of(e.dtype())?,
-                        lanes: *lanes,
-                        parts: vec![v; *lanes as usize],
-                    },
-                    ElementType::Vector {
-                        scalar: elem_of(e.dtype())?,
-                        lanes: *lanes,
-                    },
-                )
+                b.vector(elem_of(e.dtype())?, vec![v; *lanes as usize])
             }
         })
     }
-}
 
-pub(crate) fn zero_of(ty: ElementType) -> TileExpr {
-    match ty {
-        ElementType::Scalar(ScalarElement::U32) | ElementType::Scalar(ScalarElement::I32) => {
-            lit_u32(0)
+    /// `v` as an integer literal for an integer `ty`, else as an f32.
+    fn literal(&self, ty: ElementType, v: u8) -> TileExpr {
+        match ty {
+            ElementType::Scalar(ScalarElement::U32 | ScalarElement::I32) => {
+                self.b.u32(u32::from(v))
+            }
+            _ => self.b.f32(f32::from(v)),
         }
-        _ => lit_f32(0.0),
-    }
-}
-
-pub(crate) fn one_of(ty: ElementType) -> TileExpr {
-    match ty {
-        ElementType::Scalar(ScalarElement::U32) | ElementType::Scalar(ScalarElement::I32) => {
-            lit_u32(1)
-        }
-        _ => lit_f32(1.0),
     }
 }
 
 /// Decompose a flat index into per-axis coordinates by the declared divmod
 /// chain, most-significant-first.
-pub(crate) fn coords_of(flat: &TileExpr, extents: &[u32]) -> Vec<TileExpr> {
-    use fusor_ir::scalar::BinOp;
-    let mut out = Vec::with_capacity(extents.len());
-    for i in 0..extents.len() {
-        let below: u32 = extents[i + 1..].iter().product::<u32>().max(1);
-        let q = bin(BinOp::Div, flat.clone(), lit_u32(below), u32_ty());
-        out.push(bin(BinOp::Rem, q, lit_u32(extents[i].max(1)), u32_ty()));
-    }
-    out
+pub(crate) fn coords_of(b: &Kernel, flat: &TileExpr, extents: &[u32]) -> Vec<TileExpr> {
+    (0..extents.len())
+        .map(|i| {
+            let below: u32 = extents[i + 1..].iter().product::<u32>().max(1);
+            b.rem(b.div(flat.clone(), b.u32(below)), b.u32(extents[i].max(1)))
+        })
+        .collect()
 }
 
 /// Grid extent for `n` work items at `block` lanes each.

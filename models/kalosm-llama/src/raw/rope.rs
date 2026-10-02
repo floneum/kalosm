@@ -1,5 +1,5 @@
 use super::{LlamaConfig, RopePosition, RopeScalingConfig};
-use fusor::composite::base_inverse_frequency;
+use fusor::composite::{base_inverse_frequency, RopeLayout, RopePos};
 use fusor::{Device, Tensor};
 use std::f32::consts::PI;
 
@@ -168,16 +168,16 @@ impl RopeImplementation {
         interleaved: bool,
         at: RopeAt<'_>,
     ) -> (Tensor<4>, Tensor<4>) {
-        let (cos, sin) = (&self.cos, &self.sin);
-        match (at, interleaved) {
-            (RopeAt::Leaf(p), true) => query.rope_interleaved_pair_at(key, cos, sin, p),
-            (RopeAt::Leaf(p), false) => query.rope_pair_at(key, cos, sin, p),
-            (RopeAt::Offset(start), true) => {
-                query.rope_interleaved_pair(key, cos, sin, start as u64)
-            }
-            (RopeAt::Offset(start), false) => query.rope_pair(key, cos, sin, start as u64),
-            (RopeAt::Rows { cos, sin }, true) => query.rope_interleaved_pair(key, cos, sin, 0),
-            (RopeAt::Rows { cos, sin }, false) => query.rope_pair(key, cos, sin, 0),
-        }
+        let layout = if interleaved {
+            RopeLayout::Interleaved
+        } else {
+            RopeLayout::Halves
+        };
+        let (cos, sin, pos) = match at {
+            RopeAt::Leaf(p) => (&self.cos, &self.sin, RopePos::Positions(p)),
+            RopeAt::Offset(start) => (&self.cos, &self.sin, RopePos::Offset(start as u64)),
+            RopeAt::Rows { cos, sin } => (cos, sin, RopePos::Offset(0)),
+        };
+        query.rope_pair(key, cos, sin, layout, pos)
     }
 }

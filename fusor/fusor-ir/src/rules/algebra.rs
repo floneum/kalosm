@@ -1,9 +1,6 @@
-//! Logical algebra: the fold-splitting law, additive contraction recognition,
-//! contraction reassociation, closed-expression folding, identity
-//! elimination, the mixed-precision store cast and the unit-fold collapse.
-//!
-//! Every rule here is `Additive`: the unrewritten form stays live in the same
-//! chain, and which one runs is decided once, later, by extraction.
+//! Logical algebra: fold splitting, contraction recognition and reassociation,
+//! constant folding, identity elimination, the store cast and the unit-fold collapse.
+//! Every rule is `Additive`; extraction decides.
 
 use crate::dtype::{Dtype, RoundMode, Splat};
 use crate::egraph::{Builder, Facts, Id, RuleTag};
@@ -70,9 +67,8 @@ rule!(
     l0 = Fold { carrier, axis, ins },
     |b, id, node, f| {
         let _ = node;
-        // Only a single scalar slot whose lift is the bare element: a lift
-        // that computes anything still has to run, and a multi-slot carrier's
-        // output carries an axis the collapse would delete.
+        // A single scalar slot with a bare-element lift: anything else still computes
+        // or carries an axis the collapse would delete.
         if carrier.width() != 1
             || carrier.slots[0] != crate::carrier::SlotTy::Scalar
             || carrier.lift[0].kind() != &ScalarKind::Arg(0)
@@ -102,13 +98,8 @@ rule!(
     },
 );
 
-/// STRIP. Both clauses are minted at the same node because the driver's fired
-/// set is per `(RuleId, Id)`.
-///
-/// * **SPLIT** — a catamorphism over a concatenation is the merge of the
-///   catamorphisms over the segments.
-/// * **ELIDE** — a block whose lift is identically the carrier's identity
-///   contributes nothing, because `merge(acc, identity) = acc`.
+/// STRIP: SPLIT (a catamorphism over a concatenation merges the segments') and ELIDE
+/// (identity-lifted blocks contribute nothing), one rule since fired sets are per node.
 pub fn strip(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     // ELIDE first: narrowing the domain makes the split cheaper.
     let elided = fold_elide(b, node, f).and_then(|x| b.union(id, x).ok());
@@ -116,23 +107,7 @@ pub fn strip(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<
     split.or(elided)
 }
 
-/// SPLIT: `Fold{c, axis}` == `Fold{c.as_merge(), axis} . Fold{c, axis+1} . block(x)`.
-///
-/// The carrier rides through untouched: at a contraction's summed axis this
-/// is split-K, at a `(max, sum)` carrier it is online softmax, at
-/// `(n, mean, m2)` it is the stable variance accumulator.
-///
-/// The outer level uses [`crate::carrier::Carrier::as_merge`]: its elements are partial
-/// accumulators, not raw elements, and it reads ONE operand carrying the
-/// inner fold's trailing carrier axis. Reusing the inner carrier applies
-/// `lift` to a partial max and silently computes a wrong value; at a
-/// single-slot binop the two spellings coincide.
-///
-/// Without the `reassoc` guard the split and unsplit forms are declared
-/// value-equal and extraction may swap them on an f16 accumulator.
-///
-/// Every operand is blocked: one blocking view is applied to each input, and
-/// inputs that do not agree on the shape it is stated against decline.
+/// Split a scalar reduction into partial reductions and a final merge (needs reassoc).
 fn fold_split(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Logical(Logical::Fold {
         carrier,
@@ -143,46 +118,43 @@ fn fold_split(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option
     else {
         return None;
     };
-    // The outer level reads partial accumulators, so the carrier must be
-    // associative; `f.own().numeric` is the meet over every operand.
+    // Partial carriers occupy a trailing axis bound by one operand, and blocking
+    // renumbers the coordinates an indexed lift reads.
+    if carrier.slots.as_slice() != [crate::carrier::SlotTy::Scalar]
+        || carrier.lift.iter().any(ScalarExpr::reads_index_of)
+    {
+        return None;
+    }
+    // The outer level reads partial accumulators: associativity required.
     if !carrier.associative || !f.own().numeric.reassoc {
         return None;
     }
     if acc.accum_bits() < f.own().numeric.min_accum_bits {
         return None;
     }
-    // A rounding lift is the QAT fake-quant value. `infer_logical` does not yet
-    // derive `STRICT` from `ScalarKind::Round`, so the meet above cannot see a
-    // rounding ABSORB has moved into the lift; read the carrier directly.
+    // A rounding lift (QAT fake-quant) forbids reassociation, which the numeric meet
+    // cannot yet see; read the carrier directly.
     if carrier.lift.iter().any(has_round) || carrier.merge.iter().any(has_round) {
         return None;
     }
     if ins.is_empty() {
         return None;
     }
-    // A level that is itself a level of a split does not split again; every
-    // minted fold is a fresh id the driver offers the rule again, so without
-    // this the rewrite cascades.
+    // A level of a split does not split again, or the rewrite cascades.
     if ins.iter().any(|&x| stands_on_a_split(b, x, 4)) {
         return None;
     }
     let axis = *axis as usize;
     let shape = f.operand(0)?.shape.clone();
-    // One blocking view serves every operand, so all operands must agree on
-    // the shape it is stated against; otherwise decline.
+    // One blocking view serves every operand, so their shapes must agree.
     for i in 1..ins.len() {
-        let other = &f.operand(i)?.shape;
-        if other.len() != shape.len()
-            || !other.iter().zip(shape.iter()).all(|(a, c)| a.known_eq(*c))
-        {
+        if f.operand(i)?.shape != shape {
             return None;
         }
     }
-    // `Dim::Sym` declines: `StrideSpec::multiplier` is a `u32`, so the inner
-    // extent has to be spellable.
+    // A symbolic extent declines: `StrideSpec::multiplier` is a `u32`.
     let extent = shape.get(axis)?.as_const()?;
-    // A reduction one workgroup's lanes already cover has nowhere to put a
-    // second level, so blocking it buys no parallelism and costs a dispatch.
+    // A reduction one workgroup already covers gains nothing from a second level.
     if extent <= u64::from(f.caps().limits.max_compute_invocations_per_workgroup) {
         return None;
     }
@@ -212,7 +184,11 @@ fn fold_split(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option
         for &x in ins {
             let Ok(v) = b.add_logical(Logical::Restride {
                 specs: specs.clone(),
-                bounds: BoundsProof::RuntimeMask,
+                bounds: if shape.iter().all(|dim| dim.as_const().is_some()) {
+                    BoundsProof::Static
+                } else {
+                    BoundsProof::RuntimeMask
+                },
                 x,
             }) else {
                 break;
@@ -230,9 +206,7 @@ fn fold_split(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option
         }) else {
             continue;
         };
-        // The outer level's elements are partial accumulators, so it must use
-        // `as_merge`, reading the one operand that carries the inner fold's
-        // trailing carrier axis.
+        // The outer level reads partial accumulators via `as_merge`.
         let Ok(joined) = b.add_logical(Logical::Fold {
             carrier: carrier.as_merge(),
             axis: axis as u32,
@@ -241,17 +215,14 @@ fn fold_split(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option
         }) else {
             continue;
         };
-        // Every candidate joins the class; an un-unioned node is unreachable
-        // from the root.
+        // Every candidate joins the class.
         minted = b.union(id, joined).ok().or(minted);
     }
     minted
 }
 
-/// Whether a SPLIT already stands under `x`: a blocked view of one axis, or a
-/// fold reading one. The blocking spelling is two adjacent [`StrideSpec`]s
-/// naming the same `input_dim`, which is what
-/// [`fold_split`] mints and nothing else does.
+/// Whether a SPLIT already stands under `x`: two adjacent specs naming one `input_dim`,
+/// which only [`fold_split`] mints.
 fn stands_on_a_split(b: &Builder<'_>, x: Id, budget: u32) -> bool {
     if budget == 0 {
         return false;
@@ -272,11 +243,7 @@ fn stands_on_a_split(b: &Builder<'_>, x: Id, budget: u32) -> bool {
     }
 }
 
-/// Candidate block counts for one extent: the power-of-two divisors, widest
-/// first, capped at [`MAX_SPLIT_CANDIDATES`].
-///
-/// This stays with the Logical split rewrite: it creates new tensor algebra,
-/// while `FoldDomain` schedules a Launch fold that already exists.
+/// Most power-of-two block counts tried per extent, widest first.
 const MAX_SPLIT_CANDIDATES: usize = 3;
 
 fn block_candidates(extent: u64) -> SmallVec<[u64; 4]> {
@@ -287,15 +254,8 @@ fn block_candidates(extent: u64) -> SmallVec<[u64; 4]> {
         .collect()
 }
 
-/// ELIDE: a reduction whose lift is the carrier's identity outside a
-/// contiguous range of the reduced axis equals the same reduction over that
-/// range alone, because `merge(acc, identity) = acc`.
-///
-/// The narrowed range is computed from a predicate affine in `IndexOf(axis)`
-/// against a closed bound. A bound that reads a free index — the causal
-/// `IndexOf(lk) <= IndexOf(lq) + d` — narrows the domain per row, which no
-/// `IndexSpace` in this IR can express; that case declines, and so does
-/// anything `eval_closed` cannot decide.
+/// ELIDE: a reduction whose lift is the identity outside a contiguous range of the
+/// reduced axis equals the reduction over that range. Per-row bounds (causal) decline.
 fn fold_elide(b: &mut Builder<'_>, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Logical(Logical::Fold {
         carrier,
@@ -310,9 +270,7 @@ fn fold_elide(b: &mut Builder<'_>, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let shape = f.operand(0)?.shape.clone();
     let extent = shape.get(axis_u)?.as_const()?;
 
-    // Every slot must be guarded by the same predicate and fall back to that
-    // slot's own identity: a carrier whose `l` slot lifts to `Lit(1)` is not
-    // identity-valued, and eliding it would drop a count.
+    // Every slot must share one predicate and fall back to its own identity.
     let mut cond: Option<ScalarExpr> = None;
     let mut bodies: SmallVec<[ScalarExpr; 4]> = SmallVec::new();
     for (k, l) in carrier.lift.iter().enumerate() {
@@ -331,15 +289,12 @@ fn fold_elide(b: &mut Builder<'_>, node: &Node, f: &Facts<'_>) -> Option<Id> {
         bodies.push(t.clone());
     }
     let (lo, hi) = true_range(cond.as_ref()?, *axis, extent)?;
-    // An empty range would make the whole fold the identity — a `Const` leaf,
-    // not a narrowing — so decline.
+    // An empty range makes the fold a constant, not a narrowing.
     if lo >= hi || (lo == 0 && hi == extent) {
         return None;
     }
-    // Narrowing to `[lo, hi)` renumbers the reduced coordinate down by `lo`;
-    // a body that names that coordinate would read the wrong index, so it
-    // declines unless the window starts at zero.
-    if lo > 0 && bodies.iter().any(|e| reads_index_of(e, *axis)) {
+    // Narrowing renumbers the reduced coordinate by `lo`; a body reading it declines.
+    if lo > 0 && bodies.iter().any(|e| e.reads_axis(*axis)) {
         return None;
     }
 
@@ -374,21 +329,18 @@ fn fold_elide(b: &mut Builder<'_>, node: &Node, f: &Facts<'_>) -> Option<Id> {
     .ok()
 }
 
-/// The contiguous range of `axis` on which `cond` is true, or `None` when
-/// that is not decidable. Conservative by construction: an undecidable
-/// predicate does not narrow.
+/// The contiguous range of `axis` on which `cond` is true; `None` when undecidable.
 fn true_range(cond: &ScalarExpr, axis: u32, extent: u64) -> Option<(u64, u64)> {
     let ScalarKind::Cmp { op, a, b } = cond.kind() else {
         return None;
     };
-    // One side names the reduced coordinate; the other must be closed, so the
-    // bound is the same for every row.
+    // One side names the reduced coordinate; the other must be closed.
     let (op, bound) = match (a.kind(), b.kind()) {
         (ScalarKind::IndexOf(i), _) if *i == axis => (*op, eval_closed(b)?),
         (_, ScalarKind::IndexOf(i)) if *i == axis => (flip(*op), eval_closed(a)?),
         _ => return None,
     };
-    let v = to_f64(bound);
+    let v = bound.to_f64();
     if !v.is_finite() || v.fract() != 0.0 || v < 0.0 || v > u32::MAX as f64 {
         return None;
     }
@@ -421,46 +373,14 @@ fn flip(op: CmpOp) -> CmpOp {
     }
 }
 
-/// Whether `e` names the loop coordinate of `axis`.
-fn reads_index_of(e: &ScalarExpr, axis: u32) -> bool {
-    match e.kind() {
-        ScalarKind::IndexOf(a) => *a == axis,
-        ScalarKind::Un { x, .. }
-        | ScalarKind::Cast { x, .. }
-        | ScalarKind::Bitcast { x, .. }
-        | ScalarKind::Round { x, .. }
-        | ScalarKind::Splat { x, .. } => reads_index_of(x, axis),
-        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
-            reads_index_of(a, axis) || reads_index_of(b, axis)
-        }
-        ScalarKind::Select { c, t, f } => {
-            reads_index_of(c, axis) || reads_index_of(t, axis) || reads_index_of(f, axis)
-        }
-        ScalarKind::Arg(_) | ScalarKind::Lit(_) | ScalarKind::Uniform(_) => false,
-    }
-}
-
-/// Whether `e` rounds anywhere: the one syntactic marker of a value whose
-/// contract forbids reassociation.
+/// Whether `e` rounds anywhere: the marker of a value that forbids reassociation.
 fn has_round(e: &ScalarExpr) -> bool {
-    match e.kind() {
-        ScalarKind::Round { .. } => true,
-        ScalarKind::Un { x, .. }
-        | ScalarKind::Cast { x, .. }
-        | ScalarKind::Bitcast { x, .. }
-        | ScalarKind::Splat { x, .. } => has_round(x),
-        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
-            has_round(a) || has_round(b)
-        }
-        ScalarKind::Select { c, t, f } => has_round(c) || has_round(t) || has_round(f),
-        _ => false,
-    }
+    let mut found = false;
+    e.walk(&mut |e| found |= matches!(e.kind(), ScalarKind::Round { .. }));
+    found
 }
 
-/// `Fold{Add, rank-1}(Map{mul(Arg0, Arg1)}(a, b))` also *is* a `Contract`.
-///
-/// The `mul`+`fold` form stays live in the same class, so a product read
-/// twice keeps both options open and the extractor prices them.
+/// `Fold{Add, rank-1}(Map{mul(Arg0, Arg1)}(a, b))` is also a `Contract`; both stay live.
 pub fn recognize_contract(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Logical(Logical::Fold {
         carrier,
@@ -474,9 +394,7 @@ pub fn recognize_contract(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_
     if carrier.kind() != Some(BinOp::Add) || carrier.slots.len() != 1 {
         return None;
     }
-    // Both spellings of "multiply, then sum": the product may sit in a
-    // separate `Map` the fold reads, or directly in the carrier's own `lift`
-    // (what `lower_generic` mints and `ABSORB` leaves behind).
+    // The product sits in a `Map` the fold reads, or in the carrier's own lift.
     let ins: SmallVec<[Id; 2]> = if carrier.lift[0].kind() == &ScalarKind::Arg(0) {
         let &[x] = &fold_ins[..] else {
             return None;
@@ -500,17 +418,12 @@ pub fn recognize_contract(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_
     if rank == 0 || rank > u8::MAX as usize || *axis as usize != rank - 1 {
         return None;
     }
-    // Read each operand through its broadcast, not around it: an operand that
-    // reaches the product through a `multiplier == 0` `Restride` must be read
-    // at its base's own labels, or the spec names a contraction over the
-    // materialized broadcast. Naming only the axes it varies along makes the
-    // spec the real einsum — `bhqd,bhkd->bhqk`.
+    // Read each operand through a broadcasting `Restride` at its base's labels, so
+    // the spec is the real einsum (`bhqd,bhkd->bhqk`).
     let (a_src, a_labels) = contract_operand(b, ins[0], rank)?;
     let (b_src, b_labels) = contract_operand(b, ins[1], rank)?;
     let contracted = Label(rank as u8 - 1);
-    // The reduced axis has to be a real shared axis of both operands; where
-    // one side is broadcast along it the fold is a scaled sum, not a
-    // contraction.
+    // The reduced axis must be shared by both operands, or it is a scaled sum.
     if !a_labels.contains(&contracted) || !b_labels.contains(&contracted) {
         return None;
     }
@@ -535,14 +448,9 @@ pub fn recognize_contract(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_
     b.union(id, contracted).ok()
 }
 
-/// The value a contraction should read for this operand, and the labels it
-/// actually varies along.
-///
-/// An operand that reaches the product through a single `Restride` which only
-/// *broadcasts* — every kept axis read densely in order, every dropped axis
-/// `multiplier == 0` — is really its base read at the base's own labels. Any
-/// other view (a permute, a narrowing offset, a strided or multi-node spine)
-/// is left alone: this returns the operand as given with all `rank` labels.
+/// The value a contraction reads for this operand and the labels it varies along: a
+/// single broadcast-only `Restride` is its base at the base's labels; anything else is
+/// left as given with all `rank` labels.
 fn contract_operand(b: &Builder<'_>, v: Id, rank: usize) -> Option<(Id, SmallVec<[Label; 6]>)> {
     let all = || -> SmallVec<[Label; 6]> { (0..rank as u8).map(Label).collect() };
     let spine = b.trace_pure_views(v);
@@ -560,12 +468,10 @@ fn contract_operand(b: &Builder<'_>, v: Id, rank: usize) -> Option<(Id, SmallVec
     let mut next_base = 0usize;
     for (i, s) in specs.iter().enumerate() {
         if s.multiplier == 0 {
-            // A broadcast axis: not one of this operand's labels, and
-            // `Contract` will re-broadcast it from the spec.
+            // A broadcast axis: `Contract` re-broadcasts it from the spec.
             continue;
         }
-        // Every axis this operand varies along has to be the next axis of
-        // the base, read whole and in order.
+        // Each varying axis must be the next base axis, read whole and in order.
         let dim = *base_shape.get(next_base)?;
         if s.input_dim as usize != next_base
             || s.multiplier != 1
@@ -577,8 +483,7 @@ fn contract_operand(b: &Builder<'_>, v: Id, rank: usize) -> Option<(Id, SmallVec
         labels.push(Label(i as u8));
         next_base += 1;
     }
-    // Every base axis has to be accounted for, or the view is doing something
-    // other than inserting broadcasts.
+    // Every base axis must be accounted for.
     if next_base != base_shape.len() {
         return Some((v, all()));
     }
@@ -607,12 +512,8 @@ fn is_arg_product(e: &ScalarExpr) -> bool {
     )
 }
 
-/// `Contract(Contract(a, b), c)` also equals `Contract(a, Contract(b, c))`.
-///
-/// Legal when the two specs share one consistent labelling and neither
-/// regrouping captures a label: an inner-summed label may not reappear in
-/// `c`, and an outer-summed label may not appear in `a`. Every operand must
-/// permit reassociation.
+/// `Contract(Contract(a, b), c) == Contract(a, Contract(b, c))` when the specs share
+/// one labelling, no regrouping captures a label, and every operand permits reassoc.
 pub fn contract_reassoc(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Logical(Logical::Contract {
         spec: outer,
@@ -640,8 +541,7 @@ pub fn contract_reassoc(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>)
 
     let (la, lb, lt) = (&inner.a, &inner.b, &inner.out);
     let (lt2, lc, lo) = (&outer.a, &outer.b, &outer.out);
-    // One consistent labelling: the inner result enters the outer under the
-    // same names it left under.
+    // The inner result enters the outer under the labels it left with.
     if lt != lt2 {
         return None;
     }
@@ -663,8 +563,7 @@ pub fn contract_reassoc(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>)
         return None;
     }
 
-    // The regrouped intermediate keeps exactly the labels something
-    // downstream still needs.
+    // The regrouped intermediate keeps the labels something downstream needs.
     let mut lu: SmallVec<[Label; 6]> = SmallVec::new();
     for l in lb.iter().chain(lc.iter()) {
         if (has(la, l) || has(lo, l)) && !lu.contains(l) {
@@ -702,9 +601,7 @@ pub fn contract_reassoc(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>)
     b.union(id, joined).ok()
 }
 
-/// A `Map` whose body is closed over literals alone also equals a constant
-/// leaf. Additive: the unfolded form survives, so a target that would rather
-/// recompute than read a splat still can.
+/// A `Map` closed over literals also equals a constant leaf.
 pub fn const_fold_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Logical(Logical::Map { expr, outs: 1, .. }) = &node.op else {
         return None;
@@ -719,22 +616,21 @@ pub fn const_fold_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -
     b.union(id, folded).ok()
 }
 
-/// The closed interpreter `const_fold_map` runs. Declines on `Arg`,
-/// `Uniform`, `IndexOf`, `Dot` and `Splat`, which is what makes it closed.
+/// The closed interpreter `const_fold_map` runs; declines on any open leaf.
 fn eval_closed(e: &ScalarExpr) -> Option<Splat> {
     let out = e.dtype();
     match e.kind() {
         ScalarKind::Lit(Lit(v)) => Some(*v),
         ScalarKind::Un { op, x } => {
-            let v = to_f64(eval_closed(x)?);
+            let v = eval_closed(x)?.to_f64();
             from_f64(apply_un(*op, v)?, out)
         }
         ScalarKind::Bin { op, a, b } => {
-            let (x, y) = (to_f64(eval_closed(a)?), to_f64(eval_closed(b)?));
+            let (x, y) = (eval_closed(a)?.to_f64(), eval_closed(b)?.to_f64());
             from_f64(apply_bin(*op, x, y, out)?, out)
         }
         ScalarKind::Cmp { op, a, b } => {
-            let (x, y) = (to_f64(eval_closed(a)?), to_f64(eval_closed(b)?));
+            let (x, y) = (eval_closed(a)?.to_f64(), eval_closed(b)?.to_f64());
             let t = match op {
                 CmpOp::Lt => x < y,
                 CmpOp::Le => x <= y,
@@ -746,16 +642,16 @@ fn eval_closed(e: &ScalarExpr) -> Option<Splat> {
             from_f64(if t { 1.0 } else { 0.0 }, out)
         }
         ScalarKind::Select { c, t, f } => {
-            if to_f64(eval_closed(c)?) != 0.0 {
+            if eval_closed(c)?.to_f64() != 0.0 {
                 eval_closed(t)
             } else {
                 eval_closed(f)
             }
         }
-        ScalarKind::Cast { to, x } => from_f64(to_f64(eval_closed(x)?), *to),
+        ScalarKind::Cast { to, x } => from_f64(eval_closed(x)?.to_f64(), *to),
         ScalarKind::Bitcast { to, x } => from_bits(eval_closed(x)?.bits(), *to),
         ScalarKind::Round { mode, x } => {
-            let v = to_f64(eval_closed(x)?);
+            let v = eval_closed(x)?.to_f64();
             from_f64(apply_round(*mode, v), out)
         }
         ScalarKind::Arg(_)
@@ -763,16 +659,6 @@ fn eval_closed(e: &ScalarExpr) -> Option<Splat> {
         | ScalarKind::IndexOf(_)
         | ScalarKind::Dot { .. }
         | ScalarKind::Splat { .. } => None,
-    }
-}
-
-fn to_f64(s: Splat) -> f64 {
-    match s {
-        Splat::F32(v) => f64::from(v),
-        Splat::F16(bits) => half::f16::from_bits(bits).to_f64(),
-        Splat::BF16(bits) => half::bf16::from_bits(bits).to_f64(),
-        Splat::U32(v) => f64::from(v),
-        Splat::I32(v) => f64::from(v),
     }
 }
 
@@ -897,11 +783,8 @@ fn apply_round(mode: RoundMode, v: f64) -> f64 {
     }
 }
 
-/// `x+0`, `x-0`, `x*1`, `x/1`, `pow(x,1)`, `select(lit, t, f)` and a cast to
-/// the type the value already has are all identities; so is a `Restride`
-/// standing between this map and its producer whose spec vector is the
-/// identity view. Rewriting the body in place and dropping the pass-through
-/// view are one rule, minted at the reading node.
+/// Scalar identities (`x+0`, `x*1`, `select(lit, ..)`, a no-op cast, ...) and an
+/// identity-view `Restride` input, eliminated at the reading map.
 pub fn identity_elim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     let Op::Logical(Logical::Map { expr, ins, outs }) = &node.op else {
         return None;
@@ -933,42 +816,15 @@ pub fn identity_elim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -
 }
 
 fn simplify(e: &ScalarExpr) -> (ScalarExpr, bool) {
-    let rebuilt = match e.kind() {
-        ScalarKind::Un { op, x } => {
-            let (x, c) = simplify(x);
-            (ScalarExpr::un(*op, x), c)
-        }
-        ScalarKind::Bin { op, a, b } => {
-            let (a, ca) = simplify(a);
-            let (bb, cb) = simplify(b);
-            (ScalarExpr::bin(*op, a, bb), ca || cb)
-        }
-        ScalarKind::Cmp { op, a, b } => {
-            let (a, ca) = simplify(a);
-            let (bb, cb) = simplify(b);
-            (ScalarExpr::cmp(*op, a, bb), ca || cb)
-        }
-        ScalarKind::Select { c, t, f } => {
-            let (c, cc) = simplify(c);
-            let (t, ct) = simplify(t);
-            let (f, cf) = simplify(f);
-            (ScalarExpr::select(c, t, f), cc || ct || cf)
-        }
-        ScalarKind::Cast { to, x } => {
-            let (x, c) = simplify(x);
-            (ScalarExpr::cast(*to, x), c)
-        }
-        ScalarKind::Bitcast { to, x } => {
-            let (x, c) = simplify(x);
-            (ScalarExpr::bitcast(*to, x), c)
-        }
-        ScalarKind::Round { mode, x } => {
-            let (x, c) = simplify(x);
-            (ScalarExpr::round(*mode, x), c)
-        }
-        _ => (e.clone(), false),
+    let mut changed = false;
+    let node = match e.kind() {
+        ScalarKind::Dot { .. } | ScalarKind::Splat { .. } => e.clone(),
+        _ => e.map_children(&mut |child| {
+            let (simpler, did_change) = simplify(child);
+            changed |= did_change;
+            simpler
+        }),
     };
-    let (node, changed) = rebuilt;
     match peephole(&node) {
         Some(simpler) => (simpler, true),
         None => (node, changed),
@@ -1004,7 +860,7 @@ fn peephole(e: &ScalarExpr) -> Option<ScalarExpr> {
             let ScalarKind::Lit(Lit(v)) = c.kind() else {
                 return None;
             };
-            Some(if to_f64(*v) != 0.0 {
+            Some(if v.to_f64() != 0.0 {
                 t.clone()
             } else {
                 f.clone()
@@ -1016,13 +872,11 @@ fn peephole(e: &ScalarExpr) -> Option<ScalarExpr> {
 }
 
 fn lit_is(e: &ScalarExpr, v: f64) -> bool {
-    matches!(e.kind(), ScalarKind::Lit(Lit(s)) if to_f64(*s) == v)
+    matches!(e.kind(), ScalarKind::Lit(Lit(s)) if s.to_f64() == v)
 }
 
-/// The type side of the `widen-compute` lowering rule: a `Map` storing F16 or
-/// BF16 also equals the same arithmetic performed at
-/// [`Dtype::compute_dtype`] with a trailing narrowing cast. The CPU target
-/// contributes the lane-level counterpart.
+/// A `Map` storing F16/BF16 also equals its arithmetic at [`Dtype::compute_dtype`] with
+/// a trailing narrowing cast.
 pub fn widen_store_cast(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Logical(Logical::Map { expr, ins, outs }) = &node.op else {
         return None;
@@ -1049,8 +903,7 @@ pub fn widen_store_cast(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>)
     b.union(id, alt).ok()
 }
 
-/// Rebuild `e` at [`Dtype::compute_dtype`]. Declines on `Bitcast`, whose
-/// meaning depends on the storage width.
+/// Rebuild `e` at [`Dtype::compute_dtype`]; declines on width-dependent `Bitcast`.
 fn widen(e: &ScalarExpr) -> Option<ScalarExpr> {
     let up = |x: &ScalarExpr| -> Option<ScalarExpr> { widen(x) };
     Some(match e.kind() {
@@ -1077,7 +930,7 @@ fn widen(e: &ScalarExpr) -> Option<ScalarExpr> {
             if d.compute_dtype() == d {
                 e.clone()
             } else {
-                ScalarExpr::lit(from_f64(to_f64(*v), d.compute_dtype())?)
+                ScalarExpr::lit(from_f64(v.to_f64(), d.compute_dtype())?)
             }
         }
         ScalarKind::IndexOf(a) => ScalarExpr::index_of(*a),

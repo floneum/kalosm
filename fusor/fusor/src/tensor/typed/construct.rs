@@ -43,13 +43,8 @@ impl<const R: usize, T: Element> Tensor<R, T> {
     pub fn from_raw_bytes(device: &Device, dtype: Dtype, shape: [Dim; R], bytes: &[u8]) -> Self {
         Self::wrap(
             "Tensor::from_raw_bytes",
-            Dyn::from_slice(device.handle(), dtype, &shape, bytes).and_then(|t| {
-                if dtype == T::DTYPE {
-                    Ok(t)
-                } else {
-                    t.cast(T::DTYPE)
-                }
-            }),
+            Dyn::from_slice(device.handle(), dtype, &shape, bytes)
+                .and_then(|t| t.into_dtype(T::DTYPE)),
         )
     }
 
@@ -96,7 +91,7 @@ impl<T: Element> Tensor<1, T> {
     ) -> Self {
         Self::wrap(
             "Tensor::arange_step",
-            crate::tensor::construction::arange_step(
+            Dyn::arange_step(
                 device.handle(),
                 T::DTYPE,
                 start.into(),

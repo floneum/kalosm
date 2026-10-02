@@ -9,11 +9,15 @@
 //! `dBias`.
 
 use fusor_ir::autograd::{Grads, Tape, Val};
+use fusor_ir::contract_spec::partition;
+use fusor_ir::dtype::Dtype;
 use fusor_ir::ir::Node;
 use fusor_ir::ir::Op;
 use fusor_ir::ir::logical::{EinSpec, Label, Logical};
 use fusor_ir::{Error, Result};
 use smallvec::SmallVec;
+
+use crate::tape::TapeExt;
 
 pub(crate) fn contract_adjoint(
     tape: &mut dyn Tape,
@@ -54,17 +58,67 @@ pub(crate) fn contract_adjoint(
     } else {
         let d_lhs = spec.d_lhs();
         verify_spec(&d_lhs)?;
-        Some(tape.contract(grad, b, d_lhs, *acc)?)
+        Some(contract_canonical(tape, grad, b, d_lhs, *acc)?)
     };
     let db = if tape.facts(b).dtype.is_quantized() {
         None
     } else {
         let d_rhs = spec.d_rhs();
         verify_spec(&d_rhs)?;
-        Some(tape.contract(a, grad, d_rhs, *acc)?)
+        Some(contract_canonical(tape, a, grad, d_rhs, *acc)?)
     };
     Ok(smallvec::smallvec![da, db])
 }
+/// Emit a contraction with its output in `batch ++ m ++ n` order, then
+/// permute the axes back.
+///
+/// `lower_family` refuses a non-canonical `out`, so without this every
+/// adjoint contraction falls to the generic fold. The permute is a pure
+/// `Restride`.
+fn contract_canonical(
+    tape: &mut dyn Tape,
+    x: Val,
+    y: Val,
+    spec: EinSpec,
+    acc: Dtype,
+) -> Result<Val> {
+    let Ok(part) = partition(&spec) else {
+        // An unpartitionable spec is the verifier's problem, not this
+        // function's; emit it as written and let the check that follows say so.
+        return tape.contract(x, y, spec, acc);
+    };
+    let canonical: SmallVec<[Label; 6]> = part
+        .batch
+        .iter()
+        .chain(part.m.iter())
+        .chain(part.n.iter())
+        .copied()
+        .collect();
+    if spec.out[..] == canonical[..] {
+        return tape.contract(x, y, spec, acc);
+    }
+    // Where each axis the caller wanted sits in the canonical output.
+    let Some(perm) = spec
+        .out
+        .iter()
+        .map(|label| canonical.iter().position(|c| c == label).map(|i| i as u32))
+        .collect::<Option<Vec<u32>>>()
+    else {
+        return tape.contract(x, y, spec, acc);
+    };
+    let out = tape.contract(
+        x,
+        y,
+        EinSpec {
+            a: spec.a,
+            b: spec.b,
+            out: canonical,
+        },
+        acc,
+    )?;
+    tape.permute(out, &perm)
+}
+
 /// `verify_l0` rule 4, restated locally: every label appears in at least two
 /// of `{a, b, out}`, and no operand repeats a label.
 ///

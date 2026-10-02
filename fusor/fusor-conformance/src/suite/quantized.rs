@@ -14,7 +14,7 @@ use fusor_gguf::repack;
 use fusor_ir::dtype::{QFmt, QLayout};
 use half::f16;
 
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, from_u32, fuzz_case};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, from_u32};
 use crate::suite::support::{Domain, expect_values, graph_of, read, upload};
 
 /// Rows of the quantized weight in the fixed cases. One block per row keeps
@@ -129,9 +129,7 @@ fn matrix_from_parts(
 ) -> Result<QMatrix, CaseError> {
     let cols = fusor::Dim::Const(cols);
     let rows = fusor::Dim::Const(rows);
-    let tensor = graph
-        .quantized(fmt, layout, [rows, cols], bytes)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let tensor = graph.quantized(fmt, layout, [rows, cols], bytes)?;
     Ok(QMatrix {
         tensor,
         fmt,
@@ -142,7 +140,7 @@ fn matrix_from_parts(
 }
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
+    let mut cases = Cases::new("quantized");
 
     for fmt in QFmt::ALL {
         for layout in [QLayout::Native, QLayout::F32Scales] {
@@ -151,14 +149,9 @@ pub fn cases() -> Cases {
                 fmt_name(fmt),
                 layout_name(layout)
             ));
-            cases.push_case(fuzz_case(
-                "quantized",
-                name,
-                DEQUANT_SPEC,
-                async move |s: &Session, shape: &[u64], seed: u32| {
-                    dequantize_case(s, fmt, layout, shape, seed).await
-                },
-            ));
+            cases.fuzz(name, DEQUANT_SPEC, async move |s, shape, seed| {
+                dequantize_case(s, fmt, layout, shape, seed).await
+            });
         }
     }
     // The same decode forced through the `Restride` + `Map` expansion, with
@@ -173,49 +166,37 @@ pub fn cases() -> Cases {
                 continue;
             }
             let name = format!("dequantize_defn_{}_{}", fmt_name(fmt), layout_name(layout));
-            cases.push("quantized", name, async move |s: &Session| {
+            cases.push(name, async move |s: &Session| {
                 dequantize_defn_case(s, fmt, layout).await
             });
         }
     }
     for fmt in QFmt::ALL {
         let name = leak(format!("qmatmul_{}", fmt_name(fmt)));
-        cases.push_case(fuzz_case(
-            "quantized",
-            name,
-            QMATMUL_SPEC,
-            async move |s: &Session, shape: &[u64], seed: u32| {
-                qmatmul_case(s, fmt, shape, seed).await
-            },
-        ));
+        cases.fuzz(name, QMATMUL_SPEC, async move |s, shape, seed| {
+            qmatmul_case(s, fmt, shape, seed).await
+        });
     }
     for fmt in QFmt::ALL {
         let name = leak(format!("repack_round_trip_{}", fmt_name(fmt)));
-        cases.push_case(fuzz_case(
-            "quantized",
-            name,
-            REPACK_SPEC,
-            async move |s: &Session, shape: &[u64], seed: u32| {
-                repack_case(s, fmt, shape, seed).await
-            },
-        ));
+        cases.fuzz(name, REPACK_SPEC, async move |s, shape, seed| {
+            repack_case(s, fmt, shape, seed).await
+        });
     }
 
-    cases.push_case(fuzz_case(
-        "quantized",
+    cases.fuzz(
         "both_layouts_decode_to_the_same_values",
         LAYOUTS_SPEC,
         layouts_agree,
-    ));
-    cases.push_case(fuzz_case(
-        "quantized",
+    );
+    cases.fuzz(
         "q_mat_mul_backward_reaches_the_activation_only",
         BACKWARD_SPEC,
         qmatmul_backward,
-    ));
+    );
     for fmt in QFmt::ALL {
         let name = format!("qmatmul_coop_shape_{}", fmt_name(fmt));
-        cases.push("quantized", name, async move |s: &Session| {
+        cases.push(name, async move |s: &Session| {
             qmatmul_coop_shape(s, fmt).await
         });
     }
@@ -231,23 +212,18 @@ pub fn cases() -> Cases {
                 fmt_name(fmt),
                 layout_name(layout)
             );
-            cases.push("quantized", name, async move |s: &Session| {
+            cases.push(name, async move |s: &Session| {
                 defn_coop_shape(s, fmt, layout).await
             });
         }
     }
     cases.push(
-        "quantized",
         "qgemv_grid_past_the_dimension_cap",
         qgemv_grid_past_the_dimension_cap,
     );
-    cases.push("quantized", "index_select_rows", index_select_rows);
-    cases.push("quantized", "concat_rows", concat_rows);
-    cases.push(
-        "quantized",
-        "qmatrix_load_orientation",
-        qmatrix_load_orientation,
-    );
+    cases.push("index_select_rows", index_select_rows);
+    cases.push("concat_rows", concat_rows);
+    cases.push("qmatrix_load_orientation", qmatrix_load_orientation);
     cases
 }
 
@@ -362,11 +338,7 @@ async fn qmatmul_coop_shape(session: &Session, fmt: QFmt) -> CaseResult {
     let act = Domain::Wide.sample(3301, (M * k) as usize);
     let a = upload(graph.handle(), &dims(&[M, k]), &act)?;
 
-    let got = read(
-        &a.matmul_t(&w)
-            .map_err(|e| -> CaseError { e.to_string().into() })?,
-    )
-    .await?;
+    let got = read(&a.matmul_t(&w)?).await?;
 
     // The oracle: the same contraction against the dequantized weight.
     let qm = QMatrix {
@@ -376,14 +348,8 @@ async fn qmatmul_coop_shape(session: &Session, fmt: QFmt) -> CaseResult {
         rows: fusor::Dim::Const(N),
         cols: fusor::Dim::Const(k),
     };
-    let dense = qm
-        .dequantize()
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let want = read(
-        &a.matmul_t(&dense)
-            .map_err(|e| -> CaseError { e.to_string().into() })?,
-    )
-    .await?;
+    let dense = qm.dequantize()?;
+    let want = read(&a.matmul_t(&dense)?).await?;
 
     crate::compare::approx_or_relative_eq(
         backend_of(session),
@@ -436,18 +402,10 @@ async fn defn_coop_shape(session: &Session, fmt: QFmt, layout: QLayout) -> CaseR
 
     let act = Domain::Wide.sample(3301, (M * k) as usize);
     let a = upload(graph.handle(), &dims(&[M, k]), &act)?;
-    let got = read(
-        &a.matmul_t(&dense)
-            .map_err(|e| -> CaseError { e.to_string().into() })?,
-    )
-    .await?;
+    let got = read(&a.matmul_t(&dense)?).await?;
 
     let oracle = upload(graph.handle(), &dims(&[N, k]), &decoded)?;
-    let want = read(
-        &a.matmul_t(&oracle)
-            .map_err(|e| -> CaseError { e.to_string().into() })?,
-    )
-    .await?;
+    let want = read(&a.matmul_t(&oracle)?).await?;
 
     crate::compare::approx_or_relative_eq(
         backend_of(session),
@@ -601,15 +559,11 @@ async fn qgemv_grid_past_the_dimension_cap(session: &Session) -> CaseResult {
     let graph = graph_of(session);
     let rows = fusor::Dim::Const(MANY_ROWS as u64);
     let cols = fusor::Dim::Const(k as u64);
-    let w = graph
-        .quantized(fmt, layout, [rows, cols], &bytes)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let w = graph.quantized(fmt, layout, [rows, cols], &bytes)?;
 
     let act = Domain::Wide.sample(4407, k);
     let a = upload(graph.handle(), &dims(&[1, k as u64]), &act)?;
-    let y = a
-        .matmul_t(&w)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = a.matmul_t(&w)?;
     let got = read(&y).await?;
 
     let mut expected = vec![0.0f32; MANY_ROWS];
@@ -640,9 +594,7 @@ async fn qmatmul_backward(session: &Session, shape: &[u64], seed: u32) -> CaseRe
     let graph = graph_of(session);
     let qm = matrix_from_parts(&graph, fmt, layout, &bytes, rows as u64, k as u64)?;
     let a = upload(graph.handle(), &dims(&[batch as u64, k as u64]), &act)?;
-    let y = a
-        .matmul_t(&qm.tensor)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = a.matmul_t(&qm.tensor)?;
 
     // d_act[b, t] = sum over rows of w[r, t], under an all-ones seed.
     let d_a = crate::suite::support::gradient_of(&graph, &y, &a).await?;
@@ -685,8 +637,7 @@ async fn repack_case(_session: &Session, fmt: QFmt, shape: &[u64], seed: u32) ->
         QLayout::F32Scales,
         &native,
         &mut widened,
-    )
-    .map_err(|e| -> CaseError { e.to_string().into() })?;
+    )?;
     let want_len = blocks * fmt.block_bytes(QLayout::F32Scales) as usize;
     if widened.len() != want_len {
         return Err(format!(
@@ -722,8 +673,7 @@ async fn repack_case(_session: &Session, fmt: QFmt, shape: &[u64], seed: u32) ->
         QLayout::Native,
         &widened,
         &mut narrowed,
-    )
-    .map_err(|e| -> CaseError { e.to_string().into() })?;
+    )?;
     crate::compare::assert_bytes_eq(&native, &narrowed)
         .map_err(|e| -> CaseError { format!("{fmt:?} repack round trip: {e}").into() })?;
     Ok(())
@@ -743,8 +693,7 @@ async fn layouts_agree(session: &Session, shape: &[u64], seed: u32) -> CaseResul
             QLayout::F32Scales,
             &native,
             &mut widened,
-        )
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+        )?;
 
         let graph = graph_of(session);
         let a = matrix_from_parts(&graph, fmt, QLayout::Native, &native, rows, be)?
@@ -786,8 +735,7 @@ async fn index_select_rows(session: &Session) -> CaseResult {
             let (bytes, decoded) = quantized_rows(fmt, layout);
             let graph = graph_of(session);
             let qm = matrix_from_parts(&graph, fmt, layout, &bytes, ROWS, cols as u64)?;
-            let idx = from_u32(graph.handle(), &dims(&[PICKS.len() as u64]), PICKS)
-                .map_err(|e| -> CaseError { e.to_string().into() })?;
+            let idx = from_u32(graph.handle(), &dims(&[PICKS.len() as u64]), PICKS)?;
 
             let picked = qm
                 .index_select_rows(&idx)
@@ -864,8 +812,7 @@ async fn index_select_rows(session: &Session) -> CaseResult {
         ROWS,
         fmt.block_elements() as u64,
     )?;
-    let square = from_u32(graph.handle(), &dims(&[2, 2]), &[0, 1, 2, 0])
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let square = from_u32(graph.handle(), &dims(&[2, 2]), &[0, 1, 2, 0])?;
     if qm.index_select_rows(&square).is_ok() {
         return Err("index_select_rows accepted a rank-2 index run".into());
     }

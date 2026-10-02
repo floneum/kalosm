@@ -1,38 +1,21 @@
-//! `Gather` and `Scatter`.
-//!
-//! Both `ScatterMode`s name one map and differ only in strategy. On a target
-//! with no f32 atomic they share one nest: one lane per output element, a
-//! counted loop over the updates. Every output element is written by exactly one
-//! lane, so no atomic is needed and the result is bit-reproducible.
-//!
-//! Both nests read their lane tiling off `theta`. `Gather` and `Scatter` carry
-//! the same elementwise `ScheduleDomain::Map` a `Map` carries, and can use
-//! `tm` elements per lane like the grid-strided register tile in `map_fold`,
-//! amortizing the index read in scatter workloads.
+//! `Gather` and `Scatter`: one lane per output element (`tm` with a grid-stride
+//! tiling), a scatter looping over the updates, so no atomic is needed.
 
 use fusor_ir::Result;
-use fusor_ir::device::Caps;
 use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
-    Accumulator, Addr, KernelIr, Local, LocalDecl, Stmt, StorageView, TileExpr, TileExprKind,
+    Accumulator, Addr, KernelIr, ScalarElement, Stmt, TileExpr, TileExprKind,
 };
-use fusor_ir::ir::launch::{Launch, ScatterMode, SchedPoint};
+use fusor_ir::ir::launch::ScatterGeometry;
+use fusor_ir::ir::launch::{IndexSpace, Launch, Operand, SchedPoint};
 use fusor_ir::ir::logical::ScatterCombine;
 use fusor_ir::ir::{Node, Op};
-use fusor_ir::scalar::{BinOp, CmpOp};
 use fusor_ir::target::LowerCtx;
-use std::sync::Arc;
+use fusor_tile::build::Kernel;
 
-use super::{
-    Binds, bin, cmp, const_extents, default_block, global_lane, grid_for, lit_u32, u32_ty,
-};
+use super::{Binds, DEFAULT_BLOCK, const_extents, global_lane, grid_for, operand_src, view};
 
-pub(crate) fn lower(
-    caps: &Caps,
-    node: &Node,
-    theta: SchedPoint,
-    cx: &LowerCtx<'_>,
-) -> Result<KernelIr> {
+pub(crate) fn lower(node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
     let Op::Launch(op) = &node.op else {
         return Err(Error::Legality("not a Launch node".into()));
     };
@@ -40,31 +23,16 @@ pub(crate) fn lower(
     match op {
         Launch::Gather {
             space, axis, ops, ..
-        } => gather(caps, cx, space, *axis, ops, tm),
+        } => gather(cx, space, *axis, ops, tm),
         Launch::Scatter {
-            space,
-            axis,
-            mode,
-            combine,
-            ops,
-            ..
-        } => scatter(caps, cx, space, *axis, *mode, *combine, ops, tm),
+            axis, combine, ops, ..
+        } => scatter(cx, *axis, *combine, ops, tm),
         _ => Err(Error::Legality("gather_scatter got a foreign node".into())),
     }
 }
 
-/// How many output elements one lane owns, read off `theta`.
-///
-/// [`SchedPoint::Point`] is the floor lowering's untiled point, so it is
-/// answered with 1 rather than refused. Any other family on these nodes is a
-/// planner bug.
-///
-/// `MapTiling::dim` is ignored: this backend tiles with a grid stride
-/// (`flat + t * grid.x * block`), exactly as `lower_map` does, so one lane's
-/// elements are a fixed distance apart whatever axis the domain named and
-/// coverage stays a bijection with no divisibility side condition.
-/// `MapTiling::vector` is ignored too: `emit::pick_width` chooses the SIMD
-/// instantiation from `caps.simd_widths` and the block width.
+/// Output elements per lane, read off `theta` (`Point` is 1). Tiling is a grid
+/// stride, so `MapTiling::dim` and `vector` are ignored.
 fn lane_tile(theta: SchedPoint) -> Result<u32> {
     match theta {
         SchedPoint::Map(t) => Ok(t.tm.max(1)),
@@ -75,32 +43,34 @@ fn lane_tile(theta: SchedPoint) -> Result<u32> {
     }
 }
 
-fn view(buf: &Arc<fusor_ir::ir::kernel::BufferDecl>) -> StorageView {
-    StorageView {
-        buffer: Arc::clone(buf),
-        offset: 0,
-        layout: buf.layout.clone(),
-    }
+/// The `tm` flat indices one lane owns, a grid apart, and that grid.
+fn lane_offsets(b: &Kernel, n: u64, tm: u32) -> ([u32; 3], Vec<TileExpr>) {
+    let grid = grid_for(n.div_ceil(u64::from(tm)), DEFAULT_BLOCK);
+    let stride = grid[0].saturating_mul(DEFAULT_BLOCK);
+    let lane = global_lane(b, DEFAULT_BLOCK);
+    let offsets = (0..tm)
+        .map(|t| match t {
+            0 => lane.clone(),
+            _ => b.add(lane.clone(), b.u32(t.saturating_mul(stride))),
+        })
+        .collect();
+    (grid, offsets)
 }
 
 /// `out[i, rest] = src[idx[i], rest]`, one lane per output element.
-///
-/// Both `GatherMode`s share this nest; they differ only in how many output
-/// elements one lane owns, which is a schedule attribute rather than a
-/// different kernel.
 fn gather(
-    caps: &Caps,
     cx: &LowerCtx<'_>,
-    space: &fusor_ir::ir::launch::IndexSpace,
+    space: &IndexSpace,
     axis: u32,
-    ops: &[fusor_ir::ir::launch::Operand],
+    ops: &[Operand],
     tm: u32,
 ) -> Result<KernelIr> {
-    if ops.len() < 2 {
+    let [src, idx, ..] = ops else {
         return Err(Error::Legality(
             "a gather needs a source and an index operand".into(),
         ));
-    }
+    };
+    let b = Kernel::new();
     let binds = Binds::build(cx)?;
     let extents = const_extents(cx, &space.dims)?;
     let n: u64 = extents.iter().map(|e| *e as u64).product::<u64>().max(1);
@@ -110,207 +80,114 @@ fn gather(
     }
     let inner: u32 = extents[axis + 1..].iter().product::<u32>().max(1);
     let out_stride = extents[axis].max(1) * inner;
-    // The source's extent along the gathered axis, the only axis where source
-    // and output disagree. Scaling the source's outer coordinate by the
-    // output's stride reads the wrong row whenever the index vector is not
-    // exactly as long as the axis it indexes.
-    let src_shape = const_extents(cx, ops[0].layout.shape())?;
+    // The source's extent on the gathered axis: the outer coordinate must step by
+    // the source's stride, not the output's.
+    let src_shape = const_extents(cx, src.layout.shape())?;
     let src_axis = *src_shape
         .get(axis)
         .ok_or_else(|| Error::Legality("gather axis is out of range for the source".into()))?;
     let src_stride = src_axis.max(1) * inner;
 
-    let src = super::operand_src(cx, &binds, ops[0].src)?;
-    let idx = super::operand_src(cx, &binds, ops[1].src)?;
-    let out = binds.of(cx.launch.root)?;
-
-    // `tm` elements per lane, a whole grid apart, so lane 0..stride covers
-    // [0, tm*stride) >= [0, n) exactly once with no divisibility condition.
-    let block = default_block(caps);
-    let grid = grid_for(n.div_ceil(u64::from(tm)), block);
-    let stride = grid[0].saturating_mul(block);
-
+    let src = operand_src(&b, cx, &binds, src.src)?;
+    let idx = operand_src(&b, cx, &binds, idx.src)?;
+    let out = view(&binds.of(cx.launch.root)?);
+    let (grid, offsets) = lane_offsets(&b, n, tm);
     let mut body = Vec::with_capacity(tm as usize);
-    for t in 0..tm {
-        let flat = if t == 0 {
-            global_lane(block)
-        } else {
-            bin(
-                BinOp::Add,
-                global_lane(block),
-                lit_u32(t.saturating_mul(stride)),
-                u32_ty(),
-            )
-        };
-        let mask = cmp(CmpOp::Lt, flat.clone(), lit_u32(n as u32));
+    for flat in offsets {
+        let mask = b.lt(flat.clone(), b.u32(n as u32));
         // Split the flat output index into (outer, gathered, inner).
-        let outer = bin(BinOp::Div, flat.clone(), lit_u32(out_stride), u32_ty());
-        let rest = bin(BinOp::Rem, flat.clone(), lit_u32(out_stride), u32_ty());
-        let g = bin(BinOp::Div, rest.clone(), lit_u32(inner), u32_ty());
-        let within = bin(BinOp::Rem, rest, lit_u32(inner), u32_ty());
-
-        let row = idx.at(g, mask.clone());
-        // The gathered coordinate replaces `g`; everything else is unchanged —
-        // but the outer coordinate steps by the *source's* stride.
-        let src_index = bin(
-            BinOp::Add,
-            bin(
-                BinOp::Add,
-                bin(BinOp::Mul, outer, lit_u32(src_stride), u32_ty()),
-                bin(BinOp::Mul, row, lit_u32(inner), u32_ty()),
-                u32_ty(),
-            ),
+        let (outer, rest) = b.divrem(flat.clone(), b.u32(out_stride));
+        let (g, within) = b.divrem(rest, b.u32(inner));
+        // Replace the gathered coordinate; outer steps by the source's stride.
+        let row = idx.at(&b, g, mask.clone());
+        let src_index = b.add(
+            b.add(b.mul(outer, b.u32(src_stride)), b.mul(row, b.u32(inner))),
             within,
-            u32_ty(),
         );
-        let value = src.at(src_index, mask.clone());
         body.push(Stmt::Store {
-            dst: view(&out),
+            dst: out.clone(),
             addr: Addr::Linear(flat),
-            value,
+            value: src.at(&b, src_index, mask.clone()),
             mask,
         });
     }
 
-    Ok(KernelIr {
-        buffers: binds.buffers,
-        grid,
-        block,
-        body,
-        byte_arena: None,
-        name: "cpu_gather",
-    })
+    Ok(binds.finish("cpu_gather", grid, DEFAULT_BLOCK, body))
 }
 
-/// `out = base` with `out[.., idx[u], ..] (combine)= upd[.., u, ..]`.
-///
-/// The nest walks the output, not the updates: a `Scatter`'s value is its
-/// *base* with the updates applied, and the plan gives that value its own
-/// buffer — nothing copies the base in beforehand — so a kernel that only
-/// visits the written elements leaves every other one undefined.
-///
-/// One lane per output element, a counted loop over the updates, and the
-/// accumulator carried in a register: the write map is not injective, so the
-/// nest declares an associative `combine` (`verify_launch` invariant 3) and
-/// discharges it by making each output element the *only* writer of itself.
-/// The accumulation order is therefore fixed and the result bit-reproducible
-/// at any thread count — no atomic, on a target that has none for f32.
-///
-/// `tm` output elements per lane, in one loop: the loop costs one `idx[u]`
-/// read per output element per update, and `tm` accumulators in the same loop
-/// share that read.
-#[allow(clippy::too_many_arguments)]
+/// `out = base` with `out[.., idx[u], ..] (combine)= upd[.., u, ..]`. Walks the
+/// output (the plan never copies the base in), one lane per element over a
+/// counted loop of updates: each element is its own sole writer, so the result
+/// is bit-reproducible without atomics; `tm` accumulators share one `idx[u]` read.
 fn scatter(
-    caps: &Caps,
     cx: &LowerCtx<'_>,
-    space: &fusor_ir::ir::launch::IndexSpace,
     axis: u32,
-    _mode: ScatterMode,
     combine: ScatterCombine,
-    ops: &[fusor_ir::ir::launch::Operand],
+    ops: &[Operand],
     tm: u32,
 ) -> Result<KernelIr> {
-    // Either mode names a *strategy* for the same map. This nest needs no
-    // atomic, so `Atomic{Add}` is legal here even though `caps.atomic_f32`
-    // is false.
-    if ops.len() < 3 {
+    let [base, idx, upd, ..] = ops else {
         return Err(Error::Legality(
             "a scatter needs base, index and update operands".into(),
         ));
-    }
-    let _ = caps;
+    };
+    let b = Kernel::new();
     let binds = Binds::build(cx)?;
-    let geom = super::scatter_geometry(cx, space, axis, ops)?;
-    let (outer, bins, inner, updates) = (geom.outer, geom.bins, geom.inner, geom.updates);
-    let total = outer as u64 * bins as u64 * inner as u64;
+    let resolve = |d| super::resolve_dim(cx, d).map(u64::from);
+    let geom = ScatterGeometry::of(ops, axis as usize, resolve, Error::Legality)?;
+    let (bins, inner, updates) = (geom.bins, geom.inner, geom.updates);
+    let total = geom.total();
 
-    let base = super::operand_src(cx, &binds, ops[0].src)?;
-    let idx = super::operand_src(cx, &binds, ops[1].src)?;
-    let upd = super::operand_src(cx, &binds, ops[2].src)?;
-    let out = binds.of(cx.launch.root)?;
-    let elem = out.element;
+    let base = operand_src(&b, cx, &binds, base.src)?;
+    let idx = operand_src(&b, cx, &binds, idx.src)?;
+    let upd = operand_src(&b, cx, &binds, upd.src)?;
+    let out_buf = binds.of(cx.launch.root)?;
+    let elem = out_buf.element;
+    let out = view(&out_buf);
 
-    let block = default_block(caps);
-    let grid = grid_for(total.div_ceil(u64::from(tm)), block);
-    let lane_stride = grid[0].saturating_mul(block);
-
-    let u_local: Local = Arc::new(LocalDecl::new(u32_ty()));
-    let u = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(&u_local)), u32_ty());
-
-    // The lowest offset is live whenever any of this lane's offsets is, so it
-    // is the right mask for the one index read they share.
-    let first_live = cmp(CmpOp::Lt, global_lane(block), lit_u32(total as u32));
-    let u_bin = idx.at(u.clone(), first_live);
+    let (grid, offsets) = lane_offsets(&b, total, tm);
+    let u_local = b.local(ScalarElement::U32.element());
+    let u = b.load_local(u_local.clone());
+    // The lowest offset is live whenever any is: the mask for the shared index read.
+    let first_live = b.lt(global_lane(&b, DEFAULT_BLOCK), b.u32(total as u32));
+    let u_bin = idx.at(&b, u.clone(), first_live);
 
     let mut accumulators = Vec::with_capacity(tm as usize);
     let mut stores = Vec::with_capacity(tm as usize);
-    for t in 0..tm {
-        let flat = if t == 0 {
-            global_lane(block)
-        } else {
-            bin(
-                BinOp::Add,
-                global_lane(block),
-                lit_u32(t.saturating_mul(lane_stride)),
-                u32_ty(),
-            )
-        };
-        let live = cmp(CmpOp::Lt, flat.clone(), lit_u32(total as u32));
+    for flat in offsets {
+        let live = b.lt(flat.clone(), b.u32(total as u32));
         // (outer, destination bin, inner) of this output element.
-        let o = bin(BinOp::Div, flat.clone(), lit_u32(bins * inner), u32_ty());
-        let dest = bin(
-            BinOp::Rem,
-            bin(BinOp::Div, flat.clone(), lit_u32(inner), u32_ty()),
-            lit_u32(bins),
-            u32_ty(),
-        );
-        let within = bin(BinOp::Rem, flat.clone(), lit_u32(inner), u32_ty());
-
-        let acc_local: Local = Arc::new(LocalDecl::new(elem));
-        let acc = TileExpr::new(TileExprKind::LoadLocal(Arc::clone(&acc_local)), elem);
-
-        let hit = cmp(CmpOp::Eq, u_bin.clone(), dest);
+        let o = b.div(flat.clone(), b.u32(bins * inner));
+        let dest = b.rem(b.div(flat.clone(), b.u32(inner)), b.u32(bins));
+        let within = b.rem(flat.clone(), b.u32(inner));
+        let acc_local = b.local(elem);
+        let acc = b.load_local(acc_local.clone());
         // `upd[o, u, within]` in the update's own flat space.
-        let upd_index = bin(
-            BinOp::Add,
-            bin(
-                BinOp::Mul,
-                bin(
-                    BinOp::Add,
-                    bin(BinOp::Mul, o, lit_u32(updates), u32_ty()),
-                    u.clone(),
-                    u32_ty(),
-                ),
-                lit_u32(inner),
-                u32_ty(),
-            ),
+        let upd_index = b.add(
+            b.mul(b.add(b.mul(o, b.u32(updates)), u.clone()), b.u32(inner)),
             within,
-            u32_ty(),
         );
-        let contribution = upd.at(upd_index, live.clone());
+        let contribution = upd.at(&b, upd_index, live.clone());
         let combined = match combine {
-            // `Add` duplicates accumulate — normative: an embedding table
-            // receiving one token twice gets the summed gradient. `Set` is only
-            // reachable when the node proved its indices unique.
-            ScatterCombine::Add => bin(BinOp::Add, acc.clone(), contribution, elem),
+            // `Add` accumulates duplicates; `Set` only when indices are proven unique.
+            ScatterCombine::Add => b.add(acc.clone(), contribution),
             ScatterCombine::Set => contribution,
         };
         let update = TileExpr::new(
             TileExprKind::Select {
-                condition: hit,
+                condition: b.eq(u_bin.clone(), dest),
                 accept: combined,
                 reject: acc.clone(),
             },
             elem,
         );
-
         accumulators.push(Accumulator {
-            local: Arc::clone(&acc_local),
-            init: base.at(flat.clone(), live.clone()),
+            local: acc_local,
+            init: base.at(&b, flat.clone(), live.clone()),
             update,
         });
         stores.push(Stmt::Store {
-            dst: view(&out),
+            dst: out.clone(),
             addr: Addr::Linear(flat),
             value: acc,
             mask: live,
@@ -318,19 +195,12 @@ fn scatter(
     }
 
     let mut body = vec![Stmt::Loop {
-        count: Some(lit_u32(updates)),
+        count: Some(b.u32(updates)),
         index: Some(u_local),
         accumulators,
         body: Vec::new(),
     }];
     body.extend(stores);
 
-    Ok(KernelIr {
-        buffers: binds.buffers,
-        grid,
-        block,
-        body,
-        byte_arena: None,
-        name: "cpu_scatter",
-    })
+    Ok(binds.finish("cpu_scatter", grid, DEFAULT_BLOCK, body))
 }

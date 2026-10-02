@@ -202,8 +202,7 @@ fn walk(expr: &ScalarExpr, seed: ScalarExpr, out: &mut Partials) {
         ScalarKind::Cast { x, .. } => walk(x, ScalarExpr::cast(x.dtype(), seed), out),
         ScalarKind::Bitcast { x, .. } => walk(x, ScalarExpr::bitcast(x.dtype(), seed), out),
 
-        // Derivative is 0 almost everywhere. QAT straight-through comes from
-        // the backward `fake_quant` registers on the sugar node, not from here.
+        // Derivative is 0 almost everywhere; fake_quant installs its own adjoint.
         ScalarKind::Round { x, .. } => walk(x, zero_like(x), out),
 
         ScalarKind::Dot { a, b } => {

@@ -16,7 +16,13 @@ impl LlamaModel {
         } = ctx;
         #[cfg(not(debug_assertions))]
         let _ = tokenizer;
-        if tokens.is_empty() {
+        let input_len = tokens.len()
+            + usize::from(
+                cache
+                    .as_ref()
+                    .is_some_and(|cache| cache.pending_token.is_some()),
+            );
+        if input_len == 0 {
             return Err(LlamaModelError::EmptyInput);
         }
 
@@ -30,7 +36,7 @@ impl LlamaModel {
 
         let trace_enabled = decode_trace_enabled();
         let decode_eligible =
-            tokens.len() == 1 && cache.as_ref().is_some_and(|cache| !cache.tokens.is_empty());
+            input_len == 1 && cache.as_ref().is_some_and(|cache| !cache.tokens.is_empty());
         let path = if decode_eligible {
             fast_path
         } else {

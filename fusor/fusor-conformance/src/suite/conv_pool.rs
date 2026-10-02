@@ -9,10 +9,9 @@ use fusor::composite::{
 };
 use fusor::{Dim, Dtype, Session};
 
-use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fuzz_case};
+use crate::harness::{CaseResult, Cases, FuzzDim, dims};
 use crate::suite::support::{
-    Domain, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss, upload,
+    Domain, check_gradient, expect_values, gradient_of, graph_of, read, upload,
 };
 
 // Spatial extents start at 3 so they never fall under the kernel extent
@@ -43,6 +42,17 @@ const GROUPED_CONV_SPEC: &[FuzzDim] = &[
     FuzzDim::Range(3, 8),
     FuzzDim::Range(1, 3),
 ];
+// `[batch, in_ch, h, w, out_ch, kernel, stride]`. The kernel starts at 2 and
+// the stride is clamped below it, so every run of this case overlaps.
+const OVERLAP_GRAD_SPEC: &[FuzzDim] = &[
+    FuzzDim::Range(1, 2),
+    FuzzDim::Range(1, 3),
+    FuzzDim::Range(3, 9),
+    FuzzDim::Range(3, 9),
+    FuzzDim::Range(1, 3),
+    FuzzDim::Range(2, 4),
+    FuzzDim::Range(1, 3),
+];
 // The length is `window * positions`, so the non-overlapping pool always
 // tiles it exactly.
 const POOL_SPEC: &[FuzzDim] = &[
@@ -58,46 +68,26 @@ const UPSAMPLE_SPEC: &[FuzzDim] = &[
 ];
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
-    cases.push_case(fuzz_case("conv_pool", "conv1d", CONV1D_SPEC, conv1d));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "conv2d_strided",
-        CONV2D_SPEC,
-        conv2d_strided,
-    ));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "grouped_conv",
-        GROUPED_CONV_SPEC,
-        grouped_conv,
-    ));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "pool",
-        POOL_SPEC,
-        async move |s: &Session, sh: &[u64], seed: u32| pool_case(s, Pool::Avg, sh, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "pool_max",
-        POOL_SPEC,
-        async move |s: &Session, sh: &[u64], seed: u32| pool_case(s, Pool::Max, sh, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "pool_min",
-        POOL_SPEC,
-        async move |s: &Session, sh: &[u64], seed: u32| pool_case(s, Pool::Min, sh, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "conv_pool",
-        "upsample_nearest2d",
-        UPSAMPLE_SPEC,
-        upsample_nearest2d,
-    ));
+    let mut cases = Cases::new("conv_pool");
+    cases.fuzz("conv1d", CONV1D_SPEC, conv1d);
+    cases.fuzz("conv2d_strided", CONV2D_SPEC, conv2d_strided);
+    cases.fuzz("grouped_conv", GROUPED_CONV_SPEC, grouped_conv);
+    cases.fuzz(
+        "conv2d_overlapping_input_gradient",
+        OVERLAP_GRAD_SPEC,
+        conv2d_overlapping_input_gradient,
+    );
+    cases.fuzz("pool", POOL_SPEC, async move |s, sh, seed| {
+        pool_case(s, Pool::Avg, sh, seed).await
+    });
+    cases.fuzz("pool_max", POOL_SPEC, async move |s, sh, seed| {
+        pool_case(s, Pool::Max, sh, seed).await
+    });
+    cases.fuzz("pool_min", POOL_SPEC, async move |s, sh, seed| {
+        pool_case(s, Pool::Min, sh, seed).await
+    });
+    cases.fuzz("upsample_nearest2d", UPSAMPLE_SPEC, upsample_nearest2d);
     cases.push(
-        "conv_pool",
         "pool_max_non_overlapping_adjoint_is_mask",
         non_overlapping_adjoint_is_mask,
     );
@@ -153,21 +143,15 @@ async fn conv1d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let w_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, out_ch * in_ch * k);
     let b_data = Domain::Wide.sample(seed.wrapping_add(1), out_ch);
 
+    let x_shape = dims(&[batch as u64, in_ch as u64, len as u64]);
+    let w_shape = dims(&[out_ch as u64, in_ch as u64, k as u64]);
+    let b_shape = dims(&[out_ch as u64]);
     let graph = graph_of(session);
-    let x = upload(
-        graph.handle(),
-        &dims(&[batch as u64, in_ch as u64, len as u64]),
-        &x_data,
-    )?;
-    let w = upload(
-        graph.handle(),
-        &dims(&[out_ch as u64, in_ch as u64, k as u64]),
-        &w_data,
-    )?;
-    let b = upload(graph.handle(), &dims(&[out_ch as u64]), &b_data)?;
+    let x = upload(graph.handle(), &x_shape, &x_data)?;
+    let w = upload(graph.handle(), &w_shape, &w_data)?;
+    let b = upload(graph.handle(), &b_shape, &b_data)?;
 
-    let y = conv(&x, &w, Some(&b), &[1], &[k as u32 / 2], &[1])
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = conv(&x, &w, Some(&b), &[1], &[k as u32 / 2], &[1])?;
 
     let (out_len, expected) = host_conv1d(
         &x_data,
@@ -200,34 +184,15 @@ async fn conv1d(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     }
 
     let d_w = gradient_of(&graph, &y, &w).await?;
-    let probe_graph = graph_of(session);
-    let probe_x = upload(
-        probe_graph.handle(),
-        &dims(&[batch as u64, in_ch as u64, len as u64]),
-        &x_data,
-    )?;
-    let probe_w = upload(
-        probe_graph.handle(),
-        &dims(&[out_ch as u64, in_ch as u64, k as u64]),
-        &w_data,
-    )?;
-    let probe_b = upload(probe_graph.handle(), &dims(&[out_ch as u64]), &b_data)?;
-    let probe_y = conv(
-        &probe_x,
-        &probe_w,
-        Some(&probe_b),
-        &[1],
-        &[k as u32 / 2],
-        &[1],
-    )
-    .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[out_ch * in_ch * k], &w_data, |probe| {
-        read_probe_loss(&probe_w, &probe_loss, probe)
+    let inputs = [
+        (&x_shape[..], &x_data[..]),
+        (&w_shape, &w_data),
+        (&b_shape, &b_data),
+    ];
+    check_gradient(session, &inputs, 1, &d_w, |t| {
+        conv(&t[0], &t[1], Some(&t[2]), &[1], &[k as u32 / 2], &[1])
     })
-    .await?;
-    assert_gradient_matches_finite_difference(&d_w, &numeric)?;
-    Ok(())
+    .await
 }
 
 async fn conv2d_strided(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
@@ -253,8 +218,7 @@ async fn conv2d_strided(session: &Session, shape: &[u64], seed: u32) -> CaseResu
         &dims(&[out_ch as u64, in_ch as u64, k as u64, k as u64]),
         &w_data,
     )?;
-    let y = conv(&x, &w, None, &[2, 2], &[0, 0], &[1, 1])
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = conv(&x, &w, None, &[2, 2], &[0, 0], &[1, 1])?;
 
     let out_h = (h - k) / 2 + 1;
     let out_w = (w_ext - k) / 2 + 1;
@@ -290,6 +254,104 @@ async fn conv2d_strided(session: &Session, shape: &[u64], seed: u32) -> CaseResu
     Ok(())
 }
 
+/// The overlapping branch of the `Window` adjoint: `stride < kernel`, so a
+/// source element feeds several windows and the adjoint has to add their
+/// gradients together.
+///
+/// Every other conv and pool case here tiles exactly and takes the pure-view
+/// branch, so without this one nothing in the suite reaches the overlap-add
+/// at all — which is how it went unmeasured long enough to become the whole
+/// cost of a convolutional training step.
+///
+/// `d(sum y)/dx` needs no finite differences: it is exactly the sum of the
+/// weights of every window covering that source position, independent of `x`.
+async fn conv2d_overlapping_input_gradient(
+    session: &Session,
+    shape: &[u64],
+    seed: u32,
+) -> CaseResult {
+    let [batch, in_ch, h, w_ext, out_ch, kernel, stride_pick] = [
+        shape[0] as usize,
+        shape[1] as usize,
+        shape[2] as usize,
+        shape[3] as usize,
+        shape[4] as usize,
+        shape[5] as usize,
+        shape[6] as usize,
+    ];
+    // Overlap is the point of the case, so the stride never reaches the
+    // kernel; `pad` is the "same"-ish padding a real network uses.
+    let stride = stride_pick.clamp(1, kernel - 1);
+    let pad = kernel / 2;
+
+    let x_data = Domain::Wide.sample(seed, batch * in_ch * h * w_ext);
+    let w_data = Domain::Wide.sample(seed ^ 0x9e37_79b9, out_ch * in_ch * kernel * kernel);
+
+    let graph = graph_of(session);
+    let x = upload(
+        graph.handle(),
+        &dims(&[batch as u64, in_ch as u64, h as u64, w_ext as u64]),
+        &x_data,
+    )?;
+    let w = upload(
+        graph.handle(),
+        &dims(&[out_ch as u64, in_ch as u64, kernel as u64, kernel as u64]),
+        &w_data,
+    )?;
+    let y = conv(
+        &x,
+        &w,
+        None,
+        &[stride as u32, stride as u32],
+        &[pad as u32, pad as u32],
+        &[1, 1],
+    )?;
+
+    let out_h = (h + 2 * pad - kernel) / stride + 1;
+    let out_w = (w_ext + 2 * pad - kernel) / stride + 1;
+    let mut want = vec![0.0f32; batch * in_ch * h * w_ext];
+    for b in 0..batch {
+        for oc in 0..out_ch {
+            for oh in 0..out_h {
+                for ow in 0..out_w {
+                    for ic in 0..in_ch {
+                        for kh in 0..kernel {
+                            for kw in 0..kernel {
+                                let ih = (oh * stride + kh) as isize - pad as isize;
+                                let iw = (ow * stride + kw) as isize - pad as isize;
+                                if ih < 0 || iw < 0 || ih >= h as isize || iw >= w_ext as isize {
+                                    continue;
+                                }
+                                want[((b * in_ch + ic) * h + ih as usize) * w_ext + iw as usize] +=
+                                    w_data[((oc * in_ch + ic) * kernel + kh) * kernel + kw];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let got = gradient_of(&graph, &y, &x).await?;
+    if got.len() != want.len() {
+        return Err(format!(
+            "the input gradient has {} elements, want {}: it must land in the input's own shape",
+            got.len(),
+            want.len()
+        )
+        .into());
+    }
+    expect_values(
+        session,
+        &[batch as u64, in_ch as u64, h as u64, w_ext as u64],
+        Dtype::F32,
+        &got,
+        &want,
+    )
+    .await?;
+    Ok(())
+}
+
 /// PyTorch grouped layout: `weight` is `[out_ch, in_ch / groups, ...kernel]`.
 /// `shape` is `[batch, groups, per_group_in, per_group_out, len, k]` — the
 /// per-group channel counts are sampled and multiplied so groups always
@@ -320,8 +382,7 @@ async fn grouped_conv(session: &Session, shape: &[u64], seed: u32) -> CaseResult
         &dims(&[out_ch as u64, per_group_in as u64, k as u64]),
         &w_data,
     )?;
-    let y = grouped_conv_op(&x, &w, None, &[1], &[1], &[1], groups as u32)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = grouped_conv_op(&x, &w, None, &[1], &[1], &[1], groups as u32)?;
 
     let out_len = len + 2 - k + 1;
     let mut expected = vec![0.0f32; batch * out_ch * out_len];
@@ -375,8 +436,7 @@ async fn pool_case(session: &Session, kind: Pool, shape: &[u64], seed: u32) -> C
         Pool::Max => pool_max(&x, &[PoolSize::new(window, window)]),
         Pool::Min => pool_min(&x, &[PoolSize::new(window, window)]),
         Pool::Avg => pool_avg(&x, &[PoolSize::new(window, window)]),
-    }
-    .map_err(|e| -> CaseError { e.to_string().into() })?;
+    }?;
 
     let mut expected = Vec::with_capacity(ch * positions);
     for c in 0..ch {
@@ -414,8 +474,7 @@ async fn non_overlapping_adjoint_is_mask(session: &Session) -> CaseResult {
 
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(&[1, 1, LEN as u64]), &data)?;
-    let y = pool_max(&x, &[PoolSize::new(WINDOW, WINDOW)])
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = pool_max(&x, &[PoolSize::new(WINDOW, WINDOW)])?;
 
     let grad = gradient_of(&graph, &y, &x).await?;
     if grad.len() != LEN {
@@ -476,8 +535,7 @@ async fn upsample_nearest2d(session: &Session, shape: &[u64], seed: u32) -> Case
             Dim::Const(h * scale),
             Dim::Const(w * scale),
         ],
-    )
-    .map_err(|e| -> CaseError { e.to_string().into() })?;
+    )?;
 
     let mut expected = Vec::new();
     for ci in 0..c as usize {

@@ -1,21 +1,16 @@
-//! Launch `nest` — index spaces, kernels, launches. Only Launch can express fusion,
-//! tiling, split-K, layout alias-vs-gather, kernel family, horizontal merging,
-//! register tiling and rematerialization. **Allocation is not described at
-//! Launch**: buffers are derived from the extracted plan.
+//! Launch nests: index spaces, kernels, launches — where fusion, tiling and
+//! kernel family are expressed. Buffers are derived from the extracted plan.
 
 use crate::carrier::Carrier;
 use crate::dtype::Dtype;
 use crate::egraph::Id;
-use crate::ir::{AttrId, OpDefId, OpTag};
+use crate::ir::OpTag;
 use crate::scalar::ScalarExpr;
-use crate::shape::{Dim, Layout, MultiFlattenMap, SlidingWindow};
+use crate::shape::{Dim, Dims, Layout, MultiFlattenMap, SlidingWindow};
 use smallvec::SmallVec;
+use std::sync::Arc;
 
 /// The Launch op family.
-// `Contract` carries its whole tile vocabulary inline and dwarfs the other
-// variants. Nodes are hash-consed once and read many times, and every rule
-// destructures them by value pattern; the indirection boxing would add is
-// not worth the size of a variant that is a minority of any real graph.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Launch {
@@ -26,38 +21,39 @@ pub enum Launch {
         sched: ScheduleDomain,
     },
 
-    /// A reduction nest over a [`Carrier`]. `space` is
-    /// `free.. ++ vec.. ++ [reduced]`; the carrier owns the element
-    /// expression (`lift`, which is where the old `pre` went), the per-slot
-    /// identities and the merge, so a multi-slot accumulator is expressible
-    /// and there is no `TileReduceOp` to resolve for a whole fold.
+    /// A reduction nest over a [`Carrier`], which owns the element
+    /// expression, per-slot identities and merge. `space` is
+    /// `free.. ++ vec.. ++ [reduced]`.
     Fold {
         space: IndexSpace,
         axis: u32,
-        /// Free axes living in the **accumulator's data space** rather than
-        /// the iteration domain — a contiguous block immediately before
-        /// `axis`, which is what makes the output shape identical before and
-        /// after promotion. Operand address maps are stated against the full
-        /// `space` and are never rewritten; every [`ScalarExpr`] on this node
-        /// is written against [`Launch::iter_space`].
+        /// Free axes in the accumulator's data space: a contiguous block
+        /// before `axis`. Operands address the full `space`; every
+        /// [`ScalarExpr`] here is written against [`Launch::iter_space`].
         vec_axes: SmallVec<[u32; 2]>,
         carrier: Carrier,
         acc: Dtype,
-        /// One per slot, over `Arg(0..width)`. Cross-slot reads are legal —
-        /// flash's normalized output reads the running sum. Shape-preserving:
-        /// a post never changes the appended carrier axis.
+        /// One per slot, over `Arg(0..width)`; cross-slot reads are legal.
         post: SmallVec<[ScalarExpr; 4]>,
         ops: Vec<Operand>,
         sched: ScheduleDomain,
     },
 
-    /// Dense contraction. **`family` is a property of this node's lowering,
-    /// never a decision stored on a Logical op**: all three families coexist in
-    /// one chain, so a gemv-shaped contraction cannot pick Coop, have the
-    /// tile scorer decline, and silently run a third path. `acc` is
-    /// independent of operand dtype, which is what makes
-    /// `contract{acc: F32}(F16, F16) -> F16` one node.
+    /// A scalar producer Fold inlined at one operand of another Fold. The
+    /// replaced operand's `src` is canonicalized to `Id(0)`; its layout maps
+    /// consumer coordinates into the producer's dense output.
+    StreamFold {
+        producer: Box<Launch>,
+        fold: Box<Launch>,
+        operand: u32,
+        sched: ScheduleDomain,
+    },
+
+    /// Dense contraction. `family` is this node's lowering (all families
+    /// coexist as alternatives); `acc` is independent of operand dtype.
     Contract {
+        /// Logical output axes; matrix dimensions flatten adjacent axis groups.
+        output: IndexSpace,
         m: Dim,
         n: Dim,
         k: Dim,
@@ -88,76 +84,296 @@ pub enum Launch {
         sched: ScheduleDomain,
     },
 
-    /// A multi-output region: the same rewrite as producer inlining,
-    /// differing only in that it emits an extra buffer.
-    ///
-    /// `sched` is the members' shared index space walked as one linearized
-    /// body — see [`MapDomain::linear_over`]. Without it the one node family
-    /// the architecture calls its own fusion primitive would be the one whose
-    /// geometry is not a selection.
-    Region {
+    /// A pipeline of launches run by one dispatch, one workgroup per slab:
+    /// workgroup `s` computes slab `s` of every member in dependency order,
+    /// with a barrier between stages. The last member's value is this
+    /// node's; children are the members themselves, by id.
+    Slab {
+        slabs: u32,
         members: SmallVec<[Id; 8]>,
-        live_outs: SmallVec<[u32; 4]>,
         sched: ScheduleDomain,
     },
 
-    /// The one open extension point.
-    Ext {
-        def: OpDefId,
-        ops: Vec<Operand>,
-        attrs: AttrId,
+    /// Independent launches run by one dispatch, each on its own range of
+    /// workgroups. The last member's value is this node's; children are the
+    /// members by id.
+    Group {
+        members: SmallVec<[Id; 8]>,
+        sched: ScheduleDomain,
     },
 }
 impl Launch {
+    /// Stream `producer` into `fold`'s `operand`, when the read addresses the
+    /// scalar producer's dense output.
+    pub fn stream_fold(producer: Self, mut fold: Self, operand: u32) -> Option<Self> {
+        let Self::Fold { sched, ops, .. } = &mut fold else {
+            return None;
+        };
+        let sched = sched.clone();
+        ops.get_mut(operand as usize)?.src = Id(0);
+        let op = Self::StreamFold {
+            producer: Box::new(producer),
+            fold: Box::new(fold),
+            operand,
+            sched,
+        };
+        op.stream_compatible().then_some(op)
+    }
+
+    pub fn stream_compatible(&self) -> bool {
+        let Self::StreamFold {
+            producer,
+            fold,
+            operand,
+            ..
+        } = self
+        else {
+            return false;
+        };
+        let Self::Fold {
+            space: source,
+            axis,
+            carrier,
+            vec_axes,
+            post,
+            ..
+        } = producer.as_ref()
+        else {
+            return false;
+        };
+        let Self::Fold { space, ops, .. } = fold.as_ref() else {
+            return false;
+        };
+        if carrier.slots.as_slice() != [crate::carrier::SlotTy::Scalar]
+            || !vec_axes.is_empty()
+            || post.len() != 1
+            || !carrier.associative
+            || *axis as usize >= source.rank()
+        {
+            return false;
+        }
+        let mut supported = true;
+        post[0].walk(&mut |e| {
+            if matches!(e.kind(), crate::scalar::ScalarKind::IndexOf(i) if *i > 0) {
+                supported = false;
+            }
+        });
+        for merge in &carrier.merge {
+            merge.walk(&mut |e| {
+                if matches!(e.kind(), crate::scalar::ScalarKind::IndexOf(_)) {
+                    supported = false;
+                }
+            });
+        }
+        if !supported {
+            return false;
+        }
+        let Some(read) = ops.get(*operand as usize) else {
+            return false;
+        };
+        if !matches!(read.access, AccessPlan::Alias)
+            || !read.layout.offset().known_eq(Dim::Const(0))
+            || read.layout.rank() != space.rank()
+            || !read
+                .layout
+                .shape()
+                .iter()
+                .zip(&space.dims)
+                .all(|(a, b)| a.known_eq(*b) || a.known_eq(Dim::ONE))
+        {
+            return false;
+        }
+        let output: Vec<Dim> = source
+            .dims
+            .iter()
+            .enumerate()
+            .filter_map(|(i, d)| (i != *axis as usize).then_some(*d))
+            .collect();
+        if output.iter().any(|d| d.known_eq(Dim::Const(0))) {
+            return false;
+        }
+        let count = crate::shape::const_elements(&output);
+        let last = read
+            .layout
+            .shape()
+            .iter()
+            .zip(read.layout.strides())
+            .try_fold(0u64, |n, (d, s)| {
+                n.checked_add(d.as_const()?.saturating_sub(1).checked_mul(s.as_const()?)?)
+            });
+        if let (Some(count), Some(last)) = (count, last) {
+            return last < count;
+        }
+        let strides = Layout::row_major_strides(&output);
+        let mut used = vec![false; output.len()];
+        for (extent, stride) in read.layout.shape().iter().zip(read.layout.strides()) {
+            if extent.known_eq(Dim::ONE) || stride.known_eq(Dim::Const(0)) {
+                continue;
+            }
+            let Some(i) = output
+                .iter()
+                .zip(&strides)
+                .enumerate()
+                .position(|(i, (d, s))| {
+                    !used[i]
+                        && extent.known_eq(*d)
+                        && stride.known_eq(*s)
+                        && *s != Dim::Sym(crate::shape::OPAQUE_SYM)
+                })
+            else {
+                return false;
+            };
+            used[i] = true;
+        }
+        true
+    }
+
+    /// The GPU fold strategy and block width before a composite widens its block.
+    pub fn fold_schedule(
+        &self,
+        theta: Option<SchedPoint>,
+        caps: &crate::device::Caps,
+    ) -> Option<FoldSchedule> {
+        if let Self::StreamFold { fold, .. } = self {
+            return fold.fold_schedule(theta, caps);
+        }
+        let Self::Fold {
+            carrier, vec_axes, ..
+        } = self
+        else {
+            return None;
+        };
+        if caps.kind != crate::device::DeviceKind::Gpu {
+            return None;
+        }
+        let fast = vec_axes.is_empty() && super::kernel::fast_reduce_op(carrier).is_some();
+        let default = emitted_block(1, caps);
+        let strat = match theta {
+            Some(SchedPoint::Fold(s)) => s,
+            _ if fast && caps.subgroups.is_some() => FoldStrat::Subgroup,
+            _ => FoldStrat::WgTree {
+                lane_group: default,
+            },
+        };
+        let lanes = strat.lane_group(caps.subgroup_width()).max(1);
+        let block = if fast {
+            match strat {
+                FoldStrat::Subgroup => lanes.min(caps.limits.max_compute_invocations_per_workgroup),
+                _ => emitted_block(lanes, caps),
+            }
+        } else {
+            lanes.max(default)
+        };
+        let scratch = if lanes <= 1 || (fast && strat == FoldStrat::Subgroup) {
+            0
+        } else {
+            block
+        };
+        Some(FoldSchedule {
+            strategy: strat,
+            block,
+            scratch,
+        })
+    }
+
     pub const fn tag(&self) -> OpTag {
         match self {
             Self::Map { .. } => OpTag::LaunchMap,
             Self::Fold { .. } => OpTag::LaunchFold,
+            Self::StreamFold { .. } => OpTag::LaunchStreamFold,
             Self::Contract { .. } => OpTag::LaunchContract,
             Self::Gather { .. } => OpTag::LaunchGather,
             Self::Scatter { .. } => OpTag::LaunchScatter,
-            Self::Region { .. } => OpTag::LaunchRegion,
-            Self::Ext { .. } => OpTag::Ext,
+            Self::Slab { .. } => OpTag::LaunchSlab,
+            Self::Group { .. } => OpTag::LaunchGroup,
         }
     }
 
     /// The domain this node's own expressions are written against: `space`
-    /// minus any accumulator-resident axes. Equal to `space` for every node
-    /// but a promoted `Fold`.
+    /// minus a promoted `Fold`'s accumulator-resident axes.
     pub fn iter_space(&self) -> IndexSpace {
         match self {
+            Self::StreamFold { fold, .. } => fold.iter_space(),
             Self::Fold {
                 space, vec_axes, ..
-            } if !vec_axes.is_empty() => IndexSpace::new(
-                space
-                    .dims
-                    .iter()
-                    .enumerate()
-                    .filter(|(i, _)| !vec_axes.contains(&(*i as u32)))
-                    .map(|(_, d)| *d),
-            ),
-            Self::Map { space, .. }
-            | Self::Fold { space, .. }
-            | Self::Gather { space, .. }
-            | Self::Scatter { space, .. } => space.clone(),
-            _ => IndexSpace::default(),
+            } if !vec_axes.is_empty() => space.iterated(vec_axes),
+            _ => self.space().cloned().unwrap_or_default(),
         }
     }
 
-    /// This node's enumerable schedule space, or `None` when it has none.
-    ///
-    /// `Ext` is the only `None`: the open extension point carries an
-    /// `OpDef`-supplied lowering that fusor cannot enumerate geometries for,
-    /// so its lowering is handed `SchedPoint::Point` and nothing else.
+    /// The index space operand layouts are stated against.
+    pub fn space(&self) -> Option<&IndexSpace> {
+        match self {
+            Self::Map { space, .. }
+            | Self::Fold { space, .. }
+            | Self::Gather { space, .. }
+            | Self::Scatter { space, .. } => Some(space),
+            _ => None,
+        }
+    }
+
+    /// The operand lists this node reads directly: `ops`, or a contraction's
+    /// two sides.
+    fn operand_lists(&self) -> [&[Operand]; 2] {
+        match self {
+            Self::Map { ops, .. }
+            | Self::Fold { ops, .. }
+            | Self::Gather { ops, .. }
+            | Self::Scatter { ops, .. } => [ops, &[]],
+            Self::Contract { a, b, .. } => [&a.ops, &b.ops],
+            Self::StreamFold { .. } | Self::Slab { .. } | Self::Group { .. } => [&[], &[]],
+        }
+    }
+
+    /// Every operand this node reads, in `children_of` order; a streamed
+    /// fold's generated operand is skipped and a composite reads none.
+    pub fn operands(&self) -> impl Iterator<Item = &Operand> {
+        let ([a, b], [c, d], skip) = match self {
+            Self::StreamFold {
+                producer,
+                fold,
+                operand,
+                ..
+            } => {
+                let first = producer.operand_lists();
+                let skip = first[0].len() + first[1].len() + *operand as usize;
+                (first, fold.operand_lists(), skip)
+            }
+            _ => (self.operand_lists(), [&[][..], &[]], usize::MAX),
+        };
+        [a, b, c, d]
+            .into_iter()
+            .flatten()
+            .enumerate()
+            .filter(move |(i, _)| *i != skip)
+            .map(|(_, o)| o)
+    }
+
+    /// The operands a rule may re-spell in place: `ops`, or a contraction's A
+    /// side then its B side.
+    pub fn operands_mut(&mut self) -> impl Iterator<Item = &mut Operand> {
+        let [a, b]: [&mut [Operand]; 2] = match self {
+            Self::Map { ops, .. }
+            | Self::Fold { ops, .. }
+            | Self::Gather { ops, .. }
+            | Self::Scatter { ops, .. } => [ops, &mut []],
+            Self::Contract { a, b, .. } => [&mut a.ops, &mut b.ops],
+            Self::StreamFold { .. } | Self::Slab { .. } | Self::Group { .. } => [&mut [], &mut []],
+        };
+        a.iter_mut().chain(b.iter_mut())
+    }
+
+    /// This node's enumerable schedule space.
     pub fn schedule(&self) -> Option<&ScheduleDomain> {
         match self {
             Self::Map { sched, .. }
             | Self::Fold { sched, .. }
+            | Self::StreamFold { sched, .. }
             | Self::Contract { sched, .. }
             | Self::Gather { sched, .. }
             | Self::Scatter { sched, .. }
-            | Self::Region { sched, .. } => Some(sched),
-            Self::Ext { .. } => None,
+            | Self::Slab { sched, .. }
+            | Self::Group { sched, .. } => Some(sched),
         }
     }
 }
@@ -190,16 +406,42 @@ impl IndexSpace {
     }
 
     pub fn iterations(&self) -> Option<u64> {
+        crate::shape::const_elements(&self.dims)
+    }
+
+    /// A fold's iteration domain: this space minus its promoted axes.
+    pub fn iterated(&self, vec_axes: &[u32]) -> IndexSpace {
+        IndexSpace {
+            dims: self.dims_except(|i| vec_axes.contains(&i)),
+        }
+    }
+
+    /// A fold's output dims before its carrier axis: this space minus the
+    /// reduced axis and every promoted axis.
+    pub fn fold_out_dims(&self, axis: u32, vec_axes: &[u32]) -> Dims {
+        self.dims_except(|i| i == axis || vec_axes.contains(&i))
+    }
+
+    /// A fold's output shape, spelled as inference spells it: `None` under a
+    /// multi-slot carrier with a symbolic `Vector` extent.
+    pub fn fold_shape(&self, axis: u32, vec_axes: &[u32], carrier: &Carrier) -> Option<Dims> {
+        let mut shape = self.fold_out_dims(axis, vec_axes);
+        shape.extend(carrier.out_dim()?);
+        Some(shape)
+    }
+
+    fn dims_except(&self, drop: impl Fn(u32) -> bool) -> Dims {
         self.dims
             .iter()
-            .try_fold(1u64, |acc, d| acc.checked_mul(d.as_const()?))
+            .enumerate()
+            .filter(|(i, _)| !drop(*i as u32))
+            .map(|(_, d)| *d)
+            .collect()
     }
 }
 
-/// One kernel operand. **Access is an attribute of the edge, not of the
-/// producing node** — one consumer may alias a strided parameter slice
-/// while another packs it, which is the flat-parameter/gradient-concat case
-/// and the im2col operand case coexisting in one graph.
+/// One kernel operand. Access is an attribute of the edge, not of the
+/// producer: one consumer may alias a slice another packs.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Operand {
     pub src: Id,
@@ -232,36 +474,10 @@ impl AccessPlan {
     }
 }
 
-/// One side of a [`Launch::Contract`]: the buffers it reads and the elementwise
-/// chain run per loaded element.
-///
-/// # Why a side is a list
-///
-/// A side carries multiple operands so producers that read more than one
-/// buffer can be absorbed. The GGUF block decode reads one block stream through
-/// several `Restride` views at once — the quant plane, the block scale, the
-/// block minimum, the group scales — so it is irreducibly multi-edge and
-/// benefits from a side as a list of operands.
-///
-/// # Numbering
-///
-/// `pre` is written over `Arg(0..ops.len())` numbered **within this side**,
-/// not across the node. Splicing a producer into `a` therefore never
-/// renumbers `b`'s body, which is what keeps [`map_into_contract`] a local
-/// rewrite on the side it fires for.
-///
-/// [`map_into_contract`]: crate::rules::fusion::map_into_contract
-///
-/// # Shape
-///
-/// Every operand of a side maps the same index triple to its own address —
-/// `(batch, m, k)` on `a`, `(batch, k, n)` on `b` — so they agree on shape
-/// and differ only in buffer, stride and access. Geometry may be read off
-/// [`Self::primary`]; predicates about *reachability* (addressability, dtype
-/// admissibility, traffic) must range over all of [`Self::ops`].
-///
-/// `ops` is non-empty. A side with no operand would make `pre` a constant,
-/// which is a `Map` and not a contraction; `verify_launch` rejects it.
+/// One side of a [`Launch::Contract`]: the non-empty operand list it reads
+/// (multi-edge producers such as a GGUF block decode) and the elementwise
+/// `pre` over `Arg(0..ops.len())`, numbered within this side. Every operand
+/// maps the same index triple, so geometry may be read off [`Self::primary`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct ContractSide {
     pub pre: ScalarExpr,
@@ -284,8 +500,8 @@ impl ContractSide {
         }
     }
 
-    /// The operand this side's geometry is read off. See the type's docs for
-    /// why any operand would do and why predicates still may not use it.
+    /// The operand this side's geometry is read off; reachability predicates
+    /// must still range over all of [`Self::ops`].
     pub fn primary(&self) -> &Operand {
         &self.ops[0]
     }
@@ -308,13 +524,8 @@ pub struct AddressTerm {
     pub stride: u32,
 }
 
-/// How one operand turns the reading kernel's **flat space index** into a
-/// **storage element index**: `offset + sum(term)`.
-///
-/// This is the one place the edge's `layout`/`access` becomes arithmetic. An
-/// emitter that indexes an operand with the raw flat index is only correct
-/// when [`AddressMap::is_identity_over`] holds — a stride-0 broadcast axis, a
-/// transposed view, a narrowed slice and a conv window all disagree with it.
+/// How one operand turns the reading kernel's flat space index into a
+/// storage element index: `offset + sum(term)`.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct AddressMap {
     pub offset: u32,
@@ -344,37 +555,16 @@ impl AddressMap {
 }
 
 impl Operand {
-    /// The flat-index-to-storage-index map this **edge** declares, or `None`
-    /// when a dim is symbolic or overflows `u32`.
-    ///
-    /// `Alias`, `Gather` and `Pack` all name the operand's own `layout`: they
-    /// are competing *spellings* of one access (see `rules::layout`, which
-    /// declines to mint a `Gather` over a contiguous layout precisely because
-    /// it would be the same index map twice), so they differ in how the read
-    /// is emitted, never in which element it reads. `Unflatten` carries its
-    /// own map because a conv window's sub-axis strides collide and plain
-    /// per-axis strides cannot express that; the layout still supplies the
-    /// base offset, which `MultiFlattenMap` has nowhere to put.
+    /// The flat-index-to-storage-index map this edge declares, or `None` when
+    /// a dim is symbolic or overflows `u32`. `Alias`, `Gather` and `Pack` read
+    /// the layout; `Unflatten` carries its own map over the layout's offset.
     pub fn address_map(&self) -> Option<AddressMap> {
         let offset = u32::try_from(self.layout.offset().as_const()?).ok()?;
-        let groups: SmallVec<[crate::shape::AxisGroup; 4]> = match &self.access {
+        let groups = match &self.access {
             AccessPlan::Unflatten(map) => map.groups.clone(),
-            _ => self
-                .layout
-                .shape()
-                .iter()
-                .zip(self.layout.strides())
-                .map(|(d, s)| {
-                    Some(crate::shape::AxisGroup::affine(
-                        u32::try_from(d.as_const()?).ok()?,
-                        u32::try_from(s.as_const()?).ok()?,
-                    ))
-                })
-                .collect::<Option<_>>()?,
+            _ => self.layout.affine_groups()?,
         };
 
-        // Row-major over the logical axes, then most-significant-first within
-        // each axis group — the order `MultiFlattenMap` declares.
         let mut terms: SmallVec<[AddressTerm; 4]> = SmallVec::new();
         let mut div_after = 1u64;
         for g in groups.iter().rev() {
@@ -390,32 +580,32 @@ impl Operand {
             }
             div_after = div_after.checked_mul(below)?;
         }
-        // A one-wide axis and a stride-0 axis both contribute exactly zero.
-        // Dropping them is what makes a broadcast read its single row.
+        // One-wide and stride-0 axes contribute zero.
         terms.retain(|t| t.modulus > 1 && t.stride != 0);
         terms.sort_unstable_by_key(|t| std::cmp::Reverse(t.divisor));
         coalesce(&mut terms);
         Some(AddressMap { offset, terms })
     }
 
-    /// Re-spell this edge under another [`AccessPlan`], or decline when the
-    /// re-spelling would read different elements.
-    ///
-    /// `Alias`, `Gather` and `Pack` all derive every address from `layout`,
-    /// so moving between them is sound whatever the extents are — including
-    /// symbolic ones, where the map is undecidable but the *reason* the two
-    /// agree does not read an extent. An `Unflatten` map is the one plan that
-    /// may have been stated **independently** of the layout
-    /// (`rules::sink::fold_operand_views` mints exactly that), so leaving one
-    /// is sound only when the candidate's address map compares equal, and an
-    /// undecidable extent declines.
-    ///
-    /// `rules::layout::operand_alias` pinned this hazard for the `Alias`
-    /// spelling — 29 conformance cases on wrong values when a co-selection
-    /// pass first made the member reachable. The `Gather` and `Pack`
-    /// re-spellings (and the cpu backend's access rules) carried the
-    /// identical hazard; only the extraction budget kept those members
-    /// unselected. Every access-plan rewrite must come through here.
+    /// Whether this read moves as `axis`'s coordinate advances over a
+    /// row-major walk of `space`: some address term with a stride overlaps
+    /// the axis's flat-index window. `None` when undecidable.
+    pub fn varies_along(&self, space: &IndexSpace, axis: u32) -> Option<bool> {
+        let a = axis as usize;
+        let lo = crate::shape::const_elements(space.dims.get(a + 1..)?)?;
+        let hi = lo.checked_mul(space.dims.get(a)?.as_const()?)?;
+        let map = self.address_map()?;
+        Some(map.terms.iter().any(|t| {
+            let t_lo = u64::from(t.divisor);
+            let t_hi = t_lo.saturating_mul(u64::from(t.modulus));
+            t.stride != 0 && t_lo < hi && lo < t_hi
+        }))
+    }
+
+    /// Re-spell this edge under another [`AccessPlan`], or decline when it
+    /// would read different elements: leaving an `Unflatten` (whose map may
+    /// be independent of the layout) needs equal address maps. Every
+    /// access-plan rewrite must come through here.
     pub fn respell(&self, access: AccessPlan) -> Option<Operand> {
         let out = Operand {
             src: self.src,
@@ -460,21 +650,11 @@ pub enum Family {
 }
 
 /// Gather lowering.
-///
-/// `Vectorized` — one lane moving four elements instead of one — was offered
-/// 554 times over the suite and every model and selected zero times, so it is
-/// deleted; the two survivors are the row nest and the quantized-row nest.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum GatherMode {
     RowPerGroup,
-    /// The gather's source operand is the *quantized leaf itself*, addressed
-    /// in its dense logical element space; both backends' operand loaders run
-    /// the format's decode program at the flat index, so only the gathered
-    /// rows ever decode and no dense table is materialized. Minted only from
-    /// a `Gather`-of-`Dequant` pair (`GATHER_QUANTIZED_ROWS`), so the node is
-    /// float-typed — minting it straight over the leaf would give the class
-    /// the source's `Q(fmt)` dtype and the consuming `Dequant` would decode
-    /// twice.
+    /// The source is the quantized leaf itself, decoded per gathered row.
+    /// Minted only from a `Gather`-of-`Dequant` pair, so the node is float.
     QuantizedRows,
 }
 
@@ -495,9 +675,8 @@ pub enum MaskKind {
     Causal,
 }
 
-/// Whether a node mutates state. A selected node with [`Effect::InPlace`]
-/// is **pinned in the materialized set**: without that, toggling a
-/// two-consumer atomic scatter out of `M` applies its atomics twice.
+/// Whether a node mutates state. A selected [`Effect::InPlace`] node is
+/// pinned in the materialized set, so its effect applies once.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Effect {
     Pure,
@@ -508,26 +687,16 @@ pub enum Effect {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BufferRole(pub u32);
 
-// ---------------------------------------------------------------------------
-// Schedule domains
-// ---------------------------------------------------------------------------
-
-/// The enumerable schedule-parameter space of one node. **It is not
-/// e-nodes**: minting every point blows the graph up; minting a
-/// locally-Pareto top-k lets a cheap heuristic gate the real cost model;
-/// and a nested argmin inside the node's cost is circular, because the
-/// geometry it picks determines the output's padded strides and therefore
-/// every consumer's read traffic. Carrying the complete domain and
-/// resolving it as a move in the global search is the only formulation that
-/// is simultaneously small, complete and non-circular.
+/// The enumerable schedule-parameter space of one node, resolved as a move
+/// in the global search rather than minted as e-nodes.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ScheduleDomain {
     Point,
-    Coop(CoopDomain),
-    Sgemm(SgemmDomain),
-    Sgemv(SgemvDomain),
-    Fold(FoldDomain),
-    Map(MapDomain),
+    Coop(Arc<CoopDomain>),
+    Sgemm(Arc<SgemmDomain>),
+    Sgemv(Arc<SgemvDomain>),
+    Fold(Arc<FoldDomain>),
+    Map(Arc<MapDomain>),
 }
 
 impl ScheduleDomain {
@@ -541,7 +710,8 @@ impl ScheduleDomain {
             Self::Map(d) => d.tilings.len(),
         }
     }
-    /// True when no legal point exists — the node is unselectable.
+    /// True when no supported point exists. Constructors must not attach an
+    /// empty domain to a graph node.
     pub fn is_empty(&self) -> bool {
         self.len() == 0
     }
@@ -564,20 +734,14 @@ impl ScheduleDomain {
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum SchedPoint {
     Point,
-    Coop {
-        geom: CoopGeom,
-        splits: u32,
-        staging: u8,
-    },
+    Coop { geom: CoopGeom, staging: u8 },
     Sgemm(SgemmParams),
     Sgemv(SgemvParams),
     Fold(FoldStrat),
     Map(MapTiling),
 }
 
-/// Cooperative-matrix tile geometry. [`Self::subgroup_split`] is the
-/// template every other geometry factorization follows: a closed-form
-/// objective with an explicit feasibility predicate.
+/// Cooperative-matrix tile geometry.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct CoopGeom {
     pub bm: u32,
@@ -632,6 +796,16 @@ impl CoopGeom {
         self.rg * self.cg * subgroup_width
     }
 
+    /// Tiles one workgroup of `block` lanes runs side by side when a group
+    /// widens this contraction's `lanes`: each `lanes`-wide slice owns a tile.
+    pub const fn slots(lanes: u32, block: u32) -> u32 {
+        if lanes > 0 && block > lanes && block.is_multiple_of(lanes) {
+            block / lanes
+        } else {
+            1
+        }
+    }
+
     /// Structural legality, independent of workgroup-memory footprint.
     pub const fn legal(&self, subgroup_width: u32, max_wg_lanes: u32) -> bool {
         self.n_passes != 0
@@ -643,37 +817,31 @@ impl CoopGeom {
     }
 }
 
-/// The complete legal cooperative schedule space of one contraction.
-/// `geoms` is filtered by lane limits and the exact
-/// `ArenaPlan::total_bytes`; `splits` is never-split plus every divisor of
-/// the K loop leaving two iterations per workgroup; `staging` is 1 or 2.
+/// One supported geometry and staging depth. These axes are coupled by the
+/// workgroup memory limit, so a domain contains pairs, not their cross product.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub struct CoopSchedule {
+    pub geom: CoopGeom,
+    pub staging: u8,
+}
+
+/// The supported cooperative schedules of one contraction. Split-K is a
+/// graph rewrite with an explicit combine, never a single-kernel schedule.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct CoopDomain {
-    pub geoms: SmallVec<[CoopGeom; 16]>,
-    pub splits: SmallVec<[u32; 8]>,
-    pub staging: SmallVec<[u8; 2]>,
+    pub schedules: SmallVec<[CoopSchedule; 16]>,
 }
 
 impl CoopDomain {
     pub fn len(&self) -> usize {
-        self.geoms.len() * self.splits.len() * self.staging.len()
+        self.schedules.len()
     }
     pub fn is_empty(&self) -> bool {
-        self.len() == 0
+        self.schedules.is_empty()
     }
     pub fn point(&self, index: usize) -> Option<SchedPoint> {
-        let ns = self.splits.len();
-        let nd = self.staging.len();
-        if ns == 0 || nd == 0 {
-            return None;
-        }
-        let geom = *self.geoms.get(index / (ns * nd))?;
-        let rem = index % (ns * nd);
-        Some(SchedPoint::Coop {
-            geom,
-            splits: self.splits[rem / nd],
-            staging: self.staging[rem % nd],
-        })
+        let CoopSchedule { geom, staging } = *self.schedules.get(index)?;
+        Some(SchedPoint::Coop { geom, staging })
     }
 }
 
@@ -717,29 +885,13 @@ pub struct SgemmDomain {
 pub struct SgemvParams {
     pub vector: u32,
     pub subgroups: u32,
-    /// Output columns per workgroup.
-    ///
-    /// `1` is the whole-workgroup structure: every lane of all `subgroups`
-    /// subgroups cooperates on a single output element and the reduction
-    /// crosses the workgroup. `cols > 1` requires `cols % subgroups == 0`
-    /// and a fixed subgroup width: each subgroup owns `cols / subgroups`
-    /// columns end-to-end, all `width` lanes cooperate on each of them, the
-    /// k window of one pass is shared across the subgroup's columns, and the
-    /// reduction never leaves the subgroup.
+    /// Output columns per workgroup. `1` reduces across the workgroup;
+    /// `cols > 1` (a multiple of `subgroups`, fixed subgroup width) gives each
+    /// subgroup `cols / subgroups` columns reduced within it.
     pub cols: u32,
-    /// Runs the lane's k window is split into.
-    ///
-    /// `1` (with `gap == 0`, the canonical spelling) keeps the window as
-    /// `vector` consecutive k elements. `parts > 1` — legal only on the
-    /// multi-column structure — lays the window out as `parts` runs of
-    /// `vector / parts` consecutive elements, run `r` at offset `r * gap`
-    /// from the lane's base, with `gap / run` adjacent lanes' runs packing
-    /// each gap before the window's own runs interleave. The subgroup's pass
-    /// still covers exactly `width * vector` consecutive k; only which lane
-    /// owns which element changes. A split window lets one lane revisit the
-    /// same packed word of a bit-packed operand at several k offsets, so the
-    /// word loads hash-cons to a single evaluation — purely a schedule
-    /// choice, discovered by measurement like every other axis.
+    /// Runs the lane's k window is split into (`1` with `gap == 0` is
+    /// canonical): run `r` sits at `r * gap`, so one lane revisits a packed
+    /// word at several k offsets. Legal only with `cols > 1`.
     pub parts: u32,
     /// K distance between a split window's runs. `0` when `parts == 1`.
     pub gap: u32,
@@ -770,6 +922,14 @@ pub enum FoldStrat {
     LoopThenTree { iterations: u32, lane_group: u32 },
 }
 
+/// The GPU fold's strategy, thread block, and scratch elements per carrier lane.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct FoldSchedule {
+    pub strategy: FoldStrat,
+    pub block: u32,
+    pub scratch: u32,
+}
+
 impl FoldStrat {
     /// The lane group this strategy closes over. `Subgroup` closes over the
     /// device's subgroup, so the caller supplies that width.
@@ -781,16 +941,8 @@ impl FoldStrat {
     }
 }
 
-/// The workgroup width both emitters actually allocate scratch over — **the
-/// single source of it**.
-///
-/// Only `lane_group` rides on [`FoldStrat`]; the block is the default width
-/// floored by the lane group and clamped to the device, so a footprint filter
-/// that reads `lane_group` alone under-counts by up to 256x. `DEFAULT_BLOCK`
-/// is a *policy* constant, but it lives here rather than in `fusor-tile`
-/// because `verify_launch` has to admit against the same number the domain
-/// generator filters on and the emitters allocate — and it is `fusor-ir`
-/// that verifies.
+/// The workgroup width both emitters allocate scratch over — the single
+/// source verification, domain generation and emission share.
 pub fn emitted_block(lane_group: u32, caps: &crate::device::Caps) -> u32 {
     const DEFAULT_BLOCK: u32 = 256;
     lane_group
@@ -799,13 +951,41 @@ pub fn emitted_block(lane_group: u32, caps: &crate::device::Caps) -> u32 {
         .max(1)
 }
 
-/// Workgroup bytes one fold strategy's cross-lane close needs, for a carrier
-/// of `lanes` accumulator lanes at `acc_bytes` each.
-///
-/// Both emitters allocate one scratch tile of [`emitted_block`] elements *per
-/// accumulator lane*. This is the quantity `verify_launch` admits against and the
-/// quantity the fold domain generator filters on; they are one function so
-/// they cannot drift.
+/// The block a slab lowers at: a power of two covering `per_slab` (the most
+/// iterations any stage runs per slab), between one subgroup and the default.
+pub fn slab_block(per_slab: u64, caps: &crate::device::Caps) -> u32 {
+    let top = emitted_block(1, caps);
+    let floor = caps.subgroup_width().clamp(1, top);
+    u32::try_from(per_slab.max(1).next_power_of_two())
+        .unwrap_or(u32::MAX)
+        .clamp(floor, top)
+}
+
+/// Lanes a slab's fold stage gives each output row.
+pub fn slab_lanes_per_row(block: u32, rows_per_slab: u64, k: u64) -> u32 {
+    let rows = u32::try_from(rows_per_slab.max(1).next_power_of_two()).unwrap_or(u32::MAX);
+    let k = u32::try_from(k.max(1).next_power_of_two()).unwrap_or(u32::MAX);
+    (block / rows.min(block)).min(k).max(1)
+}
+
+/// Subgroup width used by a slab fold when the workgroup has full subgroups.
+pub fn slab_subgroup_width(
+    block: u32,
+    rows_per_slab: u64,
+    k: u64,
+    carrier: &Carrier,
+    caps: &crate::device::Caps,
+) -> Option<u32> {
+    let width = caps.subgroups.filter(|s| s.is_fixed())?.assumed();
+    (width > 0
+        && super::kernel::fast_reduce_op(carrier).is_some()
+        && block.is_multiple_of(width)
+        && slab_lanes_per_row(block, rows_per_slab, k) >= width)
+        .then_some(width)
+}
+
+/// Workgroup bytes one fold strategy's cross-lane close needs: one
+/// [`emitted_block`] tile per accumulator lane.
 pub fn fold_scratch_bytes(
     strat: &FoldStrat,
     lanes: u64,
@@ -814,23 +994,8 @@ pub fn fold_scratch_bytes(
     caps: &crate::device::Caps,
 ) -> u64 {
     let lane_group = strat.lane_group(subgroup_width);
-    // **A one-lane group stages nothing.** Both emitters map invocation
-    // `group` to `row = group / lane_group` and `lane = group % lane_group`,
-    // and loop `(axis_extent + lane_group - 1) / lane_group` times. At
-    // `lane_group == 1` every invocation owns a whole output row and reduces
-    // the entire axis into its own accumulator, so the cross-lane merge is
-    // over a group of one — an identity with nothing to stage.
-    //
-    // This is what makes a WIDE promoted carrier schedulable at all. The
-    // footprint of a cross-lane close is `lanes * emitted_block * acc_bytes`
-    // and `emitted_block` is floored at the default block regardless of the
-    // lane group, so a 24-lane Welford carrier wants 24 KiB and a 64-lane
-    // `TN` register tile wants 64 KiB — over any device's limit at *every*
-    // lane group. Without this clause the fold domain of such a carrier is
-    // empty, `PROMOTE` mints a nest nothing can schedule, and §4.2 turns that
-    // into a hard `verify_plan` failure instead of a slow plan. With it, the
-    // row-per-lane schedule the emitters already lower correctly is also the
-    // one the generator can offer, and register tiling stays derivable.
+    // A one-lane group reduces a whole row per invocation and stages
+    // nothing, which keeps wide promoted carriers schedulable.
     if lane_group <= 1 {
         return 0;
     }
@@ -838,12 +1003,44 @@ pub fn fold_scratch_bytes(
     lanes.saturating_mul(block).saturating_mul(acc_bytes.max(1))
 }
 
-/// Reduction strategies and lane-group widths worth scoring. Workgroup
-/// width, lane-group width and staging depth are *coupled*, so they are one
-/// domain scored together rather than three greedy formulas.
+/// Reduction strategies and lane-group widths worth scoring together.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct FoldDomain {
     pub strategies: SmallVec<[FoldStrat; 8]>,
+}
+
+impl ScheduleDomain {
+    /// Construct schedules for a fold with a new carrier. Promotion changes
+    /// scratch requirements, so it cannot copy the old domain verbatim.
+    pub fn with_fold_carrier(
+        &self,
+        lanes: u64,
+        acc_bytes: u64,
+        caps: &crate::device::Caps,
+    ) -> Option<Self> {
+        let fits = |s: &FoldStrat| {
+            fold_scratch_bytes(s, lanes, acc_bytes, caps.subgroup_width(), caps)
+                <= u64::from(caps.limits.max_compute_workgroup_storage_size)
+        };
+        let strategies = match self {
+            Self::Fold(domain) => domain.strategies.iter().copied().filter(fits).collect(),
+            Self::Point => {
+                let default = FoldStrat::WgTree {
+                    lane_group: emitted_block(1, caps),
+                };
+                if fits(&default) {
+                    return Some(Self::Point);
+                }
+                // A row per lane reduces privately and needs no scratch.
+                smallvec::smallvec![FoldStrat::WgTree { lane_group: 1 }]
+            }
+            _ => return None,
+        };
+        if strategies.is_empty() {
+            return None;
+        }
+        Some(Self::Fold(FoldDomain { strategies }.into()))
+    }
 }
 
 /// Elementwise register-reuse tiling. `vector` is the SIMD width on the CPU
@@ -855,69 +1052,14 @@ pub struct MapTiling {
     pub vector: u32,
 }
 
-/// Candidate tilings: one per eligible dim, plus untiled. Replaces the
-/// strict LLC-watermark cliff and the argmax-invariant-bytes selection.
+/// Candidate tilings: one per eligible dim, plus untiled.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, Default)]
 pub struct MapDomain {
     pub tilings: SmallVec<[MapTiling; 8]>,
 }
 
-/// Outputs per lane worth scoring for a linearized body. A *policy* constant,
-/// and it belongs beside the generator that reads it rather than in a
-/// lowering — same rule `fusor_tile::domains` follows for `BLOCK_CHOICES`.
-const LINEAR_TM_CHOICES: [u32; 3] = [2, 4, 8];
-
-impl MapDomain {
-    /// Every tiling worth scoring for a body that walks **one linearized
-    /// index** over `elements` outputs — the shape [`Launch::Region`] takes on
-    /// either backend.
-    ///
-    /// `dim` is always `None` because there is no axis to name: `tm` is the
-    /// register tile along the linear index and `vector` is the SIMD width,
-    /// which a composite body does not choose. A tiling survives only when it
-    /// leaves at least one full subgroup of work, so a body too small to tile
-    /// reports one point and says so, rather than offering a point that would
-    /// launch empty lanes.
-    ///
-    /// This needs `Caps` and an element count and nothing else — no arena
-    /// plan — which is why it lives here and both the rule that mints the
-    /// node and the verifier that checks it call the same function.
-    pub fn linear(caps: &crate::device::Caps, elements: u64) -> Self {
-        let sgw = u64::from(caps.subgroup_width().max(1));
-        let mut tilings: SmallVec<[MapTiling; 8]> = SmallVec::new();
-        tilings.push(MapTiling {
-            dim: None,
-            tm: 1,
-            vector: 1,
-        });
-        for tm in LINEAR_TM_CHOICES {
-            if elements >= u64::from(tm).saturating_mul(sgw) {
-                tilings.push(MapTiling {
-                    dim: None,
-                    tm,
-                    vector: 1,
-                });
-            }
-        }
-        Self { tilings }
-    }
-
-    /// [`Self::linear`] over a value's shape. A symbolic extent prices as 1,
-    /// the same convention `semantics::work` uses, so a shape-family node
-    /// gets the conservative domain rather than a tiling its smallest legal
-    /// binding cannot fill.
-    pub fn linear_over(caps: &crate::device::Caps, shape: &[Dim]) -> Self {
-        let elements = shape
-            .iter()
-            .map(|d| d.as_const().unwrap_or(1))
-            .fold(1u64, |a, b| a.saturating_mul(b));
-        Self::linear(caps, elements)
-    }
-}
-
-/// Window geometry a structural adjoint reads. Two integers decide the
-/// whole thing: `step >= window` proves the adjoint is an elementwise
-/// mask-and-broadcast; overlapping windows give `Scatter{Add}`.
+/// Window geometry a structural adjoint reads: non-overlapping windows give
+/// a mask-and-broadcast, overlapping ones `Scatter{Add}`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct WindowAdjoint {
     pub window: SlidingWindow,
@@ -930,5 +1072,103 @@ impl WindowAdjoint {
             window,
             is_mask: window.is_non_overlapping(),
         }
+    }
+}
+
+/// Scratch budget for a cooperative schedule, as lowering declares it,
+/// including the output staging tile.
+pub fn coop_tiles(
+    geom: CoopGeom,
+    elem: super::kernel::ScalarElement,
+    staging: u8,
+) -> super::kernel::Tiles {
+    use super::kernel::{ElementType, MemoryLevel, ScalarElement, TileDecl, TileLayout, Tiles};
+    let depth = u32::from(staging);
+    let bn_pass = geom.bn / geom.n_passes;
+    let tile = |name, elem, shape: &[u32]| {
+        std::sync::Arc::new(TileDecl::new(
+            ElementType::Scalar(elem),
+            TileLayout::contiguous(MemoryLevel::Workgroup, shape),
+            name,
+        ))
+    };
+    Tiles {
+        decls: smallvec::smallvec![
+            tile("coop_a", elem, &[depth * geom.bm, geom.bk]),
+            tile("coop_b", elem, &[depth * geom.bk, bn_pass]),
+            tile("coop_acc", ScalarElement::F32, &[geom.bm, bn_pass]),
+        ],
+    }
+}
+
+/// A scatter's destination geometry, read off the base and index operands
+/// (`space` differs between the floor and tile rules).
+pub struct ScatterGeometry {
+    /// Product of the base extents before the scattered axis.
+    pub outer: u32,
+    /// Extent of the scattered axis in the base — the destination bins.
+    pub bins: u32,
+    /// Product of the base extents after the scattered axis.
+    pub inner: u32,
+    /// Index count.
+    pub updates: u32,
+}
+
+impl ScatterGeometry {
+    /// `ops` is `(base, idx, upd)`; `resolve` binds an extent.
+    pub fn of(
+        ops: &[Operand],
+        axis: usize,
+        resolve: impl Fn(Dim) -> crate::error::Result<u64>,
+        error: fn(String) -> crate::error::Error,
+    ) -> crate::error::Result<Self> {
+        let [base, idx, ..] = ops else {
+            return Err(error("a scatter needs base and index operands".into()));
+        };
+        let dest = base
+            .layout
+            .shape()
+            .iter()
+            .map(|d| {
+                u32::try_from(resolve(*d)?)
+                    .map_err(|_| error("scatter extent exceeds a u32".into()))
+            })
+            .collect::<crate::error::Result<Vec<u32>>>()?;
+        if axis >= dest.len() {
+            return Err(error(format!(
+                "scatter axis {axis} is outside a rank-{} base",
+                dest.len()
+            )));
+        }
+        let mut updates = 1u64;
+        for d in idx.layout.shape() {
+            updates = updates.saturating_mul(resolve(*d)?);
+        }
+        Ok(Self {
+            outer: dest[..axis].iter().product::<u32>().max(1),
+            bins: dest[axis].max(1),
+            inner: dest[axis + 1..].iter().product::<u32>().max(1),
+            updates: u32::try_from(updates)
+                .map_err(|_| error("scatter update count exceeds a u32".into()))?
+                .max(1),
+        })
+    }
+
+    /// Destination rows: every `(outer, bin)` pair.
+    pub fn rows(&self) -> u32 {
+        self.outer.saturating_mul(self.bins)
+    }
+
+    /// Lanes per workgroup when each workgroup owns one destination row and
+    /// scans the indices once, or `None` for the one-lane-per-element nest.
+    pub fn row_block(&self, max_block: u32) -> Option<u32> {
+        (self.inner >= 16).then(|| self.inner.next_multiple_of(32).min(max_block.min(256)))
+    }
+
+    /// Elements of the destination.
+    pub fn total(&self) -> u64 {
+        u64::from(self.outer)
+            .saturating_mul(u64::from(self.bins))
+            .saturating_mul(u64::from(self.inner))
     }
 }

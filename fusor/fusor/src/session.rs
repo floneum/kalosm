@@ -7,7 +7,6 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use web_time::Instant;
 
-use fusor_cost::tune_cache::Verdict;
 use fusor_cost::{LocalSearch, ReplayMemo, Roofline};
 #[cfg(feature = "cpu")]
 use fusor_cpu::CpuTarget;
@@ -16,14 +15,15 @@ use fusor_gpu::GpuTarget;
 use fusor_ir::CORE_RULES;
 use fusor_ir::cost::CostModel;
 use fusor_ir::device::Caps;
-use fusor_ir::dtype::{Dtype, Persistence};
+#[cfg(feature = "compiler-tests")]
+use fusor_ir::dtype::Dtype;
+use fusor_ir::dtype::Persistence;
 use fusor_ir::egraph::{ClassId, EGraph, Id, Rule, Saturate, SaturationBudget, SaturationDelta};
 use fusor_ir::extract::{ExtractBudget, Extractor, Plan, ReplayKey};
 use fusor_ir::ir::launch::Effect;
-use fusor_ir::ir::launch::Launch;
 use fusor_ir::ir::logical::BufferId;
 use fusor_ir::ir::logical::{LeafKind, Logical};
-use fusor_ir::ir::{Level, Op, OpDefRegistry, Semantics};
+use fusor_ir::ir::{Level, Op, Semantics};
 use fusor_ir::saturate::Driver;
 use fusor_ir::shape::{Dim, Layout, SymId};
 #[cfg(feature = "cpu")]
@@ -32,7 +32,6 @@ use fusor_ir::target::{Buf, Target};
 use fusor_tile::{Planner, SCHED_RULES};
 use rustc_hash::{FxHashMap, FxHashSet};
 
-use crate::composite::register_macro_ops;
 use crate::graph::GraphRef;
 use crate::graph::WeakGraphRef;
 use crate::tensor::Tensor;
@@ -57,44 +56,25 @@ const TUNE_RUNS: usize = 4;
 /// and on the whole plan only when one does not.
 const TUNE_MARGIN: f64 = 0.08;
 
-/// Class members the tune race has caught computing wrong values, process
-/// wide. Every entry is a live miscompile: a member of some e-class whose
-/// value disagrees with its siblings'. The conformance harness races every
-/// class member (`FUSOR_VERIFY_MEMBERS`) and fails the run when this is
-/// nonzero.
-static WRONG_MEMBERS: AtomicU64 = AtomicU64::new(0);
-
-/// Number of live member-verification failures observed by this process.
-pub fn wrong_member_count() -> u64 {
-    WRONG_MEMBERS.load(Ordering::Relaxed)
+#[cfg(feature = "compiler-tests")]
+mod testing;
+#[cfg(feature = "compiler-tests")]
+pub use testing::{set_verify_members, verify_members, wrong_member_count};
+#[cfg(all(not(feature = "compiler-tests"), feature = "gpu"))]
+fn verify_members() -> bool {
+    false
 }
 
-/// Whether the tune race sweeps every class member of every launch instead
-/// of only the candidates worth timing.
-///
-/// Starts from `FUSOR_VERIFY_MEMBERS` and is settable from there on, because
-/// the sweep is a per-kernel correctness pass and a suite that reruns a case
-/// at several shapes does not need to pay for it at every one. It is by far
-/// the most expensive thing a resolve can do: one small sampling case races
-/// about 470 candidates under it.
-static VERIFY_MEMBERS: std::sync::OnceLock<std::sync::atomic::AtomicBool> =
-    std::sync::OnceLock::new();
-
-fn verify_members_flag() -> &'static std::sync::atomic::AtomicBool {
-    VERIFY_MEMBERS.get_or_init(|| {
-        std::sync::atomic::AtomicBool::new(std::env::var_os("FUSOR_VERIFY_MEMBERS").is_some())
-    })
+/// `eprintln!` behind one of the [`Flags`] switches.
+macro_rules! log_if {
+    ($flag:ident, $($arg:tt)*) => {
+        if $crate::session::flags().$flag {
+            eprintln!($($arg)*);
+        }
+    };
 }
-
-/// Whether the member sweep is currently on. See [`set_verify_members`].
-pub fn verify_members() -> bool {
-    verify_members_flag().load(Ordering::Relaxed)
-}
-
-/// Turn the member sweep on or off for the resolves that follow.
-pub fn set_verify_members(on: bool) {
-    verify_members_flag().store(on, Ordering::Relaxed);
-}
+#[cfg(feature = "gpu")]
+pub(crate) use log_if;
 
 /// Proof that the holder owns a graph's `resolve_lock`.
 pub(crate) type ResolveGuard<'a> = parking_lot::MutexGuard<'a, ()>;
@@ -168,10 +148,10 @@ impl Backend {
 
     /// Release the kernels only losing race candidates used; see
     /// `GpuTarget::release_candidates`. The CPU keeps nothing per candidate.
-    pub(crate) fn release_candidates(&self, arena: u64, candidates: &[Arc<Plan>], keep: &Plan) {
+    pub(crate) fn release_candidates(&self, _arena: u64, _candidates: &[Arc<Plan>], _keep: &Plan) {
         match self {
             #[cfg(feature = "gpu")]
-            Self::Gpu(t) => t.release_candidates(arena, candidates, keep),
+            Self::Gpu(t) => t.release_candidates(_arena, _candidates, _keep),
             #[allow(unreachable_patterns)]
             _ => {}
         }
@@ -179,10 +159,10 @@ impl Backend {
 
     /// Release every kernel compiled for graph `arena`; called when the
     /// graph is dropped. See `GpuTarget::release_arena`.
-    pub(crate) fn release_arena(&self, arena: u64) {
+    pub(crate) fn release_arena(&self, _arena: u64) {
         match self {
             #[cfg(feature = "gpu")]
-            Self::Gpu(t) => t.release_arena(arena),
+            Self::Gpu(t) => t.release_arena(_arena),
             #[allow(unreachable_patterns)]
             _ => {}
         }
@@ -404,37 +384,74 @@ struct Twin {
     leaves: Vec<(Id, usize)>,
 }
 
-/// `layout` with every symbol replaced by its binding. A derived stride
-/// (the row-major sentinel) is recomputed from the concrete shape.
-fn concrete_layout(layout: &Layout, bindings: &FxHashMap<SymId, u64>) -> Result<Layout> {
-    let value = |d: Dim| -> Result<Dim> {
-        match d {
-            Dim::Sym(s) => bindings.get(&s).map(|v| Dim::Const(*v)).ok_or_else(|| {
-                Error::Plan(format!(
-                    "shape family output layout mentions unbound symbol {s}"
-                ))
-            }),
-            c => Ok(c),
+/// A family invocation borrows node names without changing their callers' bindings.
+struct FamilyBindings<'a> {
+    graph: &'a GraphRef,
+    values: Vec<Id>,
+    saved: FxHashMap<Id, (Buf, Option<Arc<Layout>>)>,
+}
+
+impl<'a> FamilyBindings<'a> {
+    fn new(graph: &'a GraphRef, roots: &[Id]) -> Result<Self> {
+        let mut g = graph.state().egraph.lock();
+        let values = logical_postorder(&g, roots)
+            .ok_or_else(|| Error::Plan("shape family has no logical program".into()))?;
+        let mut saved = FxHashMap::default();
+        let mut leaves = graph.state().leaves.lock();
+        for value in &values {
+            let class = g.class_of(*value);
+            let members = g.class_ids_cached(class);
+            let external = members
+                .iter()
+                .any(|id| matches!(g.node(*id).op, Op::Logical(Logical::Leaf(_))));
+            for id in members.iter() {
+                if let Some(binding) = leaves.device.get(id) {
+                    saved.entry(*id).or_insert_with(|| binding.clone());
+                }
+                if !external {
+                    leaves.device.remove(id);
+                }
+            }
         }
+        Ok(Self {
+            graph,
+            values,
+            saved,
+        })
+    }
+}
+
+impl Drop for FamilyBindings<'_> {
+    fn drop(&mut self) {
+        let mut g = self.graph.state().egraph.lock();
+        let mut leaves = self.graph.state().leaves.lock();
+        for value in &self.values {
+            let class = g.class_of(*value);
+            for id in g.class_ids_cached(class).iter() {
+                leaves.device.remove(id);
+            }
+        }
+        leaves.device.extend(self.saved.drain());
+    }
+}
+
+/// Resolve symbolic extents and strides without changing the physical layout.
+fn concrete_layout(layout: &Layout, bindings: &FxHashMap<SymId, u64>) -> Result<Layout> {
+    let value = |d: Dim| {
+        d.evaluate(&mut |s| bindings.get(&s).copied())
+            .map(Dim::Const)
+            .ok_or_else(|| Error::Plan(format!("unbound layout dimension {d}")))
     };
-    let shape: Vec<Dim> = layout
+    let shape = layout
         .shape()
         .iter()
         .map(|d| value(*d))
-        .collect::<Result<_>>()?;
-    if layout.is_contiguous() {
-        return Ok(Layout::contiguous(&shape));
-    }
-    let row_major = Layout::row_major_strides(&shape);
-    let strides: Vec<Dim> = layout
+        .collect::<Result<Vec<_>>>()?;
+    let strides = layout
         .strides()
         .iter()
-        .enumerate()
-        .map(|(axis, d)| match d {
-            Dim::Sym(s) if s.0 == u32::MAX => Ok(row_major[axis]),
-            d => value(*d),
-        })
-        .collect::<Result<_>>()?;
+        .map(|d| value(*d))
+        .collect::<Result<Vec<_>>>()?;
     Layout::from_parts(value(layout.offset())?, &shape, &strides)
 }
 
@@ -448,8 +465,7 @@ fn slot_dim(slot: usize) -> Dim {
 
 fn slot_of(d: Dim) -> Option<usize> {
     match d {
-        // `SymId(u32::MAX)` is `Layout::row_major_strides`' derived-stride
-        // sentinel, not a slot.
+        // The opaque-dimension sentinel is not a family slot.
         Dim::Sym(s) if s.0 >= FAMILY_SLOT_BASE && s.0 != u32::MAX => {
             Some((s.0 - FAMILY_SLOT_BASE) as usize)
         }
@@ -469,19 +485,13 @@ impl Session {
         let planner = Planner::shared();
         let device_fingerprint = device.caps().fingerprint();
 
-        // The one registration point. Ids follow table order because
-        // `PlanHash` reads registration order.
-        let mut registry = OpDefRegistry::new();
-        register_macro_ops(&mut registry);
-
-        let semantics =
-            fusor_ir::CoreSemantics::with_registry(Arc::clone(&planner), registry.clone());
+        let semantics = fusor_ir::CoreSemantics::new(Arc::clone(&planner));
         let target = device.target();
         let cost: Arc<dyn CostModel> = Arc::new(Roofline::new(target.facts().clone()));
-        let extractor: Arc<dyn Extractor> = Arc::new(
-            LocalSearch::new(Arc::clone(&planner), target.caps().clone())
-                .with_registry(registry.clone()),
-        );
+        let extractor: Arc<dyn Extractor> = Arc::new(LocalSearch::new(
+            Arc::clone(&planner),
+            target.caps().clone(),
+        ));
 
         // Rule order carries no semantics; the fixed order exists only for
         // reproducibility.
@@ -565,19 +575,8 @@ impl Session {
         resolving: &ResolveGuard<'_>,
         values: &[Tensor],
     ) -> Result<()> {
-        self.resolve_locked_plan(resolving, values).map(|_| ())
-    }
-
-    /// [`Self::resolve_locked`], also handing back the plan when the values
-    /// were planned and run here (`None` when a memo or a restatement ran
-    /// them instead).
-    fn resolve_locked_plan(
-        &self,
-        resolving: &ResolveGuard<'_>,
-        values: &[Tensor],
-    ) -> Result<Option<Arc<Plan>>> {
         if values.is_empty() {
-            return Ok(None);
+            return Ok(());
         }
         let graph = values[0].graph.clone();
         for v in values {
@@ -588,14 +587,13 @@ impl Session {
             }
         }
 
-        // Values whose last handle dropped release their buffers first, so a
-        // loop's dead batches never reach the pool ceiling.
-        graph.reap_dead();
-
         // Every requested value already has a device buffer: nothing to plan.
         if values.iter().all(|v| graph.device_buf(v.id).is_some()) {
-            return Ok(None);
+            return Ok(());
         }
+
+        // Release dead values before allocating a new execution's buffers.
+        graph.reap_dead();
 
         if self.inner.in_flight.load(Ordering::Relaxed) >= MAX_INFLIGHT_PLANS {
             self.wait()?;
@@ -624,13 +622,12 @@ impl Session {
         }
         let replays = self.replay_would_hit(&graph, values);
         if !replays && let Some(cut) = self.cut_at_bound(&graph, values)? {
-            if resolve_profile() {
-                eprintln!(
-                    "[profile] cut at bound values: {:?} -> {:?}",
-                    values.iter().map(|v| v.id).collect::<Vec<_>>(),
-                    cut.iter().map(|v| v.id).collect::<Vec<_>>()
-                );
-            }
+            log_if!(
+                resolve_profile,
+                "[profile] cut at bound values: {:?} -> {:?}",
+                values.iter().map(|v| v.id).collect::<Vec<_>>(),
+                cut.iter().map(|v| v.id).collect::<Vec<_>>()
+            );
             self.resolve_locked(resolving, &cut)?;
             for (value, root) in values.iter().zip(&cut) {
                 if let Some(buf) = graph.device_buf(root.id) {
@@ -638,7 +635,7 @@ impl Session {
                     graph.bind_classes(&[(value.id, buf, layout)]);
                 }
             }
-            return Ok(None);
+            return Ok(());
         }
 
         // Inference frontends rebuild the same expression with fresh
@@ -657,14 +654,14 @@ impl Session {
             && let Some(term) = {
                 let roots: Vec<Id> = values.iter().map(|v| v.id).collect();
                 let term = canonical_family(&graph, &roots);
-                if resolve_profile() && term.is_none() {
+                if flags().resolve_profile && term.is_none() {
                     eprintln!("[profile] shape family: term not canonicalizable");
                 }
                 term
             }
             && self.family_step(resolving, &graph, values, term)?
         {
-            return Ok(None);
+            return Ok(());
         }
 
         let caps = self.caps();
@@ -700,26 +697,13 @@ impl Session {
             let __replayed = memo_eligible && self.inner.saturation.replay(&mut g);
             if !__skipped && !__replayed {
                 let pre = memo_eligible.then(|| g.pre_saturation());
-                // A flat `max_applications` exhausts mid-walk on a model-scale
-                // graph, leaving nodes past the exhaustion point without their
-                // `lower_*` kernel members; scale the ceiling with the
-                // pre-saturation node count.
-                let mut budget = SaturationBudget::default();
-                budget.max_applications = budget
-                    .max_applications
-                    .max((g.len() as u32).saturating_mul(16));
+                // Scale search with newly reached work. The driver finishes
+                // lowering when this budget is exhausted.
+                let budget = SaturationBudget {
+                    application_slope: 16,
+                    ..SaturationBudget::default()
+                };
                 Driver::new().saturate(&mut g, &caps, &self.inner.rules, budget)?;
-                // The frontier below `len` is the driver's own exhaustion
-                // signal: double and continue until every node has been
-                // offered every rule. Bounded, so a genuinely exploding
-                // graph still terminates.
-                for _ in 0..8 {
-                    if g.saturation_frontier >= g.len() {
-                        break;
-                    }
-                    budget.max_applications = budget.max_applications.saturating_mul(2);
-                    Driver::new().saturate(&mut g, &caps, &self.inner.rules, budget)?;
-                }
                 if let Some(pre) = pre {
                     self.inner.saturation.insert(g.record_saturation(pre));
                 }
@@ -753,46 +737,82 @@ impl Session {
             // resolve of this key replays.
             let missed = self.inner.replay.get(key).is_none();
             let graph_ref: &EGraph = &g;
-            let (plan, _unchanged) = self.inner.replay.get_or_extract(key, || {
-                self.inner.extractor.extract(
-                    graph_ref,
-                    &roots,
-                    self.inner.cost.as_ref(),
-                    ExtractBudget::default(),
-                )
-            })?;
-            let __t_verify = Instant::now();
-            // `verify_plan` is a pure function of `(key, plan)`, so the same
-            // verdict is not re-derived every dispatch. A plan reaching
-            // Kernel for the first time is always verified, and an entry
-            // replaced by a tuning winner is verified on its own hash.
-            if !self.inner.replay.is_verified(key, plan.hash) {
-                self.inner.extractor.verify_plan(graph_ref, &plan)?;
-                self.inner.replay.mark_verified(key, plan.hash);
-            }
-            let __verify_us = __t_verify.elapsed().as_micros();
-            if resolve_profile() {
-                eprintln!(
-                    "[profile] saturate{} {} us ({} -> {} nodes), extract+verify {} us (verify {__verify_us}), replay {}",
-                    if __skipped {
-                        " (skipped)"
-                    } else if __replayed {
-                        " (replayed)"
-                    } else {
-                        ""
-                    },
-                    __sat_us,
-                    __pre_nodes,
-                    g.len(),
-                    __t_rest.elapsed().as_micros(),
-                    if missed { "MISS" } else { "hit" },
-                );
-            }
+            let seed = graph.state().extraction_seed.lock().clone();
+            let (plan, _unchanged) =
+                self.inner
+                    .replay
+                    .get_or_extract(key, graph_ref, || match seed.as_deref() {
+                        Some(seed) => self.inner.extractor.extract_seeded(
+                            graph_ref,
+                            &roots,
+                            self.inner.cost.as_ref(),
+                            ExtractBudget::default(),
+                            seed,
+                        ),
+                        None => self.inner.extractor.extract(
+                            graph_ref,
+                            &roots,
+                            self.inner.cost.as_ref(),
+                            ExtractBudget::default(),
+                        ),
+                    })?;
+            // Readers of a selected view copy read through the view instead;
+            // the forwarded plan is what every later hit on this key replays.
+            let __t_fwd = Instant::now();
+            let plan = if missed {
+                let mut ex = plan.extraction.clone();
+                let mut next = plan;
+                if fusor_cost::forward::forward_selected_views(
+                    &mut g, &caps, &roots, &next, &mut ex,
+                ) {
+                    next = Arc::new(self.inner.extractor.replan_extraction(
+                        &g,
+                        &roots,
+                        &mut ex,
+                        self.inner.cost.as_ref(),
+                    )?);
+                }
+                // Independent launches of one dependency level share a dispatch.
+                let grouped =
+                    fusor_cost::wavefront::group_wavefronts(&mut g, &caps, &next, &mut |g, ex| {
+                        self.inner
+                            .extractor
+                            .replan_extraction(g, &roots, ex, self.inner.cost.as_ref())
+                            .ok()
+                    });
+                next = Arc::new(grouped);
+                self.inner.replay.insert(key, (*next).clone());
+                next
+            } else {
+                plan
+            };
+            *graph.state().extraction_seed.lock() = Some(Arc::clone(&plan));
+            #[cfg(feature = "compiler-tests")]
+            self.inner.extractor.verify_plan(&g, &plan)?;
+            log_if!(
+                resolve_profile,
+                "[profile] saturate{} {} us ({} -> {} nodes), extract {} us (forward {} us), replay {}",
+                if __skipped {
+                    " (skipped)"
+                } else if __replayed {
+                    " (replayed)"
+                } else {
+                    ""
+                },
+                __sat_us,
+                __pre_nodes,
+                g.len(),
+                __t_rest.elapsed().as_micros(),
+                __t_fwd.elapsed().as_micros(),
+                if missed { "MISS" } else { "hit" },
+            );
             (plan, roots, key, missed)
         };
 
         let plan = if missed && self.inner.device.is_gpu() {
             let tuned = self.autotune(resolving, &graph, &roots, plan, values)?;
+            #[cfg(feature = "gpu")]
+            let tuned = self.explore_prior(&graph, &roots, key, tuned);
             self.inner.replay.insert(key, (*tuned).clone());
             tuned
         } else {
@@ -801,7 +821,7 @@ impl Session {
 
         // Online tuning: on a replay hit, occasionally substitute one legal
         // arm for the incumbent and let this production dispatch's own GPU
-        // spans feed the tuner's windows. Every arm is a verify_plan-checked
+        // spans feed the tuner's windows. Every arm is a constructed
         // member plan.
         #[cfg(feature = "gpu")]
         let explored = if !missed && self.inner.device.is_gpu() {
@@ -821,7 +841,7 @@ impl Session {
         // Dumps the launch and incumbent signatures of the plan that actually
         // executes when `FUSOR_DUMP_EXEC` is set, once per distinct plan
         // hash.
-        if dump_exec() {
+        if flags().dump_exec {
             use std::collections::HashSet;
             use std::sync::{Mutex as StdMutex, OnceLock};
             static SEEN: OnceLock<StdMutex<HashSet<u128>>> = OnceLock::new();
@@ -852,13 +872,12 @@ impl Session {
             // clock drops (its drop clears the last profile).
             self.explore_record(sel);
         }
-        if resolve_profile() {
-            eprintln!(
-                "[profile] run {} us ({} launches)",
-                __t_run.elapsed().as_micros(),
-                launched
-            );
-        }
+        log_if!(
+            resolve_profile,
+            "[profile] run {} us ({} launches)",
+            __t_run.elapsed().as_micros(),
+            launched
+        );
         self.inner
             .launches
             .fetch_add(launched as u64, Ordering::Relaxed);
@@ -872,7 +891,7 @@ impl Session {
         }
         #[cfg(not(feature = "cpu"))]
         let _ = executable;
-        Ok(Some(plan))
+        Ok(())
     }
 
     /// Submit whatever is encoded without waiting.
@@ -984,10 +1003,12 @@ impl Session {
                     [x, y] => g.union(*x, *y)?,
                     _ => id,
                 }
-            } else if !is_root && !is_leaf && bound.contains(&id) {
-                if resolve_profile() {
-                    eprintln!("[profile]   cutting {id} ({:?})", node.op.tag());
-                }
+            } else if !is_root && !is_leaf && bound.contains(&id) && dense_bound(graph, id) {
+                log_if!(
+                    resolve_profile,
+                    "[profile]   cutting {id} ({:?})",
+                    node.op.tag()
+                );
                 let facts = g.facts(id).clone();
                 let leaf = g.add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
                     name: graph.fresh_buffer_id(),
@@ -1069,13 +1090,12 @@ impl Session {
                 blocked: false,
             });
             if is_new {
-                if resolve_profile() {
-                    eprintln!(
-                        "[profile] shape family: first sighting ({} slots, {} families)",
-                        term.consts.len(),
-                        fams.len()
-                    );
-                }
+                log_if!(
+                    resolve_profile,
+                    "[profile] shape family: first sighting ({} slots, {} families)",
+                    term.consts.len(),
+                    fams.len()
+                );
                 return Ok(false);
             }
             // These values are a recorded twin's own roots: plan them directly.
@@ -1094,13 +1114,12 @@ impl Session {
                     fam.concrete.remove(0);
                 }
                 fam.concrete.push(own_nodes());
-                if resolve_profile() {
-                    eprintln!(
-                        "[profile] shape family: new shape ({} of {} concrete)",
-                        fam.concrete.len(),
-                        CONCRETE_SHAPES
-                    );
-                }
+                log_if!(
+                    resolve_profile,
+                    "[profile] shape family: new shape ({} of {} concrete)",
+                    fam.concrete.len(),
+                    CONCRETE_SHAPES
+                );
                 return Ok(false);
             } else {
                 // Shapes keep changing: the symbolic twin. Slots that have
@@ -1139,9 +1158,7 @@ impl Session {
                     match self.build_twin(graph, &term, &fam.varying, &fam.group) {
                         Ok(twin) => fam.symbolic = Some(twin),
                         Err(err) => {
-                            if resolve_profile() {
-                                eprintln!("[profile] shape family blocked: {err}");
-                            }
+                            log_if!(resolve_profile, "[profile] shape family blocked: {err}");
                             fam.blocked = true;
                             fam.symbolic = None;
                             fam.concrete.push(own_nodes());
@@ -1159,8 +1176,8 @@ impl Session {
                 graph.bind_dim(*sym, term.consts[slot]);
             }
         }
-        // The member's step buffers stand behind the twin's leaves. A leaf
-        // that is this member's own node (a weight) already holds its buffer.
+        // Capture sources before rebinding: a member may permute the twin's inputs.
+        let mut inputs = Vec::new();
         for (leaf, input_ix) in &twin.leaves {
             let source = term.inputs[*input_ix];
             if *leaf == source {
@@ -1173,8 +1190,10 @@ impl Session {
                 return Ok(false);
             };
             let layout = graph.device_layout(source).map(Arc::new);
-            graph.bind_classes(&[(*leaf, buf, layout)]);
+            inputs.push((*leaf, buf, layout));
         }
+        let bindings_scope = FamilyBindings::new(graph, &twin.roots)?;
+        graph.bind_classes(&inputs);
         let twin_values: Vec<Tensor> = twin.roots.iter().map(|id| graph.tensor(*id)).collect();
         // The twin's roots are still bound to the last call's outputs; a
         // bound value is "nothing to plan", so they are unbound first.
@@ -1187,9 +1206,10 @@ impl Session {
         // that fails is dropped.
         if let Err(err) = self.resolve_locked(resolving, &twin_values) {
             {
-                if resolve_profile() {
-                    eprintln!("[profile] shape family blocked at planning: {err}");
-                }
+                log_if!(
+                    resolve_profile,
+                    "[profile] shape family blocked at planning: {err}"
+                );
                 for root in &twin.roots {
                     graph.clear_class_device_buf(*root);
                 }
@@ -1207,6 +1227,7 @@ impl Session {
         // The member's value is concrete, so its binding carries the twin's
         // layout with this call's values in place of the symbols.
         let bindings: FxHashMap<SymId, u64> = graph.dim_bindings().into_iter().collect();
+        let mut outputs = Vec::with_capacity(values.len());
         for (value, root) in values.iter().zip(&twin.roots) {
             let Some(buf) = graph.device_buf(*root) else {
                 return Err(Error::Plan(format!(
@@ -1217,52 +1238,20 @@ impl Session {
                 Some(layout) => Some(Arc::new(concrete_layout(&layout, &bindings)?)),
                 None => None,
             };
-            graph.bind_classes(&[(value.id, buf, layout)]);
+            outputs.push((value.id, buf, layout));
         }
-        if resolve_profile() {
-            eprintln!(
-                "[profile] shape family hit: {} ({} symbol(s), {} us)",
-                if symbolic { "symbolic" } else { "concrete" },
-                twin.syms.iter().flatten().count(),
-                __t.elapsed().as_micros()
-            );
-        }
-        // `FUSOR_VERIFY_FAMILIES`: also plan this member concretely and
-        // compare every output byte-for-byte. A twin computing something
-        // its member does not is a compiler bug in symbolic lowering.
-        if verify_families() {
-            let mut from_twin = Vec::with_capacity(values.len());
-            for value in values {
-                from_twin.push(self.read_bytes_locked(resolving, graph, value.id)?);
-                graph.clear_class_device_buf(value.id);
-            }
-            let saved = self.inner.families.lock().remove(&key);
-            self.resolve_locked(resolving, values)?;
-            if let Some(saved) = saved {
-                self.inner.families.lock().insert(key, saved);
-            }
-            for (o, (value, twin_bytes)) in values.iter().zip(&from_twin).enumerate() {
-                let concrete = self.read_bytes_locked(resolving, graph, value.id)?;
-                let dtype = graph.facts(value.id).dtype;
-                if !agrees(dtype, &concrete, twin_bytes) {
-                    let detail = (dtype == Dtype::F32)
-                        .then(|| first_mismatch(&concrete, twin_bytes))
-                        .flatten()
-                        .map_or_else(String::new, |(i, p, q, w)| {
-                            format!(" (elem {i}: concrete {p} vs twin {q}, worst |d| {w})")
-                        });
-                    return Err(Error::Plan(format!(
-                        "shape family twin disagrees with its member on output {o} ({} vs {} \
-                         bytes){detail}",
-                        concrete.len(),
-                        twin_bytes.len()
-                    )));
-                }
-            }
-            eprintln!(
-                "[verify] shape family twin agrees on {} output(s)",
-                values.len()
-            );
+        drop(bindings_scope);
+        graph.bind_classes(&outputs);
+        log_if!(
+            resolve_profile,
+            "[profile] shape family hit: {} ({} symbol(s), {} us)",
+            if symbolic { "symbolic" } else { "concrete" },
+            twin.syms.iter().flatten().count(),
+            __t.elapsed().as_micros()
+        );
+        #[cfg(feature = "compiler-tests")]
+        if flags().verify_families {
+            self.verify_family(resolving, graph, values, key)?;
         }
         Ok(true)
     }
@@ -1377,37 +1366,11 @@ impl Session {
         // bookkeeping only, and the download blocks on the device regardless.
         self.inner.in_flight.store(0, Ordering::Relaxed);
 
-        // A selected `Coop`/`Sgemm` geometry pads the output buffer to its
-        // tile multiple, so the bytes on the device are not the value's own
-        // dense shape. Read the whole padded buffer and gather the value out
-        // of it; a dense layout takes the straight path.
-        //
-        // The registered layout is stated against the selected member's
-        // shape, and the id being read may be a reshaped spelling of the same
-        // class, so the layout is restated over the reader's shape
-        // (`restate_layout`) — never dropped, because a dense read of a
-        // padded buffer returns padding zeros as if they were the value.
-        // Padding lives in the strides, never in the shape: a padded buffer
-        // is detected by its strides departing from the row-major set or a
-        // nonzero offset, not by its shape.
+        // The registered layout retains the value's logical axes; padding is
+        // represented by its strides and is gathered only at readback.
         let padded = graph
             .device_layout(id)
-            .filter(|l| {
-                l.shape() != &facts.shape[..]
-                    || !l.offset().known_eq(fusor_ir::shape::Dim::Const(0))
-                    || l.strides() != &fusor_ir::shape::Layout::row_major_strides(l.shape())[..]
-            })
-            .map(|l| {
-                restate_layout(&l, &facts.shape, graph).ok_or_else(|| {
-                    Error::Plan(format!(
-                        "value {id} is shaped {:?} over a device buffer laid out {:?}; \
-                         the shapes do not factor",
-                        facts.shape,
-                        l.shape()
-                    ))
-                })
-            })
-            .transpose()?;
+            .filter(|layout| !layout.is_contiguous());
         let Some(layout) = padded else {
             let elements = resolve_elements(&facts.shape, graph)?;
             return Ok(ReadPlan {
@@ -1420,7 +1383,7 @@ impl Session {
         let base = resolve_dim(layout.offset(), graph)?;
         let strides: Vec<u64> = resolve_strides(&layout, graph)?;
         // The bytes to pull are the layout's address span, not its element
-        // count: a restated layout addresses far past `product(shape)`, and a
+        // count: a padded layout addresses past `product(shape)`, and a
         // short download gathers zeros for everything past its end.
         let mut span = 1u64;
         for (d, s) in layout.shape().iter().zip(&strides) {
@@ -1500,29 +1463,6 @@ impl Session {
     fn selected(&self, graph: &GraphRef, plan: &Plan, id: Id) -> Id {
         let class = graph.state().egraph.lock().class_of(id);
         plan.extraction.selected(class).unwrap_or(id)
-    }
-
-    /// Register `buf` under every id in `id`'s e-class, `Union` spine
-    /// included.
-    ///
-    /// The class — not the member — is the stable identity of a value: which
-    /// member wins is an artifact of one extraction that a later resolve may
-    /// change. `macro_op` hands the caller a `Union` spine node, so binding
-    /// only the selectable members would leave every sugared spelling
-    /// unreadable.
-    fn bind_class(
-        &self,
-        graph: &GraphRef,
-        id: Id,
-        buf: &Buf,
-        layout: Option<&fusor_ir::shape::Layout>,
-    ) {
-        let members = {
-            let g = graph.state().egraph.lock();
-            g.class_ids(g.class_of(id))
-        };
-        let layout = layout.cloned().map(Arc::new);
-        graph.set_device_buf_class(&members, buf, layout.as_ref());
     }
 
     fn run(
@@ -1612,31 +1552,8 @@ impl Session {
             if !wanted.contains(&buffer.value) && !in_place_roots.contains(&buffer.value) {
                 continue;
             }
-            let elements = resolve_buffer_elements(buffer.elements, &buffer.layout, graph)?;
-            let bytes = (elements * buffer.dtype.byte_size()).max(4);
-            #[cfg(feature = "cpu")]
-            if self.inner.device.is_cpu()
-                && let Some(existing) = graph.device_buf(buffer.value)
-                && existing
-                    .downcast_ref::<fusor_cpu::AlignedBuf>()
-                    .is_some_and(|buf| buf.len() as u64 >= bytes)
-            {
-                supplied.insert(buffer.value, existing);
-                continue;
-            }
-            let buf = self
-                .inner
-                .device
-                .target()
-                .alloc(bytes, buffer.persistence)?;
-            // Only a requested value keeps its buffer bound to the graph. A
-            // launch root that is merely an intermediate of this resolve
-            // gets scratch that returns to the pool with the plan; binding
-            // it too would pin every intermediate of every resolve for the
-            // life of the graph — a 32-block vision tower held 22 GB of
-            // hidden states that way. A later read of an intermediate
-            // recomputes it.
-            if wanted.contains(&buffer.value) || in_place_roots.contains(&buffer.value) {
+            let (buf, fresh) = self.plan_buffer(graph, buffer)?;
+            if fresh {
                 to_bind.push((
                     buffer.value,
                     buf.clone(),
@@ -1664,7 +1581,7 @@ impl Session {
                     None => continue,
                 },
             };
-            self.bind_class(graph, *selected, &buf, None);
+            graph.bind_classes(&[(*selected, buf, None)]);
         }
 
         match &self.inner.device {
@@ -1700,6 +1617,33 @@ impl Session {
         }
     }
 
+    /// The buffer a plan buffer runs in, and whether it is freshly allocated:
+    /// on the CPU a value whose bound buffer is still large enough runs in
+    /// place.
+    fn plan_buffer(
+        &self,
+        graph: &GraphRef,
+        buffer: &fusor_ir::extract::BufferPlan,
+    ) -> Result<(Buf, bool)> {
+        let elements = resolve_dim(buffer.elements, graph)?;
+        let bytes = (elements * buffer.dtype.byte_size()).max(4);
+        #[cfg(feature = "cpu")]
+        if self.inner.device.is_cpu()
+            && let Some(existing) = graph.device_buf(buffer.value)
+            && existing
+                .downcast_ref::<fusor_cpu::AlignedBuf>()
+                .is_some_and(|buf| buf.len() as u64 >= bytes)
+        {
+            return Ok((existing, false));
+        }
+        let buf = self
+            .inner
+            .device
+            .target()
+            .alloc(bytes, buffer.persistence)?;
+        Ok((buf, true))
+    }
+
     /// The generic runner: one `lower -> emit -> launch` per plan launch, in
     /// plan order. The GPU takes `GpuTarget::resolve` instead, which adds the
     /// plan cache, the parallel build cohort and one encoder per resolve.
@@ -1719,17 +1663,8 @@ impl Session {
             if supplied.contains_key(&buffer.value) {
                 continue;
             }
-            let elements = resolve_buffer_elements(buffer.elements, &buffer.layout, graph)?;
-            let bytes = (elements * buffer.dtype.byte_size()).max(4);
-            if let Some(existing) = graph.device_buf(buffer.value)
-                && existing
-                    .downcast_ref::<fusor_cpu::AlignedBuf>()
-                    .is_some_and(|buf| buf.len() as u64 >= bytes)
-            {
-                supplied.insert(buffer.value, existing);
-                continue;
-            }
-            supplied.insert(buffer.value, target.alloc(bytes, buffer.persistence)?);
+            let (buf, _) = self.plan_buffer(graph, buffer)?;
+            supplied.insert(buffer.value, buf);
         }
 
         let executable = if let Some(cached) = cached {
@@ -1765,7 +1700,7 @@ impl Session {
         };
 
         let mut launched = 0usize;
-        for launch in &executable.launches {
+        for (launch_ix, launch) in executable.launches.iter().enumerate() {
             let mut binds = Vec::with_capacity(launch.bindings.len());
             for value in &launch.bindings {
                 let buf = supplied.get(value).cloned().ok_or_else(|| {
@@ -1778,6 +1713,28 @@ impl Session {
             // lowering indexed the body against. When they disagree the
             // kernel silently computes a prefix of its output.
             target.launch(&launch.artifact, launch.grid, &binds, &uniforms)?;
+            if flags().debug_cpu_nan {
+                let root = plan.launches[launch_ix].root;
+                if let Some(buffer) = supplied
+                    .get(&root)
+                    .and_then(|buffer| buffer.downcast_ref::<fusor_cpu::AlignedBuf>())
+                {
+                    let values: Vec<f32> = buffer
+                        .as_slice()
+                        .as_chunks::<4>()
+                        .0
+                        .iter()
+                        .map(|bytes| f32::from_le_bytes(*bytes))
+                        .collect();
+                    eprintln!("[DEBUG-cpu-nan] launch={launch_ix} root={root} values={values:?}");
+                    if values.iter().any(|v| v.is_nan()) {
+                        eprintln!(
+                            "[DEBUG-cpu-nan] OP {:?}",
+                            graph.state().egraph.lock().node(root).op
+                        );
+                    }
+                }
+            }
             launched += 1;
         }
         Ok((launched, executable))
@@ -1852,7 +1809,7 @@ impl Session {
             bytes.extend_from_slice(&unit);
         }
         let buf = self.inner.device.upload(&bytes, facts.persistence)?;
-        graph.set_device_buf(id, buf.clone());
+        graph.bind_leaf(id, buf.clone(), None);
         Ok(Some(buf))
     }
 
@@ -1878,103 +1835,63 @@ impl Session {
 
     fn autotune(
         &self,
-        guard: &ResolveGuard<'_>,
+        _guard: &ResolveGuard<'_>,
         graph: &GraphRef,
         roots: &[Id],
         base: Arc<Plan>,
         values: &[Tensor],
     ) -> Result<Arc<Plan>> {
-        // Member verification: race every candidate of every launch so each
-        // gets value-checked, but adopt none — a plan that changes under
-        // measurement would make suite dispatch counts nondeterministic.
-        let verify_members = verify_members();
-        let min_macs = if verify_members {
-            0
-        } else {
-            autotune_min_macs()
-        };
-        let log = std::env::var_os("FUSOR_AUTOTUNE_LOG").is_some();
+        #[cfg(feature = "compiler-tests")]
+        if verify_members() {
+            return self.check_members(_guard, graph, roots, base, values);
+        }
+        let min_macs = flags().autotune_min_macs;
 
         // Timing a plan re-runs it, and an in-place node makes a re-run
         // destructive, so an impure plan is never raced. It is still tuned:
         // the production explorer substitutes one candidate exactly once, in
         // place of the incumbent's own dispatch.
-        {
-            let g = graph.state().egraph.lock();
-            if base.launches.iter().any(|l| {
-                l.members
-                    .iter()
-                    .any(|m| g.semantics().effect(&g.node(*m).op) != Effect::Pure)
-            }) {
-                if log {
-                    eprintln!("[tune] not raced: the plan has an in-place launch");
-                }
-                return Ok(base);
-            }
+        if has_in_place_launch(graph, &base) {
+            log_if!(
+                autotune_log,
+                "[tune] not raced: the plan has an in-place launch"
+            );
+            return Ok(base);
         }
 
         // One probe pass over the base plan. `launch_variants` holds the work
         // gate, so "every launch offered nothing" is "not worth tuning".
-        let probe: Vec<Vec<(String, Plan)>> = {
-            let g = graph.state().egraph.lock();
-            (0..base.launches.len())
-                .map(|ix| {
-                    self.inner.extractor.launch_variants(
-                        &g,
-                        roots,
-                        &base,
-                        ix,
-                        self.inner.cost.as_ref(),
-                        min_macs,
-                    )
-                })
-                .collect()
-        };
+        let probe: Vec<Vec<(String, Plan)>> = (0..base.launches.len())
+            .map(|ix| self.launch_variants(graph, roots, &base, ix, min_macs))
+            .collect();
         if probe.iter().all(Vec::is_empty) {
-            if log {
-                eprintln!(
-                    "[tune] not raced: no launch of {} offers a variant above {min_macs} macs",
-                    base.launches.len()
-                );
-            }
+            log_if!(
+                autotune_log,
+                "[tune] not raced: no launch of {} offers a variant above {min_macs} macs",
+                base.launches.len()
+            );
             return Ok(base);
         }
 
         // The plan's identity across processes: every launch signature in
         // order. A cached combination is only replayable onto the same plan
         // shape, so this is what it is keyed on.
-        let plan_sig: String = {
-            let g = graph.state().egraph.lock();
-            base.launches
-                .iter()
-                .map(|l| fusor_cost::extract::launch_signature(&g, l))
-                .collect::<Vec<_>>()
-                .join(";")
-        };
+        let plan_sig = launch_sigs(graph, &base).join(";");
         // A combination this machine has already raced to a verdict is
         // applied as recorded, not raced again: the race costs seconds per
         // plan shape (every candidate is built, compiled and timed several
         // times), and re-running it in every process would put that on
         // every first transcription or embedding. Production sampling keeps
         // exploring from there. The member sweep must measure everything.
-        if !verify_members
-            && let Some(picks) = self.inner.tune.combo(&plan_sig)
-            && let Some(plan) = self.apply_combo(graph, roots, &base, &picks, min_macs, log)?
+        if let Some(picks) = self.inner.tune.combo(&plan_sig)
+            && let Some(plan) = self.apply_combo(graph, roots, &base, &picks, min_macs)?
         {
             return Ok(plan);
         }
 
-        // A member sweep is a correctness pass, not a benchmark: its timings
-        // are discarded below, so one execution covers each candidate. Normal
-        // autotuning keeps the repeated samples and per-dispatch timestamps it
-        // needs for stable comparisons.
-        let repetitions = if verify_members { 1 } else { TUNE_RUNS };
         #[cfg(feature = "gpu")]
-        let _clock = (!verify_members).then(|| TuningClock::new(&self.inner.device));
-
-        let Some(reference) = self.timed_run(guard, graph, &base, values, repetitions)? else {
-            return Ok(base);
-        };
+        let _clock = TuningClock::new(&self.inner.device);
+        let reference = self.timed_run(graph, &base, values, TUNE_RUNS)?;
         // What this pass actually adopts, per launch, so the combination can
         // be recorded rather than reassembled from per-launch minima that
         // were never measured together.
@@ -1989,18 +1906,17 @@ impl Session {
         // differs from the incumbent at exactly one launch, so the launch's
         // own span — not the sum — is the term `TUNE_MARGIN` belongs on.
         let mut best_spans: Option<Vec<f64>> = reference.gpu_us.clone();
-        if log {
-            eprintln!(
-                "[tune] base {best_ns:.0} ns ({} ns wall), {} launches, {}",
-                reference.nanos,
-                best.launches.len(),
-                if reference.gpu_us.is_some() {
-                    "per-kernel gpu timestamps"
-                } else {
-                    "wall clock only"
-                }
-            );
-        }
+        log_if!(
+            autotune_log,
+            "[tune] base {best_ns:.0} ns ({} ns wall), {} launches, {}",
+            reference.nanos,
+            best.launches.len(),
+            if reference.gpu_us.is_some() {
+                "per-kernel gpu timestamps"
+            } else {
+                "wall clock only"
+            }
+        );
 
         for (ix, probed) in probe.into_iter().enumerate() {
             if probed.is_empty() {
@@ -2012,15 +1928,7 @@ impl Session {
             let variants = if Arc::ptr_eq(&best, &base) {
                 probed
             } else {
-                let g = graph.state().egraph.lock();
-                self.inner.extractor.launch_variants(
-                    &g,
-                    roots,
-                    &best,
-                    ix,
-                    self.inner.cost.as_ref(),
-                    min_macs,
-                )
+                self.launch_variants(graph, roots, &best, ix, min_macs)
             };
             // What this machine already knows about this launch decides where
             // the time goes: re-confirm a known incumbent, explore a bounded
@@ -2034,9 +1942,6 @@ impl Session {
                     .map(|l| fusor_cost::extract::launch_signature(&g, l))
             };
             let variants: Vec<(String, Plan)> = match &sig {
-                // The member sweep is a coverage tool: every candidate must be
-                // built and value-checked, so the cache must not narrow it.
-                Some(_) if verify_members => variants,
                 Some(sig) => {
                     // Each candidate travels with the cost model's prior for
                     // the plan it denotes: on a cold signature the cache races
@@ -2046,12 +1951,12 @@ impl Session {
                         .map(|(n, p)| (n.clone(), p.cost.0))
                         .collect();
                     // The cache orders and prunes; it never replaces the race.
-                    // Every candidate it hands back is still built, timed and
-                    // value-checked, and a recorded combination is
+                    // Every candidate it hands back is still built and timed;
+                    // a recorded combination is
                     // authoritative only once every candidate for the launch
                     // has been measured.
                     let (run, skipped) = self.inner.tune.plan_candidates(sig, &names);
-                    if log && !skipped.is_empty() {
+                    if flags().autotune_log && !skipped.is_empty() {
                         eprintln!(
                             "[tune]   L{ix} skipping {} variant(s) this device has \
                              already ruled out",
@@ -2071,39 +1976,8 @@ impl Session {
             for (label, candidate) in variants {
                 let candidate = Arc::new(candidate);
                 raced.push(Arc::clone(&candidate));
-                let sample = match self.timed_run(guard, graph, &candidate, values, repetitions) {
-                    Ok(Some(sample)) => sample,
-                    // A candidate this device cannot build or read is not a
-                    // wrong answer; it is skipped. A candidate that took the
-                    // device down is a different matter: nothing after it
-                    // can run, and the name of the kernel is the whole
-                    // diagnosis.
-                    outcome => {
-                        if let Some(reason) = self.inner.device.device_lost() {
-                            let detail = match outcome {
-                                Err(e) => format!(" ({e})"),
-                                Ok(None) => String::new(),
-                                Ok(Some(_)) => unreachable!(),
-                            };
-                            return Err(Error::Device(format!(
-                                "the device was lost while racing candidate `{label}` of \
-                                 launch {ix}: {reason}{detail}"
-                            )));
-                        }
-                        continue;
-                    }
-                };
+                let sample = self.timed_run(graph, &candidate, values, TUNE_RUNS)?;
                 let sample_ns = plan_ns(&sample);
-                // A different tile is a different reduction order, so bit
-                // equality is the wrong test — but a wrong kernel is off by
-                // orders of magnitude. This runs before the cache write: a
-                // whole-plan disagreement is this variant's.
-                let ok = reference.bytes.len() == sample.bytes.len()
-                    && reference
-                        .bytes
-                        .iter()
-                        .zip(&sample.bytes)
-                        .all(|((dt, a), (_, b))| agrees(*dt, a, b));
                 // `replan` rebuilds the whole plan from a one-node edit, so a
                 // per-launch quantity may be attributed to index `ix` only
                 // when every other launch is untouched. Equal roots are not
@@ -2113,103 +1987,27 @@ impl Session {
                 // work onto its neighbour.
                 let aligned = plans_align(&candidate, &best, ix);
                 if let Some(sig) = &sig {
-                    // `sig` names one launch, so only a property of that
-                    // launch may be filed under it: its own kernel span,
-                    // hence the `aligned` filter. A wrong answer needs no
-                    // such guard — it is not a timing property.
-                    let verdict = if !ok {
-                        WRONG_MEMBERS.fetch_add(1, Ordering::Relaxed);
-                        let detail = reference
-                            .bytes
-                            .iter()
-                            .zip(&sample.bytes)
-                            .enumerate()
-                            .find_map(|(o, ((dt, a), (_, b)))| {
-                                (*dt == Dtype::F32)
-                                    .then(|| first_mismatch(a, b).map(|m| (o, m)))
-                                    .flatten()
-                            });
-                        let detail = detail.map_or_else(String::new, |(o, (i, p, q, w))| {
-                            format!(" (out {o} elem {i}: incumbent {p} vs {q}, worst |d| {w})")
-                        });
-                        // A tiny output is worth printing whole: the wrong
-                        // pattern (a column, a row tail, a stripe) names the
-                        // bug faster than any single element.
-                        if let Some(((_, a), (_, b))) =
-                            reference.bytes.first().zip(sample.bytes.first())
-                            && a.len() <= 128
-                            && a.len() % 4 == 0
-                        {
-                            let f = |s: &[u8]| {
-                                s.as_chunks::<4>()
-                                    .0
-                                    .iter()
-                                    .map(|c| f32::from_le_bytes(*c))
-                                    .map(|v| format!("{v:.3}"))
-                                    .collect::<Vec<_>>()
-                                    .join(" ")
-                            };
-                            eprintln!("[tune]   incumbent: {}", f(a));
-                            eprintln!("[tune]   candidate: {}", f(b));
-                        }
-                        eprintln!(
-                            "[tune] MISCOMPILE: candidate `{label}` of launch {ix} computes \
-                             different values from the incumbent plan{detail}"
-                        );
-                        // Two members of one e-class disagreeing on bytes is
-                        // a violated compiler invariant. In production the
-                        // resolve fails loudly; only the CI member sweep
-                        // (`FUSOR_VERIFY_MEMBERS`) records and continues,
-                        // so one run can enumerate every such bug.
-                        if !verify_members {
-                            return Err(Error::Plan(format!(
-                                "internal compiler error: class member `{label}` of launch \
-                                 {ix} computes different values from its siblings; every \
-                                 member of a class must compute the same value. This is a \
-                                 compiler bug — reduce and fix the kernel or rule, do not \
-                                 route around it."
-                            )));
-                        }
-                        Some(Verdict::Wrong)
-                    } else {
-                        match launch_ns(&sample, ix).filter(|_| aligned) {
-                            // Absolute nanoseconds are comparable across
-                            // processes because `launch_signature` pins family,
-                            // dtype and shape, and the file is keyed by device.
-                            Some(ns) => Some(Verdict::Ran(ns)),
-                            // No device timer at all: keep the ppm-of-base
-                            // ratio, the best a host clock supports. A GPU that
-                            // *can* time kernels but did not time this plan
-                            // records nothing, rather than mixing two units in
-                            // one device's file.
-                            None if self.inner.device.is_cpu() => {
-                                Some(Verdict::Ran(ratio_ppm(sample_ns, base_ns)))
-                            }
-                            None => None,
-                        }
-                    };
-                    // The member sweep's spans are measured under contention
-                    // at sizes production never tunes. A `Wrong` verdict is a
-                    // property of the kernel and is kept; a `Ran` time is a
-                    // property of the sweep and is dropped.
-                    let keep = !verify_members || matches!(verdict, Some(Verdict::Wrong));
-                    if let Some(verdict) = verdict.filter(|_| keep) {
-                        self.inner.tune.record(sig, &label, verdict);
+                    let measurement = launch_ns(&sample, ix).filter(|_| aligned).or_else(|| {
+                        self.inner
+                            .device
+                            .is_cpu()
+                            .then(|| ratio_ppm(sample_ns, base_ns))
+                    });
+                    if let Some(ns) = measurement {
+                        self.inner.tune.observe(sig, &label, ns);
                     }
                 }
-                if log {
-                    eprintln!(
-                        "[tune]   L{ix} {sample_ns:.0} ns  (own {} ns, {} ns wall)  {label}{}{}",
-                        launch_ns(&sample, ix).map_or_else(|| "-".to_string(), |ns| ns.to_string()),
-                        sample.nanos,
-                        if ok { "" } else { "  REJECTED: wrong values" },
-                        if aligned {
-                            ""
-                        } else {
-                            "  PERTURBED: >1 launch differs"
-                        }
-                    );
-                }
+                log_if!(
+                    autotune_log,
+                    "[tune]   L{ix} {sample_ns:.0} ns  (own {} ns, {} ns wall)  {label}{}",
+                    launch_ns(&sample, ix).map_or_else(|| "-".to_string(), |ns| ns.to_string()),
+                    sample.nanos,
+                    if aligned {
+                        ""
+                    } else {
+                        "  PERTURBED: >1 launch differs"
+                    }
+                );
                 // Only launch `ix` differs, so the launch's own span is what
                 // `TUNE_MARGIN` applies to; on the plan sum, a launch under
                 // the margin fraction of the total could never be adopted.
@@ -2218,14 +2016,14 @@ impl Session {
                     (Some(prev), Some(now))
                         if aligned && prev.len() == now.len() && ix < prev.len() =>
                     {
-                        now[ix] < prev[ix] * (1.0 - TUNE_MARGIN)
+                        beats(now[ix], prev[ix])
                     }
                     // No device timer, or `replan` moved the launches: the
                     // whole-plan number is all there is, and is what the host
                     // clock always had.
-                    _ => sample_ns < best_ns * (1.0 - TUNE_MARGIN),
+                    _ => beats(sample_ns, best_ns),
                 };
-                if ok && improved && !verify_members {
+                if improved {
                     best_ns = sample_ns;
                     // The adopted candidate is the new incumbent, so its
                     // profile serves every later launch's comparison.
@@ -2243,15 +2041,11 @@ impl Session {
         // launch, so it stays a ratio against this pass's own base, which is
         // what makes it comparable across runs.
         let combo_score = ratio_ppm(best_ns, base_ns);
-        if !verify_members {
-            self.inner.tune.record_combo(&plan_sig, picks, combo_score);
-        }
+        self.inner.tune.record_combo(&plan_sig, picks, combo_score);
         // One write per tuning pass, atomic, and a no-op when nothing new was
         // measured — a fully-learned shape costs zero IO.
         self.inner.tune.save();
-        if log {
-            eprintln!("[tune] winner {best_ns:.0} ns");
-        }
+        log_if!(autotune_log, "[tune] winner {best_ns:.0} ns");
         let arena = graph.state().egraph.lock().arena_id();
         self.inner.device.release_candidates(arena, &raced, &best);
         Ok(best)
@@ -2269,7 +2063,6 @@ impl Session {
         base: &Arc<Plan>,
         picks: &[Option<String>],
         min_macs: u64,
-        log: bool,
     ) -> Result<Option<Arc<Plan>>> {
         if picks.len() != base.launches.len() {
             return Ok(None);
@@ -2280,51 +2073,59 @@ impl Session {
             let Some(name) = pick else {
                 continue;
             };
-            let variants = {
-                let g = graph.state().egraph.lock();
-                self.inner.extractor.launch_variants(
-                    &g,
-                    roots,
-                    &best,
-                    ix,
-                    self.inner.cost.as_ref(),
-                    min_macs,
-                )
-            };
+            let variants = self.launch_variants(graph, roots, &best, ix, min_macs);
             let Some((_, plan)) = variants.into_iter().find(|(n, _)| n == name) else {
-                if log {
-                    eprintln!(
-                        "[tune] recorded pick `{name}` for launch {ix} no longer exists; racing"
-                    );
-                }
+                log_if!(
+                    autotune_log,
+                    "[tune] recorded pick `{name}` for launch {ix} no longer exists; racing"
+                );
                 return Ok(None);
             };
             best = Arc::new(plan);
             applied += 1;
         }
-        if applied > 0 {
+        #[cfg(feature = "compiler-tests")]
+        {
             let g = graph.state().egraph.lock();
             self.inner.extractor.verify_plan(&g, &best)?;
         }
-        if log {
-            eprintln!(
-                "[tune] applied the recorded combination: {applied} of {} launches substituted",
-                picks.len()
-            );
-        }
+        log_if!(
+            autotune_log,
+            "[tune] applied the recorded combination: {applied} of {} launches substituted",
+            picks.len()
+        );
         Ok(Some(best))
     }
 
-    /// Run `plan` `repetitions` times, keep the fastest, and read every
-    /// requested value back. `None` when nothing was readable.
+    /// Launch `ix`'s alternatives in `plan`, under the graph lock.
+    fn launch_variants(
+        &self,
+        graph: &GraphRef,
+        roots: &[Id],
+        plan: &Plan,
+        ix: usize,
+        min_macs: u64,
+    ) -> Vec<(String, Plan)> {
+        let g = graph.state().egraph.lock();
+        self.inner.extractor.launch_variants(
+            &g,
+            roots,
+            plan,
+            ix,
+            self.inner.cost.as_ref(),
+            min_macs,
+        )
+    }
+
+    /// Run `plan` repeatedly and retain timings. No output readback or
+    /// correctness decisions belong to the performance selector.
     fn timed_run(
         &self,
-        guard: &ResolveGuard<'_>,
         graph: &GraphRef,
         plan: &Plan,
         values: &[Tensor],
         repetitions: usize,
-    ) -> Result<Option<TuneSample>> {
+    ) -> Result<TuneSample> {
         let mut nanos = u64::MAX;
         let mut gpu_us: Option<Vec<f64>> = None;
         for _ in 0..repetitions {
@@ -2345,31 +2146,12 @@ impl Session {
                 });
             }
         }
-        let mut bytes = Vec::with_capacity(values.len());
-        for v in values {
-            match self.read_bytes_locked(guard, graph, v.id) {
-                Ok(b) => bytes.push((graph.facts(v.id).dtype, b)),
-                Err(_) => return Ok(None),
-            }
-        }
-        Ok(Some(TuneSample {
-            nanos,
-            gpu_us,
-            bytes,
-        }))
+        Ok(TuneSample { nanos, gpu_us })
     }
 
     /// The device buffer of an external leaf, uploading it on first use.
     fn leaf_buffer(&self, graph: &GraphRef, id: Id) -> Result<Option<Buf>> {
-        let is_external = {
-            let g = graph.state().egraph.lock();
-            matches!(
-                &g.node(id).op,
-                Op::Logical(Logical::Leaf(
-                    LeafKind::Buffer { .. } | LeafKind::Param { .. } | LeafKind::Quantized { .. }
-                ))
-            )
-        };
+        let is_external = crate::graph::is_external_leaf(&graph.state().egraph.lock().node(id).op);
         if !is_external {
             return Ok(None);
         }
@@ -2387,41 +2169,65 @@ impl Session {
                 self.inner.device.target().alloc(bytes, facts.persistence)?
             }
         };
-        graph.set_device_buf(id, buf.clone());
+        graph.bind_leaf(id, buf.clone(), None);
         Ok(Some(buf))
     }
 }
 
-/// The launch-work gate below which nothing is measured, env-overridable.
-/// Shared by the cold race and the online explorer so "worth tuning" means
-/// one thing.
-pub(crate) fn autotune_min_macs() -> u64 {
-    std::env::var("FUSOR_AUTOTUNE_MIN_MACS")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(AUTOTUNE_MIN_MACS)
+/// The process's `FUSOR_*` debugging and tuning switches, each read once:
+/// `resolve` is the hot path and an env lookup is a per-call allocation.
+pub(crate) struct Flags {
+    /// `FUSOR_RESOLVE_PROFILE`: per-resolve phase timings on stderr.
+    pub(crate) resolve_profile: bool,
+    /// `FUSOR_DUMP_EXEC`: the launch and incumbent signatures of each
+    /// distinct executed plan, to join a span profile to its kernels.
+    pub(crate) dump_exec: bool,
+    /// `FUSOR_NO_SAT_MEMO`: disable the saturation memo.
+    pub(crate) no_saturation_memo: bool,
+    /// `FUSOR_AUTOTUNE_LOG`: narrate the cold race and the explorer.
+    pub(crate) autotune_log: bool,
+    /// `FUSOR_DEBUG_CPU_NAN`: dump every CPU launch's output.
+    #[cfg(feature = "cpu")]
+    pub(crate) debug_cpu_nan: bool,
+    /// `FUSOR_REAP_DEBUG`: report retained dead buffers at each reap.
+    pub(crate) reap_debug: bool,
+    /// `FUSOR_AUTOTUNE_MIN_MACS`: the launch-work gate below which nothing
+    /// is measured, shared by the cold race and the explorer.
+    pub(crate) autotune_min_macs: u64,
+    /// `FUSOR_EXPLORE_EPS`: one in this many replay hits explores; `0` off.
+    #[cfg(feature = "gpu")]
+    pub(crate) explore_eps: u64,
+    /// `FUSOR_VERIFY_FAMILIES`: cross-check every shape-family hit against a
+    /// concrete plan of the same member.
+    #[cfg(feature = "compiler-tests")]
+    pub(crate) verify_families: bool,
 }
 
-/// Whether `FUSOR_RESOLVE_PROFILE` is set. Read once: `resolve` is the hot
-/// path and an env lookup per call is a per-resolve allocation.
-/// Whether `FUSOR_VERIFY_FAMILIES` is set: every shape-family hit is
-/// cross-checked against a concrete plan of the same member.
-fn verify_families() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FUSOR_VERIFY_FAMILIES").is_some())
-}
-
-fn resolve_profile() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FUSOR_RESOLVE_PROFILE").is_some())
-}
-
-/// Whether `FUSOR_DUMP_EXEC` is set. Prints the launch and incumbent
-/// signatures of each distinct executed plan, so a per-dispatch span profile
-/// can be joined to the kernel that actually ran.
-fn dump_exec() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("FUSOR_DUMP_EXEC").is_some())
+pub(crate) fn flags() -> &'static Flags {
+    static FLAGS: std::sync::OnceLock<Flags> = std::sync::OnceLock::new();
+    FLAGS.get_or_init(|| {
+        let on = |name: &str| std::env::var_os(name).is_some();
+        let num = |name: &str, default: u64| {
+            std::env::var(name)
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(default)
+        };
+        Flags {
+            resolve_profile: on("FUSOR_RESOLVE_PROFILE"),
+            dump_exec: on("FUSOR_DUMP_EXEC"),
+            no_saturation_memo: on("FUSOR_NO_SAT_MEMO"),
+            autotune_log: on("FUSOR_AUTOTUNE_LOG"),
+            #[cfg(feature = "cpu")]
+            debug_cpu_nan: on("FUSOR_DEBUG_CPU_NAN"),
+            reap_debug: on("FUSOR_REAP_DEBUG"),
+            autotune_min_macs: num("FUSOR_AUTOTUNE_MIN_MACS", AUTOTUNE_MIN_MACS),
+            #[cfg(feature = "gpu")]
+            explore_eps: num("FUSOR_EXPLORE_EPS", explore::EXPLORE_EPSILON),
+            #[cfg(feature = "compiler-tests")]
+            verify_families: on("FUSOR_VERIFY_FAMILIES"),
+        }
+    })
 }
 
 /// `op` over `children`, with every extent-carrying field passed through
@@ -2509,30 +2315,6 @@ fn rebuild_op(op: &Op, children: &[Id], dims: &mut dyn FnMut(Dim) -> Dim) -> Opt
             slot: *slot,
             x: child(0)?,
         }),
-        Op::Launch(Launch::Ext { def, ops, attrs }) => {
-            let mut ops = ops.clone();
-            if ops.len() != children.len() {
-                return None;
-            }
-            for (operand, child) in ops.iter_mut().zip(children) {
-                operand.src = *child;
-                let layout = &operand.layout;
-                let shape: Vec<Dim> = layout.shape().iter().map(|d| dims(*d)).collect();
-                // A contiguous operand keeps its strides derived from its
-                // shape, the spelling the IR uses for symbolic extents.
-                operand.layout = if layout.is_contiguous() {
-                    Layout::contiguous(&shape)
-                } else {
-                    let strides: Vec<Dim> = layout.strides().iter().map(|d| dims(*d)).collect();
-                    Layout::from_parts(dims(layout.offset()), &shape, &strides).ok()?
-                };
-            }
-            Op::Launch(Launch::Ext {
-                def: *def,
-                ops,
-                attrs: *attrs,
-            })
-        }
         Op::Union(..) => Op::Union(child(0)?, child(1)?),
         Op::Launch(_) => return None,
     })
@@ -2630,9 +2412,11 @@ fn canonicalize(graph: &GraphRef, roots: &[Id], abstract_consts: bool) -> Option
             other => match rebuild_op(other, &children, &mut slot) {
                 Some(op) => op,
                 None => {
-                    if resolve_profile() {
-                        eprintln!("[profile]   not canonicalizable: {id} is {:?}", other.tag());
-                    }
+                    log_if!(
+                        resolve_profile,
+                        "[profile]   not canonicalizable: {id} is {:?}",
+                        other.tag()
+                    );
                     return None;
                 }
             },
@@ -2671,11 +2455,6 @@ fn dims_hash(graph: &GraphRef) -> u64 {
     h.finish()
 }
 
-fn saturation_memo_disabled() -> bool {
-    static OFF: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *OFF.get_or_init(|| std::env::var_os("FUSOR_NO_SAT_MEMO").is_some())
-}
-
 /// Recorded saturations, bounded and FIFO-evicted.
 ///
 /// [`EGraph::replay_saturation`] checks the whole pre-state by value, so this
@@ -2696,7 +2475,7 @@ impl SaturationMemo {
     /// Replay a recording onto `graph` if one was taken against exactly this
     /// pre-state. `false` means the caller must saturate for real.
     fn replay(&self, graph: &mut EGraph) -> bool {
-        if saturation_memo_disabled() {
+        if flags().no_saturation_memo {
             return false;
         }
         // Cloned out of the lock: `replay_saturation` needs `&mut EGraph`
@@ -2731,7 +2510,33 @@ impl SaturationMemo {
     }
 }
 
-/// One candidate's measurement and the values it produced, together.
+/// `launch_signature` per launch of `plan`, plan order.
+fn launch_sigs(graph: &GraphRef, plan: &Plan) -> Vec<String> {
+    let g = graph.state().egraph.lock();
+    plan.launches
+        .iter()
+        .map(|l| fusor_cost::extract::launch_signature(&g, l))
+        .collect()
+}
+
+/// Whether any launch of `plan` writes through an operand: re-running such a
+/// plan is destructive, so it is never raced.
+fn has_in_place_launch(graph: &GraphRef, plan: &Plan) -> bool {
+    let g = graph.state().egraph.lock();
+    plan.launches.iter().any(|l| {
+        l.members
+            .iter()
+            .any(|m| g.semantics().effect(&g.node(*m).op) != Effect::Pure)
+    })
+}
+
+/// Whether `a` improves on `b` by more than [`TUNE_MARGIN`]: the hysteresis
+/// every adoption, cold or online, is held to.
+fn beats(a: f64, b: f64) -> bool {
+    a < b * (1.0 - TUNE_MARGIN)
+}
+
+/// One candidate's timing measurements.
 struct TuneSample {
     /// Wall clock around the whole `run`, in nanoseconds. Includes buffer
     /// allocation, binding, the plan-cache lookup, submission and the poll
@@ -2741,7 +2546,6 @@ struct TuneSample {
     /// could time them. This is the number a tuning decision wants: it excludes
     /// every host cost above and is a property of one launch.
     gpu_us: Option<Vec<f64>>,
-    bytes: Vec<(Dtype, Vec<u8>)>,
 }
 
 /// Whether `candidate` differs from `incumbent` at exactly launch `ix`, so a
@@ -2749,6 +2553,14 @@ struct TuneSample {
 /// that guarantee: a launch is its root *and* its members, grid and block. A
 /// candidate that fails this is compared at whole-plan granularity instead.
 fn plans_align(candidate: &Plan, incumbent: &Plan, ix: usize) -> bool {
+    aligned_except(candidate, incumbent, |j| j == ix)
+}
+
+/// Whether `candidate` matches `incumbent` launch for launch everywhere
+/// `swapped` does not name: same root, grid, block and member *set* (member
+/// order is a realization detail; `launch_signature` sorts for the same
+/// reason).
+fn aligned_except(candidate: &Plan, incumbent: &Plan, swapped: impl Fn(usize) -> bool) -> bool {
     candidate.launches.len() == incumbent.launches.len()
         && candidate
             .launches
@@ -2756,11 +2568,8 @@ fn plans_align(candidate: &Plan, incumbent: &Plan, ix: usize) -> bool {
             .zip(&incumbent.launches)
             .enumerate()
             .all(|(j, (c, b))| {
-                j == ix
+                swapped(j)
                     || (c.root == b.root && c.grid == b.grid && c.block == b.block && {
-                        // Member *order* is a realization detail —
-                        // `launch_signature` sorts for the same reason —
-                        // but the member set is the work.
                         let mut cm: Vec<Id> = c.members.to_vec();
                         let mut bm: Vec<Id> = b.members.to_vec();
                         cm.sort_unstable();
@@ -2768,21 +2577,6 @@ fn plans_align(candidate: &Plan, incumbent: &Plan, ix: usize) -> bool {
                         cm == bm
                     })
             })
-}
-
-/// [`plans_align`] over a *set* of swapped launches: `candidate` must differ
-/// from `incumbent` at most at the swapped indices — the check a batched
-/// prior adoption holds its composed replan to before trusting per-launch
-/// windows measured against single swaps.
-#[cfg(feature = "gpu")]
-fn batch_aligns(candidate: &Plan, incumbent: &Plan, swaps: &[(usize, String)]) -> bool {
-    candidate.launches.len() == incumbent.launches.len()
-        && candidate
-            .launches
-            .iter()
-            .zip(&incumbent.launches)
-            .enumerate()
-            .all(|(j, (c, b))| swaps.iter().any(|(s, _)| *s == j) || launch_key(c) == launch_key(b))
 }
 
 /// One launch's identity for plan diffing, hashed: the same fields
@@ -2950,52 +2744,6 @@ impl Drop for TuningClock<'_> {
     }
 }
 
-/// The first disagreeing f32 element and the worst one, for the MISCOMPILE
-/// report: `(first_index, expected, got, worst_abs_diff)`.
-fn first_mismatch(a: &[u8], b: &[u8]) -> Option<(usize, f32, f32, f32)> {
-    let f = |s: &[u8]| {
-        s.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect::<Vec<f32>>()
-    };
-    let (x, y) = (f(a), f(b));
-    let scale = x.iter().fold(1.0f32, |m, v| m.max(v.abs()));
-    let mut first = None;
-    let mut worst = 0.0f32;
-    for (i, (p, q)) in x.iter().zip(&y).enumerate() {
-        let d = (p - q).abs();
-        if d > 1e-3 * scale && first.is_none() {
-            first = Some((i, *p, *q));
-        }
-        worst = worst.max(d);
-    }
-    first.map(|(i, p, q)| (i, p, q, worst))
-}
-
-fn agrees(dtype: Dtype, a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    if a == b {
-        return true;
-    }
-    if dtype != Dtype::F32 {
-        return false;
-    }
-    let f = |s: &[u8]| {
-        s.as_chunks::<4>()
-            .0
-            .iter()
-            .map(|c| f32::from_le_bytes(*c))
-            .collect::<Vec<f32>>()
-    };
-    let (x, y) = (f(a), f(b));
-    let scale = x.iter().fold(1.0f32, |m, v| m.max(v.abs()));
-    x.iter().zip(&y).all(|(p, q)| (p - q).abs() <= 1e-3 * scale)
-}
-
 /// One element's little-endian bytes, in the splat's own dtype.
 fn splat_bytes(s: fusor_ir::dtype::Splat) -> Vec<u8> {
     use fusor_ir::dtype::Splat;
@@ -3052,140 +2800,19 @@ impl Gather {
     }
 }
 
-/// Restate a device buffer layout over a reader's shape.
+/// Whether `id`'s bound device buffer holds its value densely.
 ///
-/// The layout is stated against the selected member's own shape — a contract
-/// says `[batch, m_pad, n_pad]` — while the reader may hold a reshaped
-/// spelling of the same value, `[b, h, q, d]`. Same bytes, different
-/// coordinates. Each layout axis is either
-///
-/// - **unpadded** (a run of reader dims multiplies to exactly its extent):
-///   the run splits it row-major, so `[b, h]` over an extent-`b*h` batch axis
-///   takes strides `[s*h, s]`; or
-/// - **padded** (no run can reach the extent): the one next reader dim maps
-///   alone at the axis's stride and reads the unpadded prefix, which is what
-///   `m = 3` inside `m_pad = 16` means.
-///
-/// `None` when the shapes do not factor this way — the caller turns that
-/// into an error rather than a dense read, because reading a padded buffer
-/// densely returns padding as data.
-fn restate_layout(
-    layout: &fusor_ir::shape::Layout,
-    shape: &[Dim],
-    graph: &GraphRef,
-) -> Option<fusor_ir::shape::Layout> {
-    if layout.shape() == shape {
-        return Some(layout.clone());
-    }
-    let l_ext: Vec<u64> = layout
-        .shape()
-        .iter()
-        .map(|d| resolve_dim(*d, graph).ok())
-        .collect::<Option<_>>()?;
-    let l_str: Vec<u64> = layout
-        .strides()
-        .iter()
-        .map(|d| resolve_dim(*d, graph).ok())
-        .collect::<Option<_>>()?;
-    let r_ext: Vec<u64> = shape
-        .iter()
-        .map(|d| resolve_dim(*d, graph).ok())
-        .collect::<Option<_>>()?;
-
-    // Backtracking assignment. An exact run and a padded singleton can both
-    // look viable locally — `[2, 2, 4, 4]` over `[4, 16, 16]` has `4 * 4`
-    // exactly filling the padded 16 — and only the remainder decides which
-    // reading was right, so a greedy walk mis-factors exactly the shapes a
-    // backward pass produces.
-    fn assign(l_ext: &[u64], l_str: &[u64], r_ext: &[u64], strides: &mut Vec<u64>) -> bool {
-        let Some((&ext, l_rest)) = l_ext.split_first() else {
-            // Layout exhausted: only unit reader dims may remain.
-            if r_ext.iter().all(|&e| e == 1) {
-                strides.extend(std::iter::repeat_n(0, r_ext.len()));
-                return true;
-            }
-            return false;
-        };
-        let (&stride, s_rest) = l_str.split_first().expect("shapes and strides zip");
-        if ext == 1 {
-            return assign(l_rest, s_rest, r_ext, strides);
-        }
-        // Exact runs first — every prefix of reader dims whose product is
-        // the extent — longest first so a `[a, b]` split is preferred over
-        // treating the axis as padded when both parse.
-        let mut prod = 1u64;
-        let mut end = 0usize;
-        while prod < ext && end < r_ext.len() {
-            prod = prod.saturating_mul(r_ext[end]);
-            end += 1;
-        }
-        if prod == ext {
-            let mark = strides.len();
-            let mut inner = stride;
-            let mut group = vec![0u64; end];
-            for j in (0..end).rev() {
-                group[j] = inner;
-                inner = inner.saturating_mul(r_ext[j]);
-            }
-            strides.extend_from_slice(&group);
-            if assign(l_rest, s_rest, &r_ext[end..], strides) {
-                return true;
-            }
-            strides.truncate(mark);
-        }
-        // Padded run: one or more reader dims whose product fits inside the
-        // extent, laid out row-major over the value's own extents and reading
-        // the unpadded prefix. Shortest run first; longer runs are only
-        // reached once the singleton reading has failed the remainder.
-        //
-        // A padded axis holds exactly one logical axis, so the run may
-        // contain at most one non-unit reader dim: a second real axis nested
-        // inside the padded one would read the padding between the logical
-        // extent and the block edge as data.
-        let mut prod = 1u64;
-        let mut non_unit = 0usize;
-        for take in 1..=r_ext.len() {
-            prod = prod.saturating_mul(r_ext[take - 1]);
-            if prod > ext {
-                break;
-            }
-            if r_ext[take - 1] != 1 {
-                non_unit += 1;
-                if non_unit > 1 {
-                    break;
-                }
-            }
-            let mark = strides.len();
-            let mut inner = stride;
-            let mut group = vec![0u64; take];
-            for j in (0..take).rev() {
-                group[j] = inner;
-                inner = inner.saturating_mul(r_ext[j]);
-            }
-            strides.extend_from_slice(&group);
-            if assign(l_rest, s_rest, &r_ext[take..], strides) {
-                return true;
-            }
-            strides.truncate(mark);
-        }
-        false
-    }
-
-    let mut strides: Vec<u64> = Vec::with_capacity(r_ext.len());
-    if !assign(&l_ext, &l_str, &r_ext, &mut strides) {
-        return None;
-    }
-    // The padded parse is ambiguous in principle (only the producer knows its
-    // logical extents), so this records which parse won.
-    if std::env::var_os("FUSOR_RESTATE_LOG").is_some() {
-        eprintln!("[restate] layout={l_ext:?}/{l_str:?} reader={r_ext:?} -> strides={strides:?}");
-    }
-    fusor_ir::shape::Layout::from_parts(
-        layout.offset(),
-        shape,
-        &strides.iter().map(|&s| Dim::Const(s)).collect::<Vec<_>>(),
-    )
-    .ok()
+/// A `Coop` output is padded to whole blocks, and the padding lives in the
+/// layout the buffer was bound with. An external leaf carries no
+/// `BufferPlan`, so `repad_index` has nothing to correct a read of it with
+/// and would take the padding for data; such a value is recomputed rather
+/// than cut at.
+fn dense_bound(graph: &GraphRef, id: Id) -> bool {
+    let Some(layout) = graph.device_layout(id) else {
+        return true;
+    };
+    layout.offset().known_eq(Dim::Const(0))
+        && layout.strides() == &fusor_ir::shape::Layout::row_major_strides(layout.shape())[..]
 }
 
 fn resolve_dim(d: Dim, graph: &GraphRef) -> Result<u64> {
@@ -3194,55 +2821,12 @@ fn resolve_dim(d: Dim, graph: &GraphRef) -> Result<u64> {
         .ok_or_else(|| Error::Plan(format!("dim {d} is unbound at dispatch")))
 }
 
-/// The `row_major_strides` placeholder (`SymId(u32::MAX)`): a stride past a
-/// symbolic axis, derived at dispatch as the product of the following
-/// extents. Mirrors `UniformPack::resolve_stride`.
-const DERIVED_STRIDE: fusor_ir::shape::SymId = fusor_ir::shape::SymId(u32::MAX);
-
-/// Concrete strides of a layout at the current binding, deriving any
-/// placeholder from the (now concrete) shape.
 fn resolve_strides(layout: &fusor_ir::shape::Layout, graph: &GraphRef) -> Result<Vec<u64>> {
-    let shape = layout.shape();
     layout
         .strides()
         .iter()
-        .enumerate()
-        .map(|(axis, d)| match d {
-            Dim::Sym(s) if *s == DERIVED_STRIDE => {
-                let mut acc = 1u64;
-                for e in &shape[axis + 1..] {
-                    acc = acc.saturating_mul(resolve_dim(*e, graph)?);
-                }
-                Ok(acc)
-            }
-            other => resolve_dim(*other, graph),
-        })
+        .map(|d| resolve_dim(*d, graph))
         .collect()
-}
-
-/// A buffer's element count at the current binding. `BufferPlan::elements`
-/// is the placeholder whenever any extent is symbolic; the layout's shape is
-/// the authority then.
-fn resolve_buffer_elements(
-    elements: Dim,
-    layout: &fusor_ir::shape::Layout,
-    graph: &GraphRef,
-) -> Result<u64> {
-    match elements {
-        Dim::Sym(s) if s == DERIVED_STRIDE => {
-            // Padding lives in the strides: for the plan's row-major layouts
-            // the buffer extent is `shape[0] * strides[0]`, never the shape
-            // product, which undercounts a padded buffer.
-            let Some(first) = layout.shape().first() else {
-                return Ok(1);
-            };
-            let strides = resolve_strides(layout, graph)?;
-            Ok(resolve_dim(*first, graph)?
-                .saturating_mul(strides[0])
-                .max(1))
-        }
-        d => resolve_dim(d, graph),
-    }
 }
 
 fn resolve_elements(shape: &[Dim], graph: &GraphRef) -> Result<u64> {
@@ -3253,166 +2837,18 @@ fn resolve_elements(shape: &[Dim], graph: &GraphRef) -> Result<u64> {
     Ok(acc.max(1))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::graph::Graph;
-
-    /// The same expression rebuilt over a fresh input leaf must run the
-    /// recorded plan again rather than extract another: the graph grew, so
-    /// the replay key cannot hit, and the structural memo is what remains.
-    fn a_fresh_step_leaf_reuses_the_plan(session: Session) {
-        let graph = Graph::new(&session);
-        let run = |values: &[f32]| {
-            let x =
-                Tensor::from_elements(graph.handle(), &[Dim::Const(values.len() as u64)], values)
-                    .unwrap();
-            let y = x.add_scalar(1.0).unwrap();
-            let bytes = graph.handle().read_back(y.id).unwrap();
-            bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
-        };
-
-        assert_eq!(run(&[1.0, 2.0, 3.0]), vec![2.0, 3.0, 4.0]);
-        assert_eq!(session.inner.families.lock().len(), 1);
-
-        assert_eq!(run(&[10.0, 11.0, 12.0]), vec![11.0, 12.0, 13.0]);
-        assert_eq!(
-            session.inner.families.lock().len(),
-            1,
-            "a replay hit must not extract and record another plan"
-        );
+/// The backend a test runs on: the GPU under
+/// `FUSOR_CONFORMANCE_REQUIRE_GPU`, the CPU otherwise.
+#[cfg(all(test, feature = "cpu"))]
+pub(crate) fn test_backend() -> Backend {
+    if std::env::var_os("FUSOR_CONFORMANCE_REQUIRE_GPU").is_some() {
+        #[cfg(feature = "gpu")]
+        return Backend::gpu_blocking().expect("GPU backend required");
+        #[cfg(not(feature = "gpu"))]
+        panic!("GPU feature required");
     }
-
-    /// A model step rebuilt with a longer cache every call (a `cat` onto a
-    /// re-leafed cache, a view at a moving offset, a contraction over the
-    /// cache length): from the second call on the session plans a symbolic
-    /// twin, and every call's values must equal the host's.
-    #[test]
-    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-    fn a_shape_family_twin_computes_what_its_members_do() {
-        let Ok(backend) = Backend::gpu_blocking() else {
-            return;
-        };
-        let session = Session::new(backend).unwrap();
-        let graph = Graph::new(&session);
-        let h = graph.handle();
-        const D: usize = 8;
-        let w_host: Vec<f32> = (0..D * D)
-            .map(|i| ((i * 7) % 11) as f32 * 0.1 - 0.4)
-            .collect();
-        let w = Tensor::from_elements(h, &[Dim::Const(D as u64), Dim::Const(D as u64)], &w_host)
-            .unwrap();
-        let mut cache_host: Vec<f32> = Vec::new();
-        for step in 0..(CONCRETE_SHAPES + 4) {
-            let new_row: Vec<f32> = (0..D).map(|j| (step * D + j) as f32 * 0.05 - 0.3).collect();
-            // The step: cache' = cat(cache, row); q = row @ w; scores =
-            // q @ cache'^T (contraction over D, N = len); s = softmax(scores);
-            // out = s @ cache' (contraction over len); tail = cache' narrowed
-            // at the moving offset `step`.
-            let row =
-                Tensor::from_elements(h, &[Dim::Const(1), Dim::Const(D as u64)], &new_row).unwrap();
-            let cache = if cache_host.is_empty() {
-                row.clone()
-            } else {
-                let prev = Tensor::from_elements(
-                    h,
-                    &[
-                        Dim::Const((cache_host.len() / D) as u64),
-                        Dim::Const(D as u64),
-                    ],
-                    &cache_host,
-                )
-                .unwrap();
-                Tensor::cat(&[prev, row.clone()], 0).unwrap()
-            };
-            cache_host.extend_from_slice(&new_row);
-            let len = cache_host.len() / D;
-            let q = row.matmul(&w).unwrap();
-            let scores = q.matmul(&cache.t().unwrap()).unwrap();
-            let s = scores.softmax(1).unwrap();
-            let out = s.matmul(&cache).unwrap();
-            let tail = cache.narrow(0, step, 1).unwrap();
-            let got_out: Vec<f32> = bytemuck::cast_slice(&h.read_back(out.id).unwrap()).to_vec();
-            let got_tail: Vec<f32> = bytemuck::cast_slice(&h.read_back(tail.id).unwrap()).to_vec();
-            let got_cache: Vec<f32> =
-                bytemuck::cast_slice(&h.read_back(cache.id).unwrap()).to_vec();
-
-            // Host reference.
-            let q_h: Vec<f32> = (0..D)
-                .map(|j| (0..D).map(|k| new_row[k] * w_host[k * D + j]).sum())
-                .collect();
-            let sc: Vec<f32> = (0..len)
-                .map(|r| (0..D).map(|k| q_h[k] * cache_host[r * D + k]).sum())
-                .collect();
-            let m = sc.iter().cloned().fold(f32::MIN, f32::max);
-            let e: Vec<f32> = sc.iter().map(|v| (v - m).exp()).collect();
-            let z: f32 = e.iter().sum();
-            let out_h: Vec<f32> = (0..D)
-                .map(|j| (0..len).map(|r| e[r] / z * cache_host[r * D + j]).sum())
-                .collect();
-            let close = |a: &[f32], b: &[f32]| {
-                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-4)
-            };
-            assert!(
-                close(&got_cache, &cache_host),
-                "step {step}: cache {got_cache:?}"
-            );
-            assert!(
-                close(&got_tail, &cache_host[step * D..(step + 1) * D]),
-                "step {step}: tail {got_tail:?}"
-            );
-            assert!(
-                close(&got_out, &out_h),
-                "step {step}: out {got_out:?} vs {out_h:?}"
-            );
-        }
-        assert!(
-            session
-                .inner
-                .families
-                .lock()
-                .values()
-                .any(|f| f.symbolic.is_some()),
-            "the step's shape family never went symbolic"
-        );
-    }
-
-    /// The smallest moving-offset view: a fresh `[len, D]` leaf narrowed at
-    /// row `step`. The twin's view offset is a derived symbol.
-    #[test]
-    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-    fn a_shape_family_twin_reads_a_view_at_a_symbolic_offset() {
-        let Ok(backend) = Backend::gpu_blocking() else {
-            return;
-        };
-        let session = Session::new(backend).unwrap();
-        let graph = Graph::new(&session);
-        let h = graph.handle();
-        const D: usize = 4;
-        for step in 0..(CONCRETE_SHAPES + 4) {
-            let len = step + 2;
-            let host: Vec<f32> = (0..len * D).map(|i| i as f32).collect();
-            let x =
-                Tensor::from_elements(h, &[Dim::Const(len as u64), Dim::Const(D as u64)], &host)
-                    .unwrap();
-            let tail = x.narrow(0, step, 1).unwrap().add_scalar(0.0).unwrap();
-            let got: Vec<f32> = bytemuck::cast_slice(&h.read_back(tail.id).unwrap()).to_vec();
-            assert_eq!(got, host[step * D..(step + 1) * D], "step {step}");
-        }
-    }
-
-    #[test]
-    #[cfg(feature = "cpu")]
-    fn a_fresh_step_leaf_reuses_the_cpu_plan_and_executable() {
-        a_fresh_step_leaf_reuses_the_plan(Session::new(Backend::cpu().unwrap()).unwrap());
-    }
-
-    #[test]
-    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-    fn a_fresh_step_leaf_reuses_the_gpu_plan() {
-        let Ok(backend) = Backend::gpu_blocking() else {
-            return;
-        };
-        a_fresh_step_leaf_reuses_the_plan(Session::new(backend).unwrap());
-    }
+    Backend::cpu().unwrap()
 }
+
+#[cfg(test)]
+mod tests;

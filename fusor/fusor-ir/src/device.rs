@@ -16,8 +16,7 @@ pub struct CoopKind {
     pub k: u32,
 }
 
-/// Subgroup width range. `min == max` is the *fixed* case every
-/// subgroup-size-aware kernel requires.
+/// Subgroup width range; subgroup-size-aware kernels need `min == max`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct SubgroupWidths {
     pub min: u32,
@@ -34,11 +33,8 @@ impl SubgroupWidths {
     }
 }
 
-/// The wgpu limits the compiler actually reads, mirrored so `fusor-ir` has
-/// no wgpu dependency. Defaults are the **WebGPU baseline**, not
-/// `adapter.limits()`: a plan legal on one device is then legal on another,
-/// and the cost model's filters mean the same thing everywhere. A backend
-/// widens a field only when a selected kernel proves it needs the headroom.
+/// The wgpu limits the compiler reads. Defaults are the WebGPU baseline, so a
+/// plan legal on one device is legal on another.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Limits {
     pub max_compute_invocations_per_workgroup: u32,
@@ -64,8 +60,7 @@ impl Default for Limits {
     }
 }
 
-/// Broad device class. Used only to seed calibration and pick a fallback
-/// rate table; never to route a kernel.
+/// Broad device class.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DeviceKind {
     Gpu,
@@ -73,10 +68,7 @@ pub enum DeviceKind {
 }
 
 /// Everything a legality predicate may read about a device. Every
-/// performance feature is probed and optional, each with a working fallback
-/// (shared-memory reduction trees for subgroups, f32 for f16,
-/// sgemm/sgemv/generic fold for cooperative matrix, cold compile, no
-/// profiling).
+/// performance feature is optional, with a working fallback.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Caps {
     pub kind: DeviceKind,
@@ -91,9 +83,8 @@ pub struct Caps {
     pub atomic_f32: bool,
     /// Byte-arena workgroup packing (the `fork-metal` feature).
     pub workgroup_alias: bool,
-    /// Cooperative store of an f32 accumulator into f16 memory (also
-    /// `fork-metal`). Without it such a kernel pays a staging tile plus a
-    /// per-lane cast — footprint, never correctness.
+    /// Cooperative store of an f32 accumulator into f16 memory (`fork-metal`);
+    /// without it the kernel stages and casts per lane.
     pub mixed_precision_coop_store: bool,
     pub pipeline_cache: bool,
     pub timestamp_query: bool,
@@ -118,8 +109,8 @@ impl Caps {
             .find(|c| c.operand == operand && c.acc == acc)
     }
 
-    /// 32 when subgroups are unsupported — the narrowest width on hardware
-    /// fusor targets, so a wrong guess only keeps more parallelism.
+    /// 32 when subgroups are unsupported: a wrong guess only keeps more
+    /// parallelism.
     pub fn subgroup_width(&self) -> u32 {
         self.subgroups.map_or(32, |s| s.assumed())
     }

@@ -24,7 +24,7 @@ pub(crate) mod typed;
 use fusor_ir::dtype::{Dtype, Splat};
 use fusor_ir::egraph::Id;
 use fusor_ir::facts::ValueFacts;
-use fusor_ir::ir::logical::{LeafKind, Logical};
+use fusor_ir::ir::logical::Logical;
 use fusor_ir::scalar::ScalarExpr;
 use fusor_ir::shape::{Dim, Dims, SymId};
 use smallvec::SmallVec;
@@ -33,9 +33,9 @@ use crate::graph::GraphRef;
 use crate::session::Backend;
 use crate::{Error, Result};
 
-pub use crate::ops::index::{IndexOp, TensorIndex, cat, stack};
+pub use crate::ops::index::{IndexOp, TensorIndex};
 pub use crate::ops::view::Extent;
-pub use construction::{FromArray, arange, arange_step};
+pub use construction::FromArray;
 /// The rounding an explicit `round_mode` selects.
 pub use fusor_ir::dtype::RoundMode;
 pub use readback::{TensorSlice, ToVec};
@@ -230,9 +230,22 @@ impl Tensor {
         let buf = from.graph.device_buf(from.id).ok_or_else(|| {
             Error::Plan("adopt_buffer needs a resolved source; resolve it first".into())
         })?;
-        let layout = from.graph.device_layout(from.id).map(std::sync::Arc::new);
+        // An external leaf carries no `BufferPlan`, so nothing downstream can
+        // correct a read of it for the padding a `Coop` output holds its value
+        // under. Refuse rather than hand the next resolve a buffer it will
+        // read as if the padding were data.
+        let layout = from.graph.device_layout(from.id);
+        if let Some(l) = &layout
+            && (!l.offset().known_eq(fusor_ir::shape::Dim::Const(0))
+                || l.strides() != &fusor_ir::shape::Layout::row_major_strides(l.shape())[..])
+        {
+            return Err(Error::Plan(format!(
+                "adopt_buffer needs a densely laid out source; {} is padded to {l:?}",
+                from.id
+            )));
+        }
         self.graph
-            .set_device_buf_class(&[self.id], &buf, layout.as_ref());
+            .set_device_buf_class(&[self.id], &buf, layout.map(std::sync::Arc::new).as_ref());
         Ok(())
     }
 
@@ -246,16 +259,7 @@ impl Tensor {
     /// Whether this value is an external leaf (`Buffer`/`Param`/`Quantized`).
     pub fn is_external_leaf(&self) -> bool {
         self.graph
-            .with_egraph(|g| {
-                Ok(matches!(
-                    &g.node(self.id).op,
-                    fusor_ir::ir::Op::Logical(Logical::Leaf(
-                        LeafKind::Buffer { .. }
-                            | LeafKind::Param { .. }
-                            | LeafKind::Quantized { .. }
-                    ))
-                ))
-            })
+            .with_egraph(|g| Ok(crate::graph::is_external_leaf(&g.node(self.id).op)))
             .unwrap_or(false)
     }
 
@@ -386,43 +390,27 @@ impl Scalar {
     }
 }
 
-impl From<f32> for Scalar {
-    fn from(v: f32) -> Self {
-        Self::Lit(Splat::F32(v))
-    }
+/// Scalar conversions. No `From<f64>`: with exactly one float impl an
+/// unsuffixed literal unifies to `f32`, so `t.mul_scalar(2.0)` compiles; a
+/// second makes every such call ambiguous.
+macro_rules! scalar_from {
+    ($($ty:ty => |$v:ident| $e:expr;)*) => {$(
+        impl From<$ty> for Scalar {
+            fn from($v: $ty) -> Self {
+                $e
+            }
+        }
+    )*};
 }
-// NOTE: no `From<f64>`. With exactly one float impl, an unsuffixed literal
-// unifies to `f32`, so `t.mul_scalar(2.0)` compiles; adding `From<f64>` makes
-// every such call ambiguous.
-impl From<half::f16> for Scalar {
-    fn from(v: half::f16) -> Self {
-        Self::Lit(Splat::F16(v.to_bits()))
-    }
-}
-impl From<half::bf16> for Scalar {
-    fn from(v: half::bf16) -> Self {
-        Self::Lit(Splat::BF16(v.to_bits()))
-    }
-}
-impl From<u32> for Scalar {
-    fn from(v: u32) -> Self {
-        Self::Lit(Splat::U32(v))
-    }
-}
-impl From<i32> for Scalar {
-    fn from(v: i32) -> Self {
-        Self::Lit(Splat::I32(v))
-    }
-}
-impl From<Splat> for Scalar {
-    fn from(v: Splat) -> Self {
-        Self::Lit(v)
-    }
-}
-impl From<SymId> for Scalar {
-    fn from(v: SymId) -> Self {
-        Self::Uniform(v)
-    }
+
+scalar_from! {
+    f32 => |v| Self::Lit(Splat::F32(v));
+    half::f16 => |v| Self::Lit(Splat::F16(v.to_bits()));
+    half::bf16 => |v| Self::Lit(Splat::BF16(v.to_bits()));
+    u32 => |v| Self::Lit(Splat::U32(v));
+    i32 => |v| Self::Lit(Splat::I32(v));
+    Splat => |v| Self::Lit(v);
+    SymId => |v| Self::Uniform(v);
 }
 
 /// A `Splat`'s value as `f64`. Exact for every dtype fusor has.

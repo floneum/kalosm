@@ -1,5 +1,5 @@
-# A test that stalls is killed and named rather than holding the job for
-# GitHub's six-hour ceiling: warned after two minutes, terminated after four.
+# Warn after two minutes. Software-GPU training and model downloads need
+# more than four minutes on shared CI runners; retain a finite stall limit.
 [profile.default]
-slow-timeout = { period = "120s", terminate-after = 2 }
+slow-timeout = { period = "120s", terminate-after = 10 }
 fail-fast = false

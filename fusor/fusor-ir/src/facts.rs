@@ -10,8 +10,7 @@ pub struct ValueFacts {
     pub shape: Dims,
     pub numeric: NumericContract,
     pub persistence: Persistence,
-    /// Result count for tuple-producing ops. `1` for ordinary values; a
-    /// value with `outs > 1` is only ever read through `Logical::Project`.
+    /// Result count; `outs > 1` is only read through `Logical::Project`.
     pub outs: u8,
 }
 
@@ -26,14 +25,42 @@ impl ValueFacts {
         }
     }
 
+    /// A step-lived single value whose contract is the meet over `ins`.
+    pub fn step(dtype: Dtype, shape: Dims, ins: &[ValueFacts]) -> Self {
+        Self {
+            dtype,
+            shape,
+            numeric: Self::meet(ins),
+            persistence: Persistence::Step,
+            outs: 1,
+        }
+    }
+
+    /// The meet of every operand's contract; `RELAXED` over none.
+    pub fn meet(ins: &[ValueFacts]) -> NumericContract {
+        ins.iter()
+            .map(|f| f.numeric)
+            .reduce(NumericContract::meet)
+            .unwrap_or(NumericContract::RELAXED)
+    }
+
+    /// This value re-viewed at `shape`: same dtype, contract and lifetime.
+    pub fn view(&self, shape: Dims) -> Self {
+        Self {
+            dtype: self.dtype,
+            shape,
+            numeric: self.numeric,
+            persistence: self.persistence,
+            outs: 1,
+        }
+    }
+
     pub fn rank(&self) -> usize {
         self.shape.len()
     }
 
     pub fn elements(&self) -> Option<u64> {
-        self.shape
-            .iter()
-            .try_fold(1u64, |acc, d| acc.checked_mul(d.as_const()?))
+        crate::shape::const_elements(&self.shape)
     }
 
     pub fn bytes(&self) -> Option<u64> {
@@ -41,10 +68,8 @@ impl ValueFacts {
     }
 }
 
-/// The work one op performs, in units the cost model can price.
-/// **`verify_l0` rejects a registration whose `work` is a constant**: the
-/// reference's `Attention { work: 1 }` placeholder cannot recur, and
-/// `index_ops` is exactly the term view-fold-vs-gather needs.
+/// The work one op performs, in units the cost model can price;
+/// `verify_l0` rejects a `work` that is constant in shape.
 #[derive(Copy, Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct Work {
     pub macs: u64,

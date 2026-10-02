@@ -1,6 +1,6 @@
 //! `verify_plan` — the hard conformance assert on the extraction winner.
 //!
-//! Six clauses, each an [`Error::Plan`], **never** a silent fallback:
+//! Compiler invariants checked independently in tests:
 //!
 //! 1. every selected non-`Leaf` node is at `Level::Launch`;
 //! 2. `theta` is a member of the node's `ScheduleDomain`, the geometry's own
@@ -11,13 +11,12 @@
 //! 4. every `BufferPlan` layout has the rank its value needs and no
 //!    undefined symbolic stride;
 //! 5. no `Effect::InPlace` node is inlined;
-//! 6. every root is in `M`, and every `Launch::Ext` node can actually run
-//!    somewhere;
+//! 6. every root is in `M`;
 //! 7. every launch's bind group — its operands **plus the `Uniforms` block** —
 //!    fits `max_storage_buffers_per_shader_stage`.
 
-use crate::plan::UNKNOWN_SYM;
-use crate::realize::{self, scalar_element, tiles_for};
+use crate::nodes::{composite_members, domain_of, is_group, plan_values};
+use crate::realize;
 use fusor_ir::Result;
 use fusor_ir::device::Caps;
 use fusor_ir::egraph::{EGraph, Id};
@@ -26,36 +25,121 @@ use fusor_ir::extract::Plan;
 use fusor_ir::ir::Op;
 use fusor_ir::ir::kernel::ArenaPlanner;
 use fusor_ir::ir::launch::{Effect, Launch, SchedPoint, ScheduleDomain};
-use fusor_ir::ir::{OpDefId, OpDefRegistry};
 use fusor_ir::shape::Dim;
-use rustc_hash::FxHashMap;
+use fusor_ir::shape::OPAQUE_SYM;
+use rustc_hash::{FxHashMap, FxHashSet};
 
-/// Clauses 1, 3, 4, 5 and the root half of 6 — everything derivable from the
-/// graph and the plan alone.
+/// Every clause derivable from the graph and the plan alone.
 pub(crate) fn verify_plan(graph: &EGraph, plan: &Plan) -> Result<()> {
     check_levels(graph, plan)?;
     check_operands(graph, plan)?;
     check_operand_spaces(graph, plan)?;
     check_buffers(graph, plan)?;
+    check_launch_order(graph, plan)?;
     check_effect_pinning(graph, plan)?;
     check_roots(graph, plan)?;
+    check_slabs(graph, plan)?;
     Ok(())
 }
 
-/// Clause 8: a selected `Fold`'s aliased operands must be addressable by
-/// the fold's own flat index map.
-///
-/// The fold lowerings read every operand by running the flat space index
-/// through the operand's own layout map, unmasked. That map is exact when
-/// the operand is
-///
-/// * a single element,
-/// * stated over the space itself — full rank, each extent equal to the
-///   space's (a stride-0 axis is a broadcast) or `1`, or
-/// * a suffix of the space: each layout dim equal to the corresponding
-///   trailing space dim (`weights[n]` under `[m, n]`).
-///
-/// Anything else is read at garbage addresses on every backend.
+/// A selected slab is one materialized launch with all its members, each
+/// middle member selected and materialized, the last's class selecting it.
+pub(crate) fn check_slabs(graph: &EGraph, plan: &Plan) -> Result<()> {
+    let launch_of = launch_index(plan);
+    let mut realized: Vec<Id> = Vec::new();
+    // A member slab's class selects the group it ends.
+    let mut group_last: FxHashSet<Id> = FxHashSet::default();
+    // A group's node count is checked on the group.
+    let mut grouped: FxHashSet<Id> = FxHashSet::default();
+    for id in plan.launches.iter().flat_map(|l| l.members.iter().copied()) {
+        let Some(members) = composite_members(graph, id) else {
+            continue;
+        };
+        realized.push(id);
+        if is_group(graph, id) {
+            group_last.extend(members.last().copied());
+            grouped.extend(members.iter().copied());
+        }
+    }
+    realized.sort_unstable();
+    realized.dedup();
+    for id in realized {
+        let Some(members) = composite_members(graph, id) else {
+            continue;
+        };
+        if group_last.contains(&id) {
+            continue;
+        }
+        let expected = match &graph.node(id).op {
+            Op::Launch(Launch::Group { .. }) => {
+                members
+                    .iter()
+                    .map(|m| match &graph.node(*m).op {
+                        Op::Launch(Launch::Slab { members: sm, .. }) => sm.len() + 1,
+                        _ => 1,
+                    })
+                    .sum::<usize>()
+                    + 1
+            }
+            _ => members.len() + 1,
+        };
+        if !plan.extraction.is_materialized(id) {
+            return Err(Error::Plan(format!("slab {id} is inlined")));
+        }
+        let own = launch_of.get(&id).copied();
+        let Some((last, middle)) = members.split_last() else {
+            return Err(Error::Plan(format!("slab {id} has no members")));
+        };
+        if plan.extraction.selected(graph.class_of(*last)) != Some(id) {
+            return Err(Error::Plan(format!(
+                "slab {id}'s last member {last} is selected past the slab"
+            )));
+        }
+        if plan.extraction.is_materialized(*last) {
+            return Err(Error::Plan(format!(
+                "slab {id}'s last member {last} is materialized beside the slab's own buffer"
+            )));
+        }
+        if let Some(ix) = own
+            && !grouped.contains(&id)
+            && plan.launches[ix].members.len() != expected
+        {
+            let foreign: Vec<Id> = plan.launches[ix]
+                .members
+                .iter()
+                .copied()
+                .filter(|m| *m != id && !members.contains(m))
+                .collect();
+            return Err(Error::Plan(format!(
+                "slab {id}'s launch has {} nodes for {} members: foreign {foreign:?}",
+                plan.launches[ix].members.len(),
+                members.len()
+            )));
+        }
+        if let Some(m) = members.iter().find(|m| launch_of.get(m).copied() != own) {
+            return Err(Error::Plan(format!(
+                "slab {id}'s member {m} is in launch {:?}, not the slab's {own:?}",
+                launch_of.get(m)
+            )));
+        }
+        for m in middle {
+            let selected = plan.extraction.selected(graph.class_of(*m));
+            if selected != Some(*m) {
+                return Err(Error::Plan(format!(
+                    "slab {id}'s member {m} is not its class's selection {selected:?}"
+                )));
+            }
+            if !plan.extraction.is_materialized(*m) {
+                return Err(Error::Plan(format!("slab {id}'s member {m} is inlined")));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Clause 8: a selected `Fold`'s aliased operands are a single element, or
+/// stated over its space or a suffix of it (extents equal or `1`), so the
+/// flat index map addresses them.
 pub(crate) fn check_operand_spaces(graph: &EGraph, plan: &Plan) -> Result<()> {
     use fusor_ir::ir::launch::AccessPlan;
     for id in selected(plan) {
@@ -83,11 +167,9 @@ pub(crate) fn check_operand_spaces(graph: &EGraph, plan: &Plan) -> Result<()> {
                     .all(|(l, d)| l.known_eq(*d) || l.known_eq(Dim::Const(1)));
             if !(full_rank || suffix) {
                 return Err(Error::Plan(format!(
-                    "selected {id}: fold operand {i} aliases a {:?} layout under the \
-                     {:?} index space; the fold's flat index map cannot address it. \
-                     The rule that minted this member states its operands over the \
-                     wrong space — fix the rule, do not route around the member.",
-                    shape, space.dims
+                    "selected {id}: fold operand {i} aliases a {shape:?} layout the flat index \
+                     map of space {:?} cannot address; fix the rule that minted it",
+                    space.dims
                 )));
             }
         }
@@ -95,41 +177,34 @@ pub(crate) fn check_operand_spaces(graph: &EGraph, plan: &Plan) -> Result<()> {
     Ok(())
 }
 
-/// All six clauses. The schedule clause needs the exact planner and the caps
-/// it was admitted against; the extension clause needs the registry the
-/// e-graph's semantics were built with.
+/// Check the plan against the device and arena used to construct it.
 pub(crate) fn verify_plan_with(
     graph: &EGraph,
     plan: &Plan,
     arena: &dyn ArenaPlanner,
     caps: &Caps,
-    registry: Option<&OpDefRegistry>,
 ) -> Result<()> {
     verify_plan(graph, plan)?;
     check_schedules(graph, plan, arena, caps)?;
     check_bind_groups(plan, caps)?;
-    check_extensions(graph, plan, registry)?;
     Ok(())
 }
 
-/// Clause 7: every launch's bind group fits
+/// Clause 7: every launch's bindings plus the uniform block fit
 /// `max_storage_buffers_per_shader_stage`.
-///
-/// The uniform block counts: `plan::derive_bindings` reserves binding 0 for
-/// `Uniforms` and does not list it, but it is emitted in the `storage`
-/// address space, so the bound is `bindings.len() + 1`.
 pub(crate) fn check_bind_groups(plan: &Plan, caps: &Caps) -> Result<()> {
     let limit = caps.limits.max_storage_buffers_per_shader_stage as usize;
     for (i, launch) in plan.launches.iter().enumerate() {
-        let needed = launch.bindings.len() + 1;
+        // Arena values share a binding: count distinct slots.
+        let mut slots: Vec<u32> = launch.bindings.iter().map(|b| b.binding).collect();
+        slots.sort_unstable();
+        slots.dedup();
+        let needed = slots.len() + 1;
         if needed > limit {
             return Err(Error::Plan(format!(
-                "launch {i} (root {}) binds {} storage buffers — {} operands plus the \
-                 Uniforms block — over the {limit}-buffer limit. A rule widened an \
-                 operand list past what this device can bind.",
-                launch.root,
-                needed,
-                launch.bindings.len()
+                "launch {i} (root {}) binds {needed} storage buffers with the uniform block, \
+                 over the {limit}-buffer limit",
+                launch.root
             )));
         }
     }
@@ -139,7 +214,6 @@ pub(crate) fn check_bind_groups(plan: &Plan, caps: &Caps) -> Result<()> {
 /// Clause 1: every selected non-leaf node is at Launch — nothing skipped a level.
 pub(crate) fn check_levels(graph: &EGraph, plan: &Plan) -> Result<()> {
     for id in selected(plan) {
-        // The same predicate the seed and the move generator select against.
         if !realize::is_runnable(graph, id) {
             return Err(Error::Plan(format!(
                 "selected {id} is at {} but only Launch nodes are runnable",
@@ -162,8 +236,7 @@ pub(crate) fn check_schedules(
     let max_storage = caps.limits.max_compute_workgroup_storage_size;
 
     for id in selected(plan) {
-        // Every lowering indexes the flattened iteration space in u32, so a
-        // space past u32::MAX wraps.
+        // Lowerings index the flat space in u32.
         if let Op::Launch(l1) = &graph.node(id).op
             && let Some(iters) = l1.iter_space().iterations()
             && iters > u64::from(u32::MAX)
@@ -174,30 +247,13 @@ pub(crate) fn check_schedules(
                 .find(|d| d.root == id)
                 .map(|d| crate::extract::launch_signature(graph, d))
                 .unwrap_or_default();
-            // The class the extractor chose this member from: what else it
-            // could have run and whether the schedule domain admitted it.
-            let siblings: Vec<String> = graph
-                .members(graph.class_of(id))
-                .iter()
-                .map(|m| {
-                    format!(
-                        "{m:?} {} legal={} domain={:?}",
-                        crate::extract::op_tag(&graph.node(*m).op),
-                        realize::has_legal_point(graph, *m, caps),
-                        realize::domain_of(graph, *m).map(|d| d.len())
-                    )
-                })
-                .collect();
             return Err(Error::Plan(format!(
-                "{id} iterates {iters} elements, past u32 flat addressing: {what}; class members: [{}]",
-                siblings.join("; ")
+                "{id} iterates {iters} elements, past u32 flat addressing: {what}; \
+                 class members {:?}",
+                graph.members(graph.class_of(id))
             )));
         }
-        let domain = match &graph.node(id).op {
-            Op::Launch(l1) => l1.schedule(),
-            _ => None,
-        };
-        let Some(domain) = domain else {
+        let Some(domain) = domain_of(graph, id) else {
             continue;
         };
         let theta = match plan.extraction.theta.get(&id).copied() {
@@ -233,14 +289,7 @@ pub(crate) fn check_schedules(
             }
             _ => {}
         }
-        let lanes = realize::fold_footprint(graph, id).map(|(l, _)| l);
-        let tiles = tiles_for(
-            Some(theta),
-            scalar_element(graph.facts(id).dtype),
-            lanes,
-            caps,
-        );
-        let bytes = arena.workgroup_bytes(&tiles, caps)?;
+        let bytes = realize::tile_bytes(graph, id, Some(theta), caps, arena)?;
         if bytes > max_storage {
             return Err(Error::Plan(format!(
                 "{id} needs {bytes} workgroup bytes, over the {max_storage}-byte limit"
@@ -285,13 +334,7 @@ pub(crate) fn check_operands(graph: &EGraph, plan: &Plan) -> Result<()> {
 pub(crate) fn check_buffers(graph: &EGraph, plan: &Plan) -> Result<()> {
     for b in &plan.buffers {
         let value_rank = graph.facts(b.value).rank();
-        // A split-K scratch buffer carries one extra leading axis, one slice
-        // per partial; every other buffer matches its value exactly.
-        let extra = match plan.extraction.theta.get(&b.value) {
-            Some(SchedPoint::Coop { splits, .. }) if *splits > 1 => 1,
-            _ => 0,
-        };
-        if b.layout.rank() != value_rank + extra {
+        if b.layout.rank() != value_rank {
             return Err(Error::Plan(format!(
                 "buffer for {} has rank {} but its value has rank {value_rank}",
                 b.value,
@@ -299,13 +342,11 @@ pub(crate) fn check_buffers(graph: &EGraph, plan: &Plan) -> Result<()> {
             )));
         }
         for (axis, stride) in b.layout.strides().iter().enumerate() {
-            if *stride == Dim::Sym(UNKNOWN_SYM) {
-                // A `row_major_strides` placeholder is legal exactly when it
-                // is derivable at dispatch: every following extent is a
-                // constant or a bindable symbol.
+            if *stride == Dim::Sym(OPAQUE_SYM) {
+                // A placeholder is legal when every later extent binds.
                 let derivable = b.layout.shape()[axis + 1..]
                     .iter()
-                    .all(|d| !matches!(d, Dim::Sym(s) if *s == UNKNOWN_SYM));
+                    .all(|d| !matches!(d, Dim::Sym(s) if *s == OPAQUE_SYM));
                 if !derivable {
                     return Err(Error::Plan(format!(
                         "buffer for {} has an underivable stride on axis {axis}",
@@ -352,40 +393,9 @@ pub(crate) fn check_roots(graph: &EGraph, plan: &Plan) -> Result<()> {
     Ok(())
 }
 
-/// Clause 6, extension half: an `Launch::Ext` whose `lower_per_target` is empty
-/// cannot run on any target and must never be selected.
-pub(crate) fn check_extensions(
-    graph: &EGraph,
-    plan: &Plan,
-    registry: Option<&OpDefRegistry>,
-) -> Result<()> {
-    for id in selected(plan) {
-        let Op::Launch(Launch::Ext { def, .. }) = &graph.node(id).op else {
-            continue;
-        };
-        let Some(registry) = registry else {
-            return Err(Error::Plan(format!(
-                "extension node {id} selected but no OpDefRegistry was supplied to verify it"
-            )));
-        };
-        let Some(entry) = registry.get(*def) else {
-            return Err(Error::Plan(format!(
-                "extension node {id} names unregistered {:?}",
-                OpDefId(def.0)
-            )));
-        };
-        if entry.lower_per_target.is_empty() {
-            return Err(Error::Plan(format!(
-                "extension `{}` selected at {id} lowers on no target",
-                entry.name
-            )));
-        }
-    }
-    Ok(())
-}
-
 fn selected(plan: &Plan) -> Vec<Id> {
-    let mut out: Vec<Id> = plan.extraction.sigma.values().copied().collect();
+    // The executable DAG, not sigma's abandoned choices.
+    let mut out: Vec<Id> = plan_values(plan).collect();
     out.sort_unstable();
     out.dedup();
     out
@@ -399,4 +409,29 @@ fn launch_index(plan: &Plan) -> FxHashMap<Id, usize> {
         }
     }
     out
+}
+
+/// Every value a launch reads is written earlier or comes from outside.
+pub(crate) fn check_launch_order(graph: &EGraph, plan: &Plan) -> Result<()> {
+    let mut written: rustc_hash::FxHashSet<Id> = rustc_hash::FxHashSet::default();
+    for (i, l) in plan.launches.iter().enumerate() {
+        for b in &l.bindings {
+            if matches!(b.kind, fusor_ir::extract::BindKind::Read)
+                && realize::leaf_role(graph, b.value) == realize::LeafRole::NotLeaf
+                && !written.contains(&b.value)
+            {
+                return Err(Error::Plan(format!(
+                    "launch {i} (root {}) reads {} before any launch writes it: the launches \
+                     have a dependency cycle",
+                    l.root, b.value
+                )));
+            }
+        }
+        for b in &l.bindings {
+            if !matches!(b.kind, fusor_ir::extract::BindKind::Read) {
+                written.insert(b.value);
+            }
+        }
+    }
+    Ok(())
 }

@@ -144,7 +144,7 @@ impl Tensor {
         if q_lhs && let Some(w) = deq(self)? {
             let staged = self.contract(rhs, spec.clone(), acc)?;
             let dense = w.contract(rhs, spec.clone(), acc)?;
-            // Stable first-union root; see `composite::macro_op`.
+            // Stable first-union root; see `GraphRef::union_stable`.
             let root = self.graph.union_stable(staged.id, dense.id)?;
             if let Some(twin) = requant(self)? {
                 let restaged = twin.contract(rhs, spec, acc)?;

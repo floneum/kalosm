@@ -1,12 +1,6 @@
-//! Quantized decode on CPU, running the same `BlockProgram` the GPU emitter
-//! runs — the decode tables are shared, only the emitter differs.
-//!
-//! A `Source::Quantized` load is rewritten at *compile* time into ordinary
-//! `TileExpr`s by calling `BlockProgram::emit`, and the resulting tree is
-//! compiled by the same tape builder as everything else. That is what makes a
-//! lazy per-element dequantize inside a fused expression a *fusion alternative*
-//! rather than a materialization: the decode nodes simply become part of the
-//! consumer's tape.
+//! Quantized decode on CPU: a `Source::Quantized` load becomes ordinary
+//! `TileExpr`s via the shared `BlockProgram::emit`, so the decode fuses into
+//! the consumer's tape rather than materializing.
 
 use fusor_gguf::blocks::BlockDecodeArgs;
 use fusor_ir::ir::kernel::{ElementType, QuantizedView, ScalarElement, TileExpr};
@@ -16,8 +10,7 @@ fn f32_ty() -> ElementType {
     ElementType::Scalar(ScalarElement::F32)
 }
 
-/// Look up the shared decode program and run it for the single element at
-/// `(k_base, col)`, yielding an ordinary scalar expression.
+/// Run the shared decode program for the element at `(k_base, col)`.
 pub(crate) fn expand_dequantize(
     src: &QuantizedView,
     k_base: &TileExpr,

@@ -7,14 +7,11 @@
 use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
 
-use crate::compare::{
-    assert_all_zero, assert_gradient_matches_finite_difference, finite_difference_gradient,
-    relative_eq,
-};
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dense_len, dims, fuzz_case, is_gpu};
+use crate::compare::{assert_all_zero, assert_gradient_matches_finite_difference, relative_eq};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dense_len, dims, is_gpu};
 use crate::suite::support::{
-    BinaryOp, Domain, ELEMENTWISE_SPEC, UnaryOp, binary_case, comparison_case, expect_values,
-    gradient_of, graph_of, loss_of, read, read_probe_loss, unary_case, upload,
+    BinaryOp, Domain, ELEMENTWISE_SPEC, UnaryOp, binary_case, check_gradient, comparison_case,
+    expect_values, gradient_of, graph_of, read, unary_case, upload,
 };
 
 /// The forward-only rows take no gradient, so they can afford multi-workgroup
@@ -186,148 +183,103 @@ fn gpu_forward_tolerance(name: &str) -> Option<(f32, f32)> {
 }
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
+    let mut cases = Cases::new("elementwise");
 
     for (name, domain, op, reference) in unaries() {
-        cases.push_case(unary_case(
-            "elementwise",
-            name,
-            ELEMENTWISE_SPEC,
-            domain,
-            op,
-            reference,
-            gpu_forward_tolerance(name),
-        ));
+        let tol = gpu_forward_tolerance(name);
+        unary_case(&mut cases, name, domain, op, reference, tol);
     }
     for (name, domain, op, reference) in scalar_arith() {
-        cases.push_case(unary_case(
-            "elementwise",
-            name,
-            ELEMENTWISE_SPEC,
-            domain,
-            op,
-            reference,
-            None,
-        ));
+        unary_case(&mut cases, name, domain, op, reference, None);
     }
     for (name, domain, op, reference) in forward_only() {
-        cases.push_case(fuzz_case(
-            "elementwise",
-            name,
-            FORWARD_SPEC,
-            async move |session: &Session, shape: &[u64], seed: u32| {
-                let data = domain.sample(seed, dense_len(&dims(shape)));
-                non_vacuous(name, &data, reference)?;
-                let graph = graph_of(session);
-                let x = upload(graph.handle(), &dims(shape), &data)?;
-                let y = op(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
-                let expected: Vec<f32> = data.iter().copied().map(reference).collect();
-                expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await
-            },
-        ));
+        cases.fuzz(name, FORWARD_SPEC, async move |session, shape, seed| {
+            let data = domain.sample(seed, dense_len(&dims(shape)));
+            non_vacuous(name, &data, reference)?;
+            let graph = graph_of(session);
+            let x = upload(graph.handle(), &dims(shape), &data)?;
+            let y = op(&x)?;
+            let expected: Vec<f32> = data.iter().copied().map(reference).collect();
+            expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await
+        });
     }
     for (name, domain, op, reference) in binaries() {
-        cases.push_case(binary_case(
-            "elementwise",
-            name,
-            ELEMENTWISE_SPEC,
-            domain,
-            op,
-            reference,
-        ));
+        binary_case(&mut cases, name, domain, op, reference);
     }
     for (name, op, reference) in scalar_comparisons() {
-        cases.push_case(comparison_case("elementwise", name, op, reference));
+        comparison_case(&mut cases, name, op, reference);
     }
     for (name, op, reference) in tensor_comparisons() {
-        cases.push_case(fuzz_case(
-            "elementwise",
-            name,
-            ELEMENTWISE_SPEC,
-            async move |session: &Session, shape: &[u64], seed: u32| {
-                tensor_comparison_case(session, name, shape, seed, op, reference).await
-            },
-        ));
+        cases.fuzz(name, ELEMENTWISE_SPEC, async move |session, shape, seed| {
+            tensor_comparison_case(session, name, shape, seed, op, reference).await
+        });
     }
     for (name, op, reference) in broadcasting() {
-        cases.push_case(fuzz_case(
-            "elementwise",
-            name,
-            ELEMENTWISE_SPEC,
-            async move |session: &Session, shape: &[u64], seed: u32| {
-                broadcast_case(session, shape, seed, op, reference).await
-            },
-        ));
+        cases.fuzz(name, ELEMENTWISE_SPEC, async move |session, shape, seed| {
+            broadcast_case(session, shape, seed, op, reference).await
+        });
     }
 
     // The two GPU-approximate exponentials get a relative bound rather than
     // an elementwise reference.
-    cases.push_case(fuzz_case(
-        "elementwise",
+    cases.fuzz(
         "approximate_exp",
         ELEMENTWISE_SPEC,
-        async move |session: &Session, shape: &[u64], seed: u32| {
+        async move |session, shape, seed| {
             approximate_exp_case(session, "approximate_exp", shape, seed, 5e-3).await
         },
-    ));
-    cases.push_case(fuzz_case(
-        "elementwise",
+    );
+    cases.fuzz(
         "less_approximate_exp",
         ELEMENTWISE_SPEC,
-        async move |session: &Session, shape: &[u64], seed: u32| {
+        async move |session, shape, seed| {
             approximate_exp_case(session, "less_approximate_exp", shape, seed, 5e-2).await
         },
-    ));
+    );
 
     // The two elementwise extrema, whose adjoint is a mask rather than zero.
-    cases.push_case(binary_case(
-        "elementwise",
+    binary_case(
+        &mut cases,
         "max_elementwise",
-        ELEMENTWISE_SPEC,
         Domain::Wide,
         |a, b| a.maximum(b),
         f32::max,
-    ));
-    cases.push_case(binary_case(
-        "elementwise",
+    );
+    binary_case(
+        &mut cases,
         "min_elementwise",
-        ELEMENTWISE_SPEC,
         Domain::Wide,
         |a, b| a.minimum(b),
         f32::min,
-    ));
+    );
 
     // A chained expression is a different `ScalarExpr::compose` shape than a
     // single op.
-    cases.push_case(fuzz_case(
-        "elementwise",
+    cases.fuzz(
         "std_ops_add_sub",
         ELEMENTWISE_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
+        async move |s, shape, seed| {
             expr_case(s, shape, seed, |a, b| a.add(b)?.sub(b), |x, y| (x + y) - y).await
         },
-    ));
-    cases.push_case(fuzz_case(
-        "elementwise",
+    );
+    cases.fuzz(
         "std_ops_mul_div",
         ELEMENTWISE_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
+        async move |s, shape, seed| {
             expr_case(s, shape, seed, |a, b| a.mul(b)?.div(b), |x, y| (x * y) / y).await
         },
-    ));
-    cases.push_case(fuzz_case(
-        "elementwise",
+    );
+    cases.fuzz(
         "std_ops_neg",
         ELEMENTWISE_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
+        async move |s, shape, seed| {
             expr_case(s, shape, seed, |a, b| a.neg()?.sub(b), |x, y| -x - y).await
         },
-    ));
-    cases.push_case(fuzz_case(
-        "elementwise",
+    );
+    cases.fuzz(
         "std_ops_scalar",
         ELEMENTWISE_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
+        async move |s, shape, seed| {
             expr_case(
                 s,
                 shape,
@@ -337,14 +289,9 @@ pub fn cases() -> Cases {
             )
             .await
         },
-    ));
+    );
 
-    cases.push_case(fuzz_case(
-        "elementwise",
-        "where_cond",
-        ELEMENTWISE_SPEC,
-        where_cond_case,
-    ));
+    cases.fuzz("where_cond", ELEMENTWISE_SPEC, where_cond_case);
     cases
 }
 
@@ -376,7 +323,7 @@ async fn tensor_comparison_case(
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dimv, &lhs)?;
     let b = upload(graph.handle(), &dimv, &rhs)?;
-    let y = op(&a, &b).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = op(&a, &b)?;
 
     let actual = read(&y).await?;
     let expected: Vec<f32> = lhs
@@ -411,7 +358,7 @@ async fn broadcast_case(
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dims(&[rows, cols]), &lhs)?;
     let b = upload(graph.handle(), &dims(&[cols]), &rhs)?;
-    let y = op(&a, &b).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = op(&a, &b)?;
 
     let actual = read(&y).await?;
     let expected: Vec<f32> = (0..(rows * cols) as usize)
@@ -428,17 +375,8 @@ async fn broadcast_case(
         )
         .into());
     }
-    let probe_graph = graph_of(session);
-    let probe_a = upload(probe_graph.handle(), &dims(&[rows, cols]), &lhs)?;
-    let probe_b = upload(probe_graph.handle(), &dims(&[cols]), &rhs)?;
-    let probe_y = op(&probe_a, &probe_b).map_err(|e| -> CaseError { e.to_string().into() })?;
-    let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[cols as usize], &rhs, |probe| {
-        read_probe_loss(&probe_b, &probe_loss, probe)
-    })
-    .await?;
-    assert_gradient_matches_finite_difference(&d_rhs, &numeric)?;
-    Ok(())
+    let inputs = [(&dims(&[rows, cols])[..], &lhs[..]), (&dims(&[cols]), &rhs)];
+    check_gradient(session, &inputs, 1, &d_rhs, |t| op(&t[0], &t[1])).await
 }
 
 /// A two-operand expression checked forward and on the left gradient.
@@ -457,7 +395,7 @@ async fn expr_case(
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dimv, &lhs)?;
     let b = upload(graph.handle(), &dimv, &rhs)?;
-    let y = build(&a, &b).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = build(&a, &b)?;
 
     let actual = read(&y).await?;
     let expected: Vec<f32> = lhs
@@ -468,17 +406,8 @@ async fn expr_case(
     expect_values(session, shape, Dtype::F32, &actual, &expected).await?;
 
     let analytic = gradient_of(&graph, &y, &a).await?;
-    let probe_graph = graph_of(session);
-    let probe_a = upload(probe_graph.handle(), &dimv, &lhs)?;
-    let probe_b = upload(probe_graph.handle(), &dimv, &rhs)?;
-    let probe_y = build(&probe_a, &probe_b).map_err(|e| -> CaseError { e.to_string().into() })?;
-    let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[len], &lhs, |probe| {
-        read_probe_loss(&probe_a, &probe_loss, probe)
-    })
-    .await?;
-    assert_gradient_matches_finite_difference(&analytic, &numeric)?;
-    Ok(())
+    let inputs = [(&dimv[..], &lhs[..]), (&dimv, &rhs)];
+    check_gradient(session, &inputs, 0, &analytic, |t| build(&t[0], &t[1])).await
 }
 
 /// An approximate exponential: within `tol` of `exp` in relative terms, and
@@ -503,7 +432,7 @@ async fn approximate_exp_case(
         )
         .into());
     };
-    let y = y.map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = y?;
 
     let actual = read(&y).await?;
     let exact: Vec<f32> = data.iter().map(|v| v.exp()).collect();
@@ -544,9 +473,7 @@ async fn where_cond_case(session: &Session, shape: &[u64], seed: u32) -> CaseRes
     let c = upload(graph.handle(), &dimv, &cond)?;
     let t = upload(graph.handle(), &dimv, &on_true)?;
     let f = upload(graph.handle(), &dimv, &on_false)?;
-    let y = c
-        .where_cond(&t, &f)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = c.where_cond(&t, &f)?;
 
     let actual = read(&y).await?;
     let expected: Vec<f32> = (0..len)

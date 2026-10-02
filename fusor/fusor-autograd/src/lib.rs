@@ -5,12 +5,8 @@
 //! (grad @ Bt, At @ grad)` holds regardless of tile geometry.
 //! *Why not rewrite rules*: an adjoint is a directed transformation, not an
 //! equality; putting `grad` in the primal's chain is unsound.
-//! *Why one graph*: gradient checkpointing is then the extractor's
-//! materialization bit. Nobody writes a checkpointing pass and there is no
-//! user annotation.
-//!
-//! Seven [`ADJOINTS`] entries. No `Arc<dyn Fn>` closures, no
-//! type-erased downcasts.
+//! Forward and backward share a graph so kernel selection can fuse across
+//! their boundary and reuse intermediate storage.
 
 #![warn(unreachable_pub)]
 
@@ -24,7 +20,6 @@ mod structural;
 pub mod tape;
 
 pub use adjoints::ADJOINTS;
-pub use backward::Reverse;
 pub use map_adjoint::map_adjoint;
 pub use rules::ADJOINT_RULES;
 pub use tape::GraphTape;

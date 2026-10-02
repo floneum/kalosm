@@ -3,7 +3,7 @@
 
 use crate::carrier::Carrier;
 use crate::contract_spec;
-use crate::dtype::{Dtype, NumericContract, Persistence};
+use crate::dtype::{Dtype, Persistence};
 use crate::error::{Error, Result};
 use crate::facts::ValueFacts;
 use crate::ir::logical::{LeafKind, Logical};
@@ -12,11 +12,8 @@ use crate::shape::{Dim, Dims, Layout, StrideSpec};
 use smallvec::SmallVec;
 
 /// Infer the result facts of a Logical node from its operands' facts.
-///
-/// `numeric` is the meet of the operands' contracts, never wider: the
-/// monotonicity that makes `fold_split` sound is established here.
-/// `persistence` is `Persistent` only for a `Param`/`Quantized` leaf and for
-/// pure views over one.
+/// `numeric` is the meet of the operands' contracts, never wider, which is
+/// what makes `fold_split` sound.
 pub fn infer_logical(op: &Logical, ins: &[ValueFacts]) -> Result<ValueFacts> {
     match op {
         Logical::Leaf(kind) => infer_leaf(kind),
@@ -31,87 +28,33 @@ pub fn infer_logical(op: &Logical, ins: &[ValueFacts]) -> Result<ValueFacts> {
             let e = contract_spec::extents(spec, &a.shape, &b.shape)?;
             let shape = contract_spec::out_shape(spec, &e)?;
             Ok(ValueFacts {
-                dtype: *acc,
-                shape,
                 numeric: a.numeric.meet(b.numeric),
-                persistence: Persistence::Step,
                 outs: *outs,
+                ..ValueFacts::step(*acc, shape, &[])
             })
         }
         Logical::Restride { specs, .. } => {
             let x = one(ins, "Restride")?;
             check_restride_specs(specs, x.rank())?;
-            Ok(ValueFacts {
-                dtype: x.dtype,
-                shape: specs.iter().map(|s| s.size).collect(),
-                numeric: x.numeric,
-                persistence: x.persistence,
-                outs: 1,
-            })
+            Ok(x.view(specs.iter().map(|s| s.size).collect()))
         }
         Logical::Window { specs, .. } => {
             let x = one(ins, "Window")?;
-            let (shape, _) = window_shape(specs, &x.shape)?;
-            Ok(ValueFacts {
-                dtype: x.dtype,
-                shape,
-                numeric: x.numeric,
-                persistence: x.persistence,
-                outs: 1,
-            })
+            Ok(x.view(window_shape(specs, &x.shape)?.0))
         }
         Logical::Gather { axis, .. } => {
             let (x, idx) = two(ins, "Gather")?;
-            if !matches!(idx.dtype, Dtype::U32 | Dtype::I32) {
-                return Err(Error::Dtype(format!(
-                    "Gather indices must be U32 or I32, not {:?}",
-                    idx.dtype
-                )));
-            }
-            if idx.rank() != 1 {
-                return Err(Error::Shape(format!(
-                    "Gather indices must be rank 1, not rank {}",
-                    idx.rank()
-                )));
-            }
-            let axis = *axis as usize;
-            if axis >= x.rank() {
-                return Err(Error::Shape(format!(
-                    "Gather axis {axis} out of range for rank {}",
-                    x.rank()
-                )));
-            }
+            let axis = check_indices("Gather", idx, *axis, x.rank())?;
             let mut shape = x.shape.clone();
             shape[axis] = idx.shape[0];
             Ok(ValueFacts {
-                dtype: x.dtype,
-                shape,
-                numeric: x.numeric,
                 persistence: Persistence::Step,
-                outs: 1,
+                ..x.view(shape)
             })
         }
         Logical::Scatter { axis, .. } => {
             let (base, idx, upd) = three(ins, "Scatter")?;
-            if !matches!(idx.dtype, Dtype::U32 | Dtype::I32) {
-                return Err(Error::Dtype(format!(
-                    "Scatter indices must be U32 or I32, not {:?}",
-                    idx.dtype
-                )));
-            }
-            if idx.rank() != 1 {
-                return Err(Error::Shape(format!(
-                    "Scatter indices must be rank 1, not rank {}",
-                    idx.rank()
-                )));
-            }
-            let axis = *axis as usize;
-            if axis >= base.rank() {
-                return Err(Error::Shape(format!(
-                    "Scatter axis {axis} out of range for rank {}",
-                    base.rank()
-                )));
-            }
+            let axis = check_indices("Scatter", idx, *axis, base.rank())?;
             if upd.rank() != base.rank() {
                 return Err(Error::Shape(format!(
                     "Scatter update rank {} does not match base rank {}",
@@ -145,10 +88,7 @@ pub fn infer_logical(op: &Logical, ins: &[ValueFacts]) -> Result<ValueFacts> {
             }
             Ok(ValueFacts {
                 dtype: Dtype::F32,
-                shape: x.shape.clone(),
-                numeric: x.numeric,
-                persistence: x.persistence,
-                outs: 1,
+                ..x.view(x.shape.clone())
             })
         }
         Logical::Project { slot, .. } => {
@@ -159,75 +99,60 @@ pub fn infer_logical(op: &Logical, ins: &[ValueFacts]) -> Result<ValueFacts> {
                     x.outs
                 )));
             }
-            Ok(ValueFacts {
-                dtype: x.dtype,
-                shape: x.shape.clone(),
-                numeric: x.numeric,
-                persistence: x.persistence,
-                outs: 1,
-            })
+            Ok(x.view(x.shape.clone()))
         }
     }
 }
 
-// ---------------------------------------------------------------------------
-// Per-node rules
-// ---------------------------------------------------------------------------
+/// An index operand is a rank-1 `U32`/`I32` vector and `axis` names an axis
+/// of the indexed value; returns `axis`.
+fn check_indices(what: &str, idx: &ValueFacts, axis: u32, rank: usize) -> Result<usize> {
+    if !matches!(idx.dtype, Dtype::U32 | Dtype::I32) {
+        return Err(Error::Dtype(format!(
+            "{what} indices must be U32 or I32, not {:?}",
+            idx.dtype
+        )));
+    }
+    if idx.rank() != 1 {
+        return Err(Error::Shape(format!(
+            "{what} indices must be rank 1, not rank {}",
+            idx.rank()
+        )));
+    }
+    let axis = axis as usize;
+    if axis >= rank {
+        return Err(Error::Shape(format!(
+            "{what} axis {axis} out of range for rank {rank}"
+        )));
+    }
+    Ok(axis)
+}
 
 fn infer_leaf(kind: &LeafKind) -> Result<ValueFacts> {
+    let persistent = |f: ValueFacts| ValueFacts {
+        persistence: Persistence::Persistent,
+        ..f
+    };
     Ok(match kind {
-        LeafKind::Buffer { dtype, shape, .. } => ValueFacts {
-            dtype: *dtype,
-            shape: shape.clone(),
-            numeric: NumericContract::RELAXED,
-            persistence: Persistence::Step,
-            outs: 1,
-        },
-        LeafKind::Param { dtype, shape, .. } => ValueFacts {
-            dtype: *dtype,
-            shape: shape.clone(),
-            numeric: NumericContract::RELAXED,
-            persistence: Persistence::Persistent,
-            outs: 1,
-        },
-        LeafKind::Const { value, shape } => ValueFacts {
-            dtype: value.dtype(),
-            shape: shape.clone(),
-            numeric: NumericContract::RELAXED,
-            persistence: Persistence::Step,
-            outs: 1,
-        },
+        LeafKind::Buffer { dtype, shape, .. } => ValueFacts::new(*dtype, shape.iter().copied()),
+        LeafKind::Param { dtype, shape, .. } => {
+            persistent(ValueFacts::new(*dtype, shape.iter().copied()))
+        }
+        LeafKind::Const { value, shape } => ValueFacts::new(value.dtype(), shape.iter().copied()),
         // A runtime scalar read from the uniform block: rank 0, never baked
         // into a kernel key.
-        LeafKind::Uniform { dtype, .. } => ValueFacts {
-            dtype: *dtype,
-            shape: Dims::new(),
-            numeric: NumericContract::RELAXED,
-            persistence: Persistence::Step,
-            outs: 1,
-        },
-        LeafKind::Quantized { fmt, shape, .. } => ValueFacts {
-            dtype: Dtype::Q(*fmt),
-            shape: shape.iter().copied().collect(),
-            numeric: NumericContract::RELAXED,
-            persistence: Persistence::Persistent,
-            outs: 1,
-        },
+        LeafKind::Uniform { dtype, .. } => ValueFacts::new(*dtype, []),
+        LeafKind::Quantized { fmt, shape, .. } => {
+            persistent(ValueFacts::new(Dtype::Q(*fmt), shape.iter().copied()))
+        }
     })
 }
 
 fn infer_map(expr: &ScalarExpr, ins: &[ValueFacts], outs: u8) -> Result<ValueFacts> {
-    // **No implicit broadcasting**: every operand carries the output shape.
-    // The frontend emits `Restride { multiplier: 0 }` instead.
+    // No implicit broadcasting: every operand carries the output shape.
     if let Some(first) = ins.first() {
         for other in &ins[1..] {
-            let same = other.rank() == first.rank()
-                && other
-                    .shape
-                    .iter()
-                    .zip(&first.shape)
-                    .all(|(a, b)| a.known_eq(*b));
-            if !same {
+            if other.shape != first.shape {
                 return Err(Error::Shape(format!(
                     "Map operands must have identical shape; the frontend emits \
                      Restride{{multiplier:0}} ({:?} vs {:?})",
@@ -243,28 +168,16 @@ fn infer_map(expr: &ScalarExpr, ins: &[ValueFacts], outs: u8) -> Result<ValueFac
 
     check_arg_dtypes(expr, ins)?;
 
-    let numeric = ins
-        .iter()
-        .map(|f| f.numeric)
-        .reduce(NumericContract::meet)
-        .unwrap_or(NumericContract::RELAXED);
-
+    let shape = ins.first().map(|f| f.shape.clone()).unwrap_or_default();
     Ok(ValueFacts {
-        dtype: expr.dtype(),
-        shape: ins.first().map(|f| f.shape.clone()).unwrap_or_default(),
-        numeric,
-        persistence: Persistence::Step,
         outs,
+        ..ValueFacts::step(expr.dtype(), shape, ins)
     })
 }
 
-/// A fold's result: the operand shape minus the reduced axis, with the
-/// carrier's lane count appended when it is more than one. That appended axis
-/// is how a multi-slot accumulator is read back — slot `i` is an ordinary
-/// `Restride` of it, so no new node kind appears.
-///
-/// Every operand must have the same shape: the lift reads them all at one
-/// coordinate, exactly as a `Map` body does.
+/// A fold's result: the operand shape minus the reduced axis, plus the
+/// carrier's lane axis when wider than one (slots are read back by
+/// `Restride`). Every operand has the same shape, as for a `Map`.
 fn infer_fold(carrier: &Carrier, axis: u32, acc: Dtype, ins: &[ValueFacts]) -> Result<ValueFacts> {
     let x = ins
         .first()
@@ -277,14 +190,28 @@ fn infer_fold(carrier: &Carrier, axis: u32, acc: Dtype, ins: &[ValueFacts]) -> R
         )));
     }
     for (i, f) in ins.iter().enumerate().skip(1) {
-        if f.shape.len() != x.shape.len()
-            || !f.shape.iter().zip(&x.shape).all(|(a, b)| a.known_eq(*b))
-        {
+        if f.shape != x.shape {
             return Err(Error::Shape(format!(
                 "Fold operand {i} has shape {:?}, expected {:?}",
                 f.shape, x.shape
             )));
         }
+    }
+    let mut unbound = None;
+    for lift in &carrier.lift {
+        lift.walk(&mut |expr| {
+            if let ScalarKind::Arg(index) = expr.kind()
+                && *index as usize >= ins.len()
+            {
+                unbound = Some(*index);
+            }
+        });
+    }
+    if let Some(index) = unbound {
+        return Err(Error::Shape(format!(
+            "Fold lift reads Arg({index}) but only {} operands were supplied",
+            ins.len()
+        )));
     }
     crate::verify_l0::check_carrier(carrier, acc)?;
 
@@ -296,27 +223,11 @@ fn infer_fold(carrier: &Carrier, axis: u32, acc: Dtype, ins: &[ValueFacts]) -> R
     {
         shape.push(d);
     }
-    Ok(ValueFacts {
-        dtype: acc,
-        shape,
-        numeric: ins
-            .iter()
-            .map(|f| f.numeric)
-            .reduce(NumericContract::meet)
-            .unwrap_or(NumericContract::RELAXED),
-        persistence: Persistence::Step,
-        outs: 1,
-    })
+    Ok(ValueFacts::step(acc, shape, ins))
 }
 
-// ---------------------------------------------------------------------------
-// Restride
-// ---------------------------------------------------------------------------
-
-/// A spec references its `input_dim` when it is not a pure stride-0 axis at
-/// offset 0. The reference's `Layout::restride` reads `strides[input_dim]`
-/// for the offset term regardless of `multiplier`, so a broadcast spec with
-/// a nonzero offset still names an input dim.
+/// A spec references its `input_dim` unless it is a stride-0 axis at offset
+/// 0: the offset term reads `strides[input_dim]` whatever the multiplier.
 pub fn spec_reads_input_dim(s: &StrideSpec) -> bool {
     s.multiplier != 0 || !s.offset.known_eq(Dim::Const(0))
 }
@@ -333,16 +244,9 @@ fn check_restride_specs(specs: &[StrideSpec], in_rank: usize) -> Result<()> {
     Ok(())
 }
 
-/// The reference's `types/src/layout.rs::Layout::restride`, lifted to
-/// [`Dim`]: `out_shape[i] = spec.size`,
-/// `out_stride[i] = if multiplier == 0 { 0 } else { in_stride[input_dim] *
-/// multiplier }`, and the offset gains `sum(offset * in_stride[input_dim])`.
-/// Composition is **relative to the current strides**, which is what makes a
-/// view survive an upstream layout rewrite.
-///
-/// A product or sum over a symbolic dim becomes a derived symbol
-/// (`Dim + Dim`, `Dim * Dim`), evaluated from the bindings at dispatch;
-/// only overflow falls to the opaque placeholder.
+/// `Layout::restride` lifted to [`Dim`]. Composition is relative to the
+/// current strides, so a view survives an upstream layout rewrite; symbolic
+/// terms become derived symbols evaluated at dispatch.
 pub fn restride_layout(input: &Layout, specs: &[StrideSpec]) -> Result<Layout> {
     check_restride_specs(specs, input.rank())?;
     let in_strides = input.strides();
@@ -359,8 +263,6 @@ pub fn restride_layout(input: &Layout, specs: &[StrideSpec]) -> Result<Layout> {
         })
         .collect();
 
-    // A symbolic offset or stride stays exact as a derived symbol (see
-    // `Dim::add`), so a view at a runtime offset reads the right element.
     let mut offset = input.offset();
     for s in specs {
         if s.offset.known_eq(Dim::Const(0)) {
@@ -372,17 +274,9 @@ pub fn restride_layout(input: &Layout, specs: &[StrideSpec]) -> Result<Layout> {
     Layout::from_parts(offset, &shape, &strides)
 }
 
-// ---------------------------------------------------------------------------
-// Window
-// ---------------------------------------------------------------------------
-
-/// `types/src/layout.rs::Layout::sliding_window`, lifted to [`Dim`].
-///
-/// Returns the output shape plus `true` when any windowed axis was symbolic.
-/// A symbolic axis does **not** mint a fresh extent: the output dim stays the
-/// input `Sym` (refined at dispatch) and the node carries a
-/// `BoundsProof::RuntimeMask` obligation, which is what keeps a symbolic
-/// sequence length from forcing a recompile.
+/// `Layout::sliding_window` lifted to [`Dim`], plus `true` when a windowed
+/// axis is symbolic: it keeps the input `Sym` under a runtime mask rather
+/// than minting a fresh extent, so it never forces a recompile.
 pub fn window_shape(
     specs: &[crate::shape::SlidingWindow],
     in_shape: &[Dim],
@@ -438,14 +332,10 @@ pub fn window_shape(
     Ok((shape, runtime_mask))
 }
 
-// ---------------------------------------------------------------------------
-// Scalar-expression helpers
-// ---------------------------------------------------------------------------
-
 /// Every `Arg(i)` in `expr` names an operand whose dtype matches the leaf's.
 fn check_arg_dtypes(expr: &ScalarExpr, ins: &[ValueFacts]) -> Result<()> {
     let mut err = None;
-    walk_expr(expr, &mut |e| {
+    expr.walk(&mut |e| {
         if err.is_some() {
             return;
         }
@@ -474,48 +364,16 @@ fn check_arg_dtypes(expr: &ScalarExpr, ins: &[ValueFacts]) -> Result<()> {
     }
 }
 
-/// True when `expr` reads nothing outside `Lit`/`Uniform` — the only case in
-/// which a zero-operand `Map` is meaningful.
+/// True when `expr` reads nothing outside `Lit`/`Uniform`.
 fn expr_is_closed(expr: &ScalarExpr) -> bool {
     let mut closed = true;
-    walk_expr(expr, &mut |e| {
+    expr.walk(&mut |e| {
         if matches!(e.kind(), ScalarKind::Arg(_) | ScalarKind::IndexOf(_)) {
             closed = false;
         }
     });
     closed
 }
-
-/// Pre-order walk over a hash-consed scalar tree. Shared subtrees are
-/// revisited; callers that must count once memoize on
-/// [`ScalarExpr::structural_hash`].
-pub(crate) fn walk_expr(e: &ScalarExpr, f: &mut impl FnMut(&ScalarExpr)) {
-    f(e);
-    match e.kind() {
-        ScalarKind::Arg(_)
-        | ScalarKind::Lit(_)
-        | ScalarKind::Uniform(_)
-        | ScalarKind::IndexOf(_) => {}
-        ScalarKind::Un { x, .. }
-        | ScalarKind::Cast { x, .. }
-        | ScalarKind::Bitcast { x, .. }
-        | ScalarKind::Round { x, .. }
-        | ScalarKind::Splat { x, .. } => walk_expr(x, f),
-        ScalarKind::Bin { a, b, .. } | ScalarKind::Cmp { a, b, .. } | ScalarKind::Dot { a, b } => {
-            walk_expr(a, f);
-            walk_expr(b, f);
-        }
-        ScalarKind::Select { c, t, f: e_f } => {
-            walk_expr(c, f);
-            walk_expr(t, f);
-            walk_expr(e_f, f);
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Arity helpers — every access is length-checked, so inference is total.
-// ---------------------------------------------------------------------------
 
 fn one<'a>(ins: &'a [ValueFacts], what: &str) -> Result<&'a ValueFacts> {
     ins.first()

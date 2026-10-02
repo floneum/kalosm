@@ -15,7 +15,7 @@ pub use rms_norm::RmsNorm;
 
 use fusor_gguf::VarBuilder;
 use fusor_ir::dtype::Dtype;
-use fusor_ir::ir::logical::{LeafKind, Logical};
+use fusor_ir::ir::logical::Logical;
 use fusor_ir::shape::Dim;
 
 use crate::graph::GraphRef;
@@ -34,12 +34,8 @@ pub(crate) fn as_typed<const R: usize, T: Element>(
     t: Tensor,
     what: &str,
 ) -> Result<crate::Tensor<R, T>> {
-    let t = if t.dtype() == T::DTYPE {
-        t
-    } else {
-        t.cast(T::DTYPE)?
-    };
-    crate::Tensor::<R, T>::try_from_dyn(t).map_err(|e| Error::Shape(format!("{what}: {e}")))
+    crate::Tensor::<R, T>::try_from_dyn(t.into_dtype(T::DTYPE)?)
+        .map_err(|e| Error::Shape(format!("{what}: {e}")))
 }
 
 /// One GGUF tensor as a dense `F32` value in `graph`.
@@ -57,11 +53,7 @@ pub(crate) fn load_dense(vb: &VarBuilder, graph: &GraphRef, name: &str) -> Resul
     let shape: Vec<Dim> = raw.shape.iter().map(|d| Dim::Const(*d)).collect();
 
     let Dtype::Q(fmt) = raw.fmt else {
-        let dense = Tensor::from_slice(graph, raw.fmt, &shape, &raw.bytes)?;
-        return match raw.fmt {
-            Dtype::F32 => Ok(dense),
-            _ => dense.cast(Dtype::F32),
-        };
+        return Tensor::from_slice(graph, raw.fmt, &shape, &raw.bytes)?.into_dtype(Dtype::F32);
     };
 
     // A quantized leaf is `[rows, cols]`: the block stream runs along the
@@ -93,24 +85,28 @@ pub(crate) fn load_dense(vb: &VarBuilder, graph: &GraphRef, name: &str) -> Resul
             )));
         }
     }
-    let leaf = Tensor::emit(
-        graph,
-        Logical::Leaf(LeafKind::Quantized {
-            name: graph.fresh_buffer_id(),
-            fmt,
-            layout: raw.layout,
-            shape: [rows, cols].into_iter().collect(),
-        }),
-    )?;
-    graph.set_leaf_bytes(leaf.id(), raw.bytes.to_vec());
+    let leaf = graph.quantized_leaf(fmt, raw.layout, [rows, cols], raw.bytes.to_vec())?;
     Tensor::emit(
         graph,
         Logical::Dequant {
             fmt,
             layout: raw.layout,
-            x: leaf.id(),
+            x: leaf,
         },
     )
+}
+
+/// A layer's `[out]` bias, when it has one.
+pub(crate) fn load_bias<T: Element>(
+    vb: &VarBuilder,
+    graph: &GraphRef,
+    bias: bool,
+) -> Result<Option<crate::Tensor<1, T>>> {
+    if !bias {
+        return Ok(None);
+    }
+    let b = as_vector(load_dense(vb, graph, "bias")?, "bias")?;
+    as_typed::<1, T>(b, "bias").map(Some)
 }
 
 /// [`load_dense`], or `None` when the key is absent. A missing key is the

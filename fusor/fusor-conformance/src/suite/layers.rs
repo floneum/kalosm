@@ -14,9 +14,7 @@ use fusor::layers::{Embedding, LayerNorm, LayerNormNd, Linear, RmsNorm};
 use fusor::optim::{AdamW, clip_global_norm, cosine_decay};
 use fusor::{Dtype, Session};
 
-use crate::harness::{
-    CaseError, CaseResult, Cases, FuzzDim, dims, fill_indices, from_u32, fuzz_case,
-};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fill_indices, from_u32};
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
 
 /// A runtime-rank value as the const-rank one the layers take.
@@ -76,25 +74,20 @@ fn host_linear(
 }
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
-    cases.push_case(fuzz_case(
-        "layers",
-        "linear_with_bias",
-        LINEAR_SPEC,
-        async move |s: &Session, sh: &[u64], seed: u32| linear_case(s, true, sh, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "layers",
+    let mut cases = Cases::new("layers");
+    cases.fuzz("linear_with_bias", LINEAR_SPEC, async move |s, sh, seed| {
+        linear_case(s, true, sh, seed).await
+    });
+    cases.fuzz(
         "linear_without_bias",
         LINEAR_SPEC,
-        async move |s: &Session, sh: &[u64], seed: u32| linear_case(s, false, sh, seed).await,
-    ));
-    cases.push_case(fuzz_case(
-        "layers",
+        async move |s, sh, seed| linear_case(s, false, sh, seed).await,
+    );
+    cases.fuzz(
         "linear_gradients_reach_every_parameter",
         LINEAR_GRAD_SPEC,
         linear_grads,
-    ));
+    );
     // [vocab, emb, t0, t1]: tokens are a [t0, t1] index tensor into the table.
     // t0 >= 2 keeps room for the forced repeat the backward case relies on.
     const EMBEDDING_SPEC: &[FuzzDim] = &[
@@ -103,42 +96,21 @@ pub fn cases() -> Cases {
         FuzzDim::Range(2, 4),
         FuzzDim::Range(1, 4),
     ];
-    cases.push_case(fuzz_case(
-        "layers",
-        "embedding_layer",
-        EMBEDDING_SPEC,
-        embedding_layer,
-    ));
-    cases.push_case(fuzz_case(
-        "layers",
+    cases.fuzz("embedding_layer", EMBEDDING_SPEC, embedding_layer);
+    cases.fuzz(
         "embedding_layer_backward",
         EMBEDDING_SPEC,
         embedding_layer_backward,
-    ));
+    );
     const NORM_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(1, 16)];
-    cases.push_case(fuzz_case(
-        "layers",
-        "layer_norm_layer",
-        NORM_SPEC,
-        layer_norm_layer,
-    ));
+    cases.fuzz("layer_norm_layer", NORM_SPEC, layer_norm_layer);
     const NORM_ND_SPEC: &[FuzzDim] = &[
         FuzzDim::Range(1, 4),
         FuzzDim::Range(1, 4),
         FuzzDim::Range(1, 6),
     ];
-    cases.push_case(fuzz_case(
-        "layers",
-        "layer_norm_nd_over_two_axes",
-        NORM_ND_SPEC,
-        layer_norm_nd,
-    ));
-    cases.push_case(fuzz_case(
-        "layers",
-        "rms_norm_layer",
-        NORM_SPEC,
-        rms_norm_layer,
-    ));
+    cases.fuzz("layer_norm_nd_over_two_axes", NORM_ND_SPEC, layer_norm_nd);
+    cases.fuzz("rms_norm_layer", NORM_SPEC, rms_norm_layer);
     // [batch, in_ch, out_ch, k, extra]: the spatial extent is k + extra, so it
     // is always >= the kernel extent.
     const CONV_SPEC: &[FuzzDim] = &[
@@ -148,67 +120,31 @@ pub fn cases() -> Cases {
         FuzzDim::Range(1, 3),
         FuzzDim::Range(0, 5),
     ];
-    cases.push_case(fuzz_case("layers", "conv_nd_layer", CONV_SPEC, conv_layer));
+    cases.fuzz("conv_nd_layer", CONV_SPEC, conv_layer);
     const MLP_SPEC: &[FuzzDim] = &[
         FuzzDim::Range(1, 4),
         FuzzDim::Range(2, 6),
         FuzzDim::Range(2, 6),
     ];
-    cases.push_case(fuzz_case(
-        "layers",
-        "a_two_layer_mlp_trains_downhill",
-        MLP_SPEC,
-        mlp_step,
-    ));
+    cases.fuzz("a_two_layer_mlp_trains_downhill", MLP_SPEC, mlp_step);
     // [rows, classes]; softmax over one class is constant, so classes >= 2.
     const LOSS_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(2, 8)];
-    cases.push_case(fuzz_case(
-        "layers",
-        "softmax_cross_entropy",
-        LOSS_SPEC,
-        cross_entropy_case,
-    ));
-    cases.push_case(fuzz_case(
-        "layers",
+    cases.fuzz("softmax_cross_entropy", LOSS_SPEC, cross_entropy_case);
+    cases.fuzz(
         "softmax_cross_entropy_gradient_is_p_minus_onehot",
         LOSS_SPEC,
         cross_entropy_grad,
-    ));
-    cases.push_case(fuzz_case(
-        "layers",
-        "binary_cross_entropy_with_logits",
-        LOSS_SPEC,
-        bce_case,
-    ));
-    cases.push_case(fuzz_case(
-        "layers",
-        "distillation_loss",
-        LOSS_SPEC,
-        distillation_case,
-    ));
-    cases.push_case(fuzz_case("layers", "mse", LOSS_SPEC, mse_case));
+    );
+    cases.fuzz("binary_cross_entropy_with_logits", LOSS_SPEC, bce_case);
+    cases.fuzz("distillation_loss", LOSS_SPEC, distillation_case);
+    cases.fuzz("mse", LOSS_SPEC, mse_case);
     const PARAM_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 16)];
-    cases.push_case(fuzz_case(
-        "layers",
-        "adamw_step_moves_downhill",
-        PARAM_SPEC,
-        adamw_case,
-    ));
+    cases.fuzz("adamw_step_moves_downhill", PARAM_SPEC, adamw_case);
     const CLIP_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 8), FuzzDim::Range(1, 8)];
-    cases.push_case(fuzz_case(
-        "layers",
-        "clip_global_norm",
-        CLIP_SPEC,
-        clip_case,
-    ));
+    cases.fuzz("clip_global_norm", CLIP_SPEC, clip_case);
     // [warmup, extra]: the total is warmup + extra, so warmup < total always.
     const COSINE_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 20), FuzzDim::Range(10, 190)];
-    cases.push_case(fuzz_case(
-        "layers",
-        "cosine_decay_schedule",
-        COSINE_SPEC,
-        cosine_case,
-    ));
+    cases.fuzz("cosine_decay_schedule", COSINE_SPEC, cosine_case);
     cases
 }
 
@@ -323,8 +259,7 @@ async fn embedding_layer(session: &Session, shape: &[u64], seed: u32) -> CaseRes
     let table = Domain::Wide.sample(seed, vocab * emb);
     let graph = graph_of(session);
     let table_value = upload(graph.handle(), &dims(&[vocab as u64, emb as u64]), &table)?;
-    let token_value = from_u32(graph.handle(), &dims(&[t0, t1]), &tokens)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let token_value = from_u32(graph.handle(), &dims(&[t0, t1]), &tokens)?;
     let layer = Embedding::new(t::<2>(table_value));
     let y = layer.forward::<2, 3>(&ids::<2>(token_value)).into_dyn();
 
@@ -353,8 +288,7 @@ async fn embedding_layer_backward(session: &Session, shape: &[u64], seed: u32) -
     let table = Domain::Wide.sample(seed, vocab * emb);
     let graph = graph_of(session);
     let table_value = upload(graph.handle(), &dims(&[vocab as u64, emb as u64]), &table)?;
-    let token_value = from_u32(graph.handle(), &dims(&[t0, t1]), &tokens)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let token_value = from_u32(graph.handle(), &dims(&[t0, t1]), &tokens)?;
     let layer = Embedding::new(t::<2>(table_value.clone()));
     let y = layer.forward::<2, 3>(&ids::<2>(token_value)).into_dyn();
     let grad = gradient_of(&graph, &y, &table_value).await?;
@@ -548,12 +482,8 @@ async fn mlp_step(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
             let hidden = Linear::new(t::<2>(a.clone()), None)
                 .forward(&t::<2>(x))
                 .into_dyn()
-                .relu()
-                .map_err(|e| -> CaseError { e.to_string().into() })?;
-            let out_v = hidden
-                .mul_(&b)
-                .and_then(|v| v.sqr())
-                .map_err(|e| -> CaseError { e.to_string().into() })?;
+                .relu()?;
+            let out_v = hidden.mul_(&b).and_then(|v| v.sqr())?;
             let loss = crate::suite::support::loss_of(&out_v)?;
             let value = crate::suite::support::read_scalar(&loss).await?;
             let d_a = gradient_of(&graph, &out_v, &a).await?;
@@ -603,8 +533,7 @@ async fn cross_entropy_case(session: &Session, shape: &[u64], seed: u32) -> Case
     let graph = graph_of(session);
     let l = upload(graph.handle(), &dims(shape), &logits)?;
     let t = upload(graph.handle(), &dims(shape), &targets)?;
-    let loss =
-        softmax_cross_entropy(&l, &t, 1).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let loss = softmax_cross_entropy(&l, &t, 1)?;
 
     let expected: Vec<f32> = logits
         .chunks(classes)
@@ -636,8 +565,7 @@ async fn cross_entropy_grad(session: &Session, shape: &[u64], seed: u32) -> Case
     let graph = graph_of(session);
     let l = upload(graph.handle(), &dims(shape), &logits)?;
     let t = upload(graph.handle(), &dims(shape), &targets)?;
-    let loss =
-        softmax_cross_entropy(&l, &t, 1).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let loss = softmax_cross_entropy(&l, &t, 1)?;
     let grad = gradient_of(&graph, &loss, &l).await?;
 
     let mut want = vec![0.0f32; rows * classes];
@@ -671,8 +599,7 @@ async fn bce_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let graph = graph_of(session);
     let l = upload(graph.handle(), &dims(shape), &logits)?;
     let t = upload(graph.handle(), &dims(shape), &targets)?;
-    let loss = binary_cross_entropy_with_logits(&l, &t)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let loss = binary_cross_entropy_with_logits(&l, &t)?;
 
     // max(z,0) - z*y + ln(1 + exp(-|z|)), the numerically stable form.
     let expected: Vec<f32> = logits
@@ -709,7 +636,7 @@ async fn distillation_case(session: &Session, shape: &[u64], seed: u32) -> CaseR
     let graph = graph_of(session);
     let s = upload(graph.handle(), &dims(shape), &student)?;
     let t = upload(graph.handle(), &dims(shape), &teacher)?;
-    let loss = distillation_loss(&s, &t, T).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let loss = distillation_loss(&s, &t, T)?;
     let got = read(&loss).await?;
     if got.iter().any(|v| !v.is_finite()) {
         return Err("the distillation loss produced a non-finite value".into());
@@ -730,7 +657,7 @@ async fn mse_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dims(shape), &a_data)?;
     let b = upload(graph.handle(), &dims(shape), &b_data)?;
-    let loss = mse(&a, &b).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let loss = mse(&a, &b)?;
     let want: f32 = a_data
         .iter()
         .zip(&b_data)
@@ -753,17 +680,12 @@ async fn adamw_case(session: &Session, shape: &[u64], _seed: u32) -> CaseResult 
     let start = vec![1.0f32; n];
     let graph = graph_of(session);
     let p = upload(graph.handle(), &dims(&[n as u64]), &start)?;
-    let loss = p
-        .sqr()
-        .and_then(|s| s.sum_all())
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let loss = p.sqr().and_then(|s| s.sum_all())?;
     let g = gradient_of(&graph, &loss, &p).await?;
     let grad = upload(graph.handle(), &dims(&[n as u64]), &g)?;
 
     let mut opt = AdamW::new(LR);
-    let updated = opt
-        .step(std::slice::from_ref(&p), std::slice::from_ref(&grad))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let updated = opt.step(std::slice::from_ref(&p), std::slice::from_ref(&grad))?;
     let after = read(
         updated
             .first()
@@ -804,8 +726,7 @@ async fn clip_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dims(&[n0 as u64]), &a_data)?;
     let b = upload(graph.handle(), &dims(&[n1 as u64]), &b_data)?;
-    let clipped =
-        clip_global_norm(&[a, b], CAP).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let clipped = clip_global_norm(&[a, b], CAP)?;
 
     let mut total = 0.0f32;
     let mut flat = Vec::new();

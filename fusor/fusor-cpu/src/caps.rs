@@ -16,8 +16,7 @@ pub struct CpuCaps;
 impl CpuCaps {
     /// Bytes of the last-level cache, feeding `DeviceFacts::llc_bytes`.
     pub fn llc_bytes() -> u64 {
-        // No portable query exists. 8 MiB matches the Apple-silicon SLC slice a
-        // single core sees and is a middling x86 L3-per-core figure.
+        // No portable query; 8 MiB is a middling per-core LLC.
         8 << 20
     }
 
@@ -42,7 +41,6 @@ pub(crate) fn cpu_caps() -> &'static Caps {
             name: "cpu-cranelift".to_string(),
             limits: Limits {
                 // Keep GPU workgroup geometry out of the CPU schedule domain.
-                // The native emitter owns its host loop chunk independently.
                 max_compute_invocations_per_workgroup: 1,
                 max_compute_workgroup_size: [1, 1, 1],
                 max_compute_workgroups_per_dimension: u32::MAX,
@@ -50,20 +48,14 @@ pub(crate) fn cpu_caps() -> &'static Caps {
                 max_storage_buffers_per_shader_stage: 64,
                 max_storage_buffer_binding_size: u64::MAX,
             },
-            // A "subgroup" on CPU is one SIMD register, so `Reduce{Subgroup}`
-            // is legal and lowers to a horizontal reduce. Fixed width, which
-            // is what every subgroup-size-aware kernel requires.
+            // A CPU "subgroup" is one fixed-width SIMD register.
             subgroups: Some(SubgroupWidths { min: 1, max: 1 }),
             f16: true,
             bf16: true,
             coop: smallvec![],
-            // No f32 atomics: this forces `ScatterMode::SortSegment` and
-            // makes `ScatterMode::Atomic` unreachable at mint time. The nest
-            // both lower to needs no atomic either way.
+            // No f32 atomics: forces `ScatterMode::SortSegment`.
             atomic_f32: false,
-            // Thread-local scratch aliases freely, so `ArenaMode::ByteArena` is
-            // always available and the arena separation predicate is trivially
-            // true.
+            // Thread-local scratch aliases freely, so `ByteArena` is always available.
             workgroup_alias: true,
             mixed_precision_coop_store: false,
             pipeline_cache: false,

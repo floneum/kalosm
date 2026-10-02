@@ -569,33 +569,6 @@ a {
   }
 }
 
-/* ---------- Misc ---------- */
-
-.empty {
-  padding: 56px 24px;
-  color: var(--secondary-color-5);
-  text-align: center;
-  font-size: 14px;
-}
-
-.route-actions {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 10px;
-}
-
-.route-actions .nav-link {
-  height: 36px;
-  padding: 0 16px;
-  border: 1px solid var(--primary-color-6);
-  background: var(--primary-color);
-}
-
-.route-actions .nav-link:hover {
-  background: var(--primary-color-5);
-  color: var(--secondary-color-1);
-}
-
 @media (max-width: 760px) {
   .shell {
     padding: 20px 14px 56px;
@@ -667,6 +640,389 @@ a {
   }
 
   .bar-chart {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}
+
+/* ---------- Character language model ---------- */
+
+.lm-page {
+  display: grid;
+  gap: 20px;
+}
+
+.lm-hero {
+  display: grid;
+  gap: 12px;
+  padding: 24px;
+  border: 1px solid var(--primary-color-6);
+  border-radius: var(--radius-card);
+  background: var(--card-surface);
+  box-shadow: var(--shadow-sm);
+}
+
+.lm-hero h1 {
+  margin: 0;
+  font-size: 1.5rem;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+}
+
+.lm-hero-sub {
+  margin: 0;
+  max-width: 68ch;
+  color: var(--secondary-color-3);
+  font-size: 0.92rem;
+  line-height: 1.6;
+}
+
+.lm-hero-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  margin-top: 4px;
+}
+
+.lm-fact {
+  display: grid;
+  gap: 2px;
+  padding: 8px 14px;
+  border: 1px solid var(--primary-color-6);
+  border-radius: var(--radius-sm);
+  background: var(--primary-color-2);
+}
+
+.lm-fact-value {
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 1rem;
+  font-weight: 600;
+}
+
+.lm-fact-label {
+  color: var(--secondary-color-3);
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.lm-controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+}
+
+.lm-config-presets, .lm-config-summary {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 20px;
+  margin-bottom: 18px;
+}
+
+.lm-config-fields {
+  display: grid;
+  align-items: end;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 16px;
+  border: 0;
+  padding: 0;
+  margin: 0 0 18px;
+  min-width: 0;
+}
+
+.lm-config-fields .lm-field { margin: 0; }
+.lm-config-fields legend {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  overflow: hidden;
+  clip-path: inset(50%);
+  white-space: nowrap;
+}
+.lm-config-fields input {
+  width: 100%;
+  box-sizing: border-box;
+  padding: 10px 12px;
+  border: 1px solid var(--primary-color-6);
+  border-radius: var(--radius-sm);
+  background: var(--primary-color-2);
+  color: var(--secondary-color-1);
+  font: 0.95rem "Geist Mono", ui-monospace, monospace;
+}
+.lm-config-fields input:focus-visible { outline: 2px solid #40b8a6; outline-offset: 2px; }
+.lm-config-fields:disabled { opacity: 0.6; }
+.lm-config-summary { color: var(--ok-text); font: 0.8rem "Geist Mono", ui-monospace, monospace; }
+.lm-config-error { color: var(--err-text); font-size: 0.85rem; }
+.lm-budget { display: grid; gap: 8px; color: var(--secondary-color-3); font-size: 0.8rem; }
+.lm-budget progress { width: 100%; height: 5px; accent-color: #40b8a6; }
+
+.lm-toggle {
+  display: inline-flex;
+  gap: 8px;
+  align-items: center;
+  color: var(--secondary-color-3);
+  font-size: 0.85rem;
+  cursor: pointer;
+}
+
+.lm-grid {
+  display: grid;
+  gap: 20px;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 380px), 1fr));
+  align-items: start;
+}
+
+.lm-card {
+  overflow: hidden;
+}
+
+.lm-metrics {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(104px, 1fr));
+  gap: 14px 18px;
+  margin-top: 16px;
+}
+
+.lm-note {
+  margin: 14px 0 0;
+  color: var(--secondary-color-3);
+  font-size: 0.82rem;
+  line-height: 1.55;
+}
+
+.lm-hint {
+  color: var(--secondary-color-3);
+  font-size: 0.78rem;
+}
+
+.lm-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 12px;
+  align-items: center;
+  margin-top: 12px;
+}
+
+.lm-section {
+  margin: 26px 0 6px;
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--secondary-color-3);
+}
+
+/* ---------- Loss curve ---------- */
+
+.lm-curve {
+  display: grid;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--primary-color-6);
+  border-radius: var(--radius-md);
+  background: var(--primary-color-2);
+}
+
+.lm-curve.empty-curve {
+  padding: 28px 12px;
+  color: var(--secondary-color-3);
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+.lm-curve-label {
+  color: var(--secondary-color-3);
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 0.72rem;
+}
+
+/* ---------- Prompt and sample ---------- */
+
+.lm-field {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 14px;
+}
+
+.lm-field > span {
+  color: var(--secondary-color-3);
+  font-size: 0.78rem;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+}
+
+.lm-field textarea {
+  width: 100%;
+  padding: 10px 12px;
+  border: 1px solid var(--primary-color-6);
+  border-radius: var(--radius-sm);
+  background: var(--primary-color-1);
+  color: inherit;
+  font: inherit;
+  resize: vertical;
+}
+
+.lm-field input[type="range"] {
+  width: 100%;
+  accent-color: #40b8a6;
+}
+
+.lm-sample {
+  min-height: 9.5rem;
+  padding: 14px 16px;
+  border: 1px solid var(--primary-color-6);
+  border-radius: var(--radius-md);
+  background: var(--primary-color-2);
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 0.82rem;
+  line-height: 1.7;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.lm-sample-prompt {
+  color: var(--secondary-color-3);
+}
+
+.lm-sample-empty {
+  color: var(--secondary-color-3);
+  font-style: italic;
+}
+
+/* ---------- Corpus ---------- */
+
+.lm-corpus {
+  max-height: 11rem;
+  margin: 0;
+  padding: 14px 16px;
+  border: 1px solid var(--primary-color-6);
+  border-radius: var(--radius-md);
+  background: var(--primary-color-2);
+  color: var(--secondary-color-3);
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 0.78rem;
+  line-height: 1.6;
+  white-space: pre-wrap;
+  overflow: auto;
+}
+
+.lm-alphabet,
+.lm-context {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  align-items: center;
+  margin-top: 14px;
+}
+
+.lm-char {
+  display: inline-grid;
+  place-items: center;
+  min-width: 1.45rem;
+  height: 1.45rem;
+  padding: 0 3px;
+  border: 1px solid var(--primary-color-6);
+  border-radius: 4px;
+  background: var(--primary-color-2);
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 0.75rem;
+}
+
+.lm-char-key {
+  border-color: #40b8a6;
+  color: #40b8a6;
+}
+
+/* ---------- Interpretability ---------- */
+
+.lm-lens-check {
+  display: grid;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.lm-dist {
+  display: grid;
+  gap: 5px;
+}
+
+.lm-dist-row {
+  display: grid;
+  grid-template-columns: 1.8rem minmax(0, 1fr) 3.4rem;
+  gap: 10px;
+  align-items: center;
+}
+
+.lm-dist-char {
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 0.8rem;
+  text-align: center;
+}
+
+.lm-dist-bar {
+  height: 0.62rem;
+  border-radius: 999px;
+  background: var(--primary-color-3);
+  overflow: hidden;
+}
+
+.lm-dist-fill {
+  height: 100%;
+  border-radius: 999px;
+  background: #40b8a6;
+}
+
+.lm-dist-value {
+  color: var(--secondary-color-3);
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 0.72rem;
+  text-align: right;
+}
+
+.lm-attention {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+  gap: 16px;
+}
+
+.lm-head {
+  display: grid;
+  gap: 6px;
+}
+
+.lm-head-label {
+  color: var(--secondary-color-3);
+  font-family: "Geist Mono", ui-monospace, monospace;
+  font-size: 0.68rem;
+}
+
+/* The map keeps its own dark ground in both themes: a probability rendered
+ * as opacity only reads against one background. */
+.lm-map {
+  display: block;
+  width: 100%;
+  aspect-ratio: 1;
+  border: 1px solid var(--primary-color-6);
+  border-radius: var(--radius-sm);
+  background: #101317;
+  image-rendering: pixelated;
+}
+
+.lm-neighbours {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(190px, 1fr));
+  gap: 6px 16px;
+}
+
+.lm-neighbour {
+  display: flex;
+  gap: 4px;
+  align-items: center;
+}
+
+@media (max-width: 760px) {
+  .lm-attention {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 }

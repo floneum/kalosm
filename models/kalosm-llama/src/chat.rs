@@ -28,19 +28,49 @@ fn get_new_tokens(
         .ok_or(LlamaModelError::NoChatTemplate)?;
     let bos_token = &model.config.start_token_string;
     let eos_token = &model.config.stop_token_string;
-    let current_text = if session.history.is_empty() {
+    let has_eos = {
+        let cache = session
+            .session
+            .cache
+            .read()
+            .map_err(|err| LlamaModelError::Session(err.to_string()))?;
+        cache.pending_token.or_else(|| cache.tokens.last().copied())
+            == Some(model.config.stop_token)
+    };
+    format_new_tokens(
+        messages,
+        &mut session.history,
+        chat_template,
+        bos_token,
+        eos_token,
+        has_eos,
+    )
+}
+
+fn format_new_tokens(
+    messages: &[ChatMessage],
+    history: &mut Vec<ChatMessage>,
+    chat_template: &crate::chat_template::HuggingFaceChatTemplate,
+    bos_token: &str,
+    eos_token: &str,
+    has_eos: bool,
+) -> Result<String, LlamaModelError> {
+    let current_text = if history.is_empty() {
         String::new()
     } else {
-        let old_formatted_text =
-            chat_template.format(bos_token, eos_token, &session.history, true)?;
-        // Some chat templates (like llama v3) always include the generation prompt even when we tell them not to. If they do, try to strip it off
+        let old_formatted_text = chat_template.format(bos_token, eos_token, history, true)?;
+        // Leave the turn terminator in the new suffix unless it is already cached.
         let (before_last_eos, _) = old_formatted_text
             .rsplit_once(eos_token)
             .unwrap_or((&old_formatted_text, ""));
-        before_last_eos.to_string() + eos_token
+        if has_eos {
+            before_last_eos.to_string() + eos_token
+        } else {
+            before_last_eos.to_string()
+        }
     };
-    session.history.extend_from_slice(messages);
-    let updated_text = chat_template.format(bos_token, eos_token, &session.history, true)?;
+    history.extend_from_slice(messages);
+    let updated_text = chat_template.format(bos_token, eos_token, history, true)?;
     let new_text = updated_text.strip_prefix(&current_text).ok_or_else(|| {
         LlamaModelError::ChatTemplateError(minijinja::Error::new(
             ErrorKind::InvalidOperation,
@@ -206,5 +236,41 @@ impl LlamaChatSession {
             history: Vec::new(),
             session,
         }
+    }
+}
+
+#[test]
+fn successive_chat_prompts_preserve_the_completed_turn() {
+    let template = crate::chat_template::HuggingFaceChatTemplate::create(
+        "{{ bos_token }}{% for message in messages %}{{ message['role'] }}:{{ message['content'] }}{{ eos_token }}{% endfor %}{% if add_generation_prompt %}assistant:{% endif %}",
+    )
+    .unwrap();
+    for (answer, eos_was_sampled) in [("answer", true), ("answer", false), ("", false)] {
+        let mut history = Vec::new();
+        let first = format_new_tokens(
+            &[ChatMessage::new(MessageType::UserMessage, "first")],
+            &mut history,
+            &template,
+            "<s>",
+            "</s>",
+            false,
+        )
+        .unwrap();
+        history.push(ChatMessage::new(MessageType::ModelAnswer, answer));
+        let next = format_new_tokens(
+            &[ChatMessage::new(MessageType::UserMessage, "next")],
+            &mut history,
+            &template,
+            "<s>",
+            "</s>",
+            eos_was_sampled,
+        )
+        .unwrap();
+        let sampled_end = if eos_was_sampled { "</s>" } else { "" };
+        assert_eq!(
+            first + answer + sampled_end + &next,
+            template.format("<s>", "</s>", &history, true).unwrap(),
+            "sampled EOS: {eos_was_sampled}",
+        );
     }
 }

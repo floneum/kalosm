@@ -1,30 +1,11 @@
-//! HOIST and RETARGET — one dependence query, answered two ways.
-//!
-//! The query is asked of every operand of a reduction nest: is this operand
-//! invariant along the reduction axis? It is decided on the read the edge
-//! actually performs — [`Operand::address_map`], with a single pure view
-//! collapsed into the layout first.
-//!
-//! * **HOIST** applies when the invariant operand is *not* derived from a
-//!   fold over the same axis. If `h` is a monoid homomorphism from `(+, e+)` to
-//!   `(x, ex)` then `h(Fold{+, a}(x)) == Fold{x, a}(Map{h}(x))`. Both
-//!   directions are minted and cost decides. The pairs live in
-//!   [`crate::carrier::HOM_TABLE`].
-//! * **RETARGET** applies when it *is*: a reduction-carried dependence on
-//!   another reduction over the same axis is discharged by carrying the
-//!   reference alongside and rescaling, per
-//!   [`crate::carrier::RETARGET_TABLE`] and [`crate::carrier::Carrier::retarget`].
-//!
-//! Neither rule names a producer, an op, a frontend chain or an algorithm;
-//! they match the shape of the feedback.
-//!
-//! They are two [`Rule`](crate::egraph::Rule) entries sharing one helper: the
-//! driver's fired set is per `(RuleId, Id)`, so a single merged rule could
-//! fire at most once per node.
+//! HOIST and RETARGET: one dependence query (is this operand invariant along the
+//! reduction axis?) answered two ways. HOIST applies a [`crate::carrier::HOM_TABLE`] row
+//! when the operand is not a fold over the same axis; RETARGET carries the reference
+//! alongside when it is. Two rules, since the fired set is per `(RuleId, Id)`.
 
 use crate::carrier::{
-    Carrier, HOM_TABLE, HomRow, HomShape, RETARGET_TABLE, RetargetRow, SlotTy, is_total_on,
-    map_args, probes_for,
+    Carrier, HOM_TABLE, HomRow, HomShape, RETARGET_TABLE, RetargetRow, SlotTy, commute_canon,
+    is_total_on, map_args,
 };
 use crate::dtype::{Dtype, Splat};
 use crate::egraph::{Builder, Facts, Id, RuleTag};
@@ -33,9 +14,9 @@ use crate::ir::logical::{Logical, TiePolicy};
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
 use crate::rules::{
-    access_legal_in, alias_operand_of, composed_layout, map_view, operand_dtypes, shift_args,
+    access_legal_in, alias_operand_of, composed_layout, fold_view, map_view, splice_args,
 };
-use crate::scalar::{BinOp, ScalarExpr, ScalarKind, UnOp};
+use crate::scalar::{BinOp, CmpOp, ScalarExpr, ScalarKind, UnOp};
 use crate::shape::{Dim, Layout};
 use smallvec::{SmallVec, smallvec};
 
@@ -55,31 +36,8 @@ rule!(
     apply = retarget,
 );
 
-/// The flat-index window `[lo, hi)` that `axis` owns in a row-major walk of
-/// `space`. `None` when a dim below `axis` is symbolic or the product
-/// overflows.
-fn axis_window(space: &IndexSpace, axis: u32) -> Option<(u64, u64)> {
-    let a = axis as usize;
-    let divisor = space
-        .dims
-        .get(a + 1..)?
-        .iter()
-        .try_fold(1u64, |acc, d| acc.checked_mul(d.as_const()?))?;
-    let modulus = space.dims.get(a)?.as_const()?;
-    Some((divisor, divisor.checked_mul(modulus)?))
-}
-
-/// Does the read `o` performs land on the *same element* for every value of
-/// `axis`?
-///
-/// `Some(true)` proves invariance, `Some(false)` proves variance, `None` means
-/// undecidable and every caller declines rather than guessing.
-///
-/// When the operand's layout is stated axis-for-axis against the space, its
-/// own stride along `axis` answers directly, even under a `Dim::Sym` extent.
-/// Otherwise the divmod form: no
-/// [`AddressTerm`](crate::ir::launch::AddressTerm) overlapping the axis's
-/// `(divisor, modulus)` window may carry a nonzero stride.
+/// Whether the read `o` performs lands on the same element for every value of `axis`;
+/// `None` when undecidable, and every caller declines.
 fn invariant_along(o: &Operand, space: &IndexSpace, axis: u32) -> Option<bool> {
     let a = axis as usize;
     if a >= space.rank() {
@@ -96,30 +54,15 @@ fn invariant_along(o: &Operand, space: &IndexSpace, axis: u32) -> Option<bool> {
         return match o.layout.strides()[a].as_const() {
             Some(0) => Some(true),
             Some(_) => Some(false),
-            // A symbolic stride over a non-unit axis is a real read at one
-            // binding and not at another; refuse.
+            // A symbolic stride over a non-unit axis is undecidable.
             None => space.dims[a].known_eq(Dim::ONE).then_some(true),
         };
     }
-    let (lo, hi) = axis_window(space, axis)?;
-    let map = o.address_map()?;
-    Some(!map.terms.iter().any(|t| {
-        let t_lo = u64::from(t.divisor);
-        let t_hi = t_lo.saturating_mul(u64::from(t.modulus));
-        t.stride != 0 && t_lo < hi && lo < t_hi
-    }))
+    o.varies_along(space, axis).map(|v| !v)
 }
 
-/// The read an operand edge actually performs, with one pure view collapsed
-/// into the layout, plus the id that read ultimately names.
-///
-/// The lowering floor spells a broadcast as a `Restride` node and gives the
-/// consuming edge a dense layout over the reading space, so the view's spec
-/// vector must be composed into the layout for the dependence query to see
-/// the read rather than the spelling.
-///
-/// Only a single-node spine is collapsed: composing a multi-node spec vector
-/// is decidable only once every extent is known.
+/// The read an operand edge performs, with a single-node pure view spine composed into
+/// the layout (the floor spells a broadcast as a `Restride`), plus the id it names.
 pub(crate) fn effective(b: &Builder<'_>, o: &Operand, space: &IndexSpace) -> (Operand, Id) {
     let plain = || (o.clone(), o.src);
     if !matches!(o.access, AccessPlan::Alias) || !o.layout.is_contiguous() {
@@ -154,8 +97,7 @@ pub(crate) fn effective(b: &Builder<'_>, o: &Operand, space: &IndexSpace) -> (Op
     }
 }
 
-/// Two edges that read the same elements of the same value, compared on `src`
-/// plus the index map.
+/// Whether two edges read the same elements of the same value.
 fn same_read(a: &Operand, b: &Operand) -> bool {
     if a.src != b.src || std::mem::discriminant(&a.access) != std::mem::discriminant(&b.access) {
         return false;
@@ -169,28 +111,22 @@ fn same_read(a: &Operand, b: &Operand) -> bool {
     }
 }
 
-/// One step of an `accum`-endomorphism surround, as it appears on the path from
-/// a lift's root down to a folded subterm.
-///
-/// The folded subterm may sit anywhere on such a path, not only at the lift's
-/// root.
+/// One step of an `accum`-endomorphism surround on the path from a lift's root down to
+/// a folded subterm.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Peel {
     /// `y |-> y * s`, an `(R, +)`-endomorphism.
     Mul(ScalarExpr),
     /// `y |-> y / s`.
     Div(ScalarExpr),
-    /// `y |-> y + s`, an `(R, max)`- and `(R, min)`-endomorphism (translation),
-    /// and never an additive one.
+    /// `y |-> y + s`, a `max`/`min`-endomorphism (translation), never an additive one.
     Add(ScalarExpr),
     /// `y |-> -y`.
     Neg,
 }
 
 impl Peel {
-    /// The monoid this step acts through: `Mul` for a scalar multiplication,
-    /// `Add` for a translation. Two multiplications commute, two translations
-    /// commute, a multiplication and a translation do not.
+    /// The monoid this step acts through; steps commute only within one action.
     const fn action(&self) -> BinOp {
         match self {
             Self::Mul(_) | Self::Div(_) | Self::Neg => BinOp::Mul,
@@ -198,10 +134,7 @@ impl Peel {
         }
     }
 
-    /// Apply this step, dropping a multiplication by one and an addition of
-    /// zero. A retargeted body lift is this chain applied to the action's
-    /// identity, so an un-simplified `1 * v` would cost one multiply per
-    /// element per lane.
+    /// Apply this step, dropping a multiplication by one and an addition of zero.
     fn apply(&self, y: ScalarExpr) -> ScalarExpr {
         match self {
             Self::Mul(s) => {
@@ -243,12 +176,8 @@ const fn peel_legal_in(accum: BinOp, p: &Peel) -> bool {
     )
 }
 
-/// Peel the `accum`-linear surround off `e` on the path to the first subterm
-/// `hit` accepts. `peels[0]` is the outermost step.
-///
-/// The sibling of every step must be free of the subterm, and
-/// `|peels| + |inner| < |e|` strictly, so the laws that call this are
-/// well-founded.
+/// Peel the `accum`-linear surround off `e` down to the first subterm `hit` accepts,
+/// `peels[0]` outermost. Every sibling must be free of the subterm.
 fn linear_factor(
     e: &ScalarExpr,
     accum: BinOp,
@@ -296,102 +225,34 @@ fn apply_peels(peels: &[Peel], seed: ScalarExpr) -> ScalarExpr {
     peels.iter().rev().fold(seed, |acc, p| p.apply(acc))
 }
 
-fn children_of(e: &ScalarExpr) -> SmallVec<[ScalarExpr; 3]> {
-    use ScalarKind as K;
-    match e.kind() {
-        K::Un { x, .. }
-        | K::Cast { x, .. }
-        | K::Bitcast { x, .. }
-        | K::Round { x, .. }
-        | K::Splat { x, .. } => smallvec![x.clone()],
-        K::Bin { a, b, .. } | K::Cmp { a, b, .. } | K::Dot { a, b } => {
-            smallvec![a.clone(), b.clone()]
-        }
-        K::Select { c, t, f } => smallvec![c.clone(), t.clone(), f.clone()],
-        _ => SmallVec::new(),
-    }
-}
-
 fn contains(e: &ScalarExpr, pred: &dyn Fn(&ScalarExpr) -> bool) -> bool {
-    pred(e) || children_of(e).iter().any(|c| contains(c, pred))
+    let mut found = false;
+    e.walk(&mut |e| found = found || pred(e));
+    found
 }
 
 fn reads_arg(e: &ScalarExpr, i: u32) -> bool {
     contains(e, &|x| matches!(x.kind(), ScalarKind::Arg(j) if *j == i))
 }
 
-fn reads_any_index(e: &ScalarExpr) -> bool {
-    contains(e, &|x| matches!(x.kind(), ScalarKind::IndexOf(_)))
+fn is_lit_value(e: &ScalarExpr, v: f64) -> bool {
+    matches!(e.kind(), ScalarKind::Lit(l) if l.0.to_f64() == v)
 }
 
-fn arg_indices(e: &ScalarExpr, out: &mut Vec<u32>) {
-    if let ScalarKind::Arg(i) = e.kind()
-        && !out.contains(i)
-    {
-        out.push(*i);
-    }
-    for c in children_of(e) {
-        arg_indices(&c, out);
-    }
-}
-
-fn is_lit_value(e: &ScalarExpr, v: f32) -> bool {
-    matches!(e.kind(), ScalarKind::Lit(l) if splat_f32(l.0) == v)
-}
-
-fn splat_f32(s: Splat) -> f32 {
-    match s {
-        Splat::F32(v) => v,
-        Splat::F16(b) => half::f16::from_bits(b).to_f32(),
-        Splat::BF16(b) => half::bf16::from_bits(b).to_f32(),
-        Splat::U32(v) => v as f32,
-        Splat::I32(v) => v as f32,
-    }
-}
-
-/// Sort every commutative binop's children into a fixed order, so a guard
-/// spelled `Add(Arg(k), Arg(w + k))` still matches `Add(Arg(w + k), Arg(k))`.
-///
-/// `ScalarExpr` does not canonicalize on construction and the e-graph
-/// canonicalizes only `Op::Union` children.
-fn canon(e: &ScalarExpr) -> ScalarExpr {
-    use ScalarKind as K;
-    match e.kind() {
-        K::Un { op, x } => ScalarExpr::un(*op, canon(x)),
-        K::Bin { op, a, b } => {
-            let (a, b) = (canon(a), canon(b));
-            if op.is_commutative() && b.structural_hash() < a.structural_hash() {
-                ScalarExpr::bin(*op, b, a)
-            } else {
-                ScalarExpr::bin(*op, a, b)
-            }
-        }
-        K::Cmp { op, a, b } => ScalarExpr::cmp(*op, canon(a), canon(b)),
-        K::Select { c, t, f } => ScalarExpr::select(canon(c), canon(t), canon(f)),
-        K::Cast { to, x } => ScalarExpr::cast(*to, canon(x)),
-        K::Bitcast { to, x } => ScalarExpr::bitcast(*to, canon(x)),
-        K::Round { mode, x } => ScalarExpr::round(*mode, canon(x)),
-        _ => e.clone(),
-    }
-}
-
+/// Equal modulo commutation.
 fn expr_eq(a: &ScalarExpr, b: &ScalarExpr) -> bool {
-    a == b || canon(a) == canon(b)
+    a == b || commute_canon(a) == commute_canon(b)
 }
 
-/// Drop operand edges no lift reads any more, renumbering what is left.
-/// `None` when every operand is still read.
-///
-/// An edge the body never reads is traffic the cost model charges and the
-/// kernel never performs; keeping it would price the hoisted form at the
-/// unhoisted form's bandwidth.
+/// Drop operand edges no lift reads, renumbering the rest; `None` when all are read.
+/// An unread edge would be charged traffic the kernel never performs.
 fn prune_operands(
     lifts: &[ScalarExpr],
     ops: &[Operand],
 ) -> Option<(SmallVec<[ScalarExpr; 4]>, Vec<Operand>)> {
     let mut used: Vec<u32> = Vec::new();
     for l in lifts {
-        arg_indices(l, &mut used);
+        l.collect_args(&mut used);
     }
     used.retain(|i| (*i as usize) < ops.len());
     used.sort_unstable();
@@ -405,10 +266,8 @@ fn prune_operands(
     ))
 }
 
-/// The binop a single-slot carrier accumulates with, modulo commutation.
-///
-/// Admits a `Vector` slot: promotion changes a slot's width, never its
-/// algebra.
+/// The binop a single-slot carrier accumulates with, modulo commutation. A `Vector`
+/// slot is admitted: promotion changes width, not algebra.
 fn single_slot_accum(c: &Carrier) -> Option<BinOp> {
     (c.width() == 1).then(|| slot_accum(c, 0)).flatten()
 }
@@ -423,14 +282,15 @@ fn slot_accum(c: &Carrier, k: usize) -> Option<BinOp> {
     let (lhs, rhs) = (ScalarKind::Arg(k as u32), ScalarKind::Arg((w + k) as u32));
     let forward = a.kind() == &lhs && b.kind() == &rhs;
     let swapped = a.kind() == &rhs && b.kind() == &lhs;
-    (forward || (swapped && op.is_commutative())).then_some(*op)
+    (forward || (swapped && op.is_commutative()))
+        .then_some(*op)
+        .filter(|op| Carrier::binop_identity(*op, c.identity[k].dtype()) == Some(c.identity[k]))
 }
 
 /// One matched application of a [`HomRow`]'s `h` inside a lift.
 struct HMatch {
     row: &'static HomRow,
-    /// The invariant side, over the *fold's* `Arg` numbering. `None` for a
-    /// unary row.
+    /// The invariant side, over the fold's `Arg` numbering; `None` for a unary row.
     c: Option<ScalarExpr>,
     /// The subterm `h` was applied to.
     inner: ScalarExpr,
@@ -507,53 +367,40 @@ fn match_h(
             HomShape::TotalMonotone(op) | HomShape::TotalAntitone(op),
             ScalarKind::Un { op: got, x },
         ) if *got == op => {
-            // A monotone row over a unary that is partial on the operand
-            // dtype can turn a number into a NaN.
+            // A partial unary could turn a number into a NaN.
             is_total_on(op, x.dtype()).then(|| mk(None, x)).flatten()
         }
         _ => None,
     }
 }
 
-/// A literal that scales: not zero (which is not invertible) and not one (which
-/// would make the rewrite a no-op that still costs a node).
+/// A literal that scales: neither zero (not invertible) nor one (a no-op).
 fn is_scaling_lit(e: &ScalarExpr) -> bool {
     matches!(e.kind(), ScalarKind::Lit(l)
-        if splat_f32(l.0) != 0.0 && splat_f32(l.0) != 1.0)
+        if l.0.to_f64() != 0.0 && l.0.to_f64() != 1.0)
 }
 
-/// Does the identity this row states depend on the sign of its factor?
-///
-/// Scaling an extremum by a negative number swaps the extremum, and an
-/// axis-invariant layout proves invariance, not positivity; those rows admit
-/// a `Lit`, whose sign is decidable, and nothing else.
-///
-/// Scaling an additive fold is sign-blind — `sum(x * c) == sum(x) * c` holds
-/// for every `c` — so any axis-invariant expression is admissible.
+/// Whether this row's identity depends on the factor's sign: a negative scale swaps an
+/// extremum, so those rows admit only a literal.
 const fn sign_sensitive(row: &HomRow) -> bool {
     matches!(row.h, HomShape::MulByLit | HomShape::DivByLit)
         && matches!(row.from, BinOp::Max | BinOp::Min)
 }
 
-/// May `c` be peeled out as this row's factor?
-///
-/// The sign-sensitive branch demands a **positive** literal:
-/// `max(x * -2) == min(x) * -2`, not `max(x) * -2`.
+/// Whether `c` may be peeled out as this row's factor; a sign-sensitive row demands a
+/// positive literal.
 fn admissible_scale(c: &ScalarExpr, row: &HomRow, invariant: &dyn Fn(&ScalarExpr) -> bool) -> bool {
-    // A no-op factor is still a node the outer map has to evaluate.
     if is_lit_value(c, 1.0) || is_lit_value(c, 0.0) {
         return false;
     }
     if sign_sensitive(row) {
-        return is_scaling_lit(c) && matches!(c.kind(), ScalarKind::Lit(l) if splat_f32(l.0) > 0.0);
+        return is_scaling_lit(c) && matches!(c.kind(), ScalarKind::Lit(l) if l.0.to_f64() > 0.0);
     }
     invariant(c)
 }
 
-/// The monoid `h` acts through, for commutation purposes. `None` means `h` is
-/// neither a scalar multiplication nor a translation (`exp` is that case) and
-/// admits no surround at all; with no surround there is nothing to commute
-/// with, and the row still fires at the root.
+/// The monoid `h` acts through, or `None` (e.g. `exp`) when `h` admits no surround and
+/// fires only at the root.
 const fn h_action(h: HomShape) -> Option<BinOp> {
     match h {
         HomShape::MulByLit | HomShape::DivByLit | HomShape::TotalAntitone(UnOp::Neg) => {
@@ -564,17 +411,9 @@ const fn h_action(h: HomShape) -> Option<BinOp> {
     }
 }
 
-/// The homomorphism theorem, read outward and inward.
-///
-/// Outward: a lift of the form `L(h(inner))` — `h` applied anywhere on an
-/// `accum`-linear path — becomes `Fold{row.from}(L(inner))` with `h` applied
-/// once, outside.
-///
-/// Inward: a `post` of the form `h(Arg(0))` moves into the lift and the
-/// accumulator becomes `row.to`. Both alternatives stay live; cost decides.
-///
-/// Greedy: every hoistable factor is peeled in one firing, and `|lift|`
-/// strictly decreases at each step, so the law is well-founded.
+/// The homomorphism theorem both ways: a lift `L(h(inner))` becomes `h` applied outside
+/// `Fold{row.from}(L(inner))`, and a `post` `h(Arg(0))` moves into the lift. Both stay
+/// live; each peel strictly shrinks the lift.
 pub fn hoist(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Launch(Launch::Fold {
         carrier, acc, post, ..
@@ -585,8 +424,7 @@ pub fn hoist(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<
     if acc.accum_bits() < f.own().numeric.min_accum_bits {
         return None;
     }
-    // One slot only: a multi-slot carrier couples its slots through `merge`,
-    // so changing one slot's monoid changes what every sibling reads.
+    // One slot only: a multi-slot merge couples its slots.
     if carrier.width() != 1 || post.len() != 1 {
         return None;
     }
@@ -602,21 +440,22 @@ fn hoist_outward(
     f: &Facts<'_>,
     accum: BinOp,
 ) -> Option<Id> {
-    let Op::Launch(Launch::Fold {
-        space,
-        axis,
-        vec_axes,
-        carrier,
-        acc,
-        post,
-        ops,
-        sched,
-    }) = &node.op
+    let Op::Launch(
+        op @ Launch::Fold {
+            space,
+            axis,
+            vec_axes,
+            carrier,
+            acc,
+            post,
+            ops,
+            ..
+        },
+    ) = &node.op
     else {
         return None;
     };
-    // The peeled factor ends up outside the reduced axis and every promoted
-    // axis: a factor that varies across lanes cannot be applied once at the end.
+    // The peeled factor is applied once outside the reduced and promoted axes.
     let outside: SmallVec<[u32; 4]> = std::iter::once(*axis)
         .chain(vec_axes.iter().copied())
         .collect();
@@ -630,17 +469,16 @@ fn hoist_outward(
         })
         .collect();
     let is_invariant = |e: &ScalarExpr| -> bool {
-        if reads_any_index(e) {
+        if e.reads_index_of() {
             return false;
         }
         let mut used = Vec::new();
-        arg_indices(e, &mut used);
+        e.collect_args(&mut used);
         used.iter()
             .all(|&i| inv.get(i as usize).copied() == Some(true))
     };
 
-    // Peel greedily. Each step narrows the lift and records the `h` that has to
-    // be re-applied outside, outermost first.
+    // Peel greedily, recording each `h` to re-apply outside, outermost first.
     let mut lift = carrier.lift[0].clone();
     let mut cur = accum;
     let mut peeled: Vec<HMatch> = Vec::new();
@@ -651,10 +489,8 @@ fn hoist_outward(
         .find_map(|row| {
             let (peels, matched) =
                 linear_factor(&lift, cur, &|e| match_h(e, row, &is_invariant).is_some())?;
-            // `L` has to be an endomorphism of both monoids and commute with
-            // `h`: `Fold{to}(L(h(x))) = Fold{to}(h(L(x))) = h(Fold{from}(L(x)))`
-            // needs each equality in turn. An empty surround is `L = id` and
-            // asks nothing of the row's action.
+            // `L` must be an endomorphism of both monoids and commute with `h`;
+            // an empty surround is `L = id`.
             if !peels.is_empty() {
                 let action = h_action(row.h)?;
                 if !peels
@@ -665,7 +501,7 @@ fn hoist_outward(
                 }
             }
             let m = match_h(&matched, row, &is_invariant)?;
-            if m.c.as_ref().is_some_and(reads_any_index) {
+            if m.c.as_ref().is_some_and(ScalarExpr::reads_index_of) {
                 return None;
             }
             Some((peels, m))
@@ -679,8 +515,7 @@ fn hoist_outward(
         return None;
     }
 
-    // Everything that can still decline is decided before anything is minted,
-    // so a declined firing leaves no orphan.
+    // Decide everything that can decline before minting anything.
     let base = if cur == accum {
         carrier.clone()
     } else {
@@ -691,20 +526,16 @@ fn hoist_outward(
         None => (smallvec![lift], ops.clone()),
     };
     let inner_carrier = base.with_lift(inner_lift);
-    if !inner_carrier.identity_closed(probes_for(*acc)) {
-        return None;
-    }
 
-    // The outer map reads the fold plus whichever invariant operands the peeled
-    // factors name, each re-viewed at the fold's own output space. Slot 0 is
-    // reserved for the fold itself.
+    // The outer map reads the fold (slot 0) plus the invariant operands the peeled
+    // factors name, re-viewed at the fold's output space.
     let out_shape: Vec<Dim> = f.own().shape.to_vec();
     let mut projected: Vec<Operand> = Vec::new();
     let mut slot_of: Vec<(u32, u32)> = Vec::new();
     for m in &peeled {
         let Some(c) = &m.c else { continue };
         let mut used = Vec::new();
-        arg_indices(c, &mut used);
+        c.collect_args(&mut used);
         for i in used {
             if slot_of.iter().any(|(j, _)| *j == i) {
                 continue;
@@ -731,25 +562,14 @@ fn hoist_outward(
         body = m.apply(body, &remap);
     }
     let body = post[0].compose(&[body]);
-    // A `post` that casts would make the map and the fold two different values
-    // and the union a lie.
+    // A casting `post` would make the union a lie.
     if body.dtype() != f.own().dtype {
         return None;
     }
 
-    // The inner fold: same slot shape, `cur` as the accumulation, an identity
-    // `post`, and no edge for the factor that just left.
+    // The inner fold: `cur` accumulation, identity `post`, no edge for the factor.
     let inner = b
-        .add_launch(Launch::Fold {
-            space: space.clone(),
-            axis: *axis,
-            vec_axes: vec_axes.clone(),
-            carrier: inner_carrier,
-            acc: *acc,
-            post: smallvec![ScalarExpr::arg(0, *acc)],
-            ops: inner_ops,
-            sched: sched.clone(),
-        })
+        .add_launch(with_fold(op, inner_carrier, *acc, Some(inner_ops)))
         .ok()?;
     let mut outer_ops = vec![alias_operand_of(inner, &out_shape)];
     outer_ops.extend(projected);
@@ -762,9 +582,8 @@ fn hoist_outward(
     b.union(id, outer).ok()
 }
 
-/// `h(Fold{from}(x)) == Fold{to}(Map{h}(x))`, read left to right: a closed `h`
-/// sitting in `post` moves into the lift. Minted so both directions compete;
-/// `h` must be closed because a `post` reads accumulator slots, not operands.
+/// `h(Fold{from}(x)) == Fold{to}(Map{h}(x))` left to right: a closed `h` in `post`
+/// moves into the lift.
 fn hoist_inward(
     b: &mut Builder<'_>,
     id: Id,
@@ -772,23 +591,18 @@ fn hoist_inward(
     f: &Facts<'_>,
     accum: BinOp,
 ) -> Option<Id> {
-    let Op::Launch(Launch::Fold {
-        space,
-        axis,
-        vec_axes,
-        carrier,
-        acc,
-        post,
-        ops,
-        sched,
-    }) = &node.op
+    let Op::Launch(
+        op @ Launch::Fold {
+            carrier, acc, post, ..
+        },
+    ) = &node.op
     else {
         return None;
     };
     let closed = |e: &ScalarExpr| -> bool {
         let mut used = Vec::new();
-        arg_indices(e, &mut used);
-        used.is_empty() && !reads_any_index(e)
+        e.collect_args(&mut used);
+        used.is_empty() && !e.reads_index_of()
     };
     let (row, m) = HOM_TABLE
         .iter()
@@ -800,26 +614,30 @@ fn hoist_inward(
         })?;
     let pushed = rebind_accum(carrier, row.to, *acc)?
         .with_lift([m.apply(carrier.lift[0].clone(), &|c| c.clone())]);
-    if !pushed.identity_closed(probes_for(*acc)) {
-        return None;
-    }
-    let alt = b
-        .add_launch(Launch::Fold {
-            space: space.clone(),
-            axis: *axis,
-            vec_axes: vec_axes.clone(),
-            carrier: pushed,
-            acc: *acc,
-            post: smallvec![ScalarExpr::arg(0, *acc)],
-            ops: ops.clone(),
-            sched: sched.clone(),
-        })
-        .ok()?;
+    let alt = b.add_launch(with_fold(op, pushed, *acc, None)).ok()?;
     b.union(id, alt).ok()
 }
 
-/// The same single-slot carrier accumulating with `op` instead: new identity,
-/// new merge, the slot shape and the tie policy carried through.
+/// `fold` accumulating through `carrier` with an identity `post`, reading `ops` if given.
+fn with_fold(fold: &Launch, carrier: Carrier, acc: Dtype, ops: Option<Vec<Operand>>) -> Launch {
+    let mut out = fold.clone();
+    if let Launch::Fold {
+        carrier: c,
+        post,
+        ops: o,
+        ..
+    } = &mut out
+    {
+        *c = carrier;
+        *post = smallvec![ScalarExpr::arg(0, acc)];
+        if let Some(ops) = ops {
+            *o = ops;
+        }
+    }
+    out
+}
+
+/// The same single-slot carrier accumulating with `op`, keeping slot shape and tie.
 fn rebind_accum(c: &Carrier, op: BinOp, acc: Dtype) -> Option<Carrier> {
     Some(Carrier {
         slots: c.slots.clone(),
@@ -835,11 +653,8 @@ fn rebind_accum(c: &Carrier, op: BinOp, acc: Dtype) -> Option<Carrier> {
     })
 }
 
-/// An operand restated as a plain strided read over `space`.
-///
-/// An `Unflatten` map with one sub-axis per logical axis is a stride vector —
-/// the two spellings denote the same read. A map with several sub-axes per
-/// axis is a genuine divmod decomposition and is left alone.
+/// An operand restated as a plain strided read over `space`; an `Unflatten` with one
+/// sub-axis per axis is a stride vector.
 pub(crate) fn as_alias_over(o: &Operand, space: &IndexSpace) -> Option<Operand> {
     if matches!(o.access, AccessPlan::Alias) && o.layout.rank() == space.rank() {
         return Some(o.clone());
@@ -867,27 +682,38 @@ pub(crate) fn as_alias_over(o: &Operand, space: &IndexSpace) -> Option<Operand> 
     })
 }
 
-/// A read stated over the full `space`, restated over the iteration space.
-///
-/// `None` when the operand varies along a promoted axis: such a value is not
-/// a function of the iteration coordinate, so no nest over the iteration
-/// space can produce it.
+/// A read over the full `space` restated over the iteration space; `None` when it
+/// varies along a promoted axis.
 pub(crate) fn on_iter_space(o: &Operand, space: &IndexSpace, vec_axes: &[u32]) -> Option<Operand> {
     if vec_axes.is_empty() {
         return Some(o.clone());
     }
     let o = as_alias_over(o, space)?;
-    let mut shape: Vec<Dim> = Vec::new();
-    let mut strides: Vec<Dim> = Vec::new();
-    for i in 0..space.rank() {
-        if vec_axes.contains(&(i as u32)) {
-            if o.layout.strides()[i].as_const() != Some(0) {
-                return None;
-            }
-            continue;
-        }
-        shape.push(o.layout.shape()[i]);
-        strides.push(o.layout.strides()[i]);
+    if vec_axes.iter().any(|a| {
+        o.layout
+            .strides()
+            .get(*a as usize)
+            .is_some_and(|s| s.as_const() != Some(0))
+    }) {
+        return None;
+    }
+    drop_axes(&o, vec_axes, None)
+}
+
+/// An alias with the axes in `drop` removed, then a stride-0 `lanes` axis appended.
+fn drop_axes(o: &Operand, drop: &[u32], lanes: Option<Dim>) -> Option<Operand> {
+    let (mut shape, mut strides): (Vec<Dim>, Vec<Dim>) = o
+        .layout
+        .shape()
+        .iter()
+        .zip(o.layout.strides())
+        .enumerate()
+        .filter(|(i, _)| !drop.contains(&(*i as u32)))
+        .map(|(_, (d, s))| (*d, *s))
+        .unzip();
+    if let Some(lanes) = lanes {
+        shape.push(lanes);
+        strides.push(Dim::Const(0));
     }
     Some(Operand {
         src: o.src,
@@ -902,45 +728,20 @@ fn project_operand(
     drop: &[u32],
     carrier: &Carrier,
 ) -> Option<Operand> {
-    // Alias only: restating an affine `Unflatten` here lets the rule fire on
-    // nests it must decline (three GPU sampling cases — top-p, min-p,
-    // mirostat — computed wrong values). If an edge arrives here as
-    // `Unflatten`, the fix is at the mint.
+    // Alias only: restating an affine `Unflatten` here miscomputes; fix such an edge
+    // at its mint.
     if !matches!(o.access, AccessPlan::Alias) {
         return None;
     }
-    let o = &as_alias_over(o, space)?;
-    let mut shape: Vec<Dim> = Vec::new();
-    let mut strides: Vec<Dim> = Vec::new();
-    for i in 0..space.rank() {
-        if drop.contains(&(i as u32)) {
-            continue;
-        }
-        shape.push(o.layout.shape()[i]);
-        strides.push(o.layout.strides()[i]);
-    }
-    if let Some(lanes) = carrier.out_dim()? {
-        shape.push(lanes);
-        strides.push(Dim::Const(0));
-    }
-    Some(Operand {
-        src: o.src,
-        layout: Layout::from_parts(o.layout.offset(), &shape, &strides).ok()?,
-        access: AccessPlan::Alias,
-    })
+    drop_axes(&as_alias_over(o, space)?, drop, carrier.out_dim()?)
 }
 
-/// Hole indices no operand can occupy, used to read a table row's own action
-/// back out of it.
+/// Hole indices no operand can occupy, for reading a row's action back out.
 const HOLE_D: u32 = u32::MAX - 1;
 const HOLE_V: u32 = u32::MAX;
 
-/// Read `T` out of a [`RetargetRow`]: apply the row's own `retarget` to two
-/// holes and classify the result.
-///
-/// Returns the monoid `T` acts through and `h(delta)` as a template over
-/// [`HOLE_D`]. A row whose `T` is not `v (+) f(delta)` for a single binop is
-/// declined rather than guessed at.
+/// Read `T` out of a [`RetargetRow`] by applying it to two holes: the monoid it acts
+/// through and `h(delta)` over [`HOLE_D`]. Declines anything but `v (+) f(delta)`.
 fn row_action(row: &RetargetRow, dtype: Dtype) -> Option<(BinOp, ScalarExpr)> {
     let d = ScalarExpr::arg(HOLE_D, dtype);
     let v = ScalarExpr::arg(HOLE_V, dtype);
@@ -956,8 +757,7 @@ fn row_action(row: &RetargetRow, dtype: Dtype) -> Option<(BinOp, ScalarExpr)> {
     None
 }
 
-/// Does `e` equal `template[HOLE_D := (u - Arg(ref_arg))]`, for one `u` shared
-/// by every call? Compared modulo commutation.
+/// Whether `e` is `template[HOLE_D := (u - Arg(ref_arg))]` for one shared `u`.
 fn match_shift(
     e: &ScalarExpr,
     template: &ScalarExpr,
@@ -1025,26 +825,13 @@ fn match_shift(
 struct RefFold {
     id: Id,
     carrier: Carrier,
-    /// The reference's element expression, renumbered onto the reading fold's
-    /// operand list.
+    /// The reference's element expression over the reading fold's operands.
     lift: ScalarExpr,
 }
 
-/// A reduction-carried dependence on another reduction over the same axis is
-/// discharged by carrying the reference alongside and rescaling.
-///
-/// The rule names no producer. What it matches is an operand with no stride
-/// over the reduced axis whose value is a fold over that same axis of reads
-/// this fold already performs, and whose element expression is exactly the
-/// `u` this fold subtracts. One [`RETARGET_TABLE`] row must cover every
-/// retargeted slot's lift after `linear_factor` peels each slot's surround.
-///
-/// The law never invents a reference: it fires only where the source program
-/// already computed one.
-///
-/// Two unions are written: this fold to the body slot view, and the reference
-/// fold to the reference slot view. Without the second, extraction keeps
-/// computing the reference separately.
+/// A reduction-carried dependence on another reduction over the same axis, discharged
+/// by carrying the reference alongside and rescaling. Fires only where the program
+/// already computes the reference, and redirects only this reader.
 pub fn retarget(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Launch(Launch::Fold {
         space,
@@ -1067,18 +854,9 @@ pub fn retarget(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opti
         return None;
     }
 
-    // The reference is a nest over the ITERATION space, one rank shorter than
-    // the space this node states its operand maps against, so the two operand
-    // lists are comparable only after projection. With no promoted axis
-    // `iter == space`, `iter_axis == axis` and `proj == reads`.
-    let iter = IndexSpace::new(
-        space
-            .dims
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| !vec_axes.contains(&(*i as u32)))
-            .map(|(_, d)| *d),
-    );
+    // The reference is a nest over the iteration space; compare operands after
+    // projecting onto it.
+    let iter = space.iterated(vec_axes);
     let iter_axis = *axis - vec_axes.len() as u32;
     let reads: Vec<(Operand, Id)> = ops.iter().map(|o| effective(b, o, space)).collect();
     let proj: Vec<(Operand, Id)> = reads
@@ -1091,8 +869,7 @@ pub fn retarget(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opti
         })
         .collect();
     for r in 0..ops.len() {
-        // An operand that varies along a promoted axis cannot name a
-        // reference over the iteration space.
+        // A read varying along a promoted axis cannot name such a reference.
         if on_iter_space(&reads[r].0, space, vec_axes).is_none() {
             continue;
         }
@@ -1102,10 +879,8 @@ pub fn retarget(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opti
         let Some(reference) = reference_fold(b, reads[r].1, &iter, iter_axis, &proj) else {
             continue;
         };
-        // Acyclicity: no operand the joint fold keeps may be the reference,
-        // since the second union puts the reference's class above the joint
-        // node.
-        if (0..ops.len()).any(|i| i != r && class_members(b, reads[i].1).contains(&reference.id)) {
+        // Acyclicity: no kept operand may be the reference.
+        if (0..ops.len()).any(|i| i != r && b.class_members(reads[i].1).contains(&reference.id)) {
             continue;
         }
         if let Some(hit) = mint_retarget(b, id, node, r, &reference) {
@@ -1115,82 +890,7 @@ pub fn retarget(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opti
     None
 }
 
-/// The non-`Union` members reachable downward from `id`. A `Builder` cannot
-/// see a class's root, so this sees exactly the alternatives an operand edge
-/// already names.
-fn class_members(b: &Builder<'_>, id: Id) -> SmallVec<[Id; 8]> {
-    let mut out: SmallVec<[Id; 8]> = SmallVec::new();
-    let mut stack = vec![id];
-    while let Some(cur) = stack.pop() {
-        if out.contains(&cur) {
-            continue;
-        }
-        match &b.node(cur).op {
-            Op::Union(x, y) => {
-                stack.push(*x);
-                stack.push(*y);
-            }
-            _ => out.push(cur),
-        }
-    }
-    out
-}
-
-/// A reduction nest in either spelling — the `Logical::Fold` the frontend
-/// built or the `Launch::Fold` it was lowered to.
-///
-/// Equality in this e-graph is not congruent, so a consuming edge names
-/// whichever id it was handed while both denote the same value.
-struct FoldView {
-    space: IndexSpace,
-    axis: u32,
-    carrier: Carrier,
-    ops: Vec<Operand>,
-}
-
-fn fold_view(b: &Builder<'_>, id: Id) -> Option<FoldView> {
-    match b.node(id).op.clone() {
-        Op::Launch(Launch::Fold {
-            space,
-            axis,
-            vec_axes,
-            carrier,
-            post,
-            ops,
-            ..
-        }) => {
-            // A `post` means a reader sees `post(rho)` and not `rho`; there is
-            // nothing to redirect it to.
-            (vec_axes.is_empty() && post.len() == 1 && post[0].kind() == &ScalarKind::Arg(0))
-                .then_some(FoldView {
-                    space,
-                    axis,
-                    carrier,
-                    ops,
-                })
-        }
-        Op::Logical(Logical::Fold {
-            carrier, axis, ins, ..
-        }) => {
-            let space = IndexSpace::new(b.facts_of(*ins.first()?).shape.iter().copied());
-            let ops = ins
-                .iter()
-                .map(|&s| alias_operand_of(s, &b.facts_of(s).shape))
-                .collect();
-            Some(FoldView {
-                space,
-                axis,
-                carrier,
-                ops,
-            })
-        }
-        _ => None,
-    }
-}
-
-/// Is `src` a fold over the same axis of the same reads?
-///
-/// Pure address-map and id comparison; no producer is named.
+/// Whether `src` is a fold over the same axis of the same reads.
 fn reference_fold(
     b: &Builder<'_>,
     src: Id,
@@ -1198,8 +898,11 @@ fn reference_fold(
     axis: u32,
     reader: &[(Operand, Id)],
 ) -> Option<RefFold> {
-    for cand in class_members(b, src) {
-        let Some(v) = fold_view(b, cand) else {
+    for cand in b.class_members(src) {
+        // A `post` hides `rho` from readers.
+        let Some(v) = fold_view(b, cand).filter(|v| {
+            v.vec_axes.is_empty() && v.post.len() == 1 && v.post[0].kind() == &ScalarKind::Arg(0)
+        }) else {
             continue;
         };
         if v.axis != axis || v.carrier.width() != 1 {
@@ -1208,14 +911,7 @@ fn reference_fold(
         if v.carrier.slots[0] != SlotTy::Scalar || !v.carrier.associative {
             continue;
         }
-        if v.space.dims.len() != space.dims.len()
-            || !v
-                .space
-                .dims
-                .iter()
-                .zip(&space.dims)
-                .all(|(a, c)| a.known_eq(*c))
-        {
+        if v.space.dims != space.dims {
             continue;
         }
         let Some(lift) = common_basis(b, &v, reader) else {
@@ -1230,18 +926,16 @@ fn reference_fold(
     None
 }
 
-/// How many producers `common_basis` will substitute before giving up. This
-/// bounds work rather than deciding anything.
+/// Producers `common_basis` substitutes before giving up; bounds work only.
 const MAX_EXPANSIONS: usize = 8;
 
-/// The reference's element expression, rewritten over the reading fold's
-/// operand list, or `None` when the two folds have no common basis.
-///
-/// The two nests are absorbed independently, so the reference's expression is
-/// brought down to the reader's basis by the same substitution the fusion law
-/// performs, and the two are compared there. A producer is admitted only if
-/// it is an elementwise value at a covered index space.
-fn common_basis(b: &Builder<'_>, v: &FoldView, reader: &[(Operand, Id)]) -> Option<ScalarExpr> {
+/// The reference's lift rewritten over the reader's operands, substituting elementwise
+/// producers as fusion does; `None` without a common basis.
+fn common_basis(
+    b: &Builder<'_>,
+    v: &crate::rules::FoldView,
+    reader: &[(Operand, Id)],
+) -> Option<ScalarExpr> {
     let mut lift = v.carrier.lift[0].clone();
     let mut ops = v.ops.clone();
     for _ in 0..MAX_EXPANSIONS {
@@ -1268,28 +962,20 @@ fn common_basis(b: &Builder<'_>, v: &FoldView, reader: &[(Operand, Id)]) -> Opti
         {
             return None;
         }
-        let base = ops.len() - 1;
-        let body = shift_args(&inner.body, base as u32, &operand_dtypes(b, &inner.ops));
-        let args: Vec<ScalarExpr> = operand_dtypes(b, &ops)
-            .iter()
-            .enumerate()
-            .map(|(j, d)| match j.cmp(&slot) {
-                std::cmp::Ordering::Equal => body.clone(),
-                std::cmp::Ordering::Less => ScalarExpr::arg(j as u32, *d),
-                std::cmp::Ordering::Greater => ScalarExpr::arg(j as u32 - 1, *d),
-            })
-            .collect();
+        let (mut next, args) = splice_args(b, &ops, slot, &inner);
         lift = lift.compose(&args);
-        let mut next: Vec<Operand> = ops
-            .iter()
-            .enumerate()
-            .filter(|(j, _)| *j != slot)
-            .map(|(_, o)| o.clone())
-            .collect();
         next.extend(inner.ops.iter().cloned());
         ops = next;
     }
     None
+}
+
+fn float_magnitude_bits(value: ScalarExpr) -> ScalarExpr {
+    ScalarExpr::bin(
+        BinOp::BitAnd,
+        ScalarExpr::bitcast(Dtype::U32, ScalarExpr::cast(Dtype::F32, value)),
+        ScalarExpr::lit(Splat::U32(0x7fffffff)),
+    )
 }
 
 fn mint_retarget(
@@ -1299,16 +985,18 @@ fn mint_retarget(
     r: usize,
     reference: &RefFold,
 ) -> Option<Id> {
-    let Op::Launch(Launch::Fold {
-        space,
-        axis,
-        vec_axes,
-        carrier,
-        acc,
-        post,
-        ops,
-        sched,
-    }) = &node.op
+    let Op::Launch(
+        op @ Launch::Fold {
+            space,
+            axis,
+            vec_axes,
+            carrier,
+            acc,
+            post,
+            ops,
+            sched,
+        },
+    ) = &node.op
     else {
         return None;
     };
@@ -1316,8 +1004,7 @@ fn mint_retarget(
     let ref_arg = r as u32;
 
     for row in RETARGET_TABLE {
-        // The row's accumulation must be this carrier's, in every slot: the
-        // mint replaces each slot's merge with the retargeted form.
+        // Every slot must accumulate with the row's binop.
         if (0..w).any(|k| slot_accum(carrier, k) != Some(row.accum)) {
             continue;
         }
@@ -1336,9 +1023,7 @@ fn mint_retarget(
             continue;
         };
 
-        // One row must cover every slot simultaneously, after each slot's
-        // linear surround is peeled: every slot gets the same rescale factor
-        // or the law does not apply.
+        // One row must cover every slot after peeling: one rescale factor for all.
         let mut bound: Option<ScalarExpr> = None;
         let mut lifts: SmallVec<[ScalarExpr; 4]> = SmallVec::new();
         let mut ok = true;
@@ -1351,31 +1036,42 @@ fn mint_retarget(
                 ok = false;
                 break;
             };
-            // `commutes(T, L)`: `T` and every peeled `L` act through the same
-            // monoid, or they do not commute and the rescale is wrong.
+            // `T` and every peeled `L` must act through one monoid to commute.
             if !peels.iter().all(|p| p.action() == action)
                 || !match_shift(&matched, &template, ref_arg, &mut bound)
             {
                 ok = false;
                 break;
             }
-            // `h(e) = id`, so an element enters as `L(identity)` and the first
-            // element needs no special case.
+            // `h(e) = id`, so an element enters as `L(identity)`.
             lifts.push(apply_peels(&peels, ScalarExpr::lit(seed)));
         }
-        if !ok {
+        if !ok || lifts.iter().any(|e| reads_arg(e, ref_arg)) {
             continue;
         }
-        // The reference must be exactly what this fold subtracts, or the
-        // one-pass form seeds the accumulator with a value the two-pass form
-        // never referenced.
+        // The reference must be exactly what this fold subtracts.
         let u = bound?;
         if !expr_eq(&u, &reference.lift) {
             continue;
         }
+        let invalid = match row.accum {
+            BinOp::Add => ScalarExpr::cast(
+                *acc,
+                ScalarExpr::bitcast(Dtype::F32, ScalarExpr::lit(Splat::U32(0x7fc00000))),
+            ),
+            BinOp::Max => ScalarExpr::lit(Carrier::binop_identity(BinOp::Max, *acc)?),
+            _ => continue,
+        };
+        let nan_input = ScalarExpr::cmp(
+            CmpOp::Gt,
+            float_magnitude_bits(u.clone()),
+            ScalarExpr::lit(Splat::U32(0x7f800000)),
+        );
+        for lift in &mut lifts {
+            *lift = ScalarExpr::select(nan_input.clone(), invalid.clone(), lift.clone());
+        }
 
-        // Discharge the feedback operand: the joint fold reads the reference's
-        // own inputs, which is what makes the result acyclic by construction.
+        // The joint fold reads the reference's own inputs: acyclic by construction.
         let drop = |i: u32| if i > ref_arg { i - 1 } else { i };
         let new_ops: Vec<Operand> = ops
             .iter()
@@ -1386,8 +1082,7 @@ fn mint_retarget(
         if new_ops.is_empty() {
             continue;
         }
-        // Every lift of the joint node, in slot order, so an edge that only the
-        // discharged reference read is pruned once for all of them.
+        // Every joint lift, so an edge only the reference read is pruned once.
         let all: SmallVec<[ScalarExpr; 4]> = std::iter::once(map_args(&reference.lift, &drop))
             .chain(lifts.iter().map(|e| map_args(e, &drop)))
             .collect();
@@ -1408,73 +1103,82 @@ fn mint_retarget(
             tie: carrier.tie,
         };
         let joint = Carrier::retarget(&stat, row, &body, 0)?;
-        if !joint.identity_closed(probes_for(*acc)) {
-            continue;
-        }
-        // Slot ranges are counted in lanes, not slots: a `Vector` slot is as
-        // many lanes as it has positions.
+        // Slot ranges count lanes: a `Vector` slot is many.
         let (lanes, body_lanes) = (joint.lanes()?, carrier.lanes()?);
+        let sched = sched.with_fold_carrier(lanes, acc.byte_size(), b.caps())?;
         let Some(body_axis) = carrier.out_dim() else {
             continue;
         };
-        // The output's free dims: `space` minus the reduced axis and every
-        // promoted axis, since a promoted extent lives in the carrier's lanes.
-        let free: Vec<Dim> = space
-            .dims
-            .iter()
-            .enumerate()
-            .filter(|(i, _)| *i != *axis as usize && !vec_axes.contains(&(*i as u32)))
-            .map(|(_, d)| *d)
-            .collect();
-        // Both readbacks are checked expressible before the joint node
-        // exists, so a decline costs no orphan.
+        // Free dims: `space` minus the reduced and promoted axes.
+        let free = space.fold_out_dims(*axis, vec_axes);
+        // Check both readbacks before minting so a decline leaves no orphan.
         if !view_expressible(&free, lanes, 1, body_lanes, body_axis)
             || !view_expressible(&free, lanes, 0, 1, None)
         {
             continue;
         }
 
-        // Slot 0 is the reference; the rest are this fold's, so every `post`
-        // shifts by one and the reference's is the identity.
+        // A nonempty row with a nonfinite reference keeps the shifted result.
+        let nonempty = match space.dims[*axis as usize] {
+            Dim::Const(n) => ScalarExpr::lit(Splat::U32(u32::from(n != 0))),
+            Dim::Sym(crate::shape::OPAQUE_SYM) => continue,
+            Dim::Sym(sym) => ScalarExpr::cmp(
+                CmpOp::Ne,
+                ScalarExpr::uniform(sym, Dtype::U32),
+                ScalarExpr::lit(Splat::U32(0)),
+            ),
+        };
+        let invalid_reference = ScalarExpr::bin(
+            BinOp::BitAnd,
+            nonempty,
+            ScalarExpr::cmp(
+                CmpOp::Ge,
+                float_magnitude_bits(ScalarExpr::arg(0, *acc)),
+                ScalarExpr::lit(Splat::U32(0x7f800000)),
+            ),
+        );
+        let finalized: Vec<_> = (0..w)
+            .map(|i| {
+                ScalarExpr::select(
+                    invalid_reference.clone(),
+                    invalid.clone(),
+                    ScalarExpr::arg(i as u32 + 1, *acc),
+                )
+            })
+            .collect();
         let joint_post: SmallVec<[ScalarExpr; 4]> = std::iter::once(ScalarExpr::arg(0, *acc))
-            .chain(post.iter().map(|e| map_args(e, &|i| i + 1)))
+            .chain(post.iter().map(|e| e.compose(&finalized)))
             .collect();
 
-        let joint_id = b
-            .add_launch(Launch::Fold {
-                space: space.clone(),
-                axis: *axis,
-                vec_axes: vec_axes.clone(),
-                carrier: joint,
-                acc: *acc,
-                post: joint_post,
-                ops: new_ops,
-                sched: sched.clone(),
-            })
-            .ok()?;
+        let mut joint_fold = op.clone();
+        if let Launch::Fold {
+            carrier,
+            post,
+            ops,
+            sched: s,
+            ..
+        } = &mut joint_fold
+        {
+            (*carrier, *post, *ops, *s) = (joint, joint_post, new_ops, sched);
+        }
+        let joint_id = b.add_launch(joint_fold).ok()?;
 
         let body_view = slot_view(b, joint_id, &free, lanes, 1, body_lanes, body_axis)?;
         let ref_view = slot_view(b, joint_id, &free, lanes, 0, 1, None)?;
-        let hit = b.union(id, body_view).ok()?;
-        // The second union stops extraction running the reference pass a
-        // second time.
-        b.union(reference.id, ref_view).ok()?;
-        return Some(hit);
+        // Redirect only this reader; slot 0 cannot replace a shared reference.
+        let _ = ref_view;
+        return b.union(id, body_view).ok();
     }
     None
 }
 
-/// Read lanes `[off, off + len)` of a joint fold's trailing carrier axis back
-/// as an ordinary strided view.
-///
-/// Minted as the one `Map { body: Arg(0) }` a view lowers to: the offset is
-/// not spellable in a single relative spec vector.
+/// Whether lanes `[off, off + len)` of a joint fold's carrier axis read back as a
+/// strided view.
 fn view_expressible(free: &[Dim], lanes: u64, off: u64, len: u64, want_axis: Option<Dim>) -> bool {
     slot_layout(free, lanes, off, len, want_axis).is_some()
 }
 
-/// The `(shape, layout)` a slot readback reads through, or `None` when the
-/// range and the target's own carrier axis disagree.
+/// The `(shape, layout)` a slot readback reads through, if the range fits.
 fn slot_layout(
     free: &[Dim],
     lanes: u64,

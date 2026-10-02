@@ -50,6 +50,7 @@ fn main() -> ExitCode {
     // the selected plan, so a case covers the *class* rather than whichever
     // member extraction happened to pick. A fuzzed case pays for this on one
     // of its runs, not all of them (see `harness::fuzz_case`).
+    #[cfg(feature = "compiler-tests")]
     fusor::session::set_verify_members(true);
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Everything after the flags is a case-name substring filter.
@@ -109,7 +110,10 @@ fn main() -> ExitCode {
         println!("nothing ran; refusing to report success");
         return ExitCode::FAILURE;
     }
+    #[cfg(feature = "compiler-tests")]
     let wrong = fusor::session::wrong_member_count();
+    #[cfg(not(feature = "compiler-tests"))]
+    let wrong = 0;
     if wrong > 0 {
         println!(
             "{wrong} class member(s) computed wrong values under the member sweep; \

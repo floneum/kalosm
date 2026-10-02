@@ -6,12 +6,13 @@ use fusor_ir::ir::kernel::{
 };
 use fusor_ir::target::EmitError;
 use naga::{
-    AtomicFunction, Barrier, BinaryOperator, Block, Expression, Handle, Scalar, ScalarKind, Span,
+    AtomicFunction, Barrier, BinaryOperator, Block, Expression, Handle, Scalar, ScalarKind,
     Statement,
 };
 
 use super::coop::{row_major_tile_stride, tile_shape};
-use super::{Emitter, ScratchKind, key};
+use super::expr::{barrier, push, push_break_if, push_if, push_loop};
+use super::{Emitter, LOCAL_INVOCATION_INDEX_ARG, ScratchKind, key};
 
 impl Emitter<'_> {
     pub(crate) fn block(&mut self, body: &[Stmt]) -> Result<Block, EmitError> {
@@ -25,11 +26,8 @@ impl Emitter<'_> {
         Ok(block)
     }
 
-    /// Emit one statement, then retire the memoized reads it invalidated.
-    ///
-    /// The invalidation runs *after* the body so the statement's own operands
-    /// still see the memo state they were built against — a store reads its
-    /// value expression before it writes anything.
+    /// Emit one statement, then retire the memoized reads it invalidated; the
+    /// statement's own operands still see the memo they were built against.
     pub(crate) fn stmt(&mut self, stmt: &Stmt, out: &mut Block) -> Result<(), EmitError> {
         let result = self.stmt_inner(stmt, out);
         let written = stmt.writes();
@@ -54,10 +52,8 @@ impl Emitter<'_> {
                 mask,
             } => self.atomic_add(out, dst, addr, value, mask),
             Stmt::StoreLocal { dst, value } => {
-                // A coop accumulator fed by an MMA stays in SSA: the store is
-                // deferred to the next flush, giving one Load, N MMAs and one
-                // Store per scope. Any other coop-valued store (zero-init,
-                // reset) writes through and drops the memo entry.
+                // A coop accumulator fed by an MMA stays in SSA until the next flush; any
+                // other coop-valued store writes through and drops the memo entry.
                 let is_coop = matches!(dst.element, ElementType::CoopMatrix { .. });
                 if is_coop
                     && matches!(
@@ -111,18 +107,16 @@ impl Emitter<'_> {
                 accept,
                 reject,
             } => {
-                let cond_ty = condition.element();
-                let c = self.expr(condition, out)?;
-                let c = self.condition_value(out, c, cond_ty)?;
-                let accept_block = self.block(accept)?;
-                let reject_block = self.block(reject)?;
-                out.push(
+                let condition = self.cond(out, condition)?;
+                let accept = self.block(accept)?;
+                let reject = self.block(reject)?;
+                push(
+                    out,
                     Statement::If {
-                        condition: c,
-                        accept: accept_block,
-                        reject: reject_block,
+                        condition,
+                        accept,
+                        reject,
                     },
-                    Span::default(),
                 );
                 Ok(())
             }
@@ -137,19 +131,11 @@ impl Emitter<'_> {
             } => {
                 self.flush_coop_acc(out);
                 let loop_body = self.block(body)?;
-                out.push(
-                    Statement::Loop {
-                        body: loop_body,
-                        continuing: Block::new(),
-                        break_if: None,
-                    },
-                    Span::default(),
-                );
+                push_loop(out, loop_body);
                 Ok(())
             }
             // The N-ary reduction. One lane with a hardware operator takes the
-            // *existing* expression path, so a single-slot fold that reaches
-            // here emits `subgroupAdd` / the shared-memory tree unchanged.
+            // expression path.
             Stmt::Reduce {
                 kind,
                 values,
@@ -167,22 +153,19 @@ impl Emitter<'_> {
                 self.reduce_n(kind, values, merge, scratch, outs, out)
             }
             Stmt::Break => {
-                out.push(Statement::Break, Span::default());
+                push(out, Statement::Break);
                 Ok(())
             }
             Stmt::Return => {
-                out.push(Statement::Return { value: None }, Span::default());
+                push(out, Statement::Return { value: None });
                 Ok(())
             }
             Stmt::Barrier => {
-                out.push(
-                    Statement::ControlBarrier(Barrier::WORK_GROUP),
-                    Span::default(),
-                );
+                barrier(out);
                 Ok(())
             }
             Stmt::StorageBarrier => {
-                out.push(Statement::ControlBarrier(Barrier::STORAGE), Span::default());
+                push(out, Statement::ControlBarrier(Barrier::STORAGE));
                 Ok(())
             }
         }
@@ -196,47 +179,18 @@ impl Emitter<'_> {
         value: &TileExpr,
         mask: &TileExpr,
     ) -> Result<(), EmitError> {
-        // A store closes a value scope: nothing computed for the previous
-        // store may be reused, because the next one may run under a different
-        // predicate.
+        // A store closes a value scope: the next may run under another predicate.
         let v = self.expr(value, out)?;
         if mask.is_constant_true() {
             let index = self.addr_index(out, dst, addr)?;
-            let ptr = self.storage_dynamic_pointer(out, dst, index)?;
-            out.push(
-                Statement::Store {
-                    pointer: ptr,
-                    value: v,
-                },
-                Span::default(),
-            );
-            return Ok(());
+            return self.store_storage_value(out, dst, index, v);
         }
-        let mask_ty = mask.element();
-        let m = self.expr(mask, out)?;
-        let m = self.condition_value(out, m, mask_ty)?;
-        let dst = dst.clone();
-        let addr = addr.clone();
+        let m = self.cond(out, mask)?;
         let (accept, ()) = self.nested(|em, accept| {
-            let index = em.addr_index(accept, &dst, &addr)?;
-            let ptr = em.storage_dynamic_pointer(accept, &dst, index)?;
-            accept.push(
-                Statement::Store {
-                    pointer: ptr,
-                    value: v,
-                },
-                Span::default(),
-            );
-            Ok(())
+            let index = em.addr_index(accept, dst, addr)?;
+            em.store_storage_value(accept, dst, index, v)
         })?;
-        out.push(
-            Statement::If {
-                condition: m,
-                accept,
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
+        push_if(out, Some(m), accept);
         Ok(())
     }
 
@@ -252,30 +206,30 @@ impl Emitter<'_> {
     ) -> Result<(), EmitError> {
         let element = dst.buffer.element;
         let v = self.expr(value, out)?;
-        let masked = !mask.is_constant_true();
-        let condition = if masked {
-            let mask_ty = mask.element();
-            let m = self.expr(mask, out)?;
-            Some(self.condition_value(out, m, mask_ty)?)
-        } else {
+        let condition = if mask.is_constant_true() {
             None
+        } else {
+            Some(self.cond(out, mask)?)
         };
-
-        let dst_c = dst.clone();
-        let addr_c = addr.clone();
         let (body, ()) = self.nested(|em, block| {
-            let index = em.addr_index(block, &dst_c, &addr_c)?;
-            let ptr = em.storage_dynamic_pointer(block, &dst_c, index)?;
+            let index = em.addr_index(block, dst, addr)?;
+            let ptr = em.storage_dynamic_pointer(block, dst, index)?;
             match element {
                 ElementType::Scalar(ScalarElement::U32 | ScalarElement::I32) => {
-                    block.push(
+                    let physical = em.buffer_element(&dst.buffer);
+                    let v = if physical == element {
+                        v
+                    } else {
+                        em.cast_as(block, v, super::expr::element_scalar(physical)?.kind, None)
+                    };
+                    push(
+                        block,
                         Statement::Atomic {
                             pointer: ptr,
                             fun: AtomicFunction::Add,
                             value: v,
                             result: None,
                         },
-                        Span::default(),
                     );
                     Ok(())
                 }
@@ -285,18 +239,7 @@ impl Emitter<'_> {
                 ))),
             }
         })?;
-
-        match condition {
-            Some(c) => out.push(
-                Statement::If {
-                    condition: c,
-                    accept: body,
-                    reject: Block::new(),
-                },
-                Span::default(),
-            ),
-            None => out.push(Statement::Block(body), Span::default()),
-        }
+        push_if(out, condition, body);
         Ok(())
     }
 
@@ -308,26 +251,39 @@ impl Emitter<'_> {
         pointer: Handle<Expression>,
         value: Handle<Expression>,
     ) -> Result<(), EmitError> {
+        self.cas_loop(out, pointer, |em, body, old| {
+            let old_f = em.cast_as(body, old, ScalarKind::Float, None);
+            let sum = em.bin(body, BinaryOperator::Add, old_f, value);
+            em.cast_as(body, sum, ScalarKind::Uint, None)
+        });
+        Ok(())
+    }
+
+    /// `loop { old = *p; cas(p, old, new(old)); if exchanged { break } }`.
+    pub(crate) fn cas_loop(
+        &mut self,
+        out: &mut Block,
+        pointer: Handle<Expression>,
+        new: impl FnOnce(&mut Self, &mut Block, Handle<Expression>) -> Handle<Expression>,
+    ) {
         let cas_ty = self.module.generate_predeclared_type(
             naga::PredeclaredType::AtomicCompareExchangeWeakResult(Scalar::U32),
         );
         let mut body = Block::new();
         let old = self.emit_load(&mut body, pointer);
-        let old_f = self.cast_as(&mut body, old, ScalarKind::Float, None);
-        let sum = self.bin(&mut body, BinaryOperator::Add, old_f, value);
-        let new_u = self.cast_as(&mut body, sum, ScalarKind::Uint, None);
+        let value = new(self, &mut body, old);
         let result = self.append(Expression::AtomicResult {
             ty: cas_ty,
             comparison: true,
         });
-        body.push(
+        push(
+            &mut body,
             Statement::Atomic {
                 pointer,
                 fun: AtomicFunction::Exchange { compare: Some(old) },
-                value: new_u,
+                value,
                 result: Some(result),
             },
-            Span::default(),
         );
         let exchanged = self.emit_expr(
             &mut body,
@@ -336,28 +292,12 @@ impl Emitter<'_> {
                 index: 1,
             },
         );
-        body.push(
-            Statement::If {
-                condition: exchanged,
-                accept: Block::from_vec(vec![Statement::Break]),
-                reject: Block::new(),
-            },
-            Span::default(),
-        );
-        out.push(
-            Statement::Loop {
-                body,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            Span::default(),
-        );
-        Ok(())
+        push_break_if(&mut body, exchanged);
+        push_loop(out, body);
     }
 
-    /// A counted loop with SSA-carried accumulators: each accumulator local is
-    /// initialised in the surrounding scope, updated at the end of every
-    /// iteration, and readable after the loop.
+    /// A counted loop with SSA-carried accumulators, initialised outside, updated
+    /// at the end of every iteration, readable after.
     fn counted_loop(
         &mut self,
         out: &mut Block,
@@ -366,10 +306,8 @@ impl Emitter<'_> {
         accumulators: &[Accumulator],
         body: &[Stmt],
     ) -> Result<(), EmitError> {
-        // Every accumulator is read at the value it had entering the step,
-        // then all are written: a loop carrying `(n, mean, m2)` has `mean`'s
-        // update read `n`, and writing `n` first would make it read the new
-        // count.
+        // Every accumulator is read at its entering value before any is written:
+        // a `(n, mean, m2)` carrier's `mean` update reads the old `n`.
         let inits: Vec<Handle<Expression>> = accumulators
             .iter()
             .map(|acc| self.expr(&acc.init, out))
@@ -402,9 +340,8 @@ impl Emitter<'_> {
         })
     }
 
-    /// `i = 0; loop { if i >= n { break } ...; i += 1 }`. Coop and expression
-    /// memos are scoped to one iteration: a value cached in iteration `i` is
-    /// not reused in `i + 1`.
+    /// `i = 0; loop { if i >= n { break } ...; i += 1 }`, memos scoped to one
+    /// iteration.
     pub(crate) fn dynamic_loop(
         &mut self,
         out: &mut Block,
@@ -431,14 +368,7 @@ impl Emitter<'_> {
                 loop_index,
                 iterations,
             );
-            loop_body.push(
-                Statement::If {
-                    condition: done,
-                    accept: Block::from_vec(vec![Statement::Break]),
-                    reject: Block::new(),
-                },
-                Span::default(),
-            );
+            push_break_if(loop_body, done);
             build(em, loop_body, loop_index)?;
             em.flush_coop_acc(loop_body);
             Ok(())
@@ -451,30 +381,20 @@ impl Emitter<'_> {
         let ptr = self.local_var(loop_local);
         let current = self.emit_load(&mut loop_body, ptr);
         let next = self.bin(&mut loop_body, BinaryOperator::Add, current, one);
-        loop_body.push(
+        push(
+            &mut loop_body,
             Statement::Store {
                 pointer: ptr,
                 value: next,
             },
-            Span::default(),
         );
-
-        out.push(
-            Statement::Loop {
-                body: loop_body,
-                continuing: Block::new(),
-                break_if: None,
-            },
-            Span::default(),
-        );
+        push_loop(out, loop_body);
         Ok(())
     }
 
-    /// `FillTile` is collective: it is the only form whose vectorized and
-    /// guard-free variants the emitter can select. Lane
-    /// enumeration order comes from
-    /// [`fusor_ir::shape::MultiFlattenMap::axis_unit_run`] — lanes advance
-    /// along the axis whose unit-stride runs they can actually follow.
+    /// `FillTile` is collective, so the emitter may pick vectorized or guard-free
+    /// variants. Lanes advance along
+    /// [`fusor_ir::shape::MultiFlattenMap::axis_unit_run`].
     fn fill_tile(
         &mut self,
         out: &mut Block,
@@ -528,7 +448,8 @@ impl Emitter<'_> {
                     .checked_mul(cols)
                     .ok_or_else(|| EmitError::Unsupported("workgroup tile size overflow".into()))?;
                 let dst = dst.clone();
-                self.copy_passes(out, total, move |em, accept, flat| {
+                let (lanes, lane_arg) = (self.workgroup_invocations, LOCAL_INVOCATION_INDEX_ARG);
+                self.copy_passes(out, total, lanes, lane_arg, move |em, accept, flat| {
                     let (local_row, local_col) =
                         em.lane_coords(accept, flat, rows, cols, cols_fastest);
                     let global_row = em.add_u32(accept, row_base, local_row);
@@ -540,17 +461,14 @@ impl Emitter<'_> {
                     let load = |em: &mut Self, block: &mut Block| -> Result<_, EmitError> {
                         let index =
                             em.storage_index_from_coords(block, &view, &[global_row, global_col])?;
-                        let ptr = em.storage_dynamic_pointer(block, &view, index)?;
-                        let v = em.emit_load(block, ptr);
+                        let v = em.load_storage_value(block, &view, index)?;
                         em.cast_tile_value(block, v, view.buffer.element, dst.element)
                     };
                     em.guarded_tile_store(accept, &dst, tile_ptr, in_bounds, load)
                 })
             }
-            // A block-quantized operand never reaches the collective fill:
-            // `stage_operand_tile` stages it one lane at a time as a
-            // `Load` + `StoreTile`, because `pre` has to run per element on
-            // the way in.
+            // A quantized operand is staged per lane (`pre` runs per element), never by
+            // the collective fill.
             Source::Quantized(_) => Err(EmitError::Unsupported(
                 "FillTile's source must be dense storage: a quantized operand \
                  stages through per-lane Load + StoreTile"
@@ -559,19 +477,20 @@ impl Emitter<'_> {
         }
     }
 
-    /// Split `total` element slots across `workgroup_invocations` lanes,
-    /// guarding only the ragged final pass.
-    fn copy_passes(
+    /// Split `total` element slots across `lanes` lanes (argument `lane_arg`
+    /// numbers them), guarding only the ragged final pass.
+    pub(crate) fn copy_passes(
         &mut self,
         out: &mut Block,
         total: u32,
+        lanes: u32,
+        lane_arg: u32,
         mut build: impl FnMut(&mut Self, &mut Block, Handle<Expression>) -> Result<(), EmitError>,
     ) -> Result<(), EmitError> {
-        let lanes = self.workgroup_invocations;
         let passes = total.div_ceil(lanes.max(1));
         for pass in 0..passes {
             let full = (pass + 1) * lanes <= total;
-            let lane = self.lane();
+            let lane = self.function_arg(lane_arg);
             let flat = self.add_literal_u32(out, lane, pass * lanes);
             let condition = if full {
                 None
@@ -580,17 +499,7 @@ impl Emitter<'_> {
                 Some(self.bin(out, BinaryOperator::Less, flat, limit))
             };
             let (accept, ()) = self.nested(|em, accept| build(em, accept, flat))?;
-            match condition {
-                Some(c) => out.push(
-                    Statement::If {
-                        condition: c,
-                        accept,
-                        reject: Block::new(),
-                    },
-                    Span::default(),
-                ),
-                None => out.push(Statement::Block(accept), Span::default()),
-            }
+            push_if(out, condition, accept);
         }
         Ok(())
     }
@@ -620,7 +529,8 @@ impl Emitter<'_> {
             .ok_or_else(|| EmitError::Unsupported("workgroup tile size overflow".into()))?;
         let view = view.clone();
         let dst = dst.clone();
-        self.copy_passes(out, total, move |em, accept, flat| {
+        let (lanes, lane_arg) = (self.workgroup_invocations, LOCAL_INVOCATION_INDEX_ARG);
+        self.copy_passes(out, total, lanes, lane_arg, move |em, accept, flat| {
             let line = em.div_literal_u32(accept, flat, groups_per_line);
             let group = em.mod_literal_u32(accept, flat, groups_per_line);
             let group_base = em.mul_literal_u32(accept, group, VEC);
@@ -637,8 +547,7 @@ impl Emitter<'_> {
             let mut values = Vec::with_capacity(VEC as usize);
             for i in 0..VEC {
                 let index = em.add_literal_u32(accept, storage_base, i);
-                let ptr = em.storage_dynamic_pointer(accept, &view, index)?;
-                let loaded = em.emit_load(accept, ptr);
+                let loaded = em.load_storage_value(accept, &view, index)?;
                 values.push(em.cast_tile_value(
                     accept,
                     loaded,
@@ -732,13 +641,13 @@ impl Emitter<'_> {
                 let (reject, ()) = self.nested(move |em, block| {
                     em.store_tile_value(block, &dst_zero, tile_ptr, zero)
                 })?;
-                out.push(
+                push(
+                    out,
                     Statement::If {
                         condition,
                         accept,
                         reject,
                     },
-                    Span::default(),
                 );
                 Ok(())
             }

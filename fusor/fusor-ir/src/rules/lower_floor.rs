@@ -1,17 +1,6 @@
 //! The [`crate::egraph::RuleTag::StrictlyLowering`] floor: one trivial,
-//! always-legal Logical -> Launch lowering per Logical op. These are what the driver falls
-//! back to when a saturation budget is exhausted.
-//!
-//! Every one emits [`ScheduleDomain::Point`]: the floor depends on no
-//! schedule generator. Every one is trivially correct and trivially slow. `Leaf` needs no
-//! rule.
-//!
-//! # This module is the only place `ScheduleDomain::Point` is minted
-//!
-//! `Point` is the marker the schedule rules match on. A rule that needs to mint a
-//! nest carrying no schedule of its own calls `floor_map`,
-//! `floor_alias_map` or `floor_fold`, and a descriptor that needs the
-//! value calls `floor_sched`.
+//! always-legal Logical -> Launch lowering per Logical op, the driver's
+//! fallback on budget exhaustion. Each emits [`ScheduleDomain::Point`].
 
 use crate::carrier::Carrier;
 use crate::dtype::Dtype;
@@ -103,20 +92,7 @@ fn space_of(f: &Facts<'_>) -> IndexSpace {
     IndexSpace::new(f.own().shape.iter().copied())
 }
 
-/// The schedule a nest carries before any schedule rule has spoken.
-///
-/// For a *descriptor* rather than a node: [`crate::rules::tuple`] normalizes an
-/// `Logical::Fold` into the `Fold` fields it would lower to, and the schedule field
-/// of that normalization is this — the same value [`lower_fold`] would put
-/// there. Prefer the node constructors below wherever an id is what is wanted.
-pub(crate) fn floor_sched() -> ScheduleDomain {
-    ScheduleDomain::Point
-}
-
 /// A `Map` minted with no schedule of its own.
-///
-/// The schedule rules expand it exactly as they expand a `lower_map` output:
-/// a rule that restates a value does not decide how it is scheduled.
 pub(crate) fn floor_map(
     b: &mut Builder<'_>,
     space: IndexSpace,
@@ -127,18 +103,13 @@ pub(crate) fn floor_map(
         space,
         body,
         ops,
-        sched: floor_sched(),
+        sched: ScheduleDomain::Point,
     })
     .ok()
 }
 
-/// The identity-body alias `Map` that re-expresses `src` at `shape` through
-/// `layout`.
-///
-/// This is the readback spelling: a slot view of a multi-slot carrier, a
-/// recovery view of a promoted fold's flattened carrier axis. It computes
-/// nothing — the body is `Arg(0)` and the access is [`AccessPlan::Alias`] —
-/// so it carries no schedule decision at all.
+/// The identity alias `Map` re-expressing `src` at `shape` through `layout`:
+/// the readback spelling of a carrier slot or promoted axis.
 pub(crate) fn floor_alias_map(
     b: &mut Builder<'_>,
     src: Id,
@@ -158,13 +129,8 @@ pub(crate) fn floor_alias_map(
     )
 }
 
-/// A `Fold` minted with no schedule of its own — the nest [`lower_fold`]
-/// would have minted, given these fields.
-///
-/// TUPLE's joint carrier is the case: the joint takes neither side's schedule,
-/// because a schedule domain is not a value and a joint that inherited one
-/// would be a function of which spelling the consumer's operand happened to
-/// name.
+/// A `Fold` minted with no schedule of its own, as [`lower_fold`] would
+/// (TUPLE's joint inherits neither side's schedule).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn floor_fold(
     b: &mut Builder<'_>,
@@ -176,7 +142,28 @@ pub(crate) fn floor_fold(
     post: SmallVec<[ScalarExpr; 4]>,
     ops: Vec<Operand>,
 ) -> Option<Id> {
-    b.add_launch(Launch::Fold {
+    let fold = floor_fold_op(space, axis, vec_axes, carrier, acc, post, ops, b.caps())?;
+    b.add_launch(fold).ok()
+}
+
+/// The `Fold` [`floor_fold`] mints: `None` past `u32` flat addressing or
+/// when no fold schedule fits the carrier.
+#[allow(clippy::too_many_arguments)]
+fn floor_fold_op(
+    space: IndexSpace,
+    axis: u32,
+    vec_axes: SmallVec<[u32; 2]>,
+    carrier: Carrier,
+    acc: Dtype,
+    post: SmallVec<[ScalarExpr; 4]>,
+    ops: Vec<Operand>,
+    caps: &crate::device::Caps,
+) -> Option<Launch> {
+    if space.iterations().is_some_and(|n| n > u64::from(u32::MAX)) {
+        return None;
+    }
+    let sched = ScheduleDomain::Point.with_fold_carrier(carrier.lanes()?, acc.byte_size(), caps)?;
+    Some(Launch::Fold {
         space,
         axis,
         vec_axes,
@@ -184,9 +171,8 @@ pub(crate) fn floor_fold(
         acc,
         post,
         ops,
-        sched: floor_sched(),
+        sched,
     })
-    .ok()
 }
 
 /// `Logical::Map` -> `Launch::Map` reading every operand through its own dense
@@ -199,14 +185,7 @@ pub fn lower_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opt
         .iter()
         .map(|&s| alias_operand_of(s, &b.facts_of(s).shape.clone()))
         .collect();
-    let k = b
-        .add_launch(Launch::Map {
-            space: space_of(f),
-            body: expr.clone(),
-            ops,
-            sched: ScheduleDomain::Point,
-        })
-        .ok()?;
+    let k = floor_map(b, space_of(f), expr.clone(), ops)?;
     b.union(id, k).ok()
 }
 
@@ -224,50 +203,45 @@ pub fn lower_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Op
     };
     let in_shape = f.operand(0)?.shape.clone();
     let dtype = f.dtype(0)?;
-    // The nest reads its operands at the operand dtype and accumulates at
-    // `acc`, so the lift is retyped while the merge rides through untouched.
-    //
-    // Retyped, **not replaced**. A per-slot `Arg(0)` is right only for a
-    // single-slot binop carrier, whose lift already is `Arg(0)`; Welford's
-    // `(1, x, 0)` and a shift-stabilized `(x, 1)` would be silently rewritten
-    // into "every slot folds the element", which reduces `n` and `m2` over the
-    // data instead of over the constants they are.
+    // Retype (never replace) the lift to the operand dtype: multi-slot lifts
+    // like Welford's `(1, x, 0)` fold constants, not the element.
     let lift: SmallVec<[ScalarExpr; 4]> = carrier
         .lift
         .iter()
         .map(|e| crate::carrier::retype_args(e, dtype))
         .collect();
-    let k = b
-        .add_launch(Launch::Fold {
-            space: IndexSpace::new(in_shape.iter().copied()),
-            axis: *axis,
-            vec_axes: SmallVec::new(),
-            carrier: carrier.clone().with_lift(lift),
-            acc: *acc,
-            post: (0..carrier.width())
-                .map(|i| ScalarExpr::arg(i as u32, *acc))
-                .collect(),
-            ops: ins
-                .iter()
-                .map(|x| alias_operand_of(*x, &in_shape))
-                .collect(),
-            sched: ScheduleDomain::Point,
-        })
-        .ok()?;
+    let k = floor_fold(
+        b,
+        IndexSpace::new(in_shape.iter().copied()),
+        *axis,
+        SmallVec::new(),
+        carrier.clone().with_lift(lift),
+        *acc,
+        (0..carrier.width())
+            .map(|i| ScalarExpr::arg(i as u32, *acc))
+            .collect(),
+        ins.iter()
+            .map(|x| alias_operand_of(*x, &in_shape))
+            .collect(),
+    )?;
     b.union(id, k).ok()
 }
 
-/// `Logical::Contract` -> `Fold { combine: Add, pre: mul(Arg0, Arg1) }`.
-///
-/// This is the family-free floor: no lane geometry, no tile, no split. The
-/// four order-free family rules ride in a target's own rule table and are
-/// appended to the core set by the driver's caller.
+/// `Logical::Contract` -> `Fold { combine: Add, pre: mul(Arg0, Arg1) }`: the
+/// family-free floor. Tiled families live in a target's rule table.
 pub fn lower_contract_generic(
     b: &mut Builder<'_>,
     id: Id,
     node: &Node,
     f: &Facts<'_>,
 ) -> Option<Id> {
+    let fold = b.add_launch(contract_fold(node, f)?).ok()?;
+    b.union(id, fold).ok()
+}
+
+/// Construct the generic contraction once. Schedule rules may derive new
+/// domains from this value, without restating its shape or address mapping.
+pub fn contract_fold(node: &Node, f: &Facts<'_>) -> Option<Launch> {
     let Op::Logical(Logical::Contract {
         spec,
         acc,
@@ -322,32 +296,23 @@ pub fn lower_contract_generic(
             &b_shape,
         )?,
     ];
-    let kf = b
-        .add_launch(Launch::Fold {
-            space: IndexSpace::new(space),
-            axis,
-            vec_axes: SmallVec::new(),
-            carrier: Carrier::binop(BinOp::Add, Carrier::binop_identity(BinOp::Add, *acc)?, *acc)
-                .with_lift([pre]),
-            acc: *acc,
-            post: smallvec::smallvec![ident_expr(*acc)],
-            ops,
-            sched: ScheduleDomain::Point,
-        })
-        .ok()?;
-    b.union(id, kf).ok()
+    let carrier = Carrier::binop(BinOp::Add, Carrier::binop_identity(BinOp::Add, *acc)?, *acc)
+        .with_lift([pre]);
+    floor_fold_op(
+        IndexSpace::new(space),
+        axis,
+        SmallVec::new(),
+        carrier,
+        *acc,
+        smallvec::smallvec![ident_expr(*acc)],
+        ops,
+        f.caps(),
+    )
 }
 
-/// One contraction operand read over the fold's `[out..., k]` index space.
-///
-/// The fold walks the output plus one merged contraction axis; the operand's
-/// own axes are in `spec` order, which in general is neither. Aliasing the
-/// operand's dense layout says "axis `i` of the space is axis `i` of the
-/// operand", which is true only for a left operand of a canonical matmul.
-/// So each space axis gets an explicit stride: the operand's stride for that label,
-/// or 0 where the operand does not carry it, and the merged `k` axis
-/// decomposes into one sub-axis per contracted label, most significant
-/// first, which is the order `fold_extent` multiplied them in.
+/// One contraction operand read over the fold's `[out..., k]` space: each
+/// axis takes the operand's stride for its label (0 if absent), and a merged
+/// `k` splits into one sub-axis per contracted label, most significant first.
 #[allow(clippy::too_many_arguments)]
 fn contract_operand(
     src: Id,
@@ -360,6 +325,24 @@ fn contract_operand(
     b_shape: &[Dim],
 ) -> Option<Operand> {
     let strides = Layout::row_major_strides(shape);
+    if contracted.len() <= 1 {
+        let stride = |label: Label| {
+            labels
+                .iter()
+                .zip(&strides)
+                .filter(|(l, _)| **l == label)
+                .fold(Dim::Const(0), |sum, (_, s)| sum + *s)
+        };
+        let mut dims: SmallVec<[Dim; 6]> = out_shape.iter().copied().collect();
+        dims.push(fold_extent(contracted, spec, a_shape, b_shape)?);
+        let mut mapped: SmallVec<[Dim; 6]> = spec.out.iter().map(|l| stride(*l)).collect();
+        mapped.push(contracted.first().map_or(Dim::Const(0), |l| stride(*l)));
+        return Some(Operand {
+            src,
+            layout: Layout::from_parts(Dim::Const(0), &dims, &mapped).ok()?,
+            access: AccessPlan::Alias,
+        });
+    }
     // A label repeated within one operand is a diagonal read: its strides add.
     let stride_of = |l: Label| -> Option<u32> {
         let mut acc: u64 = 0;
@@ -370,20 +353,6 @@ fn contract_operand(
         }
         u32::try_from(acc).ok()
     };
-    let label_extent = |l: Label| -> Option<u32> {
-        let d = spec
-            .a
-            .iter()
-            .position(|x| *x == l)
-            .and_then(|i| a_shape.get(i))
-            .or_else(|| {
-                spec.b
-                    .iter()
-                    .position(|x| *x == l)
-                    .and_then(|i| b_shape.get(i))
-            })?;
-        u32::try_from(d.as_const()?).ok()
-    };
 
     let mut groups: SmallVec<[AxisGroup; 4]> = SmallVec::new();
     for (axis, l) in spec.out.iter().copied().enumerate() {
@@ -393,7 +362,7 @@ fn contract_operand(
     let mut subs: SmallVec<[SubAxis; 2]> = SmallVec::new();
     for l in contracted {
         subs.push(SubAxis {
-            extent: label_extent(*l)?,
+            extent: u32::try_from(label_dim(*l, spec, a_shape, b_shape)?.as_const()?).ok()?,
             stride: stride_of(*l)?,
         });
     }
@@ -421,35 +390,32 @@ fn fold_extent(
     a: &[Dim],
     b: &[Dim],
 ) -> Option<Dim> {
-    let extent = |l: &Label| -> Option<Dim> {
-        spec.a
-            .iter()
-            .position(|x| x == l)
-            .and_then(|i| a.get(i).copied())
-            .or_else(|| {
-                spec.b
-                    .iter()
-                    .position(|x| x == l)
-                    .and_then(|i| b.get(i).copied())
-            })
-    };
     match contracted {
         [] => Some(Dim::ONE),
-        [one] => extent(one),
+        [one] => label_dim(*one, spec, a, b),
         many => {
             let mut product = 1u64;
             for l in many {
-                product = product.checked_mul(extent(l)?.as_const()?)?;
+                product = product.checked_mul(label_dim(*l, spec, a, b)?.as_const()?)?;
             }
             Some(Dim::Const(product))
         }
     }
 }
 
+/// The extent `l` labels: its first axis on `a`, else on `b`.
+fn label_dim(l: Label, spec: &crate::ir::logical::EinSpec, a: &[Dim], b: &[Dim]) -> Option<Dim> {
+    let at = |labels: &[Label], shape: &[Dim]| {
+        labels
+            .iter()
+            .position(|x| *x == l)
+            .and_then(|i| shape.get(i).copied())
+    };
+    at(&spec.a, a).or_else(|| at(&spec.b, b))
+}
+
 /// `Logical::Restride` -> a copying `Map` whose operand carries the composed
-/// view. When the composition is not expressible as one layout the rule
-/// declines: an operand over the source's own contiguous layout would read
-/// the wrong elements, and nothing downstream reconstructs the specs.
+/// view; declines when that is not one layout.
 pub fn lower_restride(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Logical(Logical::Restride { specs, x, .. }) = &node.op else {
         return None;
@@ -461,14 +427,7 @@ pub fn lower_restride(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -
         layout: composed_layout(specs, &in_shape)?,
         access: AccessPlan::Alias,
     };
-    let k = b
-        .add_launch(Launch::Map {
-            space: space_of(f),
-            body: ident_expr(dtype),
-            ops: vec![operand],
-            sched: ScheduleDomain::Point,
-        })
-        .ok()?;
+    let k = floor_map(b, space_of(f), ident_expr(dtype), vec![operand])?;
     b.union(id, k).ok()
 }
 
@@ -486,18 +445,12 @@ pub fn lower_window(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
 
     let access = window_map(specs, &in_shape, &out_shape, &in_strides)
         .map_or(AccessPlan::Gather, AccessPlan::Unflatten);
-    let k = b
-        .add_launch(Launch::Map {
-            space: space_of(f),
-            body: ident_expr(dtype),
-            ops: vec![Operand {
-                src: *x,
-                layout: Layout::contiguous(&in_shape),
-                access,
-            }],
-            sched: ScheduleDomain::Point,
-        })
-        .ok()?;
+    let operand = Operand {
+        src: *x,
+        layout: Layout::contiguous(&in_shape),
+        access,
+    };
+    let k = floor_map(b, space_of(f), ident_expr(dtype), vec![operand])?;
     b.union(id, k).ok()
 }
 
@@ -523,12 +476,7 @@ fn window_map(
             (w.axis as usize, 1)
         };
         let base = u32::try_from(in_strides.get(src_axis)?.as_const()?).ok()?;
-        groups.push(AxisGroup {
-            sub_axes: smallvec::smallvec![SubAxis {
-                extent,
-                stride: base.checked_mul(step)?,
-            }],
-        });
+        groups.push(AxisGroup::affine(extent, base.checked_mul(step)?));
     }
     Some(MultiFlattenMap { groups })
 }
@@ -554,9 +502,8 @@ pub fn lower_gather(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
     b.union(id, k).ok()
 }
 
-/// `Logical::Scatter` -> `Scatter { mode: SortSegment }`. Atomics and the
-/// workgroup-private merge are target rules guarded on capabilities; the
-/// sorted segmented reduce needs neither and is therefore the floor.
+/// `Logical::Scatter` -> `Scatter { mode: SortSegment }`, which needs no
+/// device capability.
 pub fn lower_scatter(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Logical(Logical::Scatter {
         axis,
@@ -586,22 +533,19 @@ pub fn lower_scatter(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
     b.union(id, k).ok()
 }
 
-/// `Logical::Dequant` -> a `Map` reading a quantized operand. The block program
-/// itself lives in the format table, keyed by `(fmt, layout)`; the nest only
-/// has to say that this operand decodes.
+/// `Logical::Dequant` -> a `Map` reading a quantized operand; the decode
+/// program lives in the format table.
 pub fn lower_dequant(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Logical(Logical::Dequant { x, .. }) = &node.op else {
         return None;
     };
     let out = f.own().dtype;
-    let k = b
-        .add_launch(Launch::Map {
-            space: space_of(f),
-            body: ident_expr(if out.is_quantized() { Dtype::F32 } else { out }),
-            ops: vec![alias_operand_of(*x, &f.operand(0)?.shape.clone())],
-            sched: ScheduleDomain::Point,
-        })
-        .ok()?;
+    let k = floor_map(
+        b,
+        space_of(f),
+        ident_expr(if out.is_quantized() { Dtype::F32 } else { out }),
+        vec![alias_operand_of(*x, &f.operand(0)?.shape.clone())],
+    )?;
     b.union(id, k).ok()
 }
 
@@ -611,13 +555,11 @@ pub fn lower_project(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) ->
     let Op::Logical(Logical::Project { slot, x }) = &node.op else {
         return None;
     };
-    let k = b
-        .add_launch(Launch::Map {
-            space: space_of(f),
-            body: ScalarExpr::arg(u32::from(*slot), f.own().dtype),
-            ops: vec![alias_operand_of(*x, &f.operand(0)?.shape.clone())],
-            sched: ScheduleDomain::Point,
-        })
-        .ok()?;
+    let k = floor_map(
+        b,
+        space_of(f),
+        ScalarExpr::arg(u32::from(*slot), f.own().dtype),
+        vec![alias_operand_of(*x, &f.operand(0)?.shape.clone())],
+    )?;
     b.union(id, k).ok()
 }

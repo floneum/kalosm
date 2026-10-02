@@ -1,20 +1,7 @@
-//! `verify_l0` — the eight Logical invariants.
-//!
-//! 1. Inference is total.
-//! 2. **No implicit broadcasting**: all `Map` operands share the output shape.
-//! 3. `Fold`: `axis < rank`; the carrier's slot vectors agree; every identity
-//!    is a value of `acc`; every `Vector` slot extent is constant; and
-//!    `merge(identity, identity) == identity`.
-//! 4. `Contract`: every label appears in >= 2 of {a, b, out}; contracted
-//!    extents agree; `acc.bits >= numeric.min_accum_bits`.
-//! 5. `Restride` composes relative to current strides; `Const` dims are
-//!    checked statically, `Sym` dims record a runtime mask obligation. There
-//!    is no third case and no user `assume`.
-//! 6. `Scatter{Set}` with possibly-duplicate indices is rejected unless the
-//!    node carries `unique: true`. `Scatter{Add}` is always legal and
-//!    duplicates accumulate (normative).
-//! 7. `Dequant`: `shape[-1] % fmt.block_elements == 0`.
-//! 8. Every op's `work` varies with shape.
+//! `verify_l0` — the eight Logical invariants: 1. inference is total; 2. no
+//! implicit broadcasting; 3. `Fold` carriers are well formed; 4. `Contract`
+//! labels and accumulator width; 5. `Restride` bounds; 6. `Scatter{Set}` needs
+//! unique indices; 7. `Dequant` whole blocks; 8. `work` varies with shape.
 
 use crate::carrier::{Carrier, probes_for};
 use crate::contract_spec;
@@ -27,18 +14,9 @@ use crate::semantics::infer_logical::infer_logical;
 use crate::semantics::work::work_of;
 use crate::shape::{BoundsProof, Dim, Dims};
 
-/// Clause 3, shared with inference and with `verify_launch`: is this carrier a
-/// well-formed accumulator in `acc`?
-///
-/// * the four slot vectors agree in length and are non-empty;
-/// * every identity is a value of `acc` (never a quantized dtype — a
-///   quantized value is not an accumulator);
-/// * every `Vector` slot has a constant extent, because a symbolic private
-///   array is allocatable on neither backend;
-/// * the carrier obligation: `merge(identity, identity) == identity`. A
-///   rescale spelled without `Carrier::safe_delta` computes
-///   `0 * exp((-inf) - (-inf)) = NaN`, and every workgroup-tree and subgroup
-///   schedule merges padded identity lanes, so the NaN reaches real output.
+/// Clause 3: slot vectors agree, identities are values of `acc`, `Vector`
+/// extents are constant, and `merge(identity, identity) == identity` (padded
+/// identity lanes are merged by every schedule).
 pub(crate) fn check_carrier(c: &Carrier, acc: Dtype) -> Result<()> {
     let w = c.slots.len();
     if w == 0 || c.identity.len() != w || c.lift.len() != w || c.merge.len() != w {
@@ -80,8 +58,7 @@ pub(crate) fn check_carrier(c: &Carrier, acc: Dtype) -> Result<()> {
     Ok(())
 }
 
-/// Verify one Logical node. A failure means a rule or the frontend built
-/// something illegal; it is never recoverable.
+/// Verify one Logical node; a failure is never recoverable.
 pub fn verify_l0(cx: &VerifyCtx<'_>) -> Result<()> {
     let Op::Logical(op) = &cx.node.op else {
         return Err(Error::verify(
@@ -102,9 +79,6 @@ pub fn verify_l0(cx: &VerifyCtx<'_>) -> Result<()> {
             ),
         ));
     }
-
-    // 2.
-    check_map_shapes(cx)?;
 
     match op {
         // 3.
@@ -184,10 +158,8 @@ pub fn verify_l0(cx: &VerifyCtx<'_>) -> Result<()> {
                         ));
                     }
                 }
-                // A symbolic inner extent is admitted here: the divisibility
-                // obligation rides on the producing `Restride`'s
-                // `BoundsProof::RuntimeMask`, which clause 5 checks when that
-                // node is verified, and codegen discharges it as a mask.
+                // A symbolic extent's divisibility rides on the producing
+                // `Restride`'s runtime mask (clause 5).
                 Dim::Sym(_) => {}
             }
         }
@@ -201,43 +173,8 @@ pub fn verify_l0(cx: &VerifyCtx<'_>) -> Result<()> {
     Ok(())
 }
 
-/// Invariant 2, split out because the frontend calls it directly before
-/// emitting the stride-0 `Restride` that replaces implicit broadcasting.
-pub(crate) fn check_map_shapes(cx: &VerifyCtx<'_>) -> Result<()> {
-    let Op::Logical(Logical::Map { .. }) = &cx.node.op else {
-        return Ok(());
-    };
-    let Some(first) = cx.operands.first() else {
-        return Ok(());
-    };
-    for (i, other) in cx.operands.iter().enumerate().skip(1) {
-        let same = other.rank() == first.rank()
-            && other
-                .shape
-                .iter()
-                .zip(&first.shape)
-                .all(|(a, b)| a.known_eq(*b));
-        if !same {
-            return Err(fail(
-                cx,
-                format!(
-                    "Map operand {i} has shape {:?} but operand 0 has {:?}; the frontend emits \
-                     Restride{{multiplier:0}} rather than broadcasting implicitly",
-                    other.shape, first.shape
-                ),
-            ));
-        }
-    }
-    Ok(())
-}
-
-/// Invariant 5. Returns the `BoundsProof` the node must carry.
-///
-/// A spec is statically decidable when its `size`, its `offset` and the
-/// input dim it references are all `Const`; then the last element it
-/// addresses, `offset + (size - 1) * multiplier`, must be inside that dim.
-/// Anything else is a runtime mask obligation — there is no third case and
-/// no user `assume`.
+/// Invariant 5: the `BoundsProof` the node must carry. An all-`Const` spec is
+/// checked statically; anything else is a runtime mask obligation.
 pub(crate) fn check_restride_bounds(cx: &VerifyCtx<'_>) -> Result<BoundsProof> {
     let Op::Logical(Logical::Restride { specs, .. }) = &cx.node.op else {
         return Ok(BoundsProof::Static);
@@ -277,19 +214,13 @@ pub(crate) fn check_restride_bounds(cx: &VerifyCtx<'_>) -> Result<BoundsProof> {
     })
 }
 
-/// Invariant 8: `work` must vary with shape. Evaluate it at `cx`'s shapes and
-/// again with every `Const` dim doubled.
-///
-/// Two exemptions: `Leaf` and `Project` are constant-work, and a node whose
-/// work is zero at both bindings (an identity `Map`, a `Restride` over an
-/// empty value) genuinely performs no arithmetic. The tripwire targets a
-/// nonzero constant.
+/// Invariant 8: nonzero `work` must change when every `Const` dim doubles.
+/// `Leaf` and `Project` are exempt.
 fn check_work_varies(cx: &VerifyCtx<'_>, op: &Logical) -> Result<()> {
     if matches!(op, Logical::Leaf(_) | Logical::Project { .. }) {
         return Ok(());
     }
-    // Skip when there is no `Const` dim to double: a fully symbolic binding
-    // is priced at 1 everywhere by construction.
+    // A fully symbolic binding prices at 1 everywhere.
     let has_const = cx
         .operands
         .iter()

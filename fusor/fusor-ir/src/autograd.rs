@@ -27,8 +27,7 @@ pub trait Tape {
     fn contract(&mut self, a: Val, b: Val, spec: EinSpec, acc: Dtype) -> Result<Val>;
     fn fold(&mut self, carrier: Carrier, axis: u32, acc: Dtype, x: Val) -> Result<Val>;
 
-    /// A plain binary reduction — `Fold` at a single-slot [`Carrier`]. `Add`,
-    /// `Mul`, `Max` and `Min` are all this.
+    /// A plain binary reduction: `Fold` at a single-slot [`Carrier`].
     fn fold_binop(
         &mut self,
         op: crate::scalar::BinOp,
@@ -42,8 +41,7 @@ pub trait Tape {
         self.fold(Carrier::binop(op, ident, acc), axis, acc, x)
     }
     fn restride(&mut self, specs: &[crate::shape::StrideSpec], x: Val) -> Result<Val>;
-    /// The declared adjoint of `Gather`. Four lowerings coexist below it;
-    /// the cost model picks.
+    /// The declared adjoint of `Gather`.
     fn scatter_add(&mut self, axis: u32, base: Val, idx: Val, upd: Val) -> Result<Val>;
     fn accumulate(&mut self, a: Val, b: Val) -> Result<Val>;
 }
@@ -56,10 +54,7 @@ pub type AdjointFn = fn(&mut dyn Tape, &Node, Val, &[Val], Val) -> Result<Grads>
 #[derive(Copy, Clone, Debug)]
 pub enum AdjointKind {
     Analytic(AdjointFn),
-    /// Derived from the op's own attributes. `Window`'s structural adjoint
-    /// reads `(window, step)`: `step >= window` proves the adjoint is an
-    /// elementwise mask-and-broadcast; overlapping windows give
-    /// `Scatter{Add}`, itself a chain with four lowerings.
+    /// Derived from the op's own attributes (`Window`'s reads `window, step`).
     Structural,
 }
 
@@ -70,26 +65,8 @@ pub struct Adjoint {
     pub kind: AdjointKind,
 }
 
-/// The whole reverse-mode transform. Object-safe.
-pub trait Autograd: Send + Sync {
-    /// The adjoint table. Seven entries.
-    fn adjoints(&self) -> &'static [Adjoint];
-
-    /// Build the backward graph for `root` with respect to `wrt`, seeded
-    /// with `seed`. The result is ingested **together with** the forward as
-    /// one graph with one root set.
-    fn backward(
-        &self,
-        tape: &mut dyn Tape,
-        root: Val,
-        seed: Val,
-        wrt: &[Val],
-    ) -> Result<Vec<Option<Val>>>;
-}
-
-/// Where a user-supplied backward sends a gradient. A bare node id, never a
-/// tensor handle: a closure capturing a graph handle would close an `Arc`
-/// cycle pinning every cached activation for the process lifetime.
+/// Where a user-supplied backward sends a gradient: a bare node id, since a
+/// captured graph handle would form an `Arc` cycle.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub struct GradientSlot(pub Val);
 

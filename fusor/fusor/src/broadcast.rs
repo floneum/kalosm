@@ -28,11 +28,6 @@ impl Tensor {
             x: self.id,
         })
     }
-
-    /// Alias of [`Tensor::broadcast_as`], preserved for source compatibility.
-    pub fn expand(&self, target: &[Dim]) -> Result<Tensor> {
-        self.broadcast_as(target)
-    }
 }
 
 /// Lift both operands to their common shape and report it.

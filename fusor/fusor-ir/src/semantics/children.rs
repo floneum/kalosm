@@ -1,6 +1,5 @@
-//! Operand ids of every `Op`, in the order inference, verification, work
-//! accounting and the cost model all expect. The one place that order is
-//! written down.
+//! Operand ids of every `Op`, in the one order inference, verification,
+//! work and cost all expect.
 
 use crate::ir::launch::Launch;
 use crate::ir::logical::Logical;
@@ -31,19 +30,13 @@ pub fn children_logical(op: &Logical) -> Children {
     }
 }
 
-/// Operand ids of a Launch node, taken from its `Operand` lists. `Contract`
-/// is its A-side operands followed by its B-side ones — one each in the
-/// two-buffer case that reads `[a.src, b.src]`, more once a multi-edge
-/// producer has been absorbed. A region is its members and a merged wave is
-/// its segments.
+/// Operand ids of a Launch node, in [`Launch::operands`] order; a composite
+/// names its members.
 pub fn children_launch(op: &Launch) -> Children {
     match op {
-        Launch::Map { ops, .. }
-        | Launch::Fold { ops, .. }
-        | Launch::Gather { ops, .. }
-        | Launch::Scatter { ops, .. }
-        | Launch::Ext { ops, .. } => ops.iter().map(|o| o.src).collect(),
-        Launch::Contract { a, b, .. } => a.ops.iter().chain(b.ops.iter()).map(|o| o.src).collect(),
-        Launch::Region { members, .. } => members.iter().copied().collect(),
+        Launch::Slab { members, .. } | Launch::Group { members, .. } => {
+            members.iter().copied().collect()
+        }
+        _ => op.operands().map(|o| o.src).collect(),
     }
 }

@@ -1,18 +1,11 @@
-//! Schedule-domain generators. Each `legal` *generates* the complete legal
-//! parameter space of one node under one `Caps`, filtered by structural
-//! predicates and the exact `arena` footprint.
+//! Schedule-domain generators: each `legal` generates the complete legal
+//! parameter space of one node, filtered by the exact arena footprint.
 
 pub mod coop;
 pub mod fold;
 pub mod map;
 pub mod sgemm;
 pub mod sgemv;
-
-pub use coop::legal as coop_legal;
-pub use fold::legal as fold_legal;
-pub use map::legal as map_legal;
-pub use sgemm::legal as sgemm_legal;
-pub use sgemv::legal as sgemv_legal;
 
 pub use coop::{coop_domain, coop_tiles, stage_element};
 pub use fold::{emitted_block, fold_domain, fold_domain_for};
@@ -24,9 +17,8 @@ use fusor_ir::device::Caps;
 use fusor_ir::ir::kernel::ArenaPlanner;
 use fusor_ir::ir::launch::{FoldStrat, MapTiling, SgemmParams, SgemvParams};
 
-/// Everything a generator reads. `planner` is the *exact* footprint
-/// function — never an estimator, because a geometry admitted here must
-/// pass `verify_launch` unchanged.
+/// Everything a generator reads. `planner` is the exact footprint function,
+/// so an admitted geometry passes `verify_launch` unchanged.
 pub struct DomainCtx<'a> {
     pub caps: &'a Caps,
     pub planner: &'a dyn ArenaPlanner,
@@ -38,15 +30,8 @@ impl<'a> DomainCtx<'a> {
     }
 }
 
-/// Hard ceiling on split-K candidates. Bounds the candidate count; it is not
-/// a profitability judgement.
-pub const MAX_SPLITS: u32 = 64;
-
-/// A process-wide memo for a shape-independent candidate table.
-///
-/// The heavy generators (`coop::candidate_geoms_for`, `sgemm::sgemm_domain`)
-/// are pure functions of `(Caps, element, planner)` — no extent reaches them
-/// — so the enumeration runs once per device, not once per node.
+/// A process-wide memo for a shape-independent candidate table, so heavy
+/// generators run once per device, not per node.
 pub(crate) struct DomainMemo<K, V> {
     slots: std::sync::Mutex<Vec<(K, V)>>,
 }
@@ -58,9 +43,8 @@ impl<K: Clone + PartialEq, V: Clone> DomainMemo<K, V> {
         }
     }
 
-    /// The memoized value for `key`, computing it on a miss. A device count
-    /// in the low single digits makes a linear scan the right structure and
-    /// keeps the key free of a `Hash` bound.
+    /// The memoized value for `key`, computing it on a miss (linear scan: few
+    /// devices, no `Hash` bound).
     pub(crate) fn get_or_insert(&self, key: &K, build: impl FnOnce() -> V) -> V {
         if let Ok(slots) = self.slots.lock()
             && let Some((_, v)) = slots.iter().find(|(k, _)| k == key)
@@ -77,15 +61,13 @@ impl<K: Clone + PartialEq, V: Clone> DomainMemo<K, V> {
     }
 }
 
-/// Identity of the planner a `DomainCtx` carries, for memo keys. Two
-/// `ArenaPlanner`s may report different footprints, so a cached candidate
-/// table is only valid for the planner that filtered it.
+/// Identity of the planner a `DomainCtx` carries: a cached table is valid
+/// only for the planner that filtered it.
 pub(crate) fn planner_id(planner: &dyn ArenaPlanner) -> usize {
     std::ptr::from_ref(planner) as *const () as usize
 }
 
-/// Rank of a point no bench has ever visited. Far from the measured band and
-/// below 255, so a future seed table can still order below it.
+/// Rank of a never-benched point: far from the measured band, below 255.
 pub(crate) const UNMEASURED: u8 = 200;
 
 /// Ascending-tuple tiebreak for the sgemm cap.
@@ -115,10 +97,8 @@ pub(crate) fn map_order(t: &MapTiling) -> (u32, u32, u32) {
     (t.dim.unwrap_or(u32::MAX), t.tm, t.vector)
 }
 
-/// The [`ArenaPlanner`] the rules in [`crate::rules`] reach for: the one
-/// memoized [`crate::Planner`], the same object `verify_launch` admits against
-/// and the Kernel emitter lays out with, so a geometry this crate admits
-/// passes `verify_launch` unchanged.
+/// The [`ArenaPlanner`] the rules use: the one memoized [`crate::Planner`]
+/// that `verify_launch` and the emitter also use.
 pub fn default_planner() -> &'static dyn ArenaPlanner {
     crate::Planner::global()
 }

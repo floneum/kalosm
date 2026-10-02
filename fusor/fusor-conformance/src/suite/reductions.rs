@@ -5,11 +5,9 @@
 use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
 
-use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fuzz_case};
+use crate::harness::{CaseResult, Cases, FuzzDim, Rng, dims};
 use crate::suite::support::{
-    Domain, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss, read_scalar,
-    upload,
+    Domain, check_gradient, expect_values, gradient_of, graph_of, read, read_scalar, upload,
 };
 
 /// `[rows, axis]`. Every table case runs a finite-difference backward, which
@@ -67,46 +65,30 @@ fn host_lse_op(x: &Tensor) -> fusor::Result<Tensor> {
 }
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
+    let mut cases = Cases::new("reductions");
 
     for (name, keepdim, op, reference, domain) in table() {
-        cases.push_case(fuzz_case(
-            "reductions",
-            name,
-            SPEC,
-            async move |session: &Session, shape: &[u64], seed: u32| {
-                reduction_case(session, shape, seed, keepdim, op, reference, domain).await
-            },
-        ));
+        cases.fuzz(name, SPEC, async move |session, shape, seed| {
+            reduction_case(session, shape, seed, keepdim, op, reference, domain).await
+        });
     }
 
     // A rank-4 reduction over an interior axis: the axis-removal bookkeeping
     // is where a rank-generic `Fold` goes wrong.
-    cases.push_case(fuzz_case(
-        "reductions",
-        "sum_high_rank",
-        HIGH_RANK_SPEC,
-        sum_high_rank,
-    ));
+    cases.fuzz("sum_high_rank", HIGH_RANK_SPEC, sum_high_rank);
 
     // The two adjoints whose rule is not "broadcast the gradient". The tie
     // cases are hand-authored tables; the zero-aware case plants its zeros.
-    cases.push("reductions", "max_ties_split_evenly", max_ties_split_evenly);
-    cases.push("reductions", "min_ties_split_evenly", min_ties_split_evenly);
-    cases.push_case(fuzz_case(
-        "reductions",
-        "product_zero_aware",
-        ZERO_AWARE_SPEC,
-        product_zero_aware,
-    ));
+    cases.push("max_ties_split_evenly", max_ties_split_evenly);
+    cases.push("min_ties_split_evenly", min_ties_split_evenly);
+    cases.fuzz("product_zero_aware", ZERO_AWARE_SPEC, product_zero_aware);
 
     // `fold_split` is only sound where `NumericContract::reassoc` allows it.
-    cases.push_case(fuzz_case(
-        "reductions",
+    cases.fuzz(
         "fold_split_agrees_when_reassoc",
         FOLD_SPLIT_SPEC,
         fold_split_agrees,
-    ));
+    );
 
     cases.extend(generality::cases());
     cases
@@ -119,85 +101,59 @@ pub mod generality {
     use fusor_ir::carrier::{ArgRemap, Carrier};
     use fusor_ir::scalar::BinOp;
 
-    use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fuzz_case};
+    use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, Rng, dims};
     use crate::suite::support::{Domain, expect_shaped, graph_of, read, upload};
 
     pub fn cases() -> Cases {
-        let mut cases = Cases::new();
+        let mut cases = Cases::new("reductions");
         // ABSORB, second clause: a reduction over a reduction whose inner
         // result is never a buffer. No attention, no softmax, no split.
-        cases.push_case(fuzz_case(
-            "reductions",
+        cases.fuzz(
             "kmeans_assignment_min_of_sums",
             KMEANS_SPEC,
             kmeans_assignment,
-        ));
+        );
         // ABSORB under NumericContract::STRICT: the QAT chain every inexact
         // law must decline on, reduced by a plain sum.
-        cases.push_case(fuzz_case(
-            "reductions",
+        cases.fuzz(
             "qat_fake_quant_chain_is_exact",
             QAT_SPEC,
             qat_fake_quant_chain,
-        ));
+        );
         // HOIST, three rows, all EXACT in float: (*c) into an extremum,
         // (+c) into an extremum, and Neg swapping Max for Min.
-        cases.push_case(fuzz_case(
-            "reductions",
+        cases.fuzz(
             "sampling_temperature_hoists_out_of_argmax",
             TEMPERATURE_SPEC,
             temperature,
-        ));
-        cases.push_case(fuzz_case(
-            "reductions",
-            "max_of_shifted_is_shifted_max",
-            HOIST_SPEC,
-            shifted_max,
-        ));
-        cases.push_case(fuzz_case(
-            "reductions",
-            "min_of_negated_is_negated_max",
-            HOIST_SPEC,
-            negated_min,
-        ));
+        );
+        cases.fuzz("max_of_shifted_is_shifted_max", HOIST_SPEC, shifted_max);
+        cases.fuzz("min_of_negated_is_negated_max", HOIST_SPEC, negated_min);
         // TUPLE: two folds over one axis, read once. Dynamic-range
         // quantization calibration — no shared algebra between the two.
-        cases.push_case(fuzz_case(
-            "reductions",
-            "min_and_max_in_one_pass",
-            TUPLE_SPEC,
-            min_and_max_one_pass,
-        ));
+        cases.fuzz("min_and_max_in_one_pass", TUPLE_SPEC, min_and_max_one_pass);
         // TUPLE / RETARGET's rotation row: a single-bin DFT is two
         // projections of one windowed signal over one axis.
-        cases.push_case(fuzz_case(
-            "reductions",
-            "goertzel_single_bin_dft",
-            GOERTZEL_SPEC,
-            goertzel,
-        ));
+        cases.fuzz("goertzel_single_bin_dft", GOERTZEL_SPEC, goertzel);
         // RETARGET: the trainer's own loss. A weighted log-sum-exp, stable
         // where the naive form overflows, with no mention of softmax.
-        cases.push_case(fuzz_case(
-            "reductions",
+        cases.fuzz(
             "weighted_log_sum_exp_distillation_loss",
             DISTILLATION_SPEC,
             distillation,
-        ));
+        );
         // STRIP's elide clause: an additive-identity mask over a ragged
         // batch. Nobody would write a MaskKind variant for this.
-        cases.push_case(fuzz_case(
-            "reductions",
+        cases.fuzz(
             "ragged_batch_padding_is_identity",
             RAGGED_SPEC,
             ragged_padding,
-        ));
-        cases.push_case(fuzz_case(
-            "reductions",
+        );
+        cases.fuzz(
             "long_sum_agrees_with_f64",
             LONG_SUM_SPEC,
             long_sum_agrees_with_f64,
-        ));
+        );
         cases
     }
 
@@ -668,23 +624,14 @@ async fn reduction_case(
 
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dimv, &data)?;
-    let y = op(&x).map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = op(&x)?;
 
     let actual = read(&y).await?;
     let expected: Vec<f32> = data.chunks(axis as usize).map(reference).collect();
     expect_values(session, &out_shape, Dtype::F32, &actual, &expected).await?;
 
     let analytic = gradient_of(&graph, &y, &x).await?;
-    let probe_graph = graph_of(session);
-    let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
-    let probe_y = op(&probe_x).map_err(|e| -> CaseError { e.to_string().into() })?;
-    let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&[rows as usize, axis as usize], &data, |p| {
-        read_probe_loss(&probe_x, &probe_loss, p)
-    })
-    .await?;
-    assert_gradient_matches_finite_difference(&analytic, &numeric)?;
-    Ok(())
+    check_gradient(session, &[(&dimv, &data)], 0, &analytic, |t| op(&t[0])).await
 }
 
 /// `[b, c, h, w]`. The backward here is analytic-only (`sum`'s adjoint is a
@@ -710,9 +657,7 @@ async fn sum_high_rank(session: &Session, shape: &[u64], seed: u32) -> CaseResul
     let x = upload(graph.handle(), &dimv, &data)?;
     // Axis 2 of 4: interior, so neither the innermost nor the outermost
     // special case covers it.
-    let y = x
-        .sum(2)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.sum(2)?;
 
     let actual = read(&y).await?;
     let mut expected = vec![0.0f32; b_n * c_n * w_n];
@@ -761,8 +706,7 @@ async fn extrema_tie_case(session: &Session, is_max: bool) -> CaseResult {
     let dimv = dims(&[3, 5]);
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dimv, &data)?;
-    let y = if is_max { x.max(1) } else { x.min(1) }
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = if is_max { x.max(1) } else { x.min(1) }?;
 
     let grad = gradient_of(&graph, &y, &x).await?;
     let expected: Vec<f32> = vec![
@@ -829,9 +773,7 @@ async fn product_zero_aware(session: &Session, shape: &[u64], seed: u32) -> Case
     let dimv = dims(shape);
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dimv, &data)?;
-    let y = x
-        .product(1)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.product(1)?;
     let grad = gradient_of(&graph, &y, &x).await?;
 
     let mut expected = vec![0.0f32; data.len()];
@@ -880,9 +822,7 @@ async fn fold_split_agrees(session: &Session, shape: &[u64], seed: u32) -> CaseR
 
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dimv, &data)?;
-    let y = x
-        .sum_all()
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.sum_all()?;
     let actual = read_scalar(&y).await?;
 
     // f64-accumulated reference: a split fold and an unsplit one must both

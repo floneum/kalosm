@@ -2,7 +2,7 @@
 //! odd/small shapes with the member sweep armed and report how many class
 //! members computed wrong values. Exit code 1 when any did.
 //!
-//! Run: FUSOR_VERIFY_MEMBERS=1 cargo run --release -p fusor --example coop_attn_repro
+//! Run: FUSOR_VERIFY_MEMBERS=1 cargo run --release -p fusor --features compiler-tests --example coop_attn_repro
 
 use fusor::tensor::Dyn;
 use fusor::{Device, Dtype};

@@ -12,10 +12,9 @@
 use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
 
-use crate::compare::{assert_gradient_matches_finite_difference, finite_difference_gradient};
-use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims, fuzz_case};
+use crate::harness::{CaseError, CaseResult, Cases, FuzzDim, dims};
 use crate::suite::support::{
-    Domain, ELEMENTWISE_SPEC, expect_values, gradient_of, graph_of, loss_of, read, read_probe_loss,
+    Domain, ELEMENTWISE_SPEC, check_gradient, expect_values, gradient_of, graph_of, loss_of, read,
     upload,
 };
 
@@ -36,10 +35,6 @@ fn backend_of(session: &Session) -> &'static str {
 
 fn len_of(shape: &[u64]) -> usize {
     shape.iter().product::<u64>() as usize
-}
-
-fn usize_shape(shape: &[u64]) -> Vec<usize> {
-    shape.iter().map(|n| *n as usize).collect()
 }
 
 /// The build receives the sampled shape so shape-dependent chains
@@ -98,117 +93,74 @@ fn comparisons() -> Vec<(&'static str, Build)> {
 }
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
+    let mut cases = Cases::new("backward");
 
     for (name, build, domain) in chains() {
-        cases.push_case(fuzz_case(
-            "backward",
-            name,
-            ELEMENTWISE_SPEC,
-            async move |s: &Session, shape: &[u64], seed: u32| {
-                chain_case(s, name, build, domain, shape, seed).await
-            },
-        ));
+        cases.fuzz(name, ELEMENTWISE_SPEC, async move |s, shape, seed| {
+            chain_case(s, name, build, domain, shape, seed).await
+        });
     }
     for (name, build) in comparisons() {
         let case: &'static str =
             Box::leak(format!("{name}_differentiates_to_zero").into_boxed_str());
-        cases.push_case(fuzz_case(
-            "backward",
-            case,
-            FORWARD_SPEC,
-            async move |s: &Session, shape: &[u64], seed: u32| {
-                zero_grad_case(s, name, build, shape, seed).await
-            },
-        ));
+        cases.fuzz(case, FORWARD_SPEC, async move |s, shape, seed| {
+            zero_grad_case(s, name, build, shape, seed).await
+        });
     }
 
     // The clamp data must straddle both bounds, so its width floor keeps at
     // least the three forced elements.
     const CLAMP_SPEC: &[FuzzDim] = &[FuzzDim::Range(1, 6), FuzzDim::Range(3, 16)];
-    cases.push_case(fuzz_case(
-        "backward",
-        "clamp_masks_both_ends",
-        CLAMP_SPEC,
-        clamp_case,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
+    cases.fuzz("clamp_masks_both_ends", CLAMP_SPEC, clamp_case);
+    cases.fuzz(
         "where_cond_splits_the_gradient",
         FORWARD_SPEC,
         where_cond_case,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
+    );
+    cases.fuzz(
         "where_cond_gives_the_condition_zeros",
         FORWARD_SPEC,
         where_cond_zero,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
-        "pow_tensor_tensor",
-        ANALYTIC_SPEC,
-        pow_tensor_case,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
+    );
+    cases.fuzz("pow_tensor_tensor", ANALYTIC_SPEC, pow_tensor_case);
+    cases.fuzz(
         "broadcast_add_sums_over_the_stride_zero_axis",
         ANALYTIC_SPEC,
         broadcast_case,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
-        "broadcast_mul_backward",
-        ANALYTIC_SPEC,
-        broadcast_mul_case,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
+    );
+    cases.fuzz("broadcast_mul_backward", ANALYTIC_SPEC, broadcast_mul_case);
+    cases.fuzz(
         "gelu_matches_its_analytic_derivative",
         ANALYTIC_SPEC,
         gelu_analytic,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
+    );
+    cases.fuzz(
         "relu_is_subgradient_zero_at_the_kink",
         ANALYTIC_SPEC,
         relu_kink,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
+    );
+    cases.fuzz(
         "straight_through_fake_quant",
         ANALYTIC_SPEC,
         straight_through_case,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
-        "detach_cuts_the_tape",
-        ANALYTIC_SPEC,
-        detach_case,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
+    );
+    cases.fuzz("detach_cuts_the_tape", ANALYTIC_SPEC, detach_case);
+    cases.fuzz(
         "an_accumulated_adjoint_fires_once",
         ANALYTIC_SPEC,
         diamond_case,
-    ));
-    cases.push_case(fuzz_case(
-        "backward",
+    );
+    cases.fuzz(
         "backward_seeded_scales_the_whole_gradient",
         ANALYTIC_SPEC,
         seeded_case,
-    ));
-    cases.push(
-        "backward",
-        "backward_across_two_graphs_is_refused",
-        cross_graph,
     );
-    cases.push_case(fuzz_case(
-        "backward",
+    cases.push("backward_across_two_graphs_is_refused", cross_graph);
+    cases.fuzz(
         "a_gradient_reaches_every_requires_grad_parent",
         ANALYTIC_SPEC,
         every_parent,
-    ));
+    );
     cases
 }
 
@@ -229,17 +181,11 @@ async fn chain_case(
     let y = build(&x, shape).map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
 
     let analytic = gradient_of(&graph, &y, &x).await?;
-    let probe_graph = graph_of(session);
-    let probe_x = upload(probe_graph.handle(), &dimv, &data)?;
-    let probe_y = build(&probe_x, shape).map_err(|e| -> CaseError { e.to_string().into() })?;
-    let probe_loss = loss_of(&probe_y)?;
-    let numeric = finite_difference_gradient(&usize_shape(shape), &data, |probe| {
-        read_probe_loss(&probe_x, &probe_loss, probe)
+    check_gradient(session, &[(&dimv, &data)], 0, &analytic, |t| {
+        build(&t[0], shape)
     })
-    .await?;
-    assert_gradient_matches_finite_difference(&analytic, &numeric)
-        .map_err(|e| -> CaseError { format!("{name}: {e}").into() })?;
-    Ok(())
+    .await
+    .map_err(|e| -> CaseError { format!("{name}: {e}").into() })
 }
 
 /// A comparison's gradient must be **present and zero**. `gradient_of`
@@ -293,9 +239,7 @@ async fn clamp_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     data[2] = 0.4;
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let y = x
-        .clamp(LO, HI)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.clamp(LO, HI)?;
 
     let expected: Vec<f32> = data.iter().map(|v| v.clamp(LO, HI)).collect();
     expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await?;
@@ -321,14 +265,10 @@ async fn where_cond_case(session: &Session, shape: &[u64], seed: u32) -> CaseRes
 
     let graph = graph_of(session);
     let c = upload(graph.handle(), &dims(shape), &cond_src)?;
-    let mask = c
-        .gt_scalar(0.0f32)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let mask = c.gt_scalar(0.0f32)?;
     let a = upload(graph.handle(), &dims(shape), &a_data)?;
     let b = upload(graph.handle(), &dims(shape), &b_data)?;
-    let y = mask
-        .where_cond(&a, &b)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = mask.where_cond(&a, &b)?;
 
     let picks: Vec<f32> = cond_src.iter().map(|v| f32::from(*v > 0.0)).collect();
     let expected: Vec<f32> = (0..len)
@@ -366,9 +306,7 @@ async fn where_cond_zero(session: &Session, shape: &[u64], seed: u32) -> CaseRes
         &dims(shape),
         &Domain::Wide.sample(seed.wrapping_add(1), len),
     )?;
-    let y = c
-        .where_cond(&a, &b)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = c.where_cond(&a, &b)?;
     let d_c = gradient_of(&graph, &y, &c)
         .await
         .map_err(|e| -> CaseError {
@@ -389,9 +327,7 @@ async fn pow_tensor_case(session: &Session, shape: &[u64], seed: u32) -> CaseRes
     let graph = graph_of(session);
     let a = upload(graph.handle(), &dimv, &a_data)?;
     let b = upload(graph.handle(), &dimv, &b_data)?;
-    let y = a
-        .pow(&b)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = a.pow(&b)?;
 
     let expected: Vec<f32> = a_data
         .iter()
@@ -427,9 +363,7 @@ async fn broadcast_case(session: &Session, shape: &[u64], seed: u32) -> CaseResu
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &x_data)?;
     let b = upload(graph.handle(), &dims(&[cols as u64]), &bias)?;
-    let y = x
-        .add_(&b)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.add_(&b)?;
 
     let expected: Vec<f32> = x_data
         .iter()
@@ -453,9 +387,7 @@ async fn broadcast_mul_case(session: &Session, shape: &[u64], seed: u32) -> Case
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &x_data)?;
     let s = upload(graph.handle(), &dims(&[cols as u64]), &scale)?;
-    let y = x
-        .mul_(&s)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.mul_(&s)?;
 
     let d_s = gradient_of(&graph, &y, &s).await?;
     let want: Vec<f32> = (0..cols)
@@ -488,9 +420,7 @@ async fn gelu_analytic(session: &Session, shape: &[u64], seed: u32) -> CaseResul
     let data = Domain::Custom(-2.5, 2.5).sample(seed, len);
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let y = x
-        .gelu()
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.gelu()?;
     // The forward must be the tanh approximation, not the erf one, or the
     // analytic derivative below is being compared against the wrong function.
     let expected: Vec<f32> = data.iter().copied().map(host_gelu).collect();
@@ -523,9 +453,7 @@ async fn relu_kink(session: &Session, shape: &[u64], seed: u32) -> CaseResult {
     data[0] = 0.0;
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let y = x
-        .relu()
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.relu()?;
 
     let expected: Vec<f32> = data.iter().map(|v| v.max(0.0)).collect();
     expect_values(session, shape, Dtype::F32, &read(&y).await?, &expected).await?;
@@ -547,9 +475,7 @@ async fn straight_through_case(session: &Session, shape: &[u64], seed: u32) -> C
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
     let scale = upload(graph.handle(), &dims(&[1]), &[0.25f32])?;
-    let q = x
-        .fake_quant(7, &scale)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let q = x.fake_quant(7, &scale)?;
 
     let expected: Vec<f32> = data
         .iter()
@@ -575,13 +501,9 @@ async fn detach_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult 
     let data = Domain::Wide.sample(seed, len_of(shape));
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let mid = x.sqr().map_err(|e| -> CaseError { e.to_string().into() })?;
-    let cut = mid
-        .detach()
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let y = cut
-        .mul_scalar(3.0f32)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let mid = x.sqr()?;
+    let cut = mid.detach()?;
+    let y = cut.mul_scalar(3.0f32)?;
 
     // The detached copy holds the same values...
     let expected: Vec<f32> = data.iter().map(|v| 3.0 * v * v).collect();
@@ -602,10 +524,7 @@ async fn diamond_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult
     let data = Domain::Wide.sample(seed, len);
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let y = x
-        .mul(&x)
-        .and_then(|sq| sq.add(&x))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.mul(&x).and_then(|sq| sq.add(&x))?;
     let grad = gradient_of(&graph, &y, &x).await?;
     let want: Vec<f32> = data.iter().map(|v| 2.0 * v + 1.0).collect();
     crate::compare::approx_or_relative_eq(backend_of(session), &[len], &want, &grad, 1e-4, 1e-4)
@@ -624,7 +543,7 @@ async fn seeded_case(session: &Session, shape: &[u64], seed: u32) -> CaseResult 
     let data = Domain::Wide.sample(seed, len);
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let y = x.sqr().map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.sqr()?;
     let loss = loss_of(&y)?;
     let seed_t = upload(graph.handle(), &dims(&[]), &[SCALE]).or_else(|_| {
         // A rank-0 upload may not be expressible; a [1] seed is the same value.
@@ -651,7 +570,7 @@ async fn cross_graph(session: &Session) -> CaseResult {
     let b = graph_of(session);
     let x = upload(a.handle(), &dims(SHAPE), &Domain::Wide.sample(1451, LEN))?;
     let other = upload(b.handle(), &dims(SHAPE), &Domain::Wide.sample(1453, LEN))?;
-    let loss = loss_of(&x.sqr().map_err(|e| -> CaseError { e.to_string().into() })?)?;
+    let loss = loss_of(&x.sqr()?)?;
     if b.backward_with(&loss, std::slice::from_ref(&other)).is_ok() {
         return Err("backward accepted a loss from a different graph".into());
     }
@@ -670,11 +589,7 @@ async fn every_parent(session: &Session, shape: &[u64], seed: u32) -> CaseResult
     let a = upload(graph.handle(), &dims(shape), &a_data)?;
     let b = upload(graph.handle(), &dims(shape), &b_data)?;
     let c = upload(graph.handle(), &dims(shape), &c_data)?;
-    let y = a
-        .mul(&b)
-        .and_then(|p| p.sub(&c))
-        .and_then(|d| d.div(&b))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = a.mul(&b).and_then(|p| p.sub(&c)).and_then(|d| d.div(&b))?;
 
     for (label, operand) in [("a", &a), ("b", &b), ("c", &c)] {
         let grad = gradient_of(&graph, &y, operand)

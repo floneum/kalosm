@@ -22,3 +22,7 @@ cranelift-frontend = "0.125.3"
 cranelift-jit = "0.125.3"
 cranelift-module = "0.125.3"
 cranelift-native = "0.125.3"
+
+[features]
+# Instrumentation for the compiler conformance harness only.
+compiler-tests = ["fusor-ir/compiler-tests"]

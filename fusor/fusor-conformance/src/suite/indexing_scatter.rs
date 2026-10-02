@@ -11,9 +11,7 @@
 
 use fusor::{Dtype, Session};
 
-use crate::harness::{
-    CaseError, CaseResult, Cases, FuzzDim, Rng, dims, fill_indices, from_u32, fuzz_case,
-};
+use crate::harness::{CaseResult, Cases, FuzzDim, Rng, dims, fill_indices, from_u32};
 use crate::suite::support::{Domain, expect_values, gradient_of, graph_of, read, upload};
 
 /// The `[vocab, width]` table the gather/scatter cases read from.
@@ -45,29 +43,22 @@ fn dup_indices(seed: u32, count: usize, rows: u64) -> Vec<u32> {
 }
 
 pub fn cases() -> Cases {
-    let mut cases = Cases::new();
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
+    let mut cases = Cases::new("indexing_scatter");
+    cases.fuzz(
         "index_select_dim0",
         TABLE_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            index_select_case(s, shape, seed, 0).await
-        },
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
+        async move |s, shape, seed| index_select_case(s, shape, seed, 0).await,
+    );
+    cases.fuzz(
         "index_select_dim1",
         TABLE_SPEC,
-        async move |s: &Session, shape: &[u64], seed: u32| {
-            index_select_case(s, shape, seed, 1).await
-        },
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
+        async move |s, shape, seed| index_select_case(s, shape, seed, 1).await,
+    );
+    cases.fuzz(
         "index_select_duplicate_gradients_accumulate",
         TABLE_SPEC,
         dup_grad_case,
-    ));
+    );
     // [vocab, width, batch, tokens].
     const EMBED_SPEC: &[FuzzDim] = &[
         FuzzDim::Range(2, 8),
@@ -75,12 +66,7 @@ pub fn cases() -> Cases {
         FuzzDim::Range(1, 3),
         FuzzDim::Range(1, 3),
     ];
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "embedding",
-        EMBED_SPEC,
-        embedding_case,
-    ));
+    cases.fuzz("embedding", EMBED_SPEC, embedding_case);
     // `batch * tokens >= 2` so a duplicate can exist.
     const EMBED_DUP_SPEC: &[FuzzDim] = &[
         FuzzDim::Range(2, 8),
@@ -88,50 +74,22 @@ pub fn cases() -> Cases {
         FuzzDim::Range(1, 3),
         FuzzDim::Range(2, 3),
     ];
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
+    cases.fuzz(
         "embedding_backward_is_scatter_add",
         EMBED_DUP_SPEC,
         embedding_backward,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "gather_last",
-        TABLE_SPEC,
-        gather_last_case,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "gather_last_backward",
-        TABLE_SPEC,
-        gather_last_backward,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "scatter_add",
-        TABLE_SPEC,
-        scatter_add_case,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
+    );
+    cases.fuzz("gather_last", TABLE_SPEC, gather_last_case);
+    cases.fuzz("gather_last_backward", TABLE_SPEC, gather_last_backward);
+    cases.fuzz("scatter_add", TABLE_SPEC, scatter_add_case);
+    cases.fuzz(
         "scatter_add_duplicates_accumulate",
         TABLE_SPEC,
         scatter_add_dups,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "scatter_add_backward",
-        TABLE_SPEC,
-        scatter_add_backward,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "scatter_set_unique",
-        TABLE_SPEC,
-        scatter_set_case,
-    ));
+    );
+    cases.fuzz("scatter_add_backward", TABLE_SPEC, scatter_add_backward);
+    cases.fuzz("scatter_set_unique", TABLE_SPEC, scatter_set_case);
     cases.push(
-        "indexing_scatter",
         "scatter_set_refuses_an_unproven_index",
         scatter_set_unproven,
     );
@@ -147,37 +105,16 @@ pub fn cases() -> Cases {
         FuzzDim::Range(1, 4),
         FuzzDim::Range(2, 4),
     ];
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "i_rank2",
-        R2_SPEC,
-        index_rank2,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "i_rank3",
-        R3_SPEC,
-        index_rank3,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "i_rank4",
-        R4_SPEC,
-        index_rank4,
-    ));
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
-        "i_with_a_nonzero_pick",
-        R3_SPEC,
-        index_nonzero_pick,
-    ));
+    cases.fuzz("i_rank2", R2_SPEC, index_rank2);
+    cases.fuzz("i_rank3", R3_SPEC, index_rank3);
+    cases.fuzz("i_rank4", R4_SPEC, index_rank4);
+    cases.fuzz("i_with_a_nonzero_pick", R3_SPEC, index_nonzero_pick);
     const BACKWARD_SPEC: &[FuzzDim] = &[FuzzDim::Range(2, 5), FuzzDim::Range(2, 6)];
-    cases.push_case(fuzz_case(
-        "indexing_scatter",
+    cases.fuzz(
         "i_backward_zeroes_the_unselected_region",
         BACKWARD_SPEC,
         index_backward,
-    ));
+    );
     cases
 }
 
@@ -194,11 +131,8 @@ async fn index_select_case(session: &Session, shape: &[u64], seed: u32, dim: usi
 
     let graph = graph_of(session);
     let t = upload(graph.handle(), &dims(shape), &table)?;
-    let i = from_u32(graph.handle(), &dims(&[n as u64]), &idx)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let y = t
-        .index_select(dim, &i)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let i = from_u32(graph.handle(), &dims(&[n as u64]), &idx)?;
+    let y = t.index_select(dim, &i)?;
 
     let (out_shape, expected) = if dim == 0 {
         let mut out = Vec::with_capacity(n * width);
@@ -253,11 +187,8 @@ async fn dup_grad_case(session: &Session, shape: &[u64], seed: u32) -> CaseResul
 
     let graph = graph_of(session);
     let t = upload(graph.handle(), &dims(shape), &table)?;
-    let i = from_u32(graph.handle(), &dims(&[n as u64]), &idx)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let y = t
-        .index_select(0, &i)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let i = from_u32(graph.handle(), &dims(&[n as u64]), &idx)?;
+    let y = t.index_select(0, &i)?;
     let grad = gradient_of(&graph, &y, &t).await?;
 
     let counts = counts_of(&idx, vocab);
@@ -291,11 +222,8 @@ async fn embedding_case(session: &Session, shape: &[u64], seed: u32) -> CaseResu
 
     let graph = graph_of(session);
     let t = upload(graph.handle(), &dims(&shape[..2]), &table)?;
-    let ids_t = from_u32(graph.handle(), &dims(&[batch, tokens]), &ids)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let y = t
-        .embedding(&ids_t)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let ids_t = from_u32(graph.handle(), &dims(&[batch, tokens]), &ids)?;
+    let y = t.embedding(&ids_t)?;
 
     let mut expected = Vec::with_capacity(ids.len() * width);
     for id in &ids {
@@ -318,11 +246,8 @@ async fn embedding_backward(session: &Session, shape: &[u64], seed: u32) -> Case
 
     let graph = graph_of(session);
     let t = upload(graph.handle(), &dims(&shape[..2]), &table)?;
-    let ids_t = from_u32(graph.handle(), &dims(&[batch, tokens]), &ids)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let y = t
-        .embedding(&ids_t)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let ids_t = from_u32(graph.handle(), &dims(&[batch, tokens]), &ids)?;
+    let y = t.embedding(&ids_t)?;
     let grad = gradient_of(&graph, &y, &t).await?;
 
     let counts = counts_of(&ids, vocab);
@@ -348,11 +273,8 @@ async fn gather_last_case(session: &Session, shape: &[u64], seed: u32) -> CaseRe
 
     let graph = graph_of(session);
     let t = upload(graph.handle(), &dims(shape), &table)?;
-    let i = from_u32(graph.handle(), &dims(&[shape[0]]), &picks)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let y = t
-        .gather_last(&i)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let i = from_u32(graph.handle(), &dims(&[shape[0]]), &picks)?;
+    let y = t.gather_last(&i)?;
 
     let expected: Vec<f32> = picks
         .iter()
@@ -379,11 +301,8 @@ async fn gather_last_backward(session: &Session, shape: &[u64], seed: u32) -> Ca
 
     let graph = graph_of(session);
     let t = upload(graph.handle(), &dims(shape), &table)?;
-    let i = from_u32(graph.handle(), &dims(&[shape[0]]), &picks)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
-    let y = t
-        .gather_last(&i)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let i = from_u32(graph.handle(), &dims(&[shape[0]]), &picks)?;
+    let y = t.gather_last(&i)?;
     let grad = gradient_of(&graph, &y, &t).await?;
 
     let mut want = vec![0.0f32; vocab * width];
@@ -411,12 +330,9 @@ async fn scatter_add_case(session: &Session, shape: &[u64], seed: u32) -> CaseRe
 
     let graph = graph_of(session);
     let b = upload(graph.handle(), &dims(shape), &base)?;
-    let i = from_u32(graph.handle(), &dims(&[n as u64]), &idx)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let i = from_u32(graph.handle(), &dims(&[n as u64]), &idx)?;
     let u = upload(graph.handle(), &dims(&[n as u64, shape[1]]), &updates)?;
-    let y = b
-        .scatter_add(0, &i, &u)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = b.scatter_add(0, &i, &u)?;
 
     let mut expected = base.clone();
     for (row_n, row) in idx.iter().enumerate() {
@@ -443,12 +359,9 @@ async fn scatter_add_dups(session: &Session, shape: &[u64], seed: u32) -> CaseRe
 
     let graph = graph_of(session);
     let b = upload(graph.handle(), &dims(shape), &base)?;
-    let i = from_u32(graph.handle(), &dims(&[n as u64]), &idx)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let i = from_u32(graph.handle(), &dims(&[n as u64]), &idx)?;
     let u = upload(graph.handle(), &dims(&[n as u64, shape[1]]), &updates)?;
-    let y = b
-        .scatter_add(0, &i, &u)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = b.scatter_add(0, &i, &u)?;
 
     let mut expected = base.clone();
     for (row_n, row) in idx.iter().enumerate() {
@@ -492,12 +405,9 @@ async fn scatter_add_backward(session: &Session, shape: &[u64], seed: u32) -> Ca
 
     let graph = graph_of(session);
     let b = upload(graph.handle(), &dims(shape), &base)?;
-    let i = from_u32(graph.handle(), &dims(&[n as u64]), &idx)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let i = from_u32(graph.handle(), &dims(&[n as u64]), &idx)?;
     let u = upload(graph.handle(), &dims(&[n as u64, shape[1]]), &updates)?;
-    let y = b
-        .scatter_add(0, &i, &u)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = b.scatter_add(0, &i, &u)?;
 
     let d_base = gradient_of(&graph, &y, &b).await?;
     if let Some((row_n, v)) = d_base
@@ -535,12 +445,9 @@ async fn scatter_set_case(session: &Session, shape: &[u64], seed: u32) -> CaseRe
 
     let graph = graph_of(session);
     let b = upload(graph.handle(), &dims(shape), &base)?;
-    let i = from_u32(graph.handle(), &dims(&[n as u64]), &idx)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let i = from_u32(graph.handle(), &dims(&[n as u64]), &idx)?;
     let u = upload(graph.handle(), &dims(&[n as u64, shape[1]]), &updates)?;
-    let y = b
-        .scatter_set(0, &i, &u, true)
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = b.scatter_set(0, &i, &u, true)?;
 
     let mut expected = base.clone();
     for (row_n, row) in idx.iter().enumerate() {
@@ -577,8 +484,7 @@ async fn scatter_set_unproven(session: &Session) -> CaseResult {
         &dims(&[5, 3]),
         &Domain::Wide.sample(1087, 15),
     )?;
-    let i = from_u32(graph.handle(), &dims(&[2]), &[0u32, 4])
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let i = from_u32(graph.handle(), &dims(&[2]), &[0u32, 4])?;
     let u = upload(
         graph.handle(),
         &dims(&[2, 3]),
@@ -602,9 +508,7 @@ async fn index_rank2(session: &Session, shape: &[u64], seed: u32) -> CaseResult 
 
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let y = x
-        .i((p, ..))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.i((p, ..))?;
     expect_values(
         session,
         &[shape[1]],
@@ -627,9 +531,7 @@ async fn index_rank3(session: &Session, shape: &[u64], seed: u32) -> CaseResult 
 
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let y = x
-        .i((.., p, lo..lo + len))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.i((.., p, lo..lo + len))?;
     let mut expected = Vec::with_capacity(a * len);
     for i in 0..a {
         for k in lo..lo + len {
@@ -663,9 +565,7 @@ async fn index_rank4(session: &Session, shape: &[u64], seed: u32) -> CaseResult 
 
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let y = x
-        .i((..hi, p, .., q..))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.i((..hi, p, .., q..))?;
     let mut expected = Vec::with_capacity(hi * c * (d - q));
     for a2 in 0..hi {
         for c2 in 0..c {
@@ -700,9 +600,7 @@ async fn index_nonzero_pick(session: &Session, shape: &[u64], seed: u32) -> Case
 
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let y = x
-        .i((p, lo1..lo1 + len1, lo2..lo2 + len2))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.i((p, lo1..lo1 + len1, lo2..lo2 + len2))?;
     let mut expected = Vec::with_capacity(len1 * len2);
     for j in lo1..lo1 + len1 {
         for k in lo2..lo2 + len2 {
@@ -732,9 +630,7 @@ async fn index_backward(session: &Session, shape: &[u64], seed: u32) -> CaseResu
 
     let graph = graph_of(session);
     let x = upload(graph.handle(), &dims(shape), &data)?;
-    let y = x
-        .i((p, lo..lo + len))
-        .map_err(|e| -> CaseError { e.to_string().into() })?;
+    let y = x.i((p, lo..lo + len))?;
     let grad = gradient_of(&graph, &y, &x).await?;
     let want: Vec<f32> = (0..r * c)
         .map(|n| f32::from(n / c == p && (lo..lo + len).contains(&(n % c))))

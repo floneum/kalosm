@@ -1,8 +1,5 @@
-//! The lowering rules that consult a schedule-domain generator: the
-//! order-free contraction family rules plus `unfuse_coop_epilogue`, the
-//! four `Scatter` lowerings, the two gather lowerings.
-//!
-//! All the families coexist in one chain and compete on cost.
+//! The lowering rules that consult a schedule-domain generator: contraction
+//! families, `unfuse_coop_epilogue`, and the scatter and gather lowerings.
 
 pub mod contract;
 pub mod gather;
@@ -28,7 +25,7 @@ rule!(
     level = Level::Launch,
     head = OpTag::LaunchGather,
     tag = RuleTag::Additive,
-    apply = tile_gather,
+    apply = tile_indexed,
 );
 
 rule!(
@@ -36,22 +33,12 @@ rule!(
     level = Level::Launch,
     head = OpTag::LaunchScatter,
     tag = RuleTag::Additive,
-    apply = tile_scatter,
+    apply = tile_indexed,
 );
 
-/// Attach the complete legal reduction domain to a `Fold` that arrived
-/// carrying [`ScheduleDomain::Point`].
-///
-/// The floor lowering (`fusor-ir`) cannot generate one: schedule domains are
-/// filtered by the exact arena footprint, which lives here.
-///
-/// The domain is generated for this carrier's lane count, so a wide
-/// accumulator is filtered by workgroup storage rather than admitted and
-/// crashed at `verify_plan`. An empty domain means the rule does not apply,
-/// never that the node is broken.
-///
-/// Promoted folds included: `space = free.. ++ vec.. ++ [reduced]` is a fold
-/// like any other here; both backends lower it per promoted position.
+/// Attach the complete legal reduction domain to a `Fold` carrying
+/// [`ScheduleDomain::Point`]. Lives here because domains are filtered by the
+/// exact arena footprint; an empty domain means the rule does not apply.
 pub fn tile_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
     let Op::Launch(l1) = &node.op else {
         return None;
@@ -68,17 +55,12 @@ pub fn tile_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opt
     else {
         return None;
     };
-    // Neither backend lowers a promoted nest whose reduced axis is not last:
-    // the address arithmetic reads one output row as
-    // `vec_extent * axis_extent` consecutive elements. Pricing a schedule
-    // point for it would make extraction prefer a plan that fails at
-    // lowering.
+    // Neither backend lowers a promoted nest whose reduced axis is not last.
     if !vec_axes.is_empty() && *axis as usize + 1 != space.rank() {
         return None;
     }
     let k = *space.dims.get(*axis as usize)?;
-    // A symbolic `Vector` slot extent is allocatable on neither backend; the
-    // rule declines rather than guessing a footprint.
+    // A symbolic `Vector` slot extent is allocatable on neither backend.
     let lanes = carrier.lanes()?;
     let dom = fold_domain_for(
         k,
@@ -92,40 +74,35 @@ pub fn tile_fold(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Opt
 
     let mut rebuilt = l1.clone();
     if let Launch::Fold { sched, .. } = &mut rebuilt {
-        *sched = ScheduleDomain::Fold(dom);
+        *sched = ScheduleDomain::Fold(dom.into());
     }
-    let new = b.add_launch(rebuilt).ok()?;
-    b.union(id, new).ok()?;
-    Some(new)
+    adopt(b, id, rebuilt)
 }
 
-/// The accesses of a node's operand list, as the map-domain generator reads
-/// them: a per-lane gather has no vector load to widen into, so it forbids a
-/// vectorized tiling. Legality, not preference.
+/// The accesses of a node's operand list: a per-lane gather forbids a
+/// vectorized tiling.
 fn accesses(ops: &[Operand]) -> Vec<fusor_ir::ir::launch::AccessPlan> {
     ops.iter().map(|o| o.access.clone()).collect()
 }
 
-/// Attach the elementwise tiling domain to a floor-lowered `Gather`,
-/// without touching `mode`.
-///
-/// `gather::GATHER_*` mint a mode and a domain together; splitting them makes
-/// both late decisions.
-///
-/// There is deliberately no `TILE_MAP` beside this: a `Map` domain minted as
-/// an additive alternative measurably regresses extraction, and has to be
-/// attached where the node is minted (`lower_floor.rs`) so it replaces
-/// `ScheduleDomain::Point` instead of competing with it.
-pub fn tile_gather(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::Launch(l1) = &node.op else {
-        return None;
-    };
-    let Launch::Gather {
-        space,
-        ops,
-        sched: ScheduleDomain::Point,
-        ..
-    } = l1
+/// Attach the elementwise tiling domain to a floor-lowered `Gather` or
+/// `Scatter`, without touching `mode`. There is no `TILE_MAP`: a `Map` domain
+/// as an additive alternative regresses extraction, so it is minted in place.
+pub fn tile_indexed(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
+    let Op::Launch(
+        l1 @ (Launch::Gather {
+            space,
+            ops,
+            sched: ScheduleDomain::Point,
+            ..
+        }
+        | Launch::Scatter {
+            space,
+            ops,
+            sched: ScheduleDomain::Point,
+            ..
+        }),
+    ) = &node.op
     else {
         return None;
     };
@@ -138,54 +115,23 @@ pub fn tile_gather(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> O
         return None;
     }
     let mut rebuilt = l1.clone();
-    if let Launch::Gather { sched, .. } = &mut rebuilt {
-        *sched = ScheduleDomain::Map(dom);
+    if let Launch::Gather { sched, .. } | Launch::Scatter { sched, .. } = &mut rebuilt {
+        *sched = ScheduleDomain::Map(dom.into());
     }
-    let new = b.add_launch(rebuilt).ok()?;
+    adopt(b, id, rebuilt)
+}
+
+/// Add `op` as an alternative in `id`'s class.
+pub(crate) fn adopt(b: &mut Builder<'_>, id: Id, op: Launch) -> Option<Id> {
+    let new = b.add_launch(op).ok()?;
     b.union(id, new).ok()?;
     Some(new)
 }
 
-/// Attach the elementwise tiling domain to a floor-lowered `Scatter`,
-/// without touching `mode`.
-///
-/// Same split as [`tile_gather`]: this only stops the floor's mode from
-/// being the one alternative with no schedule.
-pub fn tile_scatter(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
-    let Op::Launch(l1) = &node.op else {
-        return None;
-    };
-    let Launch::Scatter {
-        space,
-        ops,
-        sched: ScheduleDomain::Point,
-        ..
-    } = l1
-    else {
-        return None;
-    };
-    let dom = map_domain(
-        &space.dims,
-        &accesses(ops),
-        &DomainCtx::new(f.caps(), default_planner()),
-    );
-    if dom.tilings.len() <= 1 {
-        return None;
-    }
-    let mut rebuilt = l1.clone();
-    if let Launch::Scatter { sched, .. } = &mut rebuilt {
-        *sched = ScheduleDomain::Map(dom);
-    }
-    let new = b.add_launch(rebuilt).ok()?;
-    b.union(id, new).ok()?;
-    Some(new)
-}
-
-/// Every rule `fusor-tile` owns, in a fixed declaration order. Order carries
-/// no semantics; it exists only so a run is reproducible.
+/// Every rule `fusor-tile` owns, in a fixed order for reproducibility.
 pub static TILE_RULES: &[Rule] = &[
     TILE_FOLD,
-    // `Map` is deliberately absent — see the note above `tile_gather`.
+    // `Map` is deliberately absent; see `tile_indexed`.
     TILE_GATHER,
     TILE_SCATTER,
     contract::LOWER_COOP,

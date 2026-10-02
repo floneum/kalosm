@@ -1,13 +1,11 @@
 //! R7 — `specialize_dim` substitutes a symbolic extent for the concrete one
-//! its operands already carry. Priced by compile amortization: on first
-//! sighting of a shape family the generic symbolic variant wins outright.
-//! After a binding recurs, this variant wins where specialization pays.
+//! its operands already carry; cost decides whether specializing pays.
 
 use crate::egraph::{Builder, Facts, Id, RuleTag};
 use crate::ir::launch::Launch;
 use crate::ir::{Level, Node, Op, OpTag};
 use crate::rule;
-use crate::shape::Dim;
+use crate::shape::{Dim, OPAQUE_SYM};
 
 rule!(
     SPECIALIZE_DIM,
@@ -19,32 +17,39 @@ rule!(
 
 /// Mint the variant in which a `Dim::Sym` on the node is replaced by the
 /// `Dim::Const` an operand's own layout already proves it to be.
-///
-/// Legality-only substitution: the symbol and the constant denote the same
-/// extent. Whether specializing pays is decided by the pricing crate, and both
-/// variants stay live either way.
 pub fn specialize_dim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
-    let Op::Launch(Launch::Contract {
-        m,
-        n,
-        k,
-        batch,
-        family,
-        post,
-        acc,
-        a,
-        b: rhs,
-        sched,
-    }) = &node.op
+    let Op::Launch(
+        op @ Launch::Contract {
+            m,
+            n,
+            k,
+            batch,
+            a,
+            b: rhs,
+            ..
+        },
+    ) = &node.op
     else {
         return None;
     };
-    // Every operand of a side agrees on shape — they differ only in buffer,
-    // stride and access — so the decided extent is readable off either one.
     let a_shape = a.primary().layout.shape();
     let b_shape = rhs.primary().layout.shape();
-    // `a` is `[batch?, m, k]` and `b` is `[batch?, k, n]`, so each field has
-    // exactly one place to read a decided extent from.
+    // Positional substitution requires one axis per matrix dimension.
+    let single_axes = |shape: &[Dim], axes: [Dim; 3]| {
+        let axes = match shape.len() {
+            2 if batch.known_eq(Dim::ONE) => &axes[1..],
+            3 => &axes[..],
+            _ => return false,
+        };
+        shape.iter().zip(axes).all(|(extent, field)| {
+            extent.known_eq(*field)
+                || matches!((field, extent), (Dim::Sym(s), Dim::Const(_))
+                    if !s.is_derived() && *s != OPAQUE_SYM)
+        })
+    };
+    if !single_axes(a_shape, [*batch, *m, *k]) || !single_axes(b_shape, [*batch, *k, *n]) {
+        return None;
+    }
     let from_end = |shape: &[Dim], back: usize| -> Option<Dim> {
         shape.len().checked_sub(back).map(|i| shape[i])
     };
@@ -63,19 +68,12 @@ pub fn specialize_dim(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) 
         return None;
     }
 
-    let specialized = b
-        .add_launch(Launch::Contract {
-            m: new_m.unwrap_or(*m),
-            n: new_n.unwrap_or(*n),
-            k: new_k.unwrap_or(*k),
-            batch: new_batch.unwrap_or(*batch),
-            family: *family,
-            post: post.clone(),
-            acc: *acc,
-            a: a.clone(),
-            b: rhs.clone(),
-            sched: sched.clone(),
-        })
-        .ok()?;
+    let mut specialized = op.clone();
+    if let Launch::Contract { m, n, k, batch, .. } = &mut specialized {
+        for (field, new) in [(m, new_m), (n, new_n), (k, new_k), (batch, new_batch)] {
+            *field = new.unwrap_or(*field);
+        }
+    }
+    let specialized = b.add_launch(specialized).ok()?;
     b.union(id, specialized).ok()
 }

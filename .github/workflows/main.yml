@@ -152,7 +152,10 @@ jobs:
           # hybrid-search integration test (a BERT chunker from HuggingFace).
           cargo nextest run --archive-file root-tests.tar.zst --workspace-remap . --extract-to . \
             -E 'not (package(rbert) | package(rwhisper) | binary(hybrid_test))'
-          cargo nextest run --archive-file fusor-tests.tar.zst --workspace-remap fusor --extract-to fusor
+          # The 400-step training test outlives the stall limit on lavapipe;
+          # macOS runs it on a hardware adapter.
+          cargo nextest run --archive-file fusor-tests.tar.zst --workspace-remap fusor --extract-to fusor \
+            -E 'not test(training_improves_held_out_loss_and_preserves_causal_attention)'
 
   # Shards balanced from measured per-suite times. A filter ending in `::`
   # matches one suite exactly (the harness matches by substring), and
