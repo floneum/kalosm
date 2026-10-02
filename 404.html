@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Loading...</title>
+    <script
+        data-base-path="kalosm"
+        data-pr-preview-prefix="pr-preview"
+    >
+        (function () {
+            const script = document.currentScript;
+            const basePath = script.getAttribute('data-base-path') || '';
+            const prPrefix = script.getAttribute('data-pr-preview-prefix') || '';
+            const parts = window.location.pathname.split('/').filter(Boolean);
+            let realUrl;
+            const normalizedBasePath = basePath.replace(/^\/+|\/+$/g, '');
+            const baseParts = normalizedBasePath ? normalizedBasePath.split('/').filter(Boolean) : [];
+            const normalizedPrPrefix = prPrefix.replace(/^\/+|\/+$/g, '');
+            let previewEnd = -1;
+            if (normalizedPrPrefix) {
+                const startsWithBase = baseParts.length > 0 && baseParts.every((part, index) => parts[index] === part);
+                const prefixIndex = startsWithBase ? baseParts.length : 0;
+                if (
+                    parts[prefixIndex] === normalizedPrPrefix &&
+                    /^pr-\d+$/.test(parts[prefixIndex + 1] || '')
+                ) {
+                    previewEnd = prefixIndex + 2;
+                }
+            }
+            if (previewEnd > 0) {
+                realUrl = '/' + parts.slice(0, previewEnd).join('/') + '/';
+            } else if (basePath) {
+                realUrl = '/' + normalizedBasePath + '/';
+            } else {
+                realUrl = '/';
+            }
+            fetch(realUrl)
+                .then(response => response.text())
+                .then(html => {
+                    document.documentElement.innerHTML = html;
+                    document.querySelectorAll('script').forEach(oldScript => {
+                        const newScript = document.createElement('script');
+                        for (const { name, value } of oldScript.attributes) {
+                            newScript.setAttribute(name, value);
+                        }
+                        newScript.textContent = oldScript.textContent;
+                        oldScript.replaceWith(newScript);
+                    });
+                });
+        })();
+    </script>
+</head>
+<body></body>
+</html>
