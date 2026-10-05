@@ -427,7 +427,7 @@ pub(crate) fn address_of(
 }
 
 /// The edge's address map at this artifact's concrete binding.
-fn resolved_address_map(cx: &LowerCtx<'_>, operand: &Operand) -> Result<AddressMap> {
+pub(crate) fn resolved_address_map(cx: &LowerCtx<'_>, operand: &Operand) -> Result<AddressMap> {
     let (offset, extents, strides) = resolved_layout(cx, &operand.layout)?;
     let dims = |v: Vec<u32>| {
         v.into_iter()
