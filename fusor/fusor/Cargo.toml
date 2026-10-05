@@ -31,6 +31,8 @@ default = ["cpu", "gpu"]
 # At least one must be on.
 cpu = ["dep:fusor-cpu"]
 gpu = ["dep:fusor-gpu"]
+# Route every CPU kernel through the wasm emitter under `wasmi` (verification).
+wasm-emit = ["fusor-cpu?/wasm-emit"]
 
 [[example]]
 name = "coop_attn_repro"

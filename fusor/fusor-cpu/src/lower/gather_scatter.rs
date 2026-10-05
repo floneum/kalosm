@@ -4,7 +4,7 @@
 use fusor_ir::Result;
 use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
-    Accumulator, Addr, KernelIr, ScalarElement, Stmt, TileExpr, TileExprKind,
+    Accumulator, Addr, ElementType, KernelIr, ScalarElement, Stmt, TileExpr, TileExprKind,
 };
 use fusor_ir::ir::launch::ScatterGeometry;
 use fusor_ir::ir::launch::{IndexSpace, Launch, Operand, SchedPoint};
@@ -90,7 +90,37 @@ fn gather(
 
     let src = operand_src(&b, cx, &binds, src.src)?;
     let idx = operand_src(&b, cx, &binds, idx.src)?;
-    let out = view(&binds.of(cx.launch.root)?);
+    let out = binds.of(cx.launch.root)?;
+    // Whole rows of 4-byte elements out of plain buffers are block copies.
+    if let (super::OperandSrc::Buffer(source), super::OperandSrc::Buffer(index)) = (&src, &idx)
+        && out.element.byte_size() == 4
+        && source.element == out.element
+        && matches!(
+            index.element,
+            ElementType::Scalar(ScalarElement::U32 | ScalarElement::I32)
+        )
+    {
+        let rows = crate::rows::GatherRows {
+            out: out.binding as usize,
+            src: source.binding as usize,
+            idx: index.binding as usize,
+            outer: extents[..axis]
+                .iter()
+                .map(|e| *e as usize)
+                .product::<usize>()
+                .max(1),
+            count: extents[axis] as usize,
+            inner: inner as usize,
+            src_axis: src_axis.max(1) as usize,
+        };
+        return Ok(binds.finish(
+            Box::leak(rows.name().into_boxed_str()),
+            [1, 1, 1],
+            1,
+            Vec::new(),
+        ));
+    }
+    let out = view(&out);
     let (grid, offsets) = lane_offsets(&b, n, tm);
     let mut body = Vec::with_capacity(tm as usize);
     for flat in offsets {
