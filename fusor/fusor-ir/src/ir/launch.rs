@@ -1058,6 +1058,44 @@ pub struct MapDomain {
     pub tilings: SmallVec<[MapTiling; 8]>,
 }
 
+/// Outputs per lane worth scoring for a linearized body.
+const LINEAR_TM_CHOICES: [u32; 3] = [2, 4, 8];
+
+impl MapDomain {
+    /// The tilings of a body that walks one linearized index over `elements`
+    /// outputs: `dim` is `None` because there is no axis to name, and a `tm`
+    /// survives only when it leaves at least one full subgroup of work.
+    pub fn linear(caps: &crate::device::Caps, elements: u64) -> Self {
+        let sgw = u64::from(caps.subgroup_width().max(1));
+        let mut tilings: SmallVec<[MapTiling; 8]> = SmallVec::new();
+        tilings.push(MapTiling {
+            dim: None,
+            tm: 1,
+            vector: 1,
+        });
+        for tm in LINEAR_TM_CHOICES {
+            if elements >= u64::from(tm).saturating_mul(sgw) {
+                tilings.push(MapTiling {
+                    dim: None,
+                    tm,
+                    vector: 1,
+                });
+            }
+        }
+        Self { tilings }
+    }
+
+    /// [`Self::linear`] over a shape. A symbolic extent counts as 1, so a
+    /// shape-family node gets the domain its smallest binding can fill.
+    pub fn linear_over(caps: &crate::device::Caps, shape: &[Dim]) -> Self {
+        let elements = shape
+            .iter()
+            .map(|d| d.as_const().unwrap_or(1))
+            .fold(1u64, |a, b| a.saturating_mul(b));
+        Self::linear(caps, elements)
+    }
+}
+
 /// Window geometry a structural adjoint reads: non-overlapping windows give
 /// a mask-and-broadcast, overlapping ones `Scatter{Add}`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
