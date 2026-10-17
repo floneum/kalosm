@@ -154,6 +154,7 @@ pub struct SeparateAttention {
     pub attention_wq: Weight,
     /// The row-concatenated `q|k|v` projection, when the three formats agree.
     pub attention_qkv: Option<Weight>,
+    pub attention_qk: Option<Weight>,
     pub attention_q_norm: Option<RmsNorm>,
     pub attention_wk: Weight,
     pub attention_k_norm: Option<RmsNorm>,
@@ -179,6 +180,51 @@ impl SeparateAttention {
         rope_cache: &RopeImplementation,
         at: RopeAt<'_>,
     ) -> (Tensor<4>, Tensor<4>, Tensor<4>) {
+        if hidden_states.shape()[1] == 1
+            && hidden_states
+                .backend()
+                .caps()
+                .execution_profile
+                .enabled("PROFILE_QK_VIEW_ROPE")
+            && self.attention_q_norm.is_none()
+            && self.attention_k_norm.is_none()
+        {
+            if let Some(qkv) = &self.attention_qkv {
+                let mut projected = qkv.mat_mul(hidden_states);
+                if let Some(bias) = &self.bias {
+                    projected = projected.add_(&bias.bias_qkv);
+                }
+                let (q, k) = rope_cache.forward_projected(
+                    &projected,
+                    num_heads,
+                    num_key_value_heads,
+                    head_dim,
+                    self.interleaved_rope,
+                    at,
+                );
+                let v = projected.narrow(
+                    2,
+                    (num_heads + num_key_value_heads) * head_dim,
+                    num_key_value_heads * head_dim,
+                );
+                return (q, k, split_heads(&v, num_key_value_heads, head_dim));
+            }
+            if let Some(qk) = &self.attention_qk {
+                if self.bias.is_none() {
+                    let projected = qk.mat_mul(hidden_states);
+                    let (q, k) = rope_cache.forward_projected(
+                        &projected,
+                        num_heads,
+                        num_key_value_heads,
+                        head_dim,
+                        self.interleaved_rope,
+                        at,
+                    );
+                    let v = self.attention_wv.mat_mul(hidden_states);
+                    return (q, k, split_heads(&v, num_key_value_heads, head_dim));
+                }
+            }
+        }
         let (query_states, key_states, value_states) =
             if let Some(attention_qkv) = &self.attention_qkv {
                 let query_width = num_heads * head_dim;
@@ -237,6 +283,28 @@ impl GroupedAttention {
         at: RopeAt<'_>,
     ) -> (Tensor<4>, Tensor<4>, Tensor<4>) {
         let qkv = self.attention_qkv.mat_mul(x);
+
+        if x.shape()[1] == 1
+            && x.backend()
+                .caps()
+                .execution_profile
+                .enabled("PROFILE_QK_VIEW_ROPE")
+        {
+            let (q, k) = rope_cache.forward_projected(
+                &qkv,
+                num_heads,
+                num_key_value_heads,
+                head_dim,
+                self.interleaved_rope,
+                at,
+            );
+            let v = qkv.narrow(
+                2,
+                (num_heads + num_key_value_heads) * head_dim,
+                num_key_value_heads * head_dim,
+            );
+            return (q, k, split_heads(&v, num_key_value_heads, head_dim));
+        }
 
         let query_pos = num_heads * head_dim;
         let kv_width = num_key_value_heads * head_dim;
@@ -332,15 +400,51 @@ impl LlamaAttention {
             }
         };
 
+        // A specialization of this prompt chunk's exact prefix.
+        // decode_step rebuilds such graphs when the prefix changes. Single-token
+        // decoding retains the symbolic prefix and its replayable graph.
+        let (key_states, value_states) = if q_len > 1
+            && hidden_states
+                .backend()
+                .caps()
+                .execution_profile
+                .enabled("PROFILE_CONST_PREFILL_KV")
+        {
+            let n = cache
+                .as_ref()
+                .and_then(|c| c.current_len())
+                .or_else(|| key_states.extent(2).as_const())
+                .expect("prefill KV length is host-known") as usize;
+            (key_states.narrow(2, 0, n), value_states.narrow(2, 0, n))
+        } else {
+            (key_states, value_states)
+        };
+
         let scale = 1.0 / (head_dim as f32).sqrt();
         let (kind, mask_tensor) = mask;
-        let attn_output = query_states.attention_masked(
-            &key_states,
-            &value_states,
-            kind,
-            mask_tensor,
-            Some(scale),
-        );
+        let padded = if q_len == 1
+            && matches!(kind, MaskKind::None)
+            && hidden_states
+                .backend()
+                .caps()
+                .execution_profile
+                .enabled("PROFILE_PADDED_DECODE_ATTENTION")
+        {
+            cache
+                .as_deref_mut()
+                .and_then(|c| c.attention_decode_padded(&query_states, Some(scale)))
+        } else {
+            None
+        };
+        let attn_output = padded.unwrap_or_else(|| {
+            query_states.attention_masked(
+                &key_states,
+                &value_states,
+                kind,
+                mask_tensor,
+                Some(scale),
+            )
+        });
 
         // A prefill on a sliding-window layer evicts after attention: the
         // materialized mask already bounded what each query saw.

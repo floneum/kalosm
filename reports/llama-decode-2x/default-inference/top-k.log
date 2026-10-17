@@ -1,0 +1,8 @@
+    Finished `test` profile [optimized] target(s) in 0.21s
+     Running unittests src/lib.rs (target/debug/deps/kalosm_llama-7d09d11c328612b6)
+
+running 2 tests
+test model::top_k_prefilter_tests::byte_logits_preserve_bits_including_unaligned_readback ... ok
+test model::top_k_prefilter_tests::prefilter_preserves_ties_nonfinite_values_and_partial_blocks ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 16 filtered out; finished in 0.00s

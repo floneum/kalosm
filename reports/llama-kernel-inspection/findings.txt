@@ -1,0 +1,177 @@
+Llama kernel inspection — 2026-10-10
+
+Result
+------
+The large opportunity is changing how short, strided reductions assign work to
+lanes. Adjacent workgroups already share cache lines in the virtual GPU. The
+slab kernel separately has dead staging passes and lane-private intermediates
+that can stay in registers.
+
+These findings concern three captured kernel bodies. The experiments below are
+shader prototypes for those fixed shapes, not a change to production lowering
+or a measured end-to-end Llama speedup.
+
+Follow-up model attribution: model-share/findings.txt. The two exact audited
+reduction bodies account for about 0.5–0.7% of the 208-token prompt GPU pass;
+their isolated speedups do not imply a similar whole-model speedup.
+
+Provenance
+----------
+Model: Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf (4,920,739,168 bytes).
+Same short and long prompts as the original sweep; four emitted text chunks per
+run. Both completed. GPU: Apple M2 Max, Metal. The original capture metadata
+counted 6/209 tokens with special tokens enabled; inference encodes without
+special tokens and actually processes 5/208 (confirmed in model-share).
+
+kfold:  481141fe3bada9eda021280fd023a22c-cb0b43dbe70a38cc
+kgroup: 51d6113fe37d77d1205997353dcd40cc-cb0b43dbe70a38cc
+kslab:  bfc7b725443521abb90f62873a98d31e-b1cc5ee7dff479a8
+
+Actual successful resolve submissions of these exact body/grid/uniform variants:
+kfold 6, kgroup 1, kslab 1. Counting all uniform variants of each body gives
+kfold 78, kgroup 13, kslab 9. Warm submissions can have uniform variants that
+were never relowered; report.json retains these separately. These counts include
+tuning executions and do not identify the ultimately winning plan.
+
+1. kfold: four-term reduction across 98,304 columns
+------------------------------------------------
+The emitted shader, in float-element offsets, computes:
+
+  out[3072 + row] = sum(k=0..3, arena[218112 + k*98304 + row])
+
+It launches 98,304 workgroups of 32 lanes. Each workgroup computes one output;
+only four lanes contribute useful input values. Neighboring workgroups advance
+row by one float. Lanes within a subgroup are 393,216 bytes apart.
+
+The per-lane prototype gives each lane one output, loops over the four terms,
+and lets neighboring lanes read neighboring columns. It launches 384 workgroups
+of 256 lanes: 32x fewer invocations and 256x fewer workgroups, plus coalesced
+loads and stores and no subgroup collective. This is a combined mapping change,
+not a measurement isolating coalescing alone.
+
+The existing FoldStrat::WgTree { lane_group: 1 } already describes the basic
+per-lane strategy. General integration should inspect schedule selection and
+the actual emitter's result, not add a shape-specific Llama kernel.
+
+2. kgroup: three independent reductions in one dispatch
+------------------------------------------------------
+This dispatch consists of:
+
+  65,536 outputs x 4 terms:  input 134144, output 68608
+  16,384 outputs x 16 terms: input 396288, output 920576
+  16,384 outputs x 16 terms: input 658432, output 936960
+
+All offsets above are float elements. Each input is term-major: input +
+term*output_count + row. The initially highlighted load belongs to the third
+member. It is not a special tail: every row of that member uses 16 useful lanes
+of a 32-lane subgroup, with a 65,536-byte lane stride.
+
+Again, per-lane reduction makes adjacent lanes access adjacent columns. The
+prototype combines those members into 384 256-lane workgroups, with no shared
+state or barriers. The original has two uniform workgroup barriers separating
+independent member branches.
+
+3. kslab: staging without a cross-lane dependency
+-----------------------------------------------
+The seven stages reduce to this expression for 5,120 elements:
+
+  col = i % 128
+  out[21888+i] = arena[16768+i]*arena[64+col]
+               + (arena[4288+i]*factors[col])*arena[13568+col]
+
+Emitted stages 0, 2, and 4 load broadcast factors into shared tiles. Their
+consumers reload those factors from storage and overwrite the shared locations;
+no shared read consumes those three initial stores. Removing those stages also
+removes three of six barriers.
+
+The remaining shared reads address exactly the producing lane's element.
+The register prototype keeps the same 20 workgroups of 256 lanes, evaluates the
+expression in registers, and removes all shared arrays and all six barriers.
+This also eliminates the three dead passes. The experiment separates removing
+dead stages from removing the remaining shared staging.
+
+Cache and capture corrections
+-----------------------------
+The first and last 32 adjacent workgroups were replayed for each reduction.
+Logical kfold reads: 248 cache hits / 8 misses (96.875% hits), 1,024 useful read
+bytes and 1,024 cache-fill bytes. Logical kgroup reads: 620 hits / 20 misses
+(96.875% hits), 2,560 useful read bytes and 2,560 cache-fill bytes. Thus adjacent
+workgroups fully use the lines pulled by those sampled windows. This assumes
+serial X-fast workgroups on one 16 KiB fully associative cache; real scheduling
+can differ. Both windows omit the intervening workgroups.
+
+The earlier phrase "no load" described the IR recorder, not emitted WGSL.
+emit/expr.rs emits clamped storage loads before selecting masked fill values.
+The displayed four/sixteen useful lanes do not establish that the other lanes
+execute no memory instruction. The visualizer now states this explicitly.
+Guarded-load-only shader variants benchmark this distinction separately.
+
+GPU validation and timing
+-------------------------
+Every original and candidate shader was checked against an independent CPU
+formula on three deterministic synthetic input sets, checking every element of
+the complete 1,412,096-float arena (including preservation outside outputs).
+Maximum admitted error: 1e-5 * (1 + abs(expected)); nonfinite values fail.
+This validates these shapes/data sets, not all floating-point corner cases.
+
+Primary result: gpu-timings-retired.csv and its .samples.csv file.
+GPU timestamp medians, microseconds per dispatch, 128 dispatches per sample,
+11 samples retained after two warmup rounds; case order reverses each round.
+
+                         original   guarded loads   per-lane/registers
+  kfold                   211.058       208.898              3.588
+  kgroup                  217.208       211.222              7.301
+  kslab                     3.589           n/a              1.746
+
+kslab with only dead stages removed: 3.209 us.
+Per-lane reductions improve this warm isolated benchmark by about 58.8x and
+29.8x. Register fusion improves the slab by about 2.1x. Guarding masked loads
+alone changes little. These are kernel-only synthetic repeated-dispatch results;
+they exclude compilation, CPU submission, real inference scheduling and any
+change to the rest of the model's plan. GPU timing cannot attribute the gain to
+one of coalescing, fewer workgroups, fewer invocations, or fewer collectives.
+
+Independent shorter-batch confirmation (32 dispatches per sample), using the
+new stale-timestamp rejection check: kfold 215.904 -> 4.839 us (44.6x), kgroup
+232.557 -> 8.857 us (26.3x), kslab 4.971 -> 2.111 us (2.35x). Removing only the
+slab's dead stages gives 4.474 us. See gpu-timings-confirmation.csv and its raw
+samples. The batch dependence is another reason not to project these ratios
+directly onto full inference.
+
+Files prefixed invalid-same-submit- are explicitly invalid pilot measurements:
+on this Metal backend, resolving counters in the compute submission yielded
+stale preceding samples (including GPU spans longer than host-observed elapsed
+time). The probe now follows Launcher::read_timestamps: wait for compute to
+retire, resolve in another submission, then map. It rejects empty or impossible
+timestamp spans. This did not reveal a production timestamp bug; production
+already uses the corrected sequence.
+
+Reproduction (repository root)
+------------------------------
+  python3 reports/llama-kernel-inspection/make_candidates.py
+  cargo build --manifest-path fusor/Cargo.toml -p fusor-gpu --example inspect_llama_hotspots --offline
+  INSPECT_REPEATS=128 fusor/target/debug/examples/inspect_llama_hotspots reports/llama-kernel-inspection/selected-shaders /tmp/llama-hotspots.csv
+
+selected-shaders contains the original emitted WGSL and all bounded experiments;
+the benchmark does not require model weights. The focused inference capture is
+the visualize_kernels example with the three body prefixes and NEIGHBORS=32.
+
+Relevant implementation sites
+-----------------------------
+fusor/fusor-gpu/src/lower/map_fold.rs: lower_kfold row/lane mapping and collective.
+fusor/fusor-ir/src/ir/launch.rs: fold_schedule defaults and lane-group strategy.
+fusor/fusor-tile/src/domains/fold.rs: candidate strategies and seed ordering.
+fusor/fusor-gpu/src/lower/group.rs: independent member dispatch ranges/barriers.
+fusor/fusor-gpu/src/lower/slab.rs: tile allocation and unconditional stage barriers.
+fusor/fusor-gpu/src/emit/expr.rs: branchless clamped storage-load masking.
+
+One schedule-cost detail deserves a focused follow-up: operand_line_amplification
+in fusor-cost/src/realize.rs clamps modeled lanes per row to min(lane_group, k),
+then assigns the remaining subgroup lanes to other rows. For lane_group=32 and
+k=4 or 16, the actual lowering does not pack those extra rows. This is a model
+mismatch; this inspection does not establish that it caused plan selection.
+
+Recommended implementation order: ensure short strided folds consider/select
+the existing per-lane strategy, then remove dead slab stages and promote
+provably lane-private stage values to locals. Recheck complete inference and
+floating-point contracts before treating these prototypes as production fixes.

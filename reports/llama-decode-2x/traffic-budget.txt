@@ -1,0 +1,9 @@
+Observed quantized operand volume: 4.628300 GB/token
+2x target: 15.6997 ms/token from 31.3994 ms
+Assumed 350.908 GB/s: weights alone 13.1895 ms; remaining budget 2.5102 ms
+Assumed 400 GB/s: weights alone 11.5707 ms; remaining budget 4.1290 ms
+Other work 0 ms: required weight bandwidth 294.80164231714303 GB/s
+Other work 2 ms: required weight bandwidth 337.83929493535015 GB/s
+Other work 4 ms: required weight bandwidth 395.59104185354363 GB/s
+Other work 6 ms: required weight bandwidth 477.15865845758816 GB/s
+Scenario only; no measured DRAM traffic, hardware peak, or achieved throughput claim.

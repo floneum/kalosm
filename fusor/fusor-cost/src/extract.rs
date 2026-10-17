@@ -82,15 +82,28 @@ impl LocalSearch {
         budget: ExtractBudget,
         seed: Option<&Plan>,
     ) -> Result<Plan> {
+        // Opt-in host timings, kept outside the deterministic search decisions.
+        // Format: EXTRACT_STAGE <stage> <microseconds> for each cold extraction.
+        let profiling = std::env::var_os("FUSOR_EXTRACT_PROFILE").is_some();
+        let mut timer = web_time::Instant::now();
+        let mut mark = |stage: &str| {
+            if profiling {
+                eprintln!("EXTRACT_STAGE {stage} {}", timer.elapsed().as_micros());
+                timer = web_time::Instant::now();
+            }
+        };
         let search = self.search(graph, roots, cost);
         // Scoped to what the roots reach; a session graph holds every value.
         let (classes, mask) = realize::reachable(graph, roots);
+        mark("reachable");
         let crate::lower_bound::Bounds {
             costs: lb,
             launches,
         } = crate::lower_bound::bounds_scoped(graph, Some(cost), &mask);
+        mark("bounds");
         let mut cache = NodeCache::new(graph.len());
         let mut at = search.seed_realized(&lb, &launches, &classes, &mut cache, seed)?;
+        mark("seed");
         // The seed is priced as the plan it denotes, like every candidate.
         let mut trail = Trail::default();
         match search.price(&mut at.ex, &mut cache, &mut trail) {
@@ -100,6 +113,7 @@ impl LocalSearch {
             }
             None => trail.rollback(&mut at.ex, 0),
         }
+        mark("price");
 
         let chains = classes.len() as u32;
         // The cap is the only stop: a wall clock would make the plan (and its
@@ -132,8 +146,10 @@ impl LocalSearch {
                 at = b_at;
             }
         }
+        mark("search");
 
         let plan = derive_plan(graph, &at.ex, &at.realized, cost.facts(), at.cost)?;
+        mark("derive");
         debug::dump_plan(graph, &plan, &at.ex, &at.realized, &self.caps, cost);
         #[cfg(feature = "compiler-tests")]
         crate::verify_plan::verify_plan_with(graph, &plan, self.arena.as_ref(), &self.caps)
@@ -298,6 +314,23 @@ impl Search<'_> {
         reused: &FxHashMap<ClassId, Id>,
     ) -> Incumbent {
         let graph = self.graph;
+        let profiling = std::env::var_os("FUSOR_EXTRACT_PROFILE").is_some();
+        let flags = crate::debug::for_profile(self.caps.execution_profile);
+        let seed_limit = if flags.seed_min_m <= 1
+            || at
+                .realized
+                .components
+                .iter()
+                .flat_map(|c| c.members.iter())
+                .any(|id| {
+                    matches!(graph.node(*id).op, Op::Launch(Launch::Contract { m, .. })
+                if m.as_const().is_some_and(|m| m >= flags.seed_min_m))
+                }) {
+            flags.seed_candidates
+        } else {
+            flags.seed_small_candidates
+        };
+        let mut stats = std::collections::BTreeMap::<String, (u64, u64, u64, u128)>::new();
         let classes: Vec<_> = at
             .realized
             .components
@@ -311,6 +344,16 @@ impl Search<'_> {
         for class in classes {
             let mut members = realize::selectable(graph, class, self.caps);
             members.sort_by_key(|member| (order_costs[member.index()], *member));
+            let class_limit = if flags.seed_gathers
+                && members
+                    .iter()
+                    .any(|id| matches!(graph.node(*id).op, Op::Launch(Launch::Gather { .. })))
+            {
+                usize::MAX
+            } else {
+                seed_limit
+            };
+            let mut tried = 0;
             for candidate in members {
                 let Some(index) = at
                     .realized
@@ -325,13 +368,19 @@ impl Search<'_> {
                 if candidate == current {
                     continue;
                 }
+                if tried == class_limit {
+                    break;
+                }
+                tried += 1;
                 let same_inputs = component.members.as_slice() == [current]
                     && ordinary(current)
                     && ordinary(candidate)
                     && inputs(current).eq(inputs(candidate));
+                let started = profiling.then(web_time::Instant::now);
                 let mut trail = Trail::default();
                 trail.select(&mut at.ex, class, candidate);
                 // A same-inputs swap is screened on its own launch first.
+                let mut screened = false;
                 if same_inputs {
                     seed_theta_trailed(
                         graph,
@@ -350,11 +399,27 @@ impl Search<'_> {
                     });
                     if !score.is_ok_and(|score| score < at.cost) {
                         trail.rollback(&mut at.ex, 0);
-                        continue;
+                        screened = true;
                     }
                 }
-                self.improve(&mut at, cache, &mut trail);
+                let improved = !screened && self.improve(&mut at, cache, &mut trail);
+                if let Some(started) = started {
+                    let key = format!(
+                        "{:?}/same_inputs={same_inputs}",
+                        graph.node(candidate).op.tag()
+                    );
+                    let entry = stats.entry(key).or_default();
+                    entry.0 += 1;
+                    entry.1 += u64::from(!screened);
+                    entry.2 += u64::from(improved);
+                    entry.3 += started.elapsed().as_micros();
+                }
             }
+        }
+        for (kind, (candidates, repriced, accepted, us)) in stats {
+            eprintln!(
+                "EXTRACT_SEED {kind} candidates={candidates} repriced={repriced} accepted={accepted} us={us}"
+            );
         }
         at
     }

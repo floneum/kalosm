@@ -285,30 +285,72 @@ impl PartialOrd for WorstFirstLogit {
     }
 }
 
-fn top_k_logits_from_full(logits: &[f32], k: usize) -> Vec<Logit> {
+fn f32_logits_from_bytes(bytes: &[u8]) -> Result<std::borrow::Cow<'_, [f32]>, fusor::Error> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(fusor::Error::Shape("incomplete F32 logit readback".into()));
+    }
+    Ok(match bytemuck::try_cast_slice(bytes) {
+        Ok(values) => std::borrow::Cow::Borrowed(values),
+        Err(_) => std::borrow::Cow::Owned(
+            bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_ne_bytes(b.try_into().unwrap()))
+                .collect(),
+        ),
+    })
+}
+
+fn top_k_logits_from_full(
+    logits: &[f32],
+    k: usize,
+    profile: fusor_ir::execution::ExecutionProfile,
+) -> Vec<Logit> {
+    top_k_logits_from_full_impl(logits, k, profile.enabled("PROFILE_TOP_K_PREFILTER"))
+}
+
+fn top_k_logits_from_full_impl(logits: &[f32], k: usize, prefilter: bool) -> Vec<Logit> {
     if k == 0 {
         return Vec::new();
     }
 
     let mut heap = BinaryHeap::with_capacity(k);
-    for (token_id, logit) in logits.iter().copied().enumerate() {
-        if !logit.is_finite() {
-            continue;
+    // A block whose values are all below the current heap minimum cannot
+    // change top-k. The non-short-circuit fold permits vector comparisons.
+    // Equal values still enter the original tie-break path; NaNs never pass.
+    let chunk_size = if prefilter { 32 } else { logits.len().max(1) };
+    for (chunk_id, chunk) in logits.chunks(chunk_size).enumerate() {
+        if prefilter {
+            let threshold = if heap.len() == k {
+                heap.peek()
+                    .map_or(f32::NEG_INFINITY, |v: &WorstFirstLogit| v.logit)
+            } else {
+                f32::NEG_INFINITY
+            };
+            if !chunk.iter().fold(false, |hit, &v| hit | (v >= threshold)) {
+                continue;
+            }
         }
-        let candidate = WorstFirstLogit {
-            token_id: token_id as u32,
-            logit,
-        };
-        if heap.len() < k {
-            heap.push(candidate);
-            continue;
-        }
-        let Some(worst) = heap.peek().copied() else {
-            continue;
-        };
-        if logit > worst.logit || (logit == worst.logit && candidate.token_id > worst.token_id) {
-            heap.pop();
-            heap.push(candidate);
+        for (offset, logit) in chunk.iter().copied().enumerate() {
+            let token_id = chunk_id * chunk_size + offset;
+            if !logit.is_finite() {
+                continue;
+            }
+            let candidate = WorstFirstLogit {
+                token_id: token_id as u32,
+                logit,
+            };
+            if heap.len() < k {
+                heap.push(candidate);
+                continue;
+            }
+            let Some(worst) = heap.peek().copied() else {
+                continue;
+            };
+            if logit > worst.logit || (logit == worst.logit && candidate.token_id > worst.token_id)
+            {
+                heap.pop();
+                heap.push(candidate);
+            }
         }
     }
 
@@ -327,6 +369,70 @@ fn top_k_logits_from_full(logits: &[f32], k: usize) -> Vec<Logit> {
             .then_with(|| right.token_id.cmp(&left.token_id))
     });
     logits
+}
+
+#[cfg(test)]
+mod top_k_prefilter_tests {
+    use super::top_k_logits_from_full_impl;
+
+    #[test]
+    fn byte_logits_preserve_bits_including_unaligned_readback() {
+        let values = [
+            0.0f32,
+            -0.0,
+            3.5,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::from_bits(0x7fc00023),
+        ];
+        let raw = bytemuck::cast_slice(&values);
+        let check = |bytes: &[u8]| {
+            let got = super::f32_logits_from_bytes(bytes).unwrap();
+            assert_eq!(
+                got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                values.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+            );
+        };
+        check(raw);
+        let mut unaligned = vec![0u8; raw.len() + 4];
+        let offset = (1..=4)
+            .find(|i| !(unaligned.as_ptr() as usize + i).is_multiple_of(4))
+            .unwrap();
+        unaligned[offset..offset + raw.len()].copy_from_slice(raw);
+        check(&unaligned[offset..offset + raw.len()]);
+        assert!(super::f32_logits_from_bytes(&raw[..raw.len() - 1]).is_err());
+    }
+
+    #[test]
+    fn prefilter_preserves_ties_nonfinite_values_and_partial_blocks() {
+        let mut seed = 123456789u32;
+        for n in [0, 1, 31, 32, 33, 1025, 4097] {
+            let values: Vec<_> = (0..n)
+                .map(|_| {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 17;
+                    seed ^= seed << 5;
+                    match seed % 11 {
+                        0 => f32::NAN,
+                        1 => f32::INFINITY,
+                        2 => f32::NEG_INFINITY,
+                        3 => 0.0,
+                        4 => -0.0,
+                        _ => (seed % 100) as f32 - 50.0,
+                    }
+                })
+                .collect();
+            for k in [0, 1, 16, 64, 2000] {
+                let result = |prefilter| {
+                    top_k_logits_from_full_impl(&values, k, prefilter)
+                        .into_iter()
+                        .map(|v| (v.token_id, v.logit.to_bits()))
+                        .collect::<Vec<_>>()
+                };
+                assert_eq!(result(false), result(true), "n={n}, k={k}");
+            }
+        }
+    }
 }
 
 /// An error that can occur when running a [`LlamaModel`].
@@ -488,9 +594,9 @@ impl LlamaModel {
 
         let source = format!("Model ({})", builder.source.model[0]);
         let mut create_progress = ModelLoadingProgress::downloading_progress(source);
-        let model_bytes = builder
+        let model_paths = builder
             .source
-            .model(|progress| handler(create_progress(progress)))
+            .model_paths(|progress| handler(create_progress(progress)))
             .await?;
 
         let override_stop_token_string = builder.source.override_stop_token_string.clone();
@@ -501,15 +607,15 @@ impl LlamaModel {
             let load_model = move || -> Result<(Model, LlamaTokenizer), LlamaSourceError> {
                 let tokenizer = parse_external_tokenizer(tokenizer_source)?;
                 let config = parse_external_config(config_bytes)?;
-                if model_bytes.is_empty() {
+                if model_paths.is_empty() {
                     return Err(LlamaSourceError::InvalidGguf);
                 }
 
-                // Parse every shard from its in-memory bytes.
+                // Retain each mapped shard through its tensor ranges; no full-file
+                // or per-weight heap copy is kept after upload.
                 let mut shards = Vec::new();
-                for bytes in model_bytes {
-                    let gguf =
-                        fusor_gguf::Gguf::from_bytes(bytes).map_err(LlamaSourceError::Device)?;
+                for path in model_paths {
+                    let gguf = fusor_gguf::Gguf::open(path).map_err(LlamaSourceError::Device)?;
                     shards.push(VarBuilder::new(std::sync::Arc::new(gguf)));
                 }
 

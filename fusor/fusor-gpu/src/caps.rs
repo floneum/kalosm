@@ -108,10 +108,21 @@ fn apple_fixed_subgroup_size(backend: wgpu::Backend, name: &str) -> Option<Subgr
 }
 
 /// Accept a cooperative-matrix property only in the shape the lowerer emits:
-/// 8x8x8, non-saturating, F32/F32, or F16/F16 with `SHADER_F16`.
+/// 8x8x8, non-saturating, F32/F32, or F16 operands with `SHADER_F16`.
 pub(crate) fn coop_kinds(
     features: wgpu::Features,
     props: &[wgpu::CooperativeMatrixProperties],
+) -> SmallVec<[CoopKind; 4]> {
+    // The pinned Naga emitter needs the isolated profiling patch for mixed MMA.
+    let mixed =
+        cfg!(feature = "kernel-observer") && std::env::var_os("FUSOR_PROFILE_MIXED_COOP").is_some();
+    coop_kinds_with_mixed(features, props, mixed)
+}
+
+fn coop_kinds_with_mixed(
+    features: wgpu::Features,
+    props: &[wgpu::CooperativeMatrixProperties],
+    mixed: bool,
 ) -> SmallVec<[CoopKind; 4]> {
     let mut out: SmallVec<[CoopKind; 4]> = SmallVec::new();
     if !features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX) {
@@ -138,7 +149,14 @@ pub(crate) fn coop_kinds(
                 n: 8,
                 k: 8,
             },
-            // Mixed precision and integer fragments are refused outright.
+            (S::F16, S::F32) if f16 && mixed => CoopKind {
+                operand: Dtype::F16,
+                acc: Dtype::F32,
+                m: 8,
+                n: 8,
+                k: 8,
+            },
+            // Unsupported scalar combinations are refused outright.
             _ => continue,
         };
         if !out.contains(&kind) {
@@ -199,6 +217,7 @@ pub(crate) fn build_caps(
     );
     let fork = FORK_METAL && info.backend == wgpu::Backend::Metal;
     Caps {
+        execution_profile: Default::default(),
         kind,
         name: format!("{:?}/{}", info.backend, info.name),
         limits: ir_limits(limits),
@@ -230,4 +249,32 @@ pub(crate) fn coop_properties(adapter: &wgpu::Adapter) -> Vec<wgpu::CooperativeM
         return Vec::new();
     }
     adapter.cooperative_matrix_properties()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn advertised_mixed_coop_requires_both_features() {
+        let property = wgpu::CooperativeMatrixProperties {
+            m_size: 8,
+            n_size: 8,
+            k_size: 8,
+            ab_type: wgpu::CooperativeScalarType::F16,
+            cr_type: wgpu::CooperativeScalarType::F32,
+            saturating_accumulation: false,
+        };
+        let props = [property];
+        let coop = wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
+        let half = wgpu::Features::SHADER_F16;
+        assert!(coop_kinds_with_mixed(coop, &props, true).is_empty());
+        assert!(coop_kinds_with_mixed(half, &props, true).is_empty());
+        assert!(coop_kinds_with_mixed(coop | half, &props, false).is_empty());
+        let accepted = coop_kinds_with_mixed(coop | half, &props, true);
+        assert_eq!(accepted.len(), 1);
+        assert_eq!(accepted[0].operand, Dtype::F16);
+        assert_eq!(accepted[0].acc, Dtype::F32);
+        assert!(coop_kinds_with_mixed(coop | half, &[], true).is_empty());
+    }
 }

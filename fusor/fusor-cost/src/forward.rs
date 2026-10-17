@@ -18,13 +18,24 @@ pub fn forward_selected_views(
     plan: &Plan,
     ex: &mut Extraction,
 ) -> bool {
+    let composite_copies = caps
+        .execution_profile
+        .enabled("FUSOR_PROFILE_COMPOSITE_VIEW_FORWARD");
+    fn view_copy(graph: &EGraph, id: Id, composites: bool) -> bool {
+        is_view_copy(&graph.node(id).op)
+            || (composites
+                && crate::nodes::composite_members(graph, id)
+                    .is_some_and(|members| members.iter().all(|m| view_copy(graph, *m, true))))
+    }
     let launched: FxHashSet<Id> = crate::nodes::plan_values(plan).collect();
     let root_classes: FxHashSet<ClassId> = roots.iter().map(|r| graph.class_of(*r)).collect();
     let copies: FxHashSet<ClassId> = ex
         .sigma
         .iter()
         .filter(|(c, n)| {
-            launched.contains(n) && !root_classes.contains(c) && is_view_copy(&graph.node(**n).op)
+            launched.contains(n)
+                && !root_classes.contains(c)
+                && view_copy(graph, **n, composite_copies)
         })
         .map(|(c, _)| *c)
         .collect();

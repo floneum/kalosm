@@ -51,6 +51,7 @@ impl Saturate for CoreSaturate {
 
         let by_head = head_table(rules);
         let mut fired_counts = vec![0u32; rules.len()];
+        let mut minted_counts = vec![0usize; rules.len()];
         let mut truncated: Vec<Id> = Vec::new();
         let mut saturated = true;
         let mut rounds = 0u32;
@@ -114,6 +115,7 @@ impl Saturate for CoreSaturate {
                     let mut builder = graph.builder(caps);
                     applications += 1;
                     let applied = (rules[rid.0 as usize].apply)(&mut builder, id, &node, &facts);
+                    minted_counts[rid.0 as usize] += graph.len() - before;
                     if applied.is_some() {
                         fired_counts[rid.0 as usize] += 1;
                         fired_this_round += 1;
@@ -145,6 +147,16 @@ impl Saturate for CoreSaturate {
             graph.mark_offered(Id(i as u32));
         }
 
+        if std::env::var_os("FUSOR_PROFILE_RULES").is_some() {
+            for (rid, r) in rules.iter().enumerate() {
+                if fired_counts[rid] != 0 || minted_counts[rid] != 0 {
+                    eprintln!(
+                        "RULE_PROFILE name={} fires={} minted={}",
+                        r.name, fired_counts[rid], minted_counts[rid]
+                    );
+                }
+            }
+        }
         let fired_report: Vec<(&'static str, u32)> = rules
             .iter()
             .zip(fired_counts.iter())

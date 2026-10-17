@@ -25,6 +25,11 @@ const MAX_MEMBERS: usize = 512;
 /// Fewest slabs worth a dispatch of their own.
 const MIN_SLABS: u64 = 32;
 
+fn single_slab_broadcast() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("FUSOR_PROFILE_SLAB_BROADCAST_FOLDS").is_some())
+}
+
 pub fn form_slab(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
     // The CPU pays nothing per dispatch; a slab is a GPU shape.
     if b.caps().kind != crate::device::DeviceKind::Gpu {
@@ -45,7 +50,7 @@ pub fn form_slab(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Op
     for o in ops {
         // A value every slab reads the same way cannot be a stage: each
         // workgroup writes only its own slab.
-        if !varies(o, op) {
+        if !(varies(o, op) || single_slab_broadcast() && stage(op)?.space.iterations()? <= 8192) {
             continue;
         }
         if let Some(p) = producers.get(b, o.src) {
@@ -328,7 +333,31 @@ pub(crate) fn own_buffer(b: &Builder<'_>, class: ClassId, roots: &FxHashSet<Clas
 /// Whether `id` is a contraction whose tiled kernel should stay its own
 /// dispatch rather than run as a one-lane-per-output fold stage.
 pub(crate) fn is_contraction(b: &Builder<'_>, id: Id) -> bool {
-    has_contract_spelling(b, id) && !small_fold(b, id)
+    has_contract_spelling(b, id) && !contract_stage(b, id)
+}
+
+/// Diagnostic admission of bounded dense attention dots. The normal locality
+/// and storage proofs still apply; this only permits considering the fold
+/// spelling as a stage instead of forcing a separate tiled contraction.
+fn contract_stage(b: &Builder<'_>, id: Id) -> bool {
+    if small_fold(b, id) {
+        return true;
+    }
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ENABLED.get_or_init(|| std::env::var_os("FUSOR_PROFILE_SLAB_SMALL_CONTRACTS").is_some()) {
+        return false;
+    }
+    if !matches!(b.node(id).op, Op::Launch(Launch::Fold { .. })) {
+        return false;
+    }
+    b.class_members(id).iter().any(|m| match &b.node(*m).op {
+        Op::Launch(Launch::Contract { m, n, k, .. }) => {
+            m.as_const().is_some_and(|v| v <= 4)
+                && n.as_const().is_some_and(|v| v <= 1024)
+                && k.as_const().is_some_and(|v| v <= 512)
+        }
+        _ => false,
+    })
 }
 
 /// Whether `id`'s class has a matrix-shaped `Contract` spelling; a batched
@@ -449,7 +478,7 @@ impl Producers {
                     }
                     _ => m,
                 };
-                if !small_fold(b, last) {
+                if !contract_stage(b, last) {
                     continue;
                 }
             }
@@ -645,6 +674,12 @@ fn slab_local(
             return false;
         };
         if lead == 0 {
+            // One slab owns the entire producer: a broadcast value does not
+            // cross a workgroup boundary. Still prove every read in bounds.
+            // For multiple slabs the usual disjoint-partition proof applies.
+            if single_slab_broadcast() && leading == 1 && rest < elements {
+                continue;
+            }
             return false;
         }
         if lead.checked_mul(leading) != Some(elements) || rest >= lead {

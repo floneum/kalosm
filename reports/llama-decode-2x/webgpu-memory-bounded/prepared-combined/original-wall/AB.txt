@@ -1,0 +1,31 @@
+{
+  "baseline": {
+    "samples": 31,
+    "median_ms": 32.631625,
+    "mean_ms": 32.550036387096775,
+    "min_ms": 31.803459,
+    "max_ms": 33.246958,
+    "tokens_per_second": 30.72193186230698,
+    "dispatches": [
+      1270
+    ]
+  },
+  "candidate": {
+    "samples": 31,
+    "median_ms": 16.020375,
+    "mean_ms": 16.038675967741934,
+    "min_ms": 15.938875000000001,
+    "max_ms": 16.632917,
+    "tokens_per_second": 62.34928631336324,
+    "dispatches": [
+      403
+    ]
+  },
+  "median_speedup": 2.0368827196616808,
+  "prompt_tokens": 208,
+  "mean_speedup": 2.029471538209488,
+  "text_matches": true,
+  "target": 1e-06,
+  "target_pass": true,
+  "accuracy_note": "Text check only; use separate full-logit A/B for numerical validation."
+}

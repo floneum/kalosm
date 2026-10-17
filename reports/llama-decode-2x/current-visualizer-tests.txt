@@ -1,0 +1,71 @@
+   Compiling bytemuck v1.25.2
+   Compiling serde v1.0.229
+   Compiling half v2.7.1
+   Compiling fusor-ir v0.1.0 (/private/tmp/training-kernel-visualizer/fusor/fusor-ir)
+   Compiling fusor-gguf v0.1.0 (/private/tmp/training-kernel-visualizer/fusor/fusor-gguf)
+   Compiling fusor-visualize v0.1.0 (/private/tmp/training-kernel-visualizer/fusor/fusor-visualize)
+    Finished `test` profile [optimized + debuginfo] target(s) in 6.49s
+     Running unittests src/lib.rs (fusor/target/debug/deps/fusor_visualize-2284872e4f6769de)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/main.rs (fusor/target/debug/deps/fusor_visualize-b18ca806f4a06303)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/cli.rs (fusor/target/debug/deps/cli-86cbf0b4588df792)
+
+running 4 tests
+test text_reports_action_and_model_metrics ... ok
+test portable_trace_fixture_can_be_replayed_with_another_subgroup_size ... ok
+test json_output_has_config_steps_and_an_honest_prefix_summary ... ok
+test invalid_options_and_non_terminal_tui_fail_cleanly ... ok
+
+test result: ok. 4 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running tests/kernel_capture.rs (fusor/target/debug/deps/kernel_capture-f5dad15ebc489d91)
+
+running 11 tests
+test unsupported_collectives_are_rejected_even_in_unreachable_branches ... ok
+test data_dependent_indices_fail_instead_of_becoming_zero ... ok
+test storage_offset_and_rank_two_non_contiguous_layout_are_applied ... ok
+test masked_lanes_never_request_memory_even_with_invalid_inactive_addresses ... ok
+test concrete_input_bytes_resolve_indirect_addresses_and_writes_invalidate_them ... ok
+test empty_loops_are_budgeted_and_invalid_workgroups_are_rejected ... ok
+test divergent_control_reconverges_and_returned_lanes_stay_inactive ... ok
+test vector_arithmetic_preserves_scalar_reads_but_cannot_invent_addresses ... ok
+test counted_loops_update_indices_and_accumulators_simultaneously ... ok
+test quantized_decoders_trace_packed_words_in_both_layouts ... ok
+test all_demos_capture_and_run_at_different_subgroup_sizes_without_a_gpu ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/memory_model.rs (fusor/target/debug/deps/memory_model-e0c001a48c1e01c2)
+
+running 14 tests
+test invalid_config_trace_and_overflow_fail_before_stepping ... ok
+test duplicate_non_atomic_writes_are_not_reported_as_broadcasts ... ok
+test shared_memory_is_private_to_each_workgroup ... ok
+test reuse_is_separated_by_subgroup_and_workgroup ... ok
+test stores_invalidate_read_reuse_and_do_not_allocate ... ok
+test cache_uses_lru_not_fifo_and_resource_identity ... ok
+test only_workgroup_barriers_order_shared_writes_across_subgroups ... ok
+test disabled_cache_has_no_hits_evictions_or_fills ... ok
+test bank_padding_eliminates_conflicts_and_reads_broadcast ... ok
+test wide_access_crossing_a_sector_and_cache_line_counts_both ... ok
+test coalescing_distinguishes_stride_alignment_and_broadcast ... ok
+test trace_json_roundtrip_and_unknown_fields ... ok
+test trace_can_be_regrouped_and_partial_subgroups_preserve_all_lanes ... ok
+test seek_replays_identical_cache_history_and_empty_memory_events_finish ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+   Doc-tests fusor_visualize
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

@@ -1,0 +1,87 @@
+DEFAULT WEBGPU LLAMA INFERENCE — 2026-10-17
+
+Ordinary Llama chat now requests the measured low-latency execution policy:
+
+  cargo run -j 1 -p kalosm --example chat --features llama --release
+
+No kernel-visualize feature or tuning environment is required. The policy is
+per device and participates in plan/schedule cache fingerprints; it does not
+mutate the process environment. Generic Device::gpu() keeps general defaults.
+Llama sessions inherit their model's policy, including prompt-sized KV storage
+and exact top-k filtering. Existing diagnostic settings can override defaults.
+
+Selection checks the Apple Metal adapter identity through wgpu, fixed 32-lane
+subgroups, cooperative matrices and support for 1024-thread workgroups before
+requesting wider limits. Other adapters retain general scheduling. The code
+uses standard wgpu/WebGPU throughout; shader runtime-check policy is unchanged.
+The default retains all 64 non-file settings from verified-short-config.json,
+plus disabled online exploration. Active completion polling remains 32 ms.
+The GPU pool is capped at 7 GiB or the lower platform limit, shader compilation
+uses one worker, and large plans retain the verified submission limits.
+
+Native loading maps the actual GGUF shards. Raw tensors and quantized leaves
+share ranges owned by those files instead of retaining per-weight heap copies
+or using PROFILE_MMAP_WEIGHTS and a global single-file mapping. Each model owns
+its source backing; files must remain unchanged while mapped.
+
+VALIDATION COMPLETED
+
+- Ordinary chat and default_decode compile without kernel-visualize.
+- Default builder selects LowLatency on this Apple M2 Max. The regression first
+  failed when the selector incorrectly assumed a PCI vendor ID; wgpu's Metal
+  backend reports vendor=0. It now uses the established adapter-name/capability
+  probe. General and low-latency policies have different cache fingerprints.
+- 12 GPU unit tests, including unsupported-adapter fallback and bounded uploads.
+- 9 GGUF tests, including pointer identity, independent shard ownership, and
+  backing lifetime through upload views without copying tensor bytes.
+- Both top-k/byte-view regressions pass.
+- Eight numerical conformance cases run with LowLatency and no tuning flags:
+  normalization, padded attention (including Llama geometry and tail batches),
+  rotary positions, cache growth/replay/ring wrap and retained shared snapshots.
+- Llama all-target and Fusor library/test Clippy pass with warnings denied.
+- CPU-only Llama library compiles. No CPU model inference is used for the GPU
+  performance goal.
+- Guard/protocol and comparison Python checks pass; git diff --check passes.
+
+FULL-MODEL FOLLOW-UP IS BLOCKED, NOT VERIFIED
+
+The new reference capture was stopped by the unchanged memory guard during
+its first prefill, before any completed logit vector or timing sample. Startup
+headroom was 16.929 GiB (above the required 15.17 GiB). System compressor use
+rose from 1.283 to 3.349 GiB, crossing the 2 GiB limit at 25.588 seconds. The
+guard terminated and reaped its owned model process. No additional swapouts
+were observed. Maximum sampled process RSS was 11.172 GiB; RSS is not complete
+unified GPU memory accounting. No pressure thresholds were changed, and no
+further full-model run was started after this stop.
+
+The historical 2.0204x / 16.005 ms-per-token result and 2,308,608 passing logits
+in verified-short-decode.txt apply to the October 12 opt-in checkpoint. They
+are not a newly measured result for this default-promotion change. Fresh
+full-model logits and default-path ABBA timing remain to be completed when
+memory conditions permit.
+
+REPRODUCTION
+
+Build default_decode with ordinary features and optimized code. Then, when
+memory permits, run the sequential guarded comparison against the historical
+control configuration (use a new output directory):
+
+  python3 fusor/fusor-visualize/tools/check_default_decode.py "$MODEL" \
+    --baseline-config reports/llama-decode-2x/webgpu-memory-bounded/segmented-host/baseline-scoped.json \
+    --output /tmp/llama-default-wall-new --steps 32 --rounds 1
+
+The candidate arm has an empty tuning environment and uses the ordinary Llama
+builder. ABBA compares the same executable and checks all phase/token/text
+identities; its target is 2x in both orderings. It does not collect GPU timing,
+metadata or logits during wall timing.
+
+For full logits, build profile_kernel_share with kernel-visualize, capture a
+fresh general-policy reference using the existing recipe in
+verified-short-decode.txt, and use default-inference/default-profile.json with
+check_model_logits.py --reference. PROFILE_DEFAULT_DEVICE selects the same
+inference device policy as the ordinary builder; it is only a capture-tool
+switch. Source-file mapping is automatic and needs no path override.
+
+Compact test logs, ordinary feature tree, reference provenance and memory-stop
+summary are published in default-inference/. Raw model files, executables,
+raw logits and large per-poll resource traces stay local.

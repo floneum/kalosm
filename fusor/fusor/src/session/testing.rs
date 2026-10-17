@@ -63,7 +63,7 @@ impl Session {
                 })
                 .collect()
         };
-        self.run(graph, &base, values)?;
+        self.run(graph, &base, values, false, None)?;
         let expected = read()?;
         let mut checked = vec![Arc::clone(&base)];
         let mut wrong = 0;
@@ -81,7 +81,7 @@ impl Session {
             for (label, plan) in variants {
                 let plan = Arc::new(plan);
                 checked.push(Arc::clone(&plan));
-                self.run(graph, &plan, values).map_err(|e| {
+                self.run(graph, &plan, values, false, None).map_err(|e| {
                     Error::Plan(format!(
                         "candidate `{label}` of launch {ix} failed to execute: {e}"
                     ))

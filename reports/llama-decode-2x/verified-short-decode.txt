@@ -1,0 +1,119 @@
+VERIFIED SHORT-CONTEXT WEBGPU DECODE — 2026-10-12
+
+The original 208-token steady-decode target passes 2x in both ABBA orders.
+Apple M2 Max, 32 GiB unified memory, subgroup size 32; Llama 3.1 8B Instruct
+Q4_K_M. This is an opt-in configuration in the codex/kernel-visualizer worktree,
+not a change to default model settings or a universal hardware speed guarantee.
+
+                 Baseline ms/token    Candidate ms/token    Speedup
+A then B             32.631625             16.020375          2.036883x
+B then A             32.042000             15.989875          2.003893x
+Median of runs       32.336813             16.005125          2.020404x
+
+62 steady samples per arm, same executable, prompt, generated text, and resource
+policy. One warmup and one measured round per process, 32 decode steps; the
+first decode step is excluded. No GPU timestamps, metadata, or logit writes
+inside timing. The reverse order clears 2x by only 0.19%; timings are specific
+to this machine/workload and can vary with background activity.
+
+Correctness: all 2,308,608 values in 18 full-vocabulary vectors pass the original
+reference comparison. Maximum absolute error 0.0000610352, maximum RMS error
+0.0000120242; every argmax and generated-text check matches. Quantized weights,
+F32 activations, F32 accumulation, and the workload are unchanged.
+
+Execution stays on standard wgpu/WebGPU. The registry wgpu-hal 29.0.4 is used;
+no native Metal/HAL bypass or indirect-command experiment is a build input.
+The existing shader runtime-check policy is unchanged.
+
+The retained path combines packed Q4 and coalesced Q6 access, block-addressed
+quantized storage, fused normalization/attention/rotary work, owned KV appends,
+view forwarding, exact top-k filtering, and bounded preparation caches. It
+reduces steady dispatches from 1270 to 403. Recent changes remove repeated CPU
+plan indexing and pipeline-vector copies, use an unsplit small Q4 workgroup,
+and combine the exact attention loop bound with Q6 vocabulary column reuse.
+The first submission contains 13 dispatches, later chunks 128. Warm snapshots
+hold only bounded plan/pipeline metadata; they do not pin model tensors.
+
+Memory: one resident benchmark process at a time, one compiler job, a 7 GiB
+GPU pool, read-only mapped source weights, and the unchanged pressure guard.
+Across final logits plus four timing runs, minimum estimated reclaimable
+headroom is 8.645 GiB; maximum compressor growth is 128 KiB; no additional
+swapouts. The correctness run's maximum recorded process RSS is 12.388 GiB;
+RSS is not a complete accounting of unified GPU memory. Full resource logs
+and memory-summary.json are retained. No resource thresholds were relaxed.
+
+Validation completed:
+- Root and Fusor/GPU all-target Clippy with warnings denied.
+- All 11 GPU-library unit tests, including snapshot invalidation and bounded
+  submission scheduling through usize::MAX corner cases.
+- Prepared-plan ownership/index regression and both real top-k unit tests.
+- Active-donation GPU conformance for replay/ring growth and retained snapshots.
+- 19 Python resource-guard/benchmark-protocol tests; git diff --check.
+
+Evidence (relative to reports/llama-decode-2x):
+  verified-short-config.json
+  webgpu-memory-bounded/prepared-combined/original-wall/result.json
+  webgpu-memory-bounded/prepared-combined/logits/result.json
+  webgpu-memory-bounded/prepared-combined/memory-summary.json
+  webgpu-memory-bounded/prepared-combined/clippy-{root,fusor}.txt
+  webgpu-memory-bounded/early-submit-prepared/unit.txt
+  webgpu-memory-bounded/prepared-resolve/cache-conformance-enabled.txt
+Provenance beside the results includes exact executable SHA256 and environments.
+The smaller first8 submission was slower and is not selected. Earlier failed
+experiments and the invalid 1024-threshold comparison remain labelled as such.
+
+REPRODUCE FROM /private/tmp/training-kernel-visualizer
+
+Use the existing target/debug/examples/profile_kernel_share binary, built with
+kernel-visualize, profile.dev.opt-level=3, CARGO_INCREMENTAL=0 and one compiler
+job under benchmark_guard.run_guarded. Set MODEL to the original Q4_K_M GGUF
+path recorded in verified-short-config.json. Output directories must be new.
+These launchers already serialize children and enforce the pressure guard.
+
+python3 reports/llama-decode-2x/paired_wall.py "$MODEL" \
+  --output /tmp/llama-verified-wall-new \
+  --config reports/llama-decode-2x/verified-short-config.json \
+  --baseline-config reports/llama-decode-2x/webgpu-memory-bounded/segmented-host/baseline-scoped.json \
+  --binary target/debug/examples/profile_kernel_share --rounds 1 --steps 32 --target 2
+
+python3 fusor/fusor-visualize/tools/check_model_logits.py "$MODEL" \
+  --config reports/llama-decode-2x/verified-short-config.json \
+  --output /tmp/llama-verified-logits-new --rounds 1 --steps 8
+
+Do not overlap builds or other GPU benchmarks with these runs. A pressure
+failure is a stop, not a reason to retry automatically or weaken the limits.
+
+FRESH CHECKOUT: CAPTURE A LOCAL NUMERICAL REFERENCE
+
+The PR publishes comparison summaries, not raw reference/candidate vectors.
+Build the profiling example before this step. On another machine, set the
+PROFILE_MMAP_WEIGHTS path in copies of both configuration JSON files to your
+original Q4_K_M GGUF, and use those copies for all runs. This bounded capture
+uses the conservative baseline on the same binary and runs sequentially.
+
+export MODEL=/absolute/path/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf
+python3 - <<'CAPTURE'
+import json, os, sys
+from pathlib import Path
+sys.path.insert(0, "fusor/fusor-visualize/tools")
+from benchmark_guard import run_guarded
+out = Path("/tmp/llama-reference-new")
+out.mkdir(exist_ok=False)
+model = Path(os.environ["MODEL"]).resolve()
+env = {k: v for k, v in os.environ.items()
+       if not k.startswith(("FUSOR_", "PROFILE_", "LAB_"))}
+env.update(json.loads(Path("reports/llama-decode-2x/webgpu-memory-bounded/segmented-host/baseline-scoped.json").read_text()))
+env.update(PROFILE_MMAP_WEIGHTS=str(model), PROFILE_PROMPT="long",
+           PROFILE_PROMPT_REPEATS="8", FUSOR_EXPLORE_EPS="0",
+           PROFILE_LOGITS_DIR=str(out / "reference-logits"))
+with (out / "reference.jsonl").open("w") as stdout, (out / "ab-reference.log").open("w") as stderr:
+    run_guarded([str(Path("target/debug/examples/profile_kernel_share").resolve()),
+                 str(model), "1", "8"], cwd=Path.cwd(), env=env,
+                stdout=stdout, stderr=stderr, model_bytes=model.stat().st_size,
+                timeout=600, report_path=out / "resources.jsonl",
+                poll_seconds=.1, record_child_rss=True)
+CAPTURE
+
+Then add --reference /tmp/llama-reference-new to check_model_logits.py.
+This validates a newly captured baseline; the historical maximum errors above
+remain those recorded in the committed comparison summaries.

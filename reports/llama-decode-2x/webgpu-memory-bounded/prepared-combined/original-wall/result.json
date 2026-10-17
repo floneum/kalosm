@@ -1,0 +1,24 @@
+{
+  "order": "ABBA",
+  "prompt_tokens": 208,
+  "samples_per_arm": 62,
+  "baseline_run_medians_ms": [
+    32.631625,
+    32.042
+  ],
+  "candidate_run_medians_ms": [
+    16.020375,
+    15.989875000000001
+  ],
+  "directional_speedups": [
+    2.0368827196616808,
+    2.0038930885951265
+  ],
+  "median_run_speedup": 2.0204036207152396,
+  "minimum_directional_speedup": 2.0038930885951265,
+  "target": 2.0,
+  "target_pass": true,
+  "text_matches": true,
+  "accuracy_note": "Separate full-logit validation required; text equality alone is insufficient.",
+  "timing_note": "No timestamps or logit writes; ABBA controls run order, not other GPU workloads."
+}

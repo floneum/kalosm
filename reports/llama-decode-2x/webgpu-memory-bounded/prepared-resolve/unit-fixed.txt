@@ -1,0 +1,8 @@
+   Compiling fusor v0.1.0 (/private/tmp/training-kernel-visualizer/fusor/fusor)
+    Finished `test` profile [optimized + debuginfo] target(s) in 17.87s
+     Running unittests src/lib.rs (fusor/target/debug/deps/fusor-71f09aed93848d76)
+
+running 1 test
+test session::prepared::tests::indexes_follow_the_immutable_plan_and_do_not_pin_it ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 20 filtered out; finished in 0.00s

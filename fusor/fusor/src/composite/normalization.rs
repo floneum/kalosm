@@ -169,17 +169,17 @@ impl Tensor {
 
     /// `x / sqrt(mean(x^2) + eps) * weight`.
     pub fn rms_norm(&self, weight: &Tensor, eps: f32) -> Result<Tensor> {
-        self.rms_norm_inner(Some(weight), None, eps)
+        self.rms_norm_inner(Some(weight), None, eps, None)
     }
 
     /// RMS normalization without a learned scale.
     pub fn rms_norm_no_weight(&self, eps: f32) -> Result<Tensor> {
-        self.rms_norm_inner(None, None, eps)
+        self.rms_norm_inner(None, None, eps, None)
     }
 
     /// [`Tensor::rms_norm`] with a learned shift as well as a scale.
     pub fn rms_norm_with_bias(&self, weight: &Tensor, bias: &Tensor, eps: f32) -> Result<Tensor> {
-        self.rms_norm_inner(Some(weight), Some(bias), eps)
+        self.rms_norm_inner(Some(weight), Some(bias), eps, None)
     }
 
     /// The transformer block boundary: `rms_norm(x + residual)`.
@@ -190,15 +190,22 @@ impl Tensor {
         bias: Option<&Tensor>,
         eps: f32,
     ) -> Result<Tensor> {
-        let sym = eps_uniform(&self.graph, eps);
-        let (x, r, w) = (self.id, residual.id, weight.id);
-        let b = bias.map(|t| t.id);
-        core_op(&self.graph, |t| {
+        if self
+            .graph
+            .session()
+            .caps()
+            .execution_profile
+            .enabled("FUSOR_PROFILE_RMS_RESIDUAL")
+        {
+            return self.rms_norm_inner(Some(weight), bias, eps, Some(residual));
+        }
+        let (x, r) = (self.id, residual.id);
+        let sum = core_op(&self.graph, |t| {
             let shape = t.shape_of(x);
             let r = t.broadcast_to(r, &shape)?;
-            let sum = t.binary(BinOp::Add, x, r)?;
-            layer_norm_defn(t, sum, Some(w), b, sym, false)
-        })
+            t.binary(BinOp::Add, x, r)
+        })?;
+        sum.rms_norm_inner(Some(weight), bias, eps, None)
     }
 
     fn rms_norm_inner(
@@ -206,12 +213,90 @@ impl Tensor {
         weight: Option<&Tensor>,
         bias: Option<&Tensor>,
         eps: f32,
+        residual: Option<&Tensor>,
     ) -> Result<Tensor> {
         let sym = eps_uniform(&self.graph, eps);
         let x = self.id;
         let w = weight.map(|t| t.id);
         let b = bias.map(|t| t.id);
-        core_op(&self.graph, |t| layer_norm_defn(t, x, w, b, sym, false))
+        let r = residual.map(|t| t.id);
+        let caps = self.graph.session().caps();
+        let rms_block = self
+            .graph
+            .session()
+            .caps()
+            .execution_profile
+            .var("FUSOR_PROFILE_RMS_BLOCK")
+            .ok()
+            .map(|v| v.parse::<u32>().expect("RMS block must be an integer"))
+            .unwrap_or(256);
+        assert!(
+            matches!(rms_block, 32 | 64 | 128 | 256 | 512 | 1024),
+            "RMS block must be a power of two from 32 to 1024"
+        );
+        core_op(&self.graph, |t| {
+            let summed = if let Some(r) = r {
+                let shape = t.shape_of(x);
+                let r = t.broadcast_to(r, &shape)?;
+                t.binary(BinOp::Add, x, r)?
+            } else {
+                x
+            };
+            let result = layer_norm_defn(t, summed, w, b, sym, false)?;
+            let shape = t.shape_of(x);
+            if self
+                .graph
+                .session()
+                .caps()
+                .execution_profile
+                .enabled("FUSOR_PROFILE_FUSED_RMS_NORM")
+                && caps.kind == fusor_ir::device::DeviceKind::Gpu
+                && caps.limits.max_compute_invocations_per_workgroup >= rms_block
+                && caps.limits.max_compute_workgroup_size[0] >= rms_block
+                && caps.limits.max_compute_workgroup_storage_size >= rms_block * 4
+                && b.is_none()
+                && let Some(w) = w
+                && let Some(width) = shape.last().and_then(|d| d.as_const())
+                && (1..=8192).contains(&width)
+                && shape
+                    .iter()
+                    .try_fold(1u64, |a, d| a.checked_mul(d.as_const()?))
+                    .is_some_and(|n| n > 0 && n <= width * 4)
+                && t.shape_of(w).as_slice() == [Dim::Const(width)]
+                && r.is_none_or(|r| t.shape_of(r) == shape)
+                && [x, w].into_iter().chain(r).all(|v| {
+                    t.dtype_of(v) == fusor_ir::dtype::Dtype::F32
+                        && t.facts(v).numeric.reassoc
+                        && t.facts(v).numeric.contract
+                })
+            {
+                use fusor_ir::ir::launch::{
+                    AccessPlan, IndexSpace, Launch, Operand, ScheduleDomain,
+                };
+                use fusor_ir::shape::Layout;
+                let ops = [x, w]
+                    .into_iter()
+                    .chain(r)
+                    .map(|src| Operand {
+                        src,
+                        layout: Layout::contiguous(&t.shape_of(src)),
+                        access: AccessPlan::Alias,
+                    })
+                    .collect();
+                let fused = t.graph_mut().builder(&caps).add_launch(Launch::RmsNorm {
+                    output: IndexSpace::new(shape),
+                    width: width as u32,
+                    block: rms_block,
+                    epsilon: ScalarExpr::uniform(sym, fusor_ir::dtype::Dtype::F32),
+                    ops,
+                    sched: ScheduleDomain::Point,
+                })?;
+                // Keep the logical root so reverse-mode differentiation still
+                // sees ordinary arithmetic; extraction can select this launch.
+                t.graph_mut().builder(&caps).union(result, fused)?;
+            }
+            Ok(result)
+        })
     }
 
     /// `(x - mean) / sqrt(var + eps) * weight + bias` over the last axis.

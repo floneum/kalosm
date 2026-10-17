@@ -1,0 +1,44 @@
+{
+  "runs": [
+    {
+      "run": "logits/resources.jsonl",
+      "minimum_available_gib": 8.74072265625,
+      "maximum_child_rss_gib": 12.38848876953125,
+      "maximum_compressor_growth_bytes": 131072,
+      "maximum_swapout_growth_bytes": 0
+    },
+    {
+      "run": "original-wall/AB/baseline-resources.jsonl",
+      "minimum_available_gib": 10.517257690429688,
+      "maximum_child_rss_gib": null,
+      "maximum_compressor_growth_bytes": 0,
+      "maximum_swapout_growth_bytes": 0
+    },
+    {
+      "run": "original-wall/AB/candidate-resources.jsonl",
+      "minimum_available_gib": 8.771453857421875,
+      "maximum_child_rss_gib": null,
+      "maximum_compressor_growth_bytes": 0,
+      "maximum_swapout_growth_bytes": 0
+    },
+    {
+      "run": "original-wall/BA/baseline-resources.jsonl",
+      "minimum_available_gib": 8.645263671875,
+      "maximum_child_rss_gib": null,
+      "maximum_compressor_growth_bytes": 0,
+      "maximum_swapout_growth_bytes": 0
+    },
+    {
+      "run": "original-wall/BA/candidate-resources.jsonl",
+      "minimum_available_gib": 10.563873291015625,
+      "maximum_child_rss_gib": null,
+      "maximum_compressor_growth_bytes": 0,
+      "maximum_swapout_growth_bytes": 0
+    }
+  ],
+  "minimum_available_gib": 8.645263671875,
+  "maximum_recorded_child_rss_gib": 12.38848876953125,
+  "maximum_compressor_growth_bytes": 131072,
+  "maximum_swapout_growth_bytes": 0,
+  "note": "Available memory estimates include reclaimable inactive/speculative pages; RSS is recorded only where present and is not a complete accounting of unified GPU memory. Guard limits unchanged."
+}

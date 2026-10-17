@@ -4,12 +4,46 @@
 //! u32 words; packed f16 stores update one half atomically so neighboring
 //! lanes cannot overwrite each other's values.
 
-use fusor_ir::ir::kernel::{Buffer, ElementType, ScalarElement, StorageView};
+use fusor_ir::ir::kernel::{
+    Buffer, ElementType, ScalarElement, StorageView, TileBinaryOp, TileExpr, TileExprKind,
+    TileLiteral,
+};
 use fusor_ir::target::EmitError;
 use naga::{BinaryOperator, Block, Expression, Handle, MathFunction, ScalarKind, Statement};
 
 use super::expr::{element_scalar, push};
 use super::{Emitter, key};
+
+/// Conservative bound for unsigned address arithmetic. Unknown expressions
+/// and possible wrapping return the full range, so normalization is retained.
+pub(super) fn unsigned_index_max(value: &TileExpr) -> u32 {
+    if value.element() != ScalarElement::U32.element() {
+        return u32::MAX;
+    }
+    match value.kind() {
+        TileExprKind::Literal(TileLiteral::U32(n)) => *n,
+        TileExprKind::Binary {
+            op, left, right, ..
+        } => {
+            let a = unsigned_index_max(left);
+            let literal = match right.kind() {
+                TileExprKind::Literal(TileLiteral::U32(n)) => Some(*n),
+                _ => None,
+            };
+            match op {
+                TileBinaryOp::Add => a.saturating_add(unsigned_index_max(right)),
+                TileBinaryOp::Mul => a.saturating_mul(unsigned_index_max(right)),
+                TileBinaryOp::Div => literal.filter(|n| *n > 0).map_or(u32::MAX, |n| a / n),
+                TileBinaryOp::Rem => literal
+                    .filter(|n| *n > 0)
+                    .map_or(u32::MAX, |n| a.min(n - 1)),
+                TileBinaryOp::BitAnd => a.min(unsigned_index_max(right)),
+                _ => u32::MAX,
+            }
+        }
+        _ => u32::MAX,
+    }
+}
 
 impl Emitter<'_> {
     pub(crate) fn buffer_element(&self, buffer: &Buffer) -> ElementType {
@@ -35,7 +69,42 @@ impl Emitter<'_> {
         } else {
             index
         };
+        if let Some(&width) = self.buffer_block_widths.get(&key(&view.buffer)) {
+            let row = self.div_literal_u32(body, index, width);
+            let col = self.mod_literal_u32(body, index, width);
+            let base = self.emit_expr(body, Expression::Access { base, index: row });
+            return Ok(self.emit_expr(body, Expression::Access { base, index: col }));
+        }
         Ok(self.emit_expr(body, Expression::Access { base, index }))
+    }
+
+    /// Direct row/word load for an explicitly contiguous block view. Naga's
+    /// ordinary runtime checks still guard both accesses.
+    pub(crate) fn load_storage_block(
+        &mut self,
+        body: &mut Block,
+        view: &StorageView,
+        row: Handle<Expression>,
+        col: Handle<Expression>,
+        bounded_column: bool,
+    ) -> Result<Handle<Expression>, EmitError> {
+        // Rc2 is an affine address. Carry an oversized column into its row
+        // before indexing a fixed-size inner array, including masked constant
+        // addresses that Naga would otherwise reject before runtime masking.
+        let width = self.buffer_block_widths[&key(&view.buffer)];
+        let (row, col) = if bounded_column {
+            (row, col)
+        } else {
+            let carry = self.div_literal_u32(body, col, width);
+            let row = self.bin(body, BinaryOperator::Add, row, carry);
+            let col = self.mod_literal_u32(body, col, width);
+            (row, col)
+        };
+        let global = self.buffer_global(&view.buffer)?;
+        let base = self.global_var(global);
+        let base = self.emit_expr(body, Expression::Access { base, index: row });
+        let pointer = self.emit_expr(body, Expression::Access { base, index: col });
+        Ok(self.emit_load(body, pointer))
     }
 
     pub(crate) fn load_storage_absolute(

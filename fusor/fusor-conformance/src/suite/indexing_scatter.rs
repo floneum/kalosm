@@ -89,6 +89,8 @@ pub fn cases() -> Cases {
     );
     cases.fuzz("scatter_add_backward", TABLE_SPEC, scatter_add_backward);
     cases.fuzz("scatter_set_unique", TABLE_SPEC, scatter_set_case);
+    cases.push("scatter_single_row_update", scatter_single_row_update);
+    cases.push("indexing_strided_views", indexing_strided_views);
     cases.push(
         "scatter_set_refuses_an_unproven_index",
         scatter_set_unproven,
@@ -116,6 +118,72 @@ pub fn cases() -> Cases {
         index_backward,
     );
     cases
+}
+
+/// Address forwarding must preserve nonzero offsets, transposed rows, repeated
+/// gather indices, and both single-update and duplicate-add scatter paths.
+async fn indexing_strided_views(session: &Session) -> CaseResult {
+    let graph = graph_of(session);
+    let width = 257usize;
+    let storage: Vec<f32> = (0..width * 7).map(|i| (i % 131) as f32 - 65.0).collect();
+    let source = upload(graph.handle(), &dims(&[width as u64, 7]), &storage)?
+        .narrow(1, 1, 5)?
+        .transpose(0, 1)?;
+    let idx = from_u32(graph.handle(), &dims(&[5]), &[0, 3, 1, 3, 0])?.narrow(0, 1, 3)?;
+    let selected = source.index_select(0, &idx)?;
+    let mut expected = Vec::new();
+    for r in [3, 1, 3] {
+        for c in 0..width {
+            expected.push(storage[c * 7 + r + 1]);
+        }
+    }
+    expect_values(
+        session,
+        &[3, width as u64],
+        Dtype::F32,
+        &read(&selected).await?,
+        &expected,
+    )
+    .await?;
+    for count in [1usize, 3] {
+        let updates = source.narrow(0, 1, count)?;
+        let indices = from_u32(graph.handle(), &dims(&[count as u64]), &vec![2u32; count])?;
+        for set in [false, true] {
+            if set && count > 1 {
+                continue;
+            }
+            let base = upload(
+                graph.handle(),
+                &dims(&[5, width as u64]),
+                &vec![0.5; 5 * width],
+            )?;
+            let out = if set {
+                base.scatter_set(0, &indices, &updates, true)?
+            } else {
+                base.scatter_add(0, &indices, &updates)?
+            };
+            let mut expected = vec![0.5; 5 * width];
+            for r in 0..count {
+                for c in 0..width {
+                    let value = storage[c * 7 + r + 2];
+                    if set {
+                        expected[2 * width + c] = value;
+                    } else {
+                        expected[2 * width + c] += value;
+                    }
+                }
+            }
+            expect_values(
+                session,
+                &[5, width as u64],
+                Dtype::F32,
+                &read(&out).await?,
+                &expected,
+            )
+            .await?;
+        }
+    }
+    Ok(())
 }
 
 /// `index_select(dim, idx)`, forward and backward.
@@ -468,6 +536,40 @@ async fn scatter_set_case(session: &Session, shape: &[u64], seed: u32) -> CaseRe
                      overwritten element receives nothing"
                 )
                 .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The KV-append geometry, including partial workgroups and multiple slots
+/// per lane. Verify both combines, every output element, and the old snapshot.
+async fn scatter_single_row_update(session: &Session) -> CaseResult {
+    for width in [17usize, 128, 257] {
+        for position in [0usize, 3, 6] {
+            let shape = [2, 7, width as u64];
+            let base = Domain::Wide.sample(4021, 14 * width);
+            let updates = Domain::Wide.sample(4027, 2 * width);
+            let graph = graph_of(session);
+            let b = upload(graph.handle(), &dims(&shape), &base)?;
+            let i = from_u32(graph.handle(), &dims(&[1]), &[position as u32])?;
+            let u = upload(graph.handle(), &dims(&[2, 1, width as u64]), &updates)?;
+            for add in [false, true] {
+                let y = if add {
+                    b.scatter_add(1, &i, &u)?
+                } else {
+                    b.scatter_set(1, &i, &u, true)?
+                };
+                let mut expected = base.clone();
+                for outer in 0..2 {
+                    for col in 0..width {
+                        let dest = (outer * 7 + position) * width + col;
+                        let value = updates[outer * width + col];
+                        expected[dest] = if add { base[dest] + value } else { value };
+                    }
+                }
+                expect_values(session, &shape, Dtype::F32, &read(&y).await?, &expected).await?;
+                expect_values(session, &shape, Dtype::F32, &read(&b).await?, &base).await?;
             }
         }
     }

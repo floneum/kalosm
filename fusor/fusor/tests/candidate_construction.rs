@@ -9,6 +9,7 @@ use fusor_ir::shape::Dim;
 
 fn caps() -> Caps {
     Caps {
+        execution_profile: Default::default(),
         kind: DeviceKind::Cpu,
         name: "candidate construction test".into(),
         limits: Limits {

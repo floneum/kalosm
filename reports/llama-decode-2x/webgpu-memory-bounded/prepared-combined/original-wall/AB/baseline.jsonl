@@ -1,0 +1,66 @@
+{"dispatches":25799,"key":"long-r0-prefill-0","mode":"wall","phase":"prefill","prompt":"long","prompt_tokens":208,"round":0,"step":0,"text":" \n\n","wall_ms":23763.792250000002,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-1","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":1,"text":"A","wall_ms":32.267792,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-2","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":2,"text":" GPU","wall_ms":32.1785,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-3","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":3,"text":" is","wall_ms":31.882792,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-4","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":4,"text":" a","wall_ms":31.869583,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-5","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":5,"text":" computer","wall_ms":32.205958,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-6","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":6,"text":" chip","wall_ms":32.687709000000005,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-7","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":7,"text":" that","wall_ms":31.983249999999998,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-8","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":8,"text":" contains","wall_ms":31.962290999999997,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-9","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":9,"text":" a","wall_ms":32.463542,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-10","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":10,"text":" large","wall_ms":32.088917,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-11","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":11,"text":" number","wall_ms":32.016959,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-12","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":12,"text":" of","wall_ms":32.2715,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-13","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":13,"text":" processing","wall_ms":32.288917,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-14","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":14,"text":" units","wall_ms":32.35625,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-15","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":15,"text":" called","wall_ms":32.676125,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-16","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":16,"text":" cores","wall_ms":32.894959,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-17","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":17,"text":",","wall_ms":33.052458,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-18","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":18,"text":" which","wall_ms":32.552040999999996,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-19","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":19,"text":" execute","wall_ms":32.242709,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-20","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":20,"text":" threads","wall_ms":32.607458,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-21","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":21,"text":" of","wall_ms":32.616667,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-22","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":22,"text":" code","wall_ms":32.43454199999999,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-23","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":23,"text":" in","wall_ms":31.953625,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-24","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":24,"text":" parallel","wall_ms":31.94525,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-25","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":25,"text":".","wall_ms":32.445041,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-26","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":26,"text":" It","wall_ms":31.963667,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-27","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":27,"text":" executes","wall_ms":32.494792000000004,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-28","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":28,"text":" groups","wall_ms":32.646292,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-29","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":29,"text":" of","wall_ms":32.304083,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-30","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":30,"text":" threads","wall_ms":31.980791,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-31","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":31,"text":" and","wall_ms":32.131042,"warmup":true}
+{"dispatches":1271,"key":"long-r0-decode-32","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":32,"text":" allows","wall_ms":32.238292,"warmup":true}
+{"dispatches":25783,"key":"long-r1-prefill-0","mode":"wall","phase":"prefill","prompt":"long","prompt_tokens":208,"round":1,"step":0,"text":" \n\n","wall_ms":7841.431958,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-1","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":1,"text":"A","wall_ms":32.456917000000004,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-2","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":2,"text":" GPU","wall_ms":32.0165,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-3","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":3,"text":" is","wall_ms":31.911334,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-4","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":4,"text":" a","wall_ms":32.539959,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-5","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":5,"text":" computer","wall_ms":32.650833,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-6","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":6,"text":" chip","wall_ms":32.183166,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-7","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":7,"text":" that","wall_ms":32.286584,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-8","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":8,"text":" contains","wall_ms":32.684709,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-9","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":9,"text":" a","wall_ms":33.246958,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-10","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":10,"text":" large","wall_ms":33.009417,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-11","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":11,"text":" number","wall_ms":32.713791,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-12","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":12,"text":" of","wall_ms":32.530249999999995,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-13","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":13,"text":" processing","wall_ms":32.698709,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-14","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":14,"text":" units","wall_ms":32.66125,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-15","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":15,"text":" called","wall_ms":32.274457999999996,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-16","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":16,"text":" cores","wall_ms":32.207792,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-17","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":17,"text":",","wall_ms":33.085457999999996,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-18","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":18,"text":" which","wall_ms":32.631625,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-19","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":19,"text":" execute","wall_ms":32.624417,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-20","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":20,"text":" threads","wall_ms":32.792750000000005,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-21","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":21,"text":" of","wall_ms":32.616167000000004,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-22","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":22,"text":" code","wall_ms":32.751542,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-23","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":23,"text":" in","wall_ms":32.615417,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-24","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":24,"text":" parallel","wall_ms":32.6405,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-25","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":25,"text":".","wall_ms":32.783417,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-26","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":26,"text":" It","wall_ms":32.239542,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-27","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":27,"text":" executes","wall_ms":32.929542,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-28","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":28,"text":" groups","wall_ms":32.716833,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-29","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":29,"text":" of","wall_ms":32.753625,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-30","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":30,"text":" threads","wall_ms":32.506416,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-31","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":31,"text":" and","wall_ms":31.944708000000002,"warmup":false}
+{"dispatches":1270,"key":"long-r1-decode-32","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":32,"text":" allows","wall_ms":31.803459,"warmup":false}

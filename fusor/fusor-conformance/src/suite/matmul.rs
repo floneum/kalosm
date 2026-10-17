@@ -134,7 +134,46 @@ pub fn cases() -> Cases {
     cases.push("grouped_reshape_chain", async |s| multi_axis(s, true).await);
     cases.fuzz("wide_n_columns", WIDE_N_SPEC, wide_n);
     cases.fuzz("qkv_projection_triple", QKV_SPEC, qkv_triple);
+    cases.push("coop_fragment_epilogue", coop_fragment_epilogue);
     cases
+}
+
+async fn coop_fragment_epilogue(session: &Session) -> CaseResult {
+    if !session.caps().f16 {
+        return Err(crate::harness::skip("device has no f16 support"));
+    }
+    let (m, n, k) = (65usize, 97usize, 48usize);
+    let a: Vec<_> = (0..m * k)
+        .map(|i| ((i * 13 % 31) as f32 - 15.0) / 32.0)
+        .collect();
+    let b: Vec<_> = (0..k * n)
+        .map(|i| ((i * 17 % 37) as f32 - 18.0) / 64.0)
+        .collect();
+    let graph = graph_of(session);
+    let lhs = upload(graph.handle(), &dims(&[m as u64, k as u64]), &a)?;
+    let rhs = upload(graph.handle(), &dims(&[k as u64, n as u64]), &b)?;
+    // An f32 fragment stored to f16 forces the shared-memory epilogue on
+    // ordinary backends; all three dimensions exercise multiple/tail tiles.
+    let out = lhs.matmul(&rhs)?.add_scalar(0.125)?.cast(Dtype::F16)?;
+    let actual = read(&out).await?;
+    let mut expected = vec![0.0; m * n];
+    for r in 0..m {
+        for c in 0..n {
+            let value = (0..k)
+                .map(|i| f64::from(a[r * k + i]) * f64::from(b[i * n + c]))
+                .sum::<f64>()
+                + 0.125;
+            expected[r * n + c] = half::f16::from_f32(value as f32).to_f32();
+        }
+    }
+    expect_values(
+        session,
+        &[m as u64, n as u64],
+        Dtype::F16,
+        &actual,
+        &expected,
+    )
+    .await
 }
 
 /// A dense `[m,k] x [k,n]` with **more than 64 output columns**.

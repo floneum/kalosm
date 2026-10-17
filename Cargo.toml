@@ -33,7 +33,7 @@ members = [
 ]
 # `fusor` is a standalone crate with its own `[workspace]`; keep the parent
 # workspace from trying to absorb it.
-exclude = ["fusor"]
+exclude = ["fusor", ".kernel-profile-deps/wgpu"]
 
 # The repository root repeats Fusor's vendored naga patch below because model
 # crates are built from this workspace and Cargo applies patches at the build

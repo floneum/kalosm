@@ -1,0 +1,223 @@
+Llama: the 8x investigation — 2026-10-10
+
+RESULT: 8x IS NOT YET DEMONSTRATED
+
+The longer sequential A/B measured 7.509x faster fresh-session wall time for
+a 208-token prompt followed by five generated tokens. Prompt GPU execution is
+4.144x faster. Steady decode GPU time is 8.18% slower. These are distinct results;
+neither an 8x kernel speedup nor an 8x sustained generation speedup was achieved.
+
+Apple M2 Max, Metal, subgroup 32, 32 GiB system RAM; Meta-Llama-3.1-8B-Instruct
+Q4_K_M. Both profiling executables use Rust's dev profile. GPU shaders are
+compiled by Metal; CPU planning/wall-time gains must also be checked in release
+builds before making production latency claims. Model loading is excluded.
+
+Three measured fresh sessions after one warmup, whole-plan GPU timestamps:
+
+                                         Original       Latency candidate
+Prompt GPU                                3139.281 ms       757.635 ms
+Prompt wall                               8550.590 ms      1124.373 ms
+First decode wall                         5211.172 ms       574.670 ms
+Steady decode GPU                           27.317 ms        29.552 ms
+Steady decode wall                          42.740 ms        44.120 ms
+Session GPU (prompt + five output tokens)  3259.498 ms       884.576 ms
+Session wall                             13859.291 ms      1845.701 ms
+Prompt dispatches                            16653             1756
+
+Session totals sum each session's phases BEFORE taking the median; they need
+not equal the sum of the independently reported phase medians. Steady decode
+excludes the first decode; the session total explicitly includes it. Both arms
+capture logits and host profiling, with the same timing mode and no concurrent
+GPU job. Results, all phases, executable hashes, environment and logits are in
+latency-ab/. model-ab.json's legacy key "batch128" names the candidate even
+though its recorded PROFILE_PREFILL_WIDTH is 256.
+
+The harness exited nonzero at the 8x session-wall assertion. The independent
+8x prompt-GPU requirement also fails. The numerical and <=10% steady-decode GPU
+regression checks passed in this longer run. Earlier one-round comparisons
+briefly crossed 8x wall time; they are not the headline result. Do not select
+the fastest candidate sample or compare different profiling modes.
+
+A more conservative configuration, candidate.json, leaves normal decode
+planning intact. scoped-ab/ measured 4.078x prompt GPU and 7.799x prompt wall
+speedup, with steady decode 26.412 -> 26.407 ms. It retains the approximately
+five-second first-decode planning delay, so that prompt result is not its
+whole-session speedup. latency-candidate.json trades 8% steady GPU throughput
+for much lower first-decode setup and is not the production default.
+
+CORRECTNESS
+
+latency-ab/ compares all 20 complete 128256-value vectors: 2,565,120 logits.
+Maximum absolute difference 0.000045299530029296875; maximum RMS difference
+0.00000897793832867105; all argmaxes and generated text match. No FP16 operand
+conversion or precision relaxation is used by either measured model candidate.
+The wider prompt includes padding; causal masking and truncation preserve the
+real 208 tokens. multi-chunk/ separately checks two 128-token chunks against
+the original: all 1,026,048 logits pass, max difference 0.000075817108154296875.
+That early boundary check uses candidate.json's normal decode planning.
+latency-multi-chunk/ repeats the boundary with the final latency planner:
+all 1,026,048 logits pass, max difference 0.000045299530029296875. It reports
+6.710x session-wall improvement and a 7.03% steady-decode GPU regression in
+that one measured session; the 10% throughput guard passes.
+
+short-ab/ checks the latency candidate on the five-token prompt. All 1,026,048
+logits pass (max difference 0.000011682510375976562), with identical output.
+It gives no GPU speedup: prompt GPU 138.210 -> 142.744 ms, steady decode
+25.725 -> 28.351 ms. Its 10.21% decode regression fails the default 10% guard.
+Fresh-session wall is 5.912x faster, not 8x. This is another reason to keep
+the latency configuration experimental and report the tested prompt length.
+
+15 cooperative GPU conformance cases passed, none skipped: fourteen quantized
+format/layout cases plus a new dense, multi-subgroup FP16-output epilogue case
+with M=65, N=97, K=48, signed fractional input, tails and a fused add. The latter
+exercises the shared scratch path even without the optional mixed-MMA patch.
+The virtual GPU's 27 tests and three dispatch-attribution parser tests pass.
+See the final test logs and additional boundary-check files for exact evidence.
+The final latency settings also pass the full compiler-invariant/member-sweep
+build: 30 CPU/GPU results, zero skipped or failed, in
+final-latency-conformance.log. All 24 core library tests pass. The changed
+compiler crates, visualizer and both profiling examples pass Clippy with
+warnings denied; rustfmt and git diff --check pass.
+
+WHAT CHANGED
+
+1. Prompt batching: one padded 256-token batch replaces thirteen batches of
+   sixteen. This is a feature-gated experiment, not a changed default policy.
+2. Weight staging: column-major B keeps contiguous physical workgroup stores;
+   cooperative fragment loads express the transpose. Complete tiles avoid
+   redundant masking while partial tiles retain bounds checks.
+3. Cooperative epilogues reuse one 8x8 output fragment per subgroup instead of
+   reserving the entire output tile. The scalar epilogue and both barriers run
+   per fragment. K slices update all accumulators before the next slice, to
+   shorten operand-fragment lifetimes. A fused prologue determines operand dtype.
+4. The best measured large-projection tile is 128x32x8, eight 32-lane subgroups,
+   one N pass, two staging buffers. It fits the baseline 16 KiB shared-memory
+   limit; requesting the adapter's 32 KiB limit was not necessary for this win.
+5. Prompt attention uses a host-known exact KV prefix, enabling cooperative
+   contracts instead of symbolic-N SGEMM. Such graphs are rebuilt when the
+   prefix changes; single-token replay retains symbolic lengths. Simply
+   freezing a growing prefix in a replayed graph would be wrong.
+6. Planner instrumentation found approximately ten thousand whole-DAG repricings
+   in the greedy seed sweep. Limited search and disabling wavefront regrouping
+   cut host cost. The latency candidate pins Coop for M>=16 and Sgemv below it,
+   retains gather-alternative search, and skips the other greedy seed trials.
+   The ordinary initial selection, realization and local search still run.
+7. Gather search matters: blindly skipping all seed trials materialized a
+   128256x4096 vocabulary tensor during decode. A real dispatch trace isolated
+   that launch at 17.680 ms. Keeping gather alternatives cut steady whole-plan
+   decode from about 41 to 29 ms while retaining fast first-decode setup.
+8. Large Coop tile pins now have a minimum-M scope. Without it the prompt tile
+   reached small decode-attention matrices. The default domains remain intact
+   when these measurement flags are absent.
+
+REMAINING GPU BOTTLENECK
+
+final-semantic.summary.json attributes a separate per-dispatch run of the
+conservative candidate. Its timings are not used for the headline A/B:
+
+  Gate/up Q4_K, M256 N28672 K4096       318.950 ms   40.74%   32 calls
+  Down Q6_K, M256 N4096 K14336          98.896 ms   12.63%   16 calls
+  Down Q4_K, M256 N4096 K14336          92.537 ms   11.82%   16 calls
+  4096x4096 Q4_K projections           85.318 ms   10.90%   48 calls
+
+The first three groups alone cost 510 ms. The original 3139 ms prompt requires
+at most 392 ms total GPU time to reach 8x. Removing small map/reduction kernels
+cannot close that gap. These large kernels measured roughly 4.9–6.0 TFLOP/s
+using their padded logical operation counts; this is not a hardware peak claim.
+The final latency configuration has the same large prompt matrix tiles, but
+different small contracts/planning; its whole-plan timings are reported above.
+
+NEGATIVE EXPERIMENTS RETAINED AS EVIDENCE
+
+- Larger tiles, more K staging and a 32 KiB workgroup allowance do not imply
+  better throughput. The M256 gate/up lab's winning tile takes about 10.024 ms;
+  several larger candidates take 20–39 ms. Illegal pins can silently fall back
+  to another family; those cells must not be treated as measured Coop kernels.
+- Materializing one projection's FP32 weights costs 469,762,048 bytes plus setup.
+  The best dense result was a modest improvement, not 2x. A whole-model FP32
+  cache was not attempted on this 32 GiB machine. FP16 cached weights and mixed
+  operands also failed to demonstrate the missing GPU gain.
+- Mixed F16/F32 cooperative MMA exposed a pinned Naga MSL type bug. An isolated
+  compiler patch fixes the experiment, but validated mixed tiles were slower.
+  Earlier mixed runs include compile errors and an incorrect scratch-indexing
+  version; mixed-correct/ and mixed-native/ are the corrected numerical runs.
+  The normal model does not use that patch or enable mixed capability.
+- Four decode seed trials per class reduced startup but doubled decode GPU
+  cost. Family pinning alone left a vocabulary materialization; one extra trial
+  per class did not remove it. These configurations are rejected.
+- Cost-ranked initial selection failed a 30-binding device limit with grouping;
+  disabling grouping ran numerically but took about 325 ms per decode. That
+  initial-selection code was removed. It is not in either candidate config.
+- Layer-at-a-time grouping previously changed generated text and was removed;
+  see layer4-ab/REJECTED.txt. Counted staging-copy loops also lost and were removed.
+
+TOOLS AND REPRODUCTION
+
+From the worktree root, with MODEL pointing to the local Q4_K_M GGUF:
+
+  cargo build -p kalosm-llama --example profile_kernel_share --features kernel-visualize
+  (cd fusor && cargo build -p fusor --example qmatmul_lab --features gpu,kernel-observer)
+
+Full A/B, new output directory, original preserved executable:
+
+  python3 reports/llama-8x/run_ab.py "$MODEL" \
+    --reference /private/tmp/llama-profile-original-staging \
+    --config reports/llama-8x/latency-candidate.json \
+    --output /private/tmp/new-llama-ab --rounds 3 --decode-steps 4 \
+    --session-wall-target 8
+
+This checks both an 8x prompt-GPU target (default --gpu-target 8) and the explicit
+session-wall target. Current results fail those targets after saving evidence.
+Use --gpu-target 0 --session-wall-target 0 for numerical/throughput validation
+without a speedup requirement. The default maximum steady-decode GPU ratio is
+1.10; all measured ratios are written even if an assertion fails. Use --prompt
+short for the five-token input boundary case. candidate.json is the conservative
+configuration; latency-candidate.json includes the first-decode experiment.
+
+The saved original executable is local evidence, identified by SHA256 in each
+A/B JSON. On another machine preserve an original profiling executable before
+changing the lowering. Comparing two configurations of the current executable
+does not reproduce the original compiler comparison. Both arms must expose
+the same profiling and full-logit hooks. run_ab.py clears inherited PROFILE_*
+and FUSOR_* variables; only the explicit per-arm JSON reaches the child process.
+
+For semantic attribution, pass the candidate JSON entries as environment
+variables to profile_kernel_share, add PROFILE_PROMPT=long PROFILE_METADATA=1
+FUSOR_TIME_RANGE=0 FUSOR_EXPLORE_EPS=0, and use arguments "$MODEL" 1 3.
+Do not combine FUSOR_TIME_RANGE with FUSOR_TIME_PLAN. Then:
+  python3 reports/llama-deep-profile/analyze.py capture.log
+
+The analyzer joins actual body hashes, grids, launch indices, shapes and
+timestamps, verifies complete coverage, and preserves composite launches.
+EXTRACT_STAGE / EXTRACT_SEED instrumentation is enabled with FUSOR_EXTRACT_PROFILE.
+check_candidate.py compares quick captures against a saved original by phase
+identity, including all logits and matched session lengths. It rejects >10%
+steady-decode GPU regressions, not just bad numerical outputs.
+
+The matrix sweep records executed-plan families, lowering schedules, compiler
+types, command, executable hash, environment, exit status and numerical checks.
+Fallback cells are explicitly invalid pinned comparisons. LAB_PLAN emits the
+executed plan; compiled speculative candidates alone are not execution evidence.
+LAB_BATCH_REPEAT replays only the pure lab expression while uniforms and arena
+are live; it must not be used to replay a mutable KV-cache graph. CPU f64 checks
+cover every row at 33 distributed columns on three inputs, all outputs must be
+finite, and LAB_OUTPUT_DIR can retain full tensors for differential checks.
+Logical weight bytes/GBs are not measured DRAM traffic or cache misses. Old
+weight_GBs fields use original quantized byte volume even in dense-cache trials;
+the updated lab reports the actual logical stored weight volume for those trials.
+
+Optional isolated mixed-MMA experiment:
+  python3 reports/llama-8x/prepare_mixed.py --build
+  FUSOR_PROFILE_MIXED_COOP=1 LAB_MATMUL_F16=1 enables it in qmatmul_lab.
+The helper copies the already-fetched pinned dependency into ignored
+.kernel-profile-deps/wgpu and applies naga-mixed-mma.patch. It verifies revision
+and hashes, and never edits the Cargo cache or another wgpu checkout. The patch
+contains the MSL MMA changes from upstream fork commit b6dbc4e; Naga Clippy/tests
+compilation passes with warnings denied. Full CTS was not run. Regular builds
+use the original pinned Naga; neither model result depends on the patch.
+
+The virtual GPU still supports text, JSON and stepwise TUI modes with configurable
+subgroup/cache geometry. It honestly rejects cooperative-matrix and quantized
+collectives; the real-GPU tools cover those kernels. Generated .f32 files and
+kernel bodies remain local and git-ignored; compact logs and summaries are the
+reviewable evidence. All changes are uncommitted in codex/kernel-visualizer.

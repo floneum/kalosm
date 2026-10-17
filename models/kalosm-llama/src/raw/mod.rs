@@ -354,6 +354,13 @@ impl Model {
                 let v =
                     Weight::from_raw(&graph, &source.tensor(&format!("{prefix}.attn_v.weight"))?)?;
                 let qkv = Weight::concat_rows(&[&q, &k, &v]);
+
+                let qk =
+                    if qkv.is_none() && device.execution_profile().enabled("PROFILE_QK_PROJECT") {
+                        Weight::concat_rows(&[&q, &k])
+                    } else {
+                        None
+                    };
                 let bias_q = source.tensor(&format!("{prefix}.attn_q.bias"));
                 let bias_k = source.tensor(&format!("{prefix}.attn_k.bias"));
                 let bias_v = source.tensor(&format!("{prefix}.attn_v.bias"));
@@ -371,6 +378,7 @@ impl Model {
                 let separate = SeparateAttention {
                     attention_wq: q,
                     attention_qkv: qkv,
+                    attention_qk: qk,
                     attention_q_norm: q_norm
                         .map(|norm| decode_norm(norm, rms_norm_eps))
                         .transpose()?,
@@ -718,7 +726,16 @@ impl Model {
             // A ring overwrite would discard keys still needed by earlier queries.
             1
         } else {
-            16
+            let width = device
+                .execution_profile()
+                .var("PROFILE_PREFILL_WIDTH")
+                .map(|s| {
+                    s.parse::<usize>()
+                        .expect("prefill width must be an integer")
+                })
+                .unwrap_or(16);
+            assert!(width.is_power_of_two() && (16..=256).contains(&width));
+            width
         };
         KvCache::reserve_all(&mut cache.blocks, (n.div_ceil(width) * width) as u64)?;
         let mut i = 0;
@@ -793,6 +810,16 @@ impl Model {
         device: &Device,
         cache: &mut LlamaCache,
     ) -> Result<()> {
+        if device
+            .execution_profile()
+            .enabled("FUSOR_PROFILE_CACHE_DONATION")
+        {
+            let values = out
+                .map(|v| v.clone().into_dyn())
+                .into_iter()
+                .collect::<Vec<_>>();
+            return KvCache::resolve_and_commit_all(&mut cache.blocks, &values);
+        }
         let mut batch = Vec::with_capacity(2 * cache.blocks.len() + 1);
         if let Some(out) = out {
             batch.push(out.clone().into_dyn());
@@ -879,6 +906,15 @@ impl Model {
                 .collect::<Vec<_>>(),
         );
 
+        if width > 1
+            && device
+                .execution_profile()
+                .enabled("PROFILE_CONST_PREFILL_KV")
+        {
+            cache.decode_graph = None;
+        }
+
+        cache.refresh_padded_capacity(device.execution_profile());
         if let Some(logits) = cache.decode_graph.clone() {
             // Every block or none: a half-advanced cache would silently
             // disagree with the graph about its own length.
@@ -934,6 +970,7 @@ impl Model {
         cos_slot.set_elements(cos);
         sin_slot.set_elements(sin);
 
+        cache.refresh_padded_capacity(device.execution_profile());
         if let Some(logits) = cache.embed_graph.clone() {
             if cache.blocks.iter().all(|block| block.can_replay(1)) {
                 for block in &mut cache.blocks {

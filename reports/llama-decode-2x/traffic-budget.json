@@ -1,0 +1,128 @@
+{
+  "source": "reports/llama-decode-2x/packed-semantic.summary.json",
+  "assumption": "Turn observed selected quantized operands into an explicit decode byte budget.\n\nThis is a streaming scenario, not a hardware DRAM counter: each distinct\nquantized operand occurrence is read once per invocation; no cross-token cache\nresidency, compression, or skipped weight reads are assumed. Bandwidth is an\ninput assumption. Detailed timestamp percentages are deliberately not used.\n",
+  "reference_ms": 31.3994165,
+  "target_speedup": 2,
+  "target_ms": 15.69970825,
+  "quantized_bytes_per_token": 4628299776.0,
+  "operands": [
+    {
+      "m": 1,
+      "n": 28672,
+      "k": 4096,
+      "batch": 1,
+      "dtype": "Q(Q4K)",
+      "layout": "Native",
+      "invocations_per_token": 32.0,
+      "bytes_per_invocation": 66060288,
+      "bytes_per_token": 2113929216.0
+    },
+    {
+      "m": 1,
+      "n": 4096,
+      "k": 14336,
+      "batch": 1,
+      "dtype": "Q(Q6K)",
+      "layout": "F32Scales",
+      "invocations_per_token": 16.0,
+      "bytes_per_invocation": 48627712,
+      "bytes_per_token": 778043392.0
+    },
+    {
+      "m": 1,
+      "n": 4096,
+      "k": 14336,
+      "batch": 1,
+      "dtype": "Q(Q4K)",
+      "layout": "Native",
+      "invocations_per_token": 16.0,
+      "bytes_per_invocation": 33030144,
+      "bytes_per_token": 528482304.0
+    },
+    {
+      "m": 1,
+      "n": 4096,
+      "k": 4096,
+      "batch": 1,
+      "dtype": "Q(Q4K)",
+      "layout": "Native",
+      "invocations_per_token": 48.0,
+      "bytes_per_invocation": 9437184,
+      "bytes_per_token": 452984832.0
+    },
+    {
+      "m": 1,
+      "n": 128256,
+      "k": 4096,
+      "batch": 1,
+      "dtype": "Q(Q6K)",
+      "layout": "F32Scales",
+      "invocations_per_token": 1.0,
+      "bytes_per_invocation": 435044352,
+      "bytes_per_token": 435044352.0
+    },
+    {
+      "m": 1,
+      "n": 6144,
+      "k": 4096,
+      "batch": 1,
+      "dtype": "Q(Q4K)",
+      "layout": "Native",
+      "invocations_per_token": 16.0,
+      "bytes_per_invocation": 14155776,
+      "bytes_per_token": 226492416.0
+    },
+    {
+      "m": 1,
+      "n": 1024,
+      "k": 4096,
+      "batch": 1,
+      "dtype": "Q(Q6K)",
+      "layout": "F32Scales",
+      "invocations_per_token": 16.0,
+      "bytes_per_invocation": 3473408,
+      "bytes_per_token": 55574528.0
+    },
+    {
+      "m": 1,
+      "n": 1024,
+      "k": 4096,
+      "batch": 1,
+      "dtype": "Q(Q4K)",
+      "layout": "Native",
+      "invocations_per_token": 16.0,
+      "bytes_per_invocation": 2359296,
+      "bytes_per_token": 37748736.0
+    }
+  ],
+  "streaming_scenarios": [
+    {
+      "bandwidth_GBs": 350.908,
+      "weight_only_ms": 13.189496323822768,
+      "remaining_ms_for_everything_else": 2.5102119261772327
+    },
+    {
+      "bandwidth_GBs": 400.0,
+      "weight_only_ms": 11.57074944,
+      "remaining_ms_for_everything_else": 4.12895881
+    }
+  ],
+  "required_bandwidth": [
+    {
+      "other_ms": 0,
+      "required_weight_GBs": 294.80164231714303
+    },
+    {
+      "other_ms": 2,
+      "required_weight_GBs": 337.83929493535015
+    },
+    {
+      "other_ms": 4,
+      "required_weight_GBs": 395.59104185354363
+    },
+    {
+      "other_ms": 6,
+      "required_weight_GBs": 477.15865845758816
+    }
+  ]
+}

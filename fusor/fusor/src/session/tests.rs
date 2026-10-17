@@ -37,7 +37,9 @@ fn replan_with(
 /// Run `plan` and read `out` back as f32.
 fn run_f32(session: &Session, h: &GraphRef, plan: &Plan, out: &Tensor) -> Vec<f32> {
     let resolving = h.state().resolve_lock.lock();
-    session.run(h, plan, std::slice::from_ref(out)).unwrap();
+    session
+        .run(h, plan, std::slice::from_ref(out), false, None)
+        .unwrap();
     let bytes = session.read_bytes_locked(&resolving, h, out.id).unwrap();
     bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
 }
@@ -563,7 +565,7 @@ fn symbolic_contractions_reuse_pipelines_across_tile_boundaries() {
                     assert_eq!(h.device_buf(b.id).unwrap().addr(), buffers[1].addr());
                 }
             }
-            session.run(h, &plan, std::slice::from_ref(&out)).unwrap_or_else(|error| {
+            session.run(h, &plan, std::slice::from_ref(&out), false, None).unwrap_or_else(|error| {
                 panic!("{family:?} varying_k={varying_k} columns={columns} kv_cache={kv_cache} length={len}: {error}")
             });
             let bytes = session.read_bytes_locked(&resolving, h, out.id).unwrap();
@@ -1034,3 +1036,55 @@ on_each_backend!(
     a_fresh_step_leaf_reuses_the_plan: a_fresh_step_leaf_reuses_the_cpu_plan_and_executable,
     a_fresh_step_leaf_reuses_the_gpu_plan
 );
+
+fn shared_weight_views_execute_and_concatenate(session: Session) {
+    use crate::quantized::QMatrix;
+    use fusor_ir::{
+        dtype::{QFmt, QLayout},
+        target::HostBytes,
+    };
+    let graph = Graph::new(&session);
+    let h = graph.handle();
+    let mut bytes = vec![0xFF; 7];
+    for nibble in [0x99, 0xAA] {
+        bytes.extend_from_slice(&half::f16::from_f32(1.).to_bits().to_le_bytes());
+        bytes.extend_from_slice(&[nibble; 16]);
+    }
+    bytes.extend_from_slice(&[0xFF; 5]);
+    let owner = Arc::new(bytes);
+    let mut parts = Vec::new();
+    for row in 0..2 {
+        let start = 7 + row * 18;
+        let view = Arc::new(HostBytes::shared(owner.clone(), start..start + 18).unwrap());
+        view.with_slice(|bytes| assert_eq!(bytes.as_ptr(), owner[start..].as_ptr()));
+        let weight = QMatrix::from_shared_bytes(
+            &graph,
+            QFmt::Q4_0,
+            QLayout::Native,
+            [Dim::Const(1), Dim::Const(32)],
+            view.clone(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &h.leaf_bytes_shared(weight.tensor.id()).unwrap(),
+            &view
+        ));
+        parts.push(weight);
+    }
+    drop(owner);
+    let joined = QMatrix::concat_rows(&[&parts[1], &parts[0]]).unwrap();
+    let x =
+        Tensor::from_elements(h, &[Dim::Const(1), Dim::Const(32)], &[1.0f32 / 32.; 32]).unwrap();
+    for (weight, expected) in [
+        (&parts[0], vec![1.]),
+        (&parts[1], vec![2.]),
+        (&joined, vec![2., 1.]),
+    ] {
+        let out = weight.q_mat_mul(&x).unwrap();
+        let got: Vec<f32> = bytemuck::cast_slice(&h.read_back(out.id).unwrap()).to_vec();
+        assert_eq!(got, expected);
+    }
+}
+
+on_each_backend!(shared_weight_views_execute_and_concatenate:
+    shared_weight_views_cpu, shared_weight_views_gpu);

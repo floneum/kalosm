@@ -313,7 +313,13 @@ pub fn buffer_layout_for(
 fn classified_symbols_of(graph: &EGraph, realized: &Realized) -> (Vec<SymId>, Vec<SymId>) {
     let mut visitor = Symbols::default();
     for id in &realized.order {
-        collect_dims(&graph.facts(*id).shape, &mut visitor.dims);
+        // Lowering also uses the dense storage strides to bound reads from
+        // external leaves. Forwarding can remove the only operand view that
+        // otherwise mentioned a derived stride such as capacity * width.
+        collect_layout(
+            &Layout::contiguous(&graph.facts(*id).shape),
+            &mut visitor.dims,
+        );
         graph.node(*id).op.clone().visit_mut(&mut visitor);
     }
     let Symbols {
@@ -414,7 +420,11 @@ fn hash_both(lanes: &mut [FxHasher; 2], value: &impl Hash) {
 pub(crate) fn without_schedule(op: &Op) -> Op {
     let mut op = op.clone();
     if let Op::Launch(
-        Launch::Map { sched, .. }
+        Launch::DecodeRope { sched, .. }
+        | Launch::RmsNorm { sched, .. }
+        | Launch::DecodeAttention { sched, .. }
+        | Launch::DecodeAttentionMerge { sched, .. }
+        | Launch::Map { sched, .. }
         | Launch::Fold { sched, .. }
         | Launch::StreamFold { sched, .. }
         | Launch::Contract { sched, .. }

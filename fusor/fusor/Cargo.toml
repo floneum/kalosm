@@ -31,6 +31,7 @@ default = ["cpu", "gpu"]
 # At least one must be on.
 cpu = ["dep:fusor-cpu"]
 gpu = ["dep:fusor-gpu"]
+kernel-observer = ["gpu", "fusor-gpu/kernel-observer"]
 
 [[example]]
 name = "coop_attn_repro"
@@ -39,6 +40,18 @@ required-features = ["gpu", "compiler-tests"]
 [[example]]
 name = "qgemv_bench"
 required-features = ["gpu"]
+
+[[example]]
+name = "qmatmul_lab"
+required-features = ["gpu", "kernel-observer"]
+
+[[example]]
+name = "attention_lab"
+required-features = ["gpu", "kernel-observer"]
+
+[[example]]
+name = "vector_lab"
+required-features = ["gpu", "kernel-observer"]
 
 [[example]]
 name = "sym_decode_spike"
@@ -50,4 +63,8 @@ required-features = ["gpu"]
 pollster.workspace = true
 
 [dev-dependencies]
+fusor-visualize = { path = "../fusor-visualize" }
+serde_json.workspace = true
 sha2 = "0.10"
+wgpu.workspace = true
+naga = { workspace = true, features = ["wgsl-in"] }

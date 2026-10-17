@@ -1,0 +1,26 @@
+Steady decode; long prompt, eight decode steps; first step excluded.
+Reference: GPU 27.019 ms; wall 42.511 ms; 1270 dispatches.
+probe                    GPU ms   wall ms   GPU speedup   wall speedup   dispatches   logits
+chains2                   27.080    41.540       0.998x         1.023x        1270     True
+q6scales                  27.045    41.227       0.999x         1.031x        1261     True
+submit2048                27.123    44.953       0.996x         0.946x        1270     True
+no_groups                 27.575    41.265       0.980x         1.030x        1450     True
+optimized_host            27.861    32.735       0.970x         1.299x        1270     True
+optimized_tile1           27.213    33.048       0.993x         1.286x        1270     True
+search_default            27.707    33.452       0.975x         1.271x        1270     True
+search4                   28.042    35.912       0.964x         1.184x        1000     True
+packed_q4                 25.363    32.219       1.065x         1.319x        1270     True
+packed_rule_profile       25.961    30.857       1.041x         1.378x        1288     True
+no_split_k                25.141    30.325       1.075x         1.402x        1033     True
+packed_unmasked           22.763    27.655       1.187x         1.537x        1041     True
+focused_search            22.831    31.026       1.183x         1.370x         952     True
+packed_submit64           22.928    27.829       1.178x         1.528x        1041     True
+packed_q6_16_model        22.908    27.951       1.179x         1.521x        1041     True
+packed_storage32k         22.887    26.968       1.181x         1.576x        1041     True
+packed_dense_small        22.050    26.860       1.225x         1.583x        1041     True
+packed_dense_submit2048   22.312    31.368       1.211x         1.355x        1041     True
+packed_no_norm_contract   21.875    26.396       1.235x         1.610x        1041     True
+packed_no_norm_split      22.736    30.768       1.188x         1.382x        1021     True
+packed_norm_chunk256      22.458    30.023       1.203x         1.416x        1021     True
+packed_scalar_slab        22.012    26.879       1.227x         1.582x        1020     True
+packed_scalar_slab32k     22.001    28.630       1.228x         1.485x        1020     True

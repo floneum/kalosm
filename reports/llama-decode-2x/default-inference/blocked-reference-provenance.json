@@ -1,0 +1,30 @@
+{
+  "command": [
+    "/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/target/debug/examples/profile_kernel_share",
+    "/Users/evanalmloff/Library/Application Support/kalosm/cache/lmstudio-community/Meta-Llama-3.1-8B-Instruct-GGUF/main/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+    "1",
+    "8"
+  ],
+  "binary_sha256": "8f50ee0efcd42bbadf3800583014b67c718b9a878c158c3a1a5c29c81c78a9b9",
+  "environment": {
+    "PROFILE_PREFILL_WIDTH": "64",
+    "PROFILE_CONST_PREFILL_KV": "1",
+    "FUSOR_PIN_COOP": "16,32,8,4,1,2",
+    "FUSOR_PIN_COOP_MIN_M": "16",
+    "FUSOR_PIN_CONTRACT_FAMILY": "coop",
+    "FUSOR_PIN_CONTRACT_MIN_M": "16",
+    "FUSOR_PROFILE_SEED_CANDIDATES": "0",
+    "FUSOR_PROFILE_SEED_MIN_M": "16",
+    "FUSOR_PROFILE_NO_WAVEFRONT_MIN_M": "16",
+    "FUSOR_COMPILE_THREADS": "1",
+    "FUSOR_PROFILE_MAPPED_UPLOAD": "1",
+    "FUSOR_PROFILE_MEMORY_BUDGET_BYTES": "7516192768",
+    "FUSOR_PROFILE_LARGE_PLAN_INFLIGHT_CHUNKS": "1",
+    "FUSOR_PROFILE_LARGE_PLAN_SUBMIT_SIZE": "32",
+    "FUSOR_PROFILE_LARGE_PLAN_MIN_DISPATCHES": "4096",
+    "PROFILE_PROMPT": "long",
+    "PROFILE_PROMPT_REPEATS": "8",
+    "FUSOR_EXPLORE_EPS": "0",
+    "PROFILE_LOGITS_DIR": "/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/target/default-validation/reference/reference-logits"
+  }
+}

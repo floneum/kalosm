@@ -1,4 +1,4 @@
-//! What a device *can* do. Legality only — rates live in
+//! Device capabilities and execution policy; rates live in
 //! [`crate::cost::DeviceFacts`].
 
 use crate::dtype::Dtype;
@@ -67,10 +67,12 @@ pub enum DeviceKind {
     Cpu,
 }
 
-/// Everything a legality predicate may read about a device. Every
+/// Capabilities and policy used by planning and lowering. Every
 /// performance feature is optional, with a working fallback.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct Caps {
+    /// Policy is part of every plan and schedule cache fingerprint.
+    pub execution_profile: crate::execution::ExecutionProfile,
     pub kind: DeviceKind,
     /// Stable adapter/backend name; part of the calibration cache key.
     pub name: String,

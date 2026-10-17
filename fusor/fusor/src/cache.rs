@@ -1,5 +1,6 @@
 //! Inference-time caches: KV, attention masks and rope tables.
 
+pub(crate) mod donation;
 pub(crate) mod kv;
 pub(crate) mod mask;
 pub(crate) mod rope;

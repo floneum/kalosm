@@ -829,6 +829,24 @@ pub(crate) fn tile_bytes(
     caps: &Caps,
     arena: &dyn ArenaPlanner,
 ) -> Result<u32> {
+    if let Op::Launch(Launch::RmsNorm { block, .. }) = graph.node(id).op {
+        return Ok(block * 4);
+    }
+    if let Op::Launch(Launch::DecodeAttention {
+        keys,
+        chunk,
+        block,
+        heads_per_group,
+        ..
+    }) = graph.node(id).op
+    {
+        // Conservative no-alias footprint: score, reduction and PV tiles.
+        return u32::try_from(
+            (u64::from(if chunk == 0 { keys } else { chunk }) * 4 + u64::from(block) * 20)
+                * u64::from(heads_per_group),
+        )
+        .map_err(|_| Error::Plan("decode attention scratch overflows u32".into()));
+    }
     let scratch = fold_scratch_elements(graph, id, theta, caps);
     let tiles = tiles_for(theta, scalar_element(graph.facts(id).dtype), scratch);
     arena.workgroup_bytes(&tiles, caps)
@@ -1508,6 +1526,27 @@ fn build_component<'a>(
                 iters,
                 |(source_len, reads)| if slot < source_len { reads } else { iters },
             );
+            let iters = if let Op::Launch(Launch::DecodeAttention {
+                output,
+                keys,
+                chunk,
+                ..
+            }) = op
+            {
+                let heads =
+                    output.dims[0].as_const().unwrap_or(0) * output.dims[1].as_const().unwrap_or(0);
+                heads.saturating_mul(128).saturating_mul(if slot == 0 {
+                    8 * if *chunk == 0 {
+                        1
+                    } else {
+                        u64::from(keys.div_ceil(*chunk))
+                    }
+                } else {
+                    u64::from(*keys)
+                })
+            } else {
+                iters
+            };
             let reread = iters.div_ceil(elems).max(1).min(u32::MAX as u64) as u32;
             match ext.iter_mut().find(|(id, _, _)| *id == c) {
                 Some(slot) => slot.2 = slot.2.max(reread),
@@ -1762,6 +1801,35 @@ fn member_geometry(graph: &EGraph, extraction: &Extraction, m: Id, caps: &Caps) 
         _ => None,
     };
     match launch {
+        Some(Launch::DecodeRope { output, .. }) => Geometry {
+            block: 256,
+            workgroups: output.iterations().unwrap_or(0).div_ceil(256),
+        },
+        Some(Launch::RmsNorm {
+            output,
+            width,
+            block,
+            ..
+        }) => Geometry {
+            block: *block,
+            workgroups: output.iterations().unwrap_or(0) / u64::from(*width).max(1),
+        },
+        Some(Launch::DecodeAttentionMerge { output, .. }) => Geometry {
+            block: 128,
+            workgroups: output.iterations().unwrap_or(128) / 128,
+        },
+        Some(Launch::DecodeAttention {
+            output,
+            chunk,
+            block,
+            heads_per_group,
+            ..
+        }) => Geometry {
+            block: *block * *heads_per_group,
+            workgroups: output.iterations().unwrap_or(128)
+                / if *chunk == 0 { 128 } else { 130 }
+                / u64::from(*heads_per_group),
+        },
         Some(Launch::Slab { slabs, members, .. }) => Geometry {
             block: slab_block_of(graph, *slabs, members, caps),
             workgroups: u64::from(*slabs).max(1),
@@ -2045,7 +2113,22 @@ pub(crate) fn selectable(graph: &EGraph, class: ClassId, caps: &Caps) -> Vec<Id>
     }
     let pool = narrow(graph.members(class), |m| !is_self_referential(graph, m));
     let pool = narrow(pool, |m| is_runnable(graph, m));
-    narrow(pool, |m| composite_bindings_fit(graph, m, caps))
+    let pool = narrow(pool, |m| composite_bindings_fit(graph, m, caps));
+    let flags = crate::debug::for_profile(caps.execution_profile);
+    if flags.contract_family.is_none() && flags.contract_small_family.is_none() {
+        return pool;
+    }
+    narrow(pool, |id| match graph.node(id).op {
+        Op::Launch(Launch::Contract { family, m, .. }) => m.as_const().is_some_and(|m| {
+            let wanted = if m >= flags.contract_min_m {
+                flags.contract_family
+            } else {
+                flags.contract_small_family
+            };
+            wanted == Some(family)
+        }),
+        _ => false,
+    })
 }
 
 /// The classes reachable from `roots`, ascending, and a mask of every id
@@ -2170,6 +2253,7 @@ pub(crate) mod tests {
 
     pub(crate) fn caps() -> Caps {
         Caps {
+            execution_profile: Default::default(),
             kind: DeviceKind::Gpu,
             name: "replacement pricing".into(),
             limits: Limits::default(),

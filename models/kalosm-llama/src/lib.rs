@@ -175,6 +175,7 @@ impl<T> Future for LlamaResultFuture<T> {
 
 /// A quantized Llama language model with support for streaming generation.
 pub struct Llama {
+    execution_profile: fusor_ir::execution::ExecutionProfile,
     config: Arc<LlamaConfig>,
     tokenizer: Arc<LlamaTokenizer>,
     inner: Arc<LlamaTask>,
@@ -183,6 +184,7 @@ pub struct Llama {
 impl Clone for Llama {
     fn clone(&self) -> Self {
         Self {
+            execution_profile: self.execution_profile,
             config: self.config.clone(),
             tokenizer: self.tokenizer.clone(),
             inner: self.inner.clone(),
@@ -230,6 +232,7 @@ impl Llama {
         use futures_util::StreamExt;
 
         let (task_sender, mut task_receiver) = futures_channel::mpsc::unbounded();
+        let execution_profile = model.device.execution_profile();
         let config = model.model.config.clone();
         let tokenizer = model.tokenizer.clone();
 
@@ -257,6 +260,7 @@ impl Llama {
         });
 
         Self {
+            execution_profile,
             config,
             tokenizer,
             inner: Arc::new(LlamaTask {
@@ -341,7 +345,9 @@ impl LlamaBuilder {
         self
     }
 
-    /// Set the device to run the model with. (Defaults to an accelerator if available, otherwise the CPU)
+    /// Set the device to run the model with. The default builder uses
+    /// `Device::gpu_inference()` where available, otherwise the CPU when enabled.
+    /// An explicit device retains its own execution profile.
     pub fn with_device(mut self, device: Device) -> Self {
         self.device = Some(device);
         self
@@ -354,14 +360,14 @@ impl LlamaBuilder {
         }
         #[cfg(all(feature = "gpu", feature = "cpu"))]
         {
-            Device::gpu().await.unwrap_or_else(|err| {
+            Device::gpu_inference().await.unwrap_or_else(|err| {
                 tracing::warn!("no gpu adapter, falling back to cpu: {err}");
                 Device::cpu()
             })
         }
         #[cfg(all(feature = "gpu", not(feature = "cpu")))]
         {
-            Device::gpu()
+            Device::gpu_inference()
                 .await
                 .unwrap_or_else(|err| panic!("no gpu adapter, and the `cpu` feature is off: {err}"))
         }
@@ -465,5 +471,43 @@ impl GpuSamplerConfig {
         config.top_p = sampler.top_p().map(|top_p| top_p as f32);
         config.min_p = sampler.min_p().map(|min_p| min_p as f32);
         config
+    }
+}
+
+#[cfg(all(test, feature = "gpu", not(target_arch = "wasm32")))]
+mod default_execution_tests {
+    #[test]
+    fn ordinary_builder_requests_inference_defaults() {
+        let device = pollster::block_on(super::LlamaBuilder::default().get_device());
+        let caps = device.session().caps();
+        eprintln!(
+            "default builder adapter: {}, profile: {:?}",
+            caps.name, caps.execution_profile
+        );
+        let backend = device.backend();
+        let adapter_limits = backend.gpu_target().unwrap().device().adapter().limits();
+        if caps.name.starts_with("Metal/Apple")
+            && caps.coop_supported()
+            && caps.subgroup_width() == 32
+            && adapter_limits.max_compute_invocations_per_workgroup >= 1024
+        {
+            assert_eq!(
+                caps.execution_profile,
+                fusor_ir::execution::ExecutionProfile::LowLatency
+            );
+        }
+        assert_eq!(
+            device.backend().caps().execution_profile,
+            caps.execution_profile
+        );
+        if caps.execution_profile == fusor_ir::execution::ExecutionProfile::LowLatency {
+            let mut general = caps.clone();
+            general.execution_profile = fusor_ir::execution::ExecutionProfile::General;
+            assert_ne!(
+                caps.fingerprint(),
+                general.fingerprint(),
+                "different policies cannot share plans"
+            );
+        }
     }
 }

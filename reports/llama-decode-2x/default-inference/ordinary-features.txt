@@ -1,0 +1,9 @@
+fusor-gpu v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-gpu)
+└── fusor-gpu feature "default"
+    └── fusor v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor)
+        └── kalosm-llama v0.4.1 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/models/kalosm-llama)
+            ├── kalosm-llama feature "default" (command-line)
+            └── kalosm-llama feature "gpu"
+                └── kalosm-llama feature "default" (command-line)
+        └── fusor feature "gpu"
+            └── kalosm-llama feature "gpu" (*)

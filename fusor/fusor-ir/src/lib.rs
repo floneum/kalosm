@@ -37,3 +37,6 @@ pub use saturate::Driver;
 pub use semantics::CoreSemantics;
 pub use verify_l0::verify_l0;
 pub use verify_launch::verify_launch;
+
+/// Per-device compiler and runtime policy.
+pub mod execution;

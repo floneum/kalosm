@@ -1,0 +1,27 @@
+backends: gpu
+CACHE_DONATION stores=2 aliases=2 proof_us=6 cached=false
+CACHE_DONATION stores=2 aliases=2 proof_us=3 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=3 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=3 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=3 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=3 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=1 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=1 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=1 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=1 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=1 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=1 cached=false
+CACHE_DONATION stores=2 aliases=2 proof_us=2 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=1 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=1 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=1 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=0 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=0 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=0 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=0 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=0 cached=true
+CACHE_DONATION stores=2 aliases=2 proof_us=0 cached=true
+CACHE_DONATION stores=2 aliases=1 proof_us=3 cached=false
+ok      attention_rope::fixed_cache_donation_replay_ring [gpu] 0.2s
+ok      attention_rope::fixed_cache_donation_shared_store [gpu] 0.1s
+2 results: 2 passed, 0 skipped, 0 failed

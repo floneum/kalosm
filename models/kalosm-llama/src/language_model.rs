@@ -52,7 +52,7 @@ impl CreateTextCompletionSession for Llama {
     type Error = LlamaModelError;
 
     fn new_session(&self) -> Result<Self::Session, Self::Error> {
-        Ok(LlamaSession::new(&self.config))
+        Ok(LlamaSession::new(&self.config, self.execution_profile))
     }
 }
 

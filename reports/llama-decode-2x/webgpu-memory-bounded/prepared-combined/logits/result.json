@@ -1,0 +1,261 @@
+{
+  "checks": [
+    {
+      "values": 128256,
+      "max_abs": 6.103515625e-05,
+      "rms": 1.2024242814590617e-05,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        0,
+        "prefill",
+        0
+      ],
+      "text_equal": true
+    },
+    {
+      "values": 128256,
+      "max_abs": 5.7697296142578125e-05,
+      "rms": 9.551923839867608e-06,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        0,
+        "decode",
+        1
+      ],
+      "text_equal": true
+    },
+    {
+      "values": 128256,
+      "max_abs": 5.14984130859375e-05,
+      "rms": 7.830706981516979e-06,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        0,
+        "decode",
+        2
+      ],
+      "text_equal": true
+    },
+    {
+      "values": 128256,
+      "max_abs": 4.100799560546875e-05,
+      "rms": 6.411248532748799e-06,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        0,
+        "decode",
+        3
+      ],
+      "text_equal": true
+    },
+    {
+      "values": 128256,
+      "max_abs": 3.528594970703125e-05,
+      "rms": 6.500096061523447e-06,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        0,
+        "decode",
+        4
+      ],
+      "text_equal": true
+    },
+    {
+      "values": 128256,
+      "max_abs": 1.9550323486328125e-05,
+      "rms": 4.0722561767212395e-06,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        0,
+        "decode",
+        5
+      ],
+      "text_equal": true
+    },
+    {
+      "values": 128256,
+      "max_abs": 1.621246337890625e-05,
+      "rms": 3.5986944289935833e-06,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        0,
+        "decode",
+        6
+      ],
+      "text_equal": true
+    },
+    {
+      "values": 128256,
+      "max_abs": 1.811981201171875e-05,
+      "rms": 3.915334269659998e-06,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        0,
+        "decode",
+        7
+      ],
+      "text_equal": true
+    },
+    {
+      "values": 128256,
+      "max_abs": 1.811981201171875e-05,
+      "rms": 3.846793969832873e-06,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        0,
+        "decode",
+        8
+      ],
+      "text_equal": true
+    },
+    {
+      "values": 128256,
+      "max_abs": 5.435943603515625e-05,
+      "rms": 1.038767539014795e-05,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        1,
+        "prefill",
+        0
+      ],
+      "text_equal": true
+    },
+    {
+      "values": 128256,
+      "max_abs": 5.7220458984375e-05,
+      "rms": 8.458790065674893e-06,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        1,
+        "decode",
+        1
+      ],
+      "text_equal": true
+    },
+    {
+      "values": 128256,
+      "max_abs": 2.7894973754882812e-05,
+      "rms": 6.304046790098083e-06,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        1,
+        "decode",
+        2
+      ],
+      "text_equal": true
+    },
+    {
+      "values": 128256,
+      "max_abs": 2.6464462280273438e-05,
+      "rms": 5.4764747940098745e-06,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        1,
+        "decode",
+        3
+      ],
+      "text_equal": true
+    },
+    {
+      "values": 128256,
+      "max_abs": 3.0517578125e-05,
+      "rms": 6.718902749941997e-06,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        1,
+        "decode",
+        4
+      ],
+      "text_equal": true
+    },
+    {
+      "values": 128256,
+      "max_abs": 1.919269561767578e-05,
+      "rms": 3.70838979425383e-06,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        1,
+        "decode",
+        5
+      ],
+      "text_equal": true
+    },
+    {
+      "values": 128256,
+      "max_abs": 1.71661376953125e-05,
+      "rms": 3.7897443263564594e-06,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        1,
+        "decode",
+        6
+      ],
+      "text_equal": true
+    },
+    {
+      "values": 128256,
+      "max_abs": 1.728534698486328e-05,
+      "rms": 3.3127184666273015e-06,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        1,
+        "decode",
+        7
+      ],
+      "text_equal": true
+    },
+    {
+      "values": 128256,
+      "max_abs": 1.6927719116210938e-05,
+      "rms": 3.3052430683245844e-06,
+      "argmax_equal": true,
+      "passed": true,
+      "phase": [
+        "long",
+        1,
+        "decode",
+        8
+      ],
+      "text_equal": true
+    }
+  ],
+  "values": 2308608,
+  "max_abs": 6.103515625e-05,
+  "max_rms": 1.2024242814590617e-05,
+  "passed": true,
+  "note": "Correctness only; no performance claim from logit-capture timings."
+}

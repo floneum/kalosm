@@ -1,0 +1,11 @@
+{
+  "status": "aborted_by_memory_guard",
+  "error": "compressor exceeds 2 GiB; leave memory for user applications",
+  "elapsed_seconds": 25.58759204193484,
+  "initial_headroom_gib": 16.928817749023438,
+  "min_headroom_gib": 12.617233276367188,
+  "initial_compressor_gib": 1.2826995849609375,
+  "max_compressor_gib": 3.3486175537109375,
+  "max_child_rss_gib": 11.172409057617188,
+  "max_added_swapout_bytes": 0
+}

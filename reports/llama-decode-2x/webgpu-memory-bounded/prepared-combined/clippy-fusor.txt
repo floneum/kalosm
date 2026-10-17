@@ -1,0 +1,10 @@
+    Checking fusor-ir v0.1.0 (/private/tmp/training-kernel-visualizer/fusor/fusor-ir)
+    Checking fusor-gguf v0.1.0 (/private/tmp/training-kernel-visualizer/fusor/fusor-gguf)
+    Checking fusor-tile v0.1.0 (/private/tmp/training-kernel-visualizer/fusor/fusor-tile)
+    Checking fusor-cost v0.1.0 (/private/tmp/training-kernel-visualizer/fusor/fusor-cost)
+    Checking fusor-gpu v0.1.0 (/private/tmp/training-kernel-visualizer/fusor/fusor-gpu)
+    Checking fusor-cpu v0.1.0 (/private/tmp/training-kernel-visualizer/fusor/fusor-cpu)
+    Checking fusor-autograd v0.1.0 (/private/tmp/training-kernel-visualizer/fusor/fusor-autograd)
+    Checking fusor-visualize v0.1.0 (/private/tmp/training-kernel-visualizer/fusor/fusor-visualize)
+    Checking fusor v0.1.0 (/private/tmp/training-kernel-visualizer/fusor/fusor)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 8.73s

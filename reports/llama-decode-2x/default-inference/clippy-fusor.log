@@ -1,0 +1,91 @@
+    Checking libc v0.2.189
+    Checking libm v0.2.16
+    Checking smallvec v1.15.2
+    Checking bytemuck v1.25.2
+    Checking zerocopy v0.8.55
+    Checking num-traits v0.2.19
+    Checking log v0.4.33
+    Checking half v2.7.1
+    Checking rustc-hash v2.1.3
+    Checking bitflags v2.13.1
+    Checking parking_lot_core v0.9.12
+    Checking parking_lot v0.12.5
+    Checking objc2 v0.6.4
+   Compiling cranelift-srcgen v0.125.4
+   Compiling cranelift-assembler-x64-meta v0.125.4
+    Checking fusor-ir v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-ir)
+    Checking objc2-core-foundation v0.3.2
+    Checking objc2-foundation v0.3.2
+    Checking block2 v0.6.2
+   Compiling cranelift-isle v0.125.4
+    Checking thiserror v2.0.19
+    Checking objc2-metal v0.3.2
+    Checking memmap2 v0.9.11
+   Compiling cranelift-codegen-shared v0.125.4
+   Compiling heck v0.5.0
+    Checking arrayvec v0.7.8
+    Checking once_cell v1.21.4
+    Checking naga v29.0.3 (https://github.com/ealmloff/wgpu?rev=24a7d3577213fc147637fe7fb20e0e845a74df8a#24a7d357)
+   Compiling cranelift-codegen-meta v0.125.4
+    Checking wgpu-types v29.0.4
+    Checking objc2-quartz-core v0.3.2
+    Checking serde_core v1.0.229
+   Compiling cranelift-assembler-x64 v0.125.4
+    Checking cranelift-bitset v0.125.4
+   Compiling target-lexicon v0.13.5
+    Checking cranelift-entity v0.125.4
+   Compiling cranelift-codegen v0.125.4
+    Checking raw-window-metal v1.1.0
+    Checking wgpu-naga-bridge v29.0.4
+    Checking zmij v1.0.23
+    Checking fusor-gguf v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-gguf)
+    Checking bumpalo v3.20.3
+    Checking arbitrary v1.4.2
+    Checking memchr v2.8.3
+    Checking serde_json v1.0.151
+    Checking cranelift-control v0.125.4
+    Checking wgpu-hal v29.0.4
+    Checking serde v1.0.229
+    Checking regalloc2 v0.13.5
+    Checking cranelift-bforest v0.125.4
+    Checking gimli v0.32.3
+    Checking wasmtime-internal-math v38.0.4
+   Compiling anyhow v1.0.104
+   Compiling version_check v0.9.5
+   Compiling generic-array v0.14.7
+    Checking wgpu-core-deps-apple v29.0.4
+    Checking fusor-tile v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-tile)
+    Checking errno v0.3.14
+    Checking wgpu-core v29.0.4
+   Compiling signal-hook v0.3.18
+    Checking typenum v1.20.1
+   Compiling unicode-segmentation v1.13.3
+    Checking wgpu v29.0.4 (https://github.com/ealmloff/wgpu?rev=24a7d3577213fc147637fe7fb20e0e845a74df8a#24a7d357)
+   Compiling convert_case v0.10.0
+    Checking signal-hook-registry v1.4.8
+    Checking fusor-cost v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-cost)
+    Checking mach2 v0.4.3
+    Checking bitflags v1.3.2
+   Compiling rustix v1.1.4
+    Checking region v3.0.2
+   Compiling derive_more-impl v2.1.1
+    Checking wasmtime-internal-jit-icache-coherence v38.0.4
+    Checking cranelift-module v0.125.4
+    Checking cranelift-native v0.125.4
+    Checking mio v1.2.3
+    Checking signal-hook-mio v0.2.5
+    Checking cranelift-jit v0.125.4
+    Checking derive_more v2.1.1
+    Checking fusor-gpu v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-gpu)
+    Checking block-buffer v0.10.4
+    Checking crypto-common v0.1.7
+    Checking cranelift-frontend v0.125.4
+    Checking fusor-cpu v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-cpu)
+    Checking digest v0.10.7
+    Checking crossterm v0.29.0
+    Checking fusor-autograd v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-autograd)
+    Checking cpufeatures v0.2.17
+    Checking sha2 v0.10.9
+    Checking fusor-visualize v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-visualize)
+    Checking fusor v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor)
+    Finished `dev` profile [optimized] target(s) in 43.33s

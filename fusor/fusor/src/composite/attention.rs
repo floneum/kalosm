@@ -225,9 +225,41 @@ fn attention_defn(
     scale: SymId,
     mask: MaskKind,
     mask_tensor: Option<Val>,
+    prefix: Option<SymId>,
 ) -> Result<Val> {
     let dtype = t.dtype_of(q);
     let s = scores(t, q, k, groups, scale, mask, mask_tensor)?;
+    // Mask before softmax; clear unused V entries as well, since 0 * NaN
+    // must not let stale padded storage contaminate the valid prefix.
+    let (s, v) = if let Some(prefix) = prefix {
+        let valid = |axis| -> Result<ScalarExpr> {
+            Ok(ScalarExpr::cmp(
+                CmpOp::Lt,
+                ScalarExpr::cast(fusor_ir::dtype::Dtype::F32, ScalarExpr::index_of(axis)),
+                ScalarExpr::uniform(prefix, fusor_ir::dtype::Dtype::F32),
+            ))
+        };
+        let last = (t.rank_of(s) - 1) as u32;
+        let s = t.map(
+            ScalarExpr::select(
+                valid(last)?,
+                ScalarExpr::arg(0, dtype),
+                ScalarExpr::lit(splat_of(dtype, f32::NEG_INFINITY)?),
+            ),
+            &[s],
+        )?;
+        let v = t.map(
+            ScalarExpr::select(
+                valid(2)?,
+                ScalarExpr::arg(0, dtype),
+                ScalarExpr::lit(splat_of(dtype, 0.0)?),
+            ),
+            &[v],
+        )?;
+        (s, v)
+    } else {
+        (s, v)
+    };
     let rank = t.rank_of(s);
     let p = softmax_defn(t, s, (rank - 1) as u32)?;
 
@@ -288,7 +320,184 @@ pub fn attention_masked(
     let (qi, ki, vi) = (q.id, k.id, v.id);
     let mi = mask_tensor.map(|m| m.id);
     core_op(graph, move |t| {
-        attention_defn(t, qi, ki, vi, groups, sym, mask, mi)
+        attention_defn(t, qi, ki, vi, groups, sym, mask, mi, None)
+    })
+}
+
+/// Decode attention over fixed storage with a changing valid prefix.
+/// The cache owns the proof that `0 < prefix <= storage length`.
+pub(crate) fn attention_prefix(
+    q: &Tensor,
+    k: &Tensor,
+    v: &Tensor,
+    prefix: SymId,
+    scale: Option<f32>,
+) -> Result<Tensor> {
+    let graph = &q.graph;
+    let groups = group_factor(graph, q, k)?;
+    let sym = scale_uniform(graph, resolved_scale(graph, q, scale)?);
+    let (qi, ki, vi) = (q.id, k.id, v.id);
+    let caps = graph.session().caps();
+    let attention_block = q
+        .graph
+        .session()
+        .caps()
+        .execution_profile
+        .var("FUSOR_PROFILE_ATTENTION_BLOCK")
+        .ok()
+        .map(|s| {
+            s.parse::<u32>()
+                .expect("attention block must be an integer")
+        })
+        .unwrap_or(256);
+    assert!(
+        matches!(attention_block, 32 | 64 | 128 | 256 | 512),
+        "attention block must be a power of two from 32 to 512"
+    );
+    let heads_per_group = q
+        .graph
+        .session()
+        .caps()
+        .execution_profile
+        .var("FUSOR_PROFILE_ATTENTION_HEADS")
+        .ok()
+        .map(|s| {
+            s.parse::<u32>()
+                .expect("attention heads must be an integer")
+        })
+        .unwrap_or(1);
+    assert!(
+        matches!(heads_per_group, 1 | 2 | 4),
+        "attention heads must be 1, 2 or 4"
+    );
+    core_op(graph, move |t| {
+        let result = attention_defn(
+            t,
+            qi,
+            ki,
+            vi,
+            groups,
+            sym,
+            MaskKind::None,
+            None,
+            Some(prefix),
+        )?;
+        if q.graph
+            .session()
+            .caps()
+            .execution_profile
+            .enabled("FUSOR_PROFILE_FUSED_DECODE_ATTENTION")
+            && caps.kind == fusor_ir::device::DeviceKind::Gpu
+            && caps
+                .subgroups
+                .is_some_and(|s| s.is_fixed() && s.assumed() == 32)
+            && caps.limits.max_compute_invocations_per_workgroup
+                >= attention_block * heads_per_group
+            && caps.limits.max_compute_workgroup_size[0] >= attention_block * heads_per_group
+        {
+            use fusor_ir::ir::launch::{AccessPlan, IndexSpace, Launch, Operand, ScheduleDomain};
+            use fusor_ir::shape::Layout;
+            let qshape = t.shape_of(qi);
+            let kshape = t.shape_of(ki);
+            let requested_chunk = q
+                .graph
+                .session()
+                .caps()
+                .execution_profile
+                .var("FUSOR_PROFILE_ATTENTION_CHUNK")
+                .ok()
+                .and_then(|s| s.parse::<u32>().ok())
+                .filter(|n| *n > 0);
+            if qshape.len() == 4
+                && kshape.len() == 4
+                && qshape[2].as_const() == Some(1)
+                && qshape[3].as_const() == Some(128)
+                && qshape.iter().all(|d| d.as_const().is_some())
+                && let (Some(keys), Some(kv_heads)) = (kshape[2].as_const(), kshape[1].as_const())
+                && keys > 0
+                && kv_heads > 0
+                && (qshape[1].as_const().unwrap() / kv_heads)
+                    .is_multiple_of(u64::from(heads_per_group))
+                && (requested_chunk.map_or(keys, |n| keys.min(u64::from(n))) * 4
+                    + u64::from(attention_block) * 20)
+                    * u64::from(heads_per_group)
+                    <= u64::from(caps.limits.max_compute_workgroup_storage_size)
+                && qshape[0]
+                    .as_const()
+                    .unwrap()
+                    .saturating_mul(qshape[1].as_const().unwrap())
+                    .saturating_mul(keys)
+                    .saturating_mul(130)
+                    <= u64::from(u32::MAX)
+                && [qi, ki, vi]
+                    .iter()
+                    .all(|v| t.dtype_of(*v) == fusor_ir::dtype::Dtype::F32)
+                && [qi, ki, vi]
+                    .iter()
+                    .all(|v| t.facts(*v).numeric.reassoc && t.facts(*v).numeric.contract)
+            {
+                let ops = [qi, ki, vi]
+                    .into_iter()
+                    .map(|src| Operand {
+                        src,
+                        layout: Layout::contiguous(&t.shape_of(src)),
+                        access: AccessPlan::Alias,
+                    })
+                    .collect();
+                let chunk = requested_chunk
+                    .filter(|n| u64::from(*n) < keys)
+                    .unwrap_or(0);
+                let splits = if chunk == 0 {
+                    1
+                } else {
+                    keys.div_ceil(u64::from(chunk))
+                };
+                let mut shape = qshape.clone();
+                shape[2] = Dim::Const(splits);
+                shape[3] = Dim::Const(if chunk == 0 { 128 } else { 130 });
+                let fused = t
+                    .graph_mut()
+                    .builder(&caps)
+                    .add_launch(Launch::DecodeAttention {
+                        output: IndexSpace::new(shape.clone()),
+                        kv_heads: kv_heads as u32,
+                        keys: keys as u32,
+                        block: attention_block,
+                        heads_per_group,
+                        chunk,
+                        key_major: q
+                            .graph
+                            .session()
+                            .caps()
+                            .execution_profile
+                            .enabled("FUSOR_PROFILE_ATTENTION_KEY_MAJOR"),
+                        scale: ScalarExpr::uniform(sym, fusor_ir::dtype::Dtype::F32),
+                        prefix: ScalarExpr::uniform(prefix, fusor_ir::dtype::Dtype::F32),
+                        ops,
+                        sched: ScheduleDomain::Point,
+                    })?;
+                let fused = if chunk == 0 {
+                    fused
+                } else {
+                    t.graph_mut()
+                        .builder(&caps)
+                        .add_launch(Launch::DecodeAttentionMerge {
+                            output: IndexSpace::new(qshape),
+                            splits: splits as u32,
+                            ops: vec![Operand {
+                                src: fused,
+                                layout: Layout::contiguous(&shape),
+                                access: AccessPlan::Alias,
+                            }],
+                            sched: ScheduleDomain::Point,
+                        })?
+                };
+                // The profiling switch explicitly selects this implementation;
+                // avoid silently timing the ordinary attention alternative.
+                return Ok(fused);
+            }
+        }
+        Ok(result)
     })
 }
 

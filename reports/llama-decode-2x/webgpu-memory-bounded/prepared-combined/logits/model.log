@@ -1,0 +1,37 @@
+PROFILE_DEVICE workgroup_threads=1024
+PHASE_BEGIN long-r0-prefill-0
+PHASE_END {"dispatches":10406,"key":"long-r0-prefill-0","mode":"wall","phase":"prefill","prompt":"long","prompt_tokens":208,"round":0,"step":0,"text":" \n\n","wall_ms":24243.115292,"warmup":true}
+PHASE_BEGIN long-r0-decode-1
+PHASE_END {"dispatches":403,"key":"long-r0-decode-1","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":1,"text":"A","wall_ms":16.710666,"warmup":true}
+PHASE_BEGIN long-r0-decode-2
+PHASE_END {"dispatches":403,"key":"long-r0-decode-2","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":2,"text":" GPU","wall_ms":16.166875,"warmup":true}
+PHASE_BEGIN long-r0-decode-3
+PHASE_END {"dispatches":403,"key":"long-r0-decode-3","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":3,"text":" is","wall_ms":16.127459,"warmup":true}
+PHASE_BEGIN long-r0-decode-4
+PHASE_END {"dispatches":403,"key":"long-r0-decode-4","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":4,"text":" a","wall_ms":16.202749999999998,"warmup":true}
+PHASE_BEGIN long-r0-decode-5
+PHASE_END {"dispatches":403,"key":"long-r0-decode-5","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":5,"text":" computer","wall_ms":16.131542,"warmup":true}
+PHASE_BEGIN long-r0-decode-6
+PHASE_END {"dispatches":403,"key":"long-r0-decode-6","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":6,"text":" chip","wall_ms":16.120208,"warmup":true}
+PHASE_BEGIN long-r0-decode-7
+PHASE_END {"dispatches":403,"key":"long-r0-decode-7","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":7,"text":" that","wall_ms":16.133916000000003,"warmup":true}
+PHASE_BEGIN long-r0-decode-8
+PHASE_END {"dispatches":403,"key":"long-r0-decode-8","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":0,"step":8,"text":" contains","wall_ms":16.118083,"warmup":true}
+PHASE_BEGIN long-r1-prefill-0
+PHASE_END {"dispatches":10407,"key":"long-r1-prefill-0","mode":"wall","phase":"prefill","prompt":"long","prompt_tokens":208,"round":1,"step":0,"text":" \n\n","wall_ms":3204.394625,"warmup":false}
+PHASE_BEGIN long-r1-decode-1
+PHASE_END {"dispatches":403,"key":"long-r1-decode-1","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":1,"text":"A","wall_ms":16.682624999999998,"warmup":false}
+PHASE_BEGIN long-r1-decode-2
+PHASE_END {"dispatches":403,"key":"long-r1-decode-2","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":2,"text":" GPU","wall_ms":16.147499999999997,"warmup":false}
+PHASE_BEGIN long-r1-decode-3
+PHASE_END {"dispatches":403,"key":"long-r1-decode-3","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":3,"text":" is","wall_ms":16.234167,"warmup":false}
+PHASE_BEGIN long-r1-decode-4
+PHASE_END {"dispatches":403,"key":"long-r1-decode-4","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":4,"text":" a","wall_ms":16.139332999999997,"warmup":false}
+PHASE_BEGIN long-r1-decode-5
+PHASE_END {"dispatches":403,"key":"long-r1-decode-5","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":5,"text":" computer","wall_ms":16.121917,"warmup":false}
+PHASE_BEGIN long-r1-decode-6
+PHASE_END {"dispatches":403,"key":"long-r1-decode-6","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":6,"text":" chip","wall_ms":16.120625,"warmup":false}
+PHASE_BEGIN long-r1-decode-7
+PHASE_END {"dispatches":403,"key":"long-r1-decode-7","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":7,"text":" that","wall_ms":16.139083,"warmup":false}
+PHASE_BEGIN long-r1-decode-8
+PHASE_END {"dispatches":403,"key":"long-r1-decode-8","mode":"wall","phase":"decode","prompt":"long","prompt_tokens":208,"round":1,"step":8,"text":" contains","wall_ms":16.148083,"warmup":false}

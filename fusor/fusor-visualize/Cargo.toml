@@ -1,0 +1,18 @@
+[package]
+name = "fusor-visualize"
+description = "Deterministic virtual GPU memory debugger for Fusor kernels"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+fusor-ir.workspace = true
+fusor-gguf.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+crossterm = "0.29"
+
+[[bin]]
+name = "fusor-visualize"
+path = "src/main.rs"

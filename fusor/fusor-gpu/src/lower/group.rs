@@ -59,6 +59,7 @@ pub(crate) fn lower_kgroup(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resu
             local,
             floor,
             &ctx.buffers,
+            ctx.q4_variant,
         )
     };
     // Find the common block first: widening changes a member's grid, so

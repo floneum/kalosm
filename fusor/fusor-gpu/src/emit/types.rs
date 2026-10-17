@@ -302,7 +302,37 @@ pub(crate) fn create_storage_globals(em: &mut Emitter<'_>) -> Result<(), EmitErr
         if atomic {
             em.analysis.atomic_buffers.insert(first.binding);
         }
+        // Preserve explicit contiguous u32 rows as nested arrays. Checked
+        // accesses can share the outer row bound across all words in a block.
+        // Mixed views and atomics retain their existing flat representation.
+        let block_width = (!atomic
+            && !mixed
+            && decl.element == ElementType::Scalar(ScalarElement::U32)
+            && views.iter().all(|v| v.layout == decl.layout)
+            && decl.layout.extents.len() == 2
+            && decl.layout
+                == fusor_ir::ir::kernel::TileLayout::contiguous(
+                    fusor_ir::ir::kernel::MemoryLevel::Storage,
+                    &decl.layout.extents,
+                ))
+        .then(|| decl.layout.extents[1])
+        .filter(|width| *width > 0);
         let global = storage_global_with(&mut em.module, &decl, atomic)?;
+        if let Some(width) = block_width {
+            let count = std::num::NonZeroU32::new(width).expect("positive block width");
+            let row = array_type(&mut em.module, decl.element, ArraySize::Constant(count))?;
+            let ty = insert(
+                &mut em.module,
+                TypeInner::Array {
+                    base: row,
+                    size: ArraySize::Dynamic,
+                    stride: width.checked_mul(4).ok_or_else(|| {
+                        EmitError::Unsupported("storage row stride overflows".into())
+                    })?,
+                },
+            );
+            em.module.global_variables[global].ty = ty;
+        }
         let physical = if atomic && decl.element == ElementType::Scalar(ScalarElement::F32) {
             ElementType::Scalar(ScalarElement::U32)
         } else {
@@ -311,6 +341,9 @@ pub(crate) fn create_storage_globals(em: &mut Emitter<'_>) -> Result<(), EmitErr
         for buffer in views {
             em.buffer_globals.insert(key(buffer), global);
             em.buffer_elements.insert(key(buffer), physical);
+            if let Some(width) = block_width {
+                em.buffer_block_widths.insert(key(buffer), width);
+            }
         }
     }
     Ok(())

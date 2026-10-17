@@ -1,0 +1,72 @@
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.47
+   Compiling syn v2.0.119
+   Compiling libm v0.2.16
+   Compiling autocfg v1.5.1
+   Compiling num-traits v0.2.19
+   Compiling bytemuck_derive v1.11.0
+   Compiling zerocopy v0.8.55
+   Compiling cfg_aliases v0.2.2
+   Compiling bytemuck v1.25.2
+   Compiling zerocopy-derive v0.8.55
+   Compiling libc v0.2.189
+   Compiling bitflags v2.13.1
+   Compiling objc2 v0.6.4
+   Compiling half v2.7.1
+   Compiling syn v3.0.3
+   Compiling smallvec v1.15.2
+   Compiling parking_lot_core v0.9.12
+   Compiling objc2-core-foundation v0.3.2
+   Compiling thiserror v2.0.19
+   Compiling objc2-foundation v0.3.2
+   Compiling block2 v0.6.2
+   Compiling thiserror-impl v2.0.19
+   Compiling naga v29.0.3 (https://github.com/ealmloff/wgpu?rev=24a7d3577213fc147637fe7fb20e0e845a74df8a#24a7d357)
+   Compiling log v0.4.33
+   Compiling objc2-metal v0.3.2
+   Compiling parking_lot v0.12.5
+   Compiling arrayvec v0.7.8
+   Compiling once_cell v1.21.4
+   Compiling wgpu-types v29.0.4
+   Compiling objc2-quartz-core v0.3.2
+   Compiling wgpu-hal v29.0.4
+   Compiling serde_core v1.0.229
+   Compiling rustc-hash v2.1.3
+   Compiling fusor-ir v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-ir)
+   Compiling raw-window-metal v1.1.0
+   Compiling wgpu-naga-bridge v29.0.4
+   Compiling zmij v1.0.23
+   Compiling wgpu-core v29.0.4
+   Compiling litrs v1.0.0
+   Compiling serde_json v1.0.151
+   Compiling serde v1.0.229
+   Compiling document-features v0.2.12
+   Compiling wgpu-core-deps-apple v29.0.4
+   Compiling memmap2 v0.9.11
+   Compiling serde_derive v1.0.229
+   Compiling wgpu v29.0.4 (https://github.com/ealmloff/wgpu?rev=24a7d3577213fc147637fe7fb20e0e845a74df8a#24a7d357)
+   Compiling memchr v2.8.3
+   Compiling fusor-gguf v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-gguf)
+   Compiling fusor-cost v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-cost)
+   Compiling fusor-tile v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-tile)
+   Compiling fusor-gpu v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-gpu)
+   Compiling fusor-autograd v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-autograd)
+   Compiling fusor v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor)
+   Compiling fusor-conformance v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-conformance)
+    Finished `test` profile [optimized] target(s) in 2m 56s
+     Running tests/inference_defaults.rs (target/debug/deps/inference_defaults-ddac956f4192b915)
+
+running 1 test
+test inference_profile_preserves_normalization_attention_and_cache_snapshots ... Metal/Apple M2 Max: LowLatency
+rms_norm_decode_rows: Pass
+padded_cache_decode_prefix: Pass
+padded_cache_llama_geometry: Pass
+padded_cache_tail_batches: Pass
+fixed_cache_donation_replay_ring: Pass
+fixed_cache_donation_shared_store: Pass
+rope_pair_with_position: Pass
+rope_interleaved_pair_with_position: Pass
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.31s

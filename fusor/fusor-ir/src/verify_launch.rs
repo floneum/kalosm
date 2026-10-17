@@ -69,6 +69,76 @@ pub fn verify_launch(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<(
     }
 
     // 1 + 2.
+    if let Launch::DecodeRope { sched, .. } = op
+        && (cx.caps.kind != crate::device::DeviceKind::Gpu
+            || !cx.result.numeric.reassoc
+            || !cx.result.numeric.contract
+            || cx.caps.limits.max_compute_invocations_per_workgroup < 256
+            || cx.caps.limits.max_compute_workgroup_size[0] < 256
+            || *sched != ScheduleDomain::Point)
+    {
+        return Err(relabel(
+            cx,
+            "decode rotary embedding exceeds device capabilities".into(),
+        ));
+    }
+    if let Launch::RmsNorm { sched, block, .. } = op
+        && (cx.caps.kind != crate::device::DeviceKind::Gpu
+            || !cx.result.numeric.reassoc
+            || !cx.result.numeric.contract
+            || cx.caps.limits.max_compute_invocations_per_workgroup < *block
+            || cx.caps.limits.max_compute_workgroup_size[0] < *block
+            || cx.caps.limits.max_compute_workgroup_storage_size < *block * 4
+            || *sched != ScheduleDomain::Point)
+    {
+        return Err(relabel(
+            cx,
+            "fused RMS normalization exceeds device capabilities".into(),
+        ));
+    }
+    if let Launch::DecodeAttention {
+        keys,
+        chunk,
+        block,
+        heads_per_group,
+        sched,
+        ..
+    } = op
+    {
+        let bytes = (u64::from(if *chunk == 0 { *keys } else { *chunk }) * 4
+            + u64::from(*block) * 20)
+            * u64::from(*heads_per_group);
+        if cx.caps.kind != crate::device::DeviceKind::Gpu
+            || !cx.result.numeric.reassoc
+            || !cx.result.numeric.contract
+            || !cx
+                .caps
+                .subgroups
+                .is_some_and(|s| s.is_fixed() && s.assumed() == 32)
+            || cx.caps.limits.max_compute_invocations_per_workgroup < *block * *heads_per_group
+            || cx.caps.limits.max_compute_workgroup_size[0] < *block * *heads_per_group
+            || bytes > u64::from(cx.caps.limits.max_compute_workgroup_storage_size)
+            || *sched != ScheduleDomain::Point
+        {
+            return Err(relabel(
+                cx,
+                "decode attention exceeds device capabilities".into(),
+            ));
+        }
+    }
+    if let Launch::DecodeAttentionMerge { sched, .. } = op
+        && (cx.caps.kind != crate::device::DeviceKind::Gpu
+            || !cx.result.numeric.reassoc
+            || !cx.result.numeric.contract
+            || cx.caps.limits.max_compute_invocations_per_workgroup < 128
+            || cx.caps.limits.max_compute_workgroup_size[0] < 128
+            || *sched != ScheduleDomain::Point)
+    {
+        return Err(relabel(
+            cx,
+            "attention merge exceeds device capabilities".into(),
+        ));
+    }
     if let Some(sched) = op.schedule() {
         check_schedule_domain(op, sched, cx.caps, planner)
             .map_err(|e| relabel(cx, format!("{e}")))?;

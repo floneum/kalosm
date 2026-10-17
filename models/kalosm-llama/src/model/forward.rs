@@ -45,7 +45,18 @@ impl LlamaModel {
         let token_start = trace_enabled.then(Instant::now);
         let build_start = trace_enabled.then(Instant::now);
         let mut cache = cache;
+        #[cfg(feature = "kernel-visualize")]
+        let host_stage = std::env::var_os("PROFILE_HOST_STAGES")
+            .is_some()
+            .then(Instant::now);
         let logits = model.forward(tokens, images, device, cache.as_deref_mut());
+        #[cfg(feature = "kernel-visualize")]
+        if let Some(start) = host_stage {
+            eprintln!(
+                "HOST_STAGE name=prepare_submit us={}",
+                start.elapsed().as_micros()
+            );
+        }
         if let Some(start) = build_start {
             tracing::info!(
                 "forward_graph_build path={path} decode_eligible={decode_eligible} elapsed={:?}",
@@ -148,15 +159,75 @@ impl LlamaModel {
             Ok(prepared) => prepared,
             Err(err) => return Box::pin(async move { Err(err) }),
         };
+        let profile = device.execution_profile();
         let PreparedForwardLogits { logits, len, trace } = prepared;
         Box::pin(async move {
             let download_start = trace.step_start();
             let top_logits = if use_full_logits_for_sampling(len) {
-                let logits_vec = logits
-                    .to_vec_f32_async()
-                    .await
-                    .map_err(LlamaModelError::from)?;
-                top_k_logits_from_full(&logits_vec, top_k)
+                #[cfg(feature = "kernel-visualize")]
+                let host_stage = std::env::var_os("PROFILE_HOST_STAGES")
+                    .is_some()
+                    .then(Instant::now);
+                #[cfg(feature = "kernel-visualize")]
+                let sample_bytes = std::env::var_os("PROFILE_TOP_K_BYTES").is_some()
+                    && logits.as_dyn().dtype() == fusor::Dtype::F32;
+                #[cfg(not(feature = "kernel-visualize"))]
+                let sample_bytes = false;
+                // The readback already owns contiguous F32 bytes. Sampling
+                // through a checked borrowed slice avoids a second full-vocab
+                // allocation and copy. Other dtypes retain numeric widening.
+                let raw = if sample_bytes {
+                    Some(
+                        logits
+                            .as_dyn()
+                            .to_bytes_async()
+                            .await
+                            .map_err(LlamaModelError::from)?,
+                    )
+                } else {
+                    None
+                };
+                let logits_vec = if let Some(raw) = &raw {
+                    f32_logits_from_bytes(raw)?
+                } else {
+                    std::borrow::Cow::Owned(
+                        logits
+                            .to_vec_f32_async()
+                            .await
+                            .map_err(LlamaModelError::from)?,
+                    )
+                };
+                #[cfg(feature = "kernel-visualize")]
+                if let Some(start) = host_stage {
+                    eprintln!(
+                        "HOST_STAGE name=readback_wait us={}",
+                        start.elapsed().as_micros()
+                    );
+                }
+                #[cfg(feature = "kernel-visualize")]
+                if let Some(dir) = std::env::var_os("PROFILE_LOGITS_DIR") {
+                    use std::sync::atomic::{AtomicUsize, Ordering};
+                    static SEQUENCE: AtomicUsize = AtomicUsize::new(0);
+                    let dir = std::path::PathBuf::from(dir);
+                    std::fs::create_dir_all(&dir).map_err(|e| fusor::Error::Io(e.to_string()))?;
+                    let index = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+                    let bytes: Vec<u8> = logits_vec.iter().flat_map(|v| v.to_le_bytes()).collect();
+                    std::fs::write(dir.join(format!("{index:05}.f32")), bytes)
+                        .map_err(|e| fusor::Error::Io(e.to_string()))?;
+                }
+                #[cfg(feature = "kernel-visualize")]
+                let host_stage = std::env::var_os("PROFILE_HOST_STAGES")
+                    .is_some()
+                    .then(Instant::now);
+                let result = top_k_logits_from_full(&logits_vec, top_k, profile);
+                #[cfg(feature = "kernel-visualize")]
+                if let Some(start) = host_stage {
+                    eprintln!(
+                        "HOST_STAGE name=cpu_top_k us={}",
+                        start.elapsed().as_micros()
+                    );
+                }
+                result
             } else {
                 let k = top_k.clamp(1, len) as u32;
                 // The row is `[1, vocab]` so the sampler can be a resolve

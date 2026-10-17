@@ -1,0 +1,459 @@
+CONTINUATION — target remains 2x clean steady decode; active investigation.
+
+The prior retained same-executable clean wall baseline is 31.0228 ms versus
+25.9955 ms candidate. The target remains unmet. Do not substitute historical
+unoptimized-host wall ratios from probe.py for the clean same-build result.
+
+New evidence:
+- Single-update scatter avoids index staging and two barriers. Focused GPU
+  conformance passes Add/Set, partial rows, multi-slot lanes, and snapshots.
+  Model: 21.4849 ms GPU, 26.6593 ms instrumented wall, 1041 dispatches. All
+  2,308,608 logits pass. The gain is modest; longer clean timing still needed.
+- New FUSOR_TIME_PASSES measures existing compute-pass boundaries without
+  per-dispatch timestamps. Decode has only about 2–3 us between passes over
+  21.48 ms; submission gaps are not the missing multi-millisecond speedup.
+- Fixed-extent padded attention keeps the changing valid prefix in an exact
+  float uniform (capacity <= 2^24), masks scores and unused V entries, and
+  invalidates the model graph when physical cache capacity changes. Its GPU
+  tests cover stale NaNs, growth, reset, and the Llama [32,8,211,128] geometry.
+  Full model: 968 launches, 21.3572 ms GPU, 26.8569 ms instrumented wall.
+  Every logit passes. Fewer launches have not produced a substantial gain.
+- The optional bounded small-contraction slab admission regresses to 32.8115
+  ms GPU, 1090 launches, while passing numerical checks. Selected-plan timing
+  locates 13.922 ms in 29 fused PV-reduction/copy slabs (per-dispatch timing,
+  not clean timing). This rule is experimental and is NOT in the retained
+  candidate configuration. It needs removal or a specialized lowering.
+- Accumulation chains=2 with packed Q4 (which bypasses the chains) now tests
+  mainly Q6/dense operations. 21.4440 ms GPU, no clear model improvement.
+- A new Q6 lane layout owns one complete 16-weight scale group. Actual new
+  kernel selection and fractional-input/tail CPU checks pass. Long micro:
+  down 174.799 -> 173.395 us; vocab 1449.761 -> 1414.618 us, with wide upper
+  quartile on the new vocab kernel. Not established as a model improvement.
+
+Current probe in development: dense small-M GEMV with N-contiguous B storage.
+Lanes cover adjacent columns; eight subgroups divide K, then one shared-memory
+close produces output. This targets attention PV coalescing while preserving
+all scalar pre/post expressions and symbolic K. Compile succeeded; GPU tests
+and full model timing are still pending. Flag FUSOR_PROFILE_GEMV_CONTIGUOUS_N.
+
+All new optimization switches default off. packed-candidate.json has NOT been
+updated with these exploratory changes. Keep original reports and full logits.
+
+FURTHER CONTINUATION
+- Column-coalesced PV now confirms actual symbolic-KV kernel selection. CPU
+  conformance and full logits pass. Symbolic model 21.3595 ms GPU, padded
+  21.5692 ms; removing the small-family pin gives 22.0985 ms. No large win.
+- Q4 split-K within one workgroup: scale groups remain lane-local; subgroup
+  partials close in shared storage. CPU fractional/tail checks pass. Gate
+  regresses 201.3 -> 225.5/307.5 us for splits 2/4; square improves 54.3 ->
+  44.6/46.2 us. Down 104.4 -> 107.7 us. Limited N/K probe (<=8192 each) is
+  numerically correct, 21.5284 ms GPU. No demonstrated total-model gain.
+- Removing debug groups + allowing 8 outstanding chunks with this configuration
+  gives 21.5215 ms GPU / 25.8802 ms instrumented wall. Needs clean verification.
+- Added FUSOR_TIME_SAMPLE_STRIDE rotating sparse dispatch timing and
+  analyze_samples.py. It checks exact metadata index/grid and reports sample
+  counts and unsampled groups. 62 steady tokens, 2082 samples. Sampled timing
+  STILL perturbs individual kernels (estimated sum 26.5 vs ~21.5 ms whole span),
+  so it is attribution only. Not a substitute for clean wall/span measurements.
+- Forwarding selected view copies for eight passes changes no launch count:
+  1041 / 21.477 ms GPU. Padded attention with doubled search budget reduces
+  launches to 872 but regresses to 22.2573 ms GPU. Both remain experiments.
+- Map-only private slabs can inline scalar expressions through composed view
+  addresses, avoiding scratch/barriers. Intermediate element conversions are
+  preserved. 28 GPU view + 18 normalization tests pass and actually select the
+  new kernel; all 2.3M model logits pass, 21.1502 ms GPU / 25.0853 ms wall.
+- Single-update scatter now has a separate linear copy/update probe, immutable
+  base -> new output, four or sixteen outputs per lane in contiguous blocks.
+  Both pass Add/Set/tails/snapshot conformance and full model logits. Four:
+  20.6444 ms GPU / 25.6280 wall; sixteen: 20.8240 / 24.9061. No clean headline yet.
+- Profile prompt length is now configurable (PROFILE_PROMPT_REPEATS). Existing
+  208-token benchmark remains default. wall_ab.py takes --prompt-repeats and
+  enforces equal actual prompt tokens in both arms.
+- First 4008-token full-model A/B (same executable): baseline 65.8568 ms GPU /
+  71.8309 wall -> coalesced-PV+linear-scatter+map-inline candidate 43.0157 /
+  48.7133. All full logits pass, max abs 0.000445843, max RMS 0.000038430.
+  Only 3 steady samples/arm, instrumented wall. 2x assertions STILL FAIL.
+- New opt-in Launch::DecodeAttention is an alternative to ordinary logical
+  F32 attention, single-query/head-dim128, fixed KV prefix. Subgroup QK dots,
+  workgroup softmax, N-coalesced PV; one WG/query head, no global scores.
+  CPU-reference Llama geometry passes and actual kernel executes. First short
+  model probe passes all logits but 909 launches / 21.238 ms GPU (no speed win).
+  Full KV view copies may offset fusion gain; adding normal view-absorption to
+  the new launch next. Expanded stale-NaN/growth/batch/non-block-tail tests are
+  being built. This path is NOT accepted or in packed-candidate.json.
+
+SPLIT ATTENTION CONTINUATION
+- The first full-capacity fused attention REGRESSED at 4008 tokens: 66.3125
+  -> 76.6331 ms GPU despite correct logits. Not an accepted candidate.
+- Added a pure-attention replay tool with CPU checks (attention_lab). Cache
+  mutation ends before replay, and actual command names/grids are printed.
+- Revised cost accounting stopped selecting fused attention in some micro
+  runs. Those runs are archived as attention-chunk-sweep and are NOT split
+  results. Explicit profiling selection now returns the requested launch.
+- Partitioned keys into independent workgroups, publishing 128 PV numerators,
+  local maximum and exponential sum. The initial generic merge path failed
+  structured, multi-seed replay inputs. Disabling FORM_SLAB did not fix it.
+  Partial readback matched the CPU; exact generic-path cause is still unresolved.
+  Replaced that path with a dedicated stable merge. The temporary partial
+  debug hook has been removed. Partial readback evidence is retained.
+- attention-chunk-merge: 4096 capacity / 4008 valid tokens, all 4096 outputs
+  checked on three seeds. Chunk 128/256/512/1024: 178.152/181.393/189.355/
+  180.749 us median, maximum absolute error ~1e-6. Ordinary logical attention
+  ~466.866 us; one unsplit fused workgroup per head ~1641.082 us.
+  These are isolated warm replay timings, NOT end-to-end decode speedups.
+- Dedicated merge + split launch passes stale NaNs, reset/growth, multi-batch,
+  partial-capacity, single-key and long-prefix conformance. Full-model 4K A/B
+  with 2 measured rounds and 12 decode steps is running; 2x is NOT yet verified.
+
+VERIFIED SPLIT-ATTENTION MILESTONE (2026-10-11)
+- Full 4K A/B: baseline 66.33975 ms GPU / 71.5863125 instrumented wall;
+  candidate 30.24015 / 35.544917. All 5,001,984 logits pass (39 vectors),
+  maximum abs 0.0004453659, maximum RMS 0.0000386778.
+- Same-executable CLEAN 4K wall: 71.3310625 -> 33.9546255 ms/token median,
+  2.100776x; means 70.95838897 -> 34.30095707, 2.068700x. Thirty steady
+  samples per arm, identical text. split-clean-wall-4k/result.json.
+- Same-executable CLEAN original 208-token wall: 31.7867705 -> 24.5450005
+  ms/token median, 1.2950405x. Original short-context 2x assertion FAILS.
+  Goal remains active. split-clean-wall-208/result.json.
+- split-candidate.json preserves this checkpoint; exact timing executable
+  split-attention-profile is retained. packed-candidate.json stays historical.
+- Key-major split workgroup ordering passes 3-seed CPU micro comparison, but
+  186.659 us vs 183.146 head-major gives no improvement. Defaults off.
+- Single-WG broadcast-fold slab: 18 normalization cases and every model logit
+  pass; 831 launches / 20.6814 ms GPU. No clear model gain; not accepted.
+- Q/K RoPE from a shared projection prefix eliminates join scatters. Existing
+  shared QKV layers: qk_view_rope passes all logits, ~20.2063 ms GPU.
+- Combining Q/K in remaining layers (when their quantization matches) also
+  passes all 2,308,608 logits; qk_project: 782 launches, 20.0355 ms GPU,
+  25.049 instrumented wall. Not a clean speedup claim.
+- Short-capacity unsplit attention with Q/K change: 751 launches, 20.1118 ms
+  GPU, 25.474542 instrumented wall. No useful improvement.
+- Developing fused F32 RMS normalization. Initial direct launch broke
+  backward, caught by conformance; changed to a launch alternative in the
+  original logical equivalence class. Revalidation pending.
+- qmatmul_lab now supports LAB_WEIGHT_COPIES (bounded total <=5 GiB),
+  independent storage, all output copies checked. Intended to distinguish
+  warm repeated weights from sustained large-working-set behavior.
+
+NORMALIZATION / VIEW / WORKING-SET CONTINUATION
+- Fused RMS is now a launch alternative unioned with the original logical
+  expression; backward stays on the logical graph. All 19 normalization cases
+  pass, including new widths 1/127/257/4096/8191/8192, 1/4 rows and strided views.
+- Extended residual normalization to the same path. Six RMS-specific cases
+  (including backward) pass. Full logits pass for both probes: fused_rms
+  713 launches / 19.7264 ms GPU, fused_rms_residual 646 / 19.6928. Small gain.
+- rms-dispatch-semantic confirms 65 actual RMS kernels, removing normalization
+  intermediate buffers. Per-dispatch timing perturbs the graph: 28.3 ms versus
+  ~19.7 ms whole-span, so use only for relative attribution.
+- PROFILE_HOST_STAGES (no GPU timestamps): prepare/submit median 3.738 ms,
+  readback/wait 20.276 ms, CPU top-k 0.169 ms, 15 steady samples. Preparation
+  can overlap GPU execution; these are host intervals, not additive GPU costs.
+- LAB_WEIGHT_COPIES: equal-work Q4 gate experiment, 128 matmuls per span:
+  1 buffer x128: 204.829 us; 32 buffers x4 (2.114 GB): 202.552 us. Similar
+  323/326 GB/s. Initial copies1 x4 (604 us) versus copies32 x4 was unequal duty
+  cycle and is NOT a valid cache comparison; preserved under q4-working-set.
+- Index view forwarding: opt-in GPU post-extraction forwarding for Gather and
+  Scatter updates/indices. Scatter base excluded (defines result shape/write
+  map). GPU indexing loads now compose logical indices with operand layouts.
+  All 19 indexing/scatter tests pass, including new nonzero-offset transposed
+  views, duplicate indices, Add/Set and single-row tail updates. Every model
+  logit passes. 614 launches / 19.8145 ms GPU: no improvement over RMS probe.
+- Packed Q4 geometry sweep across 13 SG/column combinations x3 shapes, each
+  eight distinct weight buffers x16 replays: gate default 202.229 us, best
+  202.159; down default 110.439, best 108.579. No major opportunity here.
+  Square cases have wide quartiles and are inconclusive. CPU checks all pass.
+- All 29 visualizer tests and root Llama example clippy pass. Nested clippy
+  found three style warnings, now corrected; rerun pending.
+- Experiment in progress: FUSOR_PROFILE_PACKED_Q4_VEC2 uses aligned 64-bit
+  weight loads via a vec2<u32> view (no weight format change). Not accepted;
+  numerical/timing tests pending.
+
+- Paired Q4 weight loads passed CPU/tail checks but regressed gate 204.454 ->
+  228.892 us and down 109.808 -> 124.144 us. Removed from compiled code;
+  archived q4-vector-loads/experimental-lowering.rs.txt with raw evidence.
+
+Q4 contiguous-payload lane experiment rejected: pinned eight-copy gate 202.434 -> 371.368 us; down 110.349 -> 199.555 us; 32-copy square 33.519 -> 60.100 us. CPU checks pass every copy, three input seeds. More contiguous addresses did not overcome extra loop/metadata cost. Prototype archived under q4-coalesced-pinned/rejected-lowering.rs.txt and removed from compiled source. Unpinned original failed bit-exact copy comparison due different selected workgroup grids (896 vs 14336), worst abs 0.000064. Lab now CPU-checks every copy and checks entire peer vectors with bounded F32 reassociation tolerance, concise mismatch output. Pinned comparisons use identical geometry.
+
+Q6 group-count experiment rejected: down groups1/2/4 = 177.035/195.222/454.551 us; vocab = 1413.369/1583.888/3994.659 us. All CPU/tail/peer checks pass; increasing lane work loses throughput, consistent with register pressure. Archived and removed group-count option. Geometry sweep of original and group16 also did not show a useful win.
+Clean current-stream candidate: 208 tokens, 30 steady samples each, baseline median31.9164 ms -> candidate22.9580 ms, 1.39021x, target2x FALSE. Full 2,308,608 logits pass with max abs6.69956e-5 and RMS1.10347e-5. Streaming128 and bounded streaming32 preserve logits, latter improves instrumented wall without materially changing GPU span. Timing query indices continue across submitted portions.
+
+Q6 contiguous-payload layout passes CPU and full 2,308,608 model logits (maxabs6.69956e-5, RMS1.10347e-5). One U32 low payload word per lane covers one Q6 block/subgroup/iteration. Tail trace sectors10026->5164, duplicate bytes22208->16000, cache fills7552unchanged (virtual pre-CSE, not DRAM). Down177->163us, vocab1414->1283us, tiny tailregresses8.8->9.8us. Full model19.2511msGPU vs~19.8prior. Flag FUSOR_PROFILE_Q6_COALESCED plus existingQ6_GROUP16; compiled guarded experiment, not default. Q6 geometry sweep finds four columns/subgroup helps vocabulary to1228us; unchangedmodelgeometrycurrentlyvalidated.
+Fused DecodeRope optional launch: direct rawtableposition reads, singlequeryF32, bothinterleaved/halves, headwidth<=256. Logical root remains for autograd. Firsttestcaughtshape-family reuse acrossrotation layouts: ordinarypassed, fusedfailedbecausefamilyreboundpermutationbufferleaveswhilekernelbakeslayout. Targetedprofileconfirmedconcretefamilyhit. CanonicalizationnowrejectstermswhoseclassescontainDecodeRope; exactgraphplanreplayisunchanged. Newrope_decode_viewscasecovers48directkernel dispatches, widths6/128/254/256, batches2heads3, stridedoffsetviews, position0/8/outofrange9, bothlayouts, gradients. Ordinaryandfixedfusedpass. Fullmodelall2,308,608logitspass; launches614->560, GPU19.2511->18.9520ms, instrumentwall23.3681ms. Cleanwallnext.
+SeparateintermediatebufferexperimentFUSOR_PROFILE_NO_ARENA: allmodellogitspassbutGPU19.7894msnotimproved; switchremoved.
+
+Clean rotary+Q6 checkpoint: 208 tokens, 30steady samples/arm, samebinary baseline31.952646ms -> candidate21.4788745ms; 1.487631x median,1.476175xmean; matchingtext,target2xstillFAIL. Exact executablepreservedrope-q6-profile, configurationfused-rope-config.json. Active-model memorymonitor RSSpeak13.15GiB, steady7.7–8.3GiB, 0swapouts/0swapinsduringrun, systemfree~5.3GiBnearend. Compressiongrew~2.6GiB duringloading; active decodinghoststages last40medians prepare3.847ms/readback17.2425ms/topk0.130ms (overlapnotadditivewithGPU).
+
+Q6 split2 (N <= 8192) full-logit check passes; clean wall 31.933084 -> 21.395021 ms, 1.49255x, 2x target still fails. Optimized qmatmul host control reveals the previous small-V ~31us timings were CPU submission limited: optimized host gives ~17us with the identical kernel. Large down/vocab unchanged. One fully encoded submit reproduces ~17us; split2 does not improve V, but down is 163.33 ->154.74us. New experiment: forward through selected composites made entirely of identity view maps, which current direct-Map detection misses.
+
+View forwarding: composite-only removes 22 decode launches; affine singleton/offset composition removes another 71, 560 ->467. Both full-logit checks pass; address-composition unit tests and IR/cost Clippy pass. Clean 30-sample wall 31.7613 ->21.6922 ms (1.464x), no demonstrated wall improvement over prior ~21.4ms. Keep as a provisional compiler simplification, not a claimed latency win. Cached semantic descriptions eliminate repeated graph traversal; exact plan/shader/grid and all dimensions read by the description are checked. Sparse attribution now covers every group, ~19.53ms estimated vs ~18.69ms whole GPU. Q4 lane16 experiment passed all CPU checks but regressed gate202.43->272.76us, down110.44->147.29us, square34.67->45.51us; archived and removed. Explicitly initialized scratch variant passes every model logit, whole GPU18.542ms; clean and conformance tests pending.
+
+Q4 REGISTER-LIFETIME / RMS / UNIFORM INDEX CONTINUATION
+- Naive Q4 lane64 and scale-group streaming both failed: gate 202.347 ->
+  304.369 us, down 110.204 -> 179.346; square 34.462 -> 48.770. All sampled
+  CPU outputs pass. Prototypes archived in q4-group64/ and q4-stream-groups/,
+  lowering and flags restored to original geometry.
+- RMS block is now explicit IR, valid 32..1024 powers of two. kernel-observer
+  device override requests actual max WG threads within adapter limits.
+  vector_lab verifies every output including strided/tail geometry.
+- rms_wide full model: 18.167 ms instrumented GPU, 467 launches, 2,308,608
+  logits pass, max abs 5.9604645e-5. No clean-wall claim yet.
+- CACHE_INDEX_UNIFORM uses one U32-typed scalar stored in existing f32
+  uniform block for added=1/capacity<=2^24; growth past range switches back
+  to integer buffers, batches keep buffers. GPU operand/scalar loads honor
+  Uniform dtype. uniform_index full model: 18.0875 ms GPU; all same logits
+  pass. Instrumented wall 21.3736 ms; historical reference wall not valid
+  for 2x claim.
+- New GPU fixed_cache_replay_ring test passes with growth, replay, wrap,
+  truncate/reset and detached snapshots. padded_cache_decode_prefix passes.
+- Broader validation caught a LINEAR_VIEW_FORWARD failure in
+  padded_cache_tail_batches: missing dim d0 uniform slot. Disabling linear
+  forwarding alone passes; disabling uniform index alone does not.
+  Diagnosing before adoption; other flags remain provisional.
+- Attention block field/probe (32..512) currently building; not validated.
+
+DERIVED STRIDE FIX / STEADY ATTENTION / FULL PLAN REPLAY
+- Missing d0 is a derived dense stride (capacity * 128) for an external
+  buffer. Affine forwarding removed the only explicit operand stride that
+  named it. classified_symbols_of now collects dense layouts, not just
+  dimensions, for every realized value, including external leaves.
+- The red padded_cache_tail_batches case is green with linear forwarding
+  enabled. fixed_cache_replay_ring, padded_cache_decode_prefix, RMS 1024,
+  19 indexing cases and 30 view cases all pass. Logs uniform-index-*.txt.
+- Attention geometry is explicit IR (32..512 threads) and recorded in
+  visualizer metadata. Short 64-replay timings were highly variable;
+  LAB_ATTENTION_REPEATS=1024 stabilizes the experiment. Existing 256/128
+  geometry wins: 25.142 us, repeated at end 25.067 us. Alternatives
+  26.8..37.7 us; all 3-seed full outputs pass. No candidate geometry change.
+- PROFILE_REPLAY_PLAN=8 captures live commands at the final measured step
+  and encodes eight pure forward replays into one submit/pass. Mode=replay
+  is excluded from wall_ab; no actual new tokens are generated by replay.
+  Requires fixed input buffers, no online tuning, submit/pass max.
+- preencoded_plan: 18.14025 ms GPU/replay, 467 commands. This rules out
+  host gaps as the source of most remaining GPU latency. Original forward
+  TPLAN 17.8296 ms at that step. All 2,308,608 logits pass after replay.
+  Its historical 42.5 ms wall ratio is NOT the target baseline.
+- Root Clippy with warnings denied passes, git diff --check passes.
+- Next experiment: actual registry wgpu-hal 29.0.4 does not set Metal
+  maxTotalThreadsPerThreadgroup. Copied only that crate into ignored
+  .kernel-profile-deps/wgpu-hal-metal-hints, option defaults off. Exact
+  pipeline workgroup product supplied when FUSOR_PROFILE_METAL_MAX_THREADS
+  is present. Patch/source hashes and executable in metal-thread-hints/.
+  Uses command-line Cargo patch, regular builds unchanged. A/B pending.
+- Metal exact-thread hint regressed Q4 gate 202.350 -> 319.294 us,
+  down 110.226 -> 151.439, square 34.626 -> 53.712. Q6 down split1
+  163.000 -> 206.503; split2 unchanged 154.655 -> 154.958. All CPU
+  checks pass. Testing explicit larger compiler maxima (128..1024) to
+  distinguish a register-occupancy tradeoff from a universally bad hint.
+
+NEW VERIFIED SHORT-CONTEXT CHECKPOINT
+- uniform-index-clean-wall-208: 30 steady samples each, same regular binary.
+  Baseline median 31.9598755 ms -> 20.1825005 ms, 1.5835439x median,
+  1.5907121x mean; identical generated text, 467 candidate launches.
+  2x assertion remains RED. Exact binary retained as uniform-index-profile.
+- The same source with preencoded_plan passed all 2,308,608 logits after
+  optional pure forward replay. No model math change from formatting.
+- Explicit Metal compiler maxima also rejected: Q4 gate default202.714,
+  max128278.294, max256277.868, max512202.527, max1024488.795 us.
+  Q6 down split1 default163.655, max128206.853, max256164.668,
+  max512163.722, max1024163.581. Default remains best overall.
+- Next hypothesis: place query heads that share K/V in one physical
+  workgroup to improve local cache reuse, retaining independent F32 softmax
+  and PV sums per head. Dedicated partitioned subgroup reductions avoid
+  expensive generic workgroup trees. Not implemented/validated yet.
+
+IN-PROGRESS GQA WORKGROUP EXPERIMENT
+- Added explicit heads_per_group to DecodeAttention (default1, opts1/2/4).
+  block means threads per query head, physical block=block*heads_per_group.
+  Heads within a group must share one KV head. Default lowering remains
+  structurally equivalent; grouped lowering uses local lane/subgroup ids
+  and per-head score/PV tile offsets.
+- head_reduce uses subgroup collectives and two whole-WG barriers, stores
+  physical-SG partials, then each head reads only its own subgroup range.
+  Avoids the generic partitioned workgroup tree. All physical lanes reach
+  barriers, including empty chunks. New kernel names decode_attention_gqa
+  and decode_attention_gqa_partial; initialized-scratch whitelist updated.
+- FUSOR_PROFILE_ATTENTION_HEADS selects grouping; WORKGROUP_THREADS1024
+  and existing WORKGROUP_STORAGE32768 allow physical1024 thread probes.
+  IR inference, capability checks, cost geometry/storage, visualizer metadata
+  updated. Also fixed RMS cost scratch bound from constant1024 to block*4.
+- Current regular nested attention_lab build includes GQA; root model binary
+  is still the preserved 1.58x source BEFORE GQA and must rebuild if retained.
+  Running attention-gqa sweep against full CPU references. Not yet validated.
+- Nested Cargo.lock restored to normal registry wgpu-hal by regular build.
+  Metal overrides remain only in ignored copy and preserved probe binaries.
+
+PROMPT CAPACITY, GQA AND OWNED CACHE UPDATES
+- Prompt-sized initial cache starts at 1, reserves prefill padding using the
+  existing doubling path, so 208 tokens use capacity 256 instead of 512.
+  PROFILE_PROMPT_SIZED_CACHE is opt-in; rings unchanged. All 2,308,608 logits
+  pass. Clean same-binary wall: 31.7608125 -> 19.805375 ms, 1.603646x median,
+  30 steady samples/arm, text matches. prompt-cache-clean-wall-208/result.json.
+- GQA heads 2/4 pass padded-cache GPU tests and all model logits. Model GPU
+  18.1331 (heads1), 18.0728 (heads2), 18.0253 (heads4) ms; no large gain.
+- One-column Q6 subgroup sweep: retained sg2 cols4 split2 ~152.8us down;
+  one-column choices ~172-180us. sg1 cols1 was a fallback and is NOT a
+  valid coalesced-kernel comparison. q6-coalesced-single-column holds evidence.
+- Full-F32 cooperative M1 widening BK regresses gate from packed ~202us to
+  2506us (BK32) and 24578us (BK64). Stopped remaining trials; wide-K domain
+  expansion was removed. coop-decode-wide-k-results.txt.
+- New KvCache::resolve_and_commit_all and FUSOR_PROFILE_CACHE_DONATION:
+  runtime exclusivity proof allows a last-use dense Set scatter to consume
+  its private store; any retained alias or later reader uses copying. One
+  RW binding replaces duplicate input/output bindings; cache_append_exclusive
+  writes only the appended row, leaving all other bytes untouched.
+- Changing-value/growth/ring/truncate/reset conformance executes the new kernel.
+  A separate shared-physical-buffer snapshot plus old-value-reader test passes
+  copying and donation. The first fixture failed both paths because it reused
+  explicitly materialized mutable reads; fixture now invalidates those reads.
+- Model first donation probe: 64/64 aliases each steady token, ~17.1ms GPU,
+  all logits pass. First clean wall 31.786104 -> 20.1831255ms (1.574885x)
+  regresses versus prompt-sized cache: ownership proof overhead lost the gain.
+- Revised proof scans graph owners, supplied refs and last uses once; caches
+  up to eight structural plan variants while rechecking ownership every call.
+  Snapshot/scatter conformance and clean full-model recheck are in progress.
+- Packed Q4 per-scale-group accumulator chains (1/2/4) prototype is being
+  prepared; earlier GEMV chains bypassed this kernel. Not yet measured.
+
+OWNERSHIP MEMO AND RESIDUAL RMS RESULTS
+- Memoized ownership proof is ~74-78 us/token, and all 2,308,608 logits pass.
+  Clean short wall 31.9414375 -> 20.0321875 ms, 1.594506x. This has not
+  beaten the preserved prompt-cache result. Donation/scatter conformance passes.
+- Q4 accumulator chains 2/4 regress gate201.990 ->208.784/209.188 us;
+  down unchanged ~110us; square noise is inconclusive. Prototype archived in
+  q4-packed-chains and removed. One-column subgroup gate/down also regresses.
+- Residual add fused into RMS via optional third operand: strided and wide
+  rows, gradients and all 2,308,608 model logits pass. 435 launches vs467.
+  GPU17.5741ms without donation,17.3125ms with donation. Clean no-donation
+  31.853646 ->20.0416455ms,1.589373x; no demonstrated short-wall improvement.
+- Pure-forward replay now rejects cache donation because its cache inputs
+  mutate. Replaying it is not equivalent to the immutable forward diagnostic.
+- Testing lossless Q4 four-block byte swizzle in qmatmul_lab only. The first
+  geometry was accidentally vector2 (ordinary sgemv_cols) and invalid for
+  swizzled storage; its nonfinite output correctly aborted. Those results
+  are NOT performance comparisons. Corrected vector32 packed trial pending.
+
+- Byte-swizzle prototypes rejected: native gate202.443/down110.015us;
+  direct swizzle232.311/125.192. Expanded u8 group metadata (lossless, 148B)
+  gives222.474/123.320, combined swizzle210.789/116.708. Every packed-path
+  CPU comparison passes. Swizzling alone worsens actual GPU time despite
+  more contiguous virtual addresses. All prototypes archived, flags removed,
+  native lowering and lab restored. Next probe: exact byte-vector unpack.
+
+- Packed-byte ALU probe rejected: native Q4 gate202.361/down110.511us;
+  scalar byte shifts256.525/135.620, exact unpack4xU8 emitter246.521/129.659,
+  normalized-byte unpack285.594/151.293. WGSL confirms actual unpack4xU8
+  calls. All CPU checks pass. Prototype lowering/emitter archived under
+  q4-byte-unpack; removed from compiled source. Root Llama Clippy passes.
+
+- Combined residual RMS plus donation clean wall:31.880979->19.582271ms,
+  1.628053x median/1.637487x mean,30steady samples/arm,text matches,
+  435launches. This is the current best short candidate; target2x remains red.
+  Config rms-residual-donation-config.json; exact binary provenance is in
+  rms-residual-donation-clean-wall-208/provenance.json.
+- Nested all-target Clippy caught four compiler-test callers of Session::run
+  needing allow_donation=false. Fixed them; nested all-target Clippy now passes.
+- Next isolated probe prepares each activation's exact power-of-two scale
+  and eight-value sum once, then removes repeated per-workgroup preparation.
+  CPU preparation is excluded in the micro probe; a retained implementation
+  must include GPU preparation or fuse it with RMS and pass full-model timing.
+
+- Prepared Q4 activation upper bound rejected even before charging preparation:
+  gate202.601->230.974us,down110.372->129.838,square34.333->38.159.
+  Fractional-input CPU references all pass; the extra scalar-sum reads cost
+  more than the eliminated scaling/reduction arithmetic saves. Prototype
+  removed; evidence retained under q4-prepared-input. All29visualizer tests pass.
+
+- Same preserved binary clean candidate-only submission sweep (30steady each):
+  stream8/inflight64 median19.7336,stream16 19.0455,stream32 20.0401,
+  stream64 19.7539ms. All text matches. Means19.61-20.11ms and visible
+  variance; stream16 needs paired confirmation before claiming a new win.
+- Pinned SGEMV domain now permits non-power-of-two column counts with the
+  existing legality/unroll checks; normal search is unchanged. Testing three
+  columns per subgroup, between the previously tried two and four.
+
+- Fresh paired stream16 confirmation did NOT reproduce the sweep win:
+  baseline31.8937085->19.888375ms,1.603636x median. Keep the1.628x
+  stream32 checkpoint; candidate-only19.05ms is not a new headline.
+- Three columns/subgroup Q4 is slower: gate202.556->213.194us,
+  padded gate(nondiv4 butdiv6)205.614 vs original unpadded202.556;
+  down110.368->118.898. Q6vocab three columns1282.254->1312.082,
+  fourcolumns1230.093 repeats the known ~52us saving. All CPU checks pass.
+- Started isolated Metal ICB experiment in .kernel-profile-deps/wgpu-hal-icb.
+  CLI patch only, default off, serial barriers on every command, exact pipeline/
+  buffer/offset/grid/threadgroup-memory keys, retained indirect resources,
+  bounded64entry/32768command cache. Unsupported runtime-size buffers,
+  immediates/textures/indirect dispatch explicitly reject. Build in progress;
+  no numerical or performance claim. Normal dependency lock must be restored
+  with an unpatched build after this probe.
+
+- ICB runtime-size constants added and keyed/retained. Micro CPU checks all
+  green. Gate direct/pipeline-only/ICB GPU202.702/202.836/202.076us;
+  Q6down162.870/162.938/162.171us, encodeCPU1547.791/1526.708/777.667us.
+  Small Q4tail9.017/8.965/10.539us: indirect execution adds overhead there.
+- Model ICB all2,308,608logits pass (maxabs5.9604645e-5,RMS9.401426e-6).
+  Clean31.9425->19.2702085ms,1.657611x/mean1.639835x,30samples,textsame.
+  Experimental only: isolated backend patch required. Pure F32 unchanged.
+  Afterwarmup every14/14pass has exact cache hits. No missing dependencies.
+- GPU conformance found donation lowering incorrectly identified arena regions
+  sharing a binding as an exclusive cache alias. views::repeat was red in
+  direct, pipeline-only, ICB and default controls. Tightened it to exact
+  StorageView equality AND nonarena bindings. Four-run repeat/direct and
+  all30views/ICB plus2donationcases/ICB now pass; full2.3Mlogits still pass.
+- ICB candidate-only submit sweep8/16/64/128/435: medians20.239/21.468/
+  20.104/20.451/19.848ms. None improves the paired stream32 checkpoint.
+- Process-scoped Metal System Trace collected (q4-gate202.412us), but default
+  template has no counter samples. Task-local profile1 template reports
+  unsupported counter profile; these traces DO NOT establish DRAM/occupancy.
+  Native Instruments automation timed out; no GUI settings changed.
+- Refreshed sparse attribution on corrected directF32candidate:62tokens,
+  1685samples,0unsampledgroups; est18.171ms (instrumented, not clean wall).
+  Gate6.671,Q6down2.537,Q4down1.850,square1.329,vocab1.300,QKV.926,
+  QK.795,Q6V.324ms. Remaining kernels~2.44ms. Source current-sampled.
+
+- Constant activation address-space probe rejected, CPUchecks pass:
+  Q4gate202.603->202.821,Q4down110.932->110.965,Q6down163.513->164.125us.
+  Source transform removed from isolated HAL. Optional safe MSL dumping kept.
+- Added native Metal packed-Q4 captured-shader lab (tools/metal_kernel_lab.mm).
+  It matches Fusor baseline202.744us, changing F32 inputs/all copies/CPU refs/
+  all-output finite checks/tail canaries pass. Texture-buffer load263.021us;
+  forced loop-unroll202.640; vector activation208.790, uint4header202.822,
+  both203.608. No claimed projection win. All raw shaders/provenance retained.
+- Added quant_entropy.py: 4096blocks/tensor, nativeQ4+Q6weight volume4.6163GB,
+  per-tensor zero-order coefficient coding scenario4.4753GB (3.0543%saving).
+  This is NOT a bound on conditional compression and excludes tables/offsets/
+  padding/decoder cost. Known Q4/Q6 coefficient fixtures pass.
+- Attention short-capacity retune: earlier64replay sweep showed large variance.
+  Repeated at512replays/onepass: old256threads/chunk12822.243us;
+  old512/chunk25618.623; newonline256/chunk25615.768us. Full CPU comparisons
+  pass. Online lowerer fuses QK, stable running max/sum and PV per subgroup,
+  then merges once in shared storage; one workgroup barrier, allF32. Flag
+  FUSOR_PROFILE_ATTENTION_ONLINE. GQAheads>1 retain existing path.
+- Online conformance passes paddedprefix, Llama geometry and tail/batch cases,
+  including1/31/257/4008keys and NaN padding, chunks128and256. Full2,308,608
+  model logits pass atmaxabs5.9604645e-5/maxRMS9.401426e-6. Config
+  attention-short-retune/config-online256.json includes isolated MetalICB.
+- NEW paired clean short checkpoint: attention-online-clean-wall-208
+  baseline31.93925->18.792916ms,1.699537xmedian/1.667722xmean,30samples/arm,
+  matchingtext,403launches. Exactbinary online-attention-profile, numerical
+  check attention_online256/check.json. Target2x stillred. Prior1.63normalHAL
+  checkpoint retained; this1.70 requires task-localICBbackendpatch.
+
+- Confirmed online-attention-profile hash c8ef63a8d7fc6d87db6b3394071ead3d16afd3f919cb1e44110f60daa61ca519
+  matches both arms of the1.699537x clean comparison. Root/nested Clippy both
+  pass with-Dwarnings; normal registry Cargo.lock restored by root Clippy.
+- Onlineattention4K numerical probe passes2,308,608logits,maxabs.0004677773,
+  maxRMS.0000321934. InstrumentedGPU66.3313->21.2536ms,435launches;
+  cleanwall not yet measured. Root/nested Clippy completed during this
+  numerical probe, so its wall result is NOT a headline timing.
+- Shared-activationQ4 variants all slower. Groups32/64/128/256/512 device:
+  202.393/203.093/203.642/205.374/208.841us; shared:
+  2709.620/835.358/353.072/268.700/264.554us. AllCPUchecks passed.
+- NativeQ6lab now supports F32Scales with an independent Q6 bitplane CPU
+  reference. Captured down162.883us;16lane masked150.284/signed149.495,
+  8lane223.243/190.921 (register pressure hypothesis, no hardwarecounter).
+  Vocab captured1287.547us,16lane masked1213.591/signed1193.339.
+  Down16lane signed split2=145.671us, split4=144.729withlargevariance.
+  Allchanging-input/finite/canary/CPUchecks pass. Integration in progress.
+- Added tools/prepare_metal_icb.py: verifiescachedcrateSHA againstCargo.lock,
+  reproducespatch and comparesallfiles againstexistingbackend without
+  replacement. Ran successfully, matches current isolated backend exactly.

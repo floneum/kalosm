@@ -1,0 +1,1 @@
+Excluded diagnostic experiments. The user requires the normal WebGPU compilation and dispatch path. These native Metal and patched backend sources are archived for provenance only, are not build inputs, and their timings do not count toward the optimization goal.

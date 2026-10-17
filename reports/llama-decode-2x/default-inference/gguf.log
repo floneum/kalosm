@@ -1,0 +1,20 @@
+   Compiling num-traits v0.2.19
+   Compiling rand_distr v0.5.1
+   Compiling half v2.7.1
+   Compiling fusor-ir v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-ir)
+   Compiling fusor-gguf v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-gguf)
+    Finished `test` profile [optimized] target(s) in 17.14s
+     Running unittests src/lib.rs (target/debug/deps/fusor_gguf-e16f21c4be32bbe9)
+
+running 9 tests
+test blocks::tests::cpu_dequantize_matches_ggml_vectors ... ok
+test decode::tests::decode_programs_agree_with_cpu_dequantize ... ok
+test parse::tests::gguf_header_round_trip ... ok
+test parse::tests::v1_and_v2_length_prefixes_round_trip ... ok
+test repack::tests::repack_preserves_dequantized_values ... ok
+test repack::tests::repack_round_trips_bit_exactly ... ok
+test sharded::tests::sharded_and_async_find_across_shards ... ok
+test varbuilder::tests::raw_tensor_and_upload_retain_their_own_shard_without_copying ... ok
+test varbuilder::tests::varbuilder_prefix_scoping ... ok
+
+test result: ok. 9 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s

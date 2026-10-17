@@ -6,9 +6,6 @@ use super::LlamaConfig;
 /// The dimension along which the attention cache grows for new tokens.
 const CONCAT_DIMENSION: u32 = 2;
 
-/// Initial per-layer capacity (tokens), doubled as needed.
-const INITIAL_CAPACITY: usize = 512;
-
 /// Device buffers with symbolic lengths and capacities. Decode replays one
 /// graph while input bytes and dimension bindings change.
 #[derive(Clone)]
@@ -21,6 +18,7 @@ pub struct LlamaCache {
     /// Token-step logits for these cache stores. Replay updates input leaves
     /// and write indices without rebuilding the graph.
     pub(crate) decode_graph: Option<Tensor<2>>,
+    padded_capacities: Vec<Option<u64>>,
     /// The same memo for the embedding-row step an image prompt runs: its
     /// input is a `[1, 1, hidden]` embedding leaf and explicit rope rows,
     /// not a token id. One of the two memos is live at a time; the other
@@ -35,7 +33,15 @@ pub struct LlamaCache {
 
 impl LlamaCache {
     /// Create a new cache for a model
-    pub fn new(config: &LlamaConfig) -> Self {
+    pub fn new(config: &LlamaConfig, profile: fusor_ir::execution::ExecutionProfile) -> Self {
+        // Starting at one lets reserve_all choose the next power of two for
+        // the actual prompt, including its prefill padding. Growth and ring
+        // windows keep their existing semantics.
+        let initial_capacity = if profile.enabled("PROFILE_PROMPT_SIZED_CACHE") {
+            1
+        } else {
+            512
+        };
         let mut blocks = Vec::with_capacity(config.n_layer);
         for i in 0..config.n_layer {
             let window = match (config.sliding_window_size, config.sliding_window_type) {
@@ -46,7 +52,7 @@ impl LlamaCache {
                 Some(w) => KvCache::windowed(CONCAT_DIMENSION, w as u64),
                 None => KvCache::with_capacity(
                     CONCAT_DIMENSION,
-                    config.context_length.min(INITIAL_CAPACITY) as u64,
+                    config.context_length.min(initial_capacity) as u64,
                 ),
             });
         }
@@ -55,8 +61,25 @@ impl LlamaCache {
             pending_token: None,
             blocks,
             decode_graph: None,
+
+            padded_capacities: Vec::new(),
             embed_graph: None,
             rope_position: 0,
+        }
+    }
+
+    pub(crate) fn refresh_padded_capacity(
+        &mut self,
+        profile: fusor_ir::execution::ExecutionProfile,
+    ) {
+        if !profile.enabled("PROFILE_PADDED_DECODE_ATTENTION") {
+            return;
+        }
+        let capacities: Vec<_> = self.blocks.iter().map(KvCache::storage_capacity).collect();
+        if capacities != self.padded_capacities {
+            self.decode_graph = None;
+            self.embed_graph = None;
+            self.padded_capacities = capacities;
         }
     }
 

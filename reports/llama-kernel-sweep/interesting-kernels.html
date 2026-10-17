@@ -1,0 +1,111 @@
+<div id="llama-hotspots">
+  <h2>Three Llama kernel patterns</h2>
+  <div class="viz-controls">
+    <label class="form-label">Captured kernel
+      <select class="form-select" id="llama-kernel-choice">
+        <option value="kgroup">kgroup · scattered reduction loads</option>
+        <option value="kfold">kfold · four loading lanes</option>
+        <option value="kslab">kslab · reuse across subgroups</option>
+      </select>
+    </label>
+  </div>
+  <div class="text-small text-muted">Subgroup 32 · sectors 32 B · cache lines 128 B · simulated cache 16 KiB</div>
+  <h3 id="llama-pattern-title"></h3>
+  <div id="llama-pattern-values" class="viz-row tabular-nums" aria-live="polite"></div>
+  <div id="llama-lane-diagram"></div>
+  <div id="llama-pattern-detail" class="text-small"></div>
+  <table class="table table-sm tabular-nums" id="llama-address-table"></table>
+  <div id="llama-source" class="text-small text-muted"></div>
+  <hr>
+  <div class="text-small text-muted">570 analyzed / 1,531 observed variants · first and last workgroups sampled · includes compiler candidates · IR before backend optimization</div>
+</div>
+<style>
+#llama-hotspots #llama-lane-diagram {margin: 16px 0 8px;}
+#llama-hotspots #llama-source {overflow-wrap:anywhere;}
+#llama-hotspots .lane-chart {display:block;width:100%;}
+#llama-hotspots .lane-chart text {fill:var(--foreground);}
+</style>
+<script>
+(() => {
+  const root = document.getElementById('llama-hotspots');
+  const pick = root.querySelector('#llama-kernel-choice');
+  const title = root.querySelector('#llama-pattern-title');
+  const values = root.querySelector('#llama-pattern-values');
+  const diagram = root.querySelector('#llama-lane-diagram');
+  const detail = root.querySelector('#llama-pattern-detail');
+  const table = root.querySelector('#llama-address-table');
+  const source = root.querySelector('#llama-source');
+  const cases = {
+    kgroup: {count:16, base:2699260, stride:65536, sectors:16, ideal:2, event:13, id:'51d6113fe37d77d1205997353dcd40cc-cb0b43dbe70a38cc', source:'body[4].then[0].value.accept', title:'16 sectors for 64 useful bytes', values:['16 / 32 loading lanes','64 KiB between lanes','8× packed minimum'], detail:'16 cache misses · 2,048 B filled · packing lower bound: 2 sectors'},
+    kfold: {count:4, base:1265660, stride:393216, sectors:4, ideal:1, event:3, id:'481141fe3bada9eda021280fd023a22c-cb0b43dbe70a38cc', source:'body[0].value.accept', title:'4 sectors for 16 useful bytes', values:['4 / 32 loading lanes','384 KiB between lanes','4× packed minimum'], detail:'4 cache misses · 512 B filled · packing lower bound: 1 sector'},
+    kslab: {event:2, id:'bfc7b725443521abb90f62873a98d31e-b1cc5ee7dff479a8', source:'body[0].loop[0].then[0].value', title:'Two subgroups read each cache line', values:['8 subgroups','512 distinct B','4 misses + 4 hits'], detail:'First load: 1,024 requested B · 512 B filled · all subgroup loads fully coalesced'}
+  };
+  const ns = 'http://www.w3.org/2000/svg';
+  const fmt = n => n.toLocaleString('en-US');
+  let selected = 'kgroup';
+  function svgNode(parent, tag, attrs, text) {
+    const node = document.createElementNS(ns,tag);
+    for (const [key,value] of Object.entries(attrs)) node.setAttribute(key,value);
+    if (text !== undefined) node.textContent = text;
+    parent.appendChild(node); return node;
+  }
+  function draw() {
+    const d=cases[selected], w=Math.max(280,Math.floor(diagram.getBoundingClientRect().width));
+    const narrow=w<460, columns=narrow?8:16, rowHeight=64;
+    const h=selected==='kslab'?244:Math.ceil(32/columns)*rowHeight+50;
+    diagram.replaceChildren();
+    const svg=svgNode(diagram,'svg',{class:'lane-chart',viewBox:`0 0 ${w} ${h}`,height:h,role:'img'});
+    svgNode(svg,'title',{},selected==='kslab'?'Subgroups 0 through 3 miss on four lines; subgroups 4 through 7 hit those same lines.':`${d.count} loading lanes out of 32, each touching a separate 32-byte sector and using only four bytes of it.`);
+    if(selected==='kslab') {
+      const left=narrow?55:84,right=w-(narrow?55:84),barWidth=right-left;
+      svgNode(svg,'text',{x:0,y:15,class:'text-small'},'First reader');
+      svgNode(svg,'text',{x:w,y:15,'text-anchor':'end',class:'text-small'},'Second reader');
+      for(let i=0;i<4;i++) {
+        const y=42+i*48;
+        svgNode(svg,'text',{x:0,y:y+15,class:'text-small'},`SG ${i}`);
+        svgNode(svg,'text',{x:w,y:y+15,'text-anchor':'end',class:'text-small'},`SG ${i+4}`);
+        svgNode(svg,'path',{d:`M ${left-14} ${y+10} H ${left} M ${right} ${y+10} H ${right+14}`,stroke:'var(--border)','stroke-width':1});
+        svgNode(svg,'rect',{x:left,y,width:barWidth,height:23,fill:'var(--viz-series-1)','fill-opacity':0.17});
+        svgNode(svg,'text',{x:(left+right)/2,y:y+16,'text-anchor':'middle',class:'text-small'},`${256+i*128}–${383+i*128} B`);
+      }
+      svgNode(svg,'text',{x:0,y:h-8,class:'text-small'},'Cache miss');
+      svgNode(svg,'text',{x:w,y:h-8,'text-anchor':'end',class:'text-small'},'Cache hit');
+      return;
+    }
+    const cell=w/columns;
+    for(let lane=0;lane<32;lane++) {
+      const x=(lane%columns)*cell,y=Math.floor(lane/columns)*rowHeight;
+      const active=lane<d.count, sectorWidth=cell-8;
+      svgNode(svg,'text',{x:x+sectorWidth/2,y:y+15,'text-anchor':'middle',class:'text-small'},String(lane));
+      svgNode(svg,'rect',{x,y:y+23,width:sectorWidth,height:18,fill:'var(--muted)',opacity:active?1:0.45});
+      if(active) {
+        svgNode(svg,'rect',{x:x+sectorWidth*7/8,y:y+23,width:sectorWidth/8,height:18,fill:'var(--viz-series-1)'});
+      } else {
+        svgNode(svg,'text',{x:x+sectorWidth/2,y:y+36,'text-anchor':'middle',class:'text-small'},'–');
+      }
+    }
+    const legendY=h-22;
+    svgNode(svg,'rect',{x:0,y:legendY-10,width:10,height:10,fill:'var(--viz-series-1)'});
+    svgNode(svg,'text',{x:16,y:legendY,class:'text-small'},'4 B read / 32 B sector');
+    svgNode(svg,'text',{x:0,y:h-4,class:'text-small'},'Lane numbers · sector gaps omitted · – no load');
+  }
+  function render() {
+    const d=cases[selected]; pick.value=selected; title.textContent=d.title;
+    values.replaceChildren(...d.values.map(v=>{const s=document.createElement('span');s.textContent=v;return s;}));
+    detail.textContent=d.detail;
+    if(selected==='kslab') {
+      table.innerHTML='<thead><tr><th>Sampled trace totals</th><th class="text-end">Bytes</th></tr></thead><tbody><tr><td>Reuse across subgroups</td><td class="text-end">9,216</td></tr><tr><td>Reuse across workgroups</td><td class="text-end">1,536</td></tr></tbody>';
+    } else {
+      const lanes=[0,1,2,d.count-1];
+      table.innerHTML='<thead><tr><th>Lane</th><th class="text-end">Byte address</th><th class="text-end">Sector ID</th></tr></thead><tbody>'+lanes.map(l=>`<tr><td>${l}</td><td class="text-end">${fmt(d.base+l*d.stride)}</td><td class="text-end">${fmt(Math.floor((d.base+l*d.stride)/32))}</td></tr>`).join('')+'</tbody>';
+    }
+    source.textContent=`${d.id} · event ${d.event} (zero-based) · WG [${selected==='kslab'?'0, 0, 0':'49151, 1, 0'}] · ${d.source}`;
+    draw();
+  }
+  function restore(state) {const value=state?.modelContent?.kernel;if(cases[value]) selected=value;render();}
+  pick.addEventListener('change',()=>{selected=pick.value;render();if(window.openai?.setWidgetState) window.openai.setWidgetState({modelContent:{kernel:selected},privateContent:null}).catch(()=>{});});
+  window.addEventListener('openai:set_globals',event=>{if(event.detail?.globals?.widgetState)restore(event.detail.globals.widgetState);});
+  new ResizeObserver(draw).observe(diagram);
+  restore(window.openai?.widgetState);
+})();
+</script>

@@ -209,7 +209,61 @@ pub fn rope(
     let graph = &x.graph;
     let ops = prepare(graph, x, cos, layout, pos)?;
     let (xi, ci, si) = (x.id, cos.id, sin.id);
-    core_op(graph, move |t| rope_defn(t, xi, ci, si, &ops))
+    let caps = graph.session().caps();
+    core_op(graph, move |t| {
+        let result = rope_defn(t, xi, ci, si, &ops)?;
+        let shape = t.shape_of(xi);
+        if caps
+            .execution_profile
+            .enabled("FUSOR_PROFILE_FUSED_DECODE_ROPE")
+            && caps.kind == fusor_ir::device::DeviceKind::Gpu
+            && caps.limits.max_compute_invocations_per_workgroup >= 256
+            && caps.limits.max_compute_workgroup_size[0] >= 256
+            && shape[2] == Dim::ONE
+            && shape[3].as_const().is_some_and(|n| n > 0 && n <= 256)
+            && shape
+                .iter()
+                .try_fold(1u64, |n, d| n.checked_mul(d.as_const()?))
+                .is_some_and(|n| n > 0 && n <= u64::from(u32::MAX))
+            && [xi, ci, si].iter().all(|id| {
+                t.dtype_of(*id) == fusor_ir::dtype::Dtype::F32
+                    && t.facts(*id).numeric.reassoc
+                    && t.facts(*id).numeric.contract
+            })
+            && let RopePos::Positions(position) = ops.rows
+            && t.dtype_of(position) == fusor_ir::dtype::Dtype::U32
+            && t.shape_of(position).as_slice() == [Dim::ONE]
+            && t.shape_of(ci) == t.shape_of(si)
+            && t.shape_of(ci)
+                .iter()
+                .try_fold(1u64, |n, d| n.checked_mul(d.as_const()?))
+                .is_some_and(|n| n > 0 && n <= u64::from(u32::MAX))
+        {
+            use fusor_ir::ir::launch::{AccessPlan, IndexSpace, Launch, Operand, ScheduleDomain};
+            use fusor_ir::shape::Layout;
+            let operands = [xi, ci, si, position]
+                .into_iter()
+                .map(|src| Operand {
+                    src,
+                    layout: Layout::contiguous(&t.shape_of(src)),
+                    access: AccessPlan::Alias,
+                })
+                .collect();
+            let head_dim = shape[3].as_const().unwrap() as u32;
+            let fused = t
+                .graph_mut()
+                .builder(&caps)
+                .add_launch(Launch::DecodeRope {
+                    output: IndexSpace::new(shape),
+                    head_dim,
+                    interleaved: layout == RopeLayout::Interleaved,
+                    ops: operands,
+                    sched: ScheduleDomain::Point,
+                })?;
+            t.graph_mut().builder(&caps).union(result, fused)?;
+        }
+        Ok(result)
+    })
 }
 
 /// `cat(-x2, x1)` over the last axis, exposed because callers spell it

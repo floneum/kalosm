@@ -272,7 +272,52 @@ fn lower_family(
             ScheduleDomain::Sgemm(dom.into())
         }
         Family::Sgemv => {
-            let dom = sgemv_domain(&cx);
+            let mut dom = sgemv_domain(&cx);
+            if mnk.m == Dim::ONE
+                && mnk.batch == Dim::ONE
+                && matches!(fb.dtype, Dtype::Q(fusor_ir::dtype::QFmt::Q4K))
+                && mnk.n.as_const().is_some_and(|n| n >= 16384)
+                && mnk.k.as_const().is_some_and(|k| k >= 4096)
+                && let Some(pin) =
+                    &crate::flags::for_profile(cx.caps.execution_profile).pin_large_q4_sgemv
+            {
+                assert!(
+                    pin.len() == 5,
+                    "FUSOR_PIN_LARGE_Q4_SGEMV requires vector,subgroups,cols,parts,gap"
+                );
+                dom.params
+                    .retain(|p| [p.vector, p.subgroups, p.cols, p.parts, p.gap] == pin.as_slice());
+            }
+            if mnk.m == Dim::ONE
+                && mnk.batch == Dim::ONE
+                && matches!(fb.dtype, Dtype::Q(fusor_ir::dtype::QFmt::Q6K))
+                && mnk.n.as_const().is_some_and(|n| n >= 16384)
+                && mnk.k.as_const().is_some_and(|k| k >= 4096)
+                && let Some(pin) =
+                    &crate::flags::for_profile(cx.caps.execution_profile).pin_large_q6_sgemv
+            {
+                assert!(
+                    pin.len() == 5,
+                    "FUSOR_PIN_LARGE_Q6_SGEMV requires vector,subgroups,cols,parts,gap"
+                );
+                dom.params
+                    .retain(|p| [p.vector, p.subgroups, p.cols, p.parts, p.gap] == pin.as_slice());
+            }
+            if !fa.dtype.is_quantized()
+                && !fb.dtype.is_quantized()
+                && mnk.m.as_const().is_some_and(|m| m <= 4)
+                && mnk.k.as_const().is_some_and(|k| k <= 512)
+                && mnk.n != Dim::ONE
+                && let Some(pin) =
+                    &crate::flags::for_profile(cx.caps.execution_profile).pin_small_dense_sgemv
+            {
+                assert!(
+                    pin.len() == 5,
+                    "FUSOR_PIN_SMALL_DENSE_SGEMV requires vector,subgroups,cols,parts,gap"
+                );
+                dom.params
+                    .retain(|p| [p.vector, p.subgroups, p.cols, p.parts, p.gap] == pin.as_slice());
+            }
             if dom.params.is_empty() {
                 return None;
             }

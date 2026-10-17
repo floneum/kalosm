@@ -1,0 +1,18 @@
+   Compiling fusor-gpu v0.1.0 (/private/tmp/training-kernel-visualizer/fusor/fusor-gpu)
+    Finished `test` profile [optimized + debuginfo] target(s) in 11.05s
+     Running unittests src/lib.rs (fusor/target/debug/deps/fusor_gpu-dbb2bda425f8a2ee)
+
+running 11 tests
+test caps::tests::advertised_mixed_coop_requires_both_features ... ok
+test launch::stream_prefix_respects_the_complete_inflight_budget ... ok
+test pool::tests::allocation_slack_is_bounded_without_padding_copy_lengths ... ok
+test pool::tests::growing_attention_scratch_reuses_size_classes ... ok
+test pool::tests::reuse_keeps_a_size_class_ahead_of_older_idle_storage ... ok
+test target::warm::tests::snapshot_checks_body_grid_and_schedule_but_not_runtime_scalars ... ok
+test pool::tests::idle_budget_bounds_growing_kv_scratch_and_keeps_live_buffers ... ok
+test launch::cancel_tests::unmap_cancels_a_pending_map ... ok
+test pool::tests::mapped_upload_roundtrip_and_reuse ... ok
+test emit::tests::subgroup_sum_tracks_active_lanes_across_scopes ... ok
+test emit::tests::block_storage_preserves_masked_flat_and_row_accesses ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.78s

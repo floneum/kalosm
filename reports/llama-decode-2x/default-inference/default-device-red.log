@@ -1,0 +1,22 @@
+   Compiling kalosm-llama v0.4.1 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/models/kalosm-llama)
+    Finished `test` profile [optimized] target(s) in 4.61s
+     Running unittests src/lib.rs (target/debug/deps/kalosm_llama-7d09d11c328612b6)
+
+running 1 test
+test default_execution_tests::ordinary_builder_requests_inference_defaults ... default builder adapter: Metal/Apple M2 Max, profile: General
+
+thread 'default_execution_tests::ordinary_builder_requests_inference_defaults' (15099542) panicked at models/kalosm-llama/src/lib.rs:486:13:
+assertion `left == right` failed
+  left: General
+ right: LowLatency
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+
+failures:
+
+failures:
+    default_execution_tests::ordinary_builder_requests_inference_defaults
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.80s
+
+error: test failed, to rerun pass `-p kalosm-llama --lib`

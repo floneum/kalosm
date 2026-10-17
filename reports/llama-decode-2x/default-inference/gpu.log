@@ -1,0 +1,44 @@
+   Compiling serde_core v1.0.228
+   Compiling bitflags v2.13.0
+   Compiling indexmap v2.14.0
+   Compiling objc2-core-foundation v0.3.2
+   Compiling objc2-foundation v0.3.2
+   Compiling hashbrown v0.16.1
+   Compiling objc2-metal v0.3.2
+   Compiling arrayvec v0.7.6
+   Compiling wgpu-types v29.0.4
+   Compiling naga v29.0.3 (https://github.com/ealmloff/wgpu?rev=24a7d3577213fc147637fe7fb20e0e845a74df8a#24a7d357)
+   Compiling objc2-quartz-core v0.3.2
+   Compiling profiling-procmacros v1.0.18
+   Compiling profiling v1.0.18
+   Compiling raw-window-metal v1.1.0
+   Compiling wgpu-naga-bridge v29.0.4
+   Compiling wgpu-hal v29.0.4
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.150
+   Compiling wgpu-core-deps-apple v29.0.4
+   Compiling memchr v2.8.1
+   Compiling fusor-gguf v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-gguf)
+   Compiling wgpu-core v29.0.4
+   Compiling wgpu v29.0.4 (https://github.com/ealmloff/wgpu?rev=24a7d3577213fc147637fe7fb20e0e845a74df8a#24a7d357)
+   Compiling fusor-cost v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-cost)
+   Compiling fusor-tile v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-tile)
+   Compiling fusor-gpu v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-gpu)
+    Finished `test` profile [optimized] target(s) in 1m 37s
+     Running unittests src/lib.rs (target/debug/deps/fusor_gpu-b41af50269df5f1e)
+
+running 12 tests
+test caps::tests::advertised_mixed_coop_requires_both_features ... ok
+test device::profile_tests::inference_profile_falls_back_before_requesting_unsupported_limits ... ok
+test emit::tests::block_storage_preserves_masked_flat_and_row_accesses ... ok
+test emit::tests::subgroup_sum_tracks_active_lanes_across_scopes ... ok
+test launch::cancel_tests::unmap_cancels_a_pending_map ... ok
+test launch::stream_prefix_respects_the_complete_inflight_budget ... ok
+test pool::tests::allocation_slack_is_bounded_without_padding_copy_lengths ... ok
+test pool::tests::growing_attention_scratch_reuses_size_classes ... ok
+test pool::tests::idle_budget_bounds_growing_kv_scratch_and_keeps_live_buffers ... ok
+test pool::tests::mapped_upload_roundtrip_and_reuse ... ok
+test pool::tests::reuse_keeps_a_size_class_ahead_of_older_idle_storage ... ok
+test target::warm::tests::snapshot_checks_body_grid_and_schedule_but_not_runtime_scalars ... ok
+
+test result: ok. 12 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.80s

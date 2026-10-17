@@ -276,6 +276,64 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             }
         }
 
+        Launch::DecodeAttention {
+            output,
+            keys,
+            chunk,
+            ..
+        } => {
+            let heads =
+                output.dims[0].as_const().unwrap_or(0) * output.dims[1].as_const().unwrap_or(0);
+            let splits = if *chunk == 0 {
+                1
+            } else {
+                u64::from(keys.div_ceil(*chunk))
+            };
+            Work {
+                macs: heads
+                    .saturating_mul(128)
+                    .saturating_mul(u64::from(*keys))
+                    .saturating_mul(2),
+                transcendentals: heads * u64::from(*keys),
+                index_ops: 0,
+                // Logical shared-memory requests: scores, softmax, broadcast
+                // probability reads, the two reductions and the PV close.
+                // This is traffic; allocation is priced separately in tile_bytes.
+                wg_bytes: heads
+                    .saturating_mul(
+                        u64::from(*keys)
+                            .saturating_mul(36)
+                            .saturating_add(6160 * splits),
+                    )
+                    .saturating_mul(4),
+            }
+        }
+        Launch::DecodeAttentionMerge { output, splits, .. } => Work {
+            macs: output
+                .iterations()
+                .unwrap_or(0)
+                .saturating_mul(u64::from(*splits))
+                .saturating_mul(2),
+            transcendentals: output
+                .iterations()
+                .unwrap_or(0)
+                .saturating_mul(u64::from(*splits)),
+            ..Work::default()
+        },
+        Launch::DecodeRope { output, .. } => Work {
+            macs: output.iterations().unwrap_or(0).saturating_mul(2),
+            ..Work::default()
+        },
+        Launch::RmsNorm {
+            output, width, ops, ..
+        } => Work {
+            macs: output
+                .iterations()
+                .unwrap_or(0)
+                .saturating_mul(3 + u64::from(ops.len() == 3)),
+            transcendentals: output.iterations().unwrap_or(0) / u64::from(*width).max(1),
+            ..Work::default()
+        },
         // Members carry their own work; sequencing adds none.
         Launch::Slab { .. } | Launch::Group { .. } => Work::default(),
     }

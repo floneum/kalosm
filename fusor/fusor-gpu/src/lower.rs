@@ -3,9 +3,12 @@
 //! never re-derived; a mismatch is a broken plan ([`Error::Plan`]).
 
 pub(crate) mod contract;
+mod decode_attention;
+mod decode_rope;
 pub(crate) mod gather_scatter;
 pub(crate) mod group;
 pub(crate) mod map_fold;
+mod rms_norm;
 pub(crate) mod slab;
 
 use fusor_cost::realize::distribute_workgroups;
@@ -16,7 +19,7 @@ use fusor_ir::egraph::Id;
 use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
     Addr, Buffer, BufferAccess, BufferDecl, Builtin, ElementType, KernelIr, MemoryLevel,
-    ScalarElement, Source, Stmt, TileCompareOp, TileExpr, TileLayout,
+    ScalarElement, Source, Stmt, StorageView, TileCompareOp, TileExpr, TileLayout,
 };
 use fusor_ir::ir::launch::{ContractSide, IndexSpace, Launch, Operand, SchedPoint};
 use fusor_ir::ir::{Node, Op};
@@ -381,9 +384,49 @@ pub(crate) struct Ctx<'a> {
     /// The fewest lanes a member may lower at: a group runs every member at
     /// its widest member's block.
     pub block_floor: u32,
+    pub q4_variant: u8,
 }
 
 impl<'a> Ctx<'a> {
+    /// Give a complete, sole-binding quantized word buffer explicit block rows.
+    /// This changes checked address structure, never its bytes or binding size.
+    pub(crate) fn block_storage_view(
+        &mut self,
+        view: &StorageView,
+        width: u32,
+    ) -> Option<StorageView> {
+        let elements = view.buffer.layout.element_count();
+        if width == 0
+            || elements == 0
+            || !elements.is_multiple_of(u64::from(width))
+            || view.offset != 0
+            || view.buffer.element != ScalarElement::U32.element()
+            || self
+                .buffers
+                .iter()
+                .filter(|v| v.binding == view.buffer.binding)
+                .count()
+                != 1
+        {
+            return None;
+        }
+        let rows = u32::try_from(elements / u64::from(width)).ok()?;
+        let layout = TileLayout::contiguous(MemoryLevel::Storage, &[rows, width]);
+        let mut decl = (*view.buffer).clone();
+        decl.layout = layout.clone();
+        let buffer = Arc::new(decl);
+        let slot = self
+            .buffers
+            .iter_mut()
+            .find(|v| v.binding == buffer.binding)?;
+        *slot = buffer.clone();
+        Some(StorageView {
+            buffer,
+            offset: 0,
+            layout,
+        })
+    }
+
     /// Build the buffer table for one launch over the plan's binding-0 pack.
     pub(crate) fn with_pack(
         caps: &'a Caps,
@@ -478,6 +521,26 @@ impl<'a> Ctx<'a> {
                 fusor_ir::extract::BindKind::Read => BufferAccess::Read,
                 _ => BufferAccess::ReadWrite,
             };
+            // Runtime-verified cache donation gives base and output one
+            // writable binding. Emit one declaration, and map both classes
+            // onto it so wgpu never sees overlapping read/write bindings.
+            if let Some(slot) = buffers
+                .iter()
+                .position(|v| v.binding == plan_binding.binding)
+            {
+                if access != BufferAccess::ReadWrite
+                    || buffers[slot].access != BufferAccess::ReadWrite
+                    || buffers[slot].element != ElementType::Scalar(scalar_element(dtype))
+                    || buffers[slot].layout
+                        != TileLayout::contiguous(MemoryLevel::Storage, &[extent.max(1)])
+                {
+                    return Err(Error::Plan("incompatible shared storage binding".into()));
+                }
+                for member in cx.graph.class_ids(class) {
+                    slot_of.insert(member, slot);
+                }
+                continue;
+            }
             // Keyed by every id in the class (`Union` spine included): an
             // `Operand::src` may name any of them.
             for member in cx.graph.class_ids(class) {
@@ -497,6 +560,7 @@ impl<'a> Ctx<'a> {
             pack,
             workgroup: None,
             block_floor: 0,
+            q4_variant: crate::flags::for_profile(caps.execution_profile).q4_variant,
         })
     }
 
@@ -873,7 +937,10 @@ impl<'a> Ctx<'a> {
             K::Uniform(sym) if expr.dtype() == Dtype::U32 && self.pack.dim_slot(*sym).is_some() => {
                 self.dim_expr(Dim::Sym(*sym))?
             }
-            K::Uniform(sym) => self.scalar_expr(*sym)?,
+            K::Uniform(sym) => self.b.cast(
+                self.scalar_expr(*sym)?,
+                scalar_element(expr.dtype()).element(),
+            ),
             K::IndexOf(axis) => {
                 let c = coords.get(*axis as usize).cloned().ok_or_else(|| {
                     Error::Plan(format!(
@@ -1058,6 +1125,16 @@ impl<'a> Ctx<'a> {
         if let Some(lit) = self.const_operand(operand.src) {
             return Ok(lit);
         }
+        if let Op::Logical(fusor_ir::ir::logical::Logical::Leaf(
+            fusor_ir::ir::logical::LeafKind::Uniform { sym, dtype },
+        )) = &self.cx.graph.node(self.cx.selected(operand.src)).op
+        {
+            return self.eval_scalar(
+                &fusor_ir::scalar::ScalarExpr::uniform(*sym, *dtype),
+                &[],
+                &[],
+            );
+        }
         let index = self.repad_index(operand.src, index)?;
         // A quantized operand runs its decode program at flat index `i`.
         if let Dtype::Q(fmt) = self.plan_dtype(operand.src)? {
@@ -1161,6 +1238,21 @@ pub(crate) fn lower_node(
     lower_launch(Ctx::with_pack(caps, cx, binding, pack)?, node, theta, false)
 }
 
+/// The diagnostic selector is part of the target's artifact cache key.
+pub(crate) fn lower_node_with_q4_variant(
+    caps: &Caps,
+    node: &Node,
+    theta: SchedPoint,
+    cx: &LowerCtx<'_>,
+    binding: DimBinding,
+    pack: std::sync::Arc<UniformPack>,
+    q4_variant: u8,
+) -> Result<KernelIr> {
+    let mut ctx = Ctx::with_pack(caps, cx, binding, pack)?;
+    ctx.q4_variant = q4_variant;
+    lower_launch(ctx, node, theta, false)
+}
+
 /// [`lower_node`] for a group member: continued decl numbering, workgroup
 /// index `workgroup`, at least `block_floor` lanes, the group's buffer table.
 #[allow(clippy::too_many_arguments)]
@@ -1174,11 +1266,13 @@ pub(crate) fn lower_member(
     workgroup: TileExpr,
     block_floor: u32,
     buffers: &[Buffer],
+    q4_variant: u8,
 ) -> Result<KernelIr> {
     let mut ctx = Ctx::with_pack_in(caps, cx, binding, pack)?;
     ctx.buffers = buffers.to_vec();
     ctx.workgroup = Some(workgroup);
     ctx.block_floor = block_floor;
+    ctx.q4_variant = q4_variant;
     lower_launch(ctx, node, theta, true)
 }
 
@@ -1190,6 +1284,10 @@ fn lower_launch(ctx: Ctx<'_>, node: &Node, theta: SchedPoint, member: bool) -> R
         )));
     };
     match op {
+        Launch::DecodeAttention { .. } => decode_attention::lower(ctx, op),
+        Launch::DecodeAttentionMerge { .. } => decode_attention::lower_merge(ctx, op),
+        Launch::DecodeRope { .. } => decode_rope::lower(ctx, op),
+        Launch::RmsNorm { .. } => rms_norm::lower(ctx, op),
         Launch::Map { .. } => map_fold::lower_kmap(ctx, op, theta),
         Launch::Fold { .. } | Launch::StreamFold { .. } => map_fold::lower_kfold(ctx, op, theta),
         Launch::Contract { family, .. } => contract::lower_contract(ctx, op, *family, theta),

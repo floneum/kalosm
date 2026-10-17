@@ -1,0 +1,11 @@
+    Checking kalosm-model-types v0.4.0 (/private/tmp/training-kernel-visualizer/interfaces/kalosm-model-types)
+    Checking kalosm-sample v0.4.0 (/private/tmp/training-kernel-visualizer/interfaces/kalosm-sample)
+    Checking fusor-gpu v0.1.0 (/private/tmp/training-kernel-visualizer/fusor/fusor-gpu)
+    Checking kalosm-language-model v0.4.1 (/private/tmp/training-kernel-visualizer/interfaces/language-model)
+    Checking kalosm-common v0.4.0 (/private/tmp/training-kernel-visualizer/interfaces/kalosm-common)
+    Checking fusor v0.1.0 (/private/tmp/training-kernel-visualizer/fusor/fusor)
+    Checking kalosm-streams v0.4.0 (/private/tmp/training-kernel-visualizer/interfaces/kalosm-streams)
+    Checking kalosm-tokenizer v0.4.0 (/private/tmp/training-kernel-visualizer/models/kalosm-tokenizer)
+    Checking kalosm v0.4.0 (/private/tmp/training-kernel-visualizer/interfaces/kalosm)
+    Checking kalosm-llama v0.4.1 (/private/tmp/training-kernel-visualizer/models/kalosm-llama)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 4.86s

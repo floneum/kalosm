@@ -1,0 +1,95 @@
+    Checking smallvec v1.15.1
+   Compiling cranelift-srcgen v0.125.4
+   Compiling cranelift-assembler-x64-meta v0.125.4
+    Checking log v0.4.32
+    Checking zerocopy v0.8.50
+   Compiling cranelift-isle v0.125.4
+   Compiling cranelift-codegen-shared v0.125.4
+   Compiling heck v0.5.0
+   Compiling cranelift-codegen-meta v0.125.4
+   Compiling cranelift-assembler-x64 v0.125.4
+   Compiling target-lexicon v0.13.5
+    Checking bytemuck v1.25.0
+   Compiling cranelift-codegen v0.125.4
+    Checking hashbrown v0.15.5
+    Checking regalloc2 v0.13.5
+    Checking wasmtime-internal-math v38.0.4
+    Checking half v2.7.1
+   Compiling anyhow v1.0.102
+    Checking fusor-ir v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-ir)
+    Checking serde v1.0.228
+    Checking parking_lot_core v0.9.12
+    Checking parking_lot v0.12.5
+    Checking mach2 v0.4.3
+    Checking futures-core v0.3.32
+    Checking http v1.4.1
+   Compiling num-traits v0.2.19
+    Checking region v3.0.2
+    Checking fusor-gguf v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-gguf)
+    Checking httparse v1.10.1
+    Checking cranelift-module v0.125.4
+    Checking wasmtime-internal-jit-icache-coherence v38.0.4
+    Checking tracing-core v0.1.36
+    Checking cranelift-native v0.125.4
+    Checking slab v0.4.12
+    Checking futures-util v0.3.32
+    Checking rustls v0.23.40
+    Checking ureq-proto v0.6.0
+    Checking tracing v0.1.44
+    Checking thiserror v2.0.18
+    Checking cranelift-jit v0.125.4
+    Checking futures-channel v0.3.32
+    Checking fusor-tile v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-tile)
+    Checking cranelift-frontend v0.125.4
+    Checking kalosm-model-types v0.4.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/interfaces/kalosm-model-types)
+    Checking ppv-lite86 v0.2.21
+    Checking ureq v3.3.0
+    Checking minijinja v2.20.0
+    Checking regex-automata v0.4.14
+    Checking rand_chacha v0.9.0
+    Checking fusor-cpu v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-cpu)
+    Checking fusor-cost v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-cost)
+    Checking fusor-autograd v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-autograd)
+    Checking fusor v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor)
+warning: unused variable: `host_roots`
+    --> fusor/fusor/src/session.rs:1593:13
+     |
+1593 |         let host_roots = host_start.map(|s| s.elapsed());
+     |             ^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_host_roots`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused variable: `host_leaves`
+    --> fusor/fusor/src/session.rs:1626:13
+     |
+1626 |         let host_leaves = host_start.map(|s| s.elapsed());
+     |             ^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_host_leaves`
+
+warning: unused variable: `host_donation`
+    --> fusor/fusor/src/session.rs:1636:13
+     |
+1636 |         let host_donation = host_start.map(|s| s.elapsed());
+     |             ^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_host_donation`
+
+warning: unused variable: `host_buffers`
+    --> fusor/fusor/src/session.rs:1671:13
+     |
+1671 |         let host_buffers = host_start.map(|s| s.elapsed());
+     |             ^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_host_buffers`
+
+warning: unused variable: `host_requested`
+    --> fusor/fusor/src/session.rs:1692:13
+     |
+1692 |         let host_requested = host_start.map(|s| s.elapsed());
+     |             ^^^^^^^^^^^^^^ help: if this is intentional, prefix it with an underscore: `_host_requested`
+
+warning: `fusor` (lib) generated 5 warnings (run `cargo fix --lib -p fusor` to apply 5 suggestions)
+    Checking kalosm-common v0.4.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/interfaces/kalosm-common)
+    Checking chrono v0.4.45
+    Checking rand v0.9.4
+    Checking regex v1.12.3
+    Checking minijinja-contrib v2.20.0
+    Checking kalosm-language-model v0.4.1 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/interfaces/language-model)
+    Checking kalosm-tokenizer v0.4.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/models/kalosm-tokenizer)
+    Checking kalosm-llama v0.4.1 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/models/kalosm-llama)
+    Finished `dev` profile [optimized] target(s) in 45.21s

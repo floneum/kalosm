@@ -1,0 +1,11 @@
+   Compiling fusor-gpu v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-gpu)
+   Compiling fusor v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor)
+   Compiling kalosm-llama v0.4.1 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/models/kalosm-llama)
+    Finished `test` profile [optimized] target(s) in 33.33s
+     Running unittests src/lib.rs (target/debug/deps/kalosm_llama-7d09d11c328612b6)
+
+running 1 test
+test default_execution_tests::ordinary_builder_requests_inference_defaults ... default builder adapter: Metal/Apple M2 Max, profile: LowLatency
+ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 17 filtered out; finished in 0.84s

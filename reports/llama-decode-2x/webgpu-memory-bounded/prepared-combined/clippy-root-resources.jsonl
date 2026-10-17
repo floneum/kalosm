@@ -1,0 +1,13 @@
+{"event": "preflight", "elapsed_seconds": 0.0024373329943045974, "snapshot": {"available_bytes": 21683683328, "compressed_bytes": 1749549056, "swapout_bytes": 67086057472, "disk_free_bytes": 11218788352}, "command": ["cargo", "clippy", "-p", "kalosm-llama", "--all-targets", "--features", "kernel-visualize", "--offline", "--", "-D", "warnings"], "model_bytes": 0}
+{"event": "started", "elapsed_seconds": 0.004895915975794196, "pid": 9382}
+{"event": "sample", "elapsed_seconds": 0.006957833014894277, "snapshot": {"available_bytes": 21683306496, "compressed_bytes": 1749549056, "swapout_bytes": 67086057472, "disk_free_bytes": 11218784256}, "child_rss_bytes": null}
+{"event": "sample", "elapsed_seconds": 0.5135127909597941, "snapshot": {"available_bytes": 21577154560, "compressed_bytes": 1749549056, "swapout_bytes": 67086057472, "disk_free_bytes": 11218370560}, "child_rss_bytes": null}
+{"event": "sample", "elapsed_seconds": 1.0252507909899577, "snapshot": {"available_bytes": 21538308096, "compressed_bytes": 1749549056, "swapout_bytes": 67086057472, "disk_free_bytes": 11217702912}, "child_rss_bytes": null}
+{"event": "sample", "elapsed_seconds": 1.5320202499860898, "snapshot": {"available_bytes": 21557559296, "compressed_bytes": 1749549056, "swapout_bytes": 67086057472, "disk_free_bytes": 11217661952}, "child_rss_bytes": null}
+{"event": "sample", "elapsed_seconds": 2.04364941600943, "snapshot": {"available_bytes": 21530968064, "compressed_bytes": 1749549056, "swapout_bytes": 67086057472, "disk_free_bytes": 11216699392}, "child_rss_bytes": null}
+{"event": "sample", "elapsed_seconds": 2.5548440410057083, "snapshot": {"available_bytes": 21536260096, "compressed_bytes": 1749549056, "swapout_bytes": 67086057472, "disk_free_bytes": 11216695296}, "child_rss_bytes": null}
+{"event": "sample", "elapsed_seconds": 3.063147332984954, "snapshot": {"available_bytes": 21594193920, "compressed_bytes": 1749549056, "swapout_bytes": 67086057472, "disk_free_bytes": 11216359424}, "child_rss_bytes": null}
+{"event": "sample", "elapsed_seconds": 3.5701353329932317, "snapshot": {"available_bytes": 21598240768, "compressed_bytes": 1749549056, "swapout_bytes": 67086057472, "disk_free_bytes": 11215544320}, "child_rss_bytes": null}
+{"event": "sample", "elapsed_seconds": 4.07383462501457, "snapshot": {"available_bytes": 21622800384, "compressed_bytes": 1749549056, "swapout_bytes": 67086057472, "disk_free_bytes": 11215339520}, "child_rss_bytes": null}
+{"event": "sample", "elapsed_seconds": 4.581863166007679, "snapshot": {"available_bytes": 21588557824, "compressed_bytes": 1749549056, "swapout_bytes": 67086057472, "disk_free_bytes": 11215155200}, "child_rss_bytes": null}
+{"event": "complete", "elapsed_seconds": 4.966175000008661, "returncode": 0}

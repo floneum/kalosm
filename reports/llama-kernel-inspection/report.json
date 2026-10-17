@@ -1,0 +1,1233 @@
+{
+  "analyzed": 3,
+  "body_filters": [
+    "51d6113fe37d77d1205997353dcd40cc",
+    "481141fe3bada9eda021280fd023a22c",
+    "bfc7b725443521abb90f62873a98d31e"
+  ],
+  "bounds_note": "Trace bounds failures compare logical IR addresses with declared resource extents before backend clamping/robustness; they are not proof of a runtime out-of-bounds access.",
+  "config": {
+    "bank_width_bytes": 4,
+    "banks": 32,
+    "cache_bytes": 16384,
+    "cache_line_bytes": 128,
+    "subgroup_size": 32,
+    "transaction_bytes": 32
+  },
+  "dispatch_scope": "Successful nonempty submissions through GpuTarget::resolve, including warm artifact hits and tuning runs. Counts do not establish which plan ultimately wins. Direct Target::launch calls are excluded.",
+  "inference_error": null,
+  "kernels": [
+    {
+      "block": 32,
+      "features": [
+        "reduction"
+      ],
+      "grid": [
+        49152,
+        2,
+        1
+      ],
+      "hotspots": [
+        {
+          "hints": [
+            "4 sectors vs packed lower bound 1: inspect lane stride/alignment or transpose the tile."
+          ],
+          "metrics": {
+            "bank_conflict_steps": 0,
+            "cache_evictions": 0,
+            "cache_fill_bytes": 0,
+            "cache_hits": 4,
+            "cache_misses": 0,
+            "cross_subgroup_reuse_bytes": 0,
+            "cross_workgroup_reuse_bytes": 0,
+            "ideal_bank_degree": 0,
+            "ideal_transactions": 1,
+            "max_bank_degree": 0,
+            "requested_bytes": 16,
+            "same_subgroup_reuse_bytes": 0,
+            "steps": 1,
+            "transactions": 4,
+            "unique_bytes": 16,
+            "within_subgroup_duplicate_bytes": 0
+          },
+          "severity": 3,
+          "source": "body[0].value.accept",
+          "subgroup": 0,
+          "workgroup": [
+            49151,
+            1,
+            0
+          ]
+        }
+      ],
+      "id": "481141fe3bada9eda021280fd023a22c-cb0b43dbe70a38cc",
+      "metrics": {
+        "bank_conflict_steps": 0,
+        "cache_evictions": 0,
+        "cache_fill_bytes": 1024,
+        "cache_hits": 248,
+        "cache_misses": 8,
+        "cross_subgroup_reuse_bytes": 0,
+        "cross_workgroup_reuse_bytes": 0,
+        "ideal_bank_degree": 0,
+        "ideal_transactions": 128,
+        "max_bank_degree": 0,
+        "requested_bytes": 1280,
+        "same_subgroup_reuse_bytes": 0,
+        "steps": 192,
+        "transactions": 320,
+        "unique_bytes": 1280,
+        "within_subgroup_duplicate_bytes": 0
+      },
+      "name": "kfold",
+      "observations": 6,
+      "runs": [
+        "long-prefill-and-decode"
+      ],
+      "sampled_workgroups": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          2,
+          0,
+          0
+        ],
+        [
+          3,
+          0,
+          0
+        ],
+        [
+          4,
+          0,
+          0
+        ],
+        [
+          5,
+          0,
+          0
+        ],
+        [
+          6,
+          0,
+          0
+        ],
+        [
+          7,
+          0,
+          0
+        ],
+        [
+          8,
+          0,
+          0
+        ],
+        [
+          9,
+          0,
+          0
+        ],
+        [
+          10,
+          0,
+          0
+        ],
+        [
+          11,
+          0,
+          0
+        ],
+        [
+          12,
+          0,
+          0
+        ],
+        [
+          13,
+          0,
+          0
+        ],
+        [
+          14,
+          0,
+          0
+        ],
+        [
+          15,
+          0,
+          0
+        ],
+        [
+          16,
+          0,
+          0
+        ],
+        [
+          17,
+          0,
+          0
+        ],
+        [
+          18,
+          0,
+          0
+        ],
+        [
+          19,
+          0,
+          0
+        ],
+        [
+          20,
+          0,
+          0
+        ],
+        [
+          21,
+          0,
+          0
+        ],
+        [
+          22,
+          0,
+          0
+        ],
+        [
+          23,
+          0,
+          0
+        ],
+        [
+          24,
+          0,
+          0
+        ],
+        [
+          25,
+          0,
+          0
+        ],
+        [
+          26,
+          0,
+          0
+        ],
+        [
+          27,
+          0,
+          0
+        ],
+        [
+          28,
+          0,
+          0
+        ],
+        [
+          29,
+          0,
+          0
+        ],
+        [
+          30,
+          0,
+          0
+        ],
+        [
+          31,
+          0,
+          0
+        ],
+        [
+          49120,
+          1,
+          0
+        ],
+        [
+          49121,
+          1,
+          0
+        ],
+        [
+          49122,
+          1,
+          0
+        ],
+        [
+          49123,
+          1,
+          0
+        ],
+        [
+          49124,
+          1,
+          0
+        ],
+        [
+          49125,
+          1,
+          0
+        ],
+        [
+          49126,
+          1,
+          0
+        ],
+        [
+          49127,
+          1,
+          0
+        ],
+        [
+          49128,
+          1,
+          0
+        ],
+        [
+          49129,
+          1,
+          0
+        ],
+        [
+          49130,
+          1,
+          0
+        ],
+        [
+          49131,
+          1,
+          0
+        ],
+        [
+          49132,
+          1,
+          0
+        ],
+        [
+          49133,
+          1,
+          0
+        ],
+        [
+          49134,
+          1,
+          0
+        ],
+        [
+          49135,
+          1,
+          0
+        ],
+        [
+          49136,
+          1,
+          0
+        ],
+        [
+          49137,
+          1,
+          0
+        ],
+        [
+          49138,
+          1,
+          0
+        ],
+        [
+          49139,
+          1,
+          0
+        ],
+        [
+          49140,
+          1,
+          0
+        ],
+        [
+          49141,
+          1,
+          0
+        ],
+        [
+          49142,
+          1,
+          0
+        ],
+        [
+          49143,
+          1,
+          0
+        ],
+        [
+          49144,
+          1,
+          0
+        ],
+        [
+          49145,
+          1,
+          0
+        ],
+        [
+          49146,
+          1,
+          0
+        ],
+        [
+          49147,
+          1,
+          0
+        ],
+        [
+          49148,
+          1,
+          0
+        ],
+        [
+          49149,
+          1,
+          0
+        ],
+        [
+          49150,
+          1,
+          0
+        ],
+        [
+          49151,
+          1,
+          0
+        ]
+      ],
+      "status": "analyzed",
+      "submitted_dispatches": 6,
+      "trace": "kernels/481141fe3bada9eda021280fd023a22c-cb0b43dbe70a38cc.trace.json",
+      "uniforms_supplied": true
+    },
+    {
+      "block": 32,
+      "features": [
+        "reduction"
+      ],
+      "grid": [
+        49152,
+        2,
+        1
+      ],
+      "hotspots": [
+        {
+          "hints": [
+            "4 sectors vs packed lower bound 1: inspect lane stride/alignment or transpose the tile."
+          ],
+          "metrics": {
+            "bank_conflict_steps": 0,
+            "cache_evictions": 0,
+            "cache_fill_bytes": 0,
+            "cache_hits": 4,
+            "cache_misses": 0,
+            "cross_subgroup_reuse_bytes": 0,
+            "cross_workgroup_reuse_bytes": 0,
+            "ideal_bank_degree": 0,
+            "ideal_transactions": 1,
+            "max_bank_degree": 0,
+            "requested_bytes": 16,
+            "same_subgroup_reuse_bytes": 0,
+            "steps": 1,
+            "transactions": 4,
+            "unique_bytes": 16,
+            "within_subgroup_duplicate_bytes": 0
+          },
+          "severity": 3,
+          "source": "body[0].then[0].value.accept",
+          "subgroup": 0,
+          "workgroup": [
+            31,
+            0,
+            0
+          ]
+        },
+        {
+          "hints": [
+            "16 sectors vs packed lower bound 2: inspect lane stride/alignment or transpose the tile."
+          ],
+          "metrics": {
+            "bank_conflict_steps": 0,
+            "cache_evictions": 0,
+            "cache_fill_bytes": 0,
+            "cache_hits": 16,
+            "cache_misses": 0,
+            "cross_subgroup_reuse_bytes": 0,
+            "cross_workgroup_reuse_bytes": 0,
+            "ideal_bank_degree": 0,
+            "ideal_transactions": 2,
+            "max_bank_degree": 0,
+            "requested_bytes": 64,
+            "same_subgroup_reuse_bytes": 0,
+            "steps": 1,
+            "transactions": 16,
+            "unique_bytes": 64,
+            "within_subgroup_duplicate_bytes": 0
+          },
+          "severity": 14,
+          "source": "body[4].then[0].value.accept",
+          "subgroup": 0,
+          "workgroup": [
+            49151,
+            1,
+            0
+          ]
+        }
+      ],
+      "id": "51d6113fe37d77d1205997353dcd40cc-cb0b43dbe70a38cc",
+      "metrics": {
+        "bank_conflict_steps": 0,
+        "cache_evictions": 0,
+        "cache_fill_bytes": 2560,
+        "cache_hits": 620,
+        "cache_misses": 20,
+        "cross_subgroup_reuse_bytes": 0,
+        "cross_workgroup_reuse_bytes": 0,
+        "ideal_bank_degree": 0,
+        "ideal_transactions": 160,
+        "max_bank_degree": 0,
+        "requested_bytes": 2816,
+        "same_subgroup_reuse_bytes": 0,
+        "steps": 512,
+        "transactions": 704,
+        "unique_bytes": 2816,
+        "within_subgroup_duplicate_bytes": 0
+      },
+      "name": "kgroup",
+      "observations": 1,
+      "runs": [
+        "long-prefill-and-decode"
+      ],
+      "sampled_workgroups": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          2,
+          0,
+          0
+        ],
+        [
+          3,
+          0,
+          0
+        ],
+        [
+          4,
+          0,
+          0
+        ],
+        [
+          5,
+          0,
+          0
+        ],
+        [
+          6,
+          0,
+          0
+        ],
+        [
+          7,
+          0,
+          0
+        ],
+        [
+          8,
+          0,
+          0
+        ],
+        [
+          9,
+          0,
+          0
+        ],
+        [
+          10,
+          0,
+          0
+        ],
+        [
+          11,
+          0,
+          0
+        ],
+        [
+          12,
+          0,
+          0
+        ],
+        [
+          13,
+          0,
+          0
+        ],
+        [
+          14,
+          0,
+          0
+        ],
+        [
+          15,
+          0,
+          0
+        ],
+        [
+          16,
+          0,
+          0
+        ],
+        [
+          17,
+          0,
+          0
+        ],
+        [
+          18,
+          0,
+          0
+        ],
+        [
+          19,
+          0,
+          0
+        ],
+        [
+          20,
+          0,
+          0
+        ],
+        [
+          21,
+          0,
+          0
+        ],
+        [
+          22,
+          0,
+          0
+        ],
+        [
+          23,
+          0,
+          0
+        ],
+        [
+          24,
+          0,
+          0
+        ],
+        [
+          25,
+          0,
+          0
+        ],
+        [
+          26,
+          0,
+          0
+        ],
+        [
+          27,
+          0,
+          0
+        ],
+        [
+          28,
+          0,
+          0
+        ],
+        [
+          29,
+          0,
+          0
+        ],
+        [
+          30,
+          0,
+          0
+        ],
+        [
+          31,
+          0,
+          0
+        ],
+        [
+          49120,
+          1,
+          0
+        ],
+        [
+          49121,
+          1,
+          0
+        ],
+        [
+          49122,
+          1,
+          0
+        ],
+        [
+          49123,
+          1,
+          0
+        ],
+        [
+          49124,
+          1,
+          0
+        ],
+        [
+          49125,
+          1,
+          0
+        ],
+        [
+          49126,
+          1,
+          0
+        ],
+        [
+          49127,
+          1,
+          0
+        ],
+        [
+          49128,
+          1,
+          0
+        ],
+        [
+          49129,
+          1,
+          0
+        ],
+        [
+          49130,
+          1,
+          0
+        ],
+        [
+          49131,
+          1,
+          0
+        ],
+        [
+          49132,
+          1,
+          0
+        ],
+        [
+          49133,
+          1,
+          0
+        ],
+        [
+          49134,
+          1,
+          0
+        ],
+        [
+          49135,
+          1,
+          0
+        ],
+        [
+          49136,
+          1,
+          0
+        ],
+        [
+          49137,
+          1,
+          0
+        ],
+        [
+          49138,
+          1,
+          0
+        ],
+        [
+          49139,
+          1,
+          0
+        ],
+        [
+          49140,
+          1,
+          0
+        ],
+        [
+          49141,
+          1,
+          0
+        ],
+        [
+          49142,
+          1,
+          0
+        ],
+        [
+          49143,
+          1,
+          0
+        ],
+        [
+          49144,
+          1,
+          0
+        ],
+        [
+          49145,
+          1,
+          0
+        ],
+        [
+          49146,
+          1,
+          0
+        ],
+        [
+          49147,
+          1,
+          0
+        ],
+        [
+          49148,
+          1,
+          0
+        ],
+        [
+          49149,
+          1,
+          0
+        ],
+        [
+          49150,
+          1,
+          0
+        ],
+        [
+          49151,
+          1,
+          0
+        ]
+      ],
+      "status": "analyzed",
+      "submitted_dispatches": 1,
+      "trace": "kernels/51d6113fe37d77d1205997353dcd40cc-cb0b43dbe70a38cc.trace.json",
+      "uniforms_supplied": true
+    },
+    {
+      "block": 256,
+      "features": [
+        "workgroup_memory"
+      ],
+      "grid": [
+        20,
+        1,
+        1
+      ],
+      "hotspots": [
+        {
+          "hints": [
+            "Other subgroups read these bytes: consider workgroup staging if reuse repays stores and barriers; cache hits already help."
+          ],
+          "metrics": {
+            "bank_conflict_steps": 0,
+            "cache_evictions": 0,
+            "cache_fill_bytes": 0,
+            "cache_hits": 1,
+            "cache_misses": 0,
+            "cross_subgroup_reuse_bytes": 128,
+            "cross_workgroup_reuse_bytes": 0,
+            "ideal_bank_degree": 0,
+            "ideal_transactions": 4,
+            "max_bank_degree": 0,
+            "requested_bytes": 128,
+            "same_subgroup_reuse_bytes": 0,
+            "steps": 1,
+            "transactions": 4,
+            "unique_bytes": 128,
+            "within_subgroup_duplicate_bytes": 0
+          },
+          "severity": 0,
+          "source": "body[0].loop[0].then[0].value",
+          "subgroup": 7,
+          "workgroup": [
+            19,
+            0,
+            0
+          ]
+        },
+        {
+          "hints": [
+            "Other subgroups read these bytes: consider workgroup staging if reuse repays stores and barriers; cache hits already help."
+          ],
+          "metrics": {
+            "bank_conflict_steps": 0,
+            "cache_evictions": 0,
+            "cache_fill_bytes": 0,
+            "cache_hits": 1,
+            "cache_misses": 0,
+            "cross_subgroup_reuse_bytes": 128,
+            "cross_workgroup_reuse_bytes": 0,
+            "ideal_bank_degree": 0,
+            "ideal_transactions": 4,
+            "max_bank_degree": 0,
+            "requested_bytes": 128,
+            "same_subgroup_reuse_bytes": 0,
+            "steps": 1,
+            "transactions": 4,
+            "unique_bytes": 128,
+            "within_subgroup_duplicate_bytes": 0
+          },
+          "severity": 0,
+          "source": "body[10].loop[0].then[0].value.right",
+          "subgroup": 7,
+          "workgroup": [
+            19,
+            0,
+            0
+          ]
+        },
+        {
+          "hints": [
+            "Other subgroups read these bytes: consider workgroup staging if reuse repays stores and barriers; cache hits already help."
+          ],
+          "metrics": {
+            "bank_conflict_steps": 0,
+            "cache_evictions": 0,
+            "cache_fill_bytes": 0,
+            "cache_hits": 1,
+            "cache_misses": 0,
+            "cross_subgroup_reuse_bytes": 128,
+            "cross_workgroup_reuse_bytes": 0,
+            "ideal_bank_degree": 0,
+            "ideal_transactions": 4,
+            "max_bank_degree": 0,
+            "requested_bytes": 128,
+            "same_subgroup_reuse_bytes": 0,
+            "steps": 1,
+            "transactions": 4,
+            "unique_bytes": 128,
+            "within_subgroup_duplicate_bytes": 0
+          },
+          "severity": 0,
+          "source": "body[2].loop[0].then[0].value.right",
+          "subgroup": 7,
+          "workgroup": [
+            19,
+            0,
+            0
+          ]
+        },
+        {
+          "hints": [
+            "Other subgroups read these bytes: consider workgroup staging if reuse repays stores and barriers; cache hits already help."
+          ],
+          "metrics": {
+            "bank_conflict_steps": 0,
+            "cache_evictions": 0,
+            "cache_fill_bytes": 0,
+            "cache_hits": 1,
+            "cache_misses": 0,
+            "cross_subgroup_reuse_bytes": 128,
+            "cross_workgroup_reuse_bytes": 0,
+            "ideal_bank_degree": 0,
+            "ideal_transactions": 4,
+            "max_bank_degree": 0,
+            "requested_bytes": 128,
+            "same_subgroup_reuse_bytes": 0,
+            "steps": 1,
+            "transactions": 4,
+            "unique_bytes": 128,
+            "within_subgroup_duplicate_bytes": 0
+          },
+          "severity": 0,
+          "source": "body[4].loop[0].then[0].value",
+          "subgroup": 7,
+          "workgroup": [
+            19,
+            0,
+            0
+          ]
+        },
+        {
+          "hints": [
+            "Other subgroups read these bytes: consider workgroup staging if reuse repays stores and barriers; cache hits already help."
+          ],
+          "metrics": {
+            "bank_conflict_steps": 0,
+            "cache_evictions": 0,
+            "cache_fill_bytes": 0,
+            "cache_hits": 1,
+            "cache_misses": 0,
+            "cross_subgroup_reuse_bytes": 128,
+            "cross_workgroup_reuse_bytes": 0,
+            "ideal_bank_degree": 0,
+            "ideal_transactions": 4,
+            "max_bank_degree": 0,
+            "requested_bytes": 128,
+            "same_subgroup_reuse_bytes": 0,
+            "steps": 1,
+            "transactions": 4,
+            "unique_bytes": 128,
+            "within_subgroup_duplicate_bytes": 0
+          },
+          "severity": 0,
+          "source": "body[6].loop[0].then[0].value.right",
+          "subgroup": 7,
+          "workgroup": [
+            19,
+            0,
+            0
+          ]
+        },
+        {
+          "hints": [
+            "Other subgroups read these bytes: consider workgroup staging if reuse repays stores and barriers; cache hits already help."
+          ],
+          "metrics": {
+            "bank_conflict_steps": 0,
+            "cache_evictions": 0,
+            "cache_fill_bytes": 0,
+            "cache_hits": 1,
+            "cache_misses": 0,
+            "cross_subgroup_reuse_bytes": 128,
+            "cross_workgroup_reuse_bytes": 0,
+            "ideal_bank_degree": 0,
+            "ideal_transactions": 4,
+            "max_bank_degree": 0,
+            "requested_bytes": 128,
+            "same_subgroup_reuse_bytes": 0,
+            "steps": 1,
+            "transactions": 4,
+            "unique_bytes": 128,
+            "within_subgroup_duplicate_bytes": 0
+          },
+          "severity": 0,
+          "source": "body[8].loop[0].then[0].value",
+          "subgroup": 7,
+          "workgroup": [
+            19,
+            0,
+            0
+          ]
+        }
+      ],
+      "id": "bfc7b725443521abb90f62873a98d31e-b1cc5ee7dff479a8",
+      "metrics": {
+        "bank_conflict_steps": 0,
+        "cache_evictions": 204,
+        "cache_fill_bytes": 42496,
+        "cache_hits": 948,
+        "cache_misses": 332,
+        "cross_subgroup_reuse_bytes": 92160,
+        "cross_workgroup_reuse_bytes": 29184,
+        "ideal_bank_degree": 1,
+        "ideal_transactions": 5760,
+        "max_bank_degree": 1,
+        "requested_bytes": 368640,
+        "same_subgroup_reuse_bytes": 0,
+        "steps": 3260,
+        "transactions": 5760,
+        "unique_bytes": 368640,
+        "within_subgroup_duplicate_bytes": 0
+      },
+      "name": "kslab",
+      "observations": 1,
+      "runs": [
+        "short-prefill-and-decode"
+      ],
+      "sampled_workgroups": [
+        [
+          0,
+          0,
+          0
+        ],
+        [
+          1,
+          0,
+          0
+        ],
+        [
+          2,
+          0,
+          0
+        ],
+        [
+          3,
+          0,
+          0
+        ],
+        [
+          4,
+          0,
+          0
+        ],
+        [
+          5,
+          0,
+          0
+        ],
+        [
+          6,
+          0,
+          0
+        ],
+        [
+          7,
+          0,
+          0
+        ],
+        [
+          8,
+          0,
+          0
+        ],
+        [
+          9,
+          0,
+          0
+        ],
+        [
+          10,
+          0,
+          0
+        ],
+        [
+          11,
+          0,
+          0
+        ],
+        [
+          12,
+          0,
+          0
+        ],
+        [
+          13,
+          0,
+          0
+        ],
+        [
+          14,
+          0,
+          0
+        ],
+        [
+          15,
+          0,
+          0
+        ],
+        [
+          16,
+          0,
+          0
+        ],
+        [
+          17,
+          0,
+          0
+        ],
+        [
+          18,
+          0,
+          0
+        ],
+        [
+          19,
+          0,
+          0
+        ]
+      ],
+      "status": "analyzed",
+      "submitted_dispatches": 1,
+      "trace": "kernels/bfc7b725443521abb90f62873a98d31e-b1cc5ee7dff479a8.trace.json",
+      "uniforms_supplied": true
+    }
+  ],
+  "model_bytes": 4920739168,
+  "model_path": "/Users/evanalmloff/.cache/huggingface/hub/models--lmstudio-community--Meta-Llama-3.1-8B-Instruct-GGUF/snapshots/8601e6db71269a2b12255ebdf09ab75becf22cc8/Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+  "runs": [
+    {
+      "completed": true,
+      "emitted_chunks": 4,
+      "name": "short-prefill-and-decode",
+      "prompt_tokens": 6,
+      "requested_chunks": 4,
+      "text": " a beautiful city,"
+    },
+    {
+      "completed": true,
+      "emitted_chunks": 4,
+      "name": "long-prefill-and-decode",
+      "prompt_tokens": 209,
+      "requested_chunks": 4,
+      "text": " \n\nA CPU has"
+    }
+  ],
+  "sampling": "First and last 32 neighboring workgroups in X-fast linear order; overlapping windows deduplicated. Gaps between windows are omitted. Totals are sampled, not full-grid traffic.",
+  "scope": "Distinct uncached lowered IR plus uniform values matching body_filters (empty means all), including tuning candidates; not every possible context length.",
+  "submitted_variants": {
+    "481141fe3bada9eda021280fd023a22c-0b1154923f568394": 6,
+    "481141fe3bada9eda021280fd023a22c-13cf78ffd7c5aea0": 6,
+    "481141fe3bada9eda021280fd023a22c-227c2d92b8d94b96": 6,
+    "481141fe3bada9eda021280fd023a22c-3e27373dd12bf3b5": 6,
+    "481141fe3bada9eda021280fd023a22c-48bdf139723f8c56": 6,
+    "481141fe3bada9eda021280fd023a22c-4e441ecb077b7bbe": 6,
+    "481141fe3bada9eda021280fd023a22c-4eeb01ae6f98c837": 6,
+    "481141fe3bada9eda021280fd023a22c-6c866e581455692e": 6,
+    "481141fe3bada9eda021280fd023a22c-8234df8ca7247b1e": 6,
+    "481141fe3bada9eda021280fd023a22c-9214eb6ba5b066aa": 6,
+    "481141fe3bada9eda021280fd023a22c-b37cb878f2ff2d0d": 6,
+    "481141fe3bada9eda021280fd023a22c-cb0b43dbe70a38cc": 6,
+    "481141fe3bada9eda021280fd023a22c-de3975d21beda889": 6,
+    "51d6113fe37d77d1205997353dcd40cc-0b1154923f568394": 1,
+    "51d6113fe37d77d1205997353dcd40cc-13cf78ffd7c5aea0": 1,
+    "51d6113fe37d77d1205997353dcd40cc-227c2d92b8d94b96": 1,
+    "51d6113fe37d77d1205997353dcd40cc-3e27373dd12bf3b5": 1,
+    "51d6113fe37d77d1205997353dcd40cc-48bdf139723f8c56": 1,
+    "51d6113fe37d77d1205997353dcd40cc-4e441ecb077b7bbe": 1,
+    "51d6113fe37d77d1205997353dcd40cc-4eeb01ae6f98c837": 1,
+    "51d6113fe37d77d1205997353dcd40cc-6c866e581455692e": 1,
+    "51d6113fe37d77d1205997353dcd40cc-8234df8ca7247b1e": 1,
+    "51d6113fe37d77d1205997353dcd40cc-9214eb6ba5b066aa": 1,
+    "51d6113fe37d77d1205997353dcd40cc-b37cb878f2ff2d0d": 1,
+    "51d6113fe37d77d1205997353dcd40cc-cb0b43dbe70a38cc": 1,
+    "51d6113fe37d77d1205997353dcd40cc-de3975d21beda889": 1,
+    "bfc7b725443521abb90f62873a98d31e-290cd630857b49a9": 1,
+    "bfc7b725443521abb90f62873a98d31e-3ad28608342344ea": 1,
+    "bfc7b725443521abb90f62873a98d31e-5a482b086757c370": 1,
+    "bfc7b725443521abb90f62873a98d31e-66d4c2048cbf865d": 1,
+    "bfc7b725443521abb90f62873a98d31e-b1cc5ee7dff479a8": 1,
+    "bfc7b725443521abb90f62873a98d31e-c8a0b3e456200a10": 1,
+    "bfc7b725443521abb90f62873a98d31e-d30f8c55b2204909": 1,
+    "bfc7b725443521abb90f62873a98d31e-e08b35968725f628": 1,
+    "bfc7b725443521abb90f62873a98d31e-e6433c187be01b6b": 1
+  },
+  "trace_bounds_errors": 0,
+  "unsupported": 0,
+  "variants": 3,
+  "version": 1,
+  "capture_semantics": "Logical masked IR loads before backend optimization. The emitter can issue clamped loads on masked-out lanes; inspect generated WGSL before interpreting these counts as physical instructions."
+}

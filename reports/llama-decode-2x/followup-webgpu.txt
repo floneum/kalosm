@@ -1,0 +1,503 @@
+WebGPU-only continuation, 2026-10-11
+
+User prohibits bypassing WebGPU. Removed the unfinished native Q6 hooks and
+archived native shader tools and isolated HAL patches outside build inputs.
+Both Cargo locks use registry wgpu-hal 29.0.4; build/hash proof is in
+webgpu-build-provenance.json. Historical ICB and native timings are excluded.
+
+webgpu-online-profile, config webgpu-online-config.json:
+- All 2,308,608 logits pass (max abs 5.96046448e-5, RMS 9.40142625e-6).
+- Same-executable clean 208-token A/B, 30 steady samples/arm:
+  baseline 31.0239795 ms -> candidate 19.329438 ms; 1.605012x. Target 2x FAIL.
+- Sparse dispatch attribution: webgpu-online-sampled-summary.txt. No unsampled
+  groups across 62 tokens; 1,473 timestamps. Attribution only, not wall timing.
+
+New normalization subgroup merge distributes partial reads across lanes and
+uses one publication barrier. 1024-thread micro shows a small gain; 512-thread
+results are mixed/noisy. Full 2,308,608 model logits pass. Its full-model clean
+benefit remains unestablished. Default off, FUSOR_PROFILE_RMS_SUBGROUP_MERGE.
+Normal-backend conformance: rms_norm 6, cache donation 2, padded attention 3,
+views 30, indexing/scatter 19 cases pass, two runs each (webgpu-conformance/).
+
+Rejected Q6 lanes16/signed prototypes were removed; source snapshot retained
+as webgpu-q6-lanes-rejected.rs.txt. Default coalesced lowering restored.
+
+New q4_layout_lab uses ordinary WebGPU shader creation with runtime checks,
+CPU dequantization of every column on the first input, rotating weight buffers,
+changing F32 inputs, full arm comparisons, tail canaries, and ABBA ordering.
+Tail N257/K1024 passes all lane widths. Deliberately corrupting column129's
+scale is rejected. The first looped gate/up variants are slower than production;
+interleaving alone is not an accepted optimization. Unrolling/static extents
+remain under investigation. No native shader compilation or dispatch is used.
+
+Cache growth: webgpu-cross256-ab uses 233 prompt tokens and 32 decode steps,
+with the same normal-backend binary in both arms. All logits pass through the
+256 -> 512 capacity transition; max abs 4.19616699e-5, RMS 8.42496308e-6.
+Instrumented run overlapped CPU checks/builds and is not a wall-time claim.
+Both root and nested all-target Clippy checks pass with -D warnings.
+
+Cache growth comparison covers 8,464,896 logits. Normal WebGPU at 4008-token
+context also passes 2,308,608 logits (max abs .0004706382751, RMS .0000321862281).
+These instrumented timing samples are not headline wall results.
+
+Rejected online attention branch: computing only the nontrivial exponential
+passed CPU checks but regressed short micro ~17 -> 20.7 us and long ~149 ->
+171.4 us in ABBA order. Removed from active lowering; source and evidence
+retained in webgpu-attention-branch/.
+
+New paired_wall.py records ABBA process order and requires the target in both
+directions. Protocol tests reject reversed orientation, one lucky ordering,
+changed text, changed prompt length, and mismatched sample counts.
+webgpu-rms-paired-wall-208: A run medians32.656917/31.719917ms; B21.234291/
+19.364583ms; directional1.537933x/1.638038x; target2x FAIL. Other graphics
+workloads were active, so no isolated-hardware claim.
+Q4 interleaved layouts all rejected: best grouped ~299us vs contemporaneous
+production257.049us. Paired-column variants did not recover the difference.
+The tool remains available with full numerical/canary/negative-control checks.
+
+Q6 signed byte unpack (normal WebGPU unpack4xI8 confirmed in dumped WGSL):
+all tail/sample checks and 2,382,336 full-arm values pass. Down projection
+base162.970/218.641us vs intrinsic166.233/223.428us; vocabulary medians are
+load-sensitive (p25..p75 ranges very wide). No reliable win accepted. Removed
+from active emitter/lowering; source and all evidence in webgpu-q6-unpack-micro/.
+
+Four-K-block word transposition using the same two-columns-per-subgroup
+algorithm: all28,672 CPU column checks and changing-input arm checks pass;
+native360.424us vs transposed353.145us (paired1.0205x). Runtime checks enabled
+in both arms. Diagnostic only; no model or production lowering change.
+
+Activation residency lab: uniform binding improved the handwritten Q4 kernel
+~1.078x; shared-memory staging regressed to0.684x/0.845x at2/8subgroups.
+The captured production shader isolated the apparent benefit: checked scalar
+array~307us vs vec4~232us, independent of static bounds or uniform vs storage.
+Real compiler A/B with its existing runtime-check policy was flat: Q4 gate
+base202.652/203.175us vs vector202.814/203.124us. Q6 likewise has no supported
+win. Every output in both arms matches bitwise. Vector-input emitter experiment
+removed; source/evidence in webgpu-vector-input/. Do not claim checked-shader
+32% gain as production or model improvement.
+
+Verified normal-WebGPU long-context clean ABBA: webgpu-rms-paired-wall-4008
+{"order": "ABBA", "prompt_tokens": 4008, "samples_per_arm": 60, "baseline_run_medians_ms": [71.420375, 71.492896], "candidate_run_medians_ms": [22.387437499999997, 23.122979], "directional_speedups": [3.1901987442734354, 3.091854903297711], "median_run_speedup": 3.1402321048852633, "minimum_directional_speedup": 3.091854903297711, "target": 2.0, "target_pass": true, "text_matches": true, "accuracy_note": "Separate full-logit validation required; text equality alone is insufficient.", "timing_note": "No timestamps or logit writes; ABBA controls run order, not other GPU workloads."}
+Same binary SHA6506a23b461027efb24bff8fd4b55911b71415486e52a03789fe09b2e5821de4.
+Prior full-logit correctness: webgpu_rms_4k/check.json. This meets the long
+context target; the original208-token target remains below2x.
+
+Current403-dispatch short-context submit retune: paired_wall against current
+stream32, same binary,60samples/arm, both orders. Stream8 ratios0.987215/
+0.988910; stream64 ratios0.971436/0.959244. Both rejected; stream32 retained.
+
+New q6_layout_lab: ordinary checked WebGPU, deterministic nonperiodic native
+Q6 bytes, varying exact-half scales, all-column CPU reference on first input,
+full-arm bitwise checks on changing inputs, rotated buffers, tail canaries,
+and ABBA per-round timestamps. Four split/tail variants pass. Both layouts
+reject corruption at column129. Reused checks in support/quant_layout_common.rs;
+Q4 all-lane tail checks and corruption check pass after extraction.
+Q6 checked layout results: planes1.0417x down/1.0535x vocab; aligned1.0312x
+down/1.0282x vocab. These are not model or production speedup claims.
+Real compiler alignment experiment in progress: new F32ScalesAligned64 layout,
+all9 GGUF tests pass including exact repack roundtrip, poisoned padding, and
+all18 scalar decode programs. Original sources saved in
+webgpu-q6-alignment-format/original-src; modified-files.json lists rollback
+scope. No model loader integration or speed acceptance yet.
+
+Aligned Q6 real compiler trial rejected: original down154.190us vs aligned
+170.458us; reverse original192.889us is load-contaminated, but lower quartiles
+153.805 vs170.131 show no win. Vocabulary p25 original1296/1298us vs aligned
+1377/1379us; all-output vectors match bitwise. Active layout/compiler/source
+changes removed; exact prototype and tests in webgpu-q6-alignment-format/.
+
+Q4 explicit FMA scheduling rejected: group/accumulator variants pass numerical
+checks but regress gate202.652us to212.076/210.575, down111.311us to117.677/
+121.658, and square37.345us to39.917/39.576. Source removed; evidence retained
+in webgpu-q4-fma/.
+
+Exact Q4 integer unpack through normal half mantissas (not reduced activation
+precision) improves actual gate203.0us ->194.4/194.8us. Full short model passes
+2,308,608 logits, maxabs0.0000596046/RMS0.00000940143. Clean current-vs-Q4 ABBA
+60samples/arm passes1.071998x/1.067642x:19.3843/19.1510 ->18.0824/17.9376ms.
+Evidence webgpu-half-weight-unpack/wall-q4; original binary profile retained.
+Current parsed flag is FUSOR_PROFILE_Q4_HALF_UNPACK; retained-q4-config.json
+uses the new name with profile-float. Old report binary/config remain immutable.
+Q6 half-unpack rejected: clean incremental ratios0.96629/1.00259; removed.
+Q4 F32 mantissa decoding rejected: paired0.90765x against half-unpack; removed.
+
+Added step-controlled qmatmul_lab and tools/pair_qmatmul.py: two persistent
+processes, strictly sequential GPU samples, alternating orders after each
+sample, three changing-input warmups, full saved output comparisons, requested
+schedule and actual packed-kernel checks, per-arm SHA/env provenance. A/A
+outputs match bitwise; corruption at column129 is rejected. Added raw native
+weight input, shared GGUF directory reader and extract_quant_weights.py.
+
+Q4 half with four columns/subgroup improves gate~1.047x. Q6 exact F32 mantissa
+integer decoding improves controlled down/vocab~1.12x. Real GGUF tensor bytes
+reproduce these micro gains: gate-half1.04165x, gate-cols8 1.04769x,
+Q6 down1.12467x, vocab1.12888x. All full arm vectors pass. However combined
+full-model clean increment over Q4-only is1.00243/0.99062x, NOT an accepted
+model gain. Original-baseline ABBA for combined variant remains red:
+1.75229/1.63413x, candidate18.4192/18.5701ms. Both full-logit variants pass.
+Current Q6 float and large-Q4 schedule flags remain diagnostic; investigating
+micro/model mismatch. Larger-model source capture is in progress.
+
+Unpack retune: Q4 square split1 vs2 gives1.0379x; vocab four columns/subgroup
+1.0409x. Other split4/extra-column changes fail. No new model acceptance from
+these micro results. All details and full vectors in
+webgpu-half-weight-unpack/retune and real-weights.
+
+Selective read-only GEMV activation allocations: actual model WGSL now matches
+the micro arithmetic and bindings except output arena offsets. All2.3M logits
+pass. Instrumented GPU16.188ms, but clean incremental ABBA1.00433/0.99397x
+is flat. Rejected and restored original planner; source and shaders retained
+in webgpu-gemv-readonly/.
+
+2026-10-11 resource failure: two resident full-model A/A processes exhausted
+memory before valid measurements; user killed them. Approximately 23 GiB
+compressed, 64 MiB free memory, 117 MiB disk free were observed before the
+kill. No benchmark/build processes remain. The interleaved method is rejected;
+its memory checks began too late. Both two-resident controllers are disabled,
+source archived in excluded-resource-experiments, full-model stdin stepping
+removed, and its preserved stepped binary made non-executable.
+
+Added benchmark_guard.py to all three full-model launchers: shared per-user
+lock, preflight memory/disk/compression checks, pressure checks from startup,
+abort on swap/compression growth, and own-child cleanup on failure/interruption.
+No automatic retry. Pressure monitoring is not a hard GPU allocation quota.
+Only tiny subprocess regression tests run; no model, GPU run, or build started.
+Optimization goal paused; original short-context >=2x remains unachieved.
+
+2026-10-11 resumed at explicit user request, one process at a time.
+Mapped fresh weight uploads through standard WebGPU mapped_at_creation remove
+a duplicate upload staging allocation; 2 MiB roundtrip/reuse test RED then GREEN.
+Added optional lower GPU pool budget. Mapped uploads alone did not eliminate
+the prefill pressure spike. Guarded width256 runs aborted without swap growth.
+Shared width32 prefill, compile_threads1, mapped uploads and 8 GiB pool cap
+completed clean wall A/B: baseline31.853083ms, retained18.635667ms, 1.709254x.
+Both arms use the same208-token prompt and resource policy; no swap growth.
+This is not yet a2x acceptance. Evidence webgpu-memory-bounded/chunk32-wall.
+
+New sequential_qmatmul.py runs guarded A,B,B,A with <=512 MiB resident weights,
+complete3-vector comparisons and actual-model weight-file provenance. Q4
+lanes16 regressed~15%, lanes4~26%, factored block scales~4-5%, exact half
+metadata unpack flat/slower. Removed these unsuccessful source experiments.
+Evidence webgpu-memory-bounded/q4-lanes and q4-metadata.
+
+Whole-plan timestamp+full-logit probe at width32 triggered the memory guard
+before prefill completion (compression4.15GB, unchanged swapout counter).
+No retry of that configuration. Adding correctness-only capture without
+timestamp/profile instrumentation, with identical complete-logit thresholds.
+
+Further bounded experiments: Q4 unrolling regressed ~3.3x; group-major ordering
+was flat; moving half-dot bias outside each decoded weight failed numerical
+thresholds and was removed. Long 101-iteration/32-replay square GEMV scheduling
+rejected the apparent short-run win (0.805/0.807x). These are not model gains.
+
+Width32 correctness without timestamps still exceeded compressor growth.
+Width16/small16x32x8 prefill, one compile worker, one in-flight large-plan
+submission, and immediate cold-IR release did not reliably fix the peak.
+The 6 GiB GPU cap also proved too small for the native+repacked vocabulary
+weights; it failed explicitly before an over-budget allocation.
+
+Read-only mapped host weights now retain the exact original GGUF bytes;
+metadata and all bytes are checked against each loaded tensor before use.
+Shared views pass CPU and WebGPU matmul/concatenation tests. First-session
+prefill and 8 decode steps complete with a 7 GiB GPU cap. Second-session
+prefill still exceeded the unchanged 512 MiB compressor-growth guard.
+No new run increased swapouts. Accuracy and speed acceptance remain pending.
+
+Next concrete memory reduction: concatenate quantized matrices as retained
+host segments, materializing only the individual upload/repack, rather than
+retaining ~2 GiB of private concatenation bytes. Width64 with the small coop
+tile also reduces the large number of graph nodes generated by width16.
+
+Segmented/mapped host weights + width64/small coop/7 GiB GPU pool completed
+both sessions and all 2,308,608 logits: maxabs0.0000638962, RMS0.0000119469,
+all argmax/text checks pass. Minimum estimated reclaimable memory10.688GiB,
+max compressor0.787GiB, compressor growth0, swapout growth0, maxchildRSS11.437GiB.
+Evidence webgpu-memory-bounded/segmented-host/logits. This is a correctness
+and resource result, not a new throughput claim.
+
+External checked-WGSL Q4 unorm prototype passed every column but regressed
+272us ->710us,0.3836x; no production IR change. Initial shader adaptation
+failed CPU reference (165u accidentally replaced as suffix of65u); fixed
+before measurement, invalid run retained separately.
+
+Isolated Q6 float-unpack full-model ABBA remains unaccepted:0.99245/1.02149x
+vs retained,30samples/arm. All four sequential processes complete with new
+resource policy. Host-stage diagnostic: prepare/submit~5ms, largely overlapping
+GPU work; cache donation proof~0.2ms, artifact probe~0.13ms. No dominant CPU
+sampler cost (top-k~0.28ms). Investigating Q6 four-block subgroup mapping.
+
+Additional bounded checks (2026-10-11 continuation):
+- Q6 four-block/lane8 coalescing rejected: 0.802/0.802x; source restored.
+- Q4 square subgroup1->2 with 288 MiB rotating weights rejected:0.9585/0.9659x.
+- Exact half2-FMA unpack prototype: 1.0018x, no gain.
+- Q4 biased-dot q+16 (all integer reconstruction exact, arithmetic F32):
+  CPU/vector checks pass; checked WGSL1.0169x but actual lowering0.9952/1.1316x
+  with high timing dispersion. Not accepted; source/flag removed.
+- Attention1024 serial merge returned invalid GPU timestamps. Parallel merge
+  passed CPU references but256threads0.895x and1024threads~0.0146x; removed
+  both parallel merge and1024 attention option. Default256 is retained.
+- Found a benchmark confound: prefill safety limits at1024dispatches slowed
+  original1270dispatch decode but not403dispatch candidate. Discarded apparent
+  2.72/2.40x comparison in segmented-host/original-baseline-wall. Added independent
+  FUSOR_PROFILE_LARGE_PLAN_MIN_DISPATCHES=4096 to both arms, preserving memory
+  controls for large prefill plans. Wall harness now rejects decode phases
+  crossing the prefill-policy threshold; focused regression failed before fix,
+  all14 tool tests pass afterwards.
+- Corrected original baseline ABBA (30steady samples/arm):32.31425/32.21733ms
+  ->18.80792/19.15788ms,1.71812/1.68168x. Goal still unmet.
+- Q6 real-model sparse attribution (62steady tokens each): down155.584->155.375us,
+  vocab1282.438->1283.104us; all body identities differ as expected, so the float
+  flag is executing. Estimated aggregate17.24675->17.27031ms is flat.
+- Q6 micro with the real model's skip-initialized-workgroup-zero,1024thread limit
+  and no-debug-group settings shrinks previous~12% claim to1.01698/1.01991x.
+  Complete12288-output comparisons pass. The older micro gain did not predict
+  full-model performance; retained config still excludes Q6_FLOAT_UNPACK.
+
+- Shared backing final focused checks:2 HostBytes unit tests plus shared-weight
+  CPU and WebGPU tests pass after segmented concatenation. Fixed fusor/.gitignore
+  so the new src/target/host_bytes.rs source is included, not mistaken for builds.
+- Online attention base2 scores/exp2 (F32) passed CPU checks but0.98893/0.99711x;
+  source and flag removed; evidence attention-exp2/.
+- Adaptive submissions (first32, then128) full ABBA19.0738/19.0447ms
+  ->18.7932/18.9828ms,1.01493/1.00326x. Failed1% both-orders threshold;
+  source and flag removed; evidence adaptive-submit/.
+- Checked-WGSL RMS/gamma/GEMV fusion prototype passes full CPU/vector checks,
+  but272.854us GEMV-only->558.253us fused. Moving square accumulation to each
+  raw load (shorter register lifetimes) remains273.106->558.620us. These are
+  checked external-shader timings, not production lowering or model claims.
+  The baseline excludes the standalone RMS kernel (~7us in model profiling);
+  the observed added cost is far larger than that dispatch. No production fusion.
+  q4_layout_lab LAB_LAYOUT_RMS retains a bounded correctness/cost probe with raw,
+  gamma and CPU-normalized input segments and unchanged numerical thresholds.
+
+
+2026-10-12 continuation: unchanged accepted short-context result ~1.70x.
+- Exact prescaled Q4 metadata (192 vs 144 bytes/block), all CPU/full-vector checks
+  pass, but checked WGSL216.784->280.673us,0.7726x. No production integration.
+- Detailed setup timing disproves earlier~1ms uniform-allocation lead:
+  pack50us,allocation0us,upload9us,buffer preparation27us. Diagnostic wall18.804ms.
+- Added paired_geometry.py and actual-compiler schedule substitution with owned
+  observer lifetimes. A/A1.0012x, Q4CPS4~1.0464x in micro; Q4CPS8~0.4512x;
+  Q6downCPS4~1.0041x. All full-vector checks pass. Dependent replay Q4CPS4~1.0438x.
+- Actual model Q4CPS4 cleanABBA (124steady samples/arm)0.99716/1.00800x, flat.
+  Sparse attribution confirms candidate executes: gate199.417->196.375us,
+  estimated aggregate17.26148->17.28024ms. No candidate adoption.
+- Added one-resident-model paired geometry tool (two KV histories, no plan replay).
+  Both arms pass4,617,216 original-reference values,maxabs6.3896e-5,RMS1.1947e-5;
+  generated text and argmax match. The three-round A/A control was resource-aborted
+  at round2 prefill: compressor growth954MiB between polls exceeded512MiB limit,
+  no swap growth. Partial timings invalid; following candidate never started.
+  Capped both Rust and Python harness to one warmup plus one measured round,
+  <=32steps. KV clear intentionally preserves tokens for context replay; unchanged.
+- Disk preflight blocked the next build at7.52GiB. Removed only disposable
+  compiler .rcgu.o files from this worktree dated before2026-10-11; manifest in
+  webgpu-memory-bounded/artifact-cleanup.json. Free space restored to11.26GiB.
+  No thresholds relaxed. Investigating normal WebGPU completion polling next.
+
+- Capped two-round paired A/A now completed: directions0.99993/1.00332x,
+  baseline18.700ms,candidate18.736ms,31samples/arm; no compressor/swap growth,
+  minimum available8.728GiB. Clean paired model harness is now validated.
+- Native WebGPU completion polling diagnostic (no HAL change):32ms poll window
+  vs existing2ms. SequentialABBA is noisy0.82569/1.27550x and not accepted.
+  Adjacent-token paired test passes1% both orders:1.03220/1.08505x,
+  medianpaired1.07514,baseline19.459ms,candidate18.135ms. Needs full-logit and
+  original-baseline clean confirmation; consumes more CPU while awaiting GPU.
+  Blocking-only0ms polling is rejected:1.01172/0.96339x.
+- Q4CPS4 with identical32ms polling remains unaccepted:1.00095/1.03491x.
+- Delaying Q4 lane powers-of-two scaling until after accumulation passes complete
+  CPU/vector checks but regresses0.8728x (218.406->250.204us).
+- Explicit F32 FMA accumulation passes external prototype1.0232x, but the actual
+  compiler micro fails0.95984/1.01310x (large process drift); not adopted.
+
+- Poll32 full original-reference validation passes2,308,608 values, unchanged
+  maxabs6.3896e-5,RMS1.1947e-5. Clean original ABBA now verifies1.89162/1.87478x:
+  baseline32.195666/32.295125ms ->candidate17.020125/17.226042ms,
+  62steady samples per arm, same executable/text/prompt/resource policy.
+  This is the new best validated checkpoint (~1.88315x), not2x.
+  Config completion-polling/spin32.json; all evidence in completion-polling/.
+  Polling trades more CPU activity for faster native WebGPU completion detection.
+- Biased16 + F32 fused correction passes checked prototype1.0490x but actual
+  compiler micro0.98238/1.08638x with large process drift; not adopted, source
+  archived and flag removed. No production Q4 arithmetic changed.
+- Testing F32 attention updates over2/4keys: one running-softmax rescale per tile,
+  padded K/V reads guarded and poisoned in CPU correctness tests. No result yet.
+
+- Tiled online attention2/4keys passes all CPU comparisons (including NaN padding)
+  but regresses:tile4~0.834/0.847x,tile2~0.848/0.819x. Removed both flag and
+  lowering; archived source in attention-key-tiles/online.rs.rejected.
+- Added bounded first-small/rest-large submission comparison on top of poll32.
+  Existing early32 batch preserved, rest128/512 candidates; prefill policy stays
+  unchanged, and larger chunks cannot increase in-flight chunk count. This is
+  a new experiment, not an accepted speedup. Root all-target clippy passes.
+
+- Rest-of-stream batches on poll32 are rejected: rest512 directions0.99811/1.00856x,
+  rest128 directions0.99754/1.00497x. No retained configuration change.
+- Optional FP16 dot prototype fails the unchanged CPU threshold, error0.03579;
+  no production integration or precision change. Evidence q4-half-dot-prototype/.
+- F32 gate/up+SwiGLU external probe passes full CPU checks but fails stricter
+  arm comparison (-27.86395 vs -27.864225). Diagnostic-only paired timing1.0073x,
+  with full_arm_match=false and nonzero process exit. Not accepted or integrated.
+- Q4 gate two-way intra-workgroup K split passes all CPU/full-vector checks but
+  slows217.110->239.749us,0.9062x. External WGSL only; no production change.
+
+- Poll interval50us on top of poll32:0.98684/0.99749x, rejected. Q4 eight subgroups
+  with current half unpack:0.98013/0.99841x, bit-identical, rejected.
+- Added same-process lowering-variant comparison (separate artifact keys); this
+  resolves earlier process drift. Q4 bias/FMA0.97564/0.98782x and ordinary FMA
+  0.95330/0.96526x: both rejected, all1,032,192 compared values pass.
+- Block-structured checked WGSL indexing, unchanged bytes/arithmetic: external
+  Q4 prototype1.1319x (runtime-sized arrays1.1299x), but actual compiler gate only
+  1.00610/1.02256x. Paired-word nested Q4 prototype adds only0.63%, not integrated.
+- Actual compiler Q6 down block indexing1.02419/1.03693x, vocab1.03205/1.03223x,
+  Q4 down1.01487/1.01379x; all compared outputs bit-identical. Experimental selector
+  FUSOR_PROFILE_Q4_VARIANT=3 currently affects Q4 and Q6; naming is provisional.
+- New storage-emitter regression catches masked constant inner-index rejection;
+  normalize column carry to preserve affine addressing. Test now passes for row,
+  flat, masked, offset and mixed-layout accesses plus canary. Q6 down after fix
+  still1.02277/1.04184x and bit-identical. Full-model timing not yet measured.
+- Nineteen Python protocol/guard tests pass. Root all-target clippy passed before
+  the storage column-carry fix and next experimental attention change.
+
+- Full model block-addressing paired comparison regresses17.11025->17.895833ms,
+  directions0.95370/0.96235x. Not accepted. Investigating whether the affine
+  column-carry fix affected Q4 differently from Q6; optional attribution prepared.
+- Attention delayed rescaling (one exponential in common path) passes normal
+  full CPU checks,maxerror1.4e-6, but0.92645/0.94535x. Rejected and source/flag
+  removed; archived online.rs.rejected. No large-score stress run was necessary
+  to reject its performance; the optional lab input generator remains diagnostic.
+
+- Q4 gate after unconditional column carry slows196.501->215.966us,
+  0.90350/0.91587x: this explains the model regression above. Added conservative
+  unsigned offset bounds (unknown/wrapping => full range) to omit normalization
+  only for proven in-block columns. All native WebGPU bounds checks remain.
+  Storage regression passes again; actual Q4 gate restored196.072->193.553us,
+  directions1.01089/1.02049x, all1,032,192 compared outputs bit-identical.
+  Corrected full-model paired comparison is now running (model-proven/).
+
+- Corrected block addressing improves paired full model17.08554->16.81329ms,
+  directions1.01007/1.01983x. All2,308,608 logits pass; maxabs6.38962e-5.
+- Struct Q4 header/payload external probe0.9918x; rejected, not integrated.
+- Common block addressing + Q4 CPS4 paired model16.87725->16.65346ms,
+  directions1.00654/1.01654x. Both positive but below1.01threshold one order;
+  original-baseline ABBA next, no2x claim.
+
+- Block address+CPS4 clean original-baseline ABBA:32.125875/32.648417ms ->
+  16.5035/16.519584ms; directions1.94661/1.97635x.2x still fails.
+- First stream8 (resource clamp13) then128:16.499666/16.517417 ->
+  16.407417/16.417542ms; directions1.00562/1.00608x. Modest consistent gain.
+- Lossless expanded Q4 metadata148 bytes vs144 slows193.117->199.311us,
+  0.9692x. Every CPU and arm check passes, but no production integration.
+
+- CPU top-k prefilter preserves exact selected ids/float bits over all saved
+  model logits and ties/NaNs/infinities/signed-zero/partial-block cases.
+  Isolated128256 scan99.97->17.56us; production helper+regression added.
+- Grouped QK/Q6V cuts403->387dispatches and passes2,308,608 logits but wall
+  directions0.99798/0.99918x. Rejected; group rule and physical-buffer merge
+  removed and archived. Retaining lowering-variant propagation correctness fix.
+
+- Block-address/CPS4 + first8/rest128 + exact top-k prefilter: original ABBA
+  32.720292/32.388750 ->16.356125/16.330583ms, directions2.00049/1.98332x.
+  Aggregate1.99191x; not a 2x pass. Evidence block-fast-sampling/original-wall.
+- Warm artifact snapshots retain at most two <=512-launch pipeline selections
+  and uniform layouts; no tensor or command buffers. Exact artifact keys and
+  every body/grid dimension must match, and uniforms are always refilled.
+  CPU dependency/layout regression passes. Detailed model setup now pack11-16us,
+  probe40us versus earlier110-150us; the whole-snapshot cache is hitting.
+  Original ABBA directions1.96311/1.96606x; baseline drift prevents a 2x claim.
+- Corrected historical wording: production compile_emitted already used standard
+  WebGPU create_shader_module_trusted with unchecked ShaderRuntimeChecks before
+  the block-address experiment. The external layout lab uses checked creation.
+  This experiment changes neither runtime-check policy nor the WebGPU backend.
+- Q6 vocabulary CPS4 actual-compiler micro1.02651/1.02875x, but full-model
+  directions1.00020/1.00103x; not retained. Large Q4 SG4 and SG1 with CPS4 also
+  fail consistent improvement. Lossless expanded Q4 metadata0.9692x; rejected.
+- Down Q4 split2 plus stream-rest64 on warm snapshots is flat:
+  0.99920/1.00164x; neither change retained. Evidence down-split-stream64/wall.
+- Attention512 + RMS512 on warm snapshots modestly improves16.22696/16.27246
+  ->16.18717/16.20217ms (1.00246/1.00434x), below the planned0.5% threshold.
+  Testing against the original baseline; no 2x claim yet.
+- Fixed gitignore so fusor-gpu/src/target/warm.rs is included as source.
+  All19 Python protocol/resource-guard tests and git diff --check pass.
+
+- Attention512+RMS512 original ABBA still fails:1.98683/1.97715x,
+  candidate16.20658/16.19658ms. No2x claim.
+- Added FUSOR_RESOLVE_HOST_DETAIL to attribute serial CPU setup: warmed
+  roots6us,leaves49-55us,donation66-73us,buffers20us,env16us. Donation
+  ownership proof itself55-60us. Existing proof is retained.
+- Warm key reuse now compares all raw key inputs (launches, buffer plans,
+  root schedules, symbol order, arena and arithmetic selector) before reusing
+  digests; at most1024 buffer plans/4096 bindings per snapshot. Expanded
+  invalidation regression passes. Probe cost drops about40->30us.
+- Exact online-attention subgroup iteration counts remove the per-key guard
+  without changing arithmetic order: small GPU ABBA1.04472/1.03036x.
+  CPU reference checks pass at prefixes1/7/31/208/255 and4093 of4096, with
+  unused cache entries poisoned. Full2,308,608 model logits pass,
+  maxabs6.29425e-5,maxRMS1.19908e-5. Original full-model ABBA nevertheless
+  only1.97160/1.97884x (16.25888/16.26879ms); no accepted model gain yet.
+- Online attention chunk64 vs256 micro1.02194/1.01972x; adds a merge dispatch.
+  Full-model validation/timing has not been run.
+- WIP CPU optimizations: restrict owner-count table construction to candidate
+  cache addresses (all alias/refcount checks remain); optional PROFILE_TOP_K_BYTES
+  samples through checked F32 readback bytes, eliminating one full-vocab copy.
+  Both real top-k regression tests pass, including unaligned byte fallback.
+  Updated root executable and cache-donation conformance still pending.
+- Q4 group-major instruction ordering is a new register-lifetime experiment;
+  no results yet. It retains each column's group and block accumulation order.
+
+- Q4 group-major instruction ordering regresses actual-compiler micro:
+  0.977983/0.977533x. Full vectors pass; source/flag removed, archived in
+  q4-group-major/packed_q4.rs.rejected. No production integration.
+- Optional byte-view sampling preserves all bits, including unaligned fallback,
+  but full-model comparison is flat:0.999719/1.001947x. Not selected.
+- Prepared resolve snapshots retain two bounded metadata indexes, using Weak
+  ownership of immutable plans. Plan mutation detaches the identity; no tensor
+  handles are cached. Reuse external-leaf/last-use/output indexes, build alias
+  counts only for actual donation candidates, and move symbol maps directly
+  into BindingEnv. All original donation alias/liveness checks remain.
+- GPU warm snapshots now verify actual borrowed-plan ownership before using a
+  Weak identity fast path. New regression caught an incorrectly labelled owner
+  hint; fixed and test passes, including Arc::make_mut invalidation.
+- Root and nested all-target Clippy pass; prepared-index and GPU snapshot unit
+  tests pass;19 Python guard/protocol tests pass;git diff --check passes.
+  Donation conformance with the actual candidate flags passes both replay-ring
+  and retained-snapshot tests, with trace confirming real donation (aliases2
+  normally and aliases1 when a retained physical snapshot forbids the other).
+- prepared-resolve full-logit check passes all2,308,608 values and generated
+  text:maxabs6.29425e-5,maxRMS1.25190e-5. Clean original-baseline ABBA pending.
+
+- prepared-resolve original ABBA:32.118792/32.170292 ->16.109209/16.129916ms,
+  directions1.993816/1.994449x. Aggregate1.994132x;2x target still fails.
+  Testing smaller-Q4 within-workgroup K split2->1 next (one dispatch either
+  way; removes the extra subgroup-partial reduction, not a dispatch).
+
+- prepared-square-unsplit original ABBA:32.001834/32.124250 ->16.018084/
+  16.021375ms. Directions1.997857/2.005087x, aggregate2.001472x, but one
+  order misses2x, so target remains open. Text matches; full logits pending.
+- Corrected stream preparation's first-chunk bound to account for the larger
+  subsequent chunks:403 launches with first8/rest128/window32 now starts at8
+  instead of unnecessarily clamping to13. A property-style budget regression
+  checks all corner cases through usize::MAX, including window1 and prefill.
+  Warm artifact selections are shared via Arc instead of cloning the entire
+  pipeline vector each token. All11 GPU-library unit tests pass. Rebuilding.
+
+- early-submit-prepared all2,308,608 logits pass:maxabs6.10352e-5,maxRMS
+  1.20242e-5. But first8/rest128 regresses to16.265208/16.268000ms,
+  original ABBA1.961654/1.989553x. First13 is restored in the next config;
+  the corrected chunk accounting remains available, with unchanged hard bounds.
+- prepared-combined combines first13, unsplit small Q4, shared warm artifacts,
+  exact attention iteration counts and Q6 vocabulary CPS4. Individual micro
+  gains do not establish combined model gains; full-model checks pending.
+
+- SUCCESS: prepared-combined original-baseline clean ABBA passes2x in BOTH
+  orders:32.631625/32.042000 ->16.020375/15.989875ms per token,
+  directional2.036883/2.003893x; aggregate2.020404x. Same binary,208-token
+  prompt,62steady samples per arm,matching generated text. No timestamps,
+  metadata or logit writes during timing;4096 resource threshold in both arms.
+- Separate full-logit validation passes all2,308,608 values,maxabs6.10352e-5,
+  maxRMS1.20242e-5,all argmaxes/text match. Same optimized executable/config.
+  Standard WebGPU,unchanged quantized weights,F32 accumulation. Opt-in config
+  copied to verified-short-config.json; reproduction in verified-short-decode.txt.
+  All correctness/timing runs finish within unchanged resource guard limits.
+- Final root and nested all-target Clippy pass with warnings denied.
+  Final resource summary:min estimated available8.645GiB,compressor growth
+  128KiB,zero additional swapouts;correctness process RSS peak12.388GiB.

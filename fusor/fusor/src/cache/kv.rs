@@ -49,16 +49,60 @@ struct FixedState {
     arm: Option<(u64, Dyn, Dyn)>,
     /// `u32` write-index leaves, one per appended-chunk width, reused across
     /// steps with fresh bytes.
-    idx: FxHashMap<u64, Dyn>,
+    idx: FxHashMap<u64, WriteIndex>,
     /// The symbol the readable length is bound to, named once per store.
     sym: Option<fusor_ir::shape::SymId>,
     /// The symbol's name. A [`KvCache`] hands both halves one name so the
     /// K and V views carry the same symbol — attention contracts their
     /// length axes against each other.
     sym_name: String,
+    /// Optional exact-f32 prefix count used by fixed-extent attention masks.
+    padded_prefix: Option<fusor_ir::shape::SymId>,
+}
+
+/// One-token decode indices fit exactly in the existing f32 uniform block.
+/// Larger capacities and multi-token appends retain the integer buffer path.
+#[derive(Clone)]
+enum WriteIndex {
+    Buffer(Dyn),
+    Uniform {
+        value: Dyn,
+        sym: fusor_ir::shape::SymId,
+    },
+}
+
+impl WriteIndex {
+    fn value(&self) -> &Dyn {
+        match self {
+            Self::Buffer(value) | Self::Uniform { value, .. } => value,
+        }
+    }
+
+    fn update(&self, state: &FixedState, added: u64) -> Result<()> {
+        match self {
+            Self::Buffer(value) => value.set_bytes(state.slots(added)),
+            Self::Uniform { value, sym } => {
+                let slot = state.window.map_or(state.len, |w| state.len % w);
+                assert!(
+                    added == 1 && slot <= 1 << 24,
+                    "uniform write index must be exact"
+                );
+                value.graph().set_uniform(*sym, slot as f32);
+                Ok(())
+            }
+        }
+    }
 }
 
 impl FixedState {
+    fn sync_padded_prefix(&self, graph: &crate::graph::GraphRef) {
+        if let Some(sym) = self.padded_prefix {
+            graph.set_uniform(
+                sym,
+                self.window.map_or(self.len, |w| self.len.min(w)) as f32,
+            );
+        }
+    }
     /// The `u32` write slots of the next `added` tokens, as bytes: a ring
     /// wraps at its window.
     fn slots(&self, added: u64) -> Vec<u8> {
@@ -131,6 +175,7 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
                 idx: FxHashMap::default(),
                 sym: None,
                 sym_name,
+                padded_prefix: None,
             }),
             ..Self::new(axis)
         }
@@ -331,18 +376,40 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
             .clone()
             .unwrap_or_else(|| f.store.as_ref().expect("minted above").0.clone());
 
+        // A growing cache can cross the exact-f32 range. Replace its index
+        // node with a buffer before rebuilding the append arm in that case.
+        if f.capacity > 1 << 24 && matches!(f.idx.get(&added), Some(WriteIndex::Uniform { .. })) {
+            f.idx.remove(&added);
+        }
         let idx = match f.idx.get(&added) {
             Some(t) => t.clone(),
             None => {
-                let t = leaf_buffer_node(&graph, Dtype::U32, &[Dim::Const(added)])?;
+                let t = if added == 1
+                    && f.capacity <= 1 << 24
+                    && graph
+                        .session()
+                        .caps()
+                        .execution_profile
+                        .enabled("FUSOR_PROFILE_CACHE_INDEX_UNIFORM")
+                {
+                    let sym = graph.fresh_sym();
+                    WriteIndex::Uniform {
+                        value: Dyn::uniform(&graph, Dtype::U32, sym)?
+                            .reshape(&[Dim::Const(1).into()])?,
+                        sym,
+                    }
+                } else {
+                    WriteIndex::Buffer(leaf_buffer_node(&graph, Dtype::U32, &[Dim::Const(added)])?)
+                };
                 f.idx.insert(added, t.clone());
                 t
             }
         };
-        idx.set_bytes(f.slots(added))?;
+        idx.update(f, added)?;
 
-        let out = store.scatter_set(axis, &idx, value, true)?;
+        let out = store.scatter_set(axis, idx.value(), value, true)?;
         graph.bind_dim(sym, f.advance(added));
+        f.sync_padded_prefix(&graph);
 
         let view = readable(&out, axis, Dim::Sym(sym))?;
 
@@ -369,6 +436,9 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         if !f.idx.contains_key(&added) {
             return false;
         }
+        if f.capacity > 1 << 24 && matches!(f.idx.get(&added), Some(WriteIndex::Uniform { .. })) {
+            return false;
+        }
         match f.window {
             Some(w) => added <= w,
             None => f.len + added <= f.capacity,
@@ -392,8 +462,9 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         let sym = f.sym.expect("checked by can_replay");
         let idx = f.idx.get(&added).cloned().expect("checked by can_replay");
 
-        idx.set_bytes(f.slots(added))?;
+        idx.update(f, added)?;
         out.graph().bind_dim(sym, f.advance(added));
+        f.sync_padded_prefix(out.graph());
         f.out = Some(out);
         self.len = Dim::Sym(sym);
         view.clear_device_buf();
@@ -420,6 +491,7 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         if let Some((_, view)) = &f.store {
             let sym = f.sym.expect("store has a length symbol");
             view.graph().bind_dim(sym, len);
+            f.sync_padded_prefix(view.graph());
             view.clear_device_buf();
         }
         if len == 0 {
@@ -616,6 +688,42 @@ impl<const R: usize, T: Element> KvCache<R, T> {
         Self::fixed_pair(axis, capacity, None)
     }
 
+    /// Resolve these caches' pending writes and `values`, then commit them.
+    /// The profiling donation path may consume an exclusively owned store at
+    /// its final read. Retained device snapshots force an immutable copy.
+    pub fn resolve_and_commit_all(caches: &mut [Self], values: &[Dyn]) -> Result<()> {
+        let mut roots = values.to_vec();
+        let mut stores = Vec::new();
+        for cache in caches.iter() {
+            cache.pending_into(&mut roots);
+            for half in [&cache.k, &cache.v] {
+                if let Some(f) = &half.fixed
+                    && f.out.is_some()
+                    && f.arm.as_ref().is_some_and(|(added, _, _)| *added == 1)
+                    && let Some((store, _)) = &f.store
+                {
+                    stores.push(store.clone());
+                }
+            }
+        }
+        if let Some(first) = roots.first() {
+            let session = first.graph().session();
+            if session
+                .caps()
+                .execution_profile
+                .enabled("FUSOR_PROFILE_CACHE_DONATION")
+            {
+                session.resolve_cache(&roots, &stores)?;
+            } else {
+                session.resolve(&roots)?;
+            }
+        }
+        for cache in caches {
+            cache.commit();
+        }
+        Ok(())
+    }
+
     /// Ring of the newest `window` tokens.
     pub fn windowed(axis: u32, window: u64) -> Self {
         Self::fixed_pair(axis, window.max(1), Some(window.max(1)))
@@ -724,9 +832,67 @@ impl<const R: usize, T: Element> KvCache<R, T> {
         self.k.len()
     }
 
+    /// The host-known readable length at this instant, when available. Unlike
+    /// `len`, this is a snapshot and must not be baked into a replayed graph
+    /// whose prefix will grow. Fixed and ring caches always know their length.
+    pub fn current_len(&self) -> Option<u64> {
+        match &self.k.fixed {
+            Some(f) => Some(f.window.map_or(f.len, |window| f.len.min(window))),
+            None => self.k.len.as_const(),
+        }
+    }
+
+    /// Physical fixed-cache capacity. A graph that bakes this value into its
+    /// dimensions must be rebuilt after growth, unlike the symbolic views.
+    pub fn storage_capacity(&self) -> Option<u64> {
+        self.k.fixed.as_ref().map(|f| f.capacity)
+    }
+
     /// Whether no key/value pair has been appended.
     pub fn is_empty(&self) -> bool {
         self.k.is_empty()
+    }
+}
+
+impl KvCache<4, f32> {
+    /// Single-query attention over fixed storage, masking its unused suffix.
+    /// This graph is valid until `storage_capacity()` changes. The ordinary
+    /// symbolic-prefix path remains appropriate for other query shapes.
+    pub fn attention_decode_padded(
+        &mut self,
+        query: &Tensor<4>,
+        scale: Option<f32>,
+    ) -> Option<Tensor<4>> {
+        if query.extent(2).as_const() != Some(1) || self.current_len()? == 0 || self.k.axis != 2 {
+            return None;
+        }
+        let full = |cache: &TensorCache| -> Option<Dyn> {
+            let f = cache.fixed.as_ref()?;
+            let root = f
+                .out
+                .as_ref()
+                .or_else(|| f.store.as_ref().map(|(s, _)| s))?;
+            Some(ok(
+                "padded cache storage",
+                root.narrow(2, 0, f.capacity as usize),
+            ))
+        };
+        // Every integer index/count is exact in f32 throughout this range.
+        if self.storage_capacity()? > (1 << 24) {
+            return None;
+        }
+        let len = self.current_len()?;
+        let (k, v) = (full(&self.k)?, full(&self.v)?);
+        let f = self.k.fixed.as_mut()?;
+        let prefix = *f.padded_prefix.get_or_insert_with(|| {
+            k.graph()
+                .named_sym(&format!("{}:padded-prefix", f.sym_name))
+        });
+        k.graph().set_uniform(prefix, len as f32);
+        Some(Tensor::from_dyn(ok(
+            "padded decode attention",
+            crate::composite::attention::attention_prefix(query.as_dyn(), &k, &v, prefix, scale),
+        )))
     }
 }
 

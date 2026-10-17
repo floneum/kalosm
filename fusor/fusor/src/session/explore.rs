@@ -105,7 +105,7 @@ struct Preparation {
     arena: u64,
     incumbent: fusor_ir::extract::PlanHash,
     candidate: fusor_ir::extract::PlanHash,
-    uploads: Vec<(Id, Arc<Vec<u8>>)>,
+    uploads: Vec<(Id, Arc<fusor_ir::target::HostBytes>)>,
     job: std::thread::JoinHandle<fusor_ir::Result<Vec<fusor_ir::target::Buf>>>,
 }
 
@@ -357,7 +357,10 @@ impl Session {
         key: ReplayKey,
         incumbent: Arc<Plan>,
     ) -> Arc<Plan> {
-        if flags().explore_eps == 0 || verify_members() || self.inner.tune.is_empty() {
+        if super::flags_for(self.caps().execution_profile).explore_eps == 0
+            || verify_members()
+            || self.inner.tune.is_empty()
+        {
             return incumbent;
         }
         let mut set = ArmSet::metadata(graph, &incumbent);
@@ -377,7 +380,7 @@ impl Session {
         key: ReplayKey,
         incumbent: &Arc<Plan>,
     ) -> Option<ExploreRun> {
-        let eps = flags().explore_eps;
+        let eps = super::flags_for(self.caps().execution_profile).explore_eps;
         if eps == 0 || verify_members() {
             return None;
         }

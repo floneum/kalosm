@@ -37,6 +37,7 @@ impl CpuCaps {
 pub(crate) fn cpu_caps() -> &'static Caps {
     CAPS.get_or_init(|| {
         Caps {
+            execution_profile: Default::default(),
             kind: DeviceKind::Cpu,
             name: "cpu-cranelift".to_string(),
             limits: Limits {

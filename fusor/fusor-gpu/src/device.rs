@@ -46,7 +46,14 @@ impl GpuDevice {
     /// Probe an adapter, request a device at baseline limits widened by
     /// `extra`, then seed (or load cached) facts.
     pub async fn request(extra: Option<wgpu::Limits>) -> Result<Self> {
-        request_device(extra).await
+        Self::request_with_profile(extra, Default::default()).await
+    }
+
+    pub async fn request_with_profile(
+        extra: Option<wgpu::Limits>,
+        profile: fusor_ir::execution::ExecutionProfile,
+    ) -> Result<Self> {
+        request_device(extra, profile).await
     }
 
     pub fn device(&self) -> &wgpu::Device {
@@ -82,9 +89,42 @@ impl GpuDevice {
     }
 }
 
+// Select before requesting limits. A profile must never make an otherwise
+// usable adapter fail device acquisition merely because it lacks an optimization.
+fn select_execution_profile(
+    requested_profile: fusor_ir::execution::ExecutionProfile,
+    adapter_info: &wgpu::AdapterInfo,
+    adapter_limits: &wgpu::Limits,
+    features: wgpu::Features,
+) -> fusor_ir::execution::ExecutionProfile {
+    // wgpu's Metal backend reports vendor=0. Use the same adapter identity
+    // as the existing fixed-subgroup capability probe, not a PCI vendor ID.
+    if adapter_info.name.starts_with("Apple")
+        && adapter_info.backend == wgpu::Backend::Metal
+        && caps::subgroup_widths(
+            features,
+            adapter_info.backend,
+            &adapter_info.name,
+            adapter_info.subgroup_min_size,
+            adapter_info.subgroup_max_size,
+        )
+        .is_some_and(|s| s.min == 32 && s.max == 32)
+        && adapter_limits.max_compute_invocations_per_workgroup >= 1024
+        && adapter_limits.max_compute_workgroup_size_x >= 1024
+        && features.contains(wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX)
+    {
+        requested_profile
+    } else {
+        fusor_ir::execution::ExecutionProfile::General
+    }
+}
+
 /// Pick an adapter, request its device at non-adapter limits, and probe
 /// compiler capabilities.
-async fn request_device(extra: Option<wgpu::Limits>) -> Result<GpuDevice> {
+async fn request_device(
+    extra: Option<wgpu::Limits>,
+    requested_profile: fusor_ir::execution::ExecutionProfile,
+) -> Result<GpuDevice> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = instance
         .request_adapter(&wgpu::RequestAdapterOptions {
@@ -99,6 +139,44 @@ async fn request_device(extra: Option<wgpu::Limits>) -> Result<GpuDevice> {
     let features = caps::requested_features(&adapter);
     let adapter_limits = adapter.limits();
     let mut limits = caps::widen_limits(caps::baseline_limits(), extra, &adapter_limits)?;
+    let profile =
+        select_execution_profile(requested_profile, &adapter_info, &adapter_limits, features);
+    if let Ok(value) = profile.var("FUSOR_PROFILE_WORKGROUP_THREADS") {
+        let threads = value
+            .parse::<u32>()
+            .map_err(|_| Error::Device("workgroup threads must be an integer".into()))?;
+        if threads < limits.max_compute_invocations_per_workgroup
+            || threads > adapter_limits.max_compute_invocations_per_workgroup
+            || threads > adapter_limits.max_compute_workgroup_size_x
+        {
+            return Err(Error::Device(format!(
+                "requested workgroup threads {threads} exceed adapter limits or reduce the baseline"
+            )));
+        }
+        limits.max_compute_invocations_per_workgroup = threads;
+        limits.max_compute_workgroup_size_x = limits.max_compute_workgroup_size_x.max(threads);
+    }
+    #[cfg(feature = "kernel-observer")]
+    if let Ok(value) = std::env::var("FUSOR_PROFILE_WORKGROUP_STORAGE") {
+        let bytes = value.parse::<u32>().map_err(|_| {
+            Error::Device("FUSOR_PROFILE_WORKGROUP_STORAGE must be an integer".into())
+        })?;
+        if bytes < limits.max_compute_workgroup_storage_size
+            || bytes > adapter_limits.max_compute_workgroup_storage_size
+        {
+            return Err(Error::Device(format!(
+                "requested workgroup storage {bytes} must be between {} and adapter maximum {}",
+                limits.max_compute_workgroup_storage_size,
+                adapter_limits.max_compute_workgroup_storage_size
+            )));
+        }
+        eprintln!(
+            "PROFILE_DEVICE workgroup_storage baseline={} requested={bytes} adapter={}",
+            limits.max_compute_workgroup_storage_size,
+            adapter_limits.max_compute_workgroup_storage_size
+        );
+        limits.max_compute_workgroup_storage_size = bytes;
+    }
     // Buffer-size ceilings are capacity, not legality: take the adapter's, since
     // 7B+ models have single weights past the baseline's 256 MiB.
     limits.max_buffer_size = limits.max_buffer_size.max(adapter_limits.max_buffer_size);
@@ -152,13 +230,14 @@ async fn request_device(extra: Option<wgpu::Limits>) -> Result<GpuDevice> {
 
     let granted = device.features();
     let coop_props = caps::coop_properties(&adapter);
-    let caps = caps::build_caps(
+    let mut caps = caps::build_caps(
         &adapter_info,
         granted,
         &limits,
         &coop_props,
         DeviceKind::Gpu,
     );
+    caps.execution_profile = profile;
     #[cfg(target_arch = "wasm32")]
     let caps = probe_browser_matrices(&device, caps).await?;
     // Rates are calibrated or cached by fusor-cost; capabilities are always
@@ -267,5 +346,63 @@ pub fn removed_reason(device: &wgpu::Device) -> Option<String> {
     {
         let _ = device;
         None
+    }
+}
+
+#[cfg(test)]
+mod profile_tests {
+    use super::*;
+    use fusor_ir::execution::ExecutionProfile::{General, LowLatency};
+
+    #[test]
+    fn inference_profile_falls_back_before_requesting_unsupported_limits() {
+        let mut info = wgpu::AdapterInfo {
+            name: "Apple M2 Max".into(),
+            vendor: 0,
+            device: 0,
+            device_type: wgpu::DeviceType::IntegratedGpu,
+            device_pci_bus_id: String::new(),
+            driver: String::new(),
+            driver_info: String::new(),
+            backend: wgpu::Backend::Metal,
+            subgroup_min_size: 4,
+            subgroup_max_size: 64,
+            transient_saves_memory: false,
+        };
+        let features = wgpu::Features::SUBGROUP | wgpu::Features::EXPERIMENTAL_COOPERATIVE_MATRIX;
+        let mut limits = wgpu::Limits {
+            max_compute_invocations_per_workgroup: 1024,
+            max_compute_workgroup_size_x: 1024,
+            ..Default::default()
+        };
+        assert_eq!(
+            select_execution_profile(LowLatency, &info, &limits, features),
+            LowLatency
+        );
+        assert_eq!(
+            select_execution_profile(General, &info, &limits, features),
+            General
+        );
+        assert_eq!(
+            select_execution_profile(LowLatency, &info, &limits, wgpu::Features::SUBGROUP),
+            General
+        );
+        limits.max_compute_invocations_per_workgroup = 256;
+        assert_eq!(
+            select_execution_profile(LowLatency, &info, &limits, features),
+            General
+        );
+        limits.max_compute_invocations_per_workgroup = 1024;
+        limits.max_compute_workgroup_size_x = 256;
+        assert_eq!(
+            select_execution_profile(LowLatency, &info, &limits, features),
+            General
+        );
+        limits.max_compute_workgroup_size_x = 1024;
+        info.name = "Intel Iris".into();
+        assert_eq!(
+            select_execution_profile(LowLatency, &info, &limits, features),
+            General
+        );
     }
 }

@@ -8,6 +8,41 @@ The main entrypoint for this crate is the [`Llama`](https://docs.rs/kalosm-llama
 you can use the [`ChatModelExt`](https://docs.rs/kalosm-language/0.4.2/kalosm_language/prelude/trait.ChatModelExt.html#method.chat) trait to start a chat session or start a task.
 
 
+## Fast chat defaults
+
+```sh
+cargo run -j 1 -p kalosm --example chat --features llama --release
+```
+
+The ordinary Llama builder selects bounded-memory inference defaults on Apple
+GPUs with fixed 32-lane subgroups, cooperative matrices and 1024-thread
+workgroups. It uses WebGPU throughout, with packed quantized projections,
+fused decode operations, cache donation, bounded preparation caches and a
+7 GiB GPU-pool ceiling (or the platform ceiling if lower). The 32 ms active
+completion-polling window trades CPU activity for lower latency. Other
+adapters retain the general execution policy.
+
+Native GGUF weights share their actual mapped shard backing. The inference
+profile sizes KV capacity to the prompt and enables exact top-k prefiltering.
+Neither `kernel-visualize` nor a tuning environment is needed. Keep mapped
+model files unchanged while a model is alive.
+
+An explicit `.with_device(Device::gpu().await?)` retains general scheduling;
+use `Device::gpu_inference()` for the automatic inference policy on a supplied
+device. Diagnostic overrides still take precedence, and boolean overrides
+accept `0` to disable a default. Source-file sharing is always enabled.
+
+For a bounded benchmark of the ordinary builder:
+
+```sh
+cargo run -j 1 -p kalosm-llama --example default_decode --release -- /path/to/model.gguf
+```
+
+This generates 32 decode tokens after a 208-token prompt, with one warmup
+round and one measured round. It reports steady decode separately from
+prefill. See `fusor/fusor-visualize/tools/check_default_decode.py` for a
+sequential, memory-guarded ABBA comparison against an explicit baseline.
+
 ## Example
 
 ```rust

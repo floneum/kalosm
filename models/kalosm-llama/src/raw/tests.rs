@@ -34,6 +34,8 @@ fn tiny_model() -> (Model, Device, LlamaCache) {
                 attention_variant: AttentionVariant::Separate(Box::new(SeparateAttention {
                     attention_wq: weight(16, 16, seed + 1),
                     attention_qkv: None,
+
+                    attention_qk: None,
                     attention_q_norm: None,
                     attention_wk: weight(8, 16, seed + 2),
                     attention_k_norm: None,
@@ -60,7 +62,7 @@ fn tiny_model() -> (Model, Device, LlamaCache) {
             }
         })
         .collect();
-    let mut cache = LlamaCache::new(&config);
+    let mut cache = LlamaCache::new(&config, device.execution_profile());
     cache.blocks = (0..2).map(|_| KvCache::with_capacity(2, 8)).collect();
     let model = Model {
         tok_embeddings: weight(13, 16, 23),

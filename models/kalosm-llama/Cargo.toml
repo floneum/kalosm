@@ -11,9 +11,13 @@ keywords = ["llm", "llama", "mistral", "agents", "nlp"]
 [dependencies]
 fusor = { path = "../../fusor/fusor", default-features = false }
 fusor-gguf = { path = "../../fusor/fusor-gguf" }
+fusor-ir = { path = "../../fusor/fusor-ir" }
+fusor-visualize = { path = "../../fusor/fusor-visualize", optional = true }
+fusor-gpu = { path = "../../fusor/fusor-gpu", optional = true }
 kalosm-tokenizer.workspace = true
 
 half = { version = "2.3.1" }
+bytemuck = "1.24"
 
 tracing = "0.1.37"
 rand.workspace = true
@@ -41,6 +45,7 @@ image = { workspace = true, optional = true }
 getrandom = { version = "0.3", features = ["wasm_js"] }
 
 [dev-dependencies]
+serde_json = "1.0.139"
 ahash = "0.8.12"
 pollster = "0.4"
 tracing-subscriber = "0.3.18"
@@ -58,11 +63,20 @@ tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
 default = ["gpu"]
 cpu = ["fusor/cpu"]
 gpu = ["fusor/gpu"]
+kernel-visualize = ["gpu", "fusor/kernel-observer", "dep:fusor-visualize", "dep:fusor-gpu", "dep:serde_json"]
 chat-template-json = ["minijinja/json"]
 hf-config-json = ["dep:serde_json"]
 vision = ["dep:image", "dep:pollster", "kalosm-language-model/media"]
 structured = ["dep:kalosm-sample", "kalosm-language-model/structured", "dep:rayon"]
 hf-tokenizer-json = ["dep:tokenizers"]
+
+[[example]]
+name = "visualize_kernels"
+required-features = ["kernel-visualize"]
+
+[[example]]
+name = "profile_kernel_share"
+required-features = ["kernel-visualize"]
 
 [[example]]
 name = "structured"
@@ -82,4 +96,8 @@ required-features = ["gpu"]
 
 [[example]]
 name = "token_probe"
+required-features = ["gpu"]
+
+[[example]]
+name = "default_decode"
 required-features = ["gpu"]

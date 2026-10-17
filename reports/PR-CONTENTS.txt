@@ -1,0 +1,18 @@
+This directory publishes selected tools, summaries, and verification evidence
+for the kernel visualizer and WebGPU Llama decode improvements.
+
+Start with llama-decode-2x/default-inference.txt for the default-path change
+and its current validation status. Historical opt-in measurements are in
+llama-decode-2x/verified-short-decode.txt. Exact final timing samples,
+configuration/binary provenance, full-logit comparison summaries, and resource
+samples are under llama-decode-2x/webgpu-memory-bounded/prepared-combined/.
+
+The complete 3.4 GiB local experiment archive is not part of the PR. Historical
+findings refer to local artifacts that may not be published here. Model files,
+executables, raw .f32 reference/candidate vectors, generated shader dumps, and
+rejected native-backend prototypes are excluded. Source and compact validation
+results are retained; the excluded experiments are not build dependencies.
+
+The correctness tool accepts --reference for a separately captured baseline.
+Raw reference vectors must be generated locally before checking a fresh clone;
+see the capture recipe in llama-decode-2x/verified-short-decode.txt.

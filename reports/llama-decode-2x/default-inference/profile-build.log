@@ -1,0 +1,5 @@
+   Compiling fusor-gpu v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-gpu)
+   Compiling fusor v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor)
+   Compiling fusor-visualize v0.1.0 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/fusor/fusor-visualize)
+   Compiling kalosm-llama v0.4.1 (/Users/evanalmloff/Desktop/Github/training-main/.worktrees/kernel-visualizer-defaults/models/kalosm-llama)
+    Finished `dev` profile [optimized] target(s) in 43.87s

@@ -413,6 +413,8 @@ pub(crate) struct Emitter<'a> {
     pub(crate) buffer_globals: FxHashMap<usize, naga::Handle<naga::GlobalVariable>>,
     /// Physical storage element, which can differ from a typed buffer view.
     pub(crate) buffer_elements: FxHashMap<usize, ElementType>,
+    /// Optional physical row width of a nested u32 storage array.
+    pub(crate) buffer_block_widths: FxHashMap<usize, u32>,
     /// Tile decl key -> how that tile is backed in workgroup memory.
     pub(crate) tile_backing: FxHashMap<usize, types::TileBacking>,
     /// Private tiles and program locals.
@@ -486,6 +488,7 @@ impl<'a> Emitter<'a> {
             fn_locals: naga::Arena::new(),
             buffer_globals: FxHashMap::default(),
             buffer_elements: FxHashMap::default(),
+            buffer_block_widths: FxHashMap::default(),
             tile_backing: FxHashMap::default(),
             local_handles: FxHashMap::default(),
             scratch: FxHashMap::default(),
@@ -670,6 +673,126 @@ mod tests {
             .iter()
             .map(|bytes| u32::from_le_bytes(*bytes))
             .collect()
+    }
+
+    #[test]
+    fn block_storage_preserves_masked_flat_and_row_accesses() {
+        let target = crate::target::GpuTarget::new_blocking().expect("WebGPU test adapter");
+        let kernel = Kernel::new();
+        let u = ScalarElement::U32.element();
+        let blocked = |binding, rows, cols| {
+            let layout = TileLayout::contiguous(MemoryLevel::Storage, &[rows, cols]);
+            let buffer = Arc::new(BufferDecl {
+                binding,
+                element: u,
+                layout: layout.clone(),
+                access: BufferAccess::ReadWrite,
+            });
+            StorageView {
+                buffer,
+                layout,
+                offset: 0,
+            }
+        };
+        let input = blocked(1, 2, 3);
+        let output = blocked(2, 2, 4);
+        let yes = kernel.bool(true);
+        let lane = kernel.builtin(Builtin::Lane);
+        let live = kernel.eq(lane, kernel.u32(0));
+        let rc = |r, c| Addr::Rc2 {
+            row: kernel.u32(r),
+            col: kernel.u32(c),
+        };
+        let flat = |i| Addr::Linear(kernel.u32(i));
+        let mut offset = input.clone();
+        offset.offset = 1;
+        let reads = [
+            (input.clone(), rc(1, 2), yes.clone()),
+            (input.clone(), flat(4), yes.clone()),
+            (
+                input.clone(),
+                rc(500, 500),
+                kernel.eq(kernel.builtin(Builtin::Lane), kernel.u32(1)),
+            ),
+            (input.clone(), flat(4), live),
+            (offset, flat(4), yes.clone()),
+            (input.clone(), rc(1, 0), yes.clone()),
+            (input.clone(), rc(0, 4), yes.clone()),
+        ];
+        let body = reads
+            .into_iter()
+            .enumerate()
+            .map(|(i, (view, addr, mask))| Stmt::Store {
+                dst: output.clone(),
+                addr: flat(i as u32),
+                value: kernel.load(Source::Storage(view), addr, mask, kernel.u32(77)),
+                mask: yes.clone(),
+            })
+            .collect();
+        let mut ir = KernelIr {
+            buffers: vec![
+                buffer(0, u, 1, BufferAccess::Read).buffer,
+                input.buffer.clone(),
+                output.buffer.clone(),
+            ],
+            grid: [1, 1, 1],
+            block: 1,
+            body,
+            byte_arena: None,
+            name: "block_storage_accesses",
+        };
+        let bytes = |values: &[u32]| {
+            values
+                .iter()
+                .flat_map(|n| n.to_le_bytes())
+                .collect::<Vec<_>>()
+        };
+        // The second pass supplies a second, flat view of the same binding:
+        // incompatible physical row layouts must fall back to flat storage.
+        for mixed_view in [false, true] {
+            if mixed_view {
+                ir.buffers
+                    .push(buffer(1, u, 6, BufferAccess::ReadWrite).buffer);
+            }
+            let emitted = emit(&ir, target.caps()).unwrap();
+            let global = emitted
+                .module
+                .global_variables
+                .iter()
+                .find(|(_, g)| g.binding.as_ref().is_some_and(|b| b.binding == 1))
+                .unwrap()
+                .1;
+            let naga::TypeInner::Array { base, .. } = emitted.module.types[global.ty].inner else {
+                panic!("storage array");
+            };
+            assert_eq!(
+                matches!(
+                    emitted.module.types[base].inner,
+                    naga::TypeInner::Array { .. }
+                ),
+                !mixed_view
+            );
+            let artifact = target.emit(&ir).unwrap();
+            let raw = target
+                .pool()
+                .create_buffer_init(&bytes(&[11, 12, 13, 21, 22, 23]), crate::pool::TENSOR_USAGE)
+                .unwrap();
+            let out = target
+                .pool()
+                .create_buffer_init(&bytes(&[0xdeadbeef; 8]), crate::pool::TENSOR_USAGE)
+                .unwrap();
+            let uniforms = target.alloc(4, Persistence::Step).unwrap();
+            target
+                .launch(
+                    &artifact,
+                    ir.grid,
+                    &[uniforms, raw, out.clone()],
+                    &Uniforms::default(),
+                )
+                .unwrap();
+            let got = pollster::block_on(target.readback(&out, 32)).unwrap();
+            assert_eq!(got, bytes(&[23, 22, 77, 22, 23, 21, 22, 0xdeadbeef]));
+        }
     }
 
     #[test]

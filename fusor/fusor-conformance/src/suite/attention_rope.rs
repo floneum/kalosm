@@ -467,6 +467,18 @@ fn rope_tables(dh: usize, max_len: usize) -> (Vec<f32>, Vec<f32>) {
 
 pub fn cases() -> Cases {
     let mut cases = Cases::new("attention_rope");
+    cases.push("padded_cache_decode_prefix", padded_cache_decode_prefix);
+    cases.push("padded_cache_llama_geometry", padded_cache_llama_geometry);
+    cases.push("padded_cache_tail_batches", padded_cache_tail_batches);
+    cases.push("fixed_cache_replay_ring", fixed_cache_replay_ring);
+    cases.push(
+        "fixed_cache_donation_replay_ring",
+        fixed_cache_donation_replay_ring,
+    );
+    cases.push(
+        "fixed_cache_donation_shared_store",
+        fixed_cache_donation_shared_store,
+    );
     cases.push(
         "attention_causal_symbolic_lengths",
         symbolic_causal_attention,
@@ -592,6 +604,82 @@ pub fn cases() -> Cases {
     );
 
     // Every rope spelling is checked against the same host rotation.
+    cases.fuzz(
+        "rope_decode_views",
+        &[FuzzDim::Fixed(1)],
+        async |session, _, seed| {
+            let graph = graph_of(session);
+            for dh in [6usize, 128, 254, 256] {
+                let d = RopeDims {
+                    b: 2,
+                    h: 3,
+                    l: 1,
+                    dh,
+                };
+                let (ct, st, cos, sin) = upload_tables(graph.handle(), dh, 9)?;
+                for strided in [false, true] {
+                    let raw =
+                        Domain::Wide.sample(seed, if strided { 2 * 5 * (dh + 2) } else { d.len() });
+                    let (x, data) = if strided {
+                        let x = upload(graph.handle(), &dims(&[2, 5, 1, (dh + 2) as u64]), &raw)?
+                            .narrow(1, 1, 3)?
+                            .narrow(3, 1, dh)?;
+                        let mut data = Vec::new();
+                        for batch in 0..2 {
+                            for head in 1..4 {
+                                let start = (batch * 5 + head) * (dh + 2) + 1;
+                                data.extend_from_slice(&raw[start..start + dh]);
+                            }
+                        }
+                        (x, data)
+                    } else {
+                        (upload(graph.handle(), &dims(&d.shape()), &raw)?, raw)
+                    };
+                    for interleaved in [false, true] {
+                        let p = from_u32(graph.handle(), &dims(&[1]), &[0])?;
+                        let y = rope(&x, &ct, &st, layout(interleaved), RopePos::Positions(&p))?;
+                        for position in [0u32, 8, 9] {
+                            p.set_bytes(position.to_le_bytes().to_vec())?;
+                            y.clear_device_buf();
+                            let expected = if position < 9 {
+                                host_rope_at(&data, &cos, &sin, &[position], d, interleaved)
+                            } else {
+                                vec![0.0; d.len()]
+                            };
+                            expect_values(
+                                session,
+                                &d.shape(),
+                                Dtype::F32,
+                                &read(&y).await?,
+                                &expected,
+                            )
+                            .await?;
+                        }
+                        if !strided && dh == 128 {
+                            p.set_bytes(8u32.to_le_bytes().to_vec())?;
+                            y.clear_device_buf();
+                            let got = gradient_of(&graph, &y, &x).await?;
+                            let mut expected = vec![0.0; d.len()];
+                            for head in 0..d.b * d.h {
+                                for i in 0..dh / 2 {
+                                    let (a, b) = if interleaved {
+                                        (2 * i, 2 * i + 1)
+                                    } else {
+                                        (i, i + dh / 2)
+                                    };
+                                    let (c, s) = (cos[8 * (dh / 2) + i], sin[8 * (dh / 2) + i]);
+                                    expected[head * dh + a] = c + s;
+                                    expected[head * dh + b] = c - s;
+                                }
+                            }
+                            expect_values(session, &d.shape(), Dtype::F32, &got, &expected).await?;
+                        }
+                    }
+                }
+            }
+            Ok(())
+        },
+    );
     cases.fuzz("rope", ROPE_SPEC, async move |s, shape, seed| {
         rope_case(s, seed, "rope", rope_dims(shape), false, 0).await
     });
@@ -675,6 +763,391 @@ pub fn cases() -> Cases {
         async move |s, shape, seed| rope_backward(s, rope_dims(shape), seed).await,
     );
     cases
+}
+
+/// Padded attention must ignore stale NaNs, follow a changing prefix, and
+/// rebuild correctly across capacity growth and reset.
+async fn padded_cache_decode_prefix(session: &Session) -> CaseResult {
+    for width in [16, 128] {
+        padded_cache_decode_prefix_width(session, width).await?;
+    }
+    Ok(())
+}
+
+async fn padded_cache_decode_prefix_width(session: &Session, width: usize) -> CaseResult {
+    let graph = graph_of(session);
+    let mut cache = fusor::cache::KvCache::with_capacity(2, 4);
+    let mut k_heads = [Vec::<f32>::new(), Vec::<f32>::new()];
+    let mut v_heads = [Vec::<f32>::new(), Vec::<f32>::new()];
+    let mut initial_k = Domain::Wide.sample(901, 2 * 8 * width);
+    let mut initial_v = Domain::Wide.sample(907, 2 * 8 * width);
+    for h in 0..2 {
+        k_heads[h].extend_from_slice(&initial_k[h * 8 * width..h * 8 * width + 3 * width]);
+        v_heads[h].extend_from_slice(&initial_v[h * 8 * width..h * 8 * width + 3 * width]);
+        initial_k[h * 8 * width + 3 * width..(h + 1) * 8 * width].fill(f32::NAN);
+        initial_v[h * 8 * width + 3 * width..(h + 1) * 8 * width].fill(f32::NAN);
+    }
+    let kt = fusor::Tensor::<4>::from_dyn(upload(
+        graph.handle(),
+        &dims(&[1, 2, 8, width as u64]),
+        &initial_k,
+    )?);
+    let vt = fusor::Tensor::<4>::from_dyn(upload(
+        graph.handle(),
+        &dims(&[1, 2, 8, width as u64]),
+        &initial_v,
+    )?);
+    cache.append(&kt, &vt);
+    cache.detach();
+    cache.truncate(3)?;
+    for step in 0..12u32 {
+        if step == 11 {
+            cache.reset();
+            for h in 0..2 {
+                k_heads[h].clear();
+                v_heads[h].clear();
+            }
+        }
+        if step > 0 {
+            let k = Domain::Wide.sample(911 + step, 2 * width);
+            let v = Domain::Wide.sample(947 + step, 2 * width);
+            for h in 0..2 {
+                k_heads[h].extend_from_slice(&k[h * width..(h + 1) * width]);
+                v_heads[h].extend_from_slice(&v[h * width..(h + 1) * width]);
+            }
+            let kt = fusor::Tensor::<4>::from_dyn(upload(
+                graph.handle(),
+                &dims(&[1, 2, 1, width as u64]),
+                &k,
+            )?);
+            let vt = fusor::Tensor::<4>::from_dyn(upload(
+                graph.handle(),
+                &dims(&[1, 2, 1, width as u64]),
+                &v,
+            )?);
+            cache.append(&kt, &vt);
+        }
+        let q = Domain::Wide.sample(971 + step, 4 * width);
+        let qt = fusor::Tensor::<4>::from_dyn(upload(
+            graph.handle(),
+            &dims(&[1, 4, 1, width as u64]),
+            &q,
+        )?);
+        let output = cache
+            .attention_decode_padded(&qt, None)
+            .expect("fixed nonempty cache");
+        let mut roots = vec![output.as_dyn().clone()];
+        cache.pending_into(&mut roots);
+        session.resolve(&roots)?;
+        let d = AttnDims {
+            b: 1,
+            h: 4,
+            heads_kv: 2,
+            lq: 1,
+            lk: k_heads[0].len() / width,
+            dh: width,
+        };
+        let k: Vec<_> = k_heads.iter().flatten().copied().collect();
+        let v: Vec<_> = v_heads.iter().flatten().copied().collect();
+        let (expected, _) = host_attention(&q, &k, &v, d, d.default_scale(), &|_, _| 0.0);
+        expect_values(
+            session,
+            &d.q_shape(),
+            Dtype::F32,
+            &read(output.as_dyn()).await?,
+            &expected,
+        )
+        .await?;
+        cache.commit();
+    }
+    Ok(())
+}
+
+/// Exercise the same index node with changing scalar values, through replay,
+/// cache growth, ring wrap, truncation and reset. Detached snapshots survive.
+async fn fixed_cache_replay_ring(session: &Session) -> CaseResult {
+    cache_replay_ring(session, false).await
+}
+
+async fn fixed_cache_donation_replay_ring(session: &Session) -> CaseResult {
+    cache_replay_ring(session, true).await
+}
+
+/// A snapshot that actually shares the cache's physical buffer, plus an old
+/// value still read in the update's resolve. Neither may observe later writes.
+async fn fixed_cache_donation_shared_store(session: &Session) -> CaseResult {
+    let graph = graph_of(session);
+    let mut cache = fusor::cache::KvCache::<3>::windowed(1, 3);
+    let input = fusor::Tensor::<3>::from_dyn(upload(graph.handle(), &dims(&[1, 1, 4]), &[0.; 4])?);
+    let values = input.mul_scalar(2.);
+    let mut expected = vec![0f32; 12];
+    let mut snapshot = None;
+    let mut snapshot_expected = Vec::new();
+    for step in 0..9 {
+        let prior = expected.clone();
+        let old_read = if step >= 3 {
+            Some(
+                cache
+                    .k()
+                    .unwrap()
+                    .narrow(1, 0, 3)
+                    .mul_scalar(0.25)
+                    .into_dyn(),
+            )
+        } else {
+            None
+        };
+        if let Some(old) = &old_read {
+            old.clear_device_buf();
+        }
+        let data: Vec<f32> = (0..4).map(|i| (step * 10 + i + 1) as f32).collect();
+        input
+            .as_dyn()
+            .set_bytes(data.iter().flat_map(|v| v.to_le_bytes()).collect())?;
+        if cache.can_replay(1) {
+            cache.replay_append(1)?;
+        } else {
+            cache.append(&input, &values);
+        }
+        expected[(step % 3) * 4..(step % 3 + 1) * 4].copy_from_slice(&data);
+        if step < 3 {
+            let mut roots = Vec::new();
+            cache.pending_into(&mut roots);
+            session.resolve(&roots)?;
+            if step == 2 {
+                let shared = graph.leaf("cache snapshot", &roots[0].shape(), Dtype::F32)?;
+                shared.adopt_buffer(&roots[0])?;
+                snapshot = Some(shared);
+                snapshot_expected = expected.clone();
+            }
+            cache.commit();
+        } else {
+            let roots = old_read.iter().cloned().collect::<Vec<_>>();
+            fusor::cache::KvCache::resolve_and_commit_all(
+                std::slice::from_mut(&mut cache),
+                &roots,
+            )?;
+            expect_values(
+                session,
+                &[1, 3, 4],
+                Dtype::F32,
+                &read(old_read.as_ref().unwrap()).await?,
+                &prior.iter().map(|v| v * 0.25).collect::<Vec<_>>(),
+            )
+            .await?;
+        }
+        if step >= 2 {
+            // The same full-window view was also a pre-update read root.
+            // Invalidate that explicitly materialized read before asking the
+            // mutable cache leaf for its new contents. The old_read root above
+            // remains bound to its pre-update result.
+            let current = cache.k().unwrap().narrow(1, 0, 3);
+            current.as_dyn().clear_device_buf();
+            expect_values(
+                session,
+                &[1, 3, 4],
+                Dtype::F32,
+                &read(current.as_dyn()).await?,
+                &expected,
+            )
+            .await?;
+            expect_values(
+                session,
+                &[1, 3, 4],
+                Dtype::F32,
+                &read(snapshot.as_ref().unwrap()).await?,
+                &snapshot_expected,
+            )
+            .await?;
+        }
+    }
+    Ok(())
+}
+
+async fn cache_replay_ring(session: &Session, donate: bool) -> CaseResult {
+    for ring in [false, true] {
+        let graph = graph_of(session);
+        let mut cache = if ring {
+            fusor::cache::KvCache::<3>::windowed(1, 3)
+        } else {
+            fusor::cache::KvCache::<3>::with_capacity(1, 2)
+        };
+        let input =
+            fusor::Tensor::<3>::from_dyn(upload(graph.handle(), &dims(&[2, 1, 2]), &[0.; 4])?);
+        let values = input.mul_scalar(2.);
+        let mut expected = [Vec::<f32>::new(), Vec::<f32>::new()];
+        let mut position = 0usize;
+        let mut snapshot = None;
+        for step in 0..11 {
+            if step == 6 && !ring {
+                cache.truncate(1)?;
+                position = 1;
+                for row in &mut expected {
+                    row.truncate(2);
+                }
+            }
+            if step == 8 {
+                cache.reset();
+                position = 0;
+                for row in &mut expected {
+                    row.clear();
+                }
+            }
+            let data: Vec<f32> = (0..4).map(|i| (step * 10 + i + 1) as f32).collect();
+            input
+                .as_dyn()
+                .set_bytes(data.iter().flat_map(|v| v.to_le_bytes()).collect())?;
+            if cache.can_replay(1) {
+                cache.replay_append(1)?;
+            } else {
+                cache.append(&input, &values);
+            }
+            let slot = if ring { position % 3 } else { position };
+            let count = if ring {
+                (position + 1).min(3)
+            } else {
+                position + 1
+            };
+            for (r, row) in expected.iter_mut().enumerate() {
+                row.resize(count * 2, 0.);
+                row[slot * 2..slot * 2 + 2].copy_from_slice(&data[r * 2..r * 2 + 2]);
+            }
+            if donate {
+                fusor::cache::KvCache::resolve_and_commit_all(
+                    std::slice::from_mut(&mut cache),
+                    &[],
+                )?;
+            } else {
+                let mut roots = Vec::new();
+                cache.pending_into(&mut roots);
+                session.resolve(&roots)?;
+            }
+            let flat: Vec<_> = expected.iter().flatten().copied().collect();
+            expect_values(
+                session,
+                &[2, count as u64, 2],
+                Dtype::F32,
+                &read(cache.k().unwrap().narrow(1, 0, count).as_dyn()).await?,
+                &flat,
+            )
+            .await?;
+            expect_values(
+                session,
+                &[2, count as u64, 2],
+                Dtype::F32,
+                &read(cache.v().unwrap().narrow(1, 0, count).as_dyn()).await?,
+                &flat.iter().map(|v| v * 2.).collect::<Vec<_>>(),
+            )
+            .await?;
+            if step == 3 {
+                snapshot = Some((
+                    cache.k().unwrap().narrow(1, 0, count).as_dyn().detach()?,
+                    flat,
+                ));
+            }
+            cache.commit();
+            position += 1;
+        }
+        let (snapshot, expected) = snapshot.unwrap();
+        expect_values(
+            session,
+            &[2, (expected.len() / 4) as u64, 2],
+            Dtype::F32,
+            &read(&snapshot).await?,
+            &expected,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn padded_cache_tail_batches(session: &Session) -> CaseResult {
+    for (batch, heads, kv_heads, len, capacity) in [
+        (1, 1, 1, 1, 257),
+        (2, 4, 2, 31, 257),
+        (1, 32, 8, 257, 257),
+        (1, 32, 8, 4008, 4096),
+    ] {
+        let graph = graph_of(session);
+        let d = AttnDims {
+            b: batch,
+            h: heads,
+            heads_kv: kv_heads,
+            lq: 1,
+            lk: len,
+            dh: 128,
+        };
+        let q = Domain::Wide.sample(1423, d.q_len());
+        let mut k = Domain::Wide.sample(1427, batch * kv_heads * capacity * 128);
+        let mut v = Domain::Wide.sample(1429, k.len());
+        let mut valid_k = Vec::new();
+        let mut valid_v = Vec::new();
+        for row in 0..batch * kv_heads {
+            let start = row * capacity * 128;
+            valid_k.extend_from_slice(&k[start..start + len * 128]);
+            valid_v.extend_from_slice(&v[start..start + len * 128]);
+            k[start + len * 128..start + capacity * 128].fill(f32::NAN);
+            v[start + len * 128..start + capacity * 128].fill(f32::NAN);
+        }
+        let qt = fusor::Tensor::<4>::from_dyn(upload(graph.handle(), &dims(&d.q_shape()), &q)?);
+        let shape = dims(&[batch as u64, kv_heads as u64, capacity as u64, 128]);
+        let kt = fusor::Tensor::<4>::from_dyn(upload(graph.handle(), &shape, &k)?);
+        let vt = fusor::Tensor::<4>::from_dyn(upload(graph.handle(), &shape, &v)?);
+        let mut cache = fusor::cache::KvCache::with_capacity(2, capacity as u64);
+        cache.append(&kt, &vt);
+        cache.detach();
+        cache.truncate(len as u64)?;
+        let out = cache
+            .attention_decode_padded(&qt, Some(0.17))
+            .expect("fixed cache");
+        let (expected, _) = host_attention(&q, &valid_k, &valid_v, d, 0.17, &no_mask);
+        expect_values(
+            session,
+            &d.q_shape(),
+            Dtype::F32,
+            &read(out.as_dyn()).await?,
+            &expected,
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn padded_cache_llama_geometry(session: &Session) -> CaseResult {
+    let graph = graph_of(session);
+    let d = AttnDims {
+        b: 1,
+        h: 32,
+        heads_kv: 8,
+        lq: 1,
+        lk: 211,
+        dh: 128,
+    };
+    let q = Domain::Wide.sample(1201, d.q_len());
+    let k = Domain::Wide.sample(1213, d.kv_len());
+    let v = Domain::Wide.sample(1217, d.kv_len());
+    let qt = fusor::Tensor::<4>::from_dyn(upload(graph.handle(), &dims(&d.q_shape()), &q)?);
+    let kt = fusor::Tensor::<4>::from_dyn(upload(graph.handle(), &dims(&d.kv_shape()), &k)?);
+    let vt = fusor::Tensor::<4>::from_dyn(upload(graph.handle(), &dims(&d.kv_shape()), &v)?);
+    let mut cache = fusor::cache::KvCache::with_capacity(2, 512);
+    cache.append(&kt, &vt);
+    let out = cache
+        .attention_decode_padded(&qt, None)
+        .expect("fixed cache");
+    let mut roots = vec![out.as_dyn().clone()];
+    cache.pending_into(&mut roots);
+    session.resolve(&roots)?;
+    let (expected, _) = host_attention(&q, &k, &v, d, d.default_scale(), &no_mask);
+    expect_values(
+        session,
+        &d.q_shape(),
+        Dtype::F32,
+        &read(out.as_dyn()).await?,
+        &expected,
+    )
+    .await?;
+    cache.commit();
+    Ok(())
 }
 
 type AttnBuild = fn(&Tensor, &Tensor, &Tensor) -> fusor::Result<Tensor>;

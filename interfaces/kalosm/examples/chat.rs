@@ -1,10 +1,4 @@
-// KALOSM_TRACE_DECODE_TIMING=1 \
-// FUSOR_TRACE_DECODE=1 \
-// KALOSM_LLAMA_GPU_SAMPLE_TOKEN=1 \
-// KALOSM_LLAMA_GPU_FUSED_LOGITS=1 \
-// KALOSM_LLAMA_GPU_SAMPLE_TOP_K=128 \
-// KALOSM_LLAMA_SAMPLER=standard \
-// cargo run -p kalosm --example chat --features llama --release
+// cargo run -j 1 -p kalosm --example chat --features llama --release
 use kalosm::language::*;
 use std::io::{BufWriter, Write};
 use std::time::Duration;

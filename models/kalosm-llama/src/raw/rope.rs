@@ -68,6 +68,41 @@ pub(crate) struct RopeImplementation {
 }
 
 impl RopeImplementation {
+    /// A joint projection already contains adjacent Q/K heads. Rotate its
+    /// prefix directly instead of concatenating two views through scatters.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_projected(
+        &self,
+        projected: &Tensor<3>,
+        query_heads: usize,
+        kv_heads: usize,
+        head_dim: usize,
+        interleaved: bool,
+        at: RopeAt<'_>,
+    ) -> (Tensor<4>, Tensor<4>) {
+        let [batch, seq, _] = projected.shape();
+        let heads = query_heads + kv_heads;
+        let qk = projected
+            .narrow(2, 0, heads * head_dim)
+            .reshape([batch, seq, heads, head_dim])
+            .transpose(1, 2);
+        let layout = if interleaved {
+            RopeLayout::Interleaved
+        } else {
+            RopeLayout::Halves
+        };
+        let (cos, sin, pos) = match at {
+            RopeAt::Leaf(p) => (&self.cos, &self.sin, RopePos::Positions(p)),
+            RopeAt::Offset(start) => (&self.cos, &self.sin, RopePos::Offset(start as u64)),
+            RopeAt::Rows { cos, sin } => (cos, sin, RopePos::Offset(0)),
+        };
+        let rotated = qk.rope(cos, sin, layout, pos);
+        (
+            rotated.narrow(1, 0, query_heads),
+            rotated.narrow(1, query_heads, kv_heads),
+        )
+    }
+
     pub fn new(config: &LlamaConfig, rope_theta: f32, device: &Device) -> Self {
         let inverse_frequency = create_inverse_frequency(
             config.rope_scaling.as_ref(),

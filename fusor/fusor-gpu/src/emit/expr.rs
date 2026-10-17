@@ -1007,6 +1007,25 @@ impl Emitter<'_> {
         match src {
             Source::Storage(view) => {
                 let element = view.buffer.element;
+                if let Addr::Rc2 { row, col } = addr
+                    && view.offset == 0
+                    && view.layout == view.buffer.layout
+                    && self
+                        .buffer_block_widths
+                        .contains_key(&super::key(&view.buffer))
+                {
+                    let width = self.buffer_block_widths[&super::key(&view.buffer)];
+                    let bounded_column = super::storage::unsigned_index_max(col) < width;
+                    let row = self.expr(row, body)?;
+                    let col = self.expr(col, body)?;
+                    if mask.is_constant_true() {
+                        return self.load_storage_block(body, view, row, col, bounded_column);
+                    }
+                    let (fill_h, mask_h) = self.fill_and_mask(body, fill, mask, element)?;
+                    return self.masked_value(body, element, fill_h, mask_h, |em, accept| {
+                        em.load_storage_block(accept, view, row, col, bounded_column)
+                    });
+                }
                 if mask.is_constant_true() {
                     let index = self.addr_index(body, view, addr)?;
                     return self.load_storage_value(body, view, index);
@@ -1023,6 +1042,11 @@ impl Emitter<'_> {
                         let global = self.buffer_global(&view.buffer)?;
                         let base_for_len = self.global_var(global);
                         let mut len = self.emit_expr(body, Expression::ArrayLength(base_for_len));
+                        if let Some(&width) =
+                            self.buffer_block_widths.get(&super::key(&view.buffer))
+                        {
+                            len = self.mul_literal_u32(body, len, width);
+                        }
                         if self.packed_half(&view.buffer) {
                             len = self.mul_literal_u32(body, len, 2);
                         }

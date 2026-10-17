@@ -124,6 +124,19 @@ impl Device {
         Ok(Self::Gpu(Gpu(Inner::new(Backend::gpu().await?)?)))
     }
 
+    /// The GPU with bounded-memory inference defaults where supported.
+    #[cfg(feature = "gpu")]
+    pub async fn gpu_inference() -> Result<Self> {
+        Ok(Self::Gpu(Gpu(Inner::new(
+            Backend::gpu_with_profile(fusor_ir::execution::ExecutionProfile::LowLatency).await?,
+        )?)))
+    }
+
+    /// The selected execution profile (after adapter fallback).
+    pub fn execution_profile(&self) -> fusor_ir::execution::ExecutionProfile {
+        self.session().caps().execution_profile
+    }
+
     /// The GPU if one is usable, otherwise the CPU.
     #[cfg(all(feature = "gpu", feature = "cpu"))]
     #[cfg(not(target_arch = "wasm32"))]

@@ -1,0 +1,154 @@
+Llama kernel investigation — 2026-10-10
+
+MEASURED RESULT
+Apple M2 Max / Metal, subgroup 32, Meta-Llama-3.1-8B-Instruct Q4_K_M,
+208-token prompt, exactly one generated token per awaited request.
+
+                              Reference       Candidate       Ratio
+Prompt GPU                     3243.87 ms       1394.15 ms       2.327x
+Fresh-session prompt wall      9299.80 ms       8390.84 ms       1.108x
+Steady decode GPU                27.963 ms        28.698 ms      0.974x
+Steady decode wall               43.160 ms        42.980 ms      1.004x
+Prompt dispatches                 16653            2161         7.71x fewer
+
+These are medians from staged-ab/model-ab.json: two measured fresh sessions
+following one warmup session; three steady decode samples per measured session.
+First decode of every fresh session is excluded because it compiles a new graph.
+Prompt wall still includes cold graph planning. Model loading is outside these
+phases. Logit capture and CPU profiling are enabled in both arms and affect wall
+time. This is a demonstrated >2x prompt GPU win, not >2x end-to-end generation.
+Only this model, machine, and prompt shape have the end-to-end numerical check.
+
+Reference: original compiler, default 16-token batches and default tile domain.
+Candidate: 128-token batches, FUSOR_PIN_COOP=64,64,8,4, plus the cooperative
+staging changes in fusor-gpu/src/lower/contract.rs. The selected large gate/up
+kernel uses 64x64x8, four subgroups, two N passes, staging depth one.
+The 208 tokens occupy two padded 128-token batches instead of thirteen batches
+of 16. Numerical accuracy is not relaxed. Batch width remains an opt-in profiling
+setting behind kernel-visualize; production's default remains 16.
+
+CORRECTNESS
+All 15 complete model output vectors (128256 f32 logits each) were compared:
+  1,923,840 values; maximum absolute difference 0.000032901763916015625;
+  maximum RMS difference 0.0000067286235220370575; all argmaxes match.
+Generated text is identical across all phases and rounds.
+The isolated matrix sweep additionally compared 33,030,144 output floats across
+three candidate tile depths and three signed inputs; maximum difference 0.0000476837.
+The lab checks every result is finite and compares every row at 33 distributed
+columns against independently dequantized CPU f64 dot products on three inputs.
+That CPU check is sampled across columns; the saved A/B comparisons are full.
+14 existing GPU cooperative-shape conformance cases passed, none skipped.
+Controlled Q6_K partial tiles M=63/64,N=28673,K=4096 also pass the CPU
+reference with zero sampled error (final-q6k-tail.txt). The corrected replay
+harness reproduces decode at 285 us with zero sampled error.
+See staging-conformance.txt and the numerical JSON files for exact evidence.
+
+WHAT THE BETTER TOOLS EXPOSED
+1. Semantic dispatch profiling ties every executed shader body to its real
+   matrix shape, quantization, schedule, grid, and timestamp. Group/slab launches
+   preserve their members; no invented division of a composite's GPU duration.
+   The analyzer verifies body IDs, launch indices, grids and complete coverage.
+2. The dominant original prompt operation is fused gate/up projection:
+   M=16, N=28672, K=4096, Q4_K. It consumes 39.4% of per-dispatch-profiled GPU
+   time: 1373 ms, 416 launches. The candidate uses M=128 and takes 524 ms in
+   64 launches (37.2% of its faster prompt). This is the worthwhile target,
+   unlike the earlier visually striking reductions that totaled under 1%.
+3. Column-major weights already had adjacent global loads, but staging wrote
+   a transposed pattern to shared memory. The new layout keeps that staging
+   contiguous and loads the cooperative B fragment with the transpose flag.
+   Complete matrix tiles also avoid redundant clamped/masked loads. Partial
+   tiles retain bounds checks and remainder lanes remain guarded.
+4. Larger batching/tiling alone, with the original staging compiler, measured
+   1.980x prompt GPU improvement (model-ab.json). Adding the staging change
+   brings the controlled result to 2.327x. The staging optimizations were tested
+   together; these numbers do not separately attribute transpose versus masking.
+5. Host-stage timings expose initial plan selection as the startup problem.
+   A representative candidate cold extraction spends 6.455 s in seed selection,
+   30.3 ms in bounds, 12.3 ms in local search, 4.5 ms deriving the plan. Setting
+   FUSOR_MOVE_WORK=0 does not avoid this seed work (seed-only.log). The initial
+   selection sweep, which reprices candidate DAGs, is the next CPU target.
+6. After this change, attention Sgemm operations M=512, K=128, batch=8, N=128
+   or 256 consume another 216 ms (15.3% of candidate prompt GPU time). They
+   reach only about 57–67 effective GFLOP/s in this profile; inspect their layout
+   and family selection next. This is a measurement, not a promised speedup.
+
+DISCARDED HYPOTHESES
+Increasing K tiles to 64/128 did not produce a consistent gain; some schedules
+fell back to Sgemv or slowed dramatically. Their domain expansion was reverted.
+The earlier combined trial is retained only as staging-experiment.patch.
+Q4_K packed nibble spacing suggested a 128-element lane gap. Batched command
+replay showed the original gap-32 cell at 294 us versus the best gap-128 trial
+near 304 us for M=1,N=28672,K=4096. No decode win. The default domain is unchanged;
+explicit debug pins can now request a legal non-default gap.
+Single cold/idle microbenchmark submissions overstated decode costs by roughly
+3x. Use LAB_BATCH_REPEAT=32 for this throughput experiment; steady-gap-* holds
+those measurements. Replays run only this lab's pure matrix graph, while its
+uniforms and arena are live. Never replay a stateful KV-cache graph this way.
+
+TIMING METHOD AND LIMITS
+The GPU completes compute before timestamps are resolved in a separate submission.
+Same-submission Metal timestamp probes from the earlier investigation were invalid
+and are not used. Whole-plan timing supplies the headline A/B. Per-dispatch
+instrumentation has extra GPU/host overhead, so its absolute totals differ;
+use baseline.summary.json and optimized-semantic.summary.json for attribution,
+not mixed-mode speedup arithmetic. Operand-byte counts are logical native-format
+volume, not physical DRAM traffic, cache misses, or a bandwidth lower bound.
+Online exploration was disabled. Actual selected families are logged: a pinned
+Coop domain does not force extraction to choose Coop. Tuning and lowering can
+produce kernels that are not the final inference plan.
+
+REPRODUCING (from the worktree root)
+Set MODEL to the local Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf path.
+
+Build:
+  cargo build -p kalosm-llama --example profile_kernel_share --features kernel-visualize
+  (cd fusor && cargo build -p fusor --example qmatmul_lab --features gpu,kernel-observer)
+
+Candidate whole-plan timing:
+  PROFILE_PROMPT=long PROFILE_PREFILL_WIDTH=128 FUSOR_PIN_COOP=64,64,8,4 FUSOR_EXPLORE_EPS=0 FUSOR_TIME_PLAN=1 target/debug/examples/profile_kernel_share "$MODEL" 2 4
+
+Semantic capture (do not combine FUSOR_TIME_PLAN and FUSOR_TIME_RANGE):
+  PROFILE_PROMPT=long PROFILE_PREFILL_WIDTH=128 PROFILE_METADATA=1 FUSOR_PIN_COOP=64,64,8,4 FUSOR_EXPLORE_EPS=0 FUSOR_TIME_RANGE=0 target/debug/examples/profile_kernel_share "$MODEL" 1 2 > phases.jsonl 2> semantic.log
+  python3 reports/llama-deep-profile/analyze.py semantic.log
+
+Host planning:
+  Add FUSOR_RESOLVE_PROFILE=1 FUSOR_EXTRACT_PROFILE=1 to a whole-plan run.
+  EXTRACT_STAGE reports each cold extraction stage in microseconds.
+
+Full numerical A/B, with a new output directory:
+  PROFILE_REPORT_DIR=/private/tmp/llama-new-ab PROFILE_REFERENCE_BINARY=/private/tmp/llama-profile-original-staging python3 reports/llama-deep-profile/model_ab.py "$MODEL"
+The preserved reference executable is local to this investigation. To repeat on
+another machine, save an executable before changing contract.rs, then pass its
+path as PROFILE_REFERENCE_BINARY. Both binaries must include the profiling
+example and logit-capture feature. Without that override, the script compares
+batching configurations using the current compiler in both arms. It refuses
+existing logit directories, validates full numerical results and GPU coverage,
+and fails if prompt GPU speedup is below 2x (PROFILE_MIN_GPU_SPEEDUP overrides).
+
+Matrix throughput and CPU validation:
+  FUSOR_AUTOTUNE_MIN_MACS=18446744073709551615 LAB_BATCH_REPEAT=32 FUSOR_EXPLORE_EPS=0 fusor/target/debug/examples/qmatmul_lab 1 28672 4096 q4k 11
+  LAB_BATCH_REPEAT=8 LAB_M=128 LAB_CELLS='16,16,8,1;64,64,8,4;64,64,16,4' LAB_REPORT_DIR=/private/tmp/llama-tiles python3 reports/llama-deep-profile/sweep.py
+LAB_OUTPUT_DIR saves full little-endian f32 outputs. Full tensors remain local
+and git-ignored; compact correctness summaries and compressed dispatch logs are
+reviewable. The stepwise virtual GPU still does not interpret cooperative-matrix
+or quantized collectives; semantic profiling and real GPU measurements cover
+those kernels without pretending the simulator can execute them.
+
+TAIL-SHAPE FOLLOW-UP
+The wide Q4_K tail experiment did complete and passed its CPU checks for
+M=63,64,65 and N=28673,K=4096. M=63 and 64 used Coop. At M=65 the selector
+switched to Sgemv, taking about 129 ms versus 5 ms at M=64; the pinned Coop
+domain creates a severe padding/family-selection cliff. That particular run
+left cold autotuning enabled: its 204-second cold setup and warm numbers are
+diagnostic only, not a controlled A/B. The lab now requires disabling autotuning
+for batched replay and enables timing only for the controlled replay. The earlier
+steady-gap sweeps already disabled autotuning and remain valid.
+The 64x64 pin is a measured configuration for the tested 128-token prompt path,
+not a universal tile policy for arbitrary matrices.
+
+TOOL VALIDATION
+27 virtual-GPU/CLI tests pass. Three attribution regression tests cover composite
+launches, zero grids, body/launch/grid mismatches and missing timestamps.
+The modified Rust crates and both profiling examples pass Clippy with warnings
+denied; rustfmt and git diff --check pass. The semantic analyzer successfully
+checks every observed dispatch in both compressed real-model traces.

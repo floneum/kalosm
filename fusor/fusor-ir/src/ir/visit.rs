@@ -80,6 +80,33 @@ impl Op {
 
 fn launch(op: &mut Launch, visitor: &mut impl VisitMut, generated: Option<usize>) {
     match op {
+        Launch::RmsNorm {
+            output,
+            epsilon,
+            ops,
+            ..
+        } => {
+            dims(&mut output.dims, visitor);
+            visitor.scalar(epsilon);
+            operands(ops, visitor);
+        }
+        Launch::DecodeAttention {
+            output,
+            scale,
+            prefix,
+            ops,
+            ..
+        } => {
+            dims(&mut output.dims, visitor);
+            visitor.scalar(scale);
+            visitor.scalar(prefix);
+            operands(ops, visitor);
+        }
+        Launch::DecodeAttentionMerge { output, ops, .. }
+        | Launch::DecodeRope { output, ops, .. } => {
+            dims(&mut output.dims, visitor);
+            operands(ops, visitor);
+        }
         Launch::Map {
             space, body, ops, ..
         } => {

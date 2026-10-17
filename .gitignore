@@ -23,3 +23,10 @@ rust-analyzer
 /.claude
 **/.claude/
 profiles
+
+# Reproducible dependency experiment; patch retained in reports/llama-8x.
+/.kernel-profile-deps/
+
+# Python profiling tools generate local bytecode caches.
+__pycache__/
+*.pyc

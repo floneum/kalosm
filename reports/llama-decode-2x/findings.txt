@@ -1,0 +1,327 @@
+VERIFIED UPDATE — 2026-10-12 — ORIGINAL SHORT-CONTEXT 2x TARGET PASSES
+
+Clean original-baseline ABBA: 32.631625/32.042000 -> 16.020375/15.989875
+ms/token, 2.036883x/2.003893x. Median-run ratio 2.020404x. All 2,308,608
+full logits pass. Standard WebGPU, unchanged weights/F32 arithmetic, bounded
+memory and no additional swapouts. The configuration is opt-in; see
+verified-short-decode.txt and verified-short-config.json for evidence/reproduction.
+
+HISTORICAL CHECKPOINTS FOLLOW (earlier open-target statements are superseded)
+
+CURRENT PROGRESS — 2026-10-11 — ORIGINAL SHORT-CONTEXT TARGET STILL OPEN
+
+The 4008-token context is verified at 2.10x clean steady decode speedup:
+71.3311 -> 33.9546 ms/token median; means improve 2.069x. Thirty steady
+samples per arm, same executable, matching text. See split-clean-wall-4k/result.json.
+Full numerical A/B validates 39 vectors / 5,001,984 logits (all pass).
+
+The original 208-token test is now verified at 1.628x, 31.880979 -> 19.582271
+ms/token median, 1.637487x mean. Its explicit 2x assertion still FAILS.
+Thirty steady samples per arm with matching text. See
+rms-residual-donation-clean-wall-208/result.json. The matching configuration
+passes 2,308,608 full logits (rms_residual_donation/check.json; maximum
+absolute error 0.000059605, maximum RMS error 0.000009402).
+The goal remains active. rms-residual-donation-config.json is the current
+short-context clean-timed checkpoint; split-candidate.json remains the
+validated long-context checkpoint.
+
+Q/K projection, RMS normalization, view forwarding and streamed submission,
+Q6 payload coalescing, rotary fusion, uniform cache indices, prompt-sized
+capacity, owned cache appends and residual RMS fusion reduce launches to435.
+Instrumented whole GPU time is about17.31ms. Exact clean-timed executable:
+rms-cache-profile, SHA256 fecdf57f81f3dffccc5edd12a37a65ee6e647b25989104320f7dc6c26ced4b0c.
+See continuation-findings.txt for hypotheses, failures, and detailed provenance.
+The historical packed-candidate.json and retained-* reports below remain intact.
+
+HISTORICAL CHECKPOINT (superseded by the results above)
+
+FINAL RETAINED CANDIDATE CHECK — 2026-10-11
+The requested 2x decode speedup is NOT achieved. Both explicit 2x assertions
+fail, and that failure is preserved in retained-ab-run.txt and
+retained-clean-wall-run.txt. The retained changes improve decode, with no
+failed Q6 or scalar-fusion prototypes left in compiled code.
+
+Same executable and same conservative prefill settings in both arms; only
+candidate decode switches differ. Exact executable hashes and environments
+are saved alongside each run.
+
+Clean wall time (retained-clean-wall/result.json):
+  30 steady samples per arm, two sessions after warmup and first-token exclusion.
+  Baseline median 31.0228 ms -> candidate 25.9955 ms: 1.1934x.
+  Mean 31.0305 -> 26.1416 ms; 32.23 -> 38.25 tokens/s.
+  An earlier independent clean run was 31.3994 -> 25.6556 ms (1.2239x).
+  These two runs support approximately 1.2x, not 2x, wall improvement.
+
+GPU spans and full numerical comparison (retained-ab/model-ab.json):
+  22 steady samples per arm: 26.6033 -> 21.6653 ms GPU, 1.2279x.
+  All 39 logit vectors / 5,001,984 values pass. Max absolute error 0.000038147;
+  max RMS 0.0000082251. Every argmax and generated text matches.
+  This run writes logits and collects timestamps; use the separate clean wall
+  result above for latency. It validates this model/prompt/horizon only.
+
+Validation: all 29 visualizer tests pass; clippy with -D warnings passes for
+both the Llama examples and Fusor/GPU/visualizer targets. Formatting and
+whitespace checks pass. retained-summary.json contains the compact result.
+
+Retained work: packed single-row Q4_K dot lowering, small dense attention
+schedule pin, and an opt-in bounded-search rule ablation. The tools now expose
+selected quantized layouts, real Q4 address traces, rule-search activity,
+clean model A/B timing and a parameterized weight bandwidth budget. Changes
+remain opt-in through packed-candidate.json.
+
+Reproduce from the worktree root after building the profiling example:
+  python3 reports/llama-decode-2x/wall_ab.py "$MODEL" --output "$NEW_WALL_DIR" --rounds 2 --steps 16
+  python3 reports/llama-8x/run_ab.py "$MODEL" --reference target/debug/examples/profile_kernel_share --reference-config reports/llama-8x/candidate.json --config reports/llama-decode-2x/packed-candidate.json --output "$NEW_AB_DIR" --rounds 2 --decode-steps 12 --gpu-target 0 --decode-gpu-target 2 --decode-wall-target 2
+Both commands retain the 2x requirement and are expected to exit nonzero.
+
+DETAILED EVIDENCE AND EARLIER CHECKPOINTS
+
+ADDITIONAL BANDWIDTH AND FUSION CHECKS
+streaming-bandwidth.txt: 512 MiB read-only input, 32 repeated dispatches per
+span, 12 measured spans after warmup, interleaved scalar/vec4 cases. Every
+subgroup checksum passes for two inputs (262,144 checks). Scalar: 350.908 GB/s;
+vec4: 348.587 GB/s. This is a synthetic observed rate, not a physical peak or
+proof of model DRAM traffic. No vector-load advantage was demonstrated here.
+The new streaming_bandwidth example is independent of planner heuristics.
+
+traffic_budget.py counts 4.6283 GB/token of selected quantized operands from
+actual semantic metadata. Under a once-per-invocation streaming assumption,
+350.908 GB/s gives 13.1895 ms for those weights alone. The same-build 2x wall
+target is 15.6997 ms: about 2.51 ms remains for all other work in that scenario.
+This explains why another isolated Q4 arithmetic tweak is insufficient. It is
+not a claim that the target is impossible, nor a hardware-counter measurement.
+
+Normalization probes (all logits pass):
+- Disable RECOGNIZE_CONTRACT as well as SPLIT_K: 21.875 ms GPU, 1041 launches;
+  too small a change to claim a robust gain over 22.05 ms.
+- Also disable STRIP: 1021 launches, 22.736 ms GPU / 30.768 ms wall. Crossing
+  the 1024-dispatch threshold changes default submission behavior. Forcing
+  256-dispatch submissions gives 22.458 / 30.023 ms, so that threshold does
+  NOT explain all of the regression. Neither variant is retained.
+- Experimental scalar-reduction slab fusion: 1020 launches, 22.012 ms GPU /
+  26.879 ms wall. A 32 KiB memory request produces 22.001 / 28.630 ms, still
+  1020 launches. No demonstrated gain versus retained candidate. The rule
+  experiment is archived as slab-scalar-probe.rs.txt and removed from code.
+
+Retained candidate remains packed Q4 + bounded search ablation + small dense
+attention tile (packed-candidate.json). The original 2x requirement is still red.
+
+CLEAN WALL COMPARISON (same executable, updated candidate)
+clean-wall/result.json excludes GPU timestamp collection and logit file writes.
+Two measured sessions, 30 steady tokens per arm after warmup and first-token
+exclusion: baseline median 31.3994 ms, candidate 25.6556 ms (1.2239x).
+Means: 31.4904 -> 26.0219 ms, 31.76 -> 38.43 tokens/s. Identical executable
+SHA256 in both arms (clean-wall/provenance.json); generated text matches.
+The explicit 2x assertion FAILS. Accuracy is verified separately with all logits.
+
+Candidate now also pins small dense SGEMV to 1,4,16,1,0 (M<=4, known K<=512,
+N!=1). packed_dense_small/check.json: GPU 22.05 ms vs original 27.0189 ms,
+1.2253x; 1041 dispatches, all 2,308,608 logits pass, max abs 0.000066996.
+The old tile's tail lowering already shrinks its window, so it does NOT run
+with the 15/16 idle-lane fraction suggested by nominal vector size. The new
+layout shares activations across columns and uses subgroup reductions.
+
+Packed Q4 is restricted to single-row, single-batch decode until a direct
+multirow packed-path test exists. signed-q6-check/q4-tails executes the packed
+path for M=1,N=257,K=1024 and passes the CPU reference; M=3 selects a decoded
+operand, so that result is NOT evidence for multirow packed-kernel correctness.
+The K=1280 and F32Scales cases verify the old-kernel fallback. Unsupported B
+scalar pre-transforms also retain the original kernel.
+
+Rejected arithmetic probes remain only as report archives:
+- Q4 u16 halves: no demonstrated gain, reverted.
+- Q4 factoring both block scales after group sums: longer ABBA with 128
+  repeated dispatches/span confirms original 205.0/207.8 us vs 218.4/217.4 us;
+  no gain, reverted. Short 32-repeat microbenchmarks were too noisy here.
+- Signed Q6 32-value groups: down projection 238 vs 202 us; vocabulary 1332
+  vs 1465 us. Smaller column tiles did not fix down-projection regression.
+  Removed from compiled code; isolated vocabulary gain is not a model gain.
+- One 2048-command submission/pass: GPU about 22.3 ms, wall about 31.4 ms,
+  worse wall latency; excluded from retained candidate.
+
+FOLLOW-UP (continued investigation)
+The packed Q4 path now improves full-model steady GPU decode. Best current
+quick probe packed_unmasked: 22.763 ms GPU, 27.655 ms wall, 1041 dispatches,
+all 2,308,608 logits pass (max abs 0.000066996). Against the saved original:
+1.187x GPU and 1.537x wall. This still does NOT meet the 2x target. Host opt-level
+3 is part of the wall comparison; the original uses a dev host build. Both runs
+include timestamp collection and saving full logits inside the timed request.
+A clean, like-for-like timing run is still required before any headline claim.
+
+Corrections to the historical text below:
+- Native Q6 input can select an automatically repacked F32Scales leaf. The old
+  Native-vs-F32Scales microbench was not a confirmed executed-layout comparison.
+  The matrix lab now logs LAB_SELECTED_QUANT and semantic metadata includes the
+  selected layout and physical storage bytes. Do not infer execution layout
+  from the requested input layout or its logical byte count.
+- Quantized decoding and scalar reads inside vector arithmetic are now supported
+  by the virtual address recorder, through the same block decoder as emission.
+  Collective memory operations and vector memory operations remain unsupported.
+- The first native-sized packed Q6 experiment did not actually run the new path;
+  see packed-q6.log. The F32Scales variant did run and was slower (263 us).
+  A separate 16-value-per-lane Q6 variant ran at 199 us and did not improve the
+  model (22.908 ms GPU). Both unsuccessful prototypes are archived, not compiled.
+
+The packed Q4 kernel keeps 4-bit fields in integer words during each dot and
+factors scale/min corrections over groups. Unnecessary column masks are removed
+only when divisibility proves the complete output tile in bounds. It is opt-in:
+FUSOR_PROFILE_GEMV_PACKED_Q4=1. Unsupported formats, layouts, K tails, and scalar
+pre-transforms keep the original kernel. Full-logit and CPU-tail checks must
+accompany any default promotion.
+
+Compiler telemetry FUSOR_PROFILE_RULES=1 counts fired rules and nodes minted in
+the bounded search. FUSOR_PROFILE_DISABLE_RULES accepts named additive rules,
+rejecting unknown names and correctness-floor lowerings. SPLIT_K accounted for
+roughly one quarter of minted search nodes. Its ablation reduced launches from
+1270 to 1033 but barely changed GPU time. More aggressive access-rule ablation
+reached ten rounds and 952 launches, still 22.83 ms GPU with worse wall time.
+The F32 small-matrix SGEMV pin and packed Q4 path produce the 1041-launch candidate
+in packed-candidate.json. Shorter submissions and 32 KiB workgroup memory did
+not show a GPU benefit; neither is enabled in that configuration.
+
+Real Q4 traces are in traces/q4-original and traces/q4-packed: one actual
+64-lane workgroup, subgroup 32, 16 KiB virtual cache, 128-byte lines, 32-byte
+sectors. Before backend CSE, explicit requested bytes fall 851984 -> 237584,
+steps 6666 -> 1866, and modeled sectors 49156 -> 39172. Cold cache fill is
+25600 bytes in both. These are logical address-model counts, not hardware
+instructions, measured cache misses, or whole-model speedups. See trace notes.
+The packed-semantic trace totals 31.85 ms due to per-dispatch instrumentation;
+the uninstrumented-span GPU result is about 22.8 ms. Q4 gate/up 8.65 ms,
+Q6 down 4.03 ms, Q4 4096-square 2.52 ms, Q4 down 2.08 ms, KV scatter 1.88 ms,
+vocabulary Q6 1.74 ms in the instrumented attribution.
+
+HISTORICAL REPORT (earlier checkpoints, superseded above)
+
+Steady decode investigation — 2026-10-11
+
+STATUS
+The 2x steady decode target is not achieved. The earlier latency candidate's
+slower decode is not an acceptable decode optimization. The retained conservative
+configuration leaves the decode search unchanged. All new probe switches default
+off; no unsuccessful probe is enabled in production.
+
+FINAL LONGER CHECK
+final-ab/model-ab.json: two measured sessions after warmup, 12 decode steps
+per session, 22 steady decode samples per arm. Original dev executable versus
+current conservative configuration with host opt-level=3:
+                                  Reference        Candidate
+Steady decode GPU                  27.1116 ms       27.4754 ms
+Steady decode wall                  40.9180 ms       33.0151 ms
+GPU speedup                        0.9868x
+Wall speedup                       1.2394x
+All 39 complete 128256-element logit vectors (5,001,984 values) pass;
+max absolute error 0.00007581710815429688, max RMS 0.000012816638520995391,
+all argmaxes and generated text match. The explicit 2x GPU assertion FAILS;
+wall speedup also falls short of 2x. Do not label this a GPU optimization or
+compare the host-build effect as a same-build kernel A/B.
+
+ENVIRONMENT AND METHOD
+Apple M2 Max, subgroup 32, Llama 3.1 8B Instruct Q4_K_M, exact local GGUF path
+in the provenance JSON files. Full-model probes use a 208-token prompt, one
+warmup session and one measured session, eight single-token decode requests.
+The first decode in each session is excluded from steady medians because it
+compiles a graph. Every candidate compares all 18 x 128256 = 2,308,608 logits,
+including warmup and startup, and requires finite values, equal argmax and text,
+max absolute difference <0.05 and RMS <0.005. Actual errors are much smaller;
+see decode-summary.json. This is one model and prompt, not general accuracy proof.
+
+Whole-plan timestamps supply GPU time. Per-dispatch timestamps materially add
+overhead and are only used for attribution. Microbenchmarks replay the pure
+matrix graph 32 times per sample with autotuning disabled and independently
+check CPU f64 dots at 33 distributed columns of every row for three signed inputs.
+The timing tools verify complete dispatch coverage; tile sweeps reject cases
+whose actually executed family differs from the requested pin.
+
+Read decode-summary.txt for all model probes. Only optimized_host and later
+probes compile host workspace code with profile.dev.opt-level=3; dependencies
+were already optimized. These are optimized dev builds with debug information,
+not release builds. The approximately 1.3x wall improvement is a host-build effect,
+not a GPU-kernel speedup. Earlier probes and the saved original use dev builds.
+
+FALSIFIED OR INSUFFICIENT HYPOTHESES
+1. Independent accumulation chains: the Q6_K microbenchmark improved from
+   212 to 182 us with two chains, while Q4_K stayed near 284 us. Full-model GPU
+   time remained 27.08 ms versus 27.02 ms original. Not a model decode win.
+2. Lossless Q6_K scale repacking: the microbenchmark reached 180 us, but the
+   full model remained 27.05 ms. Precision of the stored scales is widened
+   losslessly; packed weight bits are unchanged. LAB_QLAYOUT also tests Q4_K.
+3. Submission splitting: one large submission removed chunk waits but yielded
+   27.12 ms GPU and 44.95 ms wall. It was not the main bottleneck. Semantic
+   command telemetry found ZERO explicit CopyBuffer commands in this decode
+   plan; shader-based scatter/copy work is still present.
+4. Disabling wavefront groups: launches increased 1270 -> 1450 and GPU time
+   worsened to 27.58 ms. No win.
+5. Quantized scale/offset factoring: after fixing the address proof, 32 terms
+   formed four scale groups. Q4_K still took 278 us and Q6_K 244 us. CPU checks
+   passed. The first broken-proof experiment formed 32 groups and was far slower.
+   This unsuccessful prototype is removed from compiled code and preserved in
+   factoring-experiment.patch for review. It was never accepted on full-model
+   accuracy or enabled by default.
+6. Ten SGEMV schedules per format: no substantial Q4_K gain. Some explicit pins
+   fell back to fold kernels; those records are marked invalid comparisons.
+   Q6_K samples varied substantially, so isolated single-run wins were not
+   promoted. Model testing the one-subgroup schedule showed no decode win.
+7. Compiler fusion search DOES exhaust its node budget after two rounds,
+   despite allowing ten rounds. Four times the budget reaches three rounds
+   and reduces launches from 1270 to 1000, but GPU time remains 28.04 ms and
+   wall grows to 35.91 ms; cold extraction is approximately 19 seconds.
+   Fewer dispatches alone are not a performance result. Do not enable scale 4
+   as an optimization.
+
+CURRENT ATTRIBUTION
+The detailed semantic trace totals 36.35 ms because it timestamps each launch;
+DO NOT substitute that for the 27 ms whole-plan measurement.
+Q4_K gate/up projections: 11.01 ms, 32 calls, 30.3% of instrumented GPU time.
+Q6_K down projections: 3.89 ms, 16 calls, 10.7%.
+4096 x 4096 Q4_K projections: 3.18 ms, 48 calls, 8.8%.
+Q4_K down projections: 2.60 ms, 16 calls, 7.2%.
+KV scatters: 1.65 ms, 64 calls, 4.5%.
+Attention score folds: 1.63 ms, 32 calls, 4.5%.
+Vocabulary projection: 1.46 ms, one call, 4.0%.
+The map/fold metadata now includes scalar expressions and carrier information,
+so equal-shaped copies, activations and normalizations can be distinguished.
+
+INDEPENDENT IMPLEMENTATION CHECK
+Installed llama.cpp build 8680 (15f786e65) measured 52.00 +/- 0.12 tokens/s,
+three 32-token runs at depth 208 with these exact Q4_K_M weights and flash
+attention disabled. This is roughly 19.23 ms/token wall time. This benchmark
+uses FP16 KV storage and different runtime/build/sampling paths; it is evidence
+of performance headroom, NOT a numerically equivalent A/B or a Fusor speedup.
+The installed CLI rejects FP32 KV parameters; the failed attempt is retained.
+The flash-attention enabled runs had large variance (30.8–53.9 tokens/s) and
+are not used as a headline. Logs and complete benchmark JSON are retained.
+
+REPRODUCING
+Build the model example with ordinary dev settings or explicitly select the
+optimized host build (record which one):
+  cargo build -p kalosm-llama --example profile_kernel_share --features kernel-visualize --offline --config profile.dev.opt-level=3
+Build the matrix lab from fusor/:
+  cargo build -p fusor --example qmatmul_lab --features kernel-observer --offline
+
+An exact, red-capable steady-decode requirement with full saved logits:
+  python3 reports/llama-decode-2x/check.py reports/llama-decode-2x/baseline reports/llama-decode-2x/optimized_host --gpu-target 2 --wall-target 2
+This must currently FAIL. A 10% regression guard is not the 2x success criterion.
+Run a new full A/B with both targets:
+  python3 reports/llama-8x/run_ab.py "$MODEL" --reference "$SAVED_REFERENCE" --config reports/llama-8x/candidate.json --output "$NEW_DIRECTORY" --rounds 2 --decode-steps 12 --gpu-target 0 --decode-gpu-target 2 --decode-wall-target 2
+The preserved original/reference executable is local to this investigation;
+provenance records its SHA256 and exact environment. Fresh reproductions must
+preserve their reference before changing/building candidate code.
+
+Probe flags (independent, default unchanged):
+  FUSOR_PROFILE_GEMV_CHAINS=1|2|4|8
+  LAB_QLAYOUT=native|f32scales
+  PROFILE_Q6_F32_SCALES=1 (kernel-visualize feature only)
+  FUSOR_PROFILE_SUBMIT_SIZE=<positive dispatch count>
+  FUSOR_PROFILE_SATURATION_SCALE=1..16
+The saturation override expands node/application budgets, not the round limit.
+Keep GPU benchmarks sequential. Retain raw samples, binary hashes, environments,
+full numerical results, and actual selected kernel families.
+
+VALIDATION
+27 virtual GPU tests and three semantic-attribution parser tests pass.
+Both modified Rust example paths pass Clippy with warnings denied; both
+workspaces pass formatting, and git diff --check passes. Four GPU lab cases
+cover Q4_K/Q6_K, accumulation chains 2/4/8, Native/F32Scales layouts, M=1/3,
+N=257, K=1280 (output-column tails plus a partial K pass), three signed inputs
+each. All CPU numerical checks pass; these small tail cases are correctness
+checks, not throughput comparisons.
