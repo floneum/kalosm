@@ -1389,6 +1389,58 @@ fn immutable_word_views_share_device_storage(session: Session) {
 on_each_backend!(immutable_word_views_share_device_storage:
     immutable_word_storage_cpu, immutable_word_storage_gpu);
 
+fn immutable_word_storage_survives_family_binding_restore(session: Session) {
+    use fusor_ir::dtype::{QFmt, QLayout};
+    let graph = Graph::new(&session);
+    let h = graph.handle();
+    let bytes = vec![0x21; 4 * QFmt::Q4_0.block_bytes(QLayout::Native) as usize];
+    let make = |bytes: Vec<u8>| {
+        h.tensor(
+            h.quantized_leaf(
+                QFmt::Q4_0,
+                QLayout::Native,
+                [Dim::Const(4), Dim::Const(32)],
+                bytes,
+            )
+            .unwrap(),
+        )
+    };
+    let source = make(bytes.clone());
+    let donor = make(vec![0x43; bytes.len()]);
+    let words = h.tensor(h.words_leaf_of(source.id).unwrap().unwrap());
+    donor.upload().unwrap();
+    source.adopt_buffer(&donor).unwrap();
+    {
+        let _bindings = FamilyBindings::new(h, &[source.id]).unwrap();
+        source.clear_device_buf();
+        source.upload().unwrap();
+    }
+    // The restored binding contains donor bytes, not source's host snapshot.
+    words.upload().unwrap();
+    assert_eq!(
+        h.read_back(words.id).unwrap(),
+        bytes,
+        "family restore retained provenance for a different buffer"
+    );
+    source.clear_device_buf();
+    source.upload().unwrap();
+    let original = h.device_buf(source.id).unwrap();
+    {
+        let _bindings = FamilyBindings::new(h, &[source.id]).unwrap();
+        source.adopt_buffer(&donor).unwrap();
+    }
+    words.clear_device_buf();
+    words.upload().unwrap();
+    assert_eq!(
+        h.device_buf(words.id).unwrap().addr(),
+        original.addr(),
+        "family restore lost valid immutable upload provenance"
+    );
+}
+
+on_each_backend!(immutable_word_storage_survives_family_binding_restore:
+    immutable_word_storage_family_cpu, immutable_word_storage_family_gpu);
+
 #[test]
 #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 fn immutable_word_storage_preparation() {
