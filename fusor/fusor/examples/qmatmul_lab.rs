@@ -207,6 +207,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         n as u64 * k as u64 * dense.dtype().byte_size()
     });
     let target = device.backend().gpu_target().unwrap();
+    if std::env::var_os("LAB_ASSERT_VECTOR_STORAGE").is_some() {
+        let caps = device.session().caps().clone();
+        target.set_kernel_observer(Some(Arc::new(move |ir, _, _| {
+            if !ir.name.starts_with("sgemv") { return; }
+            let module = fusor_gpu::emit(ir, &caps).expect("valid emitted projection").module;
+            let vector_read = module.global_variables.iter().any(|(_, global)| {
+                let naga::TypeInner::Array { base, .. } = module.types[global.ty].inner else { return false; };
+                matches!(module.types[base].inner, naga::TypeInner::Vector { size: naga::VectorSize::Quad, scalar: naga::Scalar { kind: naga::ScalarKind::Float, width: 4 } })
+                    && matches!(global.space, naga::AddressSpace::Storage { access } if access == naga::StorageAccess::LOAD)
+            });
+            assert!(vector_read, "projection has no grouped activation storage reads");
+        })));
+    }
     if let Some(dir) = std::env::var_os("LAB_TRACE_DIR") {
         let dir = std::path::PathBuf::from(dir);
         std::fs::create_dir_all(&dir)?;

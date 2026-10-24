@@ -8,11 +8,18 @@ use fusor_tile::build::Kernel;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub(super) fn analyze(buffers: &[Buffer], expressions: &FxHashSet<TileExpr>) -> FxHashSet<u32> {
+    let debug = std::env::var_os("FUSOR_DEBUG_VECTOR_LOADS").is_some();
     let mut rejected = FxHashSet::default();
     for buffer in buffers {
         // A vector must never hide a partial final storage element. Symbolic
         // declarations have zero extent and stay scalar, as do mixed views.
         let count = buffer.layout.element_count();
+        if debug {
+            eprintln!(
+                "[DEBUG-vector] binding={} count={count} element={:?} access={:?}",
+                buffer.binding, buffer.element, buffer.access
+            );
+        }
         if buffer.access != BufferAccess::Read
             || count == 0
             || !count.is_multiple_of(4)
@@ -46,11 +53,25 @@ pub(super) fn analyze(buffers: &[Buffer], expressions: &FxHashSet<TileExpr>) -> 
         let group = (|| {
             // Masking and tails retain their existing scalar access path.
             if !mask.is_constant_true() {
+                if debug {
+                    eprintln!("[DEBUG-vector] binding={binding} masked");
+                }
                 return None;
             }
-            let index = physical_index(&b, view, addr)?;
+            let Some(index) = physical_index(&b, view, addr) else {
+                if debug {
+                    eprintln!(
+                        "[DEBUG-vector] binding={binding} complex layout {:?}",
+                        view.layout
+                    );
+                }
+                return None;
+            };
             let component = simplify_index(&b.rem(index.clone(), b.u32(4)));
             let TileExprKind::Literal(TileLiteral::U32(component)) = component.kind() else {
+                if debug {
+                    eprintln!("[DEBUG-vector] binding={binding} unknown component {component:?}");
+                }
                 return None;
             };
             let group = simplify_index(&b.div(index, b.u32(4)));
@@ -60,6 +81,15 @@ pub(super) fn analyze(buffers: &[Buffer], expressions: &FxHashSet<TileExpr>) -> 
             *groups.entry(binding).or_default().entry(group).or_default() |= 1 << component;
         } else {
             rejected.insert(binding);
+        }
+    }
+    if debug {
+        for (binding, groups) in &groups {
+            eprintln!(
+                "[DEBUG-vector] binding={binding} rejected={} groups={:?}",
+                rejected.contains(binding),
+                groups.values().collect::<Vec<_>>()
+            );
         }
     }
     groups
