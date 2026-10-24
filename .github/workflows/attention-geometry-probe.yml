@@ -1,0 +1,66 @@
+name: Attention workgroup geometry probe
+on:
+  push:
+    branches: [codex/attention-geometry-probe]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_OPT_LEVEL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 8ddfc99b06608c408530aae85773c8fd50494816
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fusor/target
+          key: attention-geometry-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
+          restore-keys: |
+            attention-partition-${{ runner.os }}-
+            immutable-upload-green-${{ runner.os }}-
+            workgroup-kernel-${{ runner.os }}-
+      - name: Build single-variable partition fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir artifacts
+          cp fusor/fusor-ir/src/rules/attention.rs /tmp/attention-baseline.rs
+          {
+            rustc -Vv
+            git rev-parse HEAD
+            echo 'CARGO_PROFILE_DEV_OPT_LEVEL=0 CARGO_PROFILE_DEV_DEBUG=0'
+          } > artifacts/provenance.txt
+          for geometry in 256-256 128-128 64-64 64-256; do
+            GEOMETRY="$geometry" python3 - <<'PY'
+          import os
+          from pathlib import Path
+          source = Path('/tmp/attention-baseline.rs').read_text()
+          old = 'let chunk = if keys.as_const().is_some_and(|n| n <= 256) {\n        0\n    } else {\n        256\n    };'
+          block, chunk = map(int, os.environ['GEOMETRY'].split('-'))
+          assert source.count('.min(256)') == 1
+          source = source.replace('.min(256)', f'.min({block})')
+          assert source.count(old) == 1
+          source = source.replace(old, old.replace('256', str(chunk)))
+          Path('fusor/fusor-ir/src/rules/attention.rs').write_text(source)
+          PY
+            cargo build --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer --example attention_lab
+            cp fusor/target/debug/examples/attention_lab "artifacts/attention-$geometry"
+            cp fusor/fusor-ir/src/rules/attention.rs "artifacts/attention-$geometry.rs"
+            shasum -a 256 "artifacts/attention-$geometry" "artifacts/attention-$geometry.rs" >> artifacts/provenance.txt
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: attention-geometry-fixtures
+          path: artifacts
+          retention-days: 7
