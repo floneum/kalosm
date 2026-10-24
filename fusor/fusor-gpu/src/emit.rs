@@ -844,6 +844,14 @@ mod tests {
             first_fma < outer_load,
             "outer operands stay live across the nested multiply-add"
         );
+        assert!(
+            emitted.module.entry_points[0]
+                .function
+                .named_expressions
+                .keys()
+                .any(|h| h.index() == first_fma),
+            "scheduled result is inlined again, extending its operands' lifetimes"
+        );
         let fmas = expressions
             .iter()
             .filter(|(_, e)| {

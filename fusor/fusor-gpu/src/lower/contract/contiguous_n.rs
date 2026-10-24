@@ -64,7 +64,7 @@ pub(super) fn lower(ctx: Ctx<'_>, c: &Contract<'_>) -> Result<KernelIr> {
         &ctx.caps.limits,
     )?;
     let wg = column_workgroup_index(&ctx, grid, rows, shape.n, 32)?;
-    let (row, col_group) = row_col(&ctx.b, wg, ceil_extent(&ctx, shape.n, 32)?, rows);
+    let (row, col_group) = row_col(&ctx, wg, ceil_extent(&ctx, shape.n, 32)?, rows);
     let (batch, b_row_base) = c.batch_of(&ctx, &row)?;
     let lane = b.builtin(Builtin::SubgroupLane);
     let sg = b.builtin(Builtin::SubgroupId);
