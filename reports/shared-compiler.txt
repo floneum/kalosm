@@ -1,37 +1,48 @@
 Immutable compiler storage views: one GPU upload (2026-10-24)
 ============================================================
-Runtime source 84025c02fc2c9a569063895dda87d51504870526 removes duplicate
+Runtime source a0d355d317570ff636f836ab9902b53726f37921 removes duplicate
 device allocations when lowering an immutable byte stream through its word
 view. The original leaf and compiler-created view retain one allocation,
 including background resource preparation. This uses the graph's storage
 relation and exact immutable backing identity, independent of block format,
 model or device name. Unrelated mutable leaves are not shared. Rebinding,
-adoption and clearing invalidate upload provenance; no cache pins buffers
-beyond the graph's existing bindings.
+adoption and clearing invalidate upload provenance; temporary family scopes
+save and restore the buffer and its exact host-backing witness together.
+No cache pins buffers beyond the graph's existing bindings.
 
 The regression fails on c3ff1acd4 in 0.43 seconds with duplicate GPU storage:
 https://github.com/floneum/kalosm/actions/runs/40114412471
-The fix passes 20 CPU unit tests, 14 GPU unit tests, nine shared compiler
-tests and GPU-enabled workspace Clippy. A CPU-only Clippy run exposed old
-GPU timing variables; source 84025c02f gates those variables by feature.
-Final CPU and GPU validation both pass in:
-https://github.com/floneum/kalosm/actions/runs/40115478755
-The default release is built by that same run. Tests cover both upload
-orders across all block formats, rebinding, adopted buffers, stale prepared
-uploads, exact readback and separation of mutable leaves.
+A second regression fails on 60f767588: restoring a temporary family binding
+retains upload metadata for another buffer and returns the wrong bytes.
+https://github.com/floneum/kalosm/actions/runs/40116391742
+The binding API now snapshots and restores provenance with the buffer,
+checking that the saved host backing still matches. Direct device-map access
+is private to this API. Both stale and lost provenance are covered.
+
+Final validation passes 21 CPU unit tests, 15 GPU unit tests (one unrelated
+ignored test), nine shared compiler tests, formatting, CPU-only Clippy and
+GPU-enabled workspace/all-target Clippy:
+https://github.com/floneum/kalosm/actions/runs/40116681702
+The same workflow builds default release profiler and chat artifacts with
+source and binary hashes. Tests cover both upload orders across all block
+formats, rebinding, adopted buffers, stale prepared uploads, temporary binding
+restoration, exact readback and separation of mutable leaves. GPU timing
+instrumentation is gated by feature so CPU-only builds remain warning-free.
 
 Matched allocation experiment, using the same 72 MiB fixture source:
   Baseline c3ff1acd4: first upload 75,497,472 bytes; second 75,497,472 bytes.
   Candidate e1cfe8a95: first upload 75,497,472 bytes; second zero bytes.
   Total GPU weight allocation: 144 MiB -> 72 MiB.
 Both arms verify all 150,994,944 bytes read back through the two views.
-Source 84025c02f changes only CPU feature gating after e1cfe8a95.
+The allocation experiment predates the temporary-binding restoration fix;
+the final revision passes the allocation-identity regression on both targets.
 https://github.com/floneum/kalosm/actions/runs/40115143722
 Fixture SHA256: b4f9cf64a0df85f8189ea4b698665588b297f68b8fbe0a94a6db32039d15dbd4
 
 This establishes a 50% allocation reduction for the shared weight/view
 pair, not a model throughput result. Local preflight still has about
-14.5 GiB available against the unchanged 23 GiB admission threshold.
+14.75 GiB available against the unchanged 23 GiB full-model admission threshold
+(also below the canonical guard's 15.17 GiB minimum for this model).
 No model was launched and no resource-aborted workload was retried.
 The 60 tokens/sec and 2x full-model goals remain unverified.
 
