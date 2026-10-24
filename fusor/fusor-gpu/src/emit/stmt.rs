@@ -49,28 +49,6 @@ fn early_accumulator_stores(accumulators: &[Accumulator]) -> Vec<bool> {
     early
 }
 
-/// Rematerialization is limited to ordinary expressions. Collective results
-/// and cooperative matrix state keep their original evaluation protocol.
-fn ordinary_updates(accumulators: &[Accumulator]) -> bool {
-    use fusor_ir::ir::kernel::TileExprKind as K;
-    fn visit(e: &TileExpr, seen: &mut rustc_hash::FxHashSet<TileExpr>) -> bool {
-        if !seen.insert(e.clone()) {
-            return true;
-        }
-        if matches!(
-            e.kind(),
-            K::Reduce { .. } | K::CoopLoad { .. } | K::CoopMma { .. } | K::CoopZero { .. }
-        ) {
-            return false;
-        }
-        let mut ordinary = true;
-        e.kind().visit_children(&mut |c| ordinary &= visit(c, seen));
-        ordinary
-    }
-    let mut seen = rustc_hash::FxHashSet::default();
-    accumulators.iter().all(|a| visit(&a.update, &mut seen))
-}
-
 impl Emitter<'_> {
     pub(crate) fn block(&mut self, body: &[Stmt]) -> Result<Block, EmitError> {
         let (block, ()) = self.nested(|em, block| {
@@ -376,7 +354,6 @@ impl Emitter<'_> {
         let count_h = self.expr(count, out)?;
         let iter_local = index.map(|i| self.private_local(i)).transpose()?;
         let early = early_accumulator_stores(accumulators);
-        let rematerialize = early.iter().all(|v| *v) && ordinary_updates(accumulators);
         let accumulators = accumulators.to_vec();
         let body = body.to_vec();
         self.dynamic_loop(out, count_h, move |em, loop_body, loop_index| {
@@ -392,17 +369,6 @@ impl Emitter<'_> {
                 let local = em.private_local(&acc.local)?;
                 if *early {
                     em.store_local(loop_body, local, value);
-                    if rematerialize {
-                        // Keep reuse within an update. Across independent
-                        // updates, reread storage rather than keeping its
-                        // decoded values live for the next complete update.
-                        // No storage writes intervene; local reads retain
-                        // the simultaneous-assignment semantics above.
-                        em.memo.retain(|e, _| {
-                            !e.mem_reads()
-                                .intersects(fusor_ir::ir::kernel::MemReads::STORAGE)
-                        });
-                    }
                 } else {
                     deferred.push((local, value));
                 }

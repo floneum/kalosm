@@ -1,0 +1,634 @@
+{
+  "status": "rejected: no consistent improvement in wide, long, and square projections",
+  "source": "361d0d43d4c17343eb6c073209a5f738136d04b8",
+  "cases": {
+    "long-candidate": {
+      "order": "ABBA",
+      "arms": {
+        "A0": {
+          "gpu_us": 190.145,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "14336",
+            "fmt": "Q6K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "190.145",
+            "p25_us": "189.096",
+            "p75_us": "193.453",
+            "wall_us": "9115.458",
+            "cold_ms": "354.967",
+            "logical_weight_bytes": "48627712",
+            "logical_weight_GBs": "255.741",
+            "GFLOPs": "617.638",
+            "max_error": "0.000841"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B0": {
+          "gpu_us": 193.232,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "14336",
+            "fmt": "Q6K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "193.232",
+            "p25_us": "192.018",
+            "p75_us": "206.506",
+            "wall_us": "10491.250",
+            "cold_ms": "330.957",
+            "logical_weight_bytes": "48627712",
+            "logical_weight_GBs": "251.655",
+            "GFLOPs": "607.770",
+            "max_error": "0.000841"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B1": {
+          "gpu_us": 190.302,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "14336",
+            "fmt": "Q6K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "190.302",
+            "p25_us": "188.691",
+            "p75_us": "194.572",
+            "wall_us": "9033.417",
+            "cold_ms": "284.094",
+            "logical_weight_bytes": "48627712",
+            "logical_weight_GBs": "255.529",
+            "GFLOPs": "617.127",
+            "max_error": "0.000841"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "A1": {
+          "gpu_us": 192.487,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "14336",
+            "fmt": "Q6K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "192.487",
+            "p25_us": "190.111",
+            "p75_us": "202.060",
+            "wall_us": "10357.834",
+            "cold_ms": "327.488",
+            "logical_weight_bytes": "48627712",
+            "logical_weight_GBs": "252.629",
+            "GFLOPs": "610.122",
+            "max_error": "0.000841"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        }
+      },
+      "directional_speedups": [
+        0.9840243851949988,
+        1.0114817500604303
+      ],
+      "correctness": {
+        "B0": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "B1": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "A1": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        }
+      },
+      "resident_weight_bytes": 97255424,
+      "target": 1.01,
+      "target_pass": false,
+      "note": "Sequential microbenchmark only; full-model wall and full-logit checks still required."
+    },
+    "long-q4-candidate": {
+      "order": "ABBA",
+      "arms": {
+        "A0": {
+          "gpu_us": 196.625,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "14336",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "196.625",
+            "p25_us": "177.518",
+            "p75_us": "231.859",
+            "wall_us": "10222.750",
+            "cold_ms": "423.025",
+            "logical_weight_bytes": "33030144",
+            "logical_weight_GBs": "167.985",
+            "GFLOPs": "597.282",
+            "max_error": "0.000105"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B0": {
+          "gpu_us": 184.18,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "14336",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "184.180",
+            "p25_us": "176.078",
+            "p75_us": "193.719",
+            "wall_us": "8672.458",
+            "cold_ms": "397.731",
+            "logical_weight_bytes": "33030144",
+            "logical_weight_GBs": "179.337",
+            "GFLOPs": "637.641",
+            "max_error": "0.000105"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B1": {
+          "gpu_us": 216.483,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "14336",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "216.483",
+            "p25_us": "202.452",
+            "p75_us": "231.224",
+            "wall_us": "10457.167",
+            "cold_ms": "355.001",
+            "logical_weight_bytes": "33030144",
+            "logical_weight_GBs": "152.576",
+            "GFLOPs": "542.493",
+            "max_error": "0.000105"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "A1": {
+          "gpu_us": 221.943,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "14336",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "221.943",
+            "p25_us": "216.850",
+            "p75_us": "231.496",
+            "wall_us": "10630.167",
+            "cold_ms": "396.721",
+            "logical_weight_bytes": "33030144",
+            "logical_weight_GBs": "148.823",
+            "GFLOPs": "529.148",
+            "max_error": "0.000105"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        }
+      },
+      "directional_speedups": [
+        1.0675697687045282,
+        1.0252213799697898
+      ],
+      "correctness": {
+        "B0": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "B1": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "A1": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        }
+      },
+      "resident_weight_bytes": 66060288,
+      "target": 1.01,
+      "target_pass": true,
+      "note": "Sequential microbenchmark only; full-model wall and full-logit checks still required."
+    },
+    "square-candidate": {
+      "order": "ABBA",
+      "arms": {
+        "A0": {
+          "gpu_us": 58.479,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "8",
+            "copies": "8",
+            "repeats": "16",
+            "gpu_us": "58.479",
+            "p25_us": "58.305",
+            "p75_us": "59.269",
+            "wall_us": "15797.792",
+            "cold_ms": "833.470",
+            "logical_weight_bytes": "9437184",
+            "logical_weight_GBs": "161.377",
+            "GFLOPs": "573.784",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B0": {
+          "gpu_us": 58.515,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "8",
+            "copies": "8",
+            "repeats": "16",
+            "gpu_us": "58.515",
+            "p25_us": "58.259",
+            "p75_us": "60.287",
+            "wall_us": "15578.417",
+            "cold_ms": "815.746",
+            "logical_weight_bytes": "9437184",
+            "logical_weight_GBs": "161.278",
+            "GFLOPs": "573.433",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B1": {
+          "gpu_us": 58.755,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "8",
+            "copies": "8",
+            "repeats": "16",
+            "gpu_us": "58.755",
+            "p25_us": "58.470",
+            "p75_us": "70.542",
+            "wall_us": "15795.333",
+            "cold_ms": "771.949",
+            "logical_weight_bytes": "9437184",
+            "logical_weight_GBs": "160.620",
+            "GFLOPs": "571.092",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "A1": {
+          "gpu_us": 68.92,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "8",
+            "copies": "8",
+            "repeats": "16",
+            "gpu_us": "68.920",
+            "p25_us": "63.298",
+            "p75_us": "73.732",
+            "wall_us": "15681.167",
+            "cold_ms": "808.408",
+            "logical_weight_bytes": "9437184",
+            "logical_weight_GBs": "136.930",
+            "GFLOPs": "486.863",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        }
+      },
+      "directional_speedups": [
+        0.9993847731350936,
+        1.1730065526338185
+      ],
+      "correctness": {
+        "B0": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "B1": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "A1": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        }
+      },
+      "resident_weight_bytes": 75497472,
+      "target": 1.01,
+      "target_pass": false,
+      "note": "Sequential microbenchmark only; full-model wall and full-logit checks still required."
+    },
+    "wide-candidate": {
+      "order": "ABBA",
+      "arms": {
+        "A0": {
+          "gpu_us": 209.352,
+          "row": {
+            "m": "1",
+            "n": "28672",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "209.352",
+            "p25_us": "209.112",
+            "p75_us": "225.212",
+            "wall_us": "10696.958",
+            "cold_ms": "417.307",
+            "logical_weight_bytes": "66060288",
+            "logical_weight_GBs": "315.547",
+            "GFLOPs": "1121.945",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B0": {
+          "gpu_us": 215.654,
+          "row": {
+            "m": "1",
+            "n": "28672",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "215.654",
+            "p25_us": "212.220",
+            "p75_us": "226.366",
+            "wall_us": "10658.334",
+            "cold_ms": "413.596",
+            "logical_weight_bytes": "66060288",
+            "logical_weight_GBs": "306.326",
+            "GFLOPs": "1089.159",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B1": {
+          "gpu_us": 209.43,
+          "row": {
+            "m": "1",
+            "n": "28672",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "209.430",
+            "p25_us": "209.292",
+            "p75_us": "210.465",
+            "wall_us": "10600.292",
+            "cold_ms": "365.006",
+            "logical_weight_bytes": "66060288",
+            "logical_weight_GBs": "315.429",
+            "GFLOPs": "1121.527",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "A1": {
+          "gpu_us": 209.68,
+          "row": {
+            "m": "1",
+            "n": "28672",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "209.680",
+            "p25_us": "209.441",
+            "p75_us": "210.598",
+            "wall_us": "10728.792",
+            "cold_ms": "389.264",
+            "logical_weight_bytes": "66060288",
+            "logical_weight_GBs": "315.053",
+            "GFLOPs": "1120.190",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        }
+      },
+      "directional_speedups": [
+        0.9707772635796229,
+        1.001193716277515
+      ],
+      "correctness": {
+        "B0": {
+          "values": 86016,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "B1": {
+          "values": 86016,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "A1": {
+          "values": 86016,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        }
+      },
+      "resident_weight_bytes": 132120576,
+      "target": 1.01,
+      "target_pass": false,
+      "note": "Sequential microbenchmark only; full-model wall and full-logit checks still required."
+    }
+  }
+}
