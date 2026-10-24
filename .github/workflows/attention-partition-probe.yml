@@ -1,0 +1,63 @@
+name: Attention partition probe
+on:
+  push:
+    branches: [codex/attention-partition-probe]
+permissions:
+  contents: read
+jobs:
+  build:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_OPT_LEVEL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: b87dd97364b52aa9ad114cd3e9537ba4503155e9
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fusor/target
+          key: attention-partition-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
+          restore-keys: |
+            immutable-upload-green-${{ runner.os }}-
+            workgroup-kernel-${{ runner.os }}-
+      - name: Build single-variable partition fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir artifacts
+          cp fusor/fusor-ir/src/rules/attention.rs /tmp/attention-baseline.rs
+          {
+            rustc -Vv
+            git rev-parse HEAD
+            echo 'CARGO_PROFILE_DEV_OPT_LEVEL=0 CARGO_PROFILE_DEV_DEBUG=0'
+          } > artifacts/provenance.txt
+          for chunk in 256 64 32; do
+            CHUNK="$chunk" python3 - <<'PY'
+          import os
+          from pathlib import Path
+          source = Path('/tmp/attention-baseline.rs').read_text()
+          old = 'let chunk = if keys.as_const().is_some_and(|n| n <= 256) {\n        0\n    } else {\n        256\n    };'
+          chunk = int(os.environ['CHUNK'])
+          assert source.count(old) == 1
+          source = source.replace(old, old.replace('256', str(chunk)))
+          Path('fusor/fusor-ir/src/rules/attention.rs').write_text(source)
+          PY
+            cargo build --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer --example attention_lab
+            cp fusor/target/debug/examples/attention_lab "artifacts/attention-$chunk"
+            cp fusor/fusor-ir/src/rules/attention.rs "artifacts/attention-$chunk.rs"
+            shasum -a 256 "artifacts/attention-$chunk" "artifacts/attention-$chunk.rs" >> artifacts/provenance.txt
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: attention-partition-fixtures
+          path: artifacts
+          retention-days: 7
