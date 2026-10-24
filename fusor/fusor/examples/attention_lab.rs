@@ -7,10 +7,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     let keys: usize = args
         .first()
-        .ok_or("usage: attention_lab KEYS [PREFIX]")?
+        .ok_or("usage: attention_lab KEYS [PREFIX [HEADS [KV_HEADS [WIDTH [BATCH]]]]]")?
         .parse()?;
     let prefix: usize = args.get(1).map_or(Ok(keys), |s| s.parse())?;
     assert!((1..=32768).contains(&keys) && (1..=keys).contains(&prefix));
+    let heads: usize = args.get(2).map_or(Ok(32), |s| s.parse())?;
+    let kv_heads: usize = args.get(3).map_or(Ok(8), |s| s.parse())?;
+    let width: usize = args.get(4).map_or(Ok(128), |s| s.parse())?;
+    let batch: usize = args.get(5).map_or(Ok(1), |s| s.parse())?;
+    assert!((1..=128).contains(&heads) && (1..=heads).contains(&kv_heads));
+    assert!(heads.is_multiple_of(kv_heads));
+    assert!((1..=256).contains(&width) && (1..=4).contains(&batch));
+    assert!(
+        batch * kv_heads * keys * width * 8 <= 256 * 1024 * 1024,
+        "fixture K/V storage exceeds 256 MiB"
+    );
     let repeats: usize = std::env::var("LAB_ATTENTION_REPEATS")
         .ok()
         .map(|s| s.parse())
@@ -26,34 +37,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let q = graph.leaf(
         "attention-q",
         &[
+            Dim::Const(batch as u64),
+            Dim::Const(heads as u64),
             Dim::Const(1),
-            Dim::Const(32),
-            Dim::Const(1),
-            Dim::Const(128),
+            Dim::Const(width as u64),
         ],
         Dtype::F32,
     )?;
     let shape = [
-        Dim::Const(1),
-        Dim::Const(8),
+        Dim::Const(batch as u64),
+        Dim::Const(kv_heads as u64),
         Dim::Const(keys as u64),
-        Dim::Const(128),
+        Dim::Const(width as u64),
     ];
     let k = graph.leaf("attention-k", &shape, Dtype::F32)?;
     let v = graph.leaf("attention-v", &shape, Dtype::F32)?;
-    let sample =
-        |i: usize, seed: usize| (((i * 37 + i / 128 * 7 + seed * 11) % 251) as f32 - 125.) / 63.37;
+    let sample = |i: usize, seed: usize| {
+        (((i * 37 + i / width * 7 + seed * 11) % 251) as f32 - 125.) / 63.37
+    };
     let score_stress = std::env::var_os("LAB_ATTENTION_SCORE_STRESS").is_some();
-    let kd: Vec<f32> = (0..8 * keys * 128)
+    let kd: Vec<f32> = (0..batch * kv_heads * keys * width)
         .map(|i| {
-            if i / 128 % keys < prefix {
+            if i / width % keys < prefix {
                 if score_stress {
-                    let direction = if (i / (keys * 128)).is_multiple_of(2) {
+                    let direction = if (i / (keys * width)).is_multiple_of(2) {
                         1.
                     } else {
                         -1.
                     };
-                    direction * ((i / 128 % keys) as f32 * 17. - 1000.) / 128f32.sqrt()
+                    direction * ((i / width % keys) as f32 * 17. - 1000.) / (width as f32).sqrt()
                 } else {
                     sample(i, 3)
                 }
@@ -64,7 +76,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let vd: Vec<f32> = (0..kd.len())
         .map(|i| {
-            if i / 128 % keys < prefix {
+            if i / width % keys < prefix {
                 sample(i, 7)
             } else {
                 f32::NAN
@@ -146,7 +158,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     })));
     let mut max_error = 0f64;
     for seed in 0..14 {
-        let qd: Vec<f32> = (0..32 * 128)
+        let qd: Vec<f32> = (0..batch * heads * width)
             .map(|i| {
                 if score_stress {
                     2f32.powi(seed as i32)
@@ -161,30 +173,31 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         dev.session().wait()?;
         if seed < 3 {
             let actual = y.as_dyn().to_vec_f32()?;
-            for h in 0..32 {
+            for h in 0..batch * heads {
+                let kv_row = h / heads * kv_heads + (h % heads) / (heads / kv_heads);
                 let mut scores = vec![0f64; prefix];
                 for (key, score) in scores.iter_mut().enumerate() {
-                    *score = (0..128)
+                    *score = (0..width)
                         .map(|d| {
-                            f64::from(qd[h * 128 + d])
-                                * f64::from(kd[((h / 4) * keys + key) * 128 + d])
+                            f64::from(qd[h * width + d])
+                                * f64::from(kd[(kv_row * keys + key) * width + d])
                         })
                         .sum::<f64>()
-                        / 128f64.sqrt();
+                        / (width as f64).sqrt();
                 }
                 let max = scores.iter().copied().fold(f64::NEG_INFINITY, f64::max);
                 for score in &mut scores {
                     *score = (*score - max).exp();
                 }
                 let sum: f64 = scores.iter().sum();
-                for d in 0..128 {
+                for d in 0..width {
                     let expected: f64 = scores
                         .iter()
                         .enumerate()
-                        .map(|(key, p)| p * f64::from(vd[((h / 4) * keys + key) * 128 + d]))
+                        .map(|(key, p)| p * f64::from(vd[(kv_row * keys + key) * width + d]))
                         .sum::<f64>()
                         / sum;
-                    let error = (f64::from(actual[h * 128 + d]) - expected).abs();
+                    let error = (f64::from(actual[h * width + d]) - expected).abs();
                     assert!(
                         error <= 0.002 + 0.002 * expected.abs(),
                         "seed={seed} head={h} channel={d} error={error}"
@@ -199,7 +212,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut times = times.lock().unwrap()[3..].to_vec();
     times.sort_by(f64::total_cmp);
     println!(
-        "ATTENTION keys={keys} prefix={prefix} repeats={repeats} gpu_us={:.3} p25_us={:.3} p75_us={:.3} max_error={max_error:.7}",
+        "ATTENTION keys={keys} prefix={prefix} repeats={repeats} gpu_us={:.3} p25_us={:.3} p75_us={:.3} max_error={max_error:.7} batch={batch} heads={heads} kv_heads={kv_heads} width={width}",
         times[times.len() / 2],
         times[times.len() / 4],
         times[times.len() * 3 / 4]
