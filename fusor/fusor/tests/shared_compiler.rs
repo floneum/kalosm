@@ -676,3 +676,75 @@ fn ordinary_dense_contractions_cover_tails_and_replay() {
         close(&y.to_vec_f32(), &reference, 2e-4);
     }
 }
+
+#[test]
+#[ignore = "requires a live WebGPU device"]
+fn streamed_softmax_preserves_extreme_and_nonfinite_scores() {
+    let device = pollster::block_on(Device::gpu()).unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let capture = seen.clone();
+    device
+        .backend()
+        .gpu_target()
+        .unwrap()
+        .set_kernel_observer(Some(Arc::new(move |ir, _, _| {
+            capture.lock().unwrap().push(ir.name.to_string());
+        })));
+    let (keys, width) = (513, 32);
+    let q = vec![1f32; width];
+    let v = data(keys * width, 9);
+    for case in 0..5 {
+        let mut k: Vec<_> = (0..keys * width)
+            .map(|i| {
+                let key = i / width;
+                ((key * 13 % 29) as f32 - 14.) * 10.
+            })
+            .collect();
+        match case {
+            0 => {}
+            1 => k[17 * width] = f32::INFINITY,
+            2 => k[257 * width] = f32::NAN,
+            3 => k.fill(f32::NEG_INFINITY),
+            4 => {
+                k[17 * width] = f32::INFINITY;
+                k[257 * width] = f32::NEG_INFINITY;
+            }
+            _ => unreachable!(),
+        }
+        let qt = Tensor::from_slice(&device, [1, 1, 1, width], &q);
+        let kt = Tensor::from_slice(&device, [1, 1, keys, width], &k);
+        let vt = Tensor::from_slice(&device, [1, 1, keys, width], &v);
+        let output = fusor::composite::attention(
+            qt.as_dyn(),
+            kt.as_dyn(),
+            vt.as_dyn(),
+            fusor_ir::ir::launch::MaskKind::None,
+            None,
+        )
+        .unwrap();
+        let actual = output.to_vec_f32().unwrap();
+        let expected = attention_reference(&q, &k, &v, [1, 1, 1, keys, width]);
+        if case == 0 {
+            close(&actual, &expected, 3e-4);
+        } else {
+            assert!(expected.iter().all(|v| v.is_nan()));
+            assert!(
+                actual.iter().all(|v| v.is_nan()),
+                "nonfinite case {case}: {actual:?}"
+            );
+        }
+    }
+    if device
+        .session()
+        .caps()
+        .subgroups
+        .is_some_and(|s| s.is_fixed())
+    {
+        assert!(
+            seen.lock()
+                .unwrap()
+                .iter()
+                .any(|name| name.starts_with("decode_attention_online"))
+        );
+    }
+}
