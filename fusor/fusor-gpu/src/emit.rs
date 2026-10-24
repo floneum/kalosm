@@ -11,6 +11,8 @@ pub(crate) mod reduce;
 pub(crate) mod stmt;
 mod storage;
 pub(crate) mod types;
+#[cfg(test)]
+mod vector_loads_tests;
 
 use fusor_ir::device::Caps;
 use fusor_ir::ir::kernel::{
