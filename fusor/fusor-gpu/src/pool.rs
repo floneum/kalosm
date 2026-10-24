@@ -117,8 +117,18 @@ pub struct BufferPool {
     ceiling_bytes: Mutex<u64>,
     poison: bool,
     upload_staging: Mutex<Vec<StagingChunk>>,
+    initial_uploads: Mutex<InitialUploads>,
     retired_buffers: AtomicBool,
     lost: crate::device::LostFlag,
+}
+
+/// wgpu can retain internal staging for mapped-at-creation buffers until a
+/// queue submission completes. Submit by bytes, with only one older upload
+/// batch in flight, instead of retaining staging for an entire tensor set.
+#[derive(Default)]
+struct InitialUploads {
+    bytes: u64,
+    in_flight: Option<wgpu::SubmissionIndex>,
 }
 
 /// A reusable upload staging buffer kept mapped between uses, so large
@@ -157,6 +167,7 @@ impl BufferPool {
             ceiling_bytes: Mutex::new(ceiling),
             poison: config.poison_allocations,
             upload_staging: Mutex::new(Vec::new()),
+            initial_uploads: Mutex::new(InitialUploads::default()),
             retired_buffers: AtomicBool::new(false),
             lost,
         }
@@ -273,11 +284,12 @@ impl BufferPool {
             {
                 let mut view = gpu.buffer.slice(..).get_mapped_range_mut();
                 parallel_copy(view.slice(..data.len()), data);
-                // Also clear allocation-class slack; no staging allocation or
-                // queued device copy survives initialization of these weights.
+                // Also clear allocation-class slack. Unmapping queues an
+                // internal staging copy on backends without direct mapping.
                 view.slice(data.len()..).fill(0);
             }
             gpu.buffer.unmap();
+            self.submit_initial_upload(gpu.size)?;
             return Ok(buf);
         }
         if size >= UPLOAD_STAGING_MIN && self.upload_via_staging(gpu, data, size) {
@@ -300,7 +312,28 @@ impl BufferPool {
                 self.queue.write_buffer(&gpu.buffer, 0, &padded);
             }
         }
+        self.submit_initial_upload(size)?;
         Ok(buf)
+    }
+
+    fn submit_initial_upload(&self, bytes: u64) -> Result<()> {
+        let limit = (*self.ceiling_bytes.lock() / 16).clamp(UPLOAD_STAGING_MIN, 64 << 20);
+        let mut pending = self.initial_uploads.lock();
+        pending.bytes = pending.bytes.saturating_add(bytes);
+        if pending.bytes < limit {
+            return Ok(());
+        }
+        if let Some(previous) = pending.in_flight.take() {
+            self.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(previous),
+                    timeout: None,
+                })
+                .map_err(|e| Error::Device(format!("initial upload wait failed: {e}")))?;
+        }
+        pending.in_flight = Some(self.queue.submit([]));
+        pending.bytes = 0;
+        Ok(())
     }
 
     /// Upload through the pool's remappable staging ring; `false` sends the
