@@ -133,6 +133,7 @@ pub(super) fn lower(ctx: Ctx<'_>, op: &Launch) -> Result<KernelIr> {
     }
     let score = b.local(f);
     let next_max = b.local(f);
+    let ratio = b.local(f);
     let alpha = b.local(f);
     let beta = b.local(f);
     let mut update = vec![
@@ -151,17 +152,52 @@ pub(super) fn lower(ctx: Ctx<'_>, op: &Launch) -> Result<KernelIr> {
             ),
         },
         Stmt::StoreLocal {
-            dst: alpha.clone(),
+            dst: ratio.clone(),
             value: exp(b.sub(
-                b.load_local(running_max.clone()),
-                b.load_local(next_max.clone()),
+                b.f32(0.),
+                b.unary(
+                    TileUnaryOp::Abs,
+                    b.sub(
+                        b.load_local(score.clone()),
+                        b.load_local(running_max.clone()),
+                    ),
+                    NumericContract::RELAXED,
+                ),
             )),
+        },
+    ];
+    // One exponential supplies the smaller score's rescale. The larger
+    // finite score contributes exp(0) = 1. Preserve exp(inf - inf) = NaN
+    // explicitly; this is an arithmetic identity, not a finiteness assumption.
+    let exponent = b.binary(
+        TileBinaryOp::BitAnd,
+        b.bitcast(b.load_local(next_max.clone()), u),
+        b.u32(0x7f800000),
+        NumericContract::RELAXED,
+    );
+    let unit = b.select(
+        b.lt(exponent, b.u32(0x7f800000)),
+        b.f32(1.),
+        b.bitcast(b.u32(0x7fc00000), f),
+    );
+    let increasing = b.lt(
+        b.load_local(running_max.clone()),
+        b.load_local(score.clone()),
+    );
+    update.extend([
+        Stmt::StoreLocal {
+            dst: alpha.clone(),
+            value: b.select(
+                increasing.clone(),
+                b.load_local(ratio.clone()),
+                unit.clone(),
+            ),
         },
         Stmt::StoreLocal {
             dst: beta.clone(),
-            value: exp(b.sub(b.load_local(score.clone()), b.load_local(next_max.clone()))),
+            value: b.select(increasing, unit, b.load_local(ratio)),
         },
-    ];
+    ]);
     for (channel, numerator) in numerators.iter().enumerate() {
         update.push(Stmt::StoreLocal {
             dst: numerator.clone(),
