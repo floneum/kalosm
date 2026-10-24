@@ -1,0 +1,65 @@
+name: Register batched online softmax
+on:
+  push:
+    branches: [codex/register-softmax-checks]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_OPT_LEVEL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      FUSOR_CONFORMANCE_REQUIRE_GPU: '1'
+      FUSOR_COMPILE_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 0b78aae107a7f7e80c1c11ad6424d65f3c40fe82
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fusor/target
+          key: attention-factor-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
+          restore-keys: |
+            attention-shapes-${{ runner.os }}-
+            grouped-load-${{ runner.os }}-
+      - name: Isolate attention from the independent expression experiment
+        run: |
+          git fetch --depth=1 origin b87dd97364b52aa9ad114cd3e9537ba4503155e9
+          git restore --source=b87dd97364b52aa9ad114cd3e9537ba4503155e9 -- fusor/fusor-gpu/src/emit.rs fusor/fusor-gpu/src/emit/expr.rs
+      - name: Shared compiler correctness
+        run: |
+          cargo test --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer,compiler-tests --test shared_compiler -- --ignored --test-threads=1
+          cargo test --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer,compiler-tests --test candidate_construction ordinary_attention -- --test-threads=1
+          cargo clippy --locked --manifest-path fusor/Cargo.toml --workspace --all-targets --features fusor/kernel-observer,fusor/compiler-tests -- -D warnings
+      - name: Build matched attention fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir artifacts
+          rustc -Vv > artifacts/provenance.txt
+          for arm in candidate baseline; do
+            if [ "$arm" = baseline ]; then
+              git fetch --depth=1 origin 293d44eac3738fb737ff439df74a7aa52c9267d5
+              git restore --source=293d44eac3738fb737ff439df74a7aa52c9267d5 -- fusor/fusor-gpu/src/lower/decode_attention/online.rs
+            fi
+            echo "$arm" >> artifacts/provenance.txt
+            git rev-parse HEAD >> artifacts/provenance.txt
+            git diff > "artifacts/$arm.patch"
+            cargo build --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer --example attention_lab
+            cp fusor/target/debug/examples/attention_lab "artifacts/attention-$arm"
+            shasum -a 256 "artifacts/attention-$arm" >> artifacts/provenance.txt
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: register-softmax-fixtures
+          path: artifacts
+          retention-days: 7
