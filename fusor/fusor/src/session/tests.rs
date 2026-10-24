@@ -1202,8 +1202,15 @@ macro_rules! on_each_backend {
         #[test]
         #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
         fn $gpu() {
-            let Ok(backend) = Backend::gpu_blocking() else {
-                return;
+            let backend = match Backend::gpu_blocking() {
+                Ok(backend) => backend,
+                Err(error) => {
+                    assert!(
+                        std::env::var_os("FUSOR_CONFORMANCE_REQUIRE_GPU").is_none(),
+                        "GPU required: {error}"
+                    );
+                    return;
+                }
             };
             $body(Session::new(backend).unwrap());
         }
@@ -1270,6 +1277,63 @@ fn shared_weight_views_execute_and_concatenate(session: Session) {
 
 on_each_backend!(shared_weight_views_execute_and_concatenate:
     shared_weight_views_cpu, shared_weight_views_gpu);
+
+fn immutable_word_views_share_device_storage(session: Session) {
+    use fusor_ir::dtype::{QFmt, QLayout};
+    let graph = Graph::new(&session);
+    let h = graph.handle();
+    for words_first in [false, true] {
+        // Exercise every opaque block representation. The storage relation is
+        // byte identity, independent of its decode formula or block size.
+        for fmt in QFmt::ALL {
+            let bytes: Vec<u8> = (0..4 * fmt.block_bytes(QLayout::Native) as usize)
+                .map(|i| (i * 17 + 3) as u8)
+                .collect();
+            let source = h
+                .quantized_leaf(
+                    fmt,
+                    QLayout::Native,
+                    [Dim::Const(4), Dim::Const(fmt.block_elements() as u64)],
+                    bytes.clone(),
+                )
+                .unwrap();
+            let words = h.words_leaf_of(source).unwrap().unwrap();
+            let order = if words_first {
+                [words, source]
+            } else {
+                [source, words]
+            };
+            for id in order {
+                session.upload_leaf(&h.tensor(id)).unwrap();
+            }
+            let source_buf = h.device_buf(source).unwrap();
+            let words_buf = h.device_buf(words).unwrap();
+            assert_eq!(
+                source_buf.addr(),
+                words_buf.addr(),
+                "immutable word view uploaded duplicate device storage for {fmt:?}"
+            );
+            assert_eq!(h.read_back(words).unwrap(), bytes);
+            // Rebinding one value must not change the immutable view's bytes.
+            let changed = vec![0x65; bytes.len()];
+            h.set_leaf_bytes(source, changed.clone());
+            session.upload_leaf(&h.tensor(source)).unwrap();
+            assert_ne!(h.device_buf(source).unwrap().addr(), words_buf.addr());
+            assert_eq!(h.read_back(words).unwrap(), bytes);
+            let rebound = h.tensor(source);
+            let read = pollster::block_on(
+                session
+                    .device()
+                    .download(&h.device_buf(rebound.id).unwrap(), changed.len() as u64),
+            )
+            .unwrap();
+            assert_eq!(read, changed);
+        }
+    }
+}
+
+on_each_backend!(immutable_word_views_share_device_storage:
+    immutable_word_storage_cpu, immutable_word_storage_gpu);
 
 #[test]
 #[cfg(all(feature = "cpu", not(target_arch = "wasm32")))]
