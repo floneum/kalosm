@@ -1,0 +1,478 @@
+{
+  "decision": "Rejected: wide projection regresses to 0.60x in both orders; all output values bit-identical. Restore scalar storage access.",
+  "source": "3af9f10629d9430873d79027b3506ff4560b15f5",
+  "ci": "https://github.com/floneum/kalosm/actions/runs/40126150492",
+  "measurements": {
+    "wide": {
+      "order": "ABBA",
+      "arms": {
+        "A0": {
+          "gpu_us": 209.688,
+          "row": {
+            "m": "1",
+            "n": "28672",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "209.688",
+            "p25_us": "209.431",
+            "p75_us": "210.440",
+            "wall_us": "10784.958",
+            "cold_ms": "407.942",
+            "logical_weight_bytes": "66060288",
+            "logical_weight_GBs": "315.042",
+            "GFLOPs": "1120.148",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B0": {
+          "gpu_us": 348.889,
+          "row": {
+            "m": "1",
+            "n": "28672",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "348.889",
+            "p25_us": "348.529",
+            "p75_us": "349.533",
+            "wall_us": "15642.916",
+            "cold_ms": "436.723",
+            "logical_weight_bytes": "66060288",
+            "logical_weight_GBs": "189.345",
+            "GFLOPs": "673.225",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B1": {
+          "gpu_us": 349.139,
+          "row": {
+            "m": "1",
+            "n": "28672",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "349.139",
+            "p25_us": "348.961",
+            "p75_us": "349.638",
+            "wall_us": "15523.750",
+            "cold_ms": "376.346",
+            "logical_weight_bytes": "66060288",
+            "logical_weight_GBs": "189.209",
+            "GFLOPs": "672.743",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "A1": {
+          "gpu_us": 210.492,
+          "row": {
+            "m": "1",
+            "n": "28672",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "210.492",
+            "p25_us": "210.182",
+            "p75_us": "211.826",
+            "wall_us": "10648.333",
+            "cold_ms": "428.399",
+            "logical_weight_bytes": "66060288",
+            "logical_weight_GBs": "313.837",
+            "GFLOPs": "1115.866",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        }
+      },
+      "directional_speedups": [
+        0.6010163691030671,
+        0.602888820784845
+      ],
+      "correctness": {
+        "B0": {
+          "values": 86016,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "B1": {
+          "values": 86016,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "A1": {
+          "values": 86016,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        }
+      },
+      "resident_weight_bytes": 132120576,
+      "target": 1.01,
+      "target_pass": false,
+      "note": "Sequential microbenchmark only; full-model wall and full-logit checks still required."
+    },
+    "long": {
+      "order": "ABBA",
+      "arms": {
+        "A0": {
+          "gpu_us": 193.977,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "14336",
+            "fmt": "Q6K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "193.977",
+            "p25_us": "191.421",
+            "p75_us": "214.353",
+            "wall_us": "10580.375",
+            "cold_ms": "350.252",
+            "logical_weight_bytes": "48627712",
+            "logical_weight_GBs": "250.689",
+            "GFLOPs": "605.437",
+            "max_error": "0.000841"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B0": {
+          "gpu_us": 187.384,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "14336",
+            "fmt": "Q6K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "187.384",
+            "p25_us": "179.434",
+            "p75_us": "248.872",
+            "wall_us": "9146.500",
+            "cold_ms": "350.791",
+            "logical_weight_bytes": "48627712",
+            "logical_weight_GBs": "259.508",
+            "GFLOPs": "626.737",
+            "max_error": "0.000841"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B1": {
+          "gpu_us": 203.128,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "14336",
+            "fmt": "Q6K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "203.128",
+            "p25_us": "196.387",
+            "p75_us": "216.245",
+            "wall_us": "10432.042",
+            "cold_ms": "299.631",
+            "logical_weight_bytes": "48627712",
+            "logical_weight_GBs": "239.395",
+            "GFLOPs": "578.161",
+            "max_error": "0.000841"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "A1": {
+          "gpu_us": 201.128,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "14336",
+            "fmt": "Q6K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "201.128",
+            "p25_us": "194.629",
+            "p75_us": "209.629",
+            "wall_us": "10506.625",
+            "cold_ms": "346.717",
+            "logical_weight_bytes": "48627712",
+            "logical_weight_GBs": "241.775",
+            "GFLOPs": "583.910",
+            "max_error": "0.000841"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        }
+      },
+      "directional_speedups": [
+        1.035184434103232,
+        0.9901539915718168
+      ],
+      "correctness": {
+        "B0": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "B1": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "A1": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        }
+      },
+      "resident_weight_bytes": 97255424,
+      "target": 1.01,
+      "target_pass": false,
+      "note": "Sequential microbenchmark only; full-model wall and full-logit checks still required."
+    },
+    "square": {
+      "order": "ABBA",
+      "arms": {
+        "A0": {
+          "gpu_us": 173.917,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "173.917",
+            "p25_us": "173.643",
+            "p75_us": "174.286",
+            "wall_us": "8600.417",
+            "cold_ms": "412.554",
+            "logical_weight_bytes": "9437184",
+            "logical_weight_GBs": "54.263",
+            "GFLOPs": "192.934",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B0": {
+          "gpu_us": 169.74,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "169.740",
+            "p25_us": "168.242",
+            "p75_us": "170.654",
+            "wall_us": "8869.334",
+            "cold_ms": "415.394",
+            "logical_weight_bytes": "9437184",
+            "logical_weight_GBs": "55.598",
+            "GFLOPs": "197.682",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B1": {
+          "gpu_us": 169.676,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "169.676",
+            "p25_us": "168.079",
+            "p75_us": "171.168",
+            "wall_us": "8812.125",
+            "cold_ms": "354.853",
+            "logical_weight_bytes": "9437184",
+            "logical_weight_GBs": "55.619",
+            "GFLOPs": "197.756",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "A1": {
+          "gpu_us": 173.832,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "173.832",
+            "p25_us": "173.405",
+            "p75_us": "174.052",
+            "wall_us": "8603.708",
+            "cold_ms": "412.768",
+            "logical_weight_bytes": "9437184",
+            "logical_weight_GBs": "54.289",
+            "GFLOPs": "193.028",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        }
+      },
+      "directional_speedups": [
+        1.024608224343113,
+        1.0244937410122823
+      ],
+      "correctness": {
+        "B0": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "B1": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "A1": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        }
+      },
+      "resident_weight_bytes": 18874368,
+      "target": 1.01,
+      "target_pass": true,
+      "note": "Sequential microbenchmark only; full-model wall and full-logit checks still required."
+    }
+  }
+}

@@ -435,7 +435,6 @@ pub(crate) mod interp {
     pub(crate) fn storage_view(words: usize) -> StorageView {
         let layout = TileLayout::contiguous(MemoryLevel::Storage, &[words as u32]);
         let buffer = Arc::new(BufferDecl {
-            element_count_is_static: false,
             binding: 1,
             element: U32,
             layout: layout.clone(),

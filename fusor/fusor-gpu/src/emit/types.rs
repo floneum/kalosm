@@ -297,15 +297,6 @@ pub(crate) fn create_storage_globals(em: &mut Emitter<'_>) -> Result<(), EmitErr
         if views.iter().any(|b| b.access == BufferAccess::ReadWrite) {
             decl.access = BufferAccess::ReadWrite;
         }
-        if !mixed
-            && !atomic
-            && let Some(&lanes) = em.analysis.vector_buffers.get(&first.binding)
-        {
-            let ElementType::Scalar(scalar) = decl.element else {
-                unreachable!("vector storage analysis requires scalar views");
-            };
-            decl.element = ElementType::Vector { scalar, lanes };
-        }
         // Neighboring f16 elements share a word. A compare-exchange store
         // preserves the other half even when different lanes write it.
         if atomic {
@@ -317,26 +308,6 @@ pub(crate) fn create_storage_globals(em: &mut Emitter<'_>) -> Result<(), EmitErr
         } else {
             decl.element
         };
-        if let Some(&lanes) = em.analysis.vector_buffers.get(&first.binding)
-            && matches!(physical, ElementType::Vector { .. })
-        {
-            let count = (decl.layout.element_count() / u64::from(lanes)) as u32;
-            decl.layout = fusor_ir::ir::kernel::TileLayout::contiguous(
-                fusor_ir::ir::kernel::MemoryLevel::Storage,
-                &[count],
-            );
-            let buffer = std::sync::Arc::new(decl);
-            em.buffer_globals.insert(key(&buffer), global);
-            em.buffer_elements.insert(key(&buffer), physical);
-            em.vector_views.insert(
-                first.binding,
-                fusor_ir::ir::kernel::StorageView {
-                    layout: buffer.layout.clone(),
-                    buffer,
-                    offset: 0,
-                },
-            );
-        }
         for buffer in views {
             em.buffer_globals.insert(key(buffer), global);
             em.buffer_elements.insert(key(buffer), physical);

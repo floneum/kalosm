@@ -24,7 +24,6 @@ pub fn kernel(name: &str, block: u32) -> Result<KernelIr> {
         .ok_or_else(|| Error(format!("unknown demo {name}; choose {}", NAMES.join(", "))))?;
     let elem = ScalarElement::U32.element();
     let buffer = Arc::new(BufferDecl {
-        element_count_is_static: false,
         binding: 1,
         element: elem,
         layout: TileLayout::contiguous(MemoryLevel::Storage, &[65536]),

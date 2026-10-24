@@ -1189,7 +1189,6 @@ mod tests {
         let b = crate::build::Kernel::new();
         let layout = TileLayout::contiguous(MemoryLevel::Storage, &[8]);
         let buffer = Arc::new(BufferDecl {
-            element_count_is_static: false,
             binding: 1,
             element: ScalarElement::F32.element(),
             layout: layout.clone(),
@@ -1352,7 +1351,6 @@ mod tests {
         };
         let layout = TileLayout::contiguous(MemoryLevel::Storage, &[8]);
         let buffer = Arc::new(BufferDecl {
-            element_count_is_static: false,
             binding: 1,
             element: ScalarElement::F32.element(),
             layout: layout.clone(),

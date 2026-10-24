@@ -11,14 +11,11 @@ pub(crate) mod reduce;
 pub(crate) mod stmt;
 mod storage;
 pub(crate) mod types;
-mod vector_loads;
-#[cfg(test)]
-mod vector_loads_tests;
 
 use fusor_ir::device::Caps;
 use fusor_ir::ir::kernel::{
     Accumulator, Addr, ArenaPlan, Buffer, Builtin, ElementType, KernelIr, Local, MemReads,
-    ReduceKind, ScalarElement, Source, Stmt, StorageView, Tile, TileExpr, TileExprKind,
+    ReduceKind, ScalarElement, Source, Stmt, Tile, TileExpr, TileExprKind,
 };
 use fusor_ir::target::EmitError;
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -88,8 +85,6 @@ pub(crate) struct Analysis {
     pub atomic_buffers: FxHashSet<u32>,
     /// First-use-ordered, deduplicated declaration lists.
     pub buffers: Vec<Buffer>,
-    /// Read-only scalar bindings whose accesses cover complete aligned vectors.
-    vector_buffers: FxHashMap<u32, u32>,
     pub tiles: Vec<Tile>,
     pub locals: Vec<Local>,
     /// The device's fixed subgroup width, which decides [`collective_tree`].
@@ -125,7 +120,6 @@ impl Analysis {
         for stmt in &ir.body {
             a.stmt(stmt, &mut seen);
         }
-        a.vector_buffers = vector_loads::analyze(&a.buffers, &seen.exprs);
         // Cooperative lowering addresses fragments per subgroup, so it needs a
         // subgroup id whether or not the body asked for one.
         a.subgroup_id |= a.uses_coop;
@@ -419,8 +413,6 @@ pub(crate) struct Emitter<'a> {
     pub(crate) buffer_globals: FxHashMap<usize, naga::Handle<naga::GlobalVariable>>,
     /// Physical storage element, which can differ from a typed buffer view.
     pub(crate) buffer_elements: FxHashMap<usize, ElementType>,
-    /// Typed physical views used to memoize a complete grouped read.
-    pub(crate) vector_views: FxHashMap<u32, StorageView>,
     /// Tile decl key -> how that tile is backed in workgroup memory.
     pub(crate) tile_backing: FxHashMap<usize, types::TileBacking>,
     /// Private tiles and program locals.
@@ -494,7 +486,6 @@ impl<'a> Emitter<'a> {
             fn_locals: naga::Arena::new(),
             buffer_globals: FxHashMap::default(),
             buffer_elements: FxHashMap::default(),
-            vector_views: FxHashMap::default(),
             tile_backing: FxHashMap::default(),
             local_handles: FxHashMap::default(),
             scratch: FxHashMap::default(),
@@ -645,7 +636,6 @@ mod tests {
         access: BufferAccess,
     ) -> StorageView {
         let buffer = Arc::new(BufferDecl {
-            element_count_is_static: false,
             binding,
             element,
             layout: TileLayout::contiguous(MemoryLevel::Storage, &[elements]),

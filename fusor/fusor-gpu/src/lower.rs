@@ -405,9 +405,8 @@ impl<'a> Ctx<'a> {
         binding: DimBinding,
         pack: std::sync::Arc<UniformPack>,
     ) -> Result<Self> {
-        let decl = |binding, dtype, extent: u32, access, element_count_is_static| {
+        let decl = |binding, dtype, extent: u32, access| {
             Arc::new(BufferDecl {
-                element_count_is_static,
                 binding,
                 element: ElementType::Scalar(scalar_element(dtype)),
                 layout: TileLayout::contiguous(MemoryLevel::Storage, &[extent.max(1)]),
@@ -420,7 +419,6 @@ impl<'a> Ctx<'a> {
             Dtype::U32,
             uniform_words,
             BufferAccess::Read,
-            true,
         )];
 
         let mut ordered: Vec<_> = cx.launch.bindings.iter().collect();
@@ -456,7 +454,6 @@ impl<'a> Ctx<'a> {
                         dtype,
                         extent,
                         BufferAccess::ReadWrite,
-                        true,
                     ));
                     let slot = buffers.len() - 1;
                     arena_views.insert(dtype, slot);
@@ -488,15 +485,7 @@ impl<'a> Ctx<'a> {
             for member in cx.graph.class_ids(class) {
                 slot_of.insert(member, buffers.len());
             }
-            let static_extent = layout.shape().iter().all(|d| d.as_const().is_some())
-                && layout.strides().iter().all(|s| s.as_const().is_some());
-            buffers.push(decl(
-                plan_binding.binding,
-                dtype,
-                extent,
-                access,
-                static_extent,
-            ));
+            buffers.push(decl(plan_binding.binding, dtype, extent, access));
         }
 
         Ok(Self {

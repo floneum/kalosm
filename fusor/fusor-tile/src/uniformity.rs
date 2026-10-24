@@ -277,7 +277,6 @@ mod tests {
             (BufferAccess::Read, false, true),
         ] {
             let buffer = Arc::new(BufferDecl {
-                element_count_is_static: false,
                 binding: 0,
                 element: u32_type,
                 layout: TileLayout::contiguous(MemoryLevel::Storage, &[32]),
@@ -286,7 +285,6 @@ mod tests {
             let mut buffers = vec![buffer.clone()];
             if writable_alias {
                 buffers.push(Arc::new(BufferDecl {
-                    element_count_is_static: false,
                     access: BufferAccess::ReadWrite,
                     ..(*buffer).clone()
                 }));

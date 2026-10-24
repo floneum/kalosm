@@ -1098,7 +1098,6 @@ mod tests {
 
     fn decl(binding: u32, elem: ScalarElement, n: u32, rw: bool) -> Arc<BufferDecl> {
         Arc::new(BufferDecl {
-            element_count_is_static: false,
             binding,
             element: ElementType::Scalar(elem),
             layout: TileLayout::contiguous(MemoryLevel::Storage, &[n]),
