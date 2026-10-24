@@ -1,0 +1,46 @@
+name: WebGPU streaming read diagnostic
+on:
+  push:
+    branches: [codex/stream-read-probe]
+permissions:
+  contents: read
+jobs:
+  fixture:
+    runs-on: macos-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_OPT_LEVEL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 406e9ee9432b8c200a071ad043283fa3b28a4d2e
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fusor/target
+          key: immutable-upload-green-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
+          restore-keys: |
+            grouped-load-projection-${{ runner.os }}-
+      - name: Check every checksum through WebGPU and lint the diagnostic
+        run: |
+          LAB_VALIDATE_ONLY=1 cargo run --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer --example stream_read_lab -- 1 1
+          cargo clippy --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer --example stream_read_lab -- -D warnings
+      - name: Record artifact provenance
+        run: |
+          mkdir artifacts
+          rustc -Vv > artifacts/provenance.txt
+          git rev-parse HEAD >> artifacts/provenance.txt
+          cp fusor/target/debug/examples/stream_read_lab artifacts/stream-read
+          shasum -a 256 artifacts/stream-read >> artifacts/provenance.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: stream-read-fixture
+          path: artifacts
+          retention-days: 7
