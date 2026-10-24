@@ -317,6 +317,26 @@ pub(crate) fn create_storage_globals(em: &mut Emitter<'_>) -> Result<(), EmitErr
         } else {
             decl.element
         };
+        if let Some(&lanes) = em.analysis.vector_buffers.get(&first.binding)
+            && matches!(physical, ElementType::Vector { .. })
+        {
+            let count = (decl.layout.element_count() / u64::from(lanes)) as u32;
+            decl.layout = fusor_ir::ir::kernel::TileLayout::contiguous(
+                fusor_ir::ir::kernel::MemoryLevel::Storage,
+                &[count],
+            );
+            let buffer = std::sync::Arc::new(decl);
+            em.buffer_globals.insert(key(&buffer), global);
+            em.buffer_elements.insert(key(&buffer), physical);
+            em.vector_views.insert(
+                first.binding,
+                fusor_ir::ir::kernel::StorageView {
+                    layout: buffer.layout.clone(),
+                    buffer,
+                    offset: 0,
+                },
+            );
+        }
         for buffer in views {
             em.buffer_globals.insert(key(buffer), global);
             em.buffer_elements.insert(key(buffer), physical);

@@ -1008,6 +1008,32 @@ impl Emitter<'_> {
             Source::Storage(view) => {
                 let element = view.buffer.element;
                 if mask.is_constant_true() {
+                    if let Some(width) = self.packed_vector(&view.buffer) {
+                        let b = fusor_tile::build::Kernel::new();
+                        let index = super::vector_loads::physical_index(&b, view, addr)
+                            .expect("grouped access was proven before emission");
+                        let group = fusor_ir::ir::kernel::simplify_index(
+                            &b.div(index.clone(), b.u32(width)),
+                        );
+                        let component =
+                            fusor_ir::ir::kernel::simplify_index(&b.rem(index, b.u32(width)));
+                        let physical = self.vector_views[&view.buffer.binding].clone();
+                        let value = b.load(
+                            Source::Storage(physical.clone()),
+                            Addr::Linear(group),
+                            b.bool(true),
+                            b.zero_of(physical.buffer.element),
+                        );
+                        let value = self.expr(&value, body)?;
+                        let component = self.expr(&component, body)?;
+                        return Ok(self.emit_expr(
+                            body,
+                            Expression::Access {
+                                base: value,
+                                index: component,
+                            },
+                        ));
+                    }
                     let index = self.addr_index(body, view, addr)?;
                     return self.load_storage_value(body, view, index);
                 }

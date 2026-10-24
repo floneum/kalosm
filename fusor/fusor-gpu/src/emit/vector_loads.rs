@@ -92,7 +92,7 @@ fn analyze_width(
         .collect()
 }
 
-fn physical_index(b: &Kernel, view: &StorageView, addr: &Addr) -> Option<TileExpr> {
+pub(super) fn physical_index(b: &Kernel, view: &StorageView, addr: &Addr) -> Option<TileExpr> {
     let index = match addr {
         Addr::Linear(index) => index.clone(),
         Addr::Rc2 { row, col } => {
