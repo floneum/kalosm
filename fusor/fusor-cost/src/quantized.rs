@@ -114,6 +114,7 @@ fn decode_window_uncached(key: DecodeKey) -> Result<(u64, u64)> {
     let storage = TileLayout::contiguous(MemoryLevel::Storage, &[1]);
     let src = StorageView {
         buffer: Arc::new(BufferDecl {
+            element_count_is_static: false,
             binding: 0,
             element: ScalarElement::U32.element(),
             layout: storage.clone(),

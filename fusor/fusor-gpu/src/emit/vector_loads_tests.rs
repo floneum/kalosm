@@ -26,6 +26,7 @@ fn kernel(elements: u32, components: u32, offset: u32, writable: bool, masked: b
     let b = fusor_tile::build::Kernel::new();
     let storage = |binding, access| {
         let buffer = Arc::new(BufferDecl {
+            element_count_is_static: true,
             binding,
             element: ScalarElement::F32.element(),
             layout: TileLayout::contiguous(MemoryLevel::Storage, &[elements]),
@@ -46,6 +47,7 @@ fn kernel(elements: u32, components: u32, offset: u32, writable: bool, masked: b
         },
     );
     input.offset = offset;
+    input.layout = TileLayout::contiguous(MemoryLevel::Storage, &[1, elements]);
     let output = storage(2, BufferAccess::ReadWrite);
     let base = b.mul(
         b.builtin(Builtin::ProgramId(fusor_ir::ir::kernel::WorkgroupAxis::X)),
@@ -59,7 +61,10 @@ fn kernel(elements: u32, components: u32, offset: u32, writable: bool, masked: b
                 addr: Addr::Linear(index.clone()),
                 value: b.load(
                     Source::Storage(input.clone()),
-                    Addr::Linear(index),
+                    Addr::Rc2 {
+                        row: b.u32(0),
+                        col: index,
+                    },
                     b.bool(!masked),
                     b.f32(-7.),
                 ),
@@ -127,6 +132,25 @@ fn incomplete_or_unproven_storage_groups_remain_scalar() {
             "unproven group {args:?} became vector storage"
         );
     }
+}
+
+#[test]
+fn symbolic_storage_extent_does_not_prove_vector_alignment() {
+    let ir = kernel(32, 4, 0, false, false);
+    let expressions: FxHashSet<_> = ir
+        .body
+        .iter()
+        .filter_map(|stmt| {
+            if let Stmt::Store { value, .. } = stmt {
+                Some(value.clone())
+            } else {
+                None
+            }
+        })
+        .collect();
+    let mut input = (*ir.buffers[1]).clone();
+    input.element_count_is_static = false;
+    assert!(vector_loads::analyze(&[Arc::new(input)], &expressions).is_empty());
 }
 
 #[test]

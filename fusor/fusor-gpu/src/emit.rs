@@ -642,6 +642,7 @@ mod tests {
         access: BufferAccess,
     ) -> StorageView {
         let buffer = Arc::new(BufferDecl {
+            element_count_is_static: false,
             binding,
             element,
             layout: TileLayout::contiguous(MemoryLevel::Storage, &[elements]),

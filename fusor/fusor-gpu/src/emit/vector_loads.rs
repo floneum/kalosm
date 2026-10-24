@@ -8,19 +8,13 @@ use fusor_tile::build::Kernel;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub(super) fn analyze(buffers: &[Buffer], expressions: &FxHashSet<TileExpr>) -> FxHashSet<u32> {
-    let debug = std::env::var_os("FUSOR_DEBUG_VECTOR_LOADS").is_some();
     let mut rejected = FxHashSet::default();
     for buffer in buffers {
-        // A vector must never hide a partial final storage element. Symbolic
-        // declarations have zero extent and stay scalar, as do mixed views.
+        // The symbolic declaration extent is only a lower-bound placeholder;
+        // its divisibility cannot prove that physical storage has full vectors.
         let count = buffer.layout.element_count();
-        if debug {
-            eprintln!(
-                "[DEBUG-vector] binding={} count={count} element={:?} access={:?}",
-                buffer.binding, buffer.element, buffer.access
-            );
-        }
-        if buffer.access != BufferAccess::Read
+        if !buffer.element_count_is_static
+            || buffer.access != BufferAccess::Read
             || count == 0
             || !count.is_multiple_of(4)
             || !matches!(
@@ -53,25 +47,11 @@ pub(super) fn analyze(buffers: &[Buffer], expressions: &FxHashSet<TileExpr>) -> 
         let group = (|| {
             // Masking and tails retain their existing scalar access path.
             if !mask.is_constant_true() {
-                if debug {
-                    eprintln!("[DEBUG-vector] binding={binding} masked");
-                }
                 return None;
             }
-            let Some(index) = physical_index(&b, view, addr) else {
-                if debug {
-                    eprintln!(
-                        "[DEBUG-vector] binding={binding} complex layout {:?}",
-                        view.layout
-                    );
-                }
-                return None;
-            };
+            let index = physical_index(&b, view, addr)?;
             let component = simplify_index(&b.rem(index.clone(), b.u32(4)));
             let TileExprKind::Literal(TileLiteral::U32(component)) = component.kind() else {
-                if debug {
-                    eprintln!("[DEBUG-vector] binding={binding} unknown component {component:?}");
-                }
                 return None;
             };
             let group = simplify_index(&b.div(index, b.u32(4)));
@@ -81,15 +61,6 @@ pub(super) fn analyze(buffers: &[Buffer], expressions: &FxHashSet<TileExpr>) -> 
             *groups.entry(binding).or_default().entry(group).or_default() |= 1 << component;
         } else {
             rejected.insert(binding);
-        }
-    }
-    if debug {
-        for (binding, groups) in &groups {
-            eprintln!(
-                "[DEBUG-vector] binding={binding} rejected={} groups={:?}",
-                rejected.contains(binding),
-                groups.values().collect::<Vec<_>>()
-            );
         }
     }
     groups
@@ -110,10 +81,12 @@ fn physical_index(b: &Kernel, view: &StorageView, addr: &Addr) -> Option<TileExp
             };
             let [r] = &rows.sub_axes[..] else { return None };
             let [c] = &cols.sub_axes[..] else { return None };
-            b.add(
-                b.mul(row.clone(), b.u32(r.stride)),
-                b.mul(col.clone(), b.u32(c.stride)),
-            )
+            let stride = |index: &TileExpr, stride| match stride {
+                0 => b.u32(0),
+                1 => index.clone(),
+                _ => b.mul(index.clone(), b.u32(stride)),
+            };
+            b.add(stride(row, r.stride), stride(col, c.stride))
         }
     };
     Some(simplify_index(&b.add(index, b.u32(view.offset))))

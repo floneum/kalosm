@@ -248,6 +248,7 @@ impl Binds {
 
         let mut buffers = Vec::with_capacity(bindings.len() + 1);
         buffers.push(intern_decl(BufferDecl {
+            element_count_is_static: false,
             binding: 0,
             element: ScalarElement::U32.element(),
             layout: TileLayout::contiguous(
@@ -292,6 +293,7 @@ impl Binds {
                 by_value.push((member, i + 1));
             }
             buffers.push(intern_decl(BufferDecl {
+                element_count_is_static: false,
                 binding: (i + 1) as u32,
                 element,
                 layout: TileLayout::contiguous(MemoryLevel::Storage, &extents),

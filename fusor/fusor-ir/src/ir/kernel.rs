@@ -162,6 +162,9 @@ impl TileLayout {
 /// views of one buffer.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct BufferDecl {
+    /// The declared storage extent is static, not a symbolic lower-bound placeholder.
+    /// Storage-width rewrites may use its alignment only when this is true.
+    pub element_count_is_static: bool,
     pub binding: u32,
     pub element: ElementType,
     pub layout: TileLayout,
