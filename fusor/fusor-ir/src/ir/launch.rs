@@ -10,10 +10,50 @@ use crate::shape::{Dim, Dims, Layout, MultiFlattenMap, SlidingWindow};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
+/// Bound retained row values per lane so normalization does not create an
+/// unbounded straight-line shader or register footprint.
+pub const MAX_NORMALIZATION_VALUES_PER_LANE: u32 = 32;
+
 /// The Launch op family.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Launch {
+    /// F32 row-wise RMS normalization: input, learned scale, and an optional
+    /// same-shaped residual added before the square-sum reduction.
+    RmsNorm {
+        output: IndexSpace,
+        width: u32,
+        block: u32,
+        epsilon: ScalarExpr,
+        ops: Vec<Operand>,
+        sched: ScheduleDomain,
+    },
+    /// Single-query F32 attention over a symbolic key extent. This is
+    /// an optional lowering of the ordinary QK/softmax/PV graph, with the
+    /// same output [batch, query heads, 1, head dimension].
+    DecodeAttention {
+        output: IndexSpace,
+        kv_heads: u32,
+        keys: Dim,
+        /// Threads per query head, a multiple of the fixed subgroup width.
+        block: u32,
+        /// Fixed subgroup width used by this schedule.
+        subgroup: u32,
+        /// Zero emits final attention. Otherwise emit [B,H,ceil(keys/chunk),D+2]
+        /// with D unnormalized PV values, the local max, and exponential sum.
+        chunk: u32,
+        scale: ScalarExpr,
+        prefix: ScalarExpr,
+        ops: Vec<Operand>,
+        sched: ScheduleDomain,
+    },
+    /// Stable merge of split attention's [numerator[D], max, sum].
+    DecodeAttentionMerge {
+        output: IndexSpace,
+        splits: Dim,
+        ops: Vec<Operand>,
+        sched: ScheduleDomain,
+    },
     Map {
         space: IndexSpace,
         body: ScalarExpr,
@@ -70,6 +110,9 @@ pub enum Launch {
         space: IndexSpace,
         axis: u32,
         mode: GatherMode,
+        /// Arg(0) is the gathered scalar; Arg(1..) read ops[2..] at the
+        /// output coordinate. The first two operands remain source/indices.
+        post: ScalarExpr,
         ops: Vec<Operand>,
         sched: ScheduleDomain,
     },
@@ -278,6 +321,9 @@ impl Launch {
 
     pub const fn tag(&self) -> OpTag {
         match self {
+            Self::RmsNorm { .. } => OpTag::LaunchRmsNorm,
+            Self::DecodeAttention { .. } => OpTag::LaunchDecodeAttention,
+            Self::DecodeAttentionMerge { .. } => OpTag::LaunchDecodeAttentionMerge,
             Self::Map { .. } => OpTag::LaunchMap,
             Self::Fold { .. } => OpTag::LaunchFold,
             Self::StreamFold { .. } => OpTag::LaunchStreamFold,
@@ -316,7 +362,10 @@ impl Launch {
     /// two sides.
     fn operand_lists(&self) -> [&[Operand]; 2] {
         match self {
-            Self::Map { ops, .. }
+            Self::RmsNorm { ops, .. }
+            | Self::DecodeAttention { ops, .. }
+            | Self::DecodeAttentionMerge { ops, .. }
+            | Self::Map { ops, .. }
             | Self::Fold { ops, .. }
             | Self::Gather { ops, .. }
             | Self::Scatter { ops, .. } => [ops, &[]],
@@ -353,7 +402,10 @@ impl Launch {
     /// side then its B side.
     pub fn operands_mut(&mut self) -> impl Iterator<Item = &mut Operand> {
         let [a, b]: [&mut [Operand]; 2] = match self {
-            Self::Map { ops, .. }
+            Self::RmsNorm { ops, .. }
+            | Self::DecodeAttention { ops, .. }
+            | Self::DecodeAttentionMerge { ops, .. }
+            | Self::Map { ops, .. }
             | Self::Fold { ops, .. }
             | Self::Gather { ops, .. }
             | Self::Scatter { ops, .. } => [ops, &mut []],
@@ -366,7 +418,10 @@ impl Launch {
     /// This node's enumerable schedule space.
     pub fn schedule(&self) -> Option<&ScheduleDomain> {
         match self {
-            Self::Map { sched, .. }
+            Self::RmsNorm { sched, .. }
+            | Self::DecodeAttention { sched, .. }
+            | Self::DecodeAttentionMerge { sched, .. }
+            | Self::Map { sched, .. }
             | Self::Fold { sched, .. }
             | Self::StreamFold { sched, .. }
             | Self::Contract { sched, .. }
@@ -392,6 +447,18 @@ impl IndexSpace {
 
     pub fn rank(&self) -> usize {
         self.dims.len()
+    }
+
+    /// Whether flat indexing of this space can address an operand's shape.
+    /// Scalars broadcast at any rank; other layouts must match a suffix, with
+    /// singleton axes allowed. Equal element counts alone are insufficient.
+    pub fn addresses_shape(&self, shape: &[Dim]) -> bool {
+        shape.iter().all(|d| d.known_eq(Dim::Const(1)))
+            || (shape.len() <= self.rank()
+                && shape
+                    .iter()
+                    .zip(&self.dims[self.rank() - shape.len()..])
+                    .all(|(a, b)| a.known_eq(*b) || a.known_eq(Dim::Const(1))))
     }
 
     /// The legality side of `map_into_fold`: a producer may be inlined only
@@ -1114,7 +1181,7 @@ impl WindowAdjoint {
 }
 
 /// Scratch budget for a cooperative schedule, as lowering declares it,
-/// including the output staging tile.
+/// including one output fragment per subgroup, reused by the epilogue.
 pub fn coop_tiles(
     geom: CoopGeom,
     elem: super::kernel::ScalarElement,
@@ -1134,7 +1201,11 @@ pub fn coop_tiles(
         decls: smallvec::smallvec![
             tile("coop_a", elem, &[depth * geom.bm, geom.bk]),
             tile("coop_b", elem, &[depth * geom.bk, bn_pass]),
-            tile("coop_acc", ScalarElement::F32, &[geom.bm, bn_pass]),
+            tile(
+                "coop_acc",
+                ScalarElement::F32,
+                &[geom.subgroups * CoopGeom::COOP_DIM, CoopGeom::COOP_DIM]
+            ),
         ],
     }
 }

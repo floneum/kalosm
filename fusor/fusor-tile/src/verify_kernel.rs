@@ -8,7 +8,7 @@ use fusor_ir::device::Caps;
 use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
     Accumulator, Addr, ArenaPlanner, CoopMatrixRole, ElementType, KernelIr, Local, LowerError,
-    ScalarElement, Source, Stmt, TileExpr, TileExprKind, TileLiteral,
+    ScalarElement, Source, Stmt, TileBinaryOp, TileExpr, TileExprKind, TileLiteral, TileUnaryOp,
     cooperative_store_layout_supported,
 };
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -135,7 +135,46 @@ pub(crate) fn infer_kind(kind: &TileExprKind) -> Result<ElementType> {
             Source::Quantized(_) => ElementType::Scalar(ScalarElement::F32),
         },
         K::LoadTile { tile, .. } => tile.element,
+        K::Unary {
+            op: TileUnaryOp::Unpack2x16Float,
+            value,
+            ..
+        } => {
+            if value.element() != ScalarElement::U32.element() {
+                return Err(invalid("unpack2x16float requires a u32 word"));
+            }
+            ElementType::Vector {
+                scalar: ScalarElement::F32,
+                lanes: 2,
+            }
+        }
         K::Unary { value, .. } => value.element(),
+        K::Binary {
+            op: TileBinaryOp::Shl | TileBinaryOp::Shr,
+            left,
+            right,
+            ..
+        } => {
+            let count_type = match left.element() {
+                ElementType::Scalar(ScalarElement::I32 | ScalarElement::U32) => {
+                    ScalarElement::U32.element()
+                }
+                ElementType::Vector {
+                    scalar: ScalarElement::I32 | ScalarElement::U32,
+                    lanes,
+                } => ElementType::Vector {
+                    scalar: ScalarElement::U32,
+                    lanes,
+                },
+                _ => return Err(invalid("shift requires an integer value")),
+            };
+            if right.element() != count_type {
+                return Err(invalid(
+                    "shift count must be unsigned and match the value width",
+                ));
+            }
+            left.element()
+        }
         K::Binary { left, right, .. } => {
             if left.element() != right.element() {
                 return Err(invalid(format!(
@@ -456,12 +495,21 @@ fn check_types(ir: &KernelIr) -> Result<()> {
 
 /// Bounds for the range prover: launch geometry, subgroup widths, and loop
 /// index locals in scope with their literal trip counts.
+#[derive(Clone)]
 struct BoundEnv {
     grid: [u32; 3],
     block: u32,
     /// `(min, max)` subgroup width; `None` leaves subgroup builtins unbounded.
     subgroups: Option<(u32, u32)>,
     locals: FxHashMap<usize, u64>,
+    /// Pure unsigned expressions bounded by enclosing branch conditions.
+    expressions: FxHashMap<TileExpr, IndexBound>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct IndexBound {
+    lower: u64,
+    upper: Option<u64>,
 }
 
 /// Every `Load` is masked or provably in range, using `ProgramId < grid`,
@@ -473,6 +521,7 @@ pub(crate) fn check_loads(ir: &KernelIr, caps: &Caps) -> Result<()> {
         block: ir.block,
         subgroups: caps.subgroups.map(|s| (s.min, s.max)),
         locals: FxHashMap::default(),
+        expressions: FxHashMap::default(),
     };
     let mut seen = FxHashSet::default();
     check_loads_in(&ir.body, &mut env, &mut seen)
@@ -528,8 +577,14 @@ fn check_loads_in(body: &[Stmt], env: &mut BoundEnv, seen: &mut FxHashSet<u64>) 
                 reject,
             } => {
                 check_expr_loads(condition, env, seen)?;
-                check_loads_in(accept, env, seen)?;
-                check_loads_in(reject, env, seen)?;
+                let mut inside = env.clone();
+                assume_true(condition, &mut inside);
+                // A load proved under one branch's bound must be checked again
+                // in the other branch and after the conditional.
+                check_loads_in(accept, &mut inside, &mut seen.clone())?;
+                let mut outside = env.clone();
+                assume_false(condition, &mut outside);
+                check_loads_in(reject, &mut outside, &mut seen.clone())?;
             }
             other => {
                 let mut result = Ok(());
@@ -543,6 +598,75 @@ fn check_loads_in(body: &[Stmt], env: &mut BoundEnv, seen: &mut FxHashSet<u64>) 
         }
     }
     Ok(())
+}
+
+/// Record only immutable values: a local/storage read or a collective may
+/// change between the condition and a load inside the branch. In particular,
+/// `(linear_workgroup - member_offset) < member_count` bounds grouped kernels
+/// even when the unsigned subtraction would wrap outside that member's range.
+fn assume_true(condition: &TileExpr, env: &mut BoundEnv) {
+    use fusor_ir::ir::kernel::TileCompareOp;
+    match condition.kind() {
+        TileExprKind::Binary {
+            op: TileBinaryOp::LogicalAnd,
+            left,
+            right,
+            ..
+        } => {
+            assume_true(left, env);
+            assume_true(right, env);
+        }
+        TileExprKind::Compare {
+            op: TileCompareOp::Lt,
+            left,
+            right,
+        } if left.element() == ScalarElement::U32.element()
+            && left.mem_reads().is_empty()
+            && !left.scope_dependent() =>
+        {
+            if let Some(bound) = literal_u64(right).and_then(|limit| limit.checked_sub(1)) {
+                env.expressions
+                    .entry(left.clone())
+                    .and_modify(|previous| {
+                        previous.upper = Some(previous.upper.map_or(bound, |old| old.min(bound)));
+                    })
+                    .or_insert(IndexBound {
+                        lower: 0,
+                        upper: Some(bound),
+                    });
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The rejected arm of `x < limit` proves `x >= limit`. Keeping this
+/// lower bound allows a selected tail index to subtract its origin without
+/// treating the subtraction as wrapping. The same immutability rule applies.
+fn assume_false(condition: &TileExpr, env: &mut BoundEnv) {
+    use fusor_ir::ir::kernel::TileCompareOp;
+    if let TileExprKind::Compare {
+        op: TileCompareOp::Lt,
+        left,
+        right,
+    } = condition.kind()
+        && left.element() == ScalarElement::U32.element()
+        && left.mem_reads().is_empty()
+        && !left.scope_dependent()
+        && let Some(lower) = literal_u64(right)
+    {
+        env.expressions
+            .entry(left.clone())
+            .and_modify(|previous| previous.lower = previous.lower.max(lower))
+            .or_insert(IndexBound { lower, upper: None });
+    }
+}
+
+fn min_value(expr: &TileExpr, env: &BoundEnv) -> Option<u64> {
+    literal_u64(expr).or_else(|| {
+        (expr.element() == ScalarElement::U32.element())
+            .then(|| env.expressions.get(expr).map_or(0, |bound| bound.lower))
+    })
 }
 
 fn check_expr_loads(expr: &TileExpr, env: &BoundEnv, seen: &mut FxHashSet<u64>) -> Result<()> {
@@ -609,12 +733,46 @@ fn literal_u64(expr: &TileExpr) -> Option<u64> {
 fn max_value(expr: &TileExpr, env: &BoundEnv) -> Option<u64> {
     use fusor_ir::ir::kernel::{Builtin, WorkgroupAxis};
     use fusor_ir::scalar::BinOp;
+    if let Some(bound) = env.expressions.get(expr).and_then(|bound| bound.upper) {
+        return Some(bound);
+    }
     match expr.kind() {
         TileExprKind::Literal(TileLiteral::U32(v)) => Some(u64::from(*v)),
         TileExprKind::Literal(TileLiteral::I32(v)) if *v >= 0 => Some(*v as u64),
         TileExprKind::Cast { value, .. } => max_value(value, env),
-        TileExprKind::Select { accept, reject, .. } => {
-            Some(max_value(accept, env)?.max(max_value(reject, env)?))
+        TileExprKind::Select {
+            condition,
+            accept,
+            reject,
+        } => {
+            // Bound the selected value under its predicate. This does not
+            // license loads in either arm: select operands evaluate eagerly,
+            // and check_expr_loads still visits them with the original env.
+            if let TileExprKind::Compare {
+                op: fusor_ir::ir::kernel::TileCompareOp::Lt,
+                left,
+                right,
+            } = condition.kind()
+                && left.element() == ScalarElement::U32.element()
+            {
+                if min_value(left, env)
+                    .zip(max_value(right, env))
+                    .is_some_and(|(l, r)| l >= r)
+                {
+                    return max_value(reject, env);
+                }
+                if max_value(left, env)
+                    .zip(min_value(right, env))
+                    .is_some_and(|(l, r)| l < r)
+                {
+                    return max_value(accept, env);
+                }
+            }
+            let mut inside = env.clone();
+            assume_true(condition, &mut inside);
+            let mut outside = env.clone();
+            assume_false(condition, &mut outside);
+            Some(max_value(accept, &inside)?.max(max_value(reject, &outside)?))
         }
         // `LocalInvocationIndex`, bounded by the block.
         TileExprKind::Builtin(Builtin::Lane) => Some(u64::from(env.block.max(1)) - 1),
@@ -655,8 +813,15 @@ fn max_value(expr: &TileExpr, env: &BoundEnv) -> Option<u64> {
         } => match op {
             BinOp::Add => max_value(left, env)?.checked_add(max_value(right, env)?),
             BinOp::Mul => max_value(left, env)?.checked_mul(max_value(right, env)?),
-            // Subtraction only lowers the bound.
-            BinOp::Sub => max_value(left, env),
+            // Unsigned subtraction can wrap. A lower bound on the left
+            // must prove that every possible right value can be subtracted.
+            BinOp::Sub => {
+                if min_value(left, env)? >= max_value(right, env)? {
+                    max_value(left, env)?.checked_sub(min_value(right, env)?)
+                } else {
+                    None
+                }
+            }
             // A positive literal divides the bound; a dynamic one only lowers it.
             BinOp::Div => match literal_u64(right) {
                 Some(d) if d > 0 => Some(max_value(left, env)? / d),
@@ -1009,4 +1174,223 @@ pub(crate) fn visit_unique(
         visit_unique(child, seen, f);
     }
     f(expr);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fusor_ir::dtype::NumericContract;
+
+    #[test]
+    fn grouped_load_uses_its_branch_bound_without_leaking_it() {
+        use fusor_ir::ir::kernel::{
+            BufferAccess, BufferDecl, Builtin, MemoryLevel, StorageView, TileLayout, WorkgroupAxis,
+        };
+        let b = crate::build::Kernel::new();
+        let layout = TileLayout::contiguous(MemoryLevel::Storage, &[8]);
+        let buffer = Arc::new(BufferDecl {
+            binding: 1,
+            element: ScalarElement::F32.element(),
+            layout: layout.clone(),
+            access: BufferAccess::Read,
+        });
+        let group = b.sub(b.builtin(Builtin::ProgramId(WorkgroupAxis::X)), b.u32(1));
+        let read = b.load(
+            Source::Storage(StorageView {
+                buffer,
+                layout,
+                offset: 0,
+            }),
+            Addr::Linear(b.add(b.mul(group.clone(), b.u32(8)), b.builtin(Builtin::Lane))),
+            b.bool(true),
+            b.f32(0.),
+        );
+        let store = Stmt::StoreLocal {
+            dst: b.local(read.element()),
+            value: read,
+        };
+        let branch = Stmt::If {
+            condition: b.lt(group, b.u32(1)),
+            accept: vec![store.clone()],
+            reject: vec![],
+        };
+        let mut env = BoundEnv {
+            grid: [4, 1, 1],
+            block: 8,
+            subgroups: None,
+            locals: FxHashMap::default(),
+            expressions: FxHashMap::default(),
+        };
+        assert!(
+            check_loads_in(
+                std::slice::from_ref(&branch),
+                &mut env,
+                &mut FxHashSet::default()
+            )
+            .is_ok()
+        );
+        assert!(
+            check_loads_in(
+                &[branch, store.clone()],
+                &mut env,
+                &mut FxHashSet::default()
+            )
+            .is_err()
+        );
+        // With one group, `group_id - 1` wraps to u32::MAX. A small
+        // left-hand bound alone cannot justify the unguarded subtraction.
+        env.grid = [1, 1, 1];
+        assert!(check_loads_in(&[store], &mut env, &mut FxHashSet::default()).is_err());
+    }
+
+    #[test]
+    fn branch_bounds_exclude_mutable_values_and_collectives() {
+        use fusor_ir::ir::kernel::{Builtin, ReduceKind, TileReduceOp};
+        let b = crate::build::Kernel::new();
+        let mut env = BoundEnv {
+            grid: [4, 1, 1],
+            block: 32,
+            subgroups: Some((32, 32)),
+            locals: FxHashMap::default(),
+            expressions: FxHashMap::default(),
+        };
+        let local = b.load_local(b.local(ScalarElement::U32.element()));
+        let collective = b.reduce(
+            TileReduceOp::Sum,
+            ReduceKind::Subgroup,
+            b.builtin(Builtin::Lane),
+        );
+        for value in [local, collective] {
+            let condition = b.lt(value, b.u32(8));
+            assume_true(&condition, &mut env);
+            assume_false(&condition, &mut env);
+            assert!(env.expressions.is_empty());
+        }
+    }
+
+    #[test]
+    fn selected_tile_index_has_a_branch_local_upper_bound() {
+        use fusor_ir::ir::kernel::{Builtin, WorkgroupAxis};
+        let b = crate::build::Kernel::new();
+        let env = BoundEnv {
+            grid: [376, 1, 1],
+            block: 128,
+            subgroups: None,
+            locals: FxHashMap::default(),
+            expressions: FxHashMap::default(),
+        };
+        let group = b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
+        let tiled = b.add(
+            b.mul(b.div(group.clone(), b.u32(36)), b.u32(6)),
+            b.rem(b.rem(group.clone(), b.u32(36)), b.u32(6)),
+        );
+        let tail = b.add(b.u32(60), b.rem(b.sub(group.clone(), b.u32(360)), b.u32(4)));
+        let selected = b.select(b.lt(group, b.u32(360)), tiled.clone(), tail);
+        let row = b.add(
+            b.mul(selected, b.u32(16)),
+            b.div(b.builtin(Builtin::Lane), b.u32(8)),
+        );
+        assert_eq!(max_value(&row, &env), Some(1023));
+        let group = b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
+        let tail = b.sub(group.clone(), b.u32(360));
+        let column = b.select(
+            b.lt(group.clone(), b.u32(360)),
+            b.div(b.rem(group, b.u32(36)), b.u32(6)),
+            b.div(tail.clone(), b.u32(4)),
+        );
+        assert_eq!(max_value(&column, &env), Some(5));
+        // Outside the rejected arm, the same subtraction can wrap.
+        assert_eq!(max_value(&tail, &env), None);
+        // The accepted arm's bound cannot escape to another expression.
+        assert_eq!(max_value(&tiled, &env), Some(65));
+        assert!(env.expressions.is_empty());
+    }
+
+    #[test]
+    fn selected_tile_index_excludes_an_impossible_region() {
+        use fusor_ir::ir::kernel::{Builtin, WorkgroupAxis};
+        let b = crate::build::Kernel::new();
+        let env = BoundEnv {
+            grid: [20, 1, 1],
+            block: 128,
+            subgroups: None,
+            locals: FxHashMap::default(),
+            expressions: FxHashMap::default(),
+        };
+        let group = b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
+        // No complete 5x5 tile fits in a 4x5 grid. Only the tail executes,
+        // but the unused tiled formula can produce row 4.
+        let tiled = b.add(
+            b.mul(b.div(group.clone(), b.u32(25)), b.u32(5)),
+            b.rem(b.rem(group.clone(), b.u32(25)), b.u32(5)),
+        );
+        let tail = b.rem(group.clone(), b.u32(4));
+        let selected = b.select(b.lt(group, b.u32(0)), tiled, tail);
+        let row = b.add(
+            b.mul(selected, b.u32(16)),
+            b.div(b.builtin(Builtin::Lane), b.u32(8)),
+        );
+        assert_eq!(max_value(&row, &env), Some(63));
+        let group = b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
+        let selected = b.select(b.lt(group.clone(), b.u32(20)), group, b.u32(u32::MAX));
+        assert_eq!(max_value(&selected, &env), Some(19));
+    }
+
+    #[test]
+    fn select_predicate_cannot_license_an_eager_load() {
+        use fusor_ir::ir::kernel::{
+            BufferAccess, BufferDecl, Builtin, MemoryLevel, StorageView, TileLayout, WorkgroupAxis,
+        };
+        let b = crate::build::Kernel::new();
+        let env = BoundEnv {
+            grid: [16, 1, 1],
+            block: 1,
+            subgroups: None,
+            locals: FxHashMap::default(),
+            expressions: FxHashMap::default(),
+        };
+        let layout = TileLayout::contiguous(MemoryLevel::Storage, &[8]);
+        let buffer = Arc::new(BufferDecl {
+            binding: 1,
+            element: ScalarElement::F32.element(),
+            layout: layout.clone(),
+            access: BufferAccess::Read,
+        });
+        let index = b.builtin(Builtin::ProgramId(WorkgroupAxis::X));
+        let read = b.load(
+            Source::Storage(StorageView {
+                buffer,
+                layout,
+                offset: 0,
+            }),
+            Addr::Linear(index.clone()),
+            b.bool(true),
+            b.f32(0.),
+        );
+        for limit in [0, 8] {
+            let selected = b.select(b.lt(index.clone(), b.u32(limit)), read.clone(), b.f32(0.));
+            assert!(check_expr_loads(&selected, &env, &mut FxHashSet::default()).is_err());
+        }
+    }
+
+    #[test]
+    fn packed_word_operations_infer_their_result_types() {
+        let b = crate::build::Kernel::new();
+        let numeric = NumericContract::RELAXED;
+        let unpack = b.unary(TileUnaryOp::Unpack2x16Float, b.u32(0x3c003c00), numeric);
+        assert_eq!(infer_kind(unpack.kind()).unwrap(), unpack.element());
+        for op in [TileBinaryOp::Shl, TileBinaryOp::Shr] {
+            for signed in [false, true] {
+                let value = if signed { b.i32(-128) } else { b.u32(128) };
+                let shifted = b.binary(op, value, b.u32(2), numeric);
+                assert_eq!(infer_kind(shifted.kind()).unwrap(), shifted.element());
+            }
+            let invalid = b.binary(op, b.i32(-128), b.i32(2), numeric);
+            assert!(infer_kind(invalid.kind()).is_err());
+        }
+        let invalid = b.unary(TileUnaryOp::Unpack2x16Float, b.f32(1.), numeric);
+        assert!(infer_kind(invalid.kind()).is_err());
+        let invalid = b.binary(TileBinaryOp::Add, b.i32(1), b.u32(2), numeric);
+        assert!(infer_kind(invalid.kind()).is_err());
+    }
 }

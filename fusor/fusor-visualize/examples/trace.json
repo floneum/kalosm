@@ -1,0 +1,38 @@
+{
+  "version": 1,
+  "name": "four lane stride comparison",
+  "workgroup_size": 4,
+  "recorded_subgroup_size": null,
+  "resources": [
+    { "id": 1, "name": "input", "space": "storage", "bytes": 512 }
+  ],
+  "events": [
+    {
+      "workgroup": [0, 0, 0],
+      "source": "contiguous read",
+      "action": {
+        "kind": "memory", "resource": 1, "access": "read",
+        "lanes": [
+          { "lane": 0, "address": 0, "bytes": 4 },
+          { "lane": 1, "address": 4, "bytes": 4 },
+          { "lane": 2, "address": 8, "bytes": 4 },
+          { "lane": 3, "address": 12, "bytes": 4 }
+        ]
+      }
+    },
+    {
+      "workgroup": [0, 0, 0],
+      "source": "strided read",
+      "action": {
+        "kind": "memory", "resource": 1, "access": "read",
+        "lanes": [
+          { "lane": 0, "address": 0, "bytes": 4 },
+          { "lane": 1, "address": 128, "bytes": 4 },
+          { "lane": 2, "address": 256, "bytes": 4 },
+          { "lane": 3, "address": 384, "bytes": 4 }
+        ]
+      }
+    }
+  ],
+  "notes": ["Byte addresses are independent of subgroup size in this example."]
+}

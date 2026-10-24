@@ -194,7 +194,11 @@ impl Tensor {
         if narrowed.len() <= 1 {
             let axis = narrowed.first().copied().unwrap_or(0);
             let r = &ranges[axis];
-            let idx = Tensor::arange(&self.graph, Dtype::U32, r.start as f64, r.end as f64)?;
+            let idx = self.graph.tensor(index_run(
+                &self.graph,
+                r.start as u64,
+                (r.end - r.start) as u64,
+            )?);
             return self.scatter_set(axis, &idx, value, true);
         }
 

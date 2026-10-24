@@ -3,9 +3,11 @@
 //! never re-derived; a mismatch is a broken plan ([`Error::Plan`]).
 
 pub(crate) mod contract;
+mod decode_attention;
 pub(crate) mod gather_scatter;
 pub(crate) mod group;
 pub(crate) mod map_fold;
+mod rms_norm;
 pub(crate) mod slab;
 
 use fusor_cost::realize::distribute_workgroups;
@@ -489,7 +491,7 @@ impl<'a> Ctx<'a> {
         Ok(Self {
             caps,
             cx,
-            b: Kernel::new(),
+            b: Kernel::with_subgroup_widths(caps.subgroups),
             binding,
             buffers,
             slot_of,
@@ -873,7 +875,10 @@ impl<'a> Ctx<'a> {
             K::Uniform(sym) if expr.dtype() == Dtype::U32 && self.pack.dim_slot(*sym).is_some() => {
                 self.dim_expr(Dim::Sym(*sym))?
             }
-            K::Uniform(sym) => self.scalar_expr(*sym)?,
+            K::Uniform(sym) => self.b.cast(
+                self.scalar_expr(*sym)?,
+                scalar_element(expr.dtype()).element(),
+            ),
             K::IndexOf(axis) => {
                 let c = coords.get(*axis as usize).cloned().ok_or_else(|| {
                     Error::Plan(format!(
@@ -1058,6 +1063,16 @@ impl<'a> Ctx<'a> {
         if let Some(lit) = self.const_operand(operand.src) {
             return Ok(lit);
         }
+        if let Op::Logical(fusor_ir::ir::logical::Logical::Leaf(
+            fusor_ir::ir::logical::LeafKind::Uniform { sym, dtype },
+        )) = &self.cx.graph.node(self.cx.selected(operand.src)).op
+        {
+            return self.eval_scalar(
+                &fusor_ir::scalar::ScalarExpr::uniform(*sym, *dtype),
+                &[],
+                &[],
+            );
+        }
         let index = self.repad_index(operand.src, index)?;
         // A quantized operand runs its decode program at flat index `i`.
         if let Dtype::Q(fmt) = self.plan_dtype(operand.src)? {
@@ -1190,6 +1205,9 @@ fn lower_launch(ctx: Ctx<'_>, node: &Node, theta: SchedPoint, member: bool) -> R
         )));
     };
     match op {
+        Launch::DecodeAttention { .. } => decode_attention::lower(ctx, op),
+        Launch::DecodeAttentionMerge { .. } => decode_attention::lower_merge(ctx, op),
+        Launch::RmsNorm { .. } => rms_norm::lower(ctx, op),
         Launch::Map { .. } => map_fold::lower_kmap(ctx, op, theta),
         Launch::Fold { .. } | Launch::StreamFold { .. } => map_fold::lower_kfold(ctx, op, theta),
         Launch::Contract { family, .. } => contract::lower_contract(ctx, op, *family, theta),

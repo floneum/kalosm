@@ -146,6 +146,9 @@ impl BufferPool {
         lost: crate::device::LostFlag,
     ) -> Self {
         let ceiling = config.max_gpu_memory_bytes.unwrap_or_else(default_ceiling);
+        let ceiling = crate::flags::flags()
+            .memory_budget_bytes
+            .map_or(ceiling, |limit| ceiling.min(limit));
         Self {
             device,
             queue,
@@ -168,6 +171,18 @@ impl BufferPool {
     /// Allocate or recycle at an explicit usage set, blocking and retrying at
     /// the ceiling (one of the three host syncs).
     pub fn alloc_with_usage(&self, bytes: u64, usage: wgpu::BufferUsages) -> Result<Buf> {
+        self.alloc_for_init(bytes, usage, false)
+            .map(|(buffer, _)| buffer)
+    }
+
+    /// A fresh allocation may be returned mapped for its caller to initialize
+    /// and unmap. A recycled buffer is never mapped or changed here.
+    fn alloc_for_init(
+        &self,
+        bytes: u64,
+        usage: wgpu::BufferUsages,
+        map_fresh: bool,
+    ) -> Result<(Buf, bool)> {
         let size = allocation_size(bytes)?;
         let key = PoolKey {
             size,
@@ -180,7 +195,7 @@ impl BufferPool {
         };
 
         if let Some(hit) = self.take_free(key, request) {
-            return Ok(hit);
+            return Ok((hit, false));
         }
 
         let ceiling = *self.ceiling_bytes.lock();
@@ -193,7 +208,7 @@ impl BufferPool {
             self.device.poll(wgpu::PollType::wait_indefinitely()).ok();
             self.reclaim();
             if let Some(hit) = self.take_free(key, request) {
-                return Ok(hit);
+                return Ok((hit, false));
             }
             let live = self.counters.lock().live_bytes;
             if live.saturating_add(size) > ceiling {
@@ -235,15 +250,36 @@ impl BufferPool {
 
         // A lost device returns an invalid buffer without error; name the loss.
         self.lost.check()?;
-        Ok(self.create(size, usage, request))
+        Ok((self.create(size, usage, request, map_fresh), map_fresh))
     }
 
     /// Upload initial contents, padded to `COPY_BUFFER_ALIGNMENT`.
     pub fn create_buffer_init(&self, data: &[u8], usage: wgpu::BufferUsages) -> Result<Buf> {
+        self.create_buffer_init_impl(data, usage, true)
+    }
+
+    fn create_buffer_init_impl(
+        &self,
+        data: &[u8],
+        usage: wgpu::BufferUsages,
+        map_fresh: bool,
+    ) -> Result<Buf> {
         UPLOAD_INIT.fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
         let size = padded_copy_size(data.len() as u64);
-        let buf = self.alloc_with_usage(size, usage)?;
+        let map_fresh = map_fresh && size >= UPLOAD_STAGING_MIN;
+        let (buf, mapped) = self.alloc_for_init(size, usage, map_fresh)?;
         let gpu = GpuBuffer::of(&buf, "uploaded buffer")?;
+        if mapped {
+            {
+                let mut view = gpu.buffer.slice(..).get_mapped_range_mut();
+                parallel_copy(view.slice(..data.len()), data);
+                // Also clear allocation-class slack; no staging allocation or
+                // queued device copy survives initialization of these weights.
+                view.slice(data.len()..).fill(0);
+            }
+            gpu.buffer.unmap();
+            return Ok(buf);
+        }
         if size >= UPLOAD_STAGING_MIN && self.upload_via_staging(gpu, data, size) {
             return Ok(buf);
         }
@@ -438,19 +474,25 @@ impl BufferPool {
         bucket.take(request)
     }
 
-    fn create(&self, size: u64, usage: wgpu::BufferUsages, request: u64) -> Buf {
+    fn create(
+        &self,
+        size: u64,
+        usage: wgpu::BufferUsages,
+        request: u64,
+        mapped_at_creation: bool,
+    ) -> Buf {
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("fusor pooled buffer"),
             size,
             usage,
-            mapped_at_creation: false,
+            mapped_at_creation,
         });
         let gpu = GpuBuffer {
             buffer,
             size,
             usage,
         };
-        if self.poison {
+        if self.poison && !mapped_at_creation {
             self.poison_fill(&gpu);
         }
         let buf = Buf::new(gpu);
@@ -667,6 +709,7 @@ unsafe impl Sync for GpuBuffer {}
 #[allow(dead_code)]
 fn pool_fields_are_send_sync() {
     fn assert<T: Send + Sync>() {}
+    assert::<&'static crate::flags::Flags>();
     assert::<Arc<wgpu::Device>>();
     assert::<Arc<wgpu::Queue>>();
     assert::<Mutex<FxHashMap<PoolKey, Bucket>>>();
@@ -684,6 +727,50 @@ fn pool_fields_are_send_sync() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn mapped_upload_roundtrip_and_reuse() {
+        let target = pollster::block_on(crate::target::GpuTarget::with_config(GpuConfig {
+            max_gpu_memory_bytes: Some(16 << 20),
+            poison_allocations: true,
+            ..GpuConfig::default()
+        }))
+        .unwrap();
+        let pool = target.pool();
+        let count = (2 << 20) + 3;
+        let mut previous = None;
+        for seed in [17u8, 83u8] {
+            let data: Vec<_> = (0..count)
+                .map(|i| (i as u8).wrapping_mul(37).wrapping_add(seed))
+                .collect();
+            let buf = pool
+                .create_buffer_init_impl(&data, TENSOR_USAGE, true)
+                .unwrap();
+            let bytes = padded_copy_size(count as u64);
+            let actual = pollster::block_on(target.readback(&buf, bytes)).unwrap();
+            assert_eq!(&actual[..count], data);
+            assert!(
+                actual[count..].iter().all(|b| *b == 0),
+                "copy padding must be zero"
+            );
+            if let Some(address) = previous {
+                assert_eq!(
+                    buf.addr(),
+                    address,
+                    "recycled uploads must reuse the buffer"
+                );
+            } else {
+                assert!(
+                    pool.upload_staging.lock().is_empty(),
+                    "initial uploads must not retain a second weight buffer"
+                );
+            }
+            previous = Some(buf.addr());
+            drop(buf);
+        }
+        assert!(pool.counters().live_bytes <= 16 << 20);
+    }
 
     #[test]
     fn idle_budget_bounds_growing_kv_scratch_and_keeps_live_buffers() {

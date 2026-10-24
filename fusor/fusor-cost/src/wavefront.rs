@@ -24,6 +24,18 @@ pub fn group_wavefronts(
     if caps.kind != DeviceKind::Gpu || plan.launches.len() < 2 {
         return plan.clone();
     }
+    if crate::debug::flags().no_wavefront_min_m.is_some_and(|min| {
+        plan.launches
+            .iter()
+            .flat_map(|d| std::iter::once(d.root).chain(d.members.iter().copied()))
+            .any(|id| {
+                matches!(graph.node(id).op,
+                fusor_ir::ir::Op::Launch(fusor_ir::ir::launch::Launch::Contract { m, .. })
+                if m.as_const().is_some_and(|m| m >= min))
+            })
+    }) {
+        return plan.clone();
+    }
     let ex = &plan.extraction;
     let g: &EGraph = graph;
     let producer: FxHashMap<ClassId, usize> = plan

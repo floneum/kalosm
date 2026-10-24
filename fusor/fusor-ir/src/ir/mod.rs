@@ -94,6 +94,9 @@ pub enum OpTag {
     LaunchGather,
     LaunchScatter,
     LaunchSlab,
+    LaunchDecodeAttention,
+    LaunchDecodeAttentionMerge,
+    LaunchRmsNorm,
     LaunchGroup,
     // structural
     Union,

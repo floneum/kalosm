@@ -109,7 +109,7 @@ jobs:
           cargo nextest archive --cargo-profile ci --workspace --lib --bins --tests \
             --features $FEATURES --archive-file root-tests.tar.zst
           cargo nextest archive --cargo-profile ci --manifest-path fusor/Cargo.toml \
-            --workspace --lib --bins --tests --examples --archive-file fusor-tests.tar.zst
+            --workspace --lib --bins --tests --examples --features fusor/kernel-observer,fusor/compiler-tests --archive-file fusor-tests.tar.zst
           cargo build --profile ci --manifest-path fusor/Cargo.toml -p fusor-conformance
       - uses: actions/upload-artifact@v4
         with:
@@ -162,6 +162,8 @@ jobs:
           cargo nextest list --archive-file fusor-tests.tar.zst --workspace-remap fusor --extract-to fusor > /dev/null
           cp warp/d3d10warp.dll dxc/dxcompiler.dll dxc/dxil.dll target/ci/deps/
           cp warp/d3d10warp.dll dxc/dxcompiler.dll dxc/dxil.dll fusor/target/ci/deps/
+          cargo nextest run --archive-file fusor-tests.tar.zst --workspace-remap fusor --extract-to fusor --extract-overwrite \
+            --run-ignored only --test-threads 1 -E 'binary(shared_compiler)'
           # WARP/DX12 tests share one software adapter inside each binary;
           # keep them serialized to avoid backend aborts.
           cargo nextest run --archive-file root-tests.tar.zst --workspace-remap . --extract-to . --extract-overwrite --test-threads 1 \
@@ -225,3 +227,23 @@ jobs:
           for suite in ${{ matrix.shard.suites }}; do
             bin/fusor-conformance.exe "$suite" ${{ matrix.shard.args }}
           done
+      # Preserve the failing shard result; a fresh process with synchronous
+      # dispatch tracing identifies the kernel behind an asynchronous loss.
+      - name: Diagnose backward device loss
+        if: failure() && matrix.shard.name == 'backward-1'
+        shell: bash
+        env:
+          FUSOR_CONFORMANCE_REQUIRE_GPU: "1"
+          WGPU_DX12_COMPILER: Dxc
+          FUSOR_TRACE_DISPATCH: "1"
+          FUSOR_WGSL_DUMP: kernel-failure-shaders
+        run: bin/fusor-conformance.exe backward::leaky_relu 2>&1 | tee backward-device-loss.log
+      - name: Save backward device-loss diagnostics
+        if: failure() && matrix.shard.name == 'backward-1'
+        uses: actions/upload-artifact@v4
+        with:
+          name: backward-device-loss-windows
+          path: |
+            backward-device-loss.log
+            kernel-failure-shaders/
+          retention-days: 3

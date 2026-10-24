@@ -6,11 +6,21 @@ use fusor_ir::error::Error;
 use fusor_ir::ir::kernel::{
     Accumulator, Addr, Builtin, ElementType, KernelIr, ScalarElement, Stmt, TileExpr,
 };
-use fusor_ir::ir::launch::{Launch, MapTiling, ScatterGeometry, SchedPoint};
+use fusor_ir::ir::launch::{Launch, MapTiling, Operand, ScatterGeometry, SchedPoint};
 use fusor_ir::ir::logical::ScatterCombine;
 
 use crate::lower::{Ctx, distribute_workgroups};
 use fusor_tile::domains::emitted_block;
+
+/// Gather and scatter first compute a flat index in an operand's logical
+/// shape. Compose that index with the operand view before touching storage.
+fn load_logical(ctx: &Ctx<'_>, operand: &Operand, index: TileExpr) -> Result<TileExpr> {
+    let total = operand.layout.shape().iter().try_fold(1u64, |n, d| {
+        n.checked_mul(ctx.binding.require(*d)?)
+            .ok_or_else(|| Error::Plan("indexing operand extent overflows".into()))
+    })?;
+    ctx.load_mapped(operand, index, total)
+}
 
 /// The register-reuse tiling this launch runs at; [`SchedPoint::Point`] is one
 /// element per lane.
@@ -99,7 +109,11 @@ impl LaneTile {
 /// gathered rows.
 pub(crate) fn lower_kgather(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Result<KernelIr> {
     let Launch::Gather {
-        space, axis, ops, ..
+        space,
+        axis,
+        post,
+        ops,
+        ..
     } = op
     else {
         return Err(Error::Plan("lower_kgather on a non-Gather node".into()));
@@ -160,7 +174,7 @@ pub(crate) fn lower_kgather(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Res
         // Split the flat output index into (outer, gathered, within).
         let (outer, rest) = b.divrem(flat.clone(), out_stride.clone());
         let (g, within) = b.divrem(rest, width_e.clone());
-        let picked = b.cast(ctx.load_operand(idx, g)?, ScalarElement::U32.element());
+        let picked = b.cast(load_logical(&ctx, idx, g)?, ScalarElement::U32.element());
         let src_addr = b.add(
             b.add(
                 b.mul(outer, src_stride.clone()),
@@ -168,7 +182,12 @@ pub(crate) fn lower_kgather(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Res
             ),
             within,
         );
-        let value = b.cast(ctx.load_operand(src, src_addr)?, out.buffer.element);
+        let mut args = vec![load_logical(&ctx, src, src_addr)?];
+        for operand in &ops[2..] {
+            args.push(ctx.load_mapped(operand, flat.clone(), n)?);
+        }
+        let coords = ctx.coords_from_linear(flat.clone(), space)?;
+        let value = ctx.eval_scalar(post, &args, &coords)?;
         body.push(Stmt::Store {
             dst: out.clone(),
             addr: Addr::Linear(flat.clone()),
@@ -198,7 +217,6 @@ pub(crate) fn lower_kscatter(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Re
         return Err(Error::Plan("lower_kscatter on a non-Scatter node".into()));
     };
     let tiling = tiling(theta)?;
-    let shape = ScatterGeometry::of(ops, *axis as usize, |d| ctx.binding.require(d), Error::Plan)?;
     // The operands are `(base, idx, upd)`; the base seeds the accumulator.
     let [base, idx, upd, ..] = ops.as_slice() else {
         return Err(Error::Plan(format!(
@@ -215,6 +233,100 @@ pub(crate) fn lower_kscatter(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Re
     }
     .element();
     let max_block = ctx.caps.limits.max_compute_invocations_per_workgroup;
+    let shape = ScatterGeometry::of(ops, *axis as usize, |d| ctx.binding.require(d), Error::Plan)?;
+    let slots = crate::flags::flags().scatter_single_linear.unwrap_or(4);
+    // A consecutive index expression is invertible. Prove its complete range
+    // fits before replacing the update scan with one direct source lookup.
+    let range = fusor_tile::index_range::index_start(ctx.cx, idx)
+        .filter(|start| {
+            start
+                .checked_add(u64::from(shape.updates))
+                .is_some_and(|end| end <= u64::from(shape.bins))
+        })
+        .and_then(|start| u32::try_from(start).ok());
+    if (shape.updates == 1 || range.is_some())
+        && shape.updates > 0
+        && shape.total() > 0
+        && shape.total() <= u64::from(u32::MAX - 32768)
+    {
+        // A copy with a direct row lookup. More than one row can share a block,
+        // and each lane handles several adjacent block-wide runs. All reads
+        // still come from the immutable base, into a separate output buffer.
+        let block = ctx.block(emitted_block(1, ctx.caps));
+        let groups = (shape.total() as u32).div_ceil(block * slots);
+        let grid =
+            distribute_workgroups(groups, ctx.caps.limits.max_compute_workgroups_per_dimension);
+        let origin = b.mul(ctx.linear_workgroup(), b.u32(block * slots));
+        let lane = b.builtin(Builtin::Lane);
+        let picked = match range {
+            Some(start) => b.u32(start),
+            None => b.cast(
+                load_logical(&ctx, idx, b.u32(0))?,
+                ScalarElement::U32.element(),
+            ),
+        };
+        // Binding values choose only the grid. Symbolic geometry stays in
+        // uniforms so growing storage reuses the same shader.
+        let dims = base.layout.shape();
+        let total = ctx.extent_product(dims)?;
+        let inner = ctx.extent_product(&dims[*axis as usize + 1..])?;
+        let bins = ctx.dim_expr(dims[*axis as usize])?;
+        let mut body = Vec::new();
+        for slot in 0..slots {
+            let flat = b.add(origin.clone(), b.add(lane.clone(), b.u32(slot * block)));
+            let live = b.lt(flat.clone(), total.clone());
+            let at = b.min(flat.clone(), b.sub(total.clone(), b.u32(1)));
+            let (row, col) = b.divrem(at.clone(), inner.clone());
+            let (outer, bin) = b.divrem(row, bins.clone());
+            let acc = b.local(acc_ty);
+            body.push(Stmt::StoreLocal {
+                dst: acc.clone(),
+                value: b.cast(ctx.load_mapped(base, at, total_of(&shape))?, acc_ty),
+            });
+            let (hit, update_row) = match range {
+                Some(start) => {
+                    // Unsigned subtraction makes bins below the origin miss
+                    // as well. The proven end bound excludes wrapped matches.
+                    let offset = b.sub(bin, b.u32(start));
+                    (
+                        b.lt(offset.clone(), b.u32(shape.updates)),
+                        b.add(b.mul(outer, b.u32(shape.updates)), offset),
+                    )
+                }
+                None => (b.eq(picked.clone(), bin), outer),
+            };
+            let upd_index = b.add(b.mul(update_row, inner.clone()), col);
+            let value = b.cast(load_logical(&ctx, upd, upd_index)?, acc_ty);
+            let value = match combine {
+                ScatterCombine::Add => b.add(b.load_local(acc.clone()), value),
+                ScatterCombine::Set => value,
+            };
+            body.push(Stmt::If {
+                condition: b.and(live.clone(), hit),
+                accept: vec![Stmt::StoreLocal {
+                    dst: acc.clone(),
+                    value,
+                }],
+                reject: Vec::new(),
+            });
+            body.push(Stmt::Store {
+                dst: out.clone(),
+                addr: Addr::Linear(flat),
+                value: b.cast(b.load_local(acc), out_elem),
+                mask: live,
+            });
+        }
+        return Ok(ctx.finish(
+            if range.is_some() {
+                "scatter_range"
+            } else {
+                "scatter_single_linear"
+            },
+            grid,
+            block,
+            body,
+        ));
+    }
     if let Some(row_block) = shape.row_block(max_block) {
         let block = ctx.block(row_block);
         let rows = shape.rows();
@@ -256,6 +368,37 @@ pub(crate) fn lower_kscatter(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Re
             columns.push((acc, clamped));
         }
 
+        // A single update needs no index staging or workgroup rendezvous.
+        // The row-level condition is uniform, and untouched rows still copy
+        // their base into a fresh output: this does not introduce aliasing.
+        if updates == 1 {
+            let picked = b.cast(
+                load_logical(&ctx, idx, b.u32(0))?,
+                ScalarElement::U32.element(),
+            );
+            let mut hit = Vec::new();
+            for (acc, col) in &columns {
+                let upd_index = b.add(b.mul(o.clone(), inner_e.clone()), col.clone());
+                let value = b.cast(load_logical(&ctx, upd, upd_index)?, acc_ty);
+                let value = match combine {
+                    ScatterCombine::Add => b.add(b.load_local(acc.clone()), value),
+                    ScatterCombine::Set => value,
+                };
+                hit.push(Stmt::StoreLocal {
+                    dst: acc.clone(),
+                    value,
+                });
+            }
+            let mut body = init;
+            body.push(Stmt::If {
+                condition: b.eq(picked, bin),
+                accept: hit,
+                reject: Vec::new(),
+            });
+            body.extend(stores);
+            return Ok(ctx.finish("scatter_single_row", grid, block, body));
+        }
+
         // Stage `block` indices, then walk them in update order; a lane
         // loads an update only for a match, so the sum order is the dense
         // nest's and the result is bit-identical.
@@ -264,7 +407,7 @@ pub(crate) fn lower_kscatter(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Re
         let chunk_base = b.mul(b.load_local(chunk_local.clone()), b.u32(block));
         let u = b.add(chunk_base.clone(), lane.clone());
         let picked = b.cast(
-            ctx.load_operand(idx, b.min(u.clone(), b.u32(updates - 1)))?,
+            load_logical(&ctx, idx, b.min(u.clone(), b.u32(updates - 1)))?,
             ScalarElement::U32.element(),
         );
         let j_local = b.local(ScalarElement::U32.element());
@@ -279,7 +422,7 @@ pub(crate) fn lower_kscatter(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Re
                 ),
                 col.clone(),
             );
-            let v = b.cast(ctx.load_operand(upd, upd_index)?, acc_ty);
+            let v = b.cast(load_logical(&ctx, upd, upd_index)?, acc_ty);
             let value = match combine {
                 ScatterCombine::Add => b.add(b.load_local(acc.clone()), v),
                 ScatterCombine::Set => v,
@@ -343,7 +486,7 @@ pub(crate) fn lower_kscatter(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Re
     let u_local = b.local(ScalarElement::U32.element());
     let u = b.load_local(u_local.clone());
     let u_bin = b.cast(
-        ctx.load_operand(idx, u.clone())?,
+        load_logical(&ctx, idx, u.clone())?,
         ScalarElement::U32.element(),
     );
 
@@ -367,7 +510,7 @@ pub(crate) fn lower_kscatter(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Re
             ),
             within,
         );
-        let v = b.cast(ctx.load_operand(upd, upd_index)?, acc_ty);
+        let v = b.cast(load_logical(&ctx, upd, upd_index)?, acc_ty);
         // `Add` accumulates duplicates; `Set` is only reachable with proven-unique
         // indices.
         let combined = match combine {

@@ -167,11 +167,25 @@ pub fn const_splat(cx: &LowerCtx<'_>, src: Id) -> Option<Splat> {
 #[derive(Default)]
 pub struct Kernel {
     memo: RefCell<FxHashMap<u64, SmallVec<[TileExpr; 2]>>>,
+    subgroup_lane_mask: Option<u32>,
 }
 
 impl Kernel {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// Expose the adapter's subgroup-lane bound to ordinary index algebra.
+    /// The mask is an identity for every admitted lane, including devices
+    /// whose subgroup width varies. Unknown widths retain the unbounded term.
+    pub fn with_subgroup_widths(widths: Option<fusor_ir::device::SubgroupWidths>) -> Self {
+        Self {
+            subgroup_lane_mask: widths
+                .filter(|w| w.min > 0 && w.min <= w.max)
+                .and_then(|w| w.max.checked_next_power_of_two())
+                .map(|n| n - 1),
+            ..Self::default()
+        }
     }
 
     fn intern(&self, kind: TileExprKind, ty: ElementType) -> TileExpr {
@@ -281,7 +295,19 @@ impl Kernel {
     }
 
     pub fn builtin(&self, b: Builtin) -> TileExpr {
-        self.intern(TileExprKind::Builtin(b), ScalarElement::U32.element())
+        let value = self.intern(TileExprKind::Builtin(b), ScalarElement::U32.element());
+        if b == Builtin::SubgroupLane
+            && let Some(mask) = self.subgroup_lane_mask
+        {
+            self.binary(
+                TileBinaryOp::BitAnd,
+                value,
+                self.u32(mask),
+                NumericContract::RELAXED,
+            )
+        } else {
+            value
+        }
     }
 
     pub fn load_local(&self, local: Local) -> TileExpr {
@@ -428,6 +454,24 @@ impl Kernel {
 
     pub fn select(&self, condition: TileExpr, accept: TileExpr, reject: TileExpr) -> TileExpr {
         let ty = accept.element();
+        // A predicate already carries exactly zero or one. Keep its numeric
+        // conversion explicit instead of rebuilding it with a select. Besides
+        // removing redundant choices, this avoids DXIL JIT device removal when
+        // float zero/one selects feed an FMA (the WARP regression probe).
+        if condition.element() == ScalarElement::Bool.element()
+            && let ElementType::Scalar(scalar) = ty
+            && let (TileExprKind::Literal(a), TileExprKind::Literal(r)) =
+                (accept.kind(), reject.kind())
+        {
+            let zero = reduce_identity(TileReduceOp::Sum, scalar);
+            let one = reduce_identity(TileReduceOp::Product, scalar);
+            if *a == one && *r == zero {
+                return self.cast(condition, ty);
+            }
+            if *a == zero && *r == one {
+                return self.cast(self.eq(condition, self.bool(false)), ty);
+            }
+        }
         self.intern(
             TileExprKind::Select {
                 condition,
@@ -681,5 +725,104 @@ impl FoldLanes {
 
     pub fn lanes(&self) -> usize {
         self.merges.len()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn subgroup_bounds_feed_index_simplification_without_changing_lanes() {
+        use fusor_ir::device::SubgroupWidths;
+        use fusor_ir::ir::kernel::simplify_index;
+        for (min, max) in [
+            (4, 4),
+            (8, 8),
+            (16, 32),
+            (32, 32),
+            (32, 48),
+            (32, 64),
+            (64, 128),
+        ] {
+            let b = Kernel::with_subgroup_widths(Some(SubgroupWidths { min, max }));
+            let lane = b.builtin(Builtin::SubgroupLane);
+            let TileExprKind::Binary {
+                op: TileBinaryOp::BitAnd,
+                left,
+                right,
+                ..
+            } = lane.kind()
+            else {
+                panic!("missing subgroup bound");
+            };
+            assert!(matches!(
+                left.kind(),
+                TileExprKind::Builtin(Builtin::SubgroupLane)
+            ));
+            let TileExprKind::Literal(TileLiteral::U32(mask)) = right.kind() else {
+                panic!("lane mask")
+            };
+            for value in 0..max {
+                assert_eq!(value & mask, value);
+            }
+            assert_eq!(
+                simplify_index(&b.div(lane, b.u32(max.next_power_of_two()))),
+                b.u32(0)
+            );
+            // A subgroup bound must not constrain the whole workgroup's lane.
+            assert!(matches!(
+                b.builtin(Builtin::Lane).kind(),
+                TileExprKind::Builtin(Builtin::Lane)
+            ));
+        }
+        let b = Kernel::with_subgroup_widths(None);
+        assert!(matches!(
+            b.builtin(Builtin::SubgroupLane).kind(),
+            TileExprKind::Builtin(Builtin::SubgroupLane)
+        ));
+    }
+
+    #[test]
+    fn numeric_predicate_selections_are_casts_in_both_directions() {
+        let b = Kernel::new();
+        let condition = b.lt(b.builtin(Builtin::Lane), b.u32(7));
+        for scalar in [
+            ScalarElement::F32,
+            ScalarElement::F16,
+            ScalarElement::BF16,
+            ScalarElement::U32,
+            ScalarElement::I32,
+            ScalarElement::Bool,
+        ] {
+            let zero = b.zero(scalar);
+            let one = b.lit(reduce_identity(TileReduceOp::Product, scalar));
+            assert_eq!(
+                b.select(condition.clone(), one.clone(), zero.clone()),
+                b.cast(condition.clone(), scalar.element()),
+            );
+            assert_eq!(
+                b.select(condition.clone(), zero, one),
+                b.cast(b.eq(condition.clone(), b.bool(false)), scalar.element()),
+            );
+        }
+        // A float's negative zero is not a predicate's positive zero.
+        for (zero, one) in [
+            (
+                TileLiteral::F32((-0f32).to_bits()),
+                TileLiteral::F32(1f32.to_bits()),
+            ),
+            (TileLiteral::F16(0x8000), TileLiteral::F16(0x3c00)),
+            (TileLiteral::BF16(0x8000), TileLiteral::BF16(0x3f80)),
+        ] {
+            assert!(matches!(
+                b.select(condition.clone(), b.lit(one), b.lit(zero)).kind(),
+                TileExprKind::Select { .. }
+            ));
+        }
+        assert!(matches!(
+            b.select(condition, b.f32(1.), b.f32(0.1)).kind(),
+            TileExprKind::Select { .. }
+        ));
     }
 }

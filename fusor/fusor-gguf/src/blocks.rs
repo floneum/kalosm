@@ -356,6 +356,70 @@ pub fn cpu_dequantize_block(fmt: QFmt, layout: QLayout, block: &[u8], out: &mut 
     }
 }
 
+/// Expand one quantized load into ordinary typed loads and arithmetic. The
+/// same program is available to scheduling/algebra passes and to inspection;
+/// consumers never need format-specific byte offsets or bit extraction.
+pub fn decode_load(
+    q: &fusor_ir::ir::kernel::QuantizedView,
+    addr: &fusor_ir::ir::kernel::Addr,
+    mask: TileExpr,
+    fill: TileExpr,
+) -> Result<TileExpr> {
+    use crate::decode::{add, bin, mul, u32_lit};
+    use fusor_ir::ir::kernel::Addr;
+    use fusor_ir::ir::kernel::TileBinaryOp;
+    let flat = match addr {
+        Addr::Linear(i) => i.clone(),
+        Addr::Rc2 { row, col } => {
+            let groups = &q.data.layout.indexing.groups;
+            if groups.len() != 2 {
+                return Err(fusor_ir::error::Error::Plan(
+                    "quantized Rc2 load needs two axes".into(),
+                ));
+            }
+            let mut flat = u32_lit(0);
+            for (coordinate, group) in [row, col].into_iter().zip(groups) {
+                if group.sub_axes.is_empty() || group.sub_axes.iter().any(|s| s.extent == 0) {
+                    return Err(fusor_ir::error::Error::Plan(
+                        "invalid quantized load axis".into(),
+                    ));
+                }
+                let mut coordinate = coordinate.clone();
+                for (i, sub) in group.sub_axes.iter().enumerate().rev() {
+                    let part = if i == 0 {
+                        coordinate.clone()
+                    } else {
+                        let part = bin(TileBinaryOp::Rem, coordinate.clone(), u32_lit(sub.extent));
+                        coordinate = bin(TileBinaryOp::Div, coordinate, u32_lit(sub.extent));
+                        part
+                    };
+                    if sub.stride != 0 {
+                        flat = add(
+                            flat,
+                            if sub.stride == 1 {
+                                part
+                            } else {
+                                mul(part, u32_lit(sub.stride))
+                            },
+                        );
+                    }
+                }
+            }
+            flat
+        }
+    };
+    let args = BlockDecodeArgs {
+        src: &q.data,
+        layout: q.layout,
+        k_base: flat,
+        col: u32_lit(0),
+        mask,
+        fill,
+    };
+    (block_spec(q.fmt, q.layout).decode.emit)(&args)
+        .map(|e| fusor_ir::ir::kernel::simplify_index(&e))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

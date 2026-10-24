@@ -42,7 +42,9 @@ use crate::graph::GraphRef;
 /// One in this many replay-hit resolves of a key is an exploration step.
 /// Deterministic — a per-key counter, never an RNG — so a run is exactly
 /// reproducible. `FUSOR_EXPLORE_EPS` overrides; `0` disables the explorer.
-pub(super) const EXPLORE_EPSILON: u64 = 16;
+// Production resolves reuse their incumbent. Explicit tuning remains
+// available, but speculative alternatives must not periodically stall callers.
+pub(super) const EXPLORE_EPSILON: u64 = 0;
 
 /// Window samples an arm needs before its window-min may displace the
 /// incumbent, and before the explorer stops considering it under-explored.
@@ -105,7 +107,7 @@ struct Preparation {
     arena: u64,
     incumbent: fusor_ir::extract::PlanHash,
     candidate: fusor_ir::extract::PlanHash,
-    uploads: Vec<(Id, Arc<Vec<u8>>)>,
+    uploads: Vec<crate::graph::HostUpload>,
     job: std::thread::JoinHandle<fusor_ir::Result<Vec<fusor_ir::target::Buf>>>,
 }
 
@@ -357,7 +359,9 @@ impl Session {
         key: ReplayKey,
         incumbent: Arc<Plan>,
     ) -> Arc<Plan> {
-        if flags().explore_eps == 0 || verify_members() || self.inner.tune.is_empty() {
+        // A measured prior is reusable even when online exploration is off.
+        // This selects an existing winner; it does not run speculative work.
+        if verify_members() || self.inner.tune.is_empty() {
             return incumbent;
         }
         let mut set = ArmSet::metadata(graph, &incumbent);
@@ -377,7 +381,7 @@ impl Session {
         key: ReplayKey,
         incumbent: &Arc<Plan>,
     ) -> Option<ExploreRun> {
-        let eps = flags().explore_eps;
+        let eps = super::flags().explore_eps;
         if eps == 0 || verify_members() {
             return None;
         }
@@ -622,8 +626,10 @@ impl Session {
             if let Ok(Ok(buffers)) = prepared.job.join()
                 && matches
             {
-                for ((id, bytes), buffer) in prepared.uploads.into_iter().zip(buffers) {
-                    graph.bind_prepared_leaf(id, &bytes, buffer);
+                for (upload, buffer) in prepared.uploads.into_iter().zip(buffers) {
+                    for id in upload.values {
+                        graph.bind_prepared_leaf(id, &upload.bytes, buffer.clone());
+                    }
                 }
             }
             if matches {
@@ -648,12 +654,13 @@ impl Session {
             .collect::<Vec<_>>();
         ids.sort_unstable();
         ids.dedup();
-        let uploads: Vec<_> = graph
+        let pending: Vec<_> = graph
             .external_leaf_buffers(&ids)
             .into_iter()
             .filter(|(_, buffer)| buffer.is_none())
-            .filter_map(|(id, _)| graph.leaf_bytes_shared(id).map(|bytes| (id, bytes)))
+            .map(|(id, _)| id)
             .collect();
+        let uploads = graph.pending_leaf_uploads(&pending);
         let dims = graph.dim_bindings();
         let job = match &self.inner.device {
             Backend::Gpu(target) => target.prepare_resources(
@@ -661,7 +668,10 @@ impl Session {
                 &graph.state().egraph.lock(),
                 &dims,
                 changed,
-                uploads.iter().map(|(_, bytes)| Arc::clone(bytes)).collect(),
+                uploads
+                    .iter()
+                    .map(|upload| Arc::clone(&upload.bytes))
+                    .collect(),
             ),
             #[cfg(feature = "cpu")]
             Backend::Cpu(_) => unreachable!(),

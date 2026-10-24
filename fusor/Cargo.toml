@@ -10,6 +10,7 @@ members = [
     "fusor-cpu",
     "fusor",
     "fusor-conformance",
+    "fusor-visualize",
 ]
 # The browser runner is built by `dx` in its own directory and pulls burn; it
 # is its own workspace so `--workspace` commands here never compile it.
@@ -65,9 +66,11 @@ naga = "29"
 # `CooperativeLoad` correctness fix in `bake_ref_count`, so a simdgroup load
 # referenced once cannot sink past the barrier that ordered it. This revision
 # also supplies browser matrix serialization.
+# Naga also carries declared compute workgroup sizes into Metal compilation,
+# preventing register allocation from selecting a smaller dispatch limit.
 [patch.crates-io]
-wgpu = { git = "https://github.com/ealmloff/wgpu", rev = "24a7d3577213fc147637fe7fb20e0e845a74df8a" }
-naga = { git = "https://github.com/ealmloff/wgpu", rev = "24a7d3577213fc147637fe7fb20e0e845a74df8a" }
+wgpu = { git = "https://github.com/ealmloff/wgpu", rev = "9c9187d26886eccc4b3fbfeb67989ce77fbd1217" }
+naga = { git = "https://github.com/ealmloff/wgpu", rev = "9c9187d26886eccc4b3fbfeb67989ce77fbd1217" }
 
 # CI builds: the conformance sweep runs the planner and every raced kernel
 # body on the host, and unoptimized planner code is most of its wall time.

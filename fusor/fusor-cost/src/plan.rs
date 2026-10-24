@@ -313,7 +313,13 @@ pub fn buffer_layout_for(
 fn classified_symbols_of(graph: &EGraph, realized: &Realized) -> (Vec<SymId>, Vec<SymId>) {
     let mut visitor = Symbols::default();
     for id in &realized.order {
-        collect_dims(&graph.facts(*id).shape, &mut visitor.dims);
+        // Lowering also uses the dense storage strides to bound reads from
+        // external leaves. Forwarding can remove the only operand view that
+        // otherwise mentioned a derived stride such as capacity * width.
+        collect_layout(
+            &Layout::contiguous(&graph.facts(*id).shape),
+            &mut visitor.dims,
+        );
         graph.node(*id).op.clone().visit_mut(&mut visitor);
     }
     let Symbols {
@@ -328,9 +334,12 @@ fn classified_symbols_of(graph: &EGraph, realized: &Realized) -> (Vec<SymId>, Ve
     dims.dedup();
     let mut index = 0;
     while index < dims.len() {
-        if let Some(fusor_ir::shape::DimExpr::Add(a, b) | fusor_ir::shape::DimExpr::Mul(a, b)) =
-            dims[index].derived_expr()
-        {
+        if let Some(expr) = dims[index].derived_expr() {
+            use fusor_ir::shape::DimExpr;
+            let (a, b) = match expr {
+                DimExpr::Add(a, b) | DimExpr::Mul(a, b) => (a, b),
+                DimExpr::DivCeil(a, divisor) => (a, Dim::Const(divisor)),
+            };
             for dim in [a, b] {
                 if let Dim::Sym(sym) = dim
                     && !dims.contains(&sym)
@@ -414,7 +423,10 @@ fn hash_both(lanes: &mut [FxHasher; 2], value: &impl Hash) {
 pub(crate) fn without_schedule(op: &Op) -> Op {
     let mut op = op.clone();
     if let Op::Launch(
-        Launch::Map { sched, .. }
+        Launch::RmsNorm { sched, .. }
+        | Launch::DecodeAttention { sched, .. }
+        | Launch::DecodeAttentionMerge { sched, .. }
+        | Launch::Map { sched, .. }
         | Launch::Fold { sched, .. }
         | Launch::StreamFold { sched, .. }
         | Launch::Contract { sched, .. }

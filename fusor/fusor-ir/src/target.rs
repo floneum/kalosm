@@ -13,6 +13,9 @@ use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
+mod host_bytes;
+pub use host_bytes::HostBytes;
+
 /// A backend-owned compiled artifact, opaque above the backend.
 #[derive(Clone)]
 pub struct Artifact(Arc<dyn Any + Send + Sync>);

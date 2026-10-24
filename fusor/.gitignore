@@ -1,2 +1,8 @@
 target/
 *.bak*
+
+# Rust target abstractions are source, not a Cargo build directory.
+!fusor-ir/src/target/
+!fusor-ir/src/target/host_bytes.rs
+!fusor-gpu/src/target/
+!fusor-gpu/src/target/warm.rs

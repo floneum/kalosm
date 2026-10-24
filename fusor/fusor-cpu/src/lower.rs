@@ -57,6 +57,11 @@ pub(crate) fn lower(
         // Members are read by id: the last one shares the slab's class, and
         // selecting it would lower the slab again.
         Launch::Slab { members, .. } => compose(caps, members, theta, cx, "cpu_slab"),
+        Launch::RmsNorm { .. }
+        | Launch::DecodeAttention { .. }
+        | Launch::DecodeAttentionMerge { .. } => Err(fusor_ir::Error::Plan(
+            "specialized decode launch is GPU-only".into(),
+        )),
         Launch::Group { members, .. } => compose(caps, members, theta, cx, "cpu_group"),
     }
 }
@@ -483,6 +488,15 @@ pub(crate) fn operand_src(
 ) -> Result<OperandSrc> {
     if let Some(splat) = const_splat(cx, src) {
         return Ok(OperandSrc::Const(b.lit(splat_literal(splat))));
+    }
+    if let Op::Logical(fusor_ir::ir::logical::Logical::Leaf(
+        fusor_ir::ir::logical::LeafKind::Uniform { sym, dtype },
+    )) = &cx.graph.node(cx.selected(src)).op
+    {
+        // Scalar uniforms have f32 payloads even when the logical leaf is an
+        // integer. They are free operands in the plan, with no tensor binding.
+        let scalar = ScalarExpr::cast(*dtype, ScalarExpr::uniform(*sym, Dtype::F32));
+        return Ok(OperandSrc::Const(binds.translate(b, &[], &[], &scalar)?));
     }
     let buffer = binds.of(src)?;
     let facts = cx.graph.facts(src);

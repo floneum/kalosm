@@ -37,9 +37,193 @@ fn replan_with(
 /// Run `plan` and read `out` back as f32.
 fn run_f32(session: &Session, h: &GraphRef, plan: &Plan, out: &Tensor) -> Vec<f32> {
     let resolving = h.state().resolve_lock.lock();
-    session.run(h, plan, std::slice::from_ref(out)).unwrap();
+    session
+        .run(h, plan, std::slice::from_ref(out), None)
+        .unwrap();
     let bytes = session.read_bytes_locked(&resolving, h, out.id).unwrap();
     bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+}
+
+// A symbolic K retains the full unrolled loop even at K=3. Its register
+// pressure exposed a backend compiling for fewer threads than the declared
+// workgroup size. Exercise actual extracted plans, including materialized
+// softmax operands, and verify every output against the host calculation.
+#[test]
+#[cfg(all(
+    feature = "gpu",
+    feature = "compiler-tests",
+    not(target_arch = "wasm32")
+))]
+fn symbolic_softmax_gemv_materializations_agree() {
+    use fusor_ir::dtype::Dtype;
+    use fusor_ir::ir::launch::SgemvParams;
+    let backend = match Backend::gpu_blocking() {
+        Ok(backend) => backend,
+        Err(error) => {
+            assert!(
+                std::env::var_os("FUSOR_CONFORMANCE_REQUIRE_GPU").is_none(),
+                "GPU required: {error}"
+            );
+            eprintln!("wide workgroup regression skipped: {error}");
+            return;
+        }
+    };
+    let session = Session::new(backend).unwrap();
+    let point = SgemvParams {
+        vector: 64,
+        subgroups: 32,
+        cols: 32,
+        parts: 4,
+        gap: 32,
+    };
+    if !fusor_tile::domains::sgemv::cols_structure_legal(&point, &session.caps()) {
+        eprintln!("wide workgroup regression skipped: adapter cannot execute this schedule");
+        return;
+    }
+    let graph = Graph::new(&session);
+    let h = graph.handle();
+    let k = graph.sym("k");
+    graph.bind("k", 3);
+    let a = graph
+        .leaf("a", &[Dim::Const(2), Dim::Const(2), k], Dtype::F32)
+        .unwrap();
+    let b = graph
+        .leaf("b", &[Dim::Const(2), k, Dim::Const(16)], Dtype::F32)
+        .unwrap();
+    let out = a.softmax(2).unwrap().matmul(&b).unwrap();
+    let av: Vec<f32> = (0..12).map(|i| ((i * 7 % 17) as f32 - 8.) / 8.).collect();
+    let bv: Vec<f32> = (0..96).map(|i| ((i * 11 % 19) as f32 - 9.) / 8.).collect();
+    a.set_bytes(bytemuck::cast_slice(&av).to_vec()).unwrap();
+    b.set_bytes(bytemuck::cast_slice(&bv).to_vec()).unwrap();
+    let (base, variants) = {
+        let mut g = h.state().egraph.lock();
+        g.add_root(out.id);
+        Driver::new()
+            .saturate(
+                &mut g,
+                &session.caps(),
+                &session.inner.rules,
+                Default::default(),
+            )
+            .unwrap();
+        let base = session
+            .inner
+            .extractor
+            .extract(
+                &g,
+                &[out.id],
+                session.inner.cost.as_ref(),
+                ExtractBudget::default(),
+            )
+            .unwrap();
+        let variants: Vec<_> = (0..base.launches.len())
+            .flat_map(|ix| {
+                session.inner.extractor.test_launch_variants(
+                    &g,
+                    &[out.id],
+                    &base,
+                    ix,
+                    session.inner.cost.as_ref(),
+                )
+            })
+            .filter(|(_, plan)| {
+                plan.extraction
+                    .theta
+                    .values()
+                    .any(|p| matches!(p, SchedPoint::Sgemv(p) if *p == point))
+            })
+            .collect();
+        (base, variants)
+    };
+    assert!(
+        !variants.is_empty(),
+        "large subgroup schedule was not exercised"
+    );
+    let expected: Vec<f32> = (0..64)
+        .map(|i| {
+            let row = i / 16;
+            let weights: Vec<f32> = av[row * 3..(row + 1) * 3].iter().map(|v| v.exp()).collect();
+            let denom: f32 = weights.iter().sum();
+            (0..3)
+                .map(|k| weights[k] / denom * bv[(row / 2 * 3 + k) * 16 + i % 16])
+                .sum()
+        })
+        .collect();
+    for (label, plan) in std::iter::once(("base".to_string(), base)).chain(variants) {
+        let actual = run_f32(&session, h, &plan, &out);
+        for (i, (a, e)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                a.is_finite() && (a - e).abs() < 1e-5,
+                "{label} [{i}]: {a} != {e}"
+            );
+        }
+    }
+}
+
+#[test]
+#[cfg(all(feature = "cpu", not(target_arch = "wasm32")))]
+fn layout_alternatives_materialize_only_when_borrowed() {
+    use fusor_ir::dtype::{QFmt, QLayout};
+    use fusor_ir::target::HostBytes;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    struct Counted {
+        bytes: Vec<u8>,
+        reads: AtomicUsize,
+    }
+    impl AsRef<[u8]> for Counted {
+        fn as_ref(&self) -> &[u8] {
+            self.reads.fetch_add(1, Ordering::Relaxed);
+            &self.bytes
+        }
+    }
+    let session = Session::new(test_backend()).unwrap();
+    let graph = Graph::new(&session);
+    let h = graph.handle();
+    for fmt in QFmt::ALL {
+        let owner = Arc::new(Counted {
+            bytes: (0..2 * fmt.block_bytes(QLayout::Native) as usize)
+                .map(|i| (i * 17) as u8)
+                .collect(),
+            reads: AtomicUsize::new(0),
+        });
+        let source = Arc::new(HostBytes::shared(owner.clone(), 0..owner.bytes.len()).unwrap());
+        let leaf = h
+            .quantized_leaf_shared(
+                fmt,
+                QLayout::Native,
+                [Dim::Const(2), Dim::Const(fmt.block_elements() as u64)],
+                source,
+            )
+            .unwrap();
+        let reads = owner.reads.load(Ordering::Relaxed);
+        let alternative = h.repacked_leaf_of(leaf).unwrap();
+        assert_eq!(
+            owner.reads.load(Ordering::Relaxed),
+            reads,
+            "building a layout alternative read {fmt:?} weights"
+        );
+        if fmt.block_bytes(QLayout::Native).is_multiple_of(4) {
+            assert!(alternative.is_none());
+            continue;
+        }
+        let alternative = alternative.unwrap();
+        assert_eq!(h.repacked_leaf_of(leaf).unwrap(), Some(alternative));
+        let bytes = h.leaf_bytes_shared(alternative).unwrap();
+        let mut expected = Vec::new();
+        fusor_gguf::repack::repack(
+            fmt,
+            QLayout::Native,
+            QLayout::F32Scales,
+            &owner.bytes,
+            &mut expected,
+        )
+        .unwrap();
+        assert_eq!(bytes.len(), expected.len());
+        for borrow in 1..=2 {
+            bytes.with_slice(|actual| assert_eq!(actual, expected));
+            assert_eq!(owner.reads.load(Ordering::Relaxed), reads + borrow);
+        }
+    }
 }
 
 #[test]
@@ -563,7 +747,7 @@ fn symbolic_contractions_reuse_pipelines_across_tile_boundaries() {
                     assert_eq!(h.device_buf(b.id).unwrap().addr(), buffers[1].addr());
                 }
             }
-            session.run(h, &plan, std::slice::from_ref(&out)).unwrap_or_else(|error| {
+            session.run(h, &plan, std::slice::from_ref(&out), None).unwrap_or_else(|error| {
                 panic!("{family:?} varying_k={varying_k} columns={columns} kv_cache={kv_cache} length={len}: {error}")
             });
             let bytes = session.read_bytes_locked(&resolving, h, out.id).unwrap();
@@ -1018,8 +1202,15 @@ macro_rules! on_each_backend {
         #[test]
         #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
         fn $gpu() {
-            let Ok(backend) = Backend::gpu_blocking() else {
-                return;
+            let backend = match Backend::gpu_blocking() {
+                Ok(backend) => backend,
+                Err(error) => {
+                    assert!(
+                        std::env::var_os("FUSOR_CONFORMANCE_REQUIRE_GPU").is_none(),
+                        "GPU required: {error}"
+                    );
+                    return;
+                }
             };
             $body(Session::new(backend).unwrap());
         }
@@ -1034,3 +1225,433 @@ on_each_backend!(
     a_fresh_step_leaf_reuses_the_plan: a_fresh_step_leaf_reuses_the_cpu_plan_and_executable,
     a_fresh_step_leaf_reuses_the_gpu_plan
 );
+
+fn shared_weight_views_execute_and_concatenate(session: Session) {
+    use crate::quantized::QMatrix;
+    use fusor_ir::{
+        dtype::{QFmt, QLayout},
+        target::HostBytes,
+    };
+    let graph = Graph::new(&session);
+    let h = graph.handle();
+    let mut bytes = vec![0xFF; 7];
+    for nibble in [0x99, 0xAA] {
+        bytes.extend_from_slice(&half::f16::from_f32(1.).to_bits().to_le_bytes());
+        bytes.extend_from_slice(&[nibble; 16]);
+    }
+    bytes.extend_from_slice(&[0xFF; 5]);
+    let owner = Arc::new(bytes);
+    let mut parts = Vec::new();
+    for row in 0..2 {
+        let start = 7 + row * 18;
+        let view = Arc::new(HostBytes::shared(owner.clone(), start..start + 18).unwrap());
+        view.with_slice(|bytes| assert_eq!(bytes.as_ptr(), owner[start..].as_ptr()));
+        let weight = QMatrix::from_shared_bytes(
+            &graph,
+            QFmt::Q4_0,
+            QLayout::Native,
+            [Dim::Const(1), Dim::Const(32)],
+            view.clone(),
+        )
+        .unwrap();
+        assert!(Arc::ptr_eq(
+            &h.leaf_bytes_shared(weight.tensor.id()).unwrap(),
+            &view
+        ));
+        parts.push(weight);
+    }
+    drop(owner);
+    let joined = QMatrix::concat_rows(&[&parts[1], &parts[0]]).unwrap();
+    let x =
+        Tensor::from_elements(h, &[Dim::Const(1), Dim::Const(32)], &[1.0f32 / 32.; 32]).unwrap();
+    for (weight, expected) in [
+        (&parts[0], vec![1.]),
+        (&parts[1], vec![2.]),
+        (&joined, vec![2., 1.]),
+    ] {
+        let out = weight.q_mat_mul(&x).unwrap();
+        let got: Vec<f32> = bytemuck::cast_slice(&h.read_back(out.id).unwrap()).to_vec();
+        assert_eq!(got, expected);
+    }
+}
+
+on_each_backend!(shared_weight_views_execute_and_concatenate:
+    shared_weight_views_cpu, shared_weight_views_gpu);
+
+#[cfg(not(target_arch = "wasm32"))]
+fn immutable_word_views_share_device_storage(session: Session) {
+    use fusor_ir::dtype::{QFmt, QLayout};
+    let graph = Graph::new(&session);
+    let h = graph.handle();
+    for words_first in [false, true] {
+        // Exercise every opaque block representation. The storage relation is
+        // byte identity, independent of its decode formula or block size.
+        for fmt in QFmt::ALL {
+            let bytes: Vec<u8> = (0..4 * fmt.block_bytes(QLayout::Native) as usize)
+                .map(|i| (i * 17 + 3) as u8)
+                .collect();
+            let source = h
+                .quantized_leaf(
+                    fmt,
+                    QLayout::Native,
+                    [Dim::Const(4), Dim::Const(fmt.block_elements() as u64)],
+                    bytes.clone(),
+                )
+                .unwrap();
+            let words = h.words_leaf_of(source).unwrap().unwrap();
+            let source_tensor = h.tensor(source);
+            let words_tensor = h.tensor(words);
+            let order = if words_first {
+                [words, source]
+            } else {
+                [source, words]
+            };
+            session.upload_leaf(&h.tensor(order[0])).unwrap();
+            #[cfg(feature = "gpu")]
+            let allocated = session
+                .device()
+                .gpu_target()
+                .map(|t| t.pool().counters().live_bytes);
+            session.upload_leaf(&h.tensor(order[1])).unwrap();
+            #[cfg(feature = "gpu")]
+            assert_eq!(
+                session
+                    .device()
+                    .gpu_target()
+                    .map(|t| t.pool().counters().live_bytes),
+                allocated,
+                "storage view allocated additional GPU bytes"
+            );
+            let source_buf = h.device_buf(source).unwrap();
+            let words_buf = h.device_buf(words).unwrap();
+            assert_eq!(
+                source_buf.addr(),
+                words_buf.addr(),
+                "immutable word view uploaded duplicate device storage for {fmt:?}"
+            );
+            assert_eq!(h.read_back(words).unwrap(), bytes);
+            // Rebinding one value must not change the immutable view's bytes.
+            let changed = vec![0x65; bytes.len()];
+            h.set_leaf_bytes(source, changed.clone());
+            session.upload_leaf(&h.tensor(source)).unwrap();
+            assert_ne!(h.device_buf(source).unwrap().addr(), words_buf.addr());
+            assert_eq!(h.read_back(words).unwrap(), bytes);
+            let rebound = h.tensor(source);
+            let read = pollster::block_on(
+                session
+                    .device()
+                    .download(&h.device_buf(rebound.id).unwrap(), changed.len() as u64),
+            )
+            .unwrap();
+            assert_eq!(read, changed);
+            // An adopted buffer is not evidence of the old host contents.
+            source_tensor.clear_device_buf();
+            words_tensor.clear_device_buf();
+            h.set_leaf_bytes_shared(source, h.leaf_bytes_shared(words).unwrap());
+            let donor = h.tensor(
+                h.quantized_leaf(
+                    fmt,
+                    QLayout::Native,
+                    [Dim::Const(4), Dim::Const(fmt.block_elements() as u64)],
+                    changed.clone(),
+                )
+                .unwrap(),
+            );
+            donor.upload().unwrap();
+            source_tensor.adopt_buffer(&donor).unwrap();
+            words_tensor.upload().unwrap();
+            assert_ne!(
+                h.device_buf(source).unwrap().addr(),
+                h.device_buf(words).unwrap().addr()
+            );
+            assert_eq!(h.read_back(words).unwrap(), bytes);
+        }
+    }
+    // Identical host backing does not authorize sharing mutable inputs.
+    let bytes = Arc::new(fusor_ir::target::HostBytes::from(vec![0; 16]));
+    let a = graph
+        .leaf("mutable-a", &[Dim::Const(4)], crate::Dtype::F32)
+        .unwrap();
+    let b = graph
+        .leaf("mutable-b", &[Dim::Const(4)], crate::Dtype::F32)
+        .unwrap();
+    h.set_leaf_bytes_shared(a.id, bytes.clone());
+    h.set_leaf_bytes_shared(b.id, bytes);
+    a.upload().unwrap();
+    b.upload().unwrap();
+    assert_ne!(
+        h.device_buf(a.id).unwrap().addr(),
+        h.device_buf(b.id).unwrap().addr()
+    );
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+on_each_backend!(immutable_word_views_share_device_storage:
+    immutable_word_storage_cpu, immutable_word_storage_gpu);
+
+fn immutable_word_storage_survives_family_binding_restore(session: Session) {
+    use fusor_ir::dtype::{QFmt, QLayout};
+    let graph = Graph::new(&session);
+    let h = graph.handle();
+    let bytes = vec![0x21; 4 * QFmt::Q4_0.block_bytes(QLayout::Native) as usize];
+    let make = |bytes: Vec<u8>| {
+        h.tensor(
+            h.quantized_leaf(
+                QFmt::Q4_0,
+                QLayout::Native,
+                [Dim::Const(4), Dim::Const(32)],
+                bytes,
+            )
+            .unwrap(),
+        )
+    };
+    let source = make(bytes.clone());
+    let donor = make(vec![0x43; bytes.len()]);
+    let words = h.tensor(h.words_leaf_of(source.id).unwrap().unwrap());
+    donor.upload().unwrap();
+    source.adopt_buffer(&donor).unwrap();
+    {
+        let _bindings = FamilyBindings::new(h, &[source.id]).unwrap();
+        source.clear_device_buf();
+        source.upload().unwrap();
+    }
+    // The restored binding contains donor bytes, not source's host snapshot.
+    words.upload().unwrap();
+    assert_eq!(
+        h.read_back(words.id).unwrap(),
+        bytes,
+        "family restore retained provenance for a different buffer"
+    );
+    source.clear_device_buf();
+    source.upload().unwrap();
+    let original = h.device_buf(source.id).unwrap();
+    {
+        let _bindings = FamilyBindings::new(h, &[source.id]).unwrap();
+        source.adopt_buffer(&donor).unwrap();
+    }
+    words.clear_device_buf();
+    words.upload().unwrap();
+    assert_eq!(
+        h.device_buf(words.id).unwrap().addr(),
+        original.addr(),
+        "family restore lost valid immutable upload provenance"
+    );
+}
+
+on_each_backend!(immutable_word_storage_survives_family_binding_restore:
+    immutable_word_storage_family_cpu, immutable_word_storage_family_gpu);
+
+#[test]
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+fn immutable_word_storage_preparation() {
+    use fusor_ir::dtype::{QFmt, QLayout};
+    let backend = match Backend::gpu_blocking() {
+        Ok(backend) => backend,
+        Err(error) => {
+            assert!(
+                std::env::var_os("FUSOR_CONFORMANCE_REQUIRE_GPU").is_none(),
+                "GPU required: {error}"
+            );
+            return;
+        }
+    };
+    let session = Session::new(backend).unwrap();
+    let graph = Graph::new(&session);
+    let h = graph.handle();
+    let bytes = vec![0x21; 4 * QFmt::Q8_0.block_bytes(QLayout::Native) as usize];
+    let source = h.tensor(
+        h.quantized_leaf(
+            QFmt::Q8_0,
+            QLayout::Native,
+            [Dim::Const(4), Dim::Const(32)],
+            bytes.clone(),
+        )
+        .unwrap(),
+    );
+    let words = h.tensor(h.words_leaf_of(source.id).unwrap().unwrap());
+    let pending = h.pending_leaf_uploads(&[source.id, words.id]);
+    assert_eq!(pending.len(), 1, "prepared compiler views need one upload");
+    let upload = &pending[0];
+    let buf = upload
+        .bytes
+        .with_slice(|bytes| {
+            session
+                .device()
+                .upload(bytes, fusor_ir::dtype::Persistence::Persistent)
+        })
+        .unwrap();
+    // Rebinding one leaf while its background upload runs cannot overwrite it.
+    h.set_leaf_bytes(source.id, vec![0x43; bytes.len()]);
+    for &id in &upload.values {
+        h.bind_prepared_leaf(id, &upload.bytes, buf.clone());
+    }
+    assert!(h.device_buf(source.id).is_none());
+    assert_eq!(h.read_back(words.id).unwrap(), bytes);
+    source.upload().unwrap();
+    assert_ne!(
+        h.device_buf(source.id).unwrap().addr(),
+        h.device_buf(words.id).unwrap().addr()
+    );
+}
+
+#[test]
+#[cfg(all(feature = "cpu", not(target_arch = "wasm32")))]
+fn whole_value_broadcast_replays_changed_inputs() {
+    let session = Session::new(test_backend()).unwrap();
+    for symbolic in [false, true] {
+        let graph = Graph::new(&session);
+        let columns = if symbolic {
+            graph.sym("columns")
+        } else {
+            Dim::Const(3)
+        };
+        let input = graph
+            .leaf("input", &[Dim::ONE, columns], crate::Dtype::F32)
+            .unwrap();
+        let output = input
+            .mul_scalar(3.)
+            .unwrap()
+            .broadcast_as(&[Dim::Const(2), columns])
+            .unwrap();
+        for step in 1..=3 {
+            let count = if symbolic { step + 2 } else { 3 };
+            if symbolic {
+                graph.bind("columns", count as u64);
+            }
+            let values: Vec<f32> = (0..count).map(|i| (i + step * 7) as f32).collect();
+            input
+                .set_bytes(bytemuck::cast_slice(&values).to_vec())
+                .unwrap();
+            output.clear_device_buf();
+            session.resolve(std::slice::from_ref(&output)).unwrap();
+            let expected: Vec<f32> = values
+                .iter()
+                .cycle()
+                .take(count * 2)
+                .map(|x| x * 3.)
+                .collect();
+            assert_eq!(
+                output.narrow(1, 0, count).unwrap().to_vec_f32().unwrap(),
+                expected
+            );
+        }
+    }
+}
+
+#[cfg(all(feature = "cpu", not(target_arch = "wasm32")))]
+#[test]
+fn uniform_index_is_read_without_a_buffer_binding() {
+    use crate::tensor::Dyn;
+    use crate::{Device, Dim, Dtype, Tensor};
+    let device = Device::cpu();
+    let graph = device.graph().handle();
+    let symbol = graph.fresh_sym();
+    let index = Dyn::uniform(graph, Dtype::U32, symbol)
+        .unwrap()
+        .reshape(&[Dim::ONE.into()])
+        .unwrap();
+    let base = Tensor::from_slice(&device, [4], &[1., 2., 3., 4.]);
+    let update = Tensor::from_slice(&device, [1], &[17.]);
+    let output = base
+        .as_dyn()
+        .scatter_set(0, &index, update.as_dyn(), true)
+        .unwrap();
+    for slot in [1, 3, 0] {
+        graph.set_uniform(symbol, slot as f32);
+        output.clear_device_buf();
+        let mut expected = vec![1., 2., 3., 4.];
+        expected[slot] = 17.;
+        assert_eq!(output.to_vec_f32().unwrap(), expected);
+    }
+}
+
+#[cfg(all(
+    feature = "gpu",
+    feature = "kernel-observer",
+    not(target_arch = "wasm32")
+))]
+#[test]
+#[ignore = "requires a live WebGPU device"]
+fn consecutive_scatter_uses_direct_indices_and_preserves_sources() {
+    use crate::Dtype;
+    use fusor_ir::shape::Dim;
+    let session = Session::new(Backend::gpu_blocking().unwrap()).unwrap();
+    let graph = Graph::new(&session);
+    let h = graph.handle();
+    let names = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let captured = names.clone();
+    session
+        .device()
+        .gpu_target()
+        .unwrap()
+        .set_plan_observer(Some(Arc::new(move |_, _, _, _, commands| {
+            for command in commands {
+                if let fusor_gpu::launch::CommandRecord::Dispatch { name, .. } = command {
+                    captured.lock().unwrap().push(*name);
+                }
+            }
+        })));
+    for (outer, bins, inner, start, count) in [
+        (2, 7, 3, 0, 2),
+        (3, 9, 5, 3, 4),
+        (2, 7, 3, 4, 3),
+        (1, 5, 7, 2, 1),
+    ] {
+        let dims = |shape: [usize; 3]| shape.map(|d| Dim::Const(d as u64));
+        let original: Vec<f32> = (0..outer * bins * inner).map(|i| i as f32 / 4.).collect();
+        let base = graph
+            .tensor(
+                Dtype::F32,
+                &dims([outer, bins, inner]),
+                bytemuck::cast_slice(&original),
+            )
+            .unwrap();
+        let source = graph
+            .leaf("range-update", &dims([inner, outer, count]), Dtype::F32)
+            .unwrap();
+        let updates = source.permute(&[1, 2, 0]).unwrap();
+        let index = h.tensor(crate::composite::index_run(h, start as u64, count as u64).unwrap());
+        for add in [false, true] {
+            let scatter = if add {
+                base.scatter_add(1, &index, &updates)
+            } else {
+                base.scatter_set(1, &index, &updates, true)
+            }
+            .unwrap();
+            let output = scatter.mul_scalar(0.5).unwrap();
+            for round in 0..3 {
+                let values: Vec<f32> = (0..inner * outer * count)
+                    .map(|i| (i + round * 17) as f32)
+                    .collect();
+                source
+                    .set_bytes(bytemuck::cast_slice(&values).to_vec())
+                    .unwrap();
+                scatter.clear_device_buf();
+                output.clear_device_buf();
+                let mut expected = original.clone();
+                for o in 0..outer {
+                    for u in 0..count {
+                        for i in 0..inner {
+                            let at = (o * bins + start + u) * inner + i;
+                            let value = values[(i * outer + o) * count + u];
+                            expected[at] = if add { expected[at] + value } else { value };
+                        }
+                    }
+                }
+                expected.iter_mut().for_each(|v| *v *= 0.5);
+                assert_eq!(output.to_vec_f32().unwrap(), expected);
+                assert_eq!(base.to_vec_f32().unwrap(), original);
+                assert_eq!(source.to_vec_f32().unwrap(), values);
+            }
+        }
+    }
+    let names = names.lock().unwrap();
+    assert!(
+        names.contains(&"scatter_range"),
+        "direct range lowering was not selected: {names:?}"
+    );
+    assert!(
+        !names.contains(&"scatter_rows"),
+        "consecutive indices still scanned: {names:?}"
+    );
+}

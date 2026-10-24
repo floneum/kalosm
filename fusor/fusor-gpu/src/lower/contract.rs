@@ -18,6 +18,8 @@ use fusor_ir::shape::Dim;
 
 use crate::lower::{Ctx, StagedSource, distribute_workgroups, scalar_element};
 
+mod contiguous_n;
+
 /// Dispatch on the family this lowering was selected at.
 pub(crate) fn lower_contract(
     ctx: Ctx<'_>,
@@ -28,7 +30,7 @@ pub(crate) fn lower_contract(
     let contract = Contract::of(&ctx, op);
     // Which family and which point extraction actually resolved; the answer
     // is not in the graph, it is in `theta`.
-    if crate::flags().dump_contract {
+    if crate::flags::flags().dump_contract {
         let s = contract.as_ref().map(|c| c.shape);
         eprintln!(
             "CONTRACT family={family:?} theta={theta:?} shape={:?}",
@@ -36,6 +38,12 @@ pub(crate) fn lower_contract(
         );
     }
     let contract = contract?;
+    if matches!((family, theta), (Family::Sgemv, SchedPoint::Sgemv(_)))
+        && crate::flags::flags().gemv_contiguous_n
+        && contiguous_n::supported(&contract, ctx.caps)
+    {
+        return contiguous_n::lower(ctx, &contract);
+    }
     match (family, theta) {
         (Family::Coop, SchedPoint::Coop { geom, staging }) => {
             lower_coop(ctx, &contract, geom, staging)
@@ -295,7 +303,15 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
     let depth = u32::from(staging.max(1));
     let dim = CoopGeom::COOP_DIM;
     let acc_elem = c.acc;
-    let operand_elem = scalar_element(ctx.plan_dtype(c.a.side.primary().src)?);
+    // A fused prologue can cast a wider backing buffer before staging. The
+    // matrix operand type is that prologue's result, not the backing dtype.
+    let operand_elem = scalar_element(c.a.side.pre.dtype());
+    if crate::flags::flags().dump_contract {
+        eprintln!(
+            "COOP_TYPES operand={operand_elem:?} accumulator={acc_elem:?} source={:?}",
+            ctx.plan_dtype(c.a.side.primary().src)?
+        );
+    }
     let b = &ctx.b;
 
     // Allocation maps logical output axes onto whole padded matrix tiles.
@@ -327,10 +343,15 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
         operand_elem.element(),
         &[slots * depth.saturating_mul(geom.bm), geom.bk],
     );
+    let b_transposed = column_major_side(&c.b);
     let b_tile = b.tile(
         "coop_b",
         operand_elem.element(),
-        &[slots * depth.saturating_mul(geom.bk), cs.bn_pass],
+        &if b_transposed {
+            [slots * depth.saturating_mul(cs.bn_pass), geom.bk]
+        } else {
+            [slots * depth.saturating_mul(geom.bk), cs.bn_pass]
+        },
     );
     let groups = shape
         .batch
@@ -368,8 +389,9 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
     // Element offsets of this slot's tiles, and its row offset in each.
     let slot_rows = |rows: u32| slot.as_ref().map(|s| b.mul(s.clone(), b.u32(rows)));
     let a_slot_rows = slot_rows(depth.saturating_mul(geom.bm));
-    let b_slot_rows = slot_rows(depth.saturating_mul(geom.bk));
-    let acc_slot_rows = slot_rows(geom.bm);
+    let b_slot_rows =
+        slot_rows(depth.saturating_mul(if b_transposed { cs.bn_pass } else { geom.bk }));
+    let acc_slot_rows = slot_rows(geom.subgroups * dim);
     let with_rows = |base: TileExpr, rows: &Option<TileExpr>| match rows {
         Some(r) => b.add(r.clone(), base),
         None => base,
@@ -406,6 +428,7 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
         Some(live) => Some(live.clone()),
         None => (block > cs.lanes).then(|| b.lt(sg_raw, owners)),
     };
+    let acc_sg_row = b.mul(sg.clone(), b.u32(dim));
     let (sg_row, sg_col) = b.divrem(sg, b.u32(geom.cg));
     let sg_row_base = b.mul(sg_row, b.u32(cs.sg_rows));
     let sg_col_base = b.mul(sg_col, b.u32(cs.sg_cols));
@@ -430,7 +453,7 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
             b.tile(
                 "coop_acc",
                 acc_elem.element(),
-                &[slots * geom.bm, cs.bn_pass],
+                &[slots * geom.subgroups * dim, dim],
             )
         });
 
@@ -468,67 +491,92 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
                 [a_row_base.clone(), k_base.clone()],
                 [a_row_limit.clone(), k_limit.clone()],
                 [geom.bm, geom.bk],
+                shape.m.is_multiple_of(geom.bm)
+                    && shape
+                        .k
+                        .as_const()
+                        .is_some_and(|k| k.is_multiple_of(u64::from(geom.bk * depth))),
+                false,
             )?;
             stage.copy(
                 &ctx,
                 &mut loop_body,
                 &c.b,
                 &b_tile,
-                b_slot_rows
-                    .as_ref()
-                    .map(|r| b.mul(r.clone(), b.u32(cs.bn_pass))),
+                b_slot_rows.as_ref().map(|r| {
+                    b.mul(
+                        r.clone(),
+                        b.u32(if b_transposed { geom.bk } else { cs.bn_pass }),
+                    )
+                }),
                 d.saturating_mul(geom.bk).saturating_mul(cs.bn_pass),
                 [b.add(b_batch_base.clone(), k_base), pass_col_base.clone()],
                 [b_row_limit.clone(), n_limit.clone()],
                 [geom.bk, cs.bn_pass],
+                n.is_multiple_of(geom.bn)
+                    && shape
+                        .k
+                        .as_const()
+                        .is_some_and(|k| k.is_multiple_of(u64::from(geom.bk * depth))),
+                b_transposed,
             )?;
         }
         loop_body.push(Stmt::Barrier);
 
         // One accumulator per fragment of this subgroup's sub-block, each
         // folding every `COOP_DIM` K slice of every buffer in the iteration.
-        let frag = |role, tile: &Tile, row, col| {
+        let frag = |role, tile: &Tile, row, col, transposed| {
             let src = CoopSrc {
                 tile: tile.clone(),
                 row,
                 col,
-                transposed: false,
+                transposed,
             };
             b.coop_load(role, operand_elem, dim, dim, src)
         };
-        let mut accumulators = Vec::with_capacity((cs.frags_m * cs.frags_n) as usize);
-        for r in 0..cs.frags_m {
-            for col in 0..cs.frags_n {
-                let (a_row, b_col) = frag_origin(r, col);
+        let accumulators: Vec<_> = (0..cs.frags_m * cs.frags_n)
+            .map(|_| {
                 let local = b.local(ElementType::CoopMatrix {
                     scalar: acc_elem,
                     role: CoopMatrixRole::C,
                     rows: dim,
                     cols: dim,
                 });
-                let mut update = b.load_local(local.clone());
-                for d in 0..depth {
-                    let a_row_d = with_rows(
-                        b.add(b.u32(d.saturating_mul(geom.bm)), a_row.clone()),
-                        &a_slot_rows,
-                    );
-                    let b_buf = d.saturating_mul(geom.bk);
-                    for step in 0..cs.kk_steps {
-                        let offset = step.saturating_mul(dim);
-                        let a_frag =
-                            frag(CoopMatrixRole::A, &a_tile, a_row_d.clone(), b.u32(offset));
-                        let b_row = with_rows(b.u32(b_buf.saturating_add(offset)), &b_slot_rows);
-                        let b_frag = frag(CoopMatrixRole::B, &b_tile, b_row, b_col.clone());
-                        update = b.coop_mma(a_frag, b_frag, update);
-                    }
-                }
-                // A fragment accumulator starts from a zero fragment: a
-                // scalar zero has the wrong `ElementType`.
-                accumulators.push(Accumulator {
+                Accumulator {
+                    update: b.load_local(local.clone()),
                     local,
                     init: b.coop_zero(CoopMatrixRole::C, acc_elem, dim, dim),
-                    update,
-                });
+                }
+            })
+            .collect();
+        // Consume a K slice across the accumulator grid before loading the
+        // next slice. Operand fragments then die together, rather than staying
+        // live across every accumulator's complete K chain.
+        for d in 0..depth {
+            for step in 0..cs.kk_steps {
+                let offset = step.saturating_mul(dim);
+                for r in 0..cs.frags_m {
+                    for col in 0..cs.frags_n {
+                        let (a_row, b_col) = frag_origin(r, col);
+                        let a_row =
+                            with_rows(b.add(b.u32(d.saturating_mul(geom.bm)), a_row), &a_slot_rows);
+                        let a_frag = frag(CoopMatrixRole::A, &a_tile, a_row, b.u32(offset), false);
+                        let (b_row, b_col) = if b_transposed {
+                            (
+                                b.u32(offset),
+                                with_rows(b.add(b.u32(d * cs.bn_pass), b_col), &b_slot_rows),
+                            )
+                        } else {
+                            (with_rows(b.u32(d * geom.bk + offset), &b_slot_rows), b_col)
+                        };
+                        let b_frag = frag(CoopMatrixRole::B, &b_tile, b_row, b_col, b_transposed);
+                        let local = accumulators[(r * cs.frags_n + col) as usize].local.clone();
+                        loop_body.push(Stmt::StoreLocal {
+                            value: b.coop_mma(a_frag, b_frag, b.load_local(local.clone())),
+                            dst: local,
+                        });
+                    }
+                }
             }
         }
         let locals: Vec<Local> = accumulators.iter().map(|a| a.local.clone()).collect();
@@ -544,22 +592,72 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
         for (i, local) in (0u32..).zip(locals) {
             let (frag_row, frag_col) = frag_origin(i / cs.frags_n, i % cs.frags_n);
             let acc = b.load_local(local);
-            stores.push(match &stage_tile {
-                Some(tile) => Stmt::CoopStoreTile {
+            if let Some(tile) = &stage_tile {
+                // The scalar epilogue consumes one fragment per subgroup at a
+                // time. Reusing that scratch avoids reserving the entire output
+                // block in workgroup memory, especially for wide accumulator grids.
+                let store = Stmt::CoopStoreTile {
                     acc,
                     tile: tile.clone(),
-                    row: with_rows(frag_row, &acc_slot_rows),
-                    col: frag_col,
-                },
-                None => Stmt::CoopStore {
+                    row: with_rows(acc_sg_row.clone(), &acc_slot_rows),
+                    col: b.u32(0),
+                };
+                match &owns {
+                    Some(owns) => body.push(Stmt::If {
+                        condition: owns.clone(),
+                        accept: vec![store],
+                        reject: Vec::new(),
+                    }),
+                    None => body.push(store),
+                }
+                body.push(Stmt::Barrier);
+                let mut scalar_stores = Vec::new();
+                let fragment_lane = b.rem(lane.clone(), b.u32(width));
+                per_lane_block(
+                    &ctx,
+                    &mut scalar_stores,
+                    &fragment_lane,
+                    dim,
+                    dim,
+                    width,
+                    |out, flat, lr, lc, active| {
+                        let lr = b.add(frag_row.clone(), lr);
+                        let lc = b.add(frag_col.clone(), lc);
+                        let row = b.add(out_row_base.clone(), lr.clone());
+                        let col = b.add(pass_col_base.clone(), lc);
+                        let base = b.mul(with_rows(acc_sg_row.clone(), &acc_slot_rows), b.u32(dim));
+                        let value = b.load_tile(tile.clone(), b.add(flat, base));
+                        out.push(c.store_post(
+                            &ctx,
+                            &out_view,
+                            value,
+                            b.add(a_row_base.clone(), lr),
+                            col.clone(),
+                            Addr::Rc2 { row, col },
+                            active,
+                        )?);
+                        Ok(())
+                    },
+                )?;
+                match &owns {
+                    Some(owns) => body.push(Stmt::If {
+                        condition: owns.clone(),
+                        accept: scalar_stores,
+                        reject: Vec::new(),
+                    }),
+                    None => body.extend(scalar_stores),
+                }
+                body.push(Stmt::Barrier);
+            } else {
+                stores.push(Stmt::CoopStore {
                     acc,
                     dst: out_view.clone(),
                     addr: Addr::Rc2 {
                         row: b.add(out_row_base.clone(), frag_row),
                         col: b.add(pass_col_base.clone(), frag_col),
                     },
-                },
-            });
+                });
+            }
         }
         match &owns {
             Some(owns) => body.push(Stmt::If {
@@ -613,16 +711,7 @@ fn lower_coop(ctx: Ctx<'_>, c: &Contract<'_>, geom: CoopGeom, staging: u8) -> Re
         match &stage_tile {
             // The staged path already reads every element per lane, so a fused
             // `post` costs nothing extra there.
-            Some(tile) => {
-                body.push(Stmt::Barrier);
-                let acc_base = acc_slot_rows
-                    .as_ref()
-                    .map(|r| b.mul(r.clone(), b.u32(cs.bn_pass)));
-                epilogue(&mut body, &|flat, _, _, _| {
-                    b.load_tile(tile.clone(), with_rows(flat, &acc_base))
-                })?;
-                body.push(Stmt::Barrier);
-            }
+            Some(_) => {} // Fragment stores above already applied `post`.
             // Fragments are opaque to scalar code, so a fused `post` stores, barriers,
             // then maps `post` in place over this workgroup's disjoint block.
             None if !post_is_identity => {
@@ -803,7 +892,12 @@ fn load_staged(
                     col: col.clone(),
                 };
                 let fill = b.zero(source_element(source));
-                Ok(b.load(source.clone(), addr, mask.clone(), fill))
+                match source {
+                    Source::Quantized(q) => {
+                        fusor_gguf::blocks::decode_load(q, &addr, mask.clone(), fill)
+                    }
+                    _ => Ok(b.load(source.clone(), addr, mask.clone(), fill)),
+                }
             }
             StagedSource::Indexed {
                 operand,
@@ -850,6 +944,23 @@ struct StageNest<'e> {
     elem: ScalarElement,
 }
 
+fn column_major_side(side: &Side<'_>) -> bool {
+    side.sources
+        .iter()
+        .any(|s| matches!(s, StagedSource::Mem(_)))
+        && side.sources.iter().all(|source| {
+            let layout = match source {
+                StagedSource::Const(_) => return true,
+                StagedSource::Indexed { .. } => return false,
+                StagedSource::Mem(Source::Storage(view)) => &view.layout,
+                StagedSource::Mem(Source::Quantized(view)) => &view.data.layout,
+            };
+            matches!(layout.indexing.groups.as_slice(), [row, col]
+                if matches!(row.sub_axes.as_slice(), [r] if r.stride == 1)
+                    && matches!(col.sub_axes.as_slice(), [c] if c.stride > 1))
+        })
+}
+
 impl StageNest<'_> {
     /// Copy a `rows x cols` window at `origin` of one side into `tile` from
     /// `tile_base`, `block` elements per pass, applying `pre` on the way in. A
@@ -866,26 +977,13 @@ impl StageNest<'_> {
         [row_base, col_base]: [TileExpr; 2],
         [row_limit, col_limit]: [TileExpr; 2],
         [rows, cols]: [u32; 2],
+        full_window: bool,
+        transposed: bool,
     ) -> Result<()> {
         let b = &ctx.b;
         let total = rows.saturating_mul(cols).max(1);
         let lanes = self.block.max(1);
-        let column_major = rows > 1
-            && side
-                .sources
-                .iter()
-                .any(|s| matches!(s, StagedSource::Mem(_)))
-            && side.sources.iter().all(|source| {
-                let layout = match source {
-                    StagedSource::Const(_) => return true,
-                    StagedSource::Indexed { .. } => return false,
-                    StagedSource::Mem(Source::Storage(view)) => &view.layout,
-                    StagedSource::Mem(Source::Quantized(view)) => &view.data.layout,
-                };
-                matches!(layout.indexing.groups.as_slice(), [row, col]
-                    if matches!(row.sub_axes.as_slice(), [r] if r.stride == 1)
-                        && matches!(col.sub_axes.as_slice(), [c] if c.stride > 1))
-            });
+        let column_major = rows > 1 && column_major_side(side);
         for pass in 0..total.div_ceil(lanes) {
             let flat = match pass {
                 0 => self.lane.clone(),
@@ -895,7 +993,7 @@ impl StageNest<'_> {
             // row-major layout.
             let inner = b.u32(if column_major { rows } else { cols }.max(1));
             let (major, minor) = b.divrem(flat.clone(), inner);
-            let (local_row, local_col, tile_index) = match column_major {
+            let (local_row, local_col, normal_index) = match column_major {
                 true => (
                     minor.clone(),
                     major.clone(),
@@ -903,10 +1001,21 @@ impl StageNest<'_> {
                 ),
                 false => (major, minor, flat.clone()),
             };
+            let tile_index = if transposed {
+                b.add(b.mul(local_col.clone(), b.u32(rows)), local_row.clone())
+            } else {
+                normal_index
+            };
             let row = b.add(row_base.clone(), local_row);
             let col = b.add(col_base.clone(), local_col);
-            let in_row = b.lt(row.clone(), row_limit.clone());
-            let mut active = b.and(in_row, b.lt(col.clone(), col_limit.clone()));
+            // A complete tile in every iteration needs no clamped storage load.
+            // Keep the per-lane remainder guard below even for complete windows.
+            let mut active = if full_window {
+                b.bool(true)
+            } else {
+                let in_row = b.lt(row.clone(), row_limit.clone());
+                b.and(in_row, b.lt(col.clone(), col_limit.clone()))
+            };
             let within = ((pass + 1).saturating_mul(lanes) > total).then(|| {
                 let w = b.lt(flat.clone(), b.u32(total));
                 active = b.and(active.clone(), w.clone());
@@ -1195,7 +1304,8 @@ fn lower_sgemv(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> Result<KernelI
                    _: bool|
      -> Result<Vec<TileExpr>> {
         let lane_base = b.add(step, b.mul(lane.clone(), b.u32(vector)));
-        let mut partial = b.load_local(from[0].clone());
+        let initial = b.load_local(from[0].clone());
+        let mut products = Vec::with_capacity(vector as usize);
         for v in 0..vector {
             let k = b.add(lane_base.clone(), b.u32(v));
             let mask = match masked {
@@ -1205,13 +1315,15 @@ fn lower_sgemv(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> Result<KernelI
             let av = c.a.value(&ctx, &row, &k, &mask, &batch, c.acc)?;
             let b_row = b.add(b_row_base.clone(), k);
             let bv = c.b.value(&ctx, &b_row, &col, &mask, &batch, c.acc)?;
-            partial = b.fma(
+            products.push((
                 zero_unless(&ctx, masked, &mask, av, c.acc),
                 zero_unless(&ctx, masked, &mask, bv, c.acc),
-                partial,
-            );
+            ));
         }
-        Ok(vec![partial])
+        let numeric = ctx.cx.graph.facts(ctx.cx.launch.root).numeric;
+        Ok(vec![fusor_tile::dot::accumulate(
+            b, initial, &products, numeric,
+        )])
     };
     let mut body: Vec<Stmt> = Vec::new();
     let vector = p.vector.max(1);
@@ -1286,7 +1398,10 @@ fn lower_sgemv_subgroup_cols(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> 
             (col, ok)
         })
         .collect();
-    let locals: Vec<_> = (0..cps).map(|_| b.local(c.acc.element())).collect();
+    let chains = crate::flags::flags().gemv_chains;
+    let locals: Vec<_> = (0..cps as usize * chains)
+        .map(|_| b.local(c.acc.element()))
+        .collect();
 
     // Full passes are unmasked so aligned quantized loads share decoded
     // words. Only the final partial pass needs bounds checks.
@@ -1301,15 +1416,36 @@ fn lower_sgemv_subgroup_cols(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> 
         // `width * vector` consecutive k so packed-word loads hash-cons.
         let split = !contiguous && parts > 1;
         let lane_base = match split {
-            false => b.add(step, b.mul(sg_lane.clone(), b.u32(vector))),
+            false => b.add(step.clone(), b.mul(sg_lane.clone(), b.u32(vector))),
             true => {
                 let (block_idx, within) = b.divrem(sg_lane.clone(), b.u32(p.gap / run));
                 let local = b.add(
                     b.mul(block_idx, b.u32(p.gap * parts)),
                     b.mul(within, b.u32(run)),
                 );
-                b.add(step, local)
+                b.add(step.clone(), local)
             }
+        };
+
+        let numeric = ctx.cx.graph.facts(ctx.cx.launch.root).numeric;
+        let window = if split && !masked && col_exact && numeric.reassoc {
+            if let Some(original) =
+                fusor_tile::lane_window::Window::new(width, vector, parts, p.gap)
+            {
+                fusor_tile::lane_window::choose(original, |window, v| {
+                    let k = b.add(step.clone(), window.index(b, sg_lane.clone(), v));
+                    let active = b.bool(true);
+                    let av = c.a.value(&ctx, &row, &k, &active, &batch, c.acc)?;
+                    let b_row = b.add(b_row_base.clone(), k);
+                    let bv =
+                        c.b.value(&ctx, &b_row, &cols_of_subgroup[0].0, &active, &batch, c.acc)?;
+                    Ok(vec![av, bv])
+                })?
+            } else {
+                None
+            }
+        } else {
+            None
         };
 
         // The pass's activation window, shared by every column this subgroup owns;
@@ -1321,7 +1457,10 @@ fn lower_sgemv_subgroup_cols(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> 
             } else {
                 v
             };
-            let k = b.add(lane_base.clone(), b.u32(off));
+            let k = match &window {
+                Some(window) => b.add(step.clone(), window.index(b, sg_lane.clone(), v)),
+                None => b.add(lane_base.clone(), b.u32(off)),
+            };
             let mask = match masked {
                 true => b.lt(k.clone(), ctx.dim_expr(shape.k)?),
                 false => b.bool(true),
@@ -1331,10 +1470,11 @@ fn lower_sgemv_subgroup_cols(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> 
             a_vals.push((k, mask, av));
         }
 
-        let mut partials = Vec::with_capacity(cps as usize);
-        for (local, (col, col_ok)) in from.iter().zip(&cols_of_subgroup) {
-            let mut partial = b.load_local(local.clone());
-            for (k, mask, av) in &a_vals {
+        let mut partials = Vec::with_capacity(cps as usize * chains);
+        for (locals, (col, col_ok)) in from.chunks_exact(chains).zip(&cols_of_subgroup) {
+            let mut partial: Vec<_> = locals.iter().cloned().map(|l| b.load_local(l)).collect();
+            let mut products = vec![Vec::new(); chains];
+            for (v, (k, mask, av)) in a_vals.iter().enumerate() {
                 let load_mask = match col_exact {
                     true => mask.clone(),
                     false => b.and(mask.clone(), col_ok.clone()),
@@ -1342,9 +1482,13 @@ fn lower_sgemv_subgroup_cols(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> 
                 let b_row = b.add(b_row_base.clone(), k.clone());
                 let bv = c.b.value(&ctx, &b_row, col, &load_mask, &batch, c.acc)?;
                 let bv = zero_unless(&ctx, masked, mask, bv, c.acc);
-                partial = b.fma(av.clone(), bv, partial);
+                products[v % chains].push((av.clone(), bv));
             }
-            partials.push(partial);
+            let numeric = ctx.cx.graph.facts(ctx.cx.launch.root).numeric;
+            for (partial, products) in partial.iter_mut().zip(products) {
+                *partial = fusor_tile::dot::accumulate(b, partial.clone(), &products, numeric);
+            }
+            partials.extend(partial);
         }
         Ok(partials)
     };
@@ -1356,8 +1500,14 @@ fn lower_sgemv_subgroup_cols(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> 
     // Each column's partials never leave its subgroup, so the close is a
     // subgroup sum and the store is that subgroup's lane 0.
     let lane0 = b.eq(sg_lane, b.u32(0));
-    for (local, (col, col_ok)) in locals.into_iter().zip(cols_of_subgroup) {
-        let total = b.reduce(TileReduceOp::Sum, ReduceKind::Subgroup, b.load_local(local));
+    for (locals, (col, col_ok)) in locals.chunks_exact(chains).zip(cols_of_subgroup) {
+        let partial = locals
+            .iter()
+            .cloned()
+            .map(|l| b.load_local(l))
+            .reduce(|a, v| b.add(a, v))
+            .expect("at least one accumulation chain");
+        let total = b.reduce(TileReduceOp::Sum, ReduceKind::Subgroup, partial);
         let addr = Addr::Linear(b.add(b.mul(row.clone(), n_e.clone()), col.clone()));
         let mask = b.and(lane0.clone(), col_ok);
         body.push(c.store_post(&ctx, &out, total, row.clone(), col, addr, mask)?);

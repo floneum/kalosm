@@ -13,7 +13,11 @@ use crate::shape::{Dim, Layout, const_elements};
 rule!(
     ABSORB_VIEW_INTO_CONTRACT,
     level = Level::Launch,
-    head = OpTag::LaunchContract,
+    heads = [
+        OpTag::LaunchContract,
+        OpTag::LaunchDecodeAttention,
+        OpTag::LaunchRmsNorm
+    ],
     tag = RuleTag::Additive,
     apply = absorb_view,
 );
@@ -45,7 +49,7 @@ fn absorb(b: &mut Builder<'_>, id: Id, node: &Node, broadcast_only: bool) -> Opt
     };
     let seen: Vec<Option<Operand>> = op
         .operands()
-        .map(|o| through_copy(b, o, broadcast_only))
+        .map(|o| through_copy(b, o, broadcast_only).filter(|seen| keeps_operand_space(op, seen)))
         .collect();
     if seen.iter().all(Option::is_none) {
         return None;
@@ -62,6 +66,17 @@ fn absorb(b: &mut Builder<'_>, id: Id, node: &Node, broadcast_only: bool) -> Opt
         return None;
     }
     b.union(id, minted).ok()
+}
+
+/// A composed view can split an axis into several axes. Fold's flat index
+/// map cannot address that layout unless it still broadcasts into its space.
+fn keeps_operand_space(op: &Launch, operand: &Operand) -> bool {
+    match op {
+        Launch::Fold { space, .. } if operand.access == AccessPlan::Alias => {
+            space.addresses_shape(operand.layout.shape())
+        }
+        _ => true,
+    }
 }
 
 /// `o` read through the copy that produces it: over a dense (reshape) copy
@@ -91,6 +106,13 @@ fn through_copy(b: &Builder<'_>, o: &Operand, broadcast_only: bool) -> Option<Op
             continue;
         }
         let out_elems = const_elements(&out_shape);
+        if let Some(layout) = through_linear_view(&o.layout, &out_shape, &src.layout) {
+            return Some(Operand {
+                src: src.src,
+                layout,
+                access: o.access.clone(),
+            });
+        }
         if src.layout.is_contiguous()
             && out_elems.is_some()
             && out_elems == const_elements(src.layout.shape())
@@ -118,6 +140,56 @@ fn through_copy(b: &Builder<'_>, o: &Operand, broadcast_only: bool) -> Option<Op
         }
     }
     None
+}
+
+/// A copy whose flattened address map is affine can be read through with a
+/// single offset and stride scale. Singleton strides do not affect addresses.
+/// Require constant, nonempty shapes and a bounded outer read: forwarding an
+/// out-of-bounds read could otherwise expose data outside the copied view.
+fn through_linear_view(outer: &Layout, shape: &[Dim], inner: &Layout) -> Option<Layout> {
+    if inner.shape() != shape {
+        return None;
+    }
+    let elements = const_elements(shape).filter(|n| *n > 0)?;
+    let row_major = Layout::row_major_strides(shape);
+    let mut scale = None;
+    for ((dim, stride), dense) in shape.iter().zip(inner.strides()).zip(&row_major) {
+        if dim.as_const()? <= 1 {
+            continue;
+        }
+        let (stride, dense) = (stride.as_const()?, dense.as_const()?);
+        if dense == 0 || !stride.is_multiple_of(dense) {
+            return None;
+        }
+        let here = stride / dense;
+        if scale.is_some_and(|previous| previous != here) {
+            return None;
+        }
+        scale = Some(here);
+    }
+    let scale = scale.unwrap_or(1);
+    let outer_offset = outer.offset().as_const()?;
+    let mut last = outer_offset;
+    for (dim, stride) in outer.shape().iter().zip(outer.strides()) {
+        last = last.checked_add(
+            dim.as_const()?
+                .checked_sub(1)?
+                .checked_mul(stride.as_const()?)?,
+        )?;
+    }
+    if last >= elements {
+        return None;
+    }
+    let offset = inner
+        .offset()
+        .as_const()?
+        .checked_add(outer_offset.checked_mul(scale)?)?;
+    let strides: Option<Vec<_>> = outer
+        .strides()
+        .iter()
+        .map(|stride| Some(Dim::Const(stride.as_const()?.checked_mul(scale)?)))
+        .collect();
+    Layout::from_parts(Dim::Const(offset), outer.shape(), &strides?).ok()
 }
 
 /// `outer` over the copy's row-major output `shape`, composed with the
@@ -169,11 +241,28 @@ pub fn forward_views(
     };
     let mut changed = false;
     let mut rewritten = op.clone();
+    let indexed = matches!(op, Launch::Gather { .. } | Launch::Scatter { .. });
+    if indexed && b.caps().kind != crate::device::DeviceKind::Gpu {
+        return None;
+    }
+    let skip_base = matches!(op, Launch::Scatter { .. });
     match &mut rewritten {
-        Launch::Map { .. } | Launch::Fold { .. } | Launch::Contract { .. } => {
-            for o in rewritten.operands_mut() {
+        Launch::Map { .. }
+        | Launch::Fold { .. }
+        | Launch::Contract { .. }
+        | Launch::DecodeAttention { .. }
+        | Launch::RmsNorm { .. }
+        | Launch::Gather { .. }
+        | Launch::Scatter { .. } => {
+            for (slot, o) in rewritten.operands_mut().enumerate() {
+                // The scatter's result shape and write map belong to its base.
+                // Only its indices and updates can be forwarded here.
+                if skip_base && slot == 0 {
+                    continue;
+                }
                 if copy(b, o.src)
                     && let Some(seen) = through_copy(b, o, false)
+                    && keeps_operand_space(&op, &seen)
                 {
                     *o = seen;
                     changed = true;
@@ -212,4 +301,70 @@ pub fn forward_views(
     b.union(id, new).ok()?;
     minted.push((id, new));
     Some(new)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn layout(offset: u64, shape: &[u64], strides: &[u64]) -> Layout {
+        Layout::from_parts(
+            Dim::Const(offset),
+            &shape.iter().copied().map(Dim::Const).collect::<Vec<_>>(),
+            &strides.iter().copied().map(Dim::Const).collect::<Vec<_>>(),
+        )
+        .unwrap()
+    }
+
+    fn address(view: &Layout, mut linear: u64) -> u64 {
+        let mut out = view.offset().as_const().unwrap();
+        for (d, s) in view.shape().iter().zip(view.strides()).rev() {
+            let n = d.as_const().unwrap();
+            out += linear % n * s.as_const().unwrap();
+            linear /= n;
+        }
+        out
+    }
+
+    #[test]
+    fn affine_copy_composition_preserves_every_address() {
+        // Narrow gate/up/QK views retain irrelevant batch strides. Also test
+        // a spaced source and a broadcast source, and outer permutations.
+        for scale in [0, 1, 3] {
+            for offset in [0, 37] {
+                let inner = layout(offset, &[1, 1, 40], &[80, 80, scale]);
+                for outer in [
+                    layout(0, &[1, 5, 1, 8], &[40, 8, 8, 1]),
+                    layout(8, &[4, 4], &[8, 1]),
+                    layout(0, &[8, 5], &[1, 8]),
+                ] {
+                    let combined = through_linear_view(&outer, inner.shape(), &inner).unwrap();
+                    for i in 0..const_elements(outer.shape()).unwrap() {
+                        assert_eq!(address(&combined, i), address(&inner, address(&outer, i)));
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn affine_copy_rejects_wrapping_out_of_bounds_and_empty_reads() {
+        let transposed = layout(0, &[4, 8], &[1, 4]);
+        assert!(
+            through_linear_view(
+                &Layout::contiguous(transposed.shape()),
+                transposed.shape(),
+                &transposed
+            )
+            .is_none()
+        );
+        let inner = layout(9, &[1, 40], &[80, 1]);
+        for outer in [
+            layout(39, &[2], &[1]),
+            layout(0, &[0], &[1]),
+            layout(u64::MAX, &[2], &[1]),
+        ] {
+            assert!(through_linear_view(&outer, inner.shape(), &inner).is_none());
+        }
+    }
 }

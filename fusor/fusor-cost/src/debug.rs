@@ -9,6 +9,7 @@ use fusor_ir::device::Caps;
 use fusor_ir::egraph::{ClassId, EGraph, Id};
 use fusor_ir::extract::{Extraction, Plan};
 use fusor_ir::ir::Op;
+use fusor_ir::ir::launch::Family;
 use fusor_ir::ir::launch::{AccessPlan, Launch};
 use rustc_hash::FxHashSet;
 use std::sync::OnceLock;
@@ -27,6 +28,17 @@ pub(crate) struct Flags {
     pub no_private: bool,
     /// `node_math` without the serial-chain floor.
     pub no_seed_floor: bool,
+    /// Explicit benchmark override, only where this family is a runnable equivalent.
+    pub contract_family: Option<Family>,
+    pub contract_small_family: Option<Family>,
+    pub contract_min_m: u64,
+    /// Maximum seed candidates per class for planner-quality experiments.
+    pub seed_candidates: usize,
+    pub seed_min_m: u64,
+    pub seed_small_candidates: usize,
+    /// Retain gather alternatives when bounding the rest of the seed sweep.
+    pub seed_gathers: bool,
+    pub no_wavefront_min_m: Option<u64>,
 }
 
 pub(crate) fn flags() -> &'static Flags {
@@ -34,6 +46,14 @@ pub(crate) fn flags() -> &'static Flags {
     FLAGS.get_or_init(|| {
         let set = |name| std::env::var_os(name).is_some();
         let class = |name| std::env::var(name).ok().and_then(|v| v.parse().ok());
+        let family = |name| {
+            std::env::var(name).ok().map(|s| match s.as_str() {
+                "coop" => Family::Coop,
+                "sgemm" => Family::Sgemm,
+                "sgemv" => Family::Sgemv,
+                _ => panic!("{name} must be coop, sgemm, or sgemv"),
+            })
+        };
         Flags {
             dump_plan: set("FUSOR_DUMP_PLAN"),
             dump_edges: set("FUSOR_DUMP_EDGES"),
@@ -45,6 +65,43 @@ pub(crate) fn flags() -> &'static Flags {
             tune: set("FUSOR_TUNE_DEBUG"),
             no_private: set("FUSOR_NO_PRIVATE"),
             no_seed_floor: set("FUSOR_NO_SEED_FLOOR"),
+            contract_family: family("FUSOR_PIN_CONTRACT_FAMILY"),
+            contract_small_family: family("FUSOR_PIN_CONTRACT_SMALL_FAMILY"),
+            contract_min_m: std::env::var("FUSOR_PIN_CONTRACT_MIN_M")
+                .ok()
+                .map(|s| {
+                    s.parse()
+                        .expect("FUSOR_PIN_CONTRACT_MIN_M must be an integer")
+                })
+                .unwrap_or(1),
+            seed_candidates: std::env::var("FUSOR_PROFILE_SEED_CANDIDATES")
+                .ok()
+                .map(|s| {
+                    s.parse()
+                        .expect("FUSOR_PROFILE_SEED_CANDIDATES must be an integer")
+                })
+                .unwrap_or(usize::MAX),
+            seed_min_m: std::env::var("FUSOR_PROFILE_SEED_MIN_M")
+                .ok()
+                .map(|s| {
+                    s.parse()
+                        .expect("FUSOR_PROFILE_SEED_MIN_M must be an integer")
+                })
+                .unwrap_or(1),
+            seed_small_candidates: std::env::var("FUSOR_PROFILE_SEED_SMALL_CANDIDATES")
+                .ok()
+                .map(|s| {
+                    s.parse()
+                        .expect("FUSOR_PROFILE_SEED_SMALL_CANDIDATES must be an integer")
+                })
+                .unwrap_or(usize::MAX),
+            seed_gathers: set("FUSOR_PROFILE_SEED_GATHERS"),
+            no_wavefront_min_m: std::env::var("FUSOR_PROFILE_NO_WAVEFRONT_MIN_M")
+                .ok()
+                .map(|s| {
+                    s.parse()
+                        .expect("FUSOR_PROFILE_NO_WAVEFRONT_MIN_M must be an integer")
+                }),
         }
     })
 }

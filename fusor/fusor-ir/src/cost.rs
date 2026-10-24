@@ -159,4 +159,18 @@ pub trait CostModel: Send + Sync {
 
     /// Total cost of a realized extraction: every search move's accept test.
     fn total(&self, launches: &[LaunchPlan<'_>]) -> Picoseconds;
+
+    /// Optional exact total after replacing one independent launch. The two
+    /// previous costs were computed before the trial changed its schedule.
+    /// Return `None` when other launches' contributions can change, the total
+    /// is nonlinear, or saturation prevents recovering the unchanged sum.
+    /// The caller then evaluates `total` over the complete trial sequence.
+    fn total_replacing(
+        &self,
+        _previous_total: Picoseconds,
+        _previous_launch: Picoseconds,
+        _replacement: &LaunchPlan<'_>,
+    ) -> Option<Picoseconds> {
+        None
+    }
 }

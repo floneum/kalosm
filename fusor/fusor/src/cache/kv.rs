@@ -49,13 +49,47 @@ struct FixedState {
     arm: Option<(u64, Dyn, Dyn)>,
     /// `u32` write-index leaves, one per appended-chunk width, reused across
     /// steps with fresh bytes.
-    idx: FxHashMap<u64, Dyn>,
+    idx: FxHashMap<u64, WriteIndex>,
     /// The symbol the readable length is bound to, named once per store.
     sym: Option<fusor_ir::shape::SymId>,
     /// The symbol's name. A [`KvCache`] hands both halves one name so the
     /// K and V views carry the same symbol — attention contracts their
     /// length axes against each other.
     sym_name: String,
+}
+
+/// One-token decode indices fit exactly in the existing f32 uniform block.
+/// Larger capacities and multi-token appends retain the integer buffer path.
+#[derive(Clone)]
+enum WriteIndex {
+    Buffer(Dyn),
+    Uniform {
+        value: Dyn,
+        sym: fusor_ir::shape::SymId,
+    },
+}
+
+impl WriteIndex {
+    fn value(&self) -> &Dyn {
+        match self {
+            Self::Buffer(value) | Self::Uniform { value, .. } => value,
+        }
+    }
+
+    fn update(&self, state: &FixedState, added: u64) -> Result<()> {
+        match self {
+            Self::Buffer(value) => value.set_bytes(state.slots(added)),
+            Self::Uniform { value, sym } => {
+                let slot = state.window.map_or(state.len, |w| state.len % w);
+                assert!(
+                    added == 1 && slot <= 1 << 24,
+                    "uniform write index must be exact"
+                );
+                value.graph().set_uniform(*sym, slot as f32);
+                Ok(())
+            }
+        }
+    }
 }
 
 impl FixedState {
@@ -331,17 +365,31 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
             .clone()
             .unwrap_or_else(|| f.store.as_ref().expect("minted above").0.clone());
 
+        // A growing cache can cross the exact-f32 range. Replace its index
+        // node with a buffer before rebuilding the append arm in that case.
+        if f.capacity > 1 << 24 && matches!(f.idx.get(&added), Some(WriteIndex::Uniform { .. })) {
+            f.idx.remove(&added);
+        }
         let idx = match f.idx.get(&added) {
             Some(t) => t.clone(),
             None => {
-                let t = leaf_buffer_node(&graph, Dtype::U32, &[Dim::Const(added)])?;
+                let t = if added == 1 && f.capacity <= 1 << 24 {
+                    let sym = graph.fresh_sym();
+                    WriteIndex::Uniform {
+                        value: Dyn::uniform(&graph, Dtype::U32, sym)?
+                            .reshape(&[Dim::Const(1).into()])?,
+                        sym,
+                    }
+                } else {
+                    WriteIndex::Buffer(leaf_buffer_node(&graph, Dtype::U32, &[Dim::Const(added)])?)
+                };
                 f.idx.insert(added, t.clone());
                 t
             }
         };
-        idx.set_bytes(f.slots(added))?;
+        idx.update(f, added)?;
 
-        let out = store.scatter_set(axis, &idx, value, true)?;
+        let out = store.scatter_set(axis, idx.value(), value, true)?;
         graph.bind_dim(sym, f.advance(added));
 
         let view = readable(&out, axis, Dim::Sym(sym))?;
@@ -369,6 +417,9 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         if !f.idx.contains_key(&added) {
             return false;
         }
+        if f.capacity > 1 << 24 && matches!(f.idx.get(&added), Some(WriteIndex::Uniform { .. })) {
+            return false;
+        }
         match f.window {
             Some(w) => added <= w,
             None => f.len + added <= f.capacity,
@@ -392,7 +443,7 @@ impl<const R: usize, T: Element> TensorCache<R, T> {
         let sym = f.sym.expect("checked by can_replay");
         let idx = f.idx.get(&added).cloned().expect("checked by can_replay");
 
-        idx.set_bytes(f.slots(added))?;
+        idx.update(f, added)?;
         out.graph().bind_dim(sym, f.advance(added));
         f.out = Some(out);
         self.len = Dim::Sym(sym);
@@ -526,9 +577,9 @@ fn reserve<'a>(
                 let graph = source.graph();
                 let mut shape = source.shape().to_vec();
                 shape[axis] = Dim::Const(capacity);
-                let store = leaf_buffer_node(graph, source.dtype(), &shape)?;
+                let store = Dyn::zeros(graph, source.dtype(), &shape)?;
                 let kept = source.narrow(axis, 0, state.len as usize)?;
-                let idx = Dyn::arange(graph, Dtype::U32, 0., state.len as f64)?;
+                let idx = graph.tensor(crate::composite::index_run(graph, 0, state.len)?);
                 Some(store.scatter_set(axis, &idx, &kept, true)?)
             }
             _ => None,
@@ -614,6 +665,22 @@ impl<const R: usize, T: Element> KvCache<R, T> {
     /// length axes against each other.
     pub fn with_capacity(axis: u32, capacity: u64) -> Self {
         Self::fixed_pair(axis, capacity, None)
+    }
+
+    /// Resolve these caches' pending writes and `values`, then commit them.
+    /// Uses the ordinary session resolve; retained values keep their semantics.
+    pub fn resolve_and_commit_all(caches: &mut [Self], values: &[Dyn]) -> Result<()> {
+        let mut roots = values.to_vec();
+        for cache in caches.iter() {
+            cache.pending_into(&mut roots);
+        }
+        if let Some(first) = roots.first() {
+            first.graph().session().resolve(&roots)?;
+        }
+        for cache in caches {
+            cache.commit();
+        }
+        Ok(())
     }
 
     /// Ring of the newest `window` tokens.
@@ -722,6 +789,22 @@ impl<const R: usize, T: Element> KvCache<R, T> {
     /// key cache is authoritative.
     pub fn len(&self) -> Dim {
         self.k.len()
+    }
+
+    /// The host-known readable length at this instant, when available. Unlike
+    /// `len`, this is a snapshot and must not be baked into a replayed graph
+    /// whose prefix will grow. Fixed and ring caches always know their length.
+    pub fn current_len(&self) -> Option<u64> {
+        match &self.k.fixed {
+            Some(f) => Some(f.window.map_or(f.len, |window| f.len.min(window))),
+            None => self.k.len.as_const(),
+        }
+    }
+
+    /// Physical fixed-cache capacity. A graph that bakes this value into its
+    /// dimensions must be rebuilt after growth, unlike the symbolic views.
+    pub fn storage_capacity(&self) -> Option<u64> {
+        self.k.fixed.as_ref().map(|f| f.capacity)
     }
 
     /// Whether no key/value pair has been appended.

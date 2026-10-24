@@ -62,6 +62,15 @@ env:
   FEATURES: kalosm/language,kalosm/llama,kalosm/bert,kalosm/structured,kalosm/fs-documents,kalosm/sound,kalosm/sound-denoise,kalosm/sound-source,kalosm/sound-voice-detection,kalosm/vision,kalosm/remote,kalosm/scrape,kalosm/surrealdb-local
 
 jobs:
+  benchmark-tools:
+    name: Benchmark tools
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check resource guards and measurement validation
+        run: python3 -m unittest discover -s fusor/fusor-visualize/tools -p 'test_*.py'
+
   build:
     if: github.event.pull_request.draft == false
     name: Build
@@ -107,7 +116,7 @@ jobs:
           cargo nextest archive --cargo-profile ci --workspace --lib --bins --tests --examples \
             --features $FEATURES --archive-file root-tests.tar.zst
           cargo nextest archive --cargo-profile ci --manifest-path fusor/Cargo.toml --workspace \
-            --lib --bins --tests --examples --archive-file fusor-tests.tar.zst
+            --lib --bins --tests --examples --features fusor/kernel-observer,fusor/compiler-tests --archive-file fusor-tests.tar.zst
           cargo build --profile ci --manifest-path fusor/Cargo.toml -p fusor-conformance
       - uses: actions/upload-artifact@v4
         with:
@@ -141,6 +150,12 @@ jobs:
           name: linux-tests
       - name: Configure lavapipe
         uses: ./.github/actions/lavapipe
+      - name: Run shared compiler WebGPU regressions
+        env:
+          FUSOR_CONFORMANCE_REQUIRE_GPU: "1"
+        run: |
+          cargo nextest run --archive-file fusor-tests.tar.zst --workspace-remap fusor --extract-to fusor \
+            --run-ignored only --test-threads 1 -E 'binary(shared_compiler)'
       - name: Run tests
         env:
           OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
@@ -154,7 +169,7 @@ jobs:
             -E 'not (package(rbert) | package(rwhisper) | binary(hybrid_test))'
           # The 400-step training test outlives the stall limit on lavapipe;
           # macOS runs it on a hardware adapter.
-          cargo nextest run --archive-file fusor-tests.tar.zst --workspace-remap fusor --extract-to fusor \
+          cargo nextest run --archive-file fusor-tests.tar.zst --workspace-remap fusor --extract-to fusor --extract-overwrite \
             -E 'not test(training_improves_held_out_loss_and_preserves_causal_attention)'
 
   # Shards balanced from measured per-suite times. A filter ending in `::`
@@ -281,7 +296,8 @@ jobs:
           cache-workspace-crates: "true"
       - run: |
           cargo clippy --workspace --examples --tests --features $FEATURES -- -D warnings
-          cargo clippy --manifest-path fusor/Cargo.toml --workspace --all-targets -- -D warnings
+          cargo clippy --manifest-path fusor/Cargo.toml --workspace --all-targets --features fusor/kernel-observer -- -D warnings
+          cargo clippy -p kalosm-llama --example profile_kernel_share --example visualize_kernels --features kernel-visualize -- -D warnings
 
   fmt:
     if: github.event.pull_request.draft == false

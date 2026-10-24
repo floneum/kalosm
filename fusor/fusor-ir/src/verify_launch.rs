@@ -69,6 +69,64 @@ pub fn verify_launch(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<(
     }
 
     // 1 + 2.
+    if let Launch::RmsNorm { sched, block, .. } = op
+        && (cx.caps.kind != crate::device::DeviceKind::Gpu
+            || !cx.result.numeric.reassoc
+            || !cx.result.numeric.contract
+            || cx.caps.limits.max_compute_invocations_per_workgroup < *block
+            || cx.caps.limits.max_compute_workgroup_size[0] < *block
+            || cx.caps.limits.max_compute_workgroup_storage_size < *block * 4
+            || *sched != ScheduleDomain::Point)
+    {
+        return Err(relabel(
+            cx,
+            "fused RMS normalization exceeds device capabilities".into(),
+        ));
+    }
+    if let Launch::DecodeAttention {
+        block,
+        subgroup: schedule_subgroup,
+        ops,
+        sched,
+        ..
+    } = op
+    {
+        let width = ops[0].layout.shape()[3].as_const().unwrap_or(0);
+        let subgroup = cx.caps.subgroup_width();
+        let bytes = u64::from(*block / subgroup.max(1)) * (width + 2) * 4;
+        if cx.caps.kind != crate::device::DeviceKind::Gpu
+            || !cx.result.numeric.reassoc
+            || !cx.result.numeric.contract
+            || !cx.caps.subgroups.is_some_and(|s| s.is_fixed())
+            || *schedule_subgroup != subgroup
+            || !width.is_multiple_of(u64::from(subgroup.max(1)))
+            || !block.is_multiple_of(subgroup.max(1))
+            || cx.caps.limits.max_compute_invocations_per_workgroup < *block
+            || cx.caps.limits.max_compute_workgroup_size[0] < *block
+            || bytes > u64::from(cx.caps.limits.max_compute_workgroup_storage_size)
+            || *sched != ScheduleDomain::Point
+        {
+            return Err(relabel(
+                cx,
+                "streaming attention exceeds device capabilities".into(),
+            ));
+        }
+    }
+    if let Launch::DecodeAttentionMerge { output, sched, .. } = op {
+        let width = output.dims[3].as_const().unwrap_or(u64::MAX);
+        if cx.caps.kind != crate::device::DeviceKind::Gpu
+            || !cx.result.numeric.reassoc
+            || !cx.result.numeric.contract
+            || u64::from(cx.caps.limits.max_compute_invocations_per_workgroup) < width
+            || u64::from(cx.caps.limits.max_compute_workgroup_size[0]) < width
+            || *sched != ScheduleDomain::Point
+        {
+            return Err(relabel(
+                cx,
+                "attention merge exceeds device capabilities".into(),
+            ));
+        }
+    }
     if let Some(sched) = op.schedule() {
         check_schedule_domain(op, sched, cx.caps, planner)
             .map_err(|e| relabel(cx, format!("{e}")))?;
@@ -373,6 +431,13 @@ pub fn check_operand_access(op: &Launch) -> Result<()> {
     }
     let space = op.space();
     for (i, o) in op.operands().enumerate() {
+        // Source and indices have their own logical spaces; only a gather's
+        // elementwise epilogue operands use the output space.
+        let space = if matches!(op, Launch::Gather { .. }) && i < 2 {
+            None
+        } else {
+            space
+        };
         let fail = |msg: String| Error::Legality(format!("operand {i}: {msg}"));
         match &o.access {
             // Always legal: a gather derives its own addresses.
@@ -559,6 +624,7 @@ fn store_dtype(op: &Launch) -> Dtype {
         Launch::Map { body, .. } => body.dtype(),
         Launch::Fold { acc, .. } => *acc,
         Launch::Contract { post, .. } => post.dtype(),
+        Launch::Gather { post, .. } => post.dtype(),
         _ => Dtype::F32,
     }
 }

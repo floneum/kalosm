@@ -1304,6 +1304,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "convert_case"
+version = "0.10.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "633458d4ef8c78b72454de2d54fd6ab2e60f9e02be22f3c6104cdc8a4e0fceb9"
+dependencies = [
+ "unicode-segmentation",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1653,9 +1662,13 @@ checksum = "d8b9f2e4c67f833b660cdb0a3523065869fb35570177239812ed4c905aeff87b"
 dependencies = [
  "bitflags 2.13.0",
  "crossterm_winapi",
+ "derive_more 2.1.1",
  "document-features",
+ "mio",
  "parking_lot",
  "rustix",
+ "signal-hook",
+ "signal-hook-mio",
  "winapi",
 ]
 
@@ -1995,6 +2008,28 @@ checksum = "6edb4b64a43d977b8e99788fe3a04d483834fba1215a7e02caa415b626497f7f"
 dependencies = [
  "proc-macro2",
  "quote",
+ "syn 2.0.117",
+]
+
+[[package]]
+name = "derive_more"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d751e9e49156b02b44f9c1815bcb94b984cdcc4396ecc32521c739452808b134"
+dependencies = [
+ "derive_more-impl",
+]
+
+[[package]]
+name = "derive_more-impl"
+version = "2.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "799a97264921d8623a957f6c3b9011f3b5492f557bbb7a5a19b7fa6d06ba8dcb"
+dependencies = [
+ "convert_case 0.10.0",
+ "proc-macro2",
+ "quote",
+ "rustc_version",
  "syn 2.0.117",
 ]
 
@@ -2606,6 +2641,17 @@ dependencies = [
  "parking_lot",
  "rustc-hash 2.1.2",
  "smallvec 1.15.1",
+]
+
+[[package]]
+name = "fusor-visualize"
+version = "0.1.0"
+dependencies = [
+ "crossterm",
+ "fusor-gguf",
+ "fusor-ir",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -3996,6 +4042,9 @@ dependencies = [
  "chrono",
  "fusor",
  "fusor-gguf",
+ "fusor-gpu",
+ "fusor-ir",
+ "fusor-visualize",
  "futures-channel",
  "futures-util",
  "getrandom 0.3.4",
@@ -4586,6 +4635,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda"
 dependencies = [
  "libc",
+ "log",
  "wasi",
  "windows-sys 0.61.2",
 ]
@@ -4642,7 +4692,7 @@ dependencies = [
 [[package]]
 name = "naga"
 version = "29.0.3"
-source = "git+https://github.com/ealmloff/wgpu?rev=24a7d3577213fc147637fe7fb20e0e845a74df8a#24a7d3577213fc147637fe7fb20e0e845a74df8a"
+source = "git+https://github.com/ealmloff/wgpu?rev=9c9187d26886eccc4b3fbfeb67989ce77fbd1217#9c9187d26886eccc4b3fbfeb67989ce77fbd1217"
 dependencies = [
  "arrayvec",
  "bit-set 0.9.1",
@@ -6876,7 +6926,7 @@ checksum = "4eb30575f3638fc8f6815f448d50cb1a2e255b0897985c8c59f4d37b72a07b06"
 dependencies = [
  "bitflags 2.13.0",
  "cssparser 0.31.2",
- "derive_more",
+ "derive_more 0.99.20",
  "fxhash",
  "log",
  "new_debug_unreachable",
@@ -7084,6 +7134,27 @@ name = "shlex"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
+
+[[package]]
+name = "signal-hook"
+version = "0.3.18"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d881a16cf4426aa584979d30bd82cb33429027e42122b169753d6ef1085ed6e2"
+dependencies = [
+ "libc",
+ "signal-hook-registry",
+]
+
+[[package]]
+name = "signal-hook-mio"
+version = "0.2.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b75a19a7a740b25bc7944bdee6172368f988763b744e3d4dfe753f6b4ece40cc"
+dependencies = [
+ "libc",
+ "mio",
+ "signal-hook",
+]
 
 [[package]]
 name = "signal-hook-registry"
@@ -8789,7 +8860,7 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 [[package]]
 name = "wgpu"
 version = "29.0.4"
-source = "git+https://github.com/ealmloff/wgpu?rev=24a7d3577213fc147637fe7fb20e0e845a74df8a#24a7d3577213fc147637fe7fb20e0e845a74df8a"
+source = "git+https://github.com/ealmloff/wgpu?rev=9c9187d26886eccc4b3fbfeb67989ce77fbd1217#9c9187d26886eccc4b3fbfeb67989ce77fbd1217"
 dependencies = [
  "arrayvec",
  "bitflags 2.13.0",

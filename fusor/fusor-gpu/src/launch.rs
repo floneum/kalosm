@@ -24,6 +24,71 @@ pub const METAL_SUBMIT_CHUNK: usize = 256;
 /// Chunk submits in flight before the encoder waits for the oldest: bounds
 /// transients without draining the queue mid-plan.
 pub const METAL_INFLIGHT_CHUNKS: usize = 2;
+
+pub(crate) fn inflight_chunks(total: usize) -> usize {
+    let flags = crate::flags::flags();
+    let normal = flags
+        .inflight_chunks
+        .unwrap_or(METAL_INFLIGHT_CHUNKS)
+        .max(1);
+    if total
+        >= flags
+            .large_plan_min_dispatches
+            .unwrap_or(PASS_CHUNK_THRESHOLD)
+    {
+        flags
+            .large_plan_inflight_chunks
+            .map_or(normal, |limit| limit.min(normal))
+    } else {
+        normal
+    }
+}
+
+/// Bound the number of preparation/submission chunks, accounting for a
+/// separately sized tail. A large tail need not delay the first submission.
+pub(crate) fn stream_chunks(
+    total: usize,
+    first: usize,
+    rest: Option<usize>,
+    limit: usize,
+) -> (usize, usize) {
+    let first = first.max(1);
+    let limit = limit.max(1);
+    match rest {
+        None => {
+            let chunk = first.max(total.div_ceil(limit));
+            (chunk, chunk)
+        }
+        Some(rest) => {
+            let rest = rest.max(first);
+            let first = first.max(total.saturating_sub(rest.saturating_mul(limit - 1)));
+            (first, rest.max(first))
+        }
+    }
+}
+
+#[test]
+fn stream_prefix_respects_the_complete_inflight_budget() {
+    assert_eq!(stream_chunks(403, 8, Some(128), 32), (8, 128));
+    assert_eq!(stream_chunks(403, 8, None, 32), (13, 13));
+    assert_eq!(stream_chunks(403, 8, Some(128), 1), (403, 403));
+    for total in [0, 1, 7, 8, 13, 128, 403, 4096, usize::MAX] {
+        for first in [1, 8, 32, 128, usize::MAX] {
+            for rest in [None, Some(0), Some(64), Some(128), Some(usize::MAX)] {
+                for limit in [1, 2, 4, 32, usize::MAX] {
+                    let (head, tail) = stream_chunks(total, first, rest, limit);
+                    let chunks = if total == 0 {
+                        0
+                    } else {
+                        1 + total.saturating_sub(head).div_ceil(tail)
+                    };
+                    assert!(head >= first && tail >= head);
+                    assert!(chunks <= limit, "{total} {first} {rest:?} {limit}");
+                }
+            }
+        }
+    }
+}
 /// `poll_wait` spins in `Poll` mode for this long before blocking.
 pub const POLL_SPIN: Duration = Duration::from_millis(2);
 
@@ -65,7 +130,7 @@ pub(crate) fn lru_retain<K: std::hash::Hash + Eq + Clone, V>(
 /// Dispatches packed into one compute pass: chunked past the threshold,
 /// never one pass per dispatch (a Metal pass boundary costs a small kernel).
 pub fn dispatches_per_pass(total: usize) -> usize {
-    if let Some(n) = crate::flags().pass_size {
+    if let Some(n) = crate::flags::flags().pass_size {
         return n;
     }
     if total >= PASS_CHUNK_THRESHOLD {
@@ -77,6 +142,17 @@ pub fn dispatches_per_pass(total: usize) -> usize {
 
 /// Dispatches per submit: Metal bounds in-flight memory on giant graphs.
 pub fn dispatches_per_submit(total: usize, backend: wgpu::Backend) -> usize {
+    if total
+        >= crate::flags::flags()
+            .large_plan_min_dispatches
+            .unwrap_or(PASS_CHUNK_THRESHOLD)
+        && let Some(n) = crate::flags::flags().large_plan_submit_size
+    {
+        return n.min(crate::flags::flags().submit_size.unwrap_or(usize::MAX));
+    }
+    if let Some(n) = crate::flags::flags().submit_size {
+        return n;
+    }
     if backend == wgpu::Backend::Metal && total >= PASS_CHUNK_THRESHOLD {
         METAL_SUBMIT_CHUNK
     } else {
@@ -210,20 +286,68 @@ impl KernelProfile {
     }
 }
 
+/// One checked buffer operation in a transfer launch.
+#[derive(Clone)]
+pub enum BufferTransfer {
+    Copy {
+        src: Buf,
+        dst: Buf,
+        src_offset: u64,
+        dst_offset: u64,
+        bytes: u64,
+    },
+    Clear {
+        dst: Buf,
+        offset: u64,
+        bytes: u64,
+    },
+}
+
 /// One recorded command, in exact plan order.
 #[derive(Clone)]
 pub enum CommandRecord {
+    /// One ordinary tensor launch implemented by buffer copies/clears.
+    Transfers { copies: Vec<BufferTransfer> },
     Dispatch {
         name: &'static str,
         pipeline: Arc<wgpu::ComputePipeline>,
         bind_group: Arc<wgpu::BindGroup>,
         grid: [u32; 3],
     },
-    /// `bytes` from the start of `src` to the start of `dst`.
-    CopyBuffer { src: Buf, dst: Buf, bytes: u64 },
+    /// An aligned byte range copied through the ordinary WebGPU encoder.
+    CopyBuffer {
+        src: Buf,
+        dst: Buf,
+        src_offset: u64,
+        dst_offset: u64,
+        bytes: u64,
+    },
 }
 
 impl CommandRecord {
+    /// Bytes moved by a copy; diagnostic observers use this to identify pass
+    /// boundaries and traffic omitted by dispatch-only attribution.
+    pub fn copy_bytes(&self) -> Option<u64> {
+        match self {
+            Self::CopyBuffer { bytes, .. } => Some(*bytes),
+            Self::Transfers { copies } => Some(
+                copies
+                    .iter()
+                    .map(|c| match c {
+                        BufferTransfer::Copy { bytes, .. } => *bytes,
+                        BufferTransfer::Clear { .. } => 0,
+                    })
+                    .sum(),
+            ),
+            Self::Dispatch { .. } => None,
+        }
+    }
+
+    /// Whether this command owns a compute timestamp slot.
+    pub fn is_live_dispatch(&self) -> bool {
+        matches!(self, Self::Dispatch { grid, .. } if !grid.contains(&0))
+    }
+
     /// A dispatch whose grid contains a zero launches nothing and is skipped.
     pub fn is_empty_dispatch(&self) -> bool {
         matches!(self, Self::Dispatch { grid, .. } if grid.contains(&0))
@@ -244,6 +368,8 @@ pub enum TimingMode<'a> {
     Range { start: usize, n: usize },
     /// One pair around the whole submission: the plan's GPU span.
     Whole,
+    /// Boundaries of existing compute passes, without splitting them.
+    Passes,
 }
 
 impl TimingMode<'_> {
@@ -270,7 +396,9 @@ pub(crate) struct TimingPlan {
 enum TimingKind {
     All,
     Focus,
+    Sample,
     Whole,
+    Passes,
     Range { start: usize, n: usize },
 }
 
@@ -283,8 +411,9 @@ impl TimingPlan {
         match self.kind {
             TimingKind::All => TimingMode::All,
             TimingKind::Focus if self.live.len() == 1 => TimingMode::Focus(self.live[0]),
-            TimingKind::Focus => TimingMode::Sparse(&self.live),
+            TimingKind::Focus | TimingKind::Sample => TimingMode::Sparse(&self.live),
             TimingKind::Whole => TimingMode::Whole,
+            TimingKind::Passes => TimingMode::Passes,
             TimingKind::Range { start, n } => TimingMode::Range { start, n },
         }
     }
@@ -311,6 +440,10 @@ pub struct Launcher {
     config: GpuConfig,
     in_flight: AtomicUsize,
     poll_waits: AtomicU64,
+    #[cfg(feature = "kernel-observer")]
+    poll_spin_override_ms: AtomicU64,
+    #[cfg(feature = "kernel-observer")]
+    poll_interval_override_us: AtomicU64,
     dispatches: AtomicU64,
     pipeline_compiles: AtomicU64,
     profiles: Mutex<Vec<KernelProfile>>,
@@ -320,6 +453,7 @@ pub struct Launcher {
     last_profile: Mutex<Option<Vec<f64>>>,
     /// Plan launch indices the next traced resolve times; taken by it.
     tuning_focus: Mutex<Option<Vec<usize>>>,
+    sample_cursor: AtomicUsize,
     /// Bind groups by `(artifact id, bound buffer addresses)`. An address
     /// names a buffer only while it lives, so an entry is served only while
     /// every weak witness beside it is alive.
@@ -384,12 +518,17 @@ impl Launcher {
             lost,
             in_flight: AtomicUsize::new(0),
             poll_waits: AtomicU64::new(0),
+            #[cfg(feature = "kernel-observer")]
+            poll_spin_override_ms: AtomicU64::new(u64::MAX),
+            #[cfg(feature = "kernel-observer")]
+            poll_interval_override_us: AtomicU64::new(u64::MAX),
             dispatches: AtomicU64::new(0),
             pipeline_compiles: AtomicU64::new(0),
             profiles: Mutex::new(Vec::new()),
             tuning: AtomicBool::new(false),
             last_profile: Mutex::new(None),
             tuning_focus: Mutex::new(None),
+            sample_cursor: AtomicUsize::new(0),
             bind_groups: Mutex::new(lru::LruCache::new(
                 std::num::NonZeroUsize::new(BIND_GROUP_CAPACITY).expect("nonzero"),
             )),
@@ -537,22 +676,41 @@ impl Launcher {
         timestamps: Option<&wgpu::QuerySet>,
         mode: TimingMode,
     ) -> Result<()> {
+        let total = records
+            .iter()
+            .filter(|r| matches!(r, CommandRecord::Dispatch { .. }) && !r.is_empty_dispatch())
+            .count();
+        self.encode_command_records_from(records, timestamps, mode, 0, total)
+    }
+
+    /// Submit a consecutive portion of a resolve without resetting its query
+    /// indices. The caller preserves plan order and bounds outstanding chunks.
+    pub(crate) fn encode_command_records_from(
+        &self,
+        records: &[CommandRecord],
+        timestamps: Option<&wgpu::QuerySet>,
+        mode: TimingMode,
+        first_dispatch: usize,
+        total: usize,
+    ) -> Result<()> {
         // A zero grid launches nothing but would cost a pass boundary.
         let live: Vec<&CommandRecord> = records.iter().filter(|r| !r.is_empty_dispatch()).collect();
-        let total = live
-            .iter()
-            .filter(|r| matches!(r, CommandRecord::Dispatch { .. }))
-            .count();
+        let last_portion = first_dispatch
+            + live
+                .iter()
+                .filter(|r| matches!(r, CommandRecord::Dispatch { .. }))
+                .count()
+            == total;
         // `FUSOR_TRACE_DISPATCH`: one dispatch per submit, each waited on, to
         // attribute an asynchronous device loss to a kernel.
-        let trace = crate::flags().trace_dispatch;
+        let trace = crate::flags::flags().trace_dispatch;
         let per_submit = if trace {
             1
         } else {
             dispatches_per_submit(total, self.backend)
         };
 
-        let mut dispatch_ix = 0usize;
+        let mut dispatch_ix = first_dispatch;
         let mut chunk: Vec<&CommandRecord> = Vec::new();
         let mut dispatches_in_chunk = 0usize;
         let mut submits = 0usize;
@@ -599,7 +757,7 @@ impl Launcher {
                 dispatches_in_chunk = 0;
                 submits += 1;
                 pending.push_back(submitted);
-                if pending.len() > METAL_INFLIGHT_CHUNKS
+                if pending.len() > inflight_chunks(total)
                     && let Some(oldest) = pending.pop_front()
                 {
                     let _w = Stopwatch::start(&CHUNK_WAIT_US);
@@ -615,8 +773,11 @@ impl Launcher {
         if !chunk.is_empty() || submits == 0 {
             self.encode_one_submit(&chunk, timestamps, mode, dispatch_ix, total)?;
         }
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
-        self.apply_back_pressure()
+        if last_portion {
+            self.in_flight.fetch_add(1, Ordering::Relaxed);
+            self.apply_back_pressure()?;
+        }
+        Ok(())
     }
 
     /// One encoder's passes; returns the next query index and submission.
@@ -645,7 +806,7 @@ impl Launcher {
                 TimingMode::Range { start, n } if ix >= start && ix < start + n => {
                     u32::try_from((ix - start) * 2).ok()
                 }
-                TimingMode::Range { .. } | TimingMode::Whole => None,
+                TimingMode::Range { .. } | TimingMode::Whole | TimingMode::Passes => None,
             }
         };
         // Without in-pass writes a timed dispatch needs its own pass; only
@@ -668,10 +829,50 @@ impl Launcher {
         let mut at = 0usize;
         while at < records.len() {
             match records[at] {
-                CommandRecord::CopyBuffer { src, dst, bytes } => {
+                CommandRecord::Transfers { copies } => {
+                    for copy in copies {
+                        match copy {
+                            BufferTransfer::Copy {
+                                src,
+                                dst,
+                                src_offset,
+                                dst_offset,
+                                bytes,
+                            } => {
+                                let s = GpuBuffer::of(src, "copy source")?;
+                                let d = GpuBuffer::of(dst, "copy destination")?;
+                                encoder.copy_buffer_to_buffer(
+                                    &s.buffer,
+                                    *src_offset,
+                                    &d.buffer,
+                                    *dst_offset,
+                                    *bytes,
+                                );
+                            }
+                            BufferTransfer::Clear { dst, offset, bytes } => {
+                                let d = GpuBuffer::of(dst, "clear destination")?;
+                                encoder.clear_buffer(&d.buffer, *offset, Some(*bytes));
+                            }
+                        }
+                    }
+                    at += 1;
+                }
+                CommandRecord::CopyBuffer {
+                    src,
+                    dst,
+                    src_offset,
+                    dst_offset,
+                    bytes,
+                } => {
                     let s = GpuBuffer::of(src, "copy source")?;
                     let d = GpuBuffer::of(dst, "copy destination")?;
-                    encoder.copy_buffer_to_buffer(&s.buffer, 0, &d.buffer, 0, *bytes);
+                    encoder.copy_buffer_to_buffer(
+                        &s.buffer,
+                        *src_offset,
+                        &d.buffer,
+                        *dst_offset,
+                        *bytes,
+                    );
                     at += 1;
                 }
                 CommandRecord::Dispatch { .. } => {
@@ -707,6 +908,12 @@ impl Launcher {
                             beginning_of_pass_write_index: (dispatch_ix == 0).then_some(0),
                             end_of_pass_write_index: Some(1),
                         })
+                    } else if matches!(mode, TimingMode::Passes) {
+                        timestamps.map(|set| wgpu::ComputePassTimestampWrites {
+                            query_set: set,
+                            beginning_of_pass_write_index: Some((dispatch_ix * 2) as u32),
+                            end_of_pass_write_index: Some((dispatch_ix * 2 + 1) as u32),
+                        })
                     } else {
                         pass_slot.and_then(|q| {
                             timestamps.map(|set| wgpu::ComputePassTimestampWrites {
@@ -730,7 +937,9 @@ impl Launcher {
                         else {
                             unreachable!("the run is all dispatches");
                         };
-                        pass.push_debug_group(name);
+                        if !crate::flags::flags().no_debug_groups {
+                            pass.push_debug_group(name);
+                        }
                         let in_pass_slot = timestamps
                             .filter(|_| inside_passes)
                             .and_then(|_| slots(dispatch_ix));
@@ -747,7 +956,9 @@ impl Launcher {
                         {
                             pass.write_timestamp(set, q + 1);
                         }
-                        pass.pop_debug_group();
+                        if !crate::flags::flags().no_debug_groups {
+                            pass.pop_debug_group();
+                        }
                         dispatch_ix += 1;
                         self.dispatches.fetch_add(1, Ordering::Relaxed);
                     }
@@ -814,17 +1025,60 @@ impl Launcher {
         self.lost.check()
     }
 
+    /// Bounded diagnostic comparison of ordinary WebGPU completion polling.
+    #[cfg(feature = "kernel-observer")]
+    pub fn set_poll_spin_ms(&self, milliseconds: Option<u64>) -> Result<()> {
+        if milliseconds.is_some_and(|n| n > 64) {
+            return Err(Error::Device("poll spin window must be 0..=64 ms".into()));
+        }
+        self.poll_spin_override_ms
+            .store(milliseconds.unwrap_or(u64::MAX), Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Compare ordinary polling intervals without changing queued GPU work.
+    #[cfg(feature = "kernel-observer")]
+    pub fn set_poll_interval_us(&self, microseconds: Option<u64>) -> Result<()> {
+        if microseconds.is_some_and(|n| n > 1000) {
+            return Err(Error::Device("poll interval must be 0..=1000 us".into()));
+        }
+        self.poll_interval_override_us
+            .store(microseconds.unwrap_or(u64::MAX), Ordering::Relaxed);
+        Ok(())
+    }
+
     fn poll_wait_inner(&self) -> Result<()> {
         self.poll_waits.fetch_add(1, Ordering::Relaxed);
         let _w = Stopwatch::start(&POLL_WAIT_US);
-        let deadline = Instant::now() + POLL_SPIN;
+        let spin = crate::flags::flags()
+            .poll_spin_ms
+            .map(Duration::from_millis)
+            .unwrap_or(POLL_SPIN);
+        #[cfg(feature = "kernel-observer")]
+        let spin = match self.poll_spin_override_ms.load(Ordering::Relaxed) {
+            u64::MAX => spin,
+            milliseconds => Duration::from_millis(milliseconds),
+        };
+        let deadline = Instant::now() + spin;
+        let interval = crate::flags::flags().poll_interval_us;
+        #[cfg(feature = "kernel-observer")]
+        let interval = match self.poll_interval_override_us.load(Ordering::Relaxed) {
+            u64::MAX => interval,
+            microseconds => microseconds,
+        };
         while Instant::now() < deadline {
             match self.device.poll(wgpu::PollType::Poll) {
                 Ok(wgpu::PollStatus::QueueEmpty) => {
                     self.in_flight.store(0, Ordering::Relaxed);
                     return Ok(());
                 }
-                Ok(_) => std::hint::spin_loop(),
+                Ok(_) => {
+                    if interval == 0 {
+                        std::hint::spin_loop();
+                    } else {
+                        std::thread::sleep(Duration::from_micros(interval));
+                    }
+                }
                 Err(e) => return Err(Error::Device(format!("device poll failed: {e}"))),
             }
         }
@@ -867,6 +1121,8 @@ impl Launcher {
         let record = CommandRecord::CopyBuffer {
             src: src.clone(),
             dst: dst.clone(),
+            src_offset: 0,
+            dst_offset: 0,
             bytes,
         };
         self.encode_command_records(&[record], None, TimingMode::All)
@@ -876,7 +1132,7 @@ impl Launcher {
     /// wgpu's lives across the `await` (a held `BufferSlice` overflows callers'
     /// `Send` checks), so the map is two sync halves around [`MapDone`].
     async fn readback_into(&self, src: &Buf, staging: &Buf, bytes: u64) -> Result<Vec<u8>> {
-        let trace = crate::flags().trace_dispatch;
+        let trace = crate::flags::flags().trace_dispatch;
         let state = |what: &str| {
             if trace {
                 let src_size = src.downcast_ref::<GpuBuffer>().map_or(0, |b| b.size);
@@ -962,6 +1218,20 @@ impl Launcher {
         set: &wgpu::QuerySet,
         dispatches: usize,
     ) -> Result<Vec<f64>> {
+        let period = f64::from(self.queue.get_timestamp_period());
+        Ok(self
+            .read_timestamp_ticks(pool, set, dispatches)?
+            .into_iter()
+            .map(|(start, end)| end.saturating_sub(start) as f64 * period / 1000.0)
+            .collect())
+    }
+
+    fn read_timestamp_ticks(
+        &self,
+        pool: &BufferPool,
+        set: &wgpu::QuerySet,
+        dispatches: usize,
+    ) -> Result<Vec<(u64, u64)>> {
         let slots = dispatches.saturating_mul(2);
         if slots == 0 {
             return Ok(Vec::new());
@@ -1001,45 +1271,66 @@ impl Launcher {
         pool.recycle(staging);
         pool.recycle(resolved);
 
-        // A zero period reads every span as zero, i.e. "not timed".
-        let period = f64::from(self.queue.get_timestamp_period());
         let tick = |i: usize| {
             raw.get(i * 8..i * 8 + 8)
                 .and_then(|b| <[u8; 8]>::try_from(b).ok())
                 .map_or(0u64, u64::from_le_bytes)
         };
         Ok((0..dispatches)
-            .map(|d| tick(d * 2 + 1).saturating_sub(tick(d * 2)) as f64 * period / 1000.0)
+            .map(|d| (tick(d * 2), tick(d * 2 + 1)))
             .collect())
     }
 
     /// Choose how a resolve is timed. A named `focus` wins over whole-plan
     /// timing, so a caller gets exactly the launches it will read.
-    pub(crate) fn timing_plan(
+    pub(crate) fn timing_plan_for_dispatches(
         &self,
-        records: &[CommandRecord],
+        records: &[bool],
         focus: Option<Vec<usize>>,
     ) -> TimingPlan {
         // Focus is restated in live-dispatch indices, sorted and deduped for
         // the binary-searched slot map.
+        let flags = crate::flags::flags();
+        let sampled =
+            focus.as_ref().is_none_or(Vec::is_empty) && flags.time_sample_stride.is_some();
         let mut focus = focus.unwrap_or_default();
+        if sampled {
+            let stride = flags.time_sample_stride.unwrap();
+            let offset = self.sample_cursor.fetch_add(1, Ordering::Relaxed) % stride;
+            focus = records
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| **r)
+                .skip(offset)
+                .step_by(stride)
+                .take(wgpu::QUERY_SET_MAX_QUERIES as usize / 2)
+                .map(|(i, _)| i)
+                .collect();
+            self.set_tuning(true);
+        }
         focus.sort_unstable();
         focus.dedup();
-        let live_before = |ix: usize| {
-            records[..ix]
-                .iter()
-                .filter(|r| !r.is_empty_dispatch())
-                .count()
-        };
+        let live_before = |ix: usize| records[..ix].iter().filter(|r| **r).count();
         let focus: Vec<(usize, usize)> = focus
             .into_iter()
-            .filter(|&ix| records.get(ix).is_some_and(|r| !r.is_empty_dispatch()))
+            .filter(|&ix| records.get(ix).copied().unwrap_or(false))
             .map(|ix| (ix, live_before(ix)))
             .collect();
         let live: Vec<usize> = focus.iter().map(|&(_, l)| l).collect();
-        let flags = crate::flags();
         let (set, kind) = if !focus.is_empty() {
-            (self.timestamp_query_set(focus.len()), TimingKind::Focus)
+            (
+                self.timestamp_query_set(focus.len()),
+                if sampled {
+                    TimingKind::Sample
+                } else {
+                    TimingKind::Focus
+                },
+            )
+        } else if sampled {
+            (None, TimingKind::Sample)
+        } else if flags.time_passes && self.can_time_whole(records.len()) {
+            self.set_tuning(true);
+            (self.timestamp_query_set(records.len()), TimingKind::Passes)
         } else if flags.time_plan {
             // `TPLAN <us>`: the plan's whole GPU span.
             self.set_tuning(true);
@@ -1085,9 +1376,18 @@ impl Launcher {
         self.poll_wait()?;
         let name = |r: &CommandRecord| match r {
             CommandRecord::Dispatch { name, .. } => *name,
-            CommandRecord::CopyBuffer { .. } => "?",
+            CommandRecord::CopyBuffer { .. } | CommandRecord::Transfers { .. } => "copy",
         };
         match timing.kind {
+            TimingKind::Sample => {
+                let samples = self.read_timestamps(pool, set, timing.focus.len())?;
+                for (&(plan_ix, live_ix), us) in timing.focus.iter().zip(samples) {
+                    let CommandRecord::Dispatch { name, grid, .. } = &records[plan_ix] else {
+                        unreachable!("sampled records are dispatches");
+                    };
+                    eprintln!("TSAMPLE {live_ix} {name} {us:.3} L{plan_ix} grid={grid:?}");
+                }
+            }
             // Only focused dispatches were timed; other slots read zero.
             TimingKind::Focus => {
                 let samples = self.read_timestamps(pool, set, timing.focus.len())?;
@@ -1105,13 +1405,49 @@ impl Launcher {
                     eprintln!("TPLAN {us:.1} n={}", records.len());
                 }
             }
+            TimingKind::Passes => {
+                let ticks = self.read_timestamp_ticks(pool, set, records.len())?;
+                let period = f64::from(self.queue.get_timestamp_period()) / 1000.0;
+                let mut first = None;
+                let mut last = 0;
+                let mut busy = 0u64;
+                let mut count = 0;
+                for (ix, (start, end)) in ticks.into_iter().enumerate() {
+                    if start == 0 && end == 0 {
+                        continue;
+                    }
+                    if start == 0 || end < start || start < last {
+                        return Err(Error::Device("invalid compute-pass timestamps".into()));
+                    }
+                    first.get_or_insert(start);
+                    let gap = if last == 0 { 0 } else { start - last };
+                    eprintln!(
+                        "TPASS start_dispatch={ix} duration_us={:.3} gap_us={:.3}",
+                        (end - start) as f64 * period,
+                        gap as f64 * period
+                    );
+                    busy += end - start;
+                    last = end;
+                    count += 1;
+                }
+                if let Some(first) = first {
+                    let span = last - first;
+                    eprintln!(
+                        "TPASSES passes={count} span_us={:.3} pass_us={:.3} gap_us={:.3}",
+                        span as f64 * period,
+                        busy as f64 * period,
+                        (span - busy) as f64 * period
+                    );
+                    eprintln!("TPLAN {:.1} n={}", span as f64 * period, records.len());
+                }
+            }
             // `TSPAN <live index> <kernel> <us> L<plan launch> grid=[x,y,z]`.
             TimingKind::Range { start, n } => {
                 let samples = self.read_timestamps(pool, set, n)?;
                 let live: Vec<(usize, &CommandRecord)> = records
                     .iter()
                     .enumerate()
-                    .filter(|(_, r)| !r.is_empty_dispatch())
+                    .filter(|(_, r)| r.is_live_dispatch())
                     .collect();
                 for (j, us) in samples.iter().enumerate() {
                     let ix = start + j;
@@ -1128,14 +1464,14 @@ impl Launcher {
                 }
             }
             TimingKind::All => {
-                let live = records.iter().filter(|r| !r.is_empty_dispatch()).count();
+                let live = records.iter().filter(|r| r.is_live_dispatch()).count();
                 let mut samples = self.read_timestamps(pool, set, live)?.into_iter();
                 // Back to plan order: zero-grid launches own no sample.
                 let per_launch: Vec<f64> = records
                     .iter()
-                    .map(|r| match r.is_empty_dispatch() {
-                        true => 0.0,
-                        false => samples.next().unwrap_or(0.0),
+                    .map(|r| match r.is_live_dispatch() {
+                        false => 0.0,
+                        true => samples.next().unwrap_or(0.0),
                     })
                     .collect();
                 if self.config.trace_gpu_kernels {

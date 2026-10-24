@@ -259,12 +259,13 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             w
         }
 
-        Launch::Gather { ops, .. } => Work {
+        Launch::Gather { ops, post, .. } => Work {
             index_ops: e
                 .saturating_mul(2)
                 .saturating_add(operand_index_ops(ops, e)),
             ..Work::default()
-        },
+        }
+        .add(epilogue_work(post, e)),
 
         Launch::Scatter { ops, .. } => {
             let upd = ins.last().map_or(e, elements);
@@ -276,6 +277,56 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             }
         }
 
+        Launch::DecodeAttention {
+            output,
+            keys,
+            block,
+            subgroup,
+            ops,
+            ..
+        } => {
+            let heads =
+                output.dims[0].as_const().unwrap_or(1) * output.dims[1].as_const().unwrap_or(1);
+            let width = ops[0].layout.shape()[3].as_const().unwrap_or(1);
+            let keys = keys.as_const().unwrap_or(1);
+            Work {
+                macs: heads
+                    .saturating_mul(width)
+                    .saturating_mul(keys)
+                    .saturating_mul(2),
+                transcendentals: heads.saturating_mul(keys).saturating_mul(2),
+                // One publication and merge of per-subgroup statistics; no
+                // score matrix or probability vector is written to memory.
+                wg_bytes: heads
+                    .saturating_mul(width + 2)
+                    .saturating_mul(output.dims[2].as_const().unwrap_or(1))
+                    .saturating_mul(u64::from(*block / (*subgroup).max(1)))
+                    .saturating_mul(8),
+                ..Work::default()
+            }
+        }
+        Launch::DecodeAttentionMerge { output, splits, .. } => Work {
+            macs: output
+                .iterations()
+                .unwrap_or(0)
+                .saturating_mul(splits.as_const().unwrap_or(1))
+                .saturating_mul(2),
+            transcendentals: output
+                .iterations()
+                .unwrap_or(0)
+                .saturating_mul(splits.as_const().unwrap_or(1)),
+            ..Work::default()
+        },
+        Launch::RmsNorm {
+            output, width, ops, ..
+        } => Work {
+            macs: output
+                .iterations()
+                .unwrap_or(0)
+                .saturating_mul(3 + u64::from(ops.len() == 3)),
+            transcendentals: output.iterations().unwrap_or(0) / u64::from(*width).max(1),
+            ..Work::default()
+        },
         // Members carry their own work; sequencing adds none.
         Launch::Slab { .. } | Launch::Group { .. } => Work::default(),
     }

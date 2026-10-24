@@ -327,7 +327,7 @@ pub struct Component {
 }
 
 impl Component {
-    fn launch<'a>(&'a self, extraction: &'a Extraction) -> LaunchPlan<'a> {
+    pub(crate) fn launch<'a>(&'a self, extraction: &'a Extraction) -> LaunchPlan<'a> {
         LaunchPlan {
             members: &self.members,
             root: self.root,
@@ -829,6 +829,14 @@ pub(crate) fn tile_bytes(
     caps: &Caps,
     arena: &dyn ArenaPlanner,
 ) -> Result<u32> {
+    if let Op::Launch(Launch::RmsNorm { block, .. }) = graph.node(id).op {
+        return Ok(block * 4);
+    }
+    if let Op::Launch(Launch::DecodeAttention { block, ref ops, .. }) = graph.node(id).op {
+        let width = ops[0].layout.shape()[3].as_const().unwrap_or(0);
+        return u32::try_from(u64::from(block / caps.subgroup_width().max(1)) * (width + 2) * 4)
+            .map_err(|_| Error::Plan("attention scratch overflows u32".into()));
+    }
     let scratch = fold_scratch_elements(graph, id, theta, caps);
     let tiles = tiles_for(theta, scalar_element(graph.facts(id).dtype), scratch);
     arena.workgroup_bytes(&tiles, caps)
@@ -1508,6 +1516,30 @@ fn build_component<'a>(
                 iters,
                 |(source_len, reads)| if slot < source_len { reads } else { iters },
             );
+            let iters = if let Op::Launch(Launch::DecodeAttention {
+                output,
+                keys,
+                chunk,
+                ops,
+                ..
+            }) = op
+            {
+                let heads =
+                    output.dims[0].as_const().unwrap_or(0) * output.dims[1].as_const().unwrap_or(0);
+                heads
+                    .saturating_mul(ops[0].layout.shape()[3].as_const().unwrap_or(0))
+                    .saturating_mul(if slot == 0 {
+                        8 * if *chunk == 0 {
+                            1
+                        } else {
+                            keys.as_const().unwrap_or(1).div_ceil(u64::from(*chunk))
+                        }
+                    } else {
+                        keys.as_const().unwrap_or(1)
+                    })
+            } else {
+                iters
+            };
             let reread = iters.div_ceil(elems).max(1).min(u32::MAX as u64) as u32;
             match ext.iter_mut().find(|(id, _, _)| *id == c) {
                 Some(slot) => slot.2 = slot.2.max(reread),
@@ -1762,6 +1794,27 @@ fn member_geometry(graph: &EGraph, extraction: &Extraction, m: Id, caps: &Caps) 
         _ => None,
     };
     match launch {
+        Some(Launch::RmsNorm {
+            output,
+            width,
+            block,
+            ..
+        }) => Geometry {
+            block: *block,
+            workgroups: output.iterations().unwrap_or(0) / u64::from(*width).max(1),
+        },
+        Some(Launch::DecodeAttentionMerge { output, .. }) => Geometry {
+            block: output.dims[3].as_const().unwrap_or(1) as u32,
+            workgroups: output.dims[0].as_const().unwrap_or(1)
+                * output.dims[1].as_const().unwrap_or(1),
+        },
+        Some(Launch::DecodeAttention { output, block, .. }) => Geometry {
+            block: *block,
+            workgroups: output.dims[..3]
+                .iter()
+                .map(|d| d.as_const().unwrap_or(1))
+                .product(),
+        },
         Some(Launch::Slab { slabs, members, .. }) => Geometry {
             block: slab_block_of(graph, *slabs, members, caps),
             workgroups: u64::from(*slabs).max(1),
@@ -2045,7 +2098,22 @@ pub(crate) fn selectable(graph: &EGraph, class: ClassId, caps: &Caps) -> Vec<Id>
     }
     let pool = narrow(graph.members(class), |m| !is_self_referential(graph, m));
     let pool = narrow(pool, |m| is_runnable(graph, m));
-    narrow(pool, |m| composite_bindings_fit(graph, m, caps))
+    let pool = narrow(pool, |m| composite_bindings_fit(graph, m, caps));
+    let flags = crate::debug::flags();
+    if flags.contract_family.is_none() && flags.contract_small_family.is_none() {
+        return pool;
+    }
+    narrow(pool, |id| match graph.node(id).op {
+        Op::Launch(Launch::Contract { family, m, .. }) => m.as_const().is_some_and(|m| {
+            let wanted = if m >= flags.contract_min_m {
+                flags.contract_family
+            } else {
+                flags.contract_small_family
+            };
+            wanted == Some(family)
+        }),
+        _ => false,
+    })
 }
 
 /// The classes reachable from `roots`, ascending, and a mask of every id
@@ -2984,6 +3052,34 @@ pub(crate) mod tests {
             before_cost - cost.launch_cost(&before.components[1].launch(&ex))
                 + cost.launch_cost(&replacement.launch(&ex)),
             after_cost
+        );
+
+        // The ordinary additive model can reuse its unchanged sum. A custom
+        // nonlinear model must decline, and saturated totals must be repriced.
+        let old_launch = cost.0.launch_cost(&before.components[1].launch(&ex));
+        let replacement_launch = replacement.launch(&ex);
+        let linear_before = cost.0.total(&before.launches(&ex));
+        assert_eq!(
+            cost.total_replacing(before_cost, old_launch, &replacement_launch),
+            None
+        );
+        assert_eq!(
+            cost.0
+                .total_replacing(linear_before, old_launch, &replacement_launch),
+            Some(cost.0.total(&after.launches(&ex)))
+        );
+        assert_eq!(
+            cost.0
+                .total_replacing(Picoseconds(u64::MAX), old_launch, &replacement_launch),
+            None
+        );
+        assert_eq!(
+            cost.0.total_replacing(
+                Picoseconds(old_launch.0 - 1),
+                old_launch,
+                &replacement_launch
+            ),
+            None
         );
 
         let bounds = search.lower_bound(&graph, &cost);

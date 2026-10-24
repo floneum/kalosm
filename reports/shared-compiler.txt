@@ -1,0 +1,1095 @@
+Completed full-model verification and corrected pressure monitor (2026-10-24)
+============================================================================
+Runtime a0d355d317570ff636f836ab9902b53726f37921 completes the ordinary WebGPU
+chat path on Meta-Llama-3.1-8B-Instruct-Q4_K_M, on Apple M2 Max with 32 GiB.
+The verified release binary is fb405201495b7a5243dc29a149ee2ef4049b36583eb3843ca7c95a93672e83d3.
+No compiler/runtime tuning overrides are set. Seed is zero, with eight warmup
+tokens and 512 actual measured tokens per round, repeated three times.
+
+All rounds complete with identical sampled token IDs:
+  Round 0: 37.277 tokens/sec, 26.826 ms mean, 58.610 ms maximum gap.
+  Round 1: 36.221 tokens/sec, 27.608 ms mean, 56.533 ms maximum gap.
+  Round 2: 35.686 tokens/sec, 28.022 ms mean, 57.886 ms maximum gap.
+Excluding the first full round as specified before the run leaves 1,024 tokens:
+35.951 tokens/sec, 27.815 ms mean, 31.461 ms p95 and 57.886 ms maximum gap.
+Every measured gap remains included. Both later rounds' worst gap occurs at
+measured token index 449 (zero-based); this pause remains observable.
+The 60 tokens/sec goal is not met. No matched 2x throughput result is claimed.
+
+The full run takes 87.372 seconds including loading and all three rounds.
+Minimum monitored headroom: 7.905 GiB; peak process RSS: 9.688 GiB.
+Kernel pressure remains normal at every sample; added swapouts: zero.
+Peak compression is 4.880 GiB. Thus the earlier compression-only refusals
+were not evidence that this model could not fit. The extra 23 GiB reservation
+was an experiment assumption, not an actual model requirement.
+
+The old runner first stops loading after 2.019 seconds solely because
+compression grew by 512 MiB, despite 14.019 GiB headroom and no added swapouts.
+A regression reproduces that false stop. The corrected runner records
+compression but checks the kernel's actual pressure state, rejecting warning,
+critical, unknown or unavailable readings. Startup/runtime headroom, swap,
+disk, timeout, cross-worktree lock and owned-process cleanup remain enforced.
+All 26 Python tool tests pass, including 14 guard tests. CI now runs them.
+No Rust/model code changed during these two attempts; the second run validates
+the corrected monitor, rather than automatically retrying the old policy.
+
+Machine-readable results: reports/verified-decode-20261024.json.
+Raw evidence: target/stall-validation/immutable-storage-20261024/
+full-model-pressure-verified/{decode.log,resources.jsonl,provenance.json}.
+
+Immutable compiler storage views: one GPU upload (2026-10-24)
+============================================================
+Runtime source a0d355d317570ff636f836ab9902b53726f37921 removes duplicate
+device allocations when lowering an immutable byte stream through its word
+view. The original leaf and compiler-created view retain one allocation,
+including background resource preparation. This uses the graph's storage
+relation and exact immutable backing identity, independent of block format,
+model or device name. Unrelated mutable leaves are not shared. Rebinding,
+adoption and clearing invalidate upload provenance; temporary family scopes
+save and restore the buffer and its exact host-backing witness together.
+No cache pins buffers beyond the graph's existing bindings.
+
+The regression fails on c3ff1acd4 in 0.43 seconds with duplicate GPU storage:
+https://github.com/floneum/kalosm/actions/runs/40114412471
+A second regression fails on 60f767588: restoring a temporary family binding
+retains upload metadata for another buffer and returns the wrong bytes.
+https://github.com/floneum/kalosm/actions/runs/40116391742
+The binding API now snapshots and restores provenance with the buffer,
+checking that the saved host backing still matches. Direct device-map access
+is private to this API. Both stale and lost provenance are covered.
+
+Final validation passes 21 CPU unit tests, 15 GPU unit tests (one unrelated
+ignored test), nine shared compiler tests, formatting, CPU-only Clippy and
+GPU-enabled workspace/all-target Clippy:
+https://github.com/floneum/kalosm/actions/runs/40116681702
+The same workflow builds default release profiler and chat artifacts with
+source and binary hashes. Tests cover both upload orders across all block
+formats, rebinding, adopted buffers, stale prepared uploads, temporary binding
+restoration, exact readback and separation of mutable leaves. GPU timing
+instrumentation is gated by feature so CPU-only builds remain warning-free.
+
+Matched allocation experiment, using the same 72 MiB fixture source:
+  Baseline c3ff1acd4: first upload 75,497,472 bytes; second 75,497,472 bytes.
+  Candidate e1cfe8a95: first upload 75,497,472 bytes; second zero bytes.
+  Total GPU weight allocation: 144 MiB -> 72 MiB.
+Both arms verify all 150,994,944 bytes read back through the two views.
+The allocation experiment predates the temporary-binding restoration fix;
+the final revision passes the allocation-identity regression on both targets.
+https://github.com/floneum/kalosm/actions/runs/40115143722
+Fixture SHA256: b4f9cf64a0df85f8189ea4b698665588b297f68b8fbe0a94a6db32039d15dbd4
+
+This establishes a 50% allocation reduction for the shared weight/view
+pair, not a model throughput result. The later full-model measurement above
+supersedes the earlier memory-blocked assessment. The 60 tokens/sec target
+is not met; a matched full-model 2x speedup is not established.
+
+Declared compute workgroups and final translator validation (2026-10-18)
+========================================================================
+PR head b67f55e43 pins Naga/wgpu 9c9187d26886eccc4b3fbfeb67989ce77fbd1217.
+A minimized symbolic softmax/matmul regression requests 1,024 threads, but
+Metal previously compiled the shader for a maximum of 448 under register
+pressure. The unvalidated dispatch leaves its output unwritten. Enabling
+Metal validation reproduces the explicit thread-limit failure in run
+39194119799; the same WebGPU regression passes after the translator fix in
+39194684553, with every output compared against a host calculation.
+
+Naga now emits max_total_threads_per_threadgroup from the checked product
+of each compute entry point's declared workgroup dimensions. This conveys
+the requirement before backend resource allocation, without changing the
+WebGPU execution path or dispatching by model, adapter, or storage format.
+The attribute requires MSL 2.1, so older language targets retain compatible
+emission. A regression covers MSL 1.0, 2.0, 2.1, and 2.4, two 3D workgroup
+sizes, and exclusion of fragment entry points. Generated snapshots are kept
+consistent. The dependency change is https://github.com/ealmloff/wgpu/pull/1.
+
+Validation run 39194900805 passes 27 Fusor unit tests, 10 shared compiler
+tests, 16 candidate-construction tests, all 72 attention results, all 96
+backward results, and workspace/all-target Clippy. This includes the two
+previously failing padded-cache attention cases. Its final optional SPIR-V
+snapshot step fails because spirv-as is absent on that macOS runner; this
+is not an overall green run. Linux run 39197542862 provisions the assembler
+and passes all 125 Naga unit tests, three snapshot suites, snapshot consistency,
+and all-target/all-feature Clippy. Metal shader compilation passes dependency
+run 39197470747/job/117883236398 after the language-version gate. Fork-wide
+wgpu-test jobs have the same VALIDATION_CANARY build failure as the unchanged
+fork base (34862516836/job/104038102813).
+
+The ordinary current-PR release profiler builds remotely in run 39197546114.
+Its source, profiler/inference hashes, arm64 architecture, and binary SHA256
+41e987b69dc2da4d7487db1a6a1c4f1da432853f823c42e31234efe3faa47a4d
+are verified. The planned measurement uses 512 actual tokens per round,
+eight warmup tokens, and three rounds so it crosses the earlier 512-slot
+cache-growth boundary. All measured gaps remain in statistics. Admission
+has not launched the model: the first window encounters foreign compiler/
+model processes; the current window lacks the required memory headroom.
+Canonical resource guards remain unchanged; resource-aborted workloads are
+not automatically retried. The 60 tokens/sec and 2x full-model goals remain
+unverified, and the earlier cache-growth pause is not claimed resolved.
+
+General gather epilogues and completed experiment checks (2026-10-18)
+===================================================================
+Candidate compiler 01164b16b fuses an ordinary map consuming a gather into
+that gather's output expression. It substitutes scalar values without
+reordering arithmetic; source/index operands retain their own spaces and
+extra operands read the output coordinate. Candidate construction requires
+an exact dense producer read, compatible scalar types and coordinates, and
+an available storage-binding budget. CPU and WebGPU share the same IR.
+No model, adapter-name, or quantization-format dispatch is added.
+
+The reproducer first fails on 678e0974b with two launches [kgather, kmap].
+The candidate produces one kgather and preserves all values across changed
+input and index replay. CI 39187423714 passes 16 construction tests, the CPU
+regression, nine live shared WebGPU tests, 15 cost/9 IR/18 tile units,
+workspace/all-target Clippy, formatting, and the ordinary release build.
+CI 39188190722 additionally passes CPU+GPU conformance: 38 indexing/gradient
+results, two quantized-gather results (including output casts), and 24 rotary
+composition/view results, with zero skips or failures.
+
+Bounded local GPU timings in ABBA order, in microseconds:
+  3x17:   9.839 / 5.021 / 5.010 / 9.726 (1.95957x / 1.94132x)
+  40x128: 10.691 / 5.365 / 5.353 / 6.837 (1.99273x / 1.27723x)
+Every checked value matches exactly; each arm checks 14 changing index/input
+sets. The 40x128 reverse baseline has wider timing spread, retained above.
+The 128x1024 baseline completes at 25.234 us, but its first candidate arm
+is stopped when a foreign Qwen process starts; that case is incomplete and
+is not retried. Peak owned RSS is 0.147 GiB and minimum sampled headroom is
+25.977 GiB. These are kernel measurements, not model throughput proof.
+Evidence: target/stall-validation/shared-gather-epilogue-abba/assessment.json.
+
+The attention-capacity experiment is rejected. Five completed ABBA cases
+(capacity 128 with prefixes 1,17,64,128; capacity 512 with prefix 257) show
+512 lanes taking 546--621 us versus 27--111 us for 256 lanes. CPU-reference
+checks pass, with maximum absolute error 0.0000019. The final 512/511 case
+is refused before launch when another resident process becomes active; it
+is not retried. The default remains 256 lanes. Evidence:
+target/stall-validation/shared-attention-capacity-abba/assessment.json.
+
+A separate 2 ms versus 32 ms completion-spin probe saves 0.45--0.79 ms of
+wall time around a roughly 19 ms GPU replay, with unchanged GPU duration
+and bit-identical outputs. It does not establish full-model benefit; the
+2 ms default remains unchanged. Evidence: shared-completion-window-abba.
+
+CI 39154087720 has completed all matched actual-token release builds. Their
+binary hashes and source/toolchain manifests are verified. The new current-PR
+measurement is refused before startup on a foreign GPU fixture; the actual-
+token baseline is stopped after 1.719 seconds on a foreign compiler, before
+any timing row. Both owned process groups are reaped; no automatic retries.
+The new gather candidate release also matches its manifest (SHA256
+ dede131f0930e647ef0ceba2e5eda5b87dcd8b26d05a180e80d19e1db2c2908b).
+The 60 token/sec and 2x full-model goals remain unverified.
+
+Actual-token measurement and isolated attention experiment (2026-10-18)
+======================================================================
+The profiler now observes actual sampled token IDs and timestamps on the
+ordinary chat/completion path. Text buffering no longer defines the count.
+Sampling configuration and arithmetic are unchanged; generation stops at
+exactly warmup plus measured tokens. The final warmup token anchors the first
+measured interval. Every gap, including stalls, remains in the statistics.
+The comparator checks exact token IDs and exposes --minimum-tps 60; chunk-only
+logs cannot satisfy that target. The guarded runner records a token summary
+and rejects a binary that still reports chunks.
+
+Runtime/profiler 6db93671f passes the remote Rust example tests, Clippy,
+formatting and 24 Python checks in CI 39154087720. Matched default-release
+baseline, candidate and isolated expression binaries are still building in
+separate target directories. Baseline runtime is 117c60fbc; candidate compiler
+runtime is unchanged from 287d0592b except for a disabled-by-default token
+trace event. No actual-token full-model performance result exists yet.
+
+The old 287 candidate run was refused before startup when another process
+crossed 1 GiB RSS. A separate, previously unmeasured long-reduction expression
+fixture completes A0/B0 at 150.369/153.482 us (0.979717x); all 12,288 compared
+outputs are bit-identical. A foreign compiler exceeds the overlap limit before
+B1, so the sequence is incomplete and is not retried. This does not establish
+an improvement and the experiment remains outside the PR. Evidence:
+target/stall-validation/shared-order-q6-abba/partial-evidence.json.
+The stronger expression tests also passed CI 39152356463.
+
+An independent attention-capacity candidate, 9d935fe33, raises the existing
+shared rule ceiling to 512 while retaining subgroup, invocation, X-dimension,
+scratch and arithmetic requirements. It is not in the PR. CI 39154868955 is
+running the old-rule regression, construction checks, shared WebGPU tests and
+paired small-fixture builds. Performance has not been measured. All local
+compiler/model jobs owned by this task are stopped. Foreign processes remain
+untouched and canonical memory guards remain unchanged.
+The 60 token/sec / 2x end-to-end goal is still not achieved or established.
+
+Validated shared default and blocked expression measurement (2026-10-18)
+======================================================================
+PR #465 is updated to runtime 287d0592b72ee23dd69ed5a0b4280149cd0b4f47.
+CI 39151068235 passes Linux host checks, 26 facade tests (one ignored),
+15 cost tests, 9 IR tests, 18 tile tests, 4 index regressions, 15 candidate
+construction tests, eight live shared WebGPU regressions, all-target Clippy,
+formatting, 20 Python tests, and the ordinary release build. Wide and residual
+normalization outputs match CPU references. The initial expanded construction
+test incorrectly inspected a Union node; it now inspects the resulting class.
+The candidate release executable is verified against build provenance:
+fed8c10454e71e1350290274e85f4a70464807c8f422ec2e4fc40818a5339fec.
+
+A fresh baseline of runtime 117c60fbc completes all three 8-warmup/64-chunk
+rounds in 44.56 seconds. Excluding only the first round and keeping all 128
+remaining gaps: mean 21.995889 ms, p95 22.890458 ms, maximum 23.610584 ms.
+Every generated output and measurement boundary matches the previous clean
+baseline; the earlier/current elapsed ratio is 0.985356. Peak owned RSS is
+10.569672 GiB and minimum headroom is 10.444580 GiB. This is a new baseline,
+not a measurement of runtime 287d0592b. Evidence: compiler-287-baseline-before
+and compiler-287-baseline-drift.json under target/stall-validation.
+
+An isolated emitter experiment schedules independent operands by temporary
+register demand, preserving arithmetic and argument positions. Collectives
+and cooperative operations remain ordering boundaries. Its regression fails
+on the old emitter and passes on the changed emitter. CI 39151612546 passes
+13 GPU units, 15 construction tests, eight shared WebGPU tests and all-target
+Clippy. Runtime 01de89bb3 is outside the PR. A further test-only revision
+393675956 also exercises subtraction and division; CI 39152356463 is pending.
+
+The first local expression-order ABBA fixture stops after 2.126 seconds when
+system compression exceeds the unchanged 2 GiB limit. No timing row completes.
+The fixture also enforced 1 GiB owned RSS, 12 GiB runtime headroom, and stopped
+on activity from an already-idle large resident or a new large process.
+Its owned process is reaped, and it is not retried. Evidence: shared-order-q4-abba.
+The candidate full-model comparison has not started: a new foreign chat
+process reduces available memory to about 1.7 GiB with compression above the
+limit. Foreign processes are untouched. No local compiler or GPU job remains.
+The 60 token/sec / 2x full-model goal is not achieved or established.
+
+Range writes, normalization, and rejected splitting (2026-10-18)
+=============================================================
+The last completed clean model comparison remains 21.6738 ms/stream chunk.
+The 60 token/sec / 2x end-to-end goal has not been established.
+
+Runtime e38d453c3 passes CI 39148303974: Linux host checks, macOS shared
+compiler/unit/candidate tests, eight live WebGPU regressions, workspace Clippy,
+formatting and Python tests. The consecutive-scatter regression fails with
+the old lowerer and passes with the candidate. Two computed concatenations
+also match complete CPU references. Hosted GPUs without timestamps validate
+correctness without reporting fabricated times. Release artifact SHA256:
+ff1cce9176011c9bf33561c648748ca0cf55e900dccf4764da30c3768d257075.
+
+Guarded local computed-concatenation timings in ABBA order:
+  batch 1: 38.617 / 29.113 / 27.528 / 42.277 us (1.326x / 1.536x)
+  batch 2: 49.239 / 28.659 / 35.788 / 40.537 us (1.718x / 1.133x)
+All outputs match the CPU reference. These relative microbenchmarks have
+substantial timing spread and do not establish model throughput.
+Evidence: target/stall-validation/shared-range-affine-abba.
+
+The e38 model run times out at 120 seconds after one 64-chunk round:
+38.472 ms mean, 28.105--57.109 ms gaps, and identical generated text.
+No retained steady rounds complete. Process inspection identifies an active
+rendering application sharing the GPU, so this partial contended result cannot
+be compared with the earlier clean baseline. Peak owned RSS is 10.579 GiB;
+minimum available memory is 10.494 GiB. Every resource guard stays enabled.
+The run is not automatically retried. Evidence: compiler-e38-candidate.
+The preceding f3ffe release passes CI 39145126444; its local model run stops
+at the memory guard before a complete timing row and is not retried either.
+
+A shared subgroup-splitting prototype (885a52338) passes CI 39148529521,
+including 16 candidate-construction tests, 141 symbolic matrix executions,
+eight shared GPU regressions, and Clippy. Two-way splitting gives
+1.033x / 1.027x on the long Q6 fixture, but 0.936x / 0.939x on wide Q4 and
+0.986x / 0.816x on the smaller projection. Four-way splitting gives
+0.927x / 0.921x on the long reduction. Full output comparisons pass.
+The prototype remains isolated on its candidate branch; the adopted compiler
+does not include its schedules or changes to the tuning domain.
+
+Normalization can use 512 lanes when granted by the adapter instead of a
+universal 256-lane ceiling. Candidate construction still proves invocation,
+X-dimension, storage, precision and retained-values bounds. It adds no global
+storage. The prototype passes CI 39149383039. Guarded relative ABBA timings
+(with active GPU contention) are:
+  width 4096, rows 1: 8.671 / 7.185 / 6.504 / 8.068 us (1.207x / 1.240x)
+  width 8192, rows 4: 14.959 / 10.077 / 10.942 / 16.288 us (1.484x / 1.489x)
+All tested values match CPU references within the unchanged tolerance;
+maximum absolute error is 0.00000066. This is not a full-model speed claim.
+The normalization change is isolated from the rejected splitting experiment;
+expanded capability and residual-normalization checks accompany it.
+
+Subgroup bounds follow-up (candidate after f3ffe0bce)
+--------------------------------------------------
+The common Kernel builder can expose the adapter-reported subgroup lane upper
+bound to existing integer algebra. It emits an identity mask, including ranged
+and non-power-of-two reported maxima; no fixed lane width or quantization format
+is assumed. Unknown or invalid limits retain the original expression.
+
+17 fusor-tile unit tests passed, including variable-width identity and index
+simplification checks. The guarded actual-compiler ABBA Q6 down-projection
+fixture measured 1.01466x and 1.01566x; all 3 x 12,288 output values were identical.
+The Q4 wide-projection fixture was unchanged (0.99424x / 1.00343x).
+Results: shared-subgroup-bounds-production-q6 and -q4 in target/stall-validation.
+These are GPU microbenchmarks, not an end-to-end throughput claim.
+
+Wider columns are not a universal win: after early accumulator stores, columns
+8 improved the Q4 wide fixture 1.04010x / 1.04410x, but the same geometry on Q6
+down regressed to 0.99175x / 0.99351x. No blanket schedule default was changed.
+
+Accumulator scheduling and current dispatch attribution (2026-10-18)
+======================================================================
+The 60 token/sec request corresponds to 16.667 ms/token. The existing text-stream
+fixture measures chunks rather than token IDs; its last completed clean mean
+remains 21.6738 ms/chunk, which fails even that conservative throughput target.
+
+A new 8-chunk dispatch trace of runtime 62d5 completes in 25.37 seconds under
+all canonical guards plus the 12 GiB process and 10 GiB headroom limits. Peak
+RSS is 10.806 GiB, minimum headroom 10.159 GiB, added swapouts 26.5 MiB.
+Per-dispatch timestamps add overhead and are attribution, not throughput:
+- Wide feed-forward contractions: median sum 6.707 ms per decode plan.
+- Long-reduction contractions: 4.430 ms.
+- Square projections: 1.962 ms; output head: 1.229 ms.
+- Single-update scatter: 1.063 ms; residual normalization: 0.871 ms.
+The entire current plan has 553 launches. No model-specific execution policy
+was enabled. Log: compiler-62d5-dispatch-audit under target/stall-validation.
+
+The emitter previously evaluated every loop accumulator update before storing
+any result. A shared expression-dependency analysis now permits an early store
+only if no later update reads that local. Read-before-write dependencies and
+cycles retain deferred stores; cooperative accumulators keep their existing
+protocol. No arithmetic, load bounds, schedules or precision contracts change.
+The emitted-loop lifetime regression fails before the fix and passes after it;
+GPU tests also verify zero/one/multiple iterations with cyclic dependencies.
+
+A captured-shader scheduling probe gives 1.051x in both alternating orders,
+but the actual compiler comparison is smaller: Q4 fixture 200.909 / 198.180 /
+199.031 / 201.525 us in ABBA order, directional ratios 1.01377 and 1.01253.
+Every compared output is bit-identical (86,016 values per comparison), and
+resident weights are 264 MB. These measurements do not establish model speed.
+The Q6 follow-up is refused before launching a child because another workload
+leaves only 1.92 GiB headroom against the unchanged 12 GiB requirement. It is
+not automatically retried. Full-model and broader performance validation of
+this emitter change remain pending; 60 tokens/sec has not been achieved.
+Logs: shared-accumulator-*, shared-early-accumulator-*.
+
+Replay-cache release validation (2026-10-18; model run interrupted)
+======================================================================
+CI run 39107933434 passes Linux host validation and macOS validation/build at
+runtime 62d5cff1c. macOS passes 26 facade, 15 cost, 9 IR, 16 tile, four index,
+15 candidate-construction, and eight ordinary WebGPU tests, plus workspace
+Clippy with warnings denied. The 20 Python tests pass before and after the
+Rust checks. Default-release binary SHA256:
+23ec2075082e77ac75a462e8366c66b7ba26e9f9d895d9c9579a6e579d97caf4.
+Its profile source SHA256 matches the preceding releases.
+
+Local preflight waited for an unrelated large model to exit. The guarded run
+then began with 27.61 GiB available memory and 0.23 GiB compressed. At 19.74
+seconds, another process crossed the 1 GiB overlap threshold; the wrapper
+terminated and reaped only its own model. No completed timing rounds were
+produced, no automatic retry was made, and this is not performance evidence.
+The 12 GiB owned-process limit, 10 GiB runtime headroom floor, 120-second
+limit, and every canonical resource guard stayed enabled.
+
+The small replay diagnostic proves the cache is exercised and outputs remain
+correct; full-model speed for 62d5cff1c is unverified. Latest completed model
+mean remains 21.6738 ms at 117c60fbc. The 2x target is not met. Logs:
+target/stall-validation/compiler-62d5-candidate and /tmp/shared-release-62d5.log.
+
+Release verification of exact replacement pricing (2026-10-18)
+======================================================================
+CI run 39106863582 passes all validation and builds runtime 117c60fbc with
+ordinary release settings. Binary SHA256:
+376eef772c6ad1b37541b624e54d386f4d154d697c2fb20ce3db9d6a8bb36ab2.
+The profiling source digest matches the preceding release.
+
+All seeded output matches e3634f503. Short-run mean is 21.6738 ms, p95
+22.0379 ms, maximum 22.4963 ms over the 128 gaps after the first round.
+The ratio against the preceding separate run is 0.9990x: no steady-decode gain.
+Peak RSS 10.5688 GiB, minimum headroom 12.0564 GiB, compressor growth 40.2 MiB,
+and 832 KiB added swapouts; all model guards pass.
+
+The complete two-round 512-chunk run still peaks at chunk 448, but falls to
+52.3709 / 49.7748 ms from e363's 58.7764 / 54.1336 ms. Its round means are
+23.5479 / 24.1441 ms. The second-round average is 0.9886x versus the earlier
+run, so the smaller peak does not establish an overall speedup. Peak RSS
+10.5845 GiB, minimum headroom 11.7194 GiB, no new swapouts.
+
+A separate 16-chunk whole-plan trace completes: warmed GPU spans are roughly
+18.6 ms, versus 1.2-1.3 ms CPU preparation/encoding before synchronization.
+The 553-launch plan has zero cold shaders. Timestamp readback adds overhead;
+use the clean run above for throughput. A later per-dispatch diagnostic is
+refused at preflight when other processes exceed 1 GiB; it starts no model,
+is not retried, and contributes no timing evidence.
+
+Two bounded schedule experiments remain diagnostics only: on a square
+4096-by-4096 contraction, one subgroup instead of two measures 1.0044/1.0048x.
+Two independent accumulation chains on the wide fixture regress to
+0.9783/0.9909x in ABBA order. Every compared output passes; neither change is
+adopted. These checks do not relax tolerances or use model execution presets.
+Logs: compiler-117c-{candidate,long-decode,gpu-attribution*},
+shared-small-square-q4-one-subgroup, shared-independent-accumulators-q4 under
+target/stall-validation. The 2x full-model goal remains unmet.
+The comparison tool now reports the five slowest chunks with original zero-based
+round/chunk positions. All samples remain in statistics. Its boundary regression
+fails before the change; all 20 Python tool tests pass afterward.
+
+Bounded metadata reuse for large replay plans (2026-10-18)
+======================================================================
+The full-model trace has 553 decode launches, 584 buffers, and 1,877 bindings.
+Both prepared leaves and GPU snapshots previously declined above 512 launches.
+Admission now follows bounded work/metadata rather than this dispatch cutoff:
+- Prepared leaves permit at most 4,096 launch-plus-binding visits and stop
+  scanning once exhausted. They retain only external IDs and a weak owner.
+- At most two GPU snapshots each have a conservative 512 KiB metadata budget.
+  A verified immutable plan owner avoids cloning dispatches, layouts, and
+  schedules. Unowned plans retain exact structural checks. Mutating a plan
+  detaches its weak owner; runtime dimensions and graph identity still match.
+No tensor buffers, uniform contents, or command records are retained here.
+
+The new replay_plan_lab diagnostic uses 600 ordinary scatter launches, changes
+its index between replays, and checks all 153,600 output values plus preservation
+of the shared input. Prior/candidate/prior median submission times are
+27.897 / 25.519 / 27.276 ms: conservative 1.069x. Total medians are
+31.262 / 27.521 / 29.204 ms (1.061x). The final opt-in GAPSTEP trace confirms
+warm=1. These are unoptimized host measurements, not model-throughput proof.
+Peak process-group RSS <=0.213 GiB and no added swapouts in all three arms.
+Twenty unit tests and all eight ordinary WebGPU regressions pass; tests cover
+ownership mutation, missing dimensions, runtime scalars, structural fallback,
+and rejection of metadata beyond the budget. Workspace/all-target Clippy with
+warnings denied, formatting, and diff whitespace checks pass. Full-model
+validation is pending.
+Logs: target/stall-validation/shared-replay-budget-*.
+Reproduce the small diagnostic serially:
+  cargo run --manifest-path fusor/Cargo.toml -p fusor --no-default-features \
+    --features gpu,kernel-observer --example replay_plan_lab -- 600 256 11
+
+Exact independent replacement costs (2026-10-18; release pending)
+======================================================================
+The remaining growth trace spends 7.569 ms extracting a 65-launch migration
+plan. Same-input replacement screening avoids reconstructing the DAG, but
+still reprices every unchanged launch for every trial. The shared cost-model
+interface now permits an exact replacement total. The additive roofline model
+uses it; nonlinear/custom models default to complete-sequence pricing, and a
+saturated total declines because subtraction cannot recover discarded cost.
+Per-launch costs are captured at each accepted schedule, before trial edits.
+Candidate order, budgets, and full verification of accepted plans are unchanged.
+
+The 32-independent-branch regression goes from 64 full cost-total evaluations
+to zero with identical selected plan hash and cost. All 15 cost tests pass,
+including nonlinear fallback and saturation/underflow checks. All eight shared
+WebGPU regressions pass (46.02 seconds), as do all 15 candidate-construction
+tests and workspace/all-target Clippy with warnings denied.
+
+Small cache-growth probe, prior/candidate/prior, unoptimized host build:
+- Total: 74.122 / 55.777 / 72.412 ms; conservative ratio 1.298x.
+- Migration extraction: 42.847 / 24.182 / 43.046 ms.
+- Candidate seed selection 8.924 ms and descent 4.654 ms, versus roughly
+  23.6 and 9.3 ms in the first prior run.
+All 33,554,432 values pass in every arm. Each arm uses the same 512 WebGPU
+copies and zero new pipelines; GPU wait stays about 5.04 ms. Peak process-group
+RSS <=0.666 GiB, no added swapouts. This demonstrates a shared host-planning
+improvement, not full-model throughput or elimination of the cache hitch.
+Logs: target/stall-validation/shared-additive-{growth-*,screen-*,gpu*}.
+
+Default-release and long-run validation at e3634f503 (2026-10-18)
+======================================================================
+CI release run 39104438703 succeeds. Its arm64 executable and profiling-source
+SHA256 match build.txt; default release flags are unchanged. All 20 Python
+guard/tool tests pass on Linux and macOS Python 3.15. macOS CI independently
+passes all 188 Fusor tests, full training/causal-attention validation, eight
+shared WebGPU tests, and all-target Clippy. Linux/Windows test suites and all
+three platforms' conformance shards also pass at this revision. The root
+macOS suite remains 96/97 due
+to the external Odyssey download returning HTTP 500; overall CI is not green.
+
+Clean short run, identical settings/seed/output versus runtime 73cc14893:
+3 rounds of 8 warmup + 64 measured chunks, excluding only the first round.
+Mean 21.6519 ms, p95 21.8745 ms, maximum 21.9959 ms over 128 gaps. The ratio
+against the earlier 21.9697 ms run is 1.0147x; this is not bracketed. Peak
+process RSS is 10.5692 GiB versus 11.3615 GiB earlier. Minimum headroom is
+12.0289 GiB, no compressor growth, and 1 MiB of added swapouts. The requested
+2x model-throughput goal remains unmet.
+
+The complete two-round 512-chunk run reproduces the cache-growth hitch at
+zero-based chunk 448: 58.7764 and 54.1336 ms. Earlier d4cc measured 69.4183 and
+79.7183 ms there. All seeded output matches; the hitch is reduced, not fixed.
+Round means are 23.3926 and 23.8682 ms. Peak process RSS 10.5719 GiB, minimum
+headroom 11.8146 GiB, compressor growth 40.64 MiB, added swapouts 512 KiB.
+This run also enforced a 12 GiB process-group cap, 10 GiB headroom floor,
+120-second timeout and overlap stop, in addition to all canonical guards.
+
+A separate CPU-attribution diagnostic captured one growth event: saturation
+3.268 ms, extraction 7.569 ms, then 64 artifact refreshes with zero new shader
+compiles. It stopped during the second round when an unrelated compiler
+exceeded 1 GiB RSS. That process was left untouched; the diagnostic was not
+retried and is excluded from throughput comparisons. Its partial timing trace
+motivates further planning work, not a clean latency claim.
+
+A smaller split reduction window regressed to 0.602x. A general bounded
+variable-shift packing prototype improved that slower window from roughly
+249 to 168 us, still behind the default 150 us, and default-path ABBA ratios
+0.999/0.996 showed no gain. Seventeen tile tests pass, but the prototype was
+archived and removed from production. No schedule preset was introduced.
+
+Logs: target/stall-validation/compiler-e363-{candidate,long-decode},
+compiler-e363-versus-73cc.json, compiler-e363-long-versus-d4cc.json,
+compiler-e363-growth-attribution*, and deferred-dynamic-fields.
+
+Masked-address and benchmark-cleanup follow-up (2026-10-17)
+======================================================================
+A masked address retained aligned loop/row terms that cannot affect any bit
+through the mask's highest set bit. This prevented the compiler from sharing
+the remaining offset across columns. A typed-index simplification regression
+failed before the change; the bounded shared integer transform now removes
+those addends. Lower bits are retained because they can carry into a sparse
+mask. Four differential index tests pass, including unsigned wrap and sparse
+mask counterexamples. No format, model, shape or device names select the rule.
+
+Normal-compiler ABBA, four resident weight copies, 31 x 16 repetitions:
+- Large reduction fixture: 155.171 / 149.837 / 149.302 / 155.133 us, directional
+  speedups 1.0356x / 1.0391x, 12,288 full output values per comparison.
+- Wide output fixture: 200.798 / 198.475 / 198.558 / 200.980 us, directional
+  speedups 1.0117x / 1.0122x, 86,016 full output values per comparison.
+Every compared value is bit-identical. Resident weights stay below 265 MB.
+These kernel results do not establish full-model speed. Logs are under
+shared-masked-index-{q6,q4}-abba in target/stall-validation. All eight shared
+WebGPU regressions pass in 48.37 seconds, with no added swapouts. The local
+all-target Clippy check stopped on its unchanged available-memory guard and
+was not retried; lint validation of this index change remains pending in CI.
+
+The CI cleanup failure was reproducible without Python 3.15 by raising a
+termination signal inside an OS-error fallback. The handler raised
+InterruptedError, which is an OSError and could be consumed by that fallback.
+It now raises a dedicated BaseException so termination reaches the existing
+owned-process cleanup. The new regression goes from timeout to prompt cleanup;
+all 20 Python tool tests pass locally. Resource limits and no-retry behavior
+are unchanged. Remote Python 3.15 verification and release measurement remain
+pending.
+
+Current PR measurement, runtime 73cc14893 (2026-10-17)
+======================================================================
+The isolated default-release artifact from CI run 39102160701 matches its
+source/compiler/profile digests. A completed clean 3-round, 8-warmup/64-chunk
+run produces identical seeded output to d4cc. Excluding only the first round:
+mean 21.9697 ms, p95 22.4783 ms, maximum 22.7992 ms (128 gaps). This is 1.0115x
+versus the earlier 22.2233 ms d4cc run, not a contemporaneous bracketed result.
+Peak process RSS 11.3615 GiB; minimum headroom 10.6647 GiB; no compressor growth
+or added swapouts. The requested 2x model-throughput goal is still unmet.
+Logs: target/stall-validation/compiler-73cc-candidate and
+compiler-73cc-versus-d4cc.json.
+
+A subsequent two-round 512-chunk run was aborted at 37.85 seconds on the
+unchanged compressor-growth guard. Another default_decode process was found
+running outside the benchmark's process group; it was left untouched. One
+round had finished, but this incomplete, contaminated run is excluded from
+performance comparisons and was not retried. The periodic-stall fix remains
+unverified at model level. Log: compiler-73cc-long-decode.
+
+Two captured-shader four-field conversion probes were rejected: normalized
+unpack plus round measured 0.591x and direct unsigned unpack measured 0.886x.
+Both matched every output exactly (147,456 checked values each), but neither
+improved speed. They do not change compiler defaults.
+
+Lazy host-layout alternatives (2026-10-17; release measurement pending)
+======================================================================
+Graph construction eagerly repacked every eligible immutable weight into a
+retained private host Vec, including unselected alternatives. A regression at
+the real graph seam failed because constructing an alternative read the source
+bytes. The shared HostBytes backing now supports deterministic transformed
+views: retain the source plus a conversion recipe, materialize only during a
+borrow/upload, and release temporary bytes afterward. Existing block metadata
+controls layout eligibility; there are no model, device or format-name cases.
+The original graph memo still reuses the same alternate leaf.
+
+The tiny regression covers all format metadata, checking no reads while
+constructing alternatives, unchanged conversion bytes on repeated borrows,
+and no retained conversion result between borrows. Generic backing tests also
+cover transformed concatenations and mismatched declared lengths. Linux CI
+run 39103036411 passes the IR library tests and the CPU-only graph regression.
+macOS passes 25 facade, 15 cost, 9 IR, 16 tile, 15 candidate-construction,
+and all eight shared WebGPU tests, plus workspace/all-target Clippy. The
+subsequent Python process-cleanup test failed under Python 3.15, preventing
+the release build; its signal-handler correction is recorded below. Local
+compilation was stopped after external memory pressure increased compression
+past the unchanged 32 MiB growth guard. At stop, the compiler group used only
+0.081 GiB RSS and added no swapouts. That compile was not retried locally.
+
+A descriptor-only inventory of the 8B fixture, without loading tensor payloads,
+finds 1,268,662,272 bytes (1.1815 GiB) of eligible alternate host layouts. This
+is the potential retained allocation, not measured RSS savings; a selected
+graph may use a subset. Full-model memory validation of this change is pending.
+
+A separate exact-coefficient algebra experiment was removed: Q6 normal-path
+ABBA ratios 1.0027/1.0122 did not establish a reliable improvement. Full output
+vectors passed, max difference 0.0007324. A smaller register window was also
+rejected after failing the unchanged paired-output tolerance. Neither changes
+production defaults. The ABBA tool now accepts separate compiler binaries,
+records each digest, and validates the shared GEMV family without requiring
+obsolete format-specific kernel names. All 19 Python tool tests pass.
+
+Cache-growth and search follow-up (2026-10-17; model validation pending)
+======================================================================
+A clean 512-chunk, two-round decode reproduced the periodic hitch at exactly
+measured chunk 448 in both rounds: 69.418 and 79.718 ms. This aligns with the
+512-slot cache boundary; the run added no swapouts or compressor growth,
+retained >=9.365 GiB headroom and peaked at 11.537 GiB process-group RSS.
+The correlation does not by itself attribute the entire model stall.
+Logs: target/stall-validation/compiler-d4cc-long-decode.
+
+The new cache_growth_lab uses ordinary KvCache append/reserve/resolve with no
+model weights. Its 32-pair, 8-head, 512-slot, 128-wide case retains 128 MiB and
+allocates 256 MiB on growth. It verifies every one of 33,554,432 values after
+migration. The actual execution uses 512 WebGPU buffer copies, zero compute
+dispatches, and zero new pipeline compilations. GPU completion takes 3.5-5 ms;
+host planning dominates in this unoptimized-host diagnostic.
+
+The local-search descent rebuilt the complete DAG to reject one-launch
+schedule/selection trials even when all inputs were unchanged. It now shares
+the seed selection's replacement-cost screen. That screen still prices the
+complete launch sequence, retaining shared traffic and nonlinear cost totals;
+composites and changed inputs still require full reconstruction. Search budgets
+and candidate order are unchanged. A 32-branch regression goes from 64 full
+reconstructions to zero with the exact same selected plan hash and cost.
+
+On the small growth probe, prior/candidate/prior completed in 103.473 / 69.066 /
+99.289 ms (unoptimized host). Migration extraction fell from 75.429 to 40.804 ms;
+search fell from 43.310 to 9.513 ms, avoiding 93 full reconstructions. Every
+value passes in all runs; no added swapouts, <=0.556 GiB process-group RSS.
+These are host-planning microbenchmarks, not a model throughput claim.
+Logs: shared-cache-growth-stages, shared-cache-growth-screen-after, and
+shared-cache-growth-screen-prior-after under target/stall-validation.
+
+A subsequent instrumented full-model attribution run stopped at the unchanged
+2 GiB compressor ceiling after 7.61 seconds. It produced no decode result and
+was not retried. It is excluded from performance comparisons. Local work then
+continued only with small probes and compiler tests.
+
+CI at d4cc passed 180/181 Fusor tests but training exposed an impossible
+selected-index arm: an unsigned index < 0 cannot select the oversized tiled
+region. The focused regression reproduced bound 79 instead of 63. Range proof
+now excludes provably impossible value arms; eager loads are still checked in
+both arms, including when the condition is provably false. All 16 tile tests
+pass. At runtime 73cc14893, macOS CI run 39102139801 passes all 183 Fusor
+unit/integration tests and the full training/causal-attention regression
+(231.732 seconds). Its eight shared WebGPU regressions also pass. The root
+suite has 96/97 passes: the Odyssey media download returned HTTP 500. That
+external failure remains visible; the overall job is not reported green.
+
+Validation of these changes: all 15 cost units, 15 candidate-construction
+tests, workspace/all-target Clippy with warnings denied, and all eight shared
+WebGPU regressions pass (47.64 seconds, peak 0.501 GiB RSS, no new swapouts). The
+saturation regression now also checks the selected plan has at most one
+separate map per block. The ordinary facade test's feature-dependent Dtype
+import is corrected; its 23 library tests passed before this search change.
+
+Latest clean full-model measurement, runtime d4cc3c58b
+======================================================================
+Isolated default-release build 39100620525, three rounds of 8 warmup + 64
+measured chunks, identical seeded output versus a fresh 10377cfa2 run:
+
+                      Prior 10377      Candidate d4cc     Ratio
+mean chunk gap        22.5129 ms       22.2233 ms          1.0130x
+p95                   23.0993 ms       22.8499 ms          1.0109x
+maximum               23.5473 ms       26.0193 ms          0.9050x
+
+Candidate ran before prior; this is not bracketed. Only the first round is
+excluded, all 128 remaining gaps are retained. Candidate added 64 KiB of
+swapouts and no compressor growth; this is a delta, not the cumulative macOS
+swapout counter. The new search screen is not in these binaries. The requested
+2x end-to-end goal remains unmet.
+Logs: compiler-d4cc-candidate, compiler-d4cc-prior-after, and
+compiler-d4cc-versus-prior.json under target/stall-validation.
+
+Compiler follow-up d4cc3c58b (2026-10-17; measurement pending)
+================================================================
+The ordinary saturation driver offered every rule to an early node before
+visiting later nodes. Expanding contraction alternatives exhausted the node
+budget in round two; later blocks missed even simple map substitution.
+A 32-block, ordinary dense-contract/map regression reproduced fusion in only
+blocks 0..17. Rule-ordered frontier rounds now offer substitution to all 32,
+under the same node/application/round budgets. The test also checks the node
+ceiling. All 15 candidate-construction tests pass.
+
+The range verifier also needs a rejected-arm lower bound to prove tail-origin
+subtraction cannot wrap. Its focused regression failed with an unknown bound
+for a column actually bounded by 5; it now passes along with the accepted-arm,
+eager-load, mutable-expression and escaping-scope negatives (15 tile tests).
+The complete training test exceeded the unchanged local 1 GiB process limit
+after 124 seconds and was stopped, without new swapouts. It is not a pass.
+Full training and cross-platform validation remain pending in CI.
+
+The previous runtime's attribution measured roughly 18.6-19.5 ms GPU time and
+634 launches. Doubling saturation's budget yielded 585 launches but little
+wall-time improvement (22.196 vs 22.347 ms in short diagnostic rounds); the
+production budget was not increased. A workgroup-local reduction partition
+experiment was removed: a smaller window regressed to 0.587x and keeping the
+original window gained only about 1.017x on the tested large reduction.
+
+A polling diagnostic stopped during model loading at the unchanged compressor
+limit and produced no timing. It was not retried. No claim about polling or
+full-model speed of d4cc3c58b follows from these experiments. An isolated
+release build runs in CI 39100620525; no heavy local release build is used.
+
+Previous default-path measurement (2026-10-17; goal not achieved)
+================================================================
+Runtime 10377cfa2 now has a completed full-model measurement from isolated
+default-release CI build 39097786222. Source/profile/compiler/architecture and
+binary digests match the recorded provenance. The candidate ran before a fresh
+f927525bd measurement, with identical seeded output and settings. Excluding
+only the first warmup round and retaining all 128 remaining gaps:
+
+                      Prior shared     Current shared      Ratio
+mean chunk gap        27.4354 ms       22.8954 ms          1.1983x
+p95                   30.2624 ms       26.3524 ms          1.1484x
+maximum               31.6542 ms       27.4888 ms          1.1515x
+
+Logs/provenance: target/stall-validation/compiler10377-candidate and
+compiler10377-prior-after. This is not a bracketed comparison. Neither run
+added swapouts. A fresh original-base run was stopped during loading when
+compression exceeded the unchanged guard; it produced no timing and was not
+retried. The earlier original-base comparison below remains historical.
+No 2x end-to-end claim is established by these results.
+
+Adjacent scalar-read widening was investigated and rejected. Checked shader
+prototypes gained 19-21%, but normal compiler ABBA tests did not reproduce that
+gain: first version Q4 ratios 0.971/0.966; explicit shared vector reads and
+constant components Q4 1.021/1.001, Q6 0.938/1.010. All compared vectors passed.
+The production experiment was removed; its source and binaries remain in the
+ignored target/stall-validation/rejected-wide-reads archive. This distinction
+between checked prototypes and the normal pipeline prevents shipping a
+microbenchmark-only improvement as a default optimization.
+
+CI exposed a separate grouped training-kernel range-proof failure. A focused
+regression reproduced an incorrect upper bound of 1055 for an index bounded
+by 1023. The verifier now bounds a selected value under its accepted predicate,
+without applying that predicate to eagerly evaluated loads or other scopes.
+Both the positive regression and an unsafe-eager-load rejection pass; all 15
+tile tests pass. The original training test still needs a complete rerun.
+
+Previous performance investigation
+================================================================
+Default-release binaries from CI run 39092226768 now have a completed local
+full-model comparison. Candidate runtime f927525bd versus PR base 7a9ead249,
+identical profile source/settings/seed/output, 3 rounds of 8 warmup + 64 measured
+stream chunks. The first round is excluded from both; all 128 remaining gaps
+are retained. Candidate ran before baseline; this is not a bracketed result.
+
+                      Base             Candidate          Ratio
+mean chunk gap        32.7295 ms       27.9179 ms          1.1723x
+p95                   42.9830 ms       31.3590 ms          1.3707x
+maximum               61.6587 ms       33.7685 ms          1.8259x
+
+The target check fails: 1.172x < 2.000x. Historical 16 ms/2x results used a
+different implementation/configuration and do not validate this shared rewrite.
+Logs: target/stall-validation/shared-candidate-preliminary.log and
+target/stall-validation/shared-baseline-before.log. A subsequent candidate run
+was stopped on additional swapouts before yielding measurements; it is excluded.
+Diagnostics resumed only after available memory recovered and swapouts stopped.
+
+Warm-resolve attribution finds 634 launches, about 23.8 ms GPU work and 1.3 ms
+CPU preparation/submission, with zero cold shader compilations. Per-dispatch
+timestamps identify gate/up (8.78 ms), down (5.23 ms), and square projections
+(2.48 ms) as the largest costs. Timestamp instrumentation affects absolute times;
+the clean stream-gap comparison above is the end-to-end performance result.
+
+Compiler experiments in this iteration, not yet full-model validated:
+- Track known zero/one bits through unsigned index arithmetic, preserving wrap.
+  The new differential test also found an existing overflow error in distributing
+  right shifts/power-of-two division over an addition; the correction masks the
+  distributed result to the original result width.
+- Pair small integer-to-float field conversions using exact standard half-word
+  unpack operations. Integer values are represented exactly; accumulation stays
+  f32. Recognition uses typed expressions, not format/model/device dispatch.
+- Captured shaders can now alternate ABBA/BAAB within one WebGPU process with
+  identical bindings and runtime checks in both arms. This removes the substantial
+  timing drift seen between separate-process kernel probes.
+- Q4K 1x28672x4096 fixture: 345.21 -> 294.63 us, median paired 1.1683x,
+  both timing directions 1.168x, all 516,096 compared values bit-identical.
+- Q6K 1x4096x14336 fixture: 217.77 -> 222.46 us, median paired 0.9844x,
+  both directions 0.9844x, all 73,728 compared values bit-identical. No gain is
+  claimed for this case; it does not activate the paired conversion transform.
+- A bounded expression-driven lane-window search is being evaluated separately.
+  Single-index coverage tests pass across 4/8/16/32/64-lane subgroups and all
+  admitted exchanges. No model result or default throughput claim applies yet.
+
+Follow-up experiments (still kernel measurements, not a full-model result):
+- Lane-window selection reduces the first fixture's dynamic selections from 16
+  to zero while retaining the same 16 storage reads. Paired checked shaders
+  measure 1.1995x, both directions about 1.20x. Maximum absolute difference is
+  0.0000916. All eight GPU regressions pass after this change (176.18 s), with
+  0.472 GiB peak process-group RSS, >=17.54 GiB headroom, and no extra swapouts.
+- Short vector dots alone do not improve that fixture (0.992x / 0.980x).
+  Factoring exact conversion biases with vector dots gives 1.2006x versus the
+  original shader, without an established gain beyond lane selection alone.
+- Conversion pairing now covers compositions of unsigned bit fields, with
+  explicit ten-bit value bounds and compatible lane assignments. Exact tests
+  cover independent source words, different field widths, and all legal offsets.
+- The second fixture now measures 1.101x in the checked shader pair (directional
+  ratios 1.123x and 1.053x). A separate ABBA comparison through the normal compiler
+  path confirms 1.1241x / 1.1258x: A0=285.539, B0=254.006, B1=263.658,
+  A1=296.825 us. Full changing-output vectors pass; maximum difference 0.001221.
+  Normal-path logs: target/stall-validation/composed-q6-production-abba.
+- A smaller 8-value window is rejected (paired ratio 0.493x). No schedule pin
+  from these diagnostic probes is adopted into production defaults.
+- Thirteen compiler unit tests pass, including red/green vector-dot and composed
+  field cases, strict arithmetic, lane coverage, and rejecting extra loads.
+  The final composed-field combination passes all eight GPU regressions,
+  including the 96 quantized cases and exact dyadic outputs (125.84 s).
+- Candidate runtime is committed at 10377cfa2b3f7e69f55e6592af940844bfafd2c9.
+  Final checks pass: seven IR units, two differential index regressions,
+  thirteen tile units, and workspace/all-target Clippy with warnings denied
+  (48.19 s). The Python comparison/guard suite has 19 passing tests.
+  Cross-platform validation of this candidate and its full-model performance
+  remain pending. Release build 39097786222 uses a fresh candidate-only target
+  directory and the default release settings. This prevents revision switching
+  from reusing incompatible compiler dependencies, which broke the earlier
+  auxiliary-probe build. Original base and prior-candidate binaries remain from
+  verified CI run 39092226768; no local heavy release build is started.
+
+Before the lane-window experiment, all eight ordinary-device WebGPU tests pass
+locally (186.35 s with unoptimized host code), including all 96 quantized cases,
+exact dyadic outputs, dense tails, attention growth, retained scatter inputs,
+and view/gradient replay. No extra swapouts occurred during this suite.
+The guarded profile_decode.py runner and compare_decode.py --minimum-speedup
+make the default-path end-to-end target reproducible without tuning switches.
+
+Earlier validation history (superseded performance status below)
+==============================================================
+Generic contraction rewrite
+====================================================================
+The format-specific Q4K/Q6K contraction bodies and their runtime tuning state
+have been removed. Quantized loads expand through the existing format table
+into ordinary typed expressions. A bounded shared dot-product transform
+extracts common factors when reassociation is permitted and the expression
+DAG becomes smaller. Both single-column and subgroup-column SGEMV use it.
+The visualizer and GPU emitter use the same load-expansion interface.
+CPU operand loading also handles uniform leaves without requiring tensor
+bindings; an integer-index replay regression covers the missing path.
+
+The ordinary WebGPU regression suite now includes every QFmt in Native and
+F32Scales layouts, plus dense tails and replay. Linux, macOS and Windows CI
+explicitly run these tests serially, with compiler verification enabled.
+
+Validation for this revision
+- Both shared dot-algebra tests pass, including a red/green regression for
+  factoring a common negative offset without per-element negations.
+- All eight verified WebGPU regressions pass across serial guarded runs.
+  The quantized case checks all six formats in both layouts, N=1024/1027,
+  K=4096, and one/three rows (48 cases). It passes in 29.83 seconds.
+- The quantized host reference accumulates in f64. Sequential f32 host
+  accumulation caused a false failure; the tolerance was not increased.
+- Integer uniform scatter indices replay correctly on the CPU without a
+  buffer binding. This regression lives at the internal scalar-binding seam.
+- All-target Fusor workspace Clippy passes with warnings denied, CPU/GPU,
+  kernel-observer and compiler-tests enabled. Formatting and 11 Python tool
+  tests pass. The matrix laboratory accepts every format through metadata.
+
+Resource checks use one compiler/GPU workload at a time. One combined GPU run
+was stopped when other workloads reduced memory headroom. After headroom
+recovered, the pending quantized test peaked at 0.584 GiB process-group RSS,
+retained at least 22.607 GiB headroom, and added no swapouts. No full model or
+model benchmark has been run for this revision; no 2x claim applies yet.
+CI Clippy, formatting, WebGPU compilation, and the Windows build pass at
+b34b5fb2a. Windows repeats its device loss at backward::leaky_relu, so the
+failing shard now collects a focused dispatch trace and WGSL artifacts.
+The original shard's failure remains visible. Other CI results are pending.
+
+The wall-time benchmark now logs seeded output, every stream-chunk gap, and
+p50/p95/worst latency. Its comparison tool refuses differing outputs or
+settings, missing rounds, invalid timings, and mismatched warmup boundaries.
+It discards only the configured initial warmup round, never slow samples.
+All 16 Python tool tests pass. Release compilation was stopped twice by the
+memory guard (peak process RSS 0.982/0.856 GiB, no added swapouts); the current
+model example's compilation and full-model timings remain unverified.
+
+Cross-platform follow-up at 203b15dec
+- macOS CI passes all eight shared WebGPU regressions (15.174 seconds),
+  quantized conformance, matmul, core, and normalization/layers. The separate
+  root test suite fails on an archive.org model-download timeout.
+- The sampling case sample_standard_token_is_seed_deterministic fails on
+  macOS, also reproduced locally. Grouped kernels guard each member's local
+  workgroup index, but the load-range verifier ignored that branch bound.
+  The verifier now scopes immutable unsigned bounds to the accepting branch
+  and prevents branch-local proofs leaking to other control-flow paths.
+  It also rejects unguarded subtraction whose unsigned result could wrap.
+- Windows' isolated leaky-ReLU gradient removes a fresh WARP device on its
+  very first dispatch. The captured shader contains float zero/one selects
+  feeding FMA, the pattern identified by the existing WARP regression probe.
+  The shared Kernel builder now canonicalizes predicate-valued selects to
+  casts, in both directions and across scalar types, preserving signed zero.
+  This has no adapter, model, or quantization-format dispatch.
+- Seven tile unit tests pass, including red/green predicate-canonicalization
+  and unsigned-wrap regressions, branch scoping, strict dot arithmetic, and
+  uniformity. Original GPU reproducer reruns were aborted by resource guards
+  before yielding a test result; they are not counted as passes.
+- Windows' shared quantized test reports one cancellation-sensitive mismatch:
+  Q6K/F32Scales, M=3/N=1027/K=4096, output 1059. Its f64 result is 1.78739104,
+  versus 90,334.43 summed absolute products. A scalar f32/FMA reference also
+  exceeds the test tolerance. The failing test now reports a dense WebGPU
+  contraction and scalar FMA reference to distinguish indexing from reduction
+  order; the original input, assertion, and tolerance remain unchanged.
+- Current model-example compilation passed CI Clippy; release execution and
+  a matched full-model speed comparison remain unverified. No 2x claim applies.
+
+Validation and cleanup after 18208e5f7
+- CI now passes the macOS sampling-2 shard and Windows backward-1 shard,
+  confirming the original branch-bound and WARP gradient regressions are fixed.
+  macOS again passes all eight shared WebGPU tests (18.848 seconds). Its root
+  suite passes 96 tests and fails the external Odyssey download test.
+- Windows' preserved numeric diagnostic reports quantized=1.7859497,
+  dense-GPU=1.7875061, scalar-FMA=1.7893316, and f64=1.78739104047.
+  The scalar f32 reference also fails the former result-only tolerance.
+  The floating fixture now permits max(5e-4*(1+abs(reference)),
+  f32::EPSILON*sum(abs(products))). This is an explicit test error budget,
+  not a universal floating-point error bound. The original floating inputs
+  remain covered; a second dyadic fixture requires zero error and checks
+  representability and the sum-of-magnitudes bound against the f64 reference.
+  There are now 96 cases across formats/layouts/shapes/input fixtures.
+  Local execution was pressure-aborted, so the expanded test awaits CI.
+- Removed 249 net lines of nested u32 storage emission and its dedicated
+  test, now unused because every production buffer declaration is flat.
+  Shared quantized-load expansion is unchanged. The contiguous-column
+  contraction now requires an actual fixed subgroup width, rather than
+  accepting an assumed width when subgroups are absent or variable.
+  Workspace/all-target Clippy passes after this cleanup (12.85 seconds).
+- A default release build reached final compilation but stopped at its
+  memory headroom guard after 100.49 seconds (2.222 GiB peak process-group
+  RSS, no additional swapouts). An explicit process-group inventory confirms
+  no owned compiler processes remain. A paired thin-LTO build configuration
+  is prepared to reduce linker memory without relaxing resource guards;
+  it has not yet produced a benchmark binary or a speedup measurement.
+
+Confirmed at f927525bd
+- All eight shared WebGPU tests pass on macOS (16.203 seconds), Windows
+  WARP (180.459 seconds), and Linux lavapipe (55.724 seconds). This includes
+  all 96 quantized cases and every zero-tolerance dyadic case.
+- Windows and Linux each pass all 166 executed Fusor tests (13 skipped),
+  with the shared ignored tests run explicitly in their preceding step.
+  Windows also passes all 84 executed root tests; Linux passes all 90.
+- macOS's external Odyssey download failure previously prevented the later
+  Fusor unit-test command from running. That command is now a separate step
+  which runs even after a root-test failure; the root failure stays visible.
+- The guarded local thin-LTO build also stopped on compression growth.
+  Release compilation has moved to the isolated diagnostic branch
+  codex/compiler-profile-builds. CI run 39092226768 builds the exact PR base
+  and f927525bd for aarch64-apple-darwin, serially, using the same profiling
+  source and default release settings. Only executable artifacts are built;
+  full-model execution remains local and resource-guarded. Build completion
+  and a matched speed measurement are still pending.
+
+Release artifacts and measurement readiness
+- CI run 39092226768 successfully built both default-release arm64 executables
+  with rustc 1.99.1. The downloaded hashes, full source revisions, architecture,
+  and profiling-source digest match its manifest. The binaries are available
+  locally under target/stall-validation/paired-release-ci. Later PR changes
+  affect only CI, reports, and comparison tools; runtime source is f927525bd.
+- The comparison tool also supports baseline/candidate/baseline runs. It
+  exposes baseline drift and reports the smaller improvement against the two
+  baselines, while checking every run's settings/output and keeping all slow
+  samples. All 18 Python tests pass, including the second-baseline checks.
+- No full-model benchmark has started. Following artifact verification,
+  memory headroom dropped from 18 GiB to 8.3 GiB, then 2.5 GiB with a
+  4.6 GiB compressor. Model admission was refused; no local compiler or model
+  process was left running. The performance goal remains unverified.
+
+Previous revision 4934d7cda (does not validate the rewrite above)
+==============================================================
+Shared compiler rewrite (2026-10-17)
+
+Scope
+The complete PR uses the ordinary Fusor tensor/compiler path.
+There is no ExecutionProfile, gpu_inference constructor, Apple adapter preset,
+model-specific schedule pin, or alternate Llama decode implementation.
+The only model-source change is adopting the shared immutable GGUF byte storage
+interface; graph construction, sampling, and device selection match main.
+
+Compiler changes
+- Recognize normalization from Map/Fold/View algebra. Retain the logical graph
+  for differentiation and price the fused launch during normal extraction.
+- Recognize single-query attention from QK, stable softmax, and PV contractions,
+  including grouped heads and prefix masks. Width comes from the operands;
+  fixed subgroup width and resource limits determine legality. Unsupported
+  cases retain the existing algebraic implementation.
+- Coalesced Q4/Q6 loads are selected from format, layout and subgroup legality.
+  Whole-block storage views preserve buffer bytes and checked accesses.
+- Forward affine views and pure map slabs through the ordinary compiler.
+  Forwarding validates each extracted plan, and rekeys the previous selection
+  after rejected graph unions. Replanning preserves the exact rejection cause.
+- Lower contiguous range updates into ordinary WebGPU copy/clear commands.
+- Keep symbolic single-index scatter geometry in uniforms; growth changes the
+  dispatch grid without compiling another shader.
+- Keep full-size and expanding views in the producer's replay plan. Only
+  partial views materialize their base separately. View forwarding preserves
+  the reduction's index space; equal element counts alone are not sufficient.
+
+Runtime changes
+- Generic QMatrix and dense-layer GGUF loaders share immutable host bytes,
+  as does the model loader. Concatenation retains segments without copying
+  every weight into another full host allocation.
+- Bounded prepared-plan/artifact caches apply to normal resolves.
+- One compiler worker by default avoids retaining a cohort of lowered kernels.
+- Submission overlaps preparation within the existing in-flight resource bound.
+- Production replay keeps its incumbent by default. Explicit online tuning is
+  still available, but no longer substitutes an alternative every 16 resolves.
+  Previously measured winners remain reusable with online exploration disabled.
+- Cache-only donation and its alias-specific lowering have been removed.
+  Ordinary scatter preserves its input and retained views. Prepared GPU
+  artifacts share the normal plan's weak ownership; no alternate plan is needed.
+
+Validation
+- All seven ordinary-device WebGPU tests pass with compiler-tests and
+  kernel-observer enabled (13.88 seconds). Cases cover RMS/attention vs host
+  references, copy lowering, concrete/symbolic/expanding view replay, scatter
+  input and retained-view preservation, view reductions plus gradients, and
+  softmax Jacobian-vector products with replay.
+- Q4/Q6 outputs match dequantized references at N=1024/1027, K=4096, and
+  one/three input rows. Aligned cases select both coalesced lowerings without
+  a preset; odd dimensions may select another legal schedule.
+- Symbolic grouped attention crosses 256 keys, grows storage to 512 slots,
+  and remains correct through 260 keys with zero extra shader compilations.
+- All 14 candidate-construction tests pass. Normalization tests cover four
+  shapes and absent/16/32/64-wide subgroups. Attention tests cover five channel
+  widths, grouped heads, and concrete/symbolic keys. Unsupported cases decline.
+- Both prepared-plan and GPU-artifact ownership tests pass.
+- The model library and both visualization/profiling examples pass cargo check.
+- The portable Python tool suite passes all 11 tests. Tests and stubs for
+  removed historical controllers were removed with those controllers.
+- All 29 visualizer Rust tests pass after the relocated-archive CLI fix.
+- The packed-word verifier and persisted-schedule/pipeline-reuse tests pass.
+- The complete Fusor workspace/all-target Clippy check passes with warnings
+  denied and kernel-observer enabled; formatting and diff whitespace pass.
+
+Resource validation
+Checks used one compiler job and one GPU process, at least 12 GiB starting
+memory headroom, a 1 GiB process-group RSS cap, no additional swapouts, a 32 MiB
+compressor-growth ceiling, and a 1 GiB runtime disk reserve. Small incremental
+tests may start with that disk reserve plus a 64 MiB linking allowance; larger
+checks require 1.5 GiB at startup. No model was loaded for these checks.
+The final GPU suite peaked at 0.387 GiB process-group RSS, with at least
+13.535 GiB memory headroom and no added swapouts.
+
+An expanded fixture initially exceeded its process-group cap while retaining
+multiple matrix graphs. It now releases the graph, device and GPU pool between
+cases and completes inside the same cap. When another workload reduced free
+disk below the reserve, builds were refused. They resumed after space recovered;
+only obsolete task-owned executables and check metadata were removed.
+
+CI follow-up
+Cross-platform compilation, Clippy, and WebGPU compilation passed at 4cb376d55.
+The subsequent native conformance results caught a reduction/view addressing
+bug and two gaps in the kernel type verifier (half-word unpack and signed
+shifts). A small verified WebGPU test reproduced the addressing panic before
+its fix; all seven verified GPU regressions now pass.
+
+A softmax-backward case additionally exposed a cyclic forwarded selection.
+The compiler now validates that candidate and restores the incumbent using
+its current class identities. The reproducer checks three row geometries and
+replays the resulting gradient; it matches the host Jacobian-vector product.
+
+The visualizer CLI tests now use runtime paths when Nextest relocates an
+archive. The cooperative scratch assertion follows the shared fragment
+geometry, and persisted measured schedules remain usable when online tuning
+is disabled. CI is being rerun for these corrections. An unrelated macOS
+root test failed when archive.org returned HTTP 500; a Windows GPU shard lost
+its WARP device. Neither is counted as a pass.
+
+Reproduction (from repository root; run GPU checks serially):
+  CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test --manifest-path fusor/Cargo.toml -p fusor --no-default-features \
+    --features kernel-observer,compiler-tests --config profile.dev.opt-level=0 --config profile.dev.debug=0 --test candidate_construction
+  CARGO_BUILD_JOBS=1 CARGO_INCREMENTAL=0 cargo test --manifest-path fusor/Cargo.toml -p fusor --no-default-features \
+    --features kernel-observer,compiler-tests --config profile.dev.opt-level=0 --config profile.dev.debug=0 --test shared_compiler -- --ignored --test-threads=1
+
+
+Performance scope
+Historical model presets, measurements, and experiment drivers are no longer
+part of the PR. Their earlier 2x result does not establish throughput for this
+rewrite. A fresh full-model comparison remains unverified: the final read-only
+preflight refused 14.96 GiB headroom against its 15.17 GiB requirement. No model
+was started. The previously
+built release chat executable also predates this rewrite.

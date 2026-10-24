@@ -4,10 +4,12 @@
 
 pub mod absorb_view;
 pub mod algebra;
+pub mod attention;
 pub mod fusion;
 pub mod group;
 pub mod layout;
 pub mod lower_floor;
+pub mod normalization;
 pub mod promote;
 pub mod rebase;
 pub mod scatter_fold;
@@ -36,6 +38,8 @@ pub struct RuleId(pub u16);
 /// Every rule `fusor-ir` owns, in a fixed order.
 pub static CORE_RULES: &[Rule] = &[
     // Logical algebra
+    normalization::FUSE_ROW_NORMALIZATION,
+    attention::FUSE_STREAMING_ATTENTION,
     algebra::STRIP,
     algebra::RECOGNIZE_CONTRACT,
     algebra::CONTRACT_REASSOC,
@@ -47,6 +51,7 @@ pub static CORE_RULES: &[Rule] = &[
     fusion::ABSORB,
     fusion::MAP_INTO_CONTRACT,
     fusion::MAP_INTO_MAP,
+    fusion::GATHER_POST_EPILOGUE,
     fusion::FOLD_POST_EPILOGUE,
     slab::FORM_SLAB,
     stream::STREAM_FOLD,

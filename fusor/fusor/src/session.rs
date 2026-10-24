@@ -39,6 +39,7 @@ use crate::{Error, Result};
 
 #[cfg(feature = "gpu")]
 mod explore;
+pub(crate) mod prepared;
 
 /// Submitted-but-unretired plans the session will let pile up before it
 /// blocks in `resolve`.
@@ -388,7 +389,7 @@ struct Twin {
 struct FamilyBindings<'a> {
     graph: &'a GraphRef,
     values: Vec<Id>,
-    saved: FxHashMap<Id, (Buf, Option<Arc<Layout>>)>,
+    saved: FxHashMap<Id, crate::graph::SavedBinding>,
 }
 
 impl<'a> FamilyBindings<'a> {
@@ -405,11 +406,11 @@ impl<'a> FamilyBindings<'a> {
                 .iter()
                 .any(|id| matches!(g.node(*id).op, Op::Logical(Logical::Leaf(_))));
             for id in members.iter() {
-                if let Some(binding) = leaves.device.get(id) {
-                    saved.entry(*id).or_insert_with(|| binding.clone());
+                if let Some(binding) = leaves.snapshot_binding(*id) {
+                    saved.entry(*id).or_insert(binding);
                 }
                 if !external {
-                    leaves.device.remove(id);
+                    leaves.clear_binding(*id);
                 }
             }
         }
@@ -428,10 +429,12 @@ impl Drop for FamilyBindings<'_> {
         for value in &self.values {
             let class = g.class_of(*value);
             for id in g.class_ids_cached(class).iter() {
-                leaves.device.remove(id);
+                leaves.clear_binding(*id);
             }
         }
-        leaves.device.extend(self.saved.drain());
+        for (id, binding) in self.saved.drain() {
+            leaves.restore_binding(id, binding);
+        }
     }
 }
 
@@ -500,6 +503,21 @@ impl Session {
         rules.extend_from_slice(SCHED_RULES);
         rules.extend_from_slice(fusor_autograd::ADJOINT_RULES);
         rules.extend_from_slice(target.rules());
+        // Diagnostic rule ablation. Only additive alternatives may be removed;
+        // every correctness-floor lowering remains available.
+        if let Ok(names) = std::env::var("FUSOR_PROFILE_DISABLE_RULES") {
+            for name in names.split(',').filter(|s| !s.is_empty()) {
+                let rule = rules
+                    .iter()
+                    .find(|r| r.name == name)
+                    .unwrap_or_else(|| panic!("unknown rule {name}"));
+                assert!(
+                    matches!(rule.tag, fusor_ir::egraph::RuleTag::Additive),
+                    "cannot disable correctness-floor rule {name}"
+                );
+                rules.retain(|r| r.name != name);
+            }
+        }
 
         Ok(Self {
             inner: Arc::new(SessionInner {
@@ -700,10 +718,24 @@ impl Session {
                 // Scale search with newly reached work. The driver finishes
                 // lowering when this budget is exhausted.
                 let budget = SaturationBudget {
-                    application_slope: 16,
+                    application_slope: flags().saturation_budget_scale.saturating_mul(16),
+                    node_slope: flags().saturation_budget_scale.saturating_mul(8),
+                    max_applications: flags().saturation_budget_scale.saturating_mul(200_000),
                     ..SaturationBudget::default()
                 };
-                Driver::new().saturate(&mut g, &caps, &self.inner.rules, budget)?;
+                let report = Driver::new().saturate(&mut g, &caps, &self.inner.rules, budget)?;
+                if flags().resolve_profile {
+                    eprintln!(
+                        "SATURATION scale={} saturated={} rounds={} applications={} initial={} final={} truncated={}",
+                        flags().saturation_budget_scale,
+                        report.saturated,
+                        report.rounds,
+                        report.applications,
+                        report.initial_nodes,
+                        report.final_nodes,
+                        report.truncated.len()
+                    );
+                }
                 if let Some(pre) = pre {
                     self.inner.saturation.insert(g.record_saturation(pre));
                 }
@@ -760,18 +792,20 @@ impl Session {
             // the forwarded plan is what every later hit on this key replays.
             let __t_fwd = Instant::now();
             let plan = if missed {
-                let mut ex = plan.extraction.clone();
-                let mut next = plan;
-                if fusor_cost::forward::forward_selected_views(
-                    &mut g, &caps, &roots, &next, &mut ex,
-                ) {
-                    next = Arc::new(self.inner.extractor.replan_extraction(
-                        &g,
-                        &roots,
-                        &mut ex,
-                        self.inner.cost.as_ref(),
-                    )?);
-                }
+                let mut next = Arc::new(fusor_cost::forward::forward_selected_views(
+                    &mut g,
+                    &caps,
+                    &roots,
+                    &plan,
+                    &mut |g, ex| {
+                        self.inner.extractor.replan_extraction(
+                            g,
+                            &roots,
+                            ex,
+                            self.inner.cost.as_ref(),
+                        )
+                    },
+                )?);
                 // Independent launches of one dependency level share a dispatch.
                 let grouped =
                     fusor_cost::wavefront::group_wavefronts(&mut g, &caps, &next, &mut |g, ex| {
@@ -865,7 +899,8 @@ impl Session {
         }
 
         let __t_run = Instant::now();
-        let (launched, executable) = self.run(&graph, &plan, values)?;
+        let prepared = graph.prepare_run(&plan);
+        let (launched, executable) = self.run(&graph, &plan, values, prepared.as_deref())?;
         #[cfg(feature = "gpu")]
         if let Some(sel) = explored {
             // Reads the profile the armed clock captured; must run before the
@@ -923,12 +958,15 @@ impl Session {
     }
 
     /// For each requested value that is a chain of pure views over a computed
-    /// value with no device buffer, that base value (deduplicated).
+    /// value with no device buffer, materialize a base only for a partial view.
+    /// Full-size reshapes/permutations stay in the same replay plan as their
+    /// producer; splitting them would freeze an intermediate from an old step.
     fn unresolved_view_bases(&self, graph: &GraphRef, values: &[Tensor]) -> Vec<Id> {
         let g = graph.state().egraph.lock();
         let mut out: Vec<Id> = Vec::new();
         for value in values {
             let mut id = value.id;
+            let mut partial = false;
             loop {
                 match logical_children(&g, id) {
                     Some(kids) if matches!(g.node(id).op, Op::Union(..)) && kids.len() == 1 => {
@@ -937,12 +975,35 @@ impl Session {
                     Some(kids)
                         if matches!(g.node(id).op, Op::Logical(Logical::Restride { .. })) =>
                     {
+                        // Constant products and the multiset of symbolic
+                        // factors prove full-size permutations, reshapes and
+                        // expanding broadcasts without consulting this step's
+                        // bindings. Only a smaller view needs a materialized base.
+                        let factors = |shape: &[Dim]| {
+                            let mut constant = 1u64;
+                            let mut symbols = Vec::new();
+                            for dim in shape {
+                                match dim {
+                                    Dim::Const(n) => constant = constant.checked_mul(*n)?,
+                                    Dim::Sym(s) if *s != fusor_ir::shape::OPAQUE_SYM => {
+                                        symbols.push(*s)
+                                    }
+                                    _ => return None,
+                                }
+                            }
+                            symbols.sort_unstable();
+                            Some((constant, symbols))
+                        };
+                        partial |= factors(&g.facts(id).shape)
+                            .zip(factors(&g.facts(kids[0]).shape))
+                            .is_none_or(|(view, base)| view.1 != base.1 || view.0 < base.0);
                         id = kids[0];
                     }
                     _ => break,
                 }
             }
-            if id != value.id
+            if partial
+                && id != value.id
                 && !matches!(g.node(id).op, Op::Logical(Logical::Leaf(_)))
                 && graph.device_buf(id).is_none()
                 && !out.contains(&id)
@@ -1470,7 +1531,12 @@ impl Session {
         graph: &GraphRef,
         plan: &Plan,
         values: &[Tensor],
+        prepared: Option<&prepared::PreparedRun>,
     ) -> Result<(usize, Option<Arc<CpuExecutable>>)> {
+        #[cfg(feature = "gpu")]
+        let host_detail = std::env::var_os("FUSOR_RESOLVE_HOST_DETAIL").is_some();
+        #[cfg(feature = "gpu")]
+        let host_start = host_detail.then(std::time::Instant::now);
         // What the extractor selected for each requested value.
         let wanted: Vec<Id> = values
             .iter()
@@ -1509,22 +1575,29 @@ impl Session {
                 .map(|launch| launch.root)
                 .collect()
         };
+        #[cfg(feature = "gpu")]
+        let host_roots = host_start.map(|s| s.elapsed());
         // Every external leaf the plan reads, uploaded once. A `Persistent`
         // leaf keeps its buffer across resolves. The classification runs once
         // over the distinct bound values under one lock apiece rather than
         // per binding; only the values that are genuinely unbacked reach
         // `leaf_buffer` and upload.
         let mut supplied: FxHashMap<Id, Buf> = FxHashMap::default();
-        let mut bound: rustc_hash::FxHashSet<Id> = rustc_hash::FxHashSet::default();
-        let mut distinct: Vec<Id> = Vec::with_capacity(plan.launches.len());
-        for launch in &plan.launches {
-            for binding in &launch.bindings {
-                if bound.insert(binding.value) {
-                    distinct.push(binding.value);
+        let external = if let Some(prepared) = prepared {
+            graph.prepared_leaf_buffers(&prepared.external)
+        } else {
+            let mut bound = rustc_hash::FxHashSet::default();
+            let mut distinct = Vec::with_capacity(plan.launches.len());
+            for launch in &plan.launches {
+                for binding in &launch.bindings {
+                    if bound.insert(binding.value) {
+                        distinct.push(binding.value);
+                    }
                 }
             }
-        }
-        for (id, existing) in graph.external_leaf_buffers(&distinct) {
+            graph.external_leaf_buffers(&distinct)
+        };
+        for (id, existing) in external {
             match existing {
                 Some(buf) => {
                     supplied.insert(id, buf);
@@ -1536,6 +1609,8 @@ impl Session {
                 }
             }
         }
+        #[cfg(feature = "gpu")]
+        let host_leaves = host_start.map(|s| s.elapsed());
         // Root outputs are allocated here rather than inside the backend so
         // the handle survives for readback. The root set is built once;
         // rescanning the launch list per buffer would be quadratic.
@@ -1563,6 +1638,8 @@ impl Session {
             supplied.insert(buffer.value, buf);
         }
         graph.bind_classes(&to_bind);
+        #[cfg(feature = "gpu")]
+        let host_buffers = host_start.map(|s| s.elapsed());
         // A value the caller asked for that the plan never had to allocate: a
         // bare leaf, or a leaf that only ever appears as an operand. Reading
         // one back is still a legal request, and a graph of nothing but a leaf
@@ -1583,19 +1660,32 @@ impl Session {
             };
             graph.bind_classes(&[(*selected, buf, None)]);
         }
+        #[cfg(feature = "gpu")]
+        let host_requested = host_start.map(|s| s.elapsed());
 
         match &self.inner.device {
             #[cfg(feature = "gpu")]
             Backend::Gpu(target) => {
-                let mut env = fusor_gpu::target::BindingEnv::new();
-                for (sym, value) in graph.dim_bindings() {
-                    env = env.with_dim(sym, value);
-                }
-                for (sym, value) in graph.uniform_scalars() {
-                    env = env.with_scalar(sym, value);
-                }
-                for (id, buf) in &supplied {
-                    env = env.with_buffer(*id, buf.clone());
+                let (dims, scalars) = graph.binding_symbols();
+                let env = fusor_gpu::target::BindingEnv {
+                    dims,
+                    scalars,
+                    buffers: supplied,
+                    plan_owner: prepared.map(|p| p.owner.clone()),
+                };
+                if let Some(start) = host_start {
+                    let roots = host_roots.unwrap();
+                    let leaves = host_leaves.unwrap();
+                    let buffers = host_buffers.unwrap();
+                    let requested = host_requested.unwrap();
+                    eprintln!(
+                        "RESOLVE_HOST_DETAIL roots_us={} leaves_us={} buffers_us={} requested_us={} env_us={}",
+                        roots.as_micros(),
+                        (leaves - roots).as_micros(),
+                        (buffers - leaves).as_micros(),
+                        (requested - buffers).as_micros(),
+                        (start.elapsed() - requested).as_micros()
+                    );
                 }
                 let g = graph.state().egraph.lock();
                 target.resolve(plan, &g, &env)?;
@@ -2130,7 +2220,7 @@ impl Session {
         let mut gpu_us: Option<Vec<f64>> = None;
         for _ in 0..repetitions {
             let t = Instant::now();
-            let _ = self.run(graph, plan, values)?;
+            let _ = self.run(graph, plan, values, None)?;
             self.inner.device.target().wait()?;
             self.inner.in_flight.store(0, Ordering::Relaxed);
             nanos = nanos.min(t.elapsed().as_nanos() as u64);
@@ -2159,16 +2249,14 @@ impl Session {
             return Ok(Some(buf));
         }
         let facts = graph.facts(id);
-        let buf = match graph.with_leaf_bytes(id, |bytes| {
+        if let Some(buf) = graph.upload_leaf_bytes(id, |bytes| {
             self.inner.device.upload(bytes, facts.persistence)
-        }) {
-            Some(uploaded) => uploaded?,
-            None => {
-                let elements = resolve_elements(&facts.shape, graph)?;
-                let bytes = (elements * facts.dtype.byte_size()).max(4);
-                self.inner.device.target().alloc(bytes, facts.persistence)?
-            }
-        };
+        })? {
+            return Ok(Some(buf));
+        }
+        let elements = resolve_elements(&facts.shape, graph)?;
+        let bytes = (elements * facts.dtype.byte_size()).max(4);
+        let buf = self.inner.device.target().alloc(bytes, facts.persistence)?;
         graph.bind_leaf(id, buf.clone(), None);
         Ok(Some(buf))
     }
@@ -2179,6 +2267,8 @@ impl Session {
 pub(crate) struct Flags {
     /// `FUSOR_RESOLVE_PROFILE`: per-resolve phase timings on stderr.
     pub(crate) resolve_profile: bool,
+    /// Bounded diagnostic expansion of compiler search, default unchanged.
+    pub(crate) saturation_budget_scale: u32,
     /// `FUSOR_DUMP_EXEC`: the launch and incumbent signatures of each
     /// distinct executed plan, to join a span profile to its kernels.
     pub(crate) dump_exec: bool,
@@ -2215,6 +2305,19 @@ pub(crate) fn flags() -> &'static Flags {
         };
         Flags {
             resolve_profile: on("FUSOR_RESOLVE_PROFILE"),
+            saturation_budget_scale: std::env::var("FUSOR_PROFILE_SATURATION_SCALE")
+                .ok()
+                .map(|v| {
+                    let n = v
+                        .parse()
+                        .expect("FUSOR_PROFILE_SATURATION_SCALE must be an integer");
+                    assert!(
+                        (1..=16).contains(&n),
+                        "FUSOR_PROFILE_SATURATION_SCALE must be 1..=16"
+                    );
+                    n
+                })
+                .unwrap_or(1),
             dump_exec: on("FUSOR_DUMP_EXEC"),
             no_saturation_memo: on("FUSOR_NO_SAT_MEMO"),
             autotune_log: on("FUSOR_AUTOTUNE_LOG"),

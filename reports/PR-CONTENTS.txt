@@ -1,0 +1,5 @@
+shared-compiler.txt records the current shared implementation and validation.
+
+Model-specific presets, experiment drivers, generated traces, binaries, and
+historical performance results are local investigation artifacts, not part of
+this PR. No earlier throughput result establishes the speed of this rewrite.

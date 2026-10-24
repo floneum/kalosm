@@ -59,6 +59,7 @@ fn gather(
         space: IndexSpace::new(out.iter().copied()),
         axis,
         mode,
+        post: fusor_ir::scalar::ScalarExpr::arg(0, f.own().dtype),
         ops: vec![x, idx],
         sched: ScheduleDomain::Map(map_domain(&out, &accesses, &cx).into()),
     };

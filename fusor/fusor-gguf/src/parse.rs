@@ -639,6 +639,12 @@ pub struct Gguf {
     metadata: GgufMetadata,
 }
 
+impl AsRef<[u8]> for Gguf {
+    fn as_ref(&self) -> &[u8] {
+        self.bytes()
+    }
+}
+
 impl Gguf {
     pub fn open(path: impl AsRef<std::path::Path>) -> Result<Self> {
         let file = std::fs::File::open(path.as_ref()).map_err(io)?;

@@ -36,8 +36,12 @@ impl Weight {
         };
         let shape = [Dim::Const(rows), Dim::Const(cols)];
         match raw.fmt {
-            Dtype::Q(fmt) => Ok(Self::Quantized(QMatrix::from_raw_bytes(
-                graph, fmt, raw.layout, shape, &raw.bytes,
+            Dtype::Q(fmt) => Ok(Self::Quantized(QMatrix::from_shared_bytes(
+                graph,
+                fmt,
+                raw.layout,
+                shape,
+                raw.bytes.shared_host_bytes(),
             )?)),
             Dtype::F16 | Dtype::F32 | Dtype::BF16 => Ok(Self::Dense(Dyn::from_slice(
                 graph.handle(),

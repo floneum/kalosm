@@ -85,7 +85,12 @@ pub(crate) fn load_dense(vb: &VarBuilder, graph: &GraphRef, name: &str) -> Resul
             )));
         }
     }
-    let leaf = graph.quantized_leaf(fmt, raw.layout, [rows, cols], raw.bytes.to_vec())?;
+    let leaf = graph.quantized_leaf_shared(
+        fmt,
+        raw.layout,
+        [rows, cols],
+        raw.bytes.shared_host_bytes(),
+    )?;
     Tensor::emit(
         graph,
         Logical::Dequant {

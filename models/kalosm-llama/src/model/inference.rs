@@ -68,6 +68,9 @@ impl LlamaModel {
                 break;
             }
             tokens_generated += 1;
+            // Observe actual token boundaries independently of UTF-8 text buffering.
+            // This trace target is disabled during ordinary generation.
+            tracing::trace!(target: "kalosm_llama::decode_token", token_id = new_token, ordinal = tokens_generated);
             if let Some(mut new_text) = text_stream
                 .next_token(new_token)
                 .map_err(LlamaModelError::TokenOutputStreamError)?

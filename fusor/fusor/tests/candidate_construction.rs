@@ -115,6 +115,111 @@ fn assert_declines(graph: &mut EGraph, caps: &Caps, id: Id, rule: RuleFn) {
 }
 
 #[test]
+fn gather_epilogue_requires_dense_coordinates_and_available_bindings() {
+    use fusor_ir::ir::launch::{
+        AccessPlan, GatherMode, IndexSpace, Launch, Operand, ScheduleDomain,
+    };
+    use fusor_ir::scalar::{BinOp, ScalarExpr};
+    use fusor_ir::shape::Layout;
+    let rule = fusor_ir::rules::fusion::GATHER_POST_EPILOGUE.apply;
+    for transposed in [false, true] {
+        for budget in [4, 5] {
+            let mut g = graph();
+            let source = leaf(&mut g, 0, &consts([2, 5]));
+            let index = g
+                .add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
+                    name: BufferId(1),
+                    dtype: Dtype::U32,
+                    shape: consts([3]).into_iter().collect(),
+                })))
+                .unwrap();
+            let extra = leaf(&mut g, 2, &consts([2, 3]));
+            let operand = |src, shape: &[Dim]| Operand {
+                src,
+                layout: Layout::contiguous(shape),
+                access: AccessPlan::Alias,
+            };
+            let gather = g
+                .add(Op::Launch(Launch::Gather {
+                    space: IndexSpace::new(consts([2, 3])),
+                    axis: 1,
+                    mode: GatherMode::RowPerGroup,
+                    post: ScalarExpr::arg(0, Dtype::F32),
+                    ops: vec![
+                        operand(source, &consts([2, 5])),
+                        operand(index, &consts([3])),
+                    ],
+                    sched: ScheduleDomain::Point,
+                }))
+                .unwrap();
+            let mut read = operand(gather, &consts([2, 3]));
+            if transposed {
+                read.layout =
+                    Layout::from_parts(Dim::Const(0), &consts([2, 3]), &consts([1, 2])).unwrap();
+            }
+            let body = ScalarExpr::bin(
+                BinOp::Sub,
+                ScalarExpr::arg(0, Dtype::F32),
+                ScalarExpr::arg(1, Dtype::F32),
+            );
+            let root = g
+                .add(Op::Launch(Launch::Map {
+                    space: IndexSpace::new(consts([2, 3])),
+                    body,
+                    ops: vec![read, operand(extra, &consts([2, 3]))],
+                    sched: ScheduleDomain::Point,
+                }))
+                .unwrap();
+            let mut c = gpu_caps();
+            c.limits.max_storage_buffers_per_shader_stage = budget;
+            if transposed || budget < 5 {
+                assert_declines(&mut g, &c, root, rule);
+            } else {
+                assert!(apply(&mut g, &c, root, rule).is_some());
+                let fused = g
+                    .class_ids(g.class_of(root))
+                    .into_iter()
+                    .find_map(|id| match &g.node(id).op {
+                        Op::Launch(op @ Launch::Gather { .. }) => Some(op.clone()),
+                        _ => None,
+                    })
+                    .unwrap();
+                fusor_ir::verify_launch::check_operand_access(&fused).unwrap();
+                let Launch::Gather { post, ops, .. } = fused else {
+                    unreachable!()
+                };
+                assert_eq!(ops.len(), 3);
+                assert_eq!(
+                    post,
+                    ScalarExpr::bin(
+                        BinOp::Sub,
+                        ScalarExpr::arg(0, Dtype::F32),
+                        ScalarExpr::arg(1, Dtype::F32)
+                    )
+                );
+                for invalid in [
+                    ScalarExpr::arg(2, Dtype::F32),
+                    ScalarExpr::arg(0, Dtype::F16),
+                    ScalarExpr::index_of(2),
+                ] {
+                    assert!(
+                        g.add(Op::Launch(Launch::Gather {
+                            space: IndexSpace::new(consts([2, 3])),
+                            axis: 1,
+                            mode: GatherMode::RowPerGroup,
+                            post: invalid,
+                            ops: ops.clone(),
+                            sched: ScheduleDomain::Point,
+                        }))
+                        .is_err()
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn shared_matmul_ancestors_are_charged_once_with_every_branch() {
     use fusor_ir::dtype::{QFmt, QLayout};
     use fusor_ir::egraph::{Saturate, SaturationBudget};
@@ -192,6 +297,84 @@ fn shared_matmul_ancestors_are_charged_once_with_every_branch() {
     let first_cost = fusor_cost::realize::exact_cost(&first, &selected, &cost);
     let all_cost = fusor_cost::realize::exact_cost(&all, &selected, &cost);
     assert_eq!(all_cost.0, first_cost.0 * 32);
+}
+
+/// Every repeated block must see cheap map substitution before an early
+/// block consumes the graph-wide frontier with contraction alternatives.
+#[test]
+fn bounded_saturation_offers_map_fusion_to_every_block() {
+    use fusor_ir::egraph::{Saturate, SaturationBudget};
+    use fusor_ir::ir::launch::Launch;
+    use fusor_ir::scalar::{ScalarExpr, UnOp};
+
+    let caps = gpu_caps();
+    let (planner, mut graph) = planner_graph();
+    let mut x = leaf(&mut graph, 0, &consts([1, 1024]));
+    let mut outputs = Vec::new();
+    for layer in 0..32 {
+        let weight = leaf(&mut graph, layer + 1, &consts([1024, 1024]));
+        let input = contract(&mut graph, x, weight, MATMUL);
+        x = input;
+        for op in [UnOp::Neg, UnOp::Exp, UnOp::Tanh] {
+            x = graph
+                .add(Op::Logical(Logical::Map {
+                    expr: ScalarExpr::un(op, ScalarExpr::arg(0, Dtype::F32)),
+                    ins: [x].into_iter().collect(),
+                    outs: 1,
+                }))
+                .unwrap();
+        }
+        outputs.push((input, x));
+    }
+    graph.add_root(x);
+    let rules: Vec<_> = fusor_ir::CORE_RULES
+        .iter()
+        .chain(fusor_tile::SCHED_RULES)
+        .copied()
+        .collect();
+    let report = fusor_ir::Driver::new()
+        .saturate(
+            &mut graph,
+            &caps,
+            &rules,
+            SaturationBudget {
+                node_slack: 0,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    // One rule invocation can cross the ceiling before the driver checks it;
+    // this graph's largest invocation adds at most sixteen nodes.
+    assert!(
+        report.final_nodes <= report.initial_nodes * 8 + 16,
+        "{report:?}"
+    );
+    let fused: Vec<_> = outputs
+        .iter()
+        .map(|&(input, output)| {
+            graph.members(graph.class_of(output)).iter().any(|&id| {
+                matches!(&graph.node(id).op, Op::Launch(Launch::Map {ops, ..})
+                if ops.len() == 1 && graph.class_of(ops[0].src) == graph.class_of(input))
+            })
+        })
+        .collect();
+    assert!(
+        fused.iter().all(|v| *v),
+        "fusion offered by block: {fused:?}; {report:?}"
+    );
+    // Check the selected plan too. Contractions may split their reduction,
+    // but each block should need at most one separate pointwise dispatch.
+    use fusor_ir::extract::{ExtractBudget, Extractor};
+    let cost = fusor_cost::Roofline::new(fusor_cost::facts::seed_facts(&caps));
+    let plan = fusor_cost::LocalSearch::new(planner, caps)
+        .extract(&graph, &[x], &cost, ExtractBudget::default())
+        .unwrap();
+    let maps = plan
+        .launches
+        .iter()
+        .filter(|launch| matches!(graph.node(launch.root).op, Op::Launch(Launch::Map { .. })))
+        .count();
+    assert!(maps <= 32, "{maps} pointwise launches for 32 blocks");
 }
 
 #[test]
@@ -357,14 +540,20 @@ fn cooperative_domains_contain_only_supported_scratch_combinations() {
                 };
                 let tiles = coop_tiles(point.geom, element, point.staging);
                 // Independent extent calculation: two stacked operand tiles
-                // plus enough room for a scalar accumulator copy.
+                // plus one accumulator fragment per subgroup. The
+                // epilogue reuses that fragment for successive output tiles.
                 let g = point.geom;
                 let depth = u64::from(point.staging);
                 let expected =
                     depth * u64::from(g.bm * g.bk + g.bk * (g.bn / g.n_passes)) * dtype.byte_size()
-                        + u64::from(g.bm * (g.bn / g.n_passes)) * 4;
+                        + u64::from(g.subgroups)
+                            * u64::from(fusor_ir::ir::launch::CoopGeom::COOP_DIM).pow(2)
+                            * 4;
                 let actual = planner.workgroup_bytes(&tiles, &caps).unwrap();
-                assert!(u64::from(actual) >= expected);
+                assert!(
+                    u64::from(actual) >= expected,
+                    "{dtype:?} {point:?}: {actual} < {expected}"
+                );
                 assert!(actual <= limit, "{point:?}: {actual} > {limit}");
             }
         }
@@ -839,4 +1028,215 @@ fn symbolic_map_fusion_preserves_the_producer_address() {
             );
         }
     }
+}
+
+/// Build normalization through scalar algebra, without calling an RMS helper.
+fn normalization_expression(g: &mut EGraph, rows: u64, width: u64, mean_scale: f32) -> Id {
+    use fusor_autograd::tape::{GraphTape, TapeExt};
+    use fusor_ir::autograd::Tape;
+    use fusor_ir::scalar::{BinOp, ScalarExpr, UnOp};
+    let x = leaf(g, 0, &consts([rows, width]));
+    let w = leaf(g, 1, &consts([width]));
+    let mut t = GraphTape::new(g);
+    let square = t.binary(BinOp::Mul, x, x).unwrap();
+    let sum = t.fold_binop(BinOp::Add, 1, Dtype::F32, square).unwrap();
+    let mean = t.mul_scalar(sum, mean_scale).unwrap();
+    let eps = ScalarExpr::lit(fusor_ir::dtype::Splat::F32(1e-5));
+    let inv = t
+        .map(
+            ScalarExpr::un(
+                UnOp::InverseSqrt,
+                ScalarExpr::bin(BinOp::Add, ScalarExpr::arg(0, Dtype::F32), eps),
+            ),
+            &[mean],
+        )
+        .unwrap();
+    let inv = t.broadcast_axis(inv, 1, Dim::Const(width)).unwrap();
+    let y = t.binary(BinOp::Mul, x, inv).unwrap();
+    let w = t.broadcast_to(w, &consts([rows, width])).unwrap();
+    t.binary(BinOp::Mul, y, w).unwrap()
+}
+
+#[test]
+fn ordinary_algebra_gets_normalization_on_capability_variants() {
+    use fusor_ir::ir::launch::Launch;
+    let rule = fusor_ir::rules::normalization::FUSE_ROW_NORMALIZATION.apply;
+    for subgroup in [None, Some(16), Some(32), Some(64)] {
+        for (rows, width) in [(7, 37), (2, 128), (5, 257), (3, 768)] {
+            let mut g = graph();
+            let root = normalization_expression(&mut g, rows, width, 1.0 / width as f32);
+            let mut c = gpu_caps();
+            c.name = "anonymous capability fixture".into();
+            c.subgroups = subgroup.map(|n| SubgroupWidths { min: n, max: n });
+            c.limits.max_compute_invocations_per_workgroup = 128;
+            c.limits.max_compute_workgroup_size[0] = 128;
+            assert!(
+                apply(&mut g, &c, root, rule).is_some(),
+                "{subgroup:?}, {rows}x{width}"
+            );
+            assert!(g.class_ids(g.class_of(root)).iter().any(|id| matches!(
+                g.node(*id).op,
+                Op::Launch(Launch::RmsNorm {
+                    block: 32 | 64 | 128,
+                    ..
+                })
+            )));
+        }
+    }
+    // Wide rows can use more parallel lanes, but never exceed the granted
+    // invocation, X dimension, storage, or per-lane live-value limits.
+    for (width, lanes, x_limit, storage, expected) in [
+        (4096, 1024, 1024, 32768, Some(512)),
+        (8192, 512, 512, 32768, Some(512)),
+        (16384, 512, 512, 32768, Some(512)),
+        (16385, 512, 512, 32768, None),
+        (4096, 256, 1024, 32768, Some(256)),
+        (4096, 1024, 128, 32768, Some(128)),
+        (4096, 1024, 1024, 512, Some(128)),
+        (8193, 256, 256, 32768, None),
+        (37, 1024, 1024, 32768, Some(64)),
+    ] {
+        for subgroup in [
+            None,
+            Some(SubgroupWidths { min: 16, max: 32 }),
+            Some(SubgroupWidths { min: 64, max: 64 }),
+        ] {
+            let mut g = graph();
+            let root = normalization_expression(&mut g, 2, width, 1.0 / width as f32);
+            let mut c = gpu_caps();
+            c.subgroups = subgroup;
+            c.limits.max_compute_invocations_per_workgroup = lanes;
+            c.limits.max_compute_workgroup_size[0] = x_limit;
+            c.limits.max_compute_workgroup_storage_size = storage;
+            let fused = apply(&mut g, &c, root, rule);
+            let actual = g.class_ids(g.class_of(root)).iter().find_map(|id| {
+                if let Op::Launch(Launch::RmsNorm { block, .. }) = g.node(*id).op {
+                    Some(block)
+                } else {
+                    None
+                }
+            });
+            assert_eq!(fused.is_some(), actual.is_some());
+            assert_eq!(
+                actual, expected,
+                "width={width} limits={lanes}/{x_limit}/{storage}"
+            );
+        }
+    }
+    let mut g = graph();
+    let root = normalization_expression(&mut g, 3, 37, 1.0 / 36.0);
+    assert_declines(&mut g, &gpu_caps(), root, rule);
+    let mut g = graph();
+    let root = normalization_expression(&mut g, 3, 37, 1.0 / 37.0);
+    assert_declines(&mut g, &caps(), root, rule);
+}
+
+fn attention_expression(g: &mut EGraph, width: u64, keys: Dim, grouped: bool) -> Id {
+    use fusor_autograd::tape::{GraphTape, TapeExt};
+    use fusor_ir::autograd::Tape;
+    use fusor_ir::scalar::{BinOp, UnOp};
+    let qs = if grouped {
+        vec![
+            Dim::Const(2),
+            Dim::Const(3),
+            Dim::Const(2),
+            Dim::ONE,
+            Dim::Const(width),
+        ]
+    } else {
+        consts([2, 3, 1, width]).to_vec()
+    };
+    let q = leaf(g, 0, &qs);
+    let k = leaf(
+        g,
+        1,
+        &[Dim::Const(2), Dim::Const(3), keys, Dim::Const(width)],
+    );
+    let v = leaf(
+        g,
+        2,
+        &[Dim::Const(2), Dim::Const(3), keys, Dim::Const(width)],
+    );
+    let labels = |x: &[u8]| x.iter().copied().map(Label).collect();
+    let qlabels = if grouped {
+        vec![0, 1, 5, 2, 4]
+    } else {
+        vec![0, 1, 2, 4]
+    };
+    let slabels = if grouped {
+        vec![0, 1, 5, 2, 3]
+    } else {
+        vec![0, 1, 2, 3]
+    };
+    let mut t = GraphTape::new(g);
+    let s = t
+        .contract(
+            q,
+            k,
+            EinSpec {
+                a: labels(&qlabels),
+                b: labels(&[0, 1, 3, 4]),
+                out: labels(&slabels),
+            },
+            Dtype::F32,
+        )
+        .unwrap();
+    let s = t.mul_scalar(s, 1.0 / (width as f32).sqrt()).unwrap();
+    let axis = (qs.len() - 1) as u32;
+    let max = t.fold_binop(BinOp::Max, axis, Dtype::F32, s).unwrap();
+    let max = t.broadcast_axis(max, axis, keys).unwrap();
+    let centered = t.binary(BinOp::Sub, s, max).unwrap();
+    let exp = t.unary(UnOp::Exp, centered).unwrap();
+    let sum = t.fold_binop(BinOp::Add, axis, Dtype::F32, exp).unwrap();
+    let sum = t.broadcast_axis(sum, axis, keys).unwrap();
+    let prob = t.binary(BinOp::Div, exp, sum).unwrap();
+    t.contract(
+        prob,
+        v,
+        EinSpec {
+            a: labels(&slabels),
+            b: labels(&[0, 1, 3, 4]),
+            out: labels(&qlabels),
+        },
+        Dtype::F32,
+    )
+    .unwrap()
+}
+
+#[test]
+fn ordinary_attention_is_recognized_for_multiple_widths_and_subgroups() {
+    let rule = fusor_ir::rules::attention::FUSE_STREAMING_ATTENTION.apply;
+    for subgroup in [16, 32, 64] {
+        for width in [32, 64, 96, 128, 256] {
+            if width % subgroup != 0 {
+                continue;
+            }
+            for grouped in [false, true] {
+                for keys in [
+                    Dim::Const(17),
+                    Dim::Const(513),
+                    Dim::Sym(fusor_ir::shape::SymId(77)),
+                ] {
+                    let mut g = graph();
+                    let root = attention_expression(&mut g, width, keys, grouped);
+                    let mut c = gpu_caps();
+                    c.name = "anonymous capability fixture".into();
+                    c.subgroups = Some(SubgroupWidths {
+                        min: subgroup as u32,
+                        max: subgroup as u32,
+                    });
+                    assert!(
+                        apply(&mut g, &c, root, rule).is_some(),
+                        "width={width} subgroup={subgroup} grouped={grouped} keys={keys:?}"
+                    );
+                }
+            }
+        }
+    }
+    let mut g = graph();
+    let root = attention_expression(&mut g, 128, Dim::Const(17), false);
+    let mut c = gpu_caps();
+    c.subgroups = None;
+    assert_declines(&mut g, &c, root, rule);
+    assert_declines(&mut g, &caps(), root, rule);
 }

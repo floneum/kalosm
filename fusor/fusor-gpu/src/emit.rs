@@ -672,6 +672,124 @@ mod tests {
             .collect()
     }
 
+    fn accumulator_kernel(cross_reads: bool, count: u32) -> KernelIr {
+        let b = Kernel::new();
+        let ty = ScalarElement::U32.element();
+        let a = b.local(ty);
+        let c = b.local(ty);
+        let output = buffer(1, ty, 2, BufferAccess::ReadWrite);
+        let (next_a, next_c) = if cross_reads {
+            (
+                b.add(b.load_local(c.clone()), b.u32(1)),
+                b.add(b.load_local(a.clone()), b.u32(2)),
+            )
+        } else {
+            (
+                b.add(b.load_local(a.clone()), b.u32(101)),
+                b.mul(b.load_local(c.clone()), b.u32(103)),
+            )
+        };
+        let store = |index, local| Stmt::Store {
+            dst: output.clone(),
+            addr: Addr::Linear(b.u32(index)),
+            value: b.load_local(local),
+            mask: b.bool(true),
+        };
+        KernelIr {
+            buffers: vec![
+                buffer(0, ty, 1, BufferAccess::Read).buffer,
+                output.buffer.clone(),
+            ],
+            grid: [1, 1, 1],
+            block: 1,
+            body: vec![
+                Stmt::Loop {
+                    count: Some(b.u32(count)),
+                    index: None,
+                    accumulators: vec![
+                        Accumulator {
+                            local: a.clone(),
+                            init: b.u32(1),
+                            update: next_a,
+                        },
+                        Accumulator {
+                            local: c.clone(),
+                            init: b.u32(2),
+                            update: next_c,
+                        },
+                    ],
+                    body: vec![],
+                },
+                store(0, a),
+                store(1, c),
+            ],
+            byte_arena: None,
+            name: "accumulator_schedule",
+        }
+    }
+
+    #[test]
+    fn independent_loop_updates_release_values_before_the_next_update() {
+        let Ok(target) = crate::target::GpuTarget::new_blocking() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        let ir = accumulator_kernel(false, 3);
+        let emitted = emit(&ir, target.caps()).unwrap();
+        let f = &emitted.module.entry_points[0].function;
+        fn find_loop(block: &naga::Block) -> Option<&naga::Block> {
+            block.iter().find_map(|stmt| match stmt {
+                naga::Statement::Loop { body, .. } => Some(body),
+                naga::Statement::Block(body) => find_loop(body),
+                _ => None,
+            })
+        }
+        let body = find_loop(&f.body).expect("emitted counted loop");
+        let first_store = body
+            .iter()
+            .position(|s| matches!(s, naga::Statement::Store { .. }))
+            .unwrap();
+        let second_math = body
+            .iter()
+            .position(|s| match s {
+                naga::Statement::Emit(range) => range.clone().any(|h| {
+                    matches!(
+                        f.expressions[h],
+                        naga::Expression::Binary {
+                            op: naga::BinaryOperator::Multiply,
+                            ..
+                        }
+                    )
+                }),
+                _ => false,
+            })
+            .unwrap();
+        assert!(
+            first_store < second_math,
+            "independent update is held across the next update"
+        );
+        assert_eq!(
+            run(&target, &ir, Uniforms::default()),
+            [304, 2 * 103u32.pow(3)]
+        );
+    }
+
+    #[test]
+    fn loop_updates_keep_the_old_values_for_cross_dependencies() {
+        let Ok(target) = crate::target::GpuTarget::new_blocking() else {
+            eprintln!("no GPU adapter; skipping");
+            return;
+        };
+        for (count, expected) in [(0, [1, 2]), (1, [3, 3]), (2, [4, 5]), (3, [6, 6])] {
+            let ir = accumulator_kernel(true, count);
+            assert_eq!(
+                run(&target, &ir, Uniforms::default()),
+                expected,
+                "{count} iterations"
+            );
+        }
+    }
+
     #[test]
     fn subgroup_sum_tracks_active_lanes_across_scopes() {
         let Ok(target) = crate::target::GpuTarget::new_blocking() else {

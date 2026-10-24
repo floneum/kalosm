@@ -1,0 +1,5 @@
+# Generated model investigations and machine-specific benchmarks stay local.
+*
+!/.gitignore
+!/PR-CONTENTS.txt
+!/shared-compiler.txt

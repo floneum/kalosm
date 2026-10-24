@@ -9,6 +9,8 @@ use fusor_ir::dtype::{Dtype, QFmt, QLayout};
 use fusor_ir::ir::Op;
 use fusor_ir::ir::logical::{LeafKind, Logical};
 use fusor_ir::shape::Dim;
+use fusor_ir::target::HostBytes;
+use std::sync::Arc;
 
 use crate::graph::{Graph, GraphRef};
 use crate::tensor::Tensor;
@@ -86,6 +88,28 @@ impl QMatrix {
         shape: [Dim; 2],
         bytes: &[u8],
     ) -> Result<Self> {
+        Self::from_shared_bytes_in(graph, fmt, layout, shape, Arc::new(bytes.to_vec().into()))
+    }
+
+    /// Build from stable shared host backing, including a read-only file view.
+    /// The backing is retained for future uploads and legal layout rewrites.
+    pub fn from_shared_bytes(
+        graph: &Graph,
+        fmt: QFmt,
+        layout: QLayout,
+        shape: [Dim; 2],
+        bytes: Arc<HostBytes>,
+    ) -> Result<Self> {
+        Self::from_shared_bytes_in(graph.handle(), fmt, layout, shape, bytes)
+    }
+
+    fn from_shared_bytes_in(
+        graph: &GraphRef,
+        fmt: QFmt,
+        layout: QLayout,
+        shape: [Dim; 2],
+        bytes: Arc<HostBytes>,
+    ) -> Result<Self> {
         let [rows, cols] = shape;
         let elements = fmt.block_elements() as u64;
         if let Dim::Const(c) = cols
@@ -105,7 +129,7 @@ impl QMatrix {
                 )));
             }
         }
-        let id = graph.quantized_leaf(fmt, layout, shape, bytes.to_vec())?;
+        let id = graph.quantized_leaf_shared(fmt, layout, shape, bytes)?;
         Ok(Self {
             tensor: graph.tensor(id),
             fmt,
@@ -139,12 +163,12 @@ impl QMatrix {
                 )));
             }
         };
-        Self::from_raw_bytes(
+        Self::from_shared_bytes(
             graph,
             fmt,
             raw.layout,
             [Dim::Const(rows), Dim::Const(cols)],
-            &raw.bytes,
+            raw.bytes.shared_host_bytes(),
         )
     }
 
@@ -293,21 +317,21 @@ impl QMatrix {
                     "concat_rows part {i} has a symbolic row extent"
                 )));
             };
-            let Some(part) = graph.leaf_bytes(m.tensor.id()) else {
+            let Some(part) = graph.leaf_bytes_shared(m.tensor.id()) else {
                 return Err(Error::Shape(format!(
                     "concat_rows part {i} has no host bytes; only a quantized leaf \
                      built from bytes can be concatenated"
                 )));
             };
+            bytes.push(part);
             rows = rows.saturating_add(r);
-            bytes.extend_from_slice(&part);
         }
-        Self::from_raw_bytes_in(
+        Self::from_shared_bytes_in(
             graph,
             fmt,
             layout,
             [Dim::Const(rows), Dim::Const(cols_n)],
-            &bytes,
+            Arc::new(HostBytes::concat(bytes)?),
         )
     }
 }

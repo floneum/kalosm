@@ -44,6 +44,14 @@ rule!(
     apply = fold_post_epilogue,
 );
 
+rule!(
+    GATHER_POST_EPILOGUE,
+    level = Level::Launch,
+    head = OpTag::LaunchMap,
+    tag = RuleTag::Additive,
+    apply = gather_post_epilogue,
+);
+
 /// A reader's operands after one splice, and the `Arg` renumbering onto them.
 struct Spliced {
     ops: Vec<Operand>,
@@ -464,6 +472,72 @@ pub fn map_into_map(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
     crate::verify_launch::check_operand_access(&fused).ok()?;
     let fused = b.add_launch(fused).ok()?;
     b.union(id, fused).ok()
+}
+
+/// A map consuming a gather at the same dense coordinate can compute its
+/// expression before the gather's store. Source/index operands keep their own
+/// spaces; additional reads use the map's output space. This substitutes only
+/// scalar values, so strict arithmetic and runtime index changes are preserved.
+pub fn gather_post_epilogue(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
+    let Op::Launch(Launch::Map {
+        space, body, ops, ..
+    }) = &node.op
+    else {
+        return None;
+    };
+    let mut used = Vec::new();
+    body.collect_args(&mut used);
+    for (slot, operand) in ops.iter().enumerate() {
+        if !used.contains(&(slot as u32)) || operand.access != AccessPlan::Alias {
+            continue;
+        }
+        for producer in b.class_ids(operand.src).into_iter().take(32) {
+            let Op::Launch(mut fused @ Launch::Gather { .. }) = b.node(producer).op.clone() else {
+                continue;
+            };
+            let Launch::Gather {
+                space: gathered_space,
+                post,
+                ops: inputs,
+                ..
+            } = &mut fused
+            else {
+                unreachable!()
+            };
+            if *gathered_space != *space
+                || !reads_producer_densely(operand, &space.dims, space, &[])
+                || inputs.len().saturating_add(ops.len().saturating_sub(1)) > MAX_ABSORBED_OPERANDS
+            {
+                continue;
+            }
+            let mut args = Vec::with_capacity(ops.len());
+            for (at, other) in ops.iter().enumerate() {
+                if at == slot {
+                    args.push(post.clone());
+                } else {
+                    // Two indexed operands, then one post argument per extra
+                    // operand: inputs[2] is Arg(1).
+                    args.push(ScalarExpr::arg(
+                        (inputs.len() - 1) as u32,
+                        b.facts_of(other.src).dtype,
+                    ));
+                    inputs.push(other.clone());
+                }
+            }
+            if storage_bindings(b, inputs)
+                > f.caps().limits.max_storage_buffers_per_shader_stage as usize
+            {
+                continue;
+            }
+            *post = body.compose(&args);
+            if crate::verify_launch::check_operand_access(&fused).is_err() {
+                continue;
+            }
+            let fused = b.add_launch(fused).ok()?;
+            return b.union(id, fused).ok();
+        }
+    }
+    None
 }
 
 /// Inline elementwise producers into a contraction's `a` or `b` side.
