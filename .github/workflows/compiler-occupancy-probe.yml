@@ -37,6 +37,9 @@ jobs:
         run: |
           set -euo pipefail
           mkdir artifacts
+          git fetch --depth=1 origin 9f52cde755f06575510c7a62e872d89bb0a96c81
+          git restore --source=9f52cde755f06575510c7a62e872d89bb0a96c81 -- fusor/fusor/examples/qmatmul_lab.rs
+          git diff > artifacts/fixture-only.patch
           rustc -Vv > artifacts/provenance.txt
           git rev-parse HEAD >> artifacts/provenance.txt
           cargo metadata --locked --manifest-path fusor/Cargo.toml --format-version 1 > /tmp/occupancy-metadata.json
