@@ -52,7 +52,7 @@ pub(crate) struct LeafStore {
     /// `Coop`/`Sgemm` geometry pads the output to its tile multiple, so a
     /// readback that assumed contiguity would hand back the first row plus
     /// padding.
-    pub(crate) device: FxHashMap<Id, (Buf, Option<Arc<fusor_ir::shape::Layout>>)>,
+    device: FxHashMap<Id, (Buf, Option<Arc<fusor_ir::shape::Layout>>)>,
     /// Only ordinary uploads witness these bindings' immutable host contents.
     /// Rebinding or clearing a value removes its witness.
     uploaded: FxHashSet<Id>,
@@ -63,6 +63,14 @@ pub(crate) struct LeafStore {
     prepared_runs: Vec<Arc<crate::session::prepared::PreparedRun>>,
 }
 
+/// A temporary binding scope restores the buffer and its upload provenance
+/// together. Keeping the backing owner also prevents pointer reuse while the
+/// original binding is saved.
+pub(crate) struct SavedBinding {
+    device: (Buf, Option<Arc<fusor_ir::shape::Layout>>),
+    uploaded: Option<Arc<fusor_ir::target::HostBytes>>,
+}
+
 #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
 pub(crate) struct HostUpload {
     pub(crate) values: Vec<Id>,
@@ -70,6 +78,34 @@ pub(crate) struct HostUpload {
 }
 
 impl LeafStore {
+    pub(crate) fn snapshot_binding(&self, id: Id) -> Option<SavedBinding> {
+        Some(SavedBinding {
+            device: self.device.get(&id)?.clone(),
+            uploaded: self
+                .uploaded
+                .contains(&id)
+                .then(|| self.bytes.get(&id).cloned())
+                .flatten(),
+        })
+    }
+
+    pub(crate) fn clear_binding(&mut self, id: Id) {
+        self.device.remove(&id);
+        self.uploaded.remove(&id);
+    }
+
+    pub(crate) fn restore_binding(&mut self, id: Id, saved: SavedBinding) {
+        self.uploaded.remove(&id);
+        if saved.uploaded.as_ref().is_some_and(|bytes| {
+            self.bytes
+                .get(&id)
+                .is_some_and(|current| Arc::ptr_eq(bytes, current))
+        }) {
+            self.uploaded.insert(id);
+        }
+        self.device.insert(id, saved.device);
+    }
+
     fn reuse_uploaded_view(&mut self, id: Id) -> Option<Buf> {
         if let Some((buf, _)) = self.device.get(&id) {
             return Some(buf.clone());
@@ -573,8 +609,7 @@ impl GraphRef {
         let mut store = self.state.leaves.lock();
         store.bytes.insert(id, bytes);
         // A changed upload invalidates the device copy, never the plan.
-        store.device.remove(&id);
-        store.uploaded.remove(&id);
+        store.clear_binding(id);
     }
 
     /// The shared handle to a leaf's host bytes, no copy.
@@ -709,8 +744,7 @@ impl GraphRef {
         };
         let mut store = self.state.leaves.lock();
         for m in members.iter() {
-            store.device.remove(m);
-            store.uploaded.remove(m);
+            store.clear_binding(*m);
         }
     }
 

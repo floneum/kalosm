@@ -389,7 +389,7 @@ struct Twin {
 struct FamilyBindings<'a> {
     graph: &'a GraphRef,
     values: Vec<Id>,
-    saved: FxHashMap<Id, (Buf, Option<Arc<Layout>>)>,
+    saved: FxHashMap<Id, crate::graph::SavedBinding>,
 }
 
 impl<'a> FamilyBindings<'a> {
@@ -406,11 +406,11 @@ impl<'a> FamilyBindings<'a> {
                 .iter()
                 .any(|id| matches!(g.node(*id).op, Op::Logical(Logical::Leaf(_))));
             for id in members.iter() {
-                if let Some(binding) = leaves.device.get(id) {
-                    saved.entry(*id).or_insert_with(|| binding.clone());
+                if let Some(binding) = leaves.snapshot_binding(*id) {
+                    saved.entry(*id).or_insert(binding);
                 }
                 if !external {
-                    leaves.device.remove(id);
+                    leaves.clear_binding(*id);
                 }
             }
         }
@@ -429,10 +429,12 @@ impl Drop for FamilyBindings<'_> {
         for value in &self.values {
             let class = g.class_of(*value);
             for id in g.class_ids_cached(class).iter() {
-                leaves.device.remove(id);
+                leaves.clear_binding(*id);
             }
         }
-        leaves.device.extend(self.saved.drain());
+        for (id, binding) in self.saved.drain() {
+            leaves.restore_binding(id, binding);
+        }
     }
 }
 
