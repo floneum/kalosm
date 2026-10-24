@@ -18,11 +18,11 @@ jobs:
       FUSOR_PIN_SGEMV: '32,2,4,4,32'
       FUSOR_COMPILE_THREADS: '1'
       LAB_QLAYOUT: native
-      LAB_BATCH_REPEAT: '16'
+      LAB_VALIDATE_ONLY: '1'
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: 1a671e05bfdb3b346240fc35c8e6eef13174d03c
+          ref: f34161ee6f41cb9c2f6a009de254cc83f6175889
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
@@ -53,6 +53,12 @@ jobs:
           cargo build --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer --example qmatmul_lab
           cp fusor/target/debug/examples/qmatmul_lab artifacts/qmatmul-candidate
           shasum -a 256 artifacts/qmatmul-candidate >> artifacts/provenance.txt
+          git fetch --depth=1 origin 8a64c7c1699eff0b8d196a9441b81376af69bc9e
+          git checkout --detach 8a64c7c1699eff0b8d196a9441b81376af69bc9e
+          git rev-parse HEAD >> artifacts/provenance.txt
+          cargo build --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer --example qmatmul_lab
+          cp fusor/target/debug/examples/qmatmul_lab artifacts/qmatmul-quad
+          shasum -a 256 artifacts/qmatmul-quad >> artifacts/provenance.txt
       - uses: actions/upload-artifact@v4
         with:
           name: grouped-pair-projection-fixture
