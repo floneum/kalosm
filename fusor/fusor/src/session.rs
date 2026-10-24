@@ -1531,7 +1531,9 @@ impl Session {
         values: &[Tensor],
         prepared: Option<&prepared::PreparedRun>,
     ) -> Result<(usize, Option<Arc<CpuExecutable>>)> {
+        #[cfg(feature = "gpu")]
         let host_detail = std::env::var_os("FUSOR_RESOLVE_HOST_DETAIL").is_some();
+        #[cfg(feature = "gpu")]
         let host_start = host_detail.then(std::time::Instant::now);
         // What the extractor selected for each requested value.
         let wanted: Vec<Id> = values
@@ -1571,6 +1573,7 @@ impl Session {
                 .map(|launch| launch.root)
                 .collect()
         };
+        #[cfg(feature = "gpu")]
         let host_roots = host_start.map(|s| s.elapsed());
         // Every external leaf the plan reads, uploaded once. A `Persistent`
         // leaf keeps its buffer across resolves. The classification runs once
@@ -1604,6 +1607,7 @@ impl Session {
                 }
             }
         }
+        #[cfg(feature = "gpu")]
         let host_leaves = host_start.map(|s| s.elapsed());
         // Root outputs are allocated here rather than inside the backend so
         // the handle survives for readback. The root set is built once;
@@ -1632,6 +1636,7 @@ impl Session {
             supplied.insert(buffer.value, buf);
         }
         graph.bind_classes(&to_bind);
+        #[cfg(feature = "gpu")]
         let host_buffers = host_start.map(|s| s.elapsed());
         // A value the caller asked for that the plan never had to allocate: a
         // bare leaf, or a leaf that only ever appears as an operand. Reading
@@ -1653,6 +1658,7 @@ impl Session {
             };
             graph.bind_classes(&[(*selected, buf, None)]);
         }
+        #[cfg(feature = "gpu")]
         let host_requested = host_start.map(|s| s.elapsed());
 
         match &self.inner.device {
