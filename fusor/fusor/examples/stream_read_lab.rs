@@ -67,7 +67,9 @@ fn main(@builtin(local_invocation_index) lane:u32,
             );
             let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
                 label: Some("streaming checksum"),
-                source: wgpu::ShaderSource::Wgsl(source.into()),
+                source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(
+                    naga::front::wgsl::parse_str(&source)?,
+                )),
             });
             let pipeline = Arc::new(device.create_compute_pipeline(
                 &wgpu::ComputePipelineDescriptor {
