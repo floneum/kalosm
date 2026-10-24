@@ -1,0 +1,35 @@
+name: Streaming attention numerical edge checks
+on:
+  push:
+    branches: [codex/attention-factor-edge-check]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_OPT_LEVEL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      FUSOR_CONFORMANCE_REQUIRE_GPU: '1'
+      FUSOR_COMPILE_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: e0c4eb84c72c4da3570765fe858790dc58314093
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fusor/target
+          key: attention-factor-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
+          restore-keys: |
+            attention-shapes-${{ runner.os }}-
+            grouped-load-${{ runner.os }}-
+      - name: Verify extreme and nonfinite streaming attention
+        run: cargo test --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer,compiler-tests --test shared_compiler streamed_softmax_preserves_extreme_and_nonfinite_scores -- --ignored --test-threads=1
