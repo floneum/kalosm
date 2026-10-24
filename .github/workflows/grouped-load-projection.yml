@@ -19,6 +19,7 @@ jobs:
       FUSOR_COMPILE_THREADS: '1'
       LAB_ASSERT_VECTOR_STORAGE: '1'
       LAB_QLAYOUT: native
+      LAB_BATCH_REPEAT: '16'
     steps:
       - uses: actions/checkout@v6
         with:
