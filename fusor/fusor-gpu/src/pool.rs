@@ -770,6 +770,13 @@ mod tests {
         }))
         .unwrap();
         let pool = target.pool();
+        // Device initialization can itself queue staging copies. Retire those
+        // before taking the baseline so their later destruction is not
+        // subtracted from the nine allocations this test owns.
+        pool.queue.submit([]);
+        pool.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
         let before = pool.device.get_internal_counters().hal.buffers.read();
         let data: Vec<_> = (0..16 << 20).map(|i| (i as u8).wrapping_mul(37)).collect();
         let buffers: Vec<_> = (0..9)
@@ -783,7 +790,7 @@ mod tests {
         let live = pool.device.get_internal_counters().hal.buffers.read() - before;
         assert!(
             live >= buffers.len() as isize,
-            "backend buffer counters unavailable"
+            "backend buffer counters unavailable: before={before}, delta={live}"
         );
         assert!(
             live <= buffers.len() as isize + 3,
