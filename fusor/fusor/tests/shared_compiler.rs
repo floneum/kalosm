@@ -193,6 +193,9 @@ fn shared_fusions_and_transfers_match_host_results() {
         assert_eq!(r.to_vec_f32(), residual);
     }
     for (batch, heads, kv_heads, keys, width) in [
+        (1, 1, 1, 1, 32),
+        (1, 2, 1, 31, 128),
+        (1, 2, 1, 32, 128),
         (1, 3, 3, 17, 32),
         (1, 3, 3, 23, 37),
         (2, 4, 2, 33, 64),

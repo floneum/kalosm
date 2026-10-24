@@ -107,90 +107,118 @@ pub(super) fn lower(ctx: Ctx<'_>, op: &Launch) -> Result<KernelIr> {
         dst: running_sum.clone(),
         value: b.f32(0.),
     });
+    // Batch several keys in registers. One rescale applies to the whole batch,
+    // shortening the online dependency chain without workgroup synchronization.
+    const KEYS_PER_STEP: u32 = 4;
     let it = b.local(u);
-    let key = b.add(
-        b.mul(b.load_local(it.clone()), b.u32(subgroups)),
+    let first = b.add(
+        b.mul(b.load_local(it.clone()), b.u32(subgroups * KEYS_PER_STEP)),
         sg.clone(),
     );
     let kv_total =
         u64::from(batches) * u64::from(*kv_heads) * keys.as_const().unwrap_or(0) * u64::from(width);
-    let index = |channel| {
+    let index = |key: TileExpr, channel| {
         b.add(
             kv_base.clone(),
             b.add(
-                b.mul(b.add(start.clone(), key.clone()), b.u32(width)),
+                b.mul(b.add(start.clone(), key), b.u32(width)),
                 b.add(lane.clone(), b.u32(channel * subgroup)),
             ),
         )
     };
-    let mut dot = b.f32(0.);
-    for (channel, q) in query.into_iter().enumerate() {
-        dot = b.fma(
-            q,
-            ctx.load_mapped(&ops[1], index(channel as u32), kv_total)?,
-            dot,
-        );
-    }
-    let score = b.local(f);
     let next_max = b.local(f);
     let alpha = b.local(f);
-    let beta = b.local(f);
-    let mut update = vec![
-        Stmt::StoreLocal {
-            dst: score.clone(),
-            value: b.mul(
-                b.reduce(TileReduceOp::Sum, ReduceKind::Subgroup, dot),
-                scale,
-            ),
-        },
-        Stmt::StoreLocal {
-            dst: next_max.clone(),
-            value: maximum(
-                b.load_local(running_max.clone()),
-                b.load_local(score.clone()),
-            ),
-        },
-        Stmt::StoreLocal {
-            dst: alpha.clone(),
-            value: exp(b.sub(
-                b.load_local(running_max.clone()),
-                b.load_local(next_max.clone()),
-            )),
-        },
-        Stmt::StoreLocal {
-            dst: beta.clone(),
-            value: exp(b.sub(b.load_local(score.clone()), b.load_local(next_max.clone()))),
-        },
-    ];
-    for (channel, numerator) in numerators.iter().enumerate() {
+    let mut update = vec![Stmt::StoreLocal {
+        dst: next_max.clone(),
+        value: b.load_local(running_max.clone()),
+    }];
+    let mut scores = Vec::new();
+    for item in 0..KEYS_PER_STEP {
+        let key = b.add(first.clone(), b.u32(item * subgroups));
+        let live = b.lt(key.clone(), length.clone());
+        let score = b.local(f);
+        let mut dot = b.f32(0.);
+        for (channel, q) in query.iter().enumerate() {
+            dot = b.fma(
+                q.clone(),
+                ctx.load_mapped(&ops[1], index(key.clone(), channel as u32), kv_total)?,
+                dot,
+            );
+        }
+        update.push(Stmt::If {
+            // Subgroup-uniform: inactive keys never load K or participate in
+            // the score arithmetic, including masked NaNs and infinities.
+            condition: live.clone(),
+            accept: vec![
+                Stmt::StoreLocal {
+                    dst: score.clone(),
+                    value: b.mul(
+                        b.reduce(TileReduceOp::Sum, ReduceKind::Subgroup, dot),
+                        scale.clone(),
+                    ),
+                },
+                Stmt::StoreLocal {
+                    dst: next_max.clone(),
+                    value: maximum(b.load_local(next_max.clone()), b.load_local(score.clone())),
+                },
+            ],
+            reject: Vec::new(),
+        });
+        scores.push((key, live, score));
+    }
+    update.push(Stmt::StoreLocal {
+        dst: alpha.clone(),
+        value: exp(b.sub(
+            b.load_local(running_max.clone()),
+            b.load_local(next_max.clone()),
+        )),
+    });
+    for numerator in &numerators {
         update.push(Stmt::StoreLocal {
             dst: numerator.clone(),
-            value: b.fma(
-                b.load_local(beta.clone()),
-                ctx.load_mapped(&ops[2], index(channel as u32), kv_total)?,
-                b.mul(b.load_local(alpha.clone()), b.load_local(numerator.clone())),
-            ),
+            value: b.mul(b.load_local(alpha.clone()), b.load_local(numerator.clone())),
         });
     }
-    update.extend([
-        Stmt::StoreLocal {
+    update.push(Stmt::StoreLocal {
+        dst: running_sum.clone(),
+        value: b.mul(b.load_local(alpha), b.load_local(running_sum.clone())),
+    });
+    for (key, live, score) in scores {
+        let beta = b.local(f);
+        let mut accumulate = vec![Stmt::StoreLocal {
+            dst: beta.clone(),
+            value: exp(b.sub(b.load_local(score), b.load_local(next_max.clone()))),
+        }];
+        for (channel, numerator) in numerators.iter().enumerate() {
+            accumulate.push(Stmt::StoreLocal {
+                dst: numerator.clone(),
+                value: b.fma(
+                    b.load_local(beta.clone()),
+                    ctx.load_mapped(&ops[2], index(key.clone(), channel as u32), kv_total)?,
+                    b.load_local(numerator.clone()),
+                ),
+            });
+        }
+        accumulate.push(Stmt::StoreLocal {
             dst: running_sum.clone(),
-            value: b.fma(
-                b.load_local(alpha),
-                b.load_local(running_sum.clone()),
-                b.load_local(beta),
-            ),
-        },
-        Stmt::StoreLocal {
-            dst: running_max.clone(),
-            value: b.load_local(next_max),
-        },
-    ]);
-    // Each subgroup has a uniform trip count; no workgroup barrier occurs
-    // until all independent partitions have completed.
+            value: b.add(b.load_local(running_sum.clone()), b.load_local(beta)),
+        });
+        update.push(Stmt::If {
+            condition: live,
+            accept: accumulate,
+            reject: Vec::new(),
+        });
+    }
+    update.push(Stmt::StoreLocal {
+        dst: running_max.clone(),
+        value: b.load_local(next_max),
+    });
     let iterations = b.div(
-        b.sub(b.add(length, b.u32(subgroups - 1)), sg.clone()),
-        b.u32(subgroups),
+        b.sub(
+            b.add(length, b.u32(subgroups * KEYS_PER_STEP - 1)),
+            sg.clone(),
+        ),
+        b.u32(subgroups * KEYS_PER_STEP),
     );
     body.push(Stmt::Loop {
         count: Some(iterations),
