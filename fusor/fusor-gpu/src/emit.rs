@@ -11,6 +11,7 @@ pub(crate) mod reduce;
 pub(crate) mod stmt;
 mod storage;
 pub(crate) mod types;
+mod vector_loads;
 #[cfg(test)]
 mod vector_loads_tests;
 
@@ -87,6 +88,8 @@ pub(crate) struct Analysis {
     pub atomic_buffers: FxHashSet<u32>,
     /// First-use-ordered, deduplicated declaration lists.
     pub buffers: Vec<Buffer>,
+    /// Read-only scalar bindings whose accesses cover complete aligned vectors.
+    vector_buffers: FxHashSet<u32>,
     pub tiles: Vec<Tile>,
     pub locals: Vec<Local>,
     /// The device's fixed subgroup width, which decides [`collective_tree`].
@@ -122,6 +125,7 @@ impl Analysis {
         for stmt in &ir.body {
             a.stmt(stmt, &mut seen);
         }
+        a.vector_buffers = vector_loads::analyze(&a.buffers, &seen.exprs);
         // Cooperative lowering addresses fragments per subgroup, so it needs a
         // subgroup id whether or not the body asked for one.
         a.subgroup_id |= a.uses_coop;

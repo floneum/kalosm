@@ -21,6 +21,14 @@ impl Emitter<'_> {
             && self.buffer_element(buffer) == ElementType::Scalar(ScalarElement::U32)
     }
 
+    pub(crate) fn packed_vector(&self, buffer: &Buffer) -> bool {
+        matches!(buffer.element, ElementType::Scalar(_))
+            && matches!(
+                self.buffer_element(buffer),
+                ElementType::Vector { lanes: 4, .. }
+            )
+    }
+
     /// Pointer at an absolute index in the view's element units.
     pub(crate) fn storage_pointer_absolute(
         &mut self,
@@ -30,6 +38,24 @@ impl Emitter<'_> {
     ) -> Result<Handle<Expression>, EmitError> {
         let global = self.buffer_global(&view.buffer)?;
         let base = self.global_var(global);
+        if self.packed_vector(&view.buffer) {
+            let vector = self.div_literal_u32(body, index, 4);
+            let component = self.mod_literal_u32(body, index, 4);
+            let base = self.emit_expr(
+                body,
+                Expression::Access {
+                    base,
+                    index: vector,
+                },
+            );
+            return Ok(self.emit_expr(
+                body,
+                Expression::Access {
+                    base,
+                    index: component,
+                },
+            ));
+        }
         let index = if self.packed_half(&view.buffer) {
             self.div_literal_u32(body, index, 2)
         } else {
@@ -44,6 +70,27 @@ impl Emitter<'_> {
         view: &StorageView,
         index: Handle<Expression>,
     ) -> Result<Handle<Expression>, EmitError> {
+        if self.packed_vector(&view.buffer) {
+            let global = self.buffer_global(&view.buffer)?;
+            let base = self.global_var(global);
+            let vector = self.div_literal_u32(body, index, 4);
+            let component = self.mod_literal_u32(body, index, 4);
+            let pointer = self.emit_expr(
+                body,
+                Expression::Access {
+                    base,
+                    index: vector,
+                },
+            );
+            let value = self.emit_load(body, pointer);
+            return Ok(self.emit_expr(
+                body,
+                Expression::Access {
+                    base: value,
+                    index: component,
+                },
+            ));
+        }
         let pointer = self.storage_pointer_absolute(body, view, index)?;
         let value = self.emit_load(body, pointer);
         let physical = self.buffer_element(&view.buffer);

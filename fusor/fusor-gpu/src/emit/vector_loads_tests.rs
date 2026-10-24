@@ -97,7 +97,7 @@ fn input_type(ir: &KernelIr) -> naga::TypeInner {
 fn complete_aligned_scalar_reads_use_one_vector_storage_element() {
     assert!(
         matches!(
-            input_type(&kernel(32, 4, 0, false, false)),
+            input_type(&kernel(32, 4, 4, false, false)),
             naga::TypeInner::Vector {
                 size: naga::VectorSize::Quad,
                 ..
@@ -143,9 +143,12 @@ fn grouped_storage_reads_preserve_all_bits_on_webgpu() {
     let uniform = target.alloc(128, Persistence::Step).unwrap();
     let output = target.alloc(128, Persistence::Step).unwrap();
     for round in 0..3u32 {
-        let words: Vec<u32> = (0..32u32)
+        let mut words: Vec<u32> = (0..32u32)
             .map(|i| (i.wrapping_mul(0x182d7615) ^ 0x3f800000).wrapping_add(round))
             .collect();
+        words[..8].copy_from_slice(&[
+            0, 0x80000000, 1, 0x007fffff, 0x7f800000, 0xff800000, 0x7fc01234, 0xffc05678,
+        ]);
         let bytes: Vec<u8> = words.iter().flat_map(|v| v.to_le_bytes()).collect();
         let input = target
             .pool()
