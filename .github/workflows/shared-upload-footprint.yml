@@ -1,0 +1,63 @@
+name: Bounded immutable storage allocation comparison
+on:
+  push:
+    branches: [codex/shared-upload-footprint]
+permissions:
+  contents: read
+jobs:
+  measure:
+    strategy:
+      max-parallel: 1
+      matrix:
+        include:
+          - name: baseline
+            source: c3ff1acd4e65872857284929df13c2880e2383ce
+            reuse: '0'
+          - name: candidate
+            source: e1cfe8a95c99e7f15223a471903222955f20f601
+            reuse: '1'
+    runs-on: macos-latest
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_OPT_LEVEL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      FUSOR_CONFORMANCE_REQUIRE_GPU: '1'
+      EXPECT_STORAGE_REUSE: ${{ matrix.reuse }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.source }}
+          persist-credentials: false
+      - uses: actions/checkout@v6
+        with:
+          ref: codex/shared-upload-footprint
+          path: fixture-source
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fusor/target
+          key: immutable-upload-footprint-${{ matrix.name }}-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
+          restore-keys: |
+            immutable-upload-green-${{ runner.os }}-
+            immutable-upload-red-${{ runner.os }}-
+      - name: Measure storage and verify every uploaded byte
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir artifacts
+          git rev-parse HEAD > artifacts/provenance.txt
+          shasum -a 256 fixture-source/.github/fixtures/immutable_storage_footprint.rs >> artifacts/provenance.txt
+          cat fixture-source/.github/fixtures/immutable_storage_footprint.rs >> fusor/fusor/src/session/tests.rs
+          cargo test --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer,compiler-tests --lib immutable_storage_footprint_fixture -- --test-threads=1 --nocapture 2>&1 | tee artifacts/measurement.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: immutable-storage-${{ matrix.name }}
+          path: artifacts
+          retention-days: 7
