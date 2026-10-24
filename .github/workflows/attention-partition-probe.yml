@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: b87dd97364b52aa9ad114cd3e9537ba4503155e9
+          ref: 8ddfc99b06608c408530aae85773c8fd50494816
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
@@ -25,8 +25,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             fusor/target
-          key: attention-partition-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
+          key: attention-shapes-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
           restore-keys: |
+            attention-partition-${{ runner.os }}-
             immutable-upload-green-${{ runner.os }}-
             workgroup-kernel-${{ runner.os }}-
       - name: Build single-variable partition fixtures
@@ -40,7 +41,7 @@ jobs:
             git rev-parse HEAD
             echo 'CARGO_PROFILE_DEV_OPT_LEVEL=0 CARGO_PROFILE_DEV_DEBUG=0'
           } > artifacts/provenance.txt
-          for chunk in 256 64 32; do
+          for chunk in 256 32; do
             CHUNK="$chunk" python3 - <<'PY'
           import os
           from pathlib import Path
@@ -58,6 +59,6 @@ jobs:
           done
       - uses: actions/upload-artifact@v4
         with:
-          name: attention-partition-fixtures
+          name: attention-shape-fixtures
           path: artifacts
           retention-days: 7
