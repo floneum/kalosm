@@ -130,8 +130,10 @@ fn main(@builtin(local_invocation_index) lane:u32,
                 launcher.poll_wait()?;
                 let bytes = pollster::block_on(target.readback(&output, u64::from(outputs) * 4))?;
                 let actual: Vec<_> = bytes
-                    .chunks_exact(4)
-                    .map(|b| u32::from_le_bytes(b.try_into().unwrap()))
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .map(|b| u32::from_le_bytes(*b))
                     .collect();
                 assert_eq!(actual, expected, "streaming checksum mismatch");
             }
