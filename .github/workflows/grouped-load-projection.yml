@@ -17,13 +17,12 @@ jobs:
       FUSOR_PIN_CONTRACT_FAMILY: sgemv
       FUSOR_PIN_SGEMV: '32,2,4,4,32'
       FUSOR_COMPILE_THREADS: '1'
-      FUSOR_DEBUG_VECTOR_LOADS: '1'
       LAB_ASSERT_VECTOR_STORAGE: '1'
       LAB_QLAYOUT: native
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: bd4ee4def5221b594a98d4ab6cfdce571c7b9c28
+          ref: 8a64c7c1699eff0b8d196a9441b81376af69bc9e
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
@@ -39,3 +38,19 @@ jobs:
             attention-partition-${{ runner.os }}-
       - name: Exercise actual projection address expressions
         run: cargo run --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer --example qmatmul_lab -- 1 4096 4096 q4k 3
+      - name: Storage regression tests
+        run: cargo test --locked --manifest-path fusor/Cargo.toml -p fusor-gpu --lib emit::vector_loads_tests -- --test-threads=1
+      - name: Build current projection fixture
+        shell: bash
+        run: |
+          mkdir artifacts
+          rustc -Vv > artifacts/provenance.txt
+          git rev-parse HEAD >> artifacts/provenance.txt
+          cargo build --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer --example qmatmul_lab
+          cp fusor/target/debug/examples/qmatmul_lab artifacts/qmatmul-candidate
+          shasum -a 256 artifacts/qmatmul-candidate >> artifacts/provenance.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grouped-load-projection-fixture
+          path: artifacts
+          retention-days: 7
