@@ -178,3 +178,76 @@ fn masked_sums_keep_lower_bits_that_carry_into_sparse_masks() {
         }
     }
 }
+
+#[test]
+fn bounded_lane_offsets_share_aligned_storage_words() {
+    let row = TileExpr::new(
+        K::Builtin(Builtin::SubgroupId),
+        ScalarElement::U32.element(),
+    );
+    let base = bin(Op::Mul, row, lit(144));
+    let bounded_lane = bin(Op::BitAnd, lane(), lit(31));
+    let low = bin(
+        Op::Shr,
+        bin(
+            Op::Add,
+            bin(Op::Mul, bin(Op::Rem, bounded_lane.clone(), lit(4)), lit(8)),
+            bin(
+                Op::Mul,
+                bin(Op::Rem, bin(Op::Div, bounded_lane, lit(4)), lit(2)),
+                lit(64),
+            ),
+        ),
+        lit(5),
+    );
+    for (op, by) in [(Op::Shr, 2), (Op::Div, 4)] {
+        let expected = simplify_index(&bin(op, base.clone(), lit(by)));
+        for sum in [
+            bin(Op::Add, base.clone(), low.clone()),
+            bin(Op::Add, low.clone(), base.clone()),
+        ] {
+            let original = bin(op, sum, lit(by));
+            let simplified = simplify_index(&original);
+            assert_eq!(
+                simplified, expected,
+                "bounded low bits still prevent storage word sharing"
+            );
+            for value in [0, 1, 31, 255, 0x7fff_ffff, 0xffff_ffff] {
+                assert_eq!(eval(&original, value), eval(&simplified, value));
+            }
+        }
+    }
+}
+
+#[test]
+fn bounded_offset_rewrites_preserve_carry_and_wrap_edges() {
+    let mut seed = u32::MAX;
+    for shift in 1..32 {
+        let mask = (1u32 << shift) - 1;
+        for aligned_shift in [0, shift - 1, shift, 31] {
+            let high = bin(Op::Shl, lane(), lit(aligned_shift));
+            for low_mask in [mask, mask | (1u32 << shift), u32::MAX] {
+                let low = bin(
+                    Op::BitAnd,
+                    TileExpr::new(
+                        K::Builtin(Builtin::SubgroupId),
+                        ScalarElement::U32.element(),
+                    ),
+                    lit(low_mask),
+                );
+                for (op, by) in [(Op::Shr, shift), (Op::Div, 1u32 << shift)] {
+                    let original = bin(op, bin(Op::Add, high.clone(), low.clone()), lit(by));
+                    let simplified = simplify_index(&original);
+                    for _ in 0..256 {
+                        assert_eq!(
+                            eval(&original, seed),
+                            eval(&simplified, seed),
+                            "shift={shift} aligned_shift={aligned_shift} low_mask={low_mask:x} value={seed:x}"
+                        );
+                        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                    }
+                }
+            }
+        }
+    }
+}
