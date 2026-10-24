@@ -1,0 +1,49 @@
+name: Shared immutable storage regression
+on:
+  push:
+    branches: [codex/shared-upload-ci]
+permissions:
+  contents: read
+jobs:
+  red:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_OPT_LEVEL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      FUSOR_CONFORMANCE_REQUIRE_GPU: '1'
+      FUSOR_COMPILE_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: c3ff1acd4e65872857284929df13c2880e2383ce
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fusor/target
+          key: immutable-upload-red-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
+          restore-keys: upload-reclaim-green-${{ runner.os }}-
+      - name: Reproduce duplicate GPU storage
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir artifacts
+          if cargo test --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer,compiler-tests --lib immutable_word_storage_gpu -- --test-threads=1 > artifacts/red.log 2>&1; then
+            cat artifacts/red.log
+            echo 'storage reuse regression unexpectedly passed'
+            exit 1
+          fi
+          cat artifacts/red.log
+          grep -q 'immutable word view uploaded duplicate device storage' artifacts/red.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: immutable-upload-red
+          path: artifacts
+          retention-days: 7
