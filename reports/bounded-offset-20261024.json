@@ -1,0 +1,478 @@
+{
+  "decision": "Rejected in isolation: wide projection slows to 0.60x, square improves 1.34x, long result inconsistent. Keep proof implementation and tests in experiment history, not default.",
+  "source": "5ce489afb73f725d136c1f08823fd67286d19a77",
+  "ci": "https://github.com/floneum/kalosm/actions/runs/40126690331",
+  "measurements": {
+    "wide": {
+      "order": "ABBA",
+      "arms": {
+        "A0": {
+          "gpu_us": 209.897,
+          "row": {
+            "m": "1",
+            "n": "28672",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "209.897",
+            "p25_us": "209.674",
+            "p75_us": "210.220",
+            "wall_us": "10577.000",
+            "cold_ms": "360.476",
+            "logical_weight_bytes": "66060288",
+            "logical_weight_GBs": "314.727",
+            "GFLOPs": "1119.029",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B0": {
+          "gpu_us": 351.454,
+          "row": {
+            "m": "1",
+            "n": "28672",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "351.454",
+            "p25_us": "351.008",
+            "p75_us": "351.575",
+            "wall_us": "15575.458",
+            "cold_ms": "414.940",
+            "logical_weight_bytes": "66060288",
+            "logical_weight_GBs": "187.963",
+            "GFLOPs": "668.311",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B1": {
+          "gpu_us": 351.535,
+          "row": {
+            "m": "1",
+            "n": "28672",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "351.535",
+            "p25_us": "351.230",
+            "p75_us": "351.728",
+            "wall_us": "15598.875",
+            "cold_ms": "371.337",
+            "logical_weight_bytes": "66060288",
+            "logical_weight_GBs": "187.919",
+            "GFLOPs": "668.158",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "A1": {
+          "gpu_us": 210.566,
+          "row": {
+            "m": "1",
+            "n": "28672",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "210.566",
+            "p25_us": "210.348",
+            "p75_us": "210.874",
+            "wall_us": "10582.583",
+            "cold_ms": "360.674",
+            "logical_weight_bytes": "66060288",
+            "logical_weight_GBs": "313.727",
+            "GFLOPs": "1115.472",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        }
+      },
+      "directional_speedups": [
+        0.5972246723611055,
+        0.5989901432289815
+      ],
+      "correctness": {
+        "B0": {
+          "values": 86016,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "B1": {
+          "values": 86016,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "A1": {
+          "values": 86016,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        }
+      },
+      "resident_weight_bytes": 132120576,
+      "target": 1.01,
+      "target_pass": false,
+      "note": "Sequential microbenchmark only; full-model wall and full-logit checks still required."
+    },
+    "long": {
+      "order": "ABBA",
+      "arms": {
+        "A0": {
+          "gpu_us": 213.514,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "14336",
+            "fmt": "Q6K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "213.514",
+            "p25_us": "210.104",
+            "p75_us": "218.098",
+            "wall_us": "10515.375",
+            "cold_ms": "332.147",
+            "logical_weight_bytes": "48627712",
+            "logical_weight_GBs": "227.749",
+            "GFLOPs": "550.036",
+            "max_error": "0.000841"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B0": {
+          "gpu_us": 191.24,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "14336",
+            "fmt": "Q6K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "191.240",
+            "p25_us": "189.844",
+            "p75_us": "217.587",
+            "wall_us": "10328.209",
+            "cold_ms": "327.045",
+            "logical_weight_bytes": "48627712",
+            "logical_weight_GBs": "254.276",
+            "GFLOPs": "614.102",
+            "max_error": "0.000841"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B1": {
+          "gpu_us": 221.117,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "14336",
+            "fmt": "Q6K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "221.117",
+            "p25_us": "209.361",
+            "p75_us": "235.978",
+            "wall_us": "10474.750",
+            "cold_ms": "277.697",
+            "logical_weight_bytes": "48627712",
+            "logical_weight_GBs": "219.918",
+            "GFLOPs": "531.123",
+            "max_error": "0.000841"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "A1": {
+          "gpu_us": 196.635,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "14336",
+            "fmt": "Q6K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "196.635",
+            "p25_us": "191.419",
+            "p75_us": "211.299",
+            "wall_us": "10543.708",
+            "cold_ms": "296.350",
+            "logical_weight_bytes": "48627712",
+            "logical_weight_GBs": "247.299",
+            "GFLOPs": "597.250",
+            "max_error": "0.000841"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        }
+      },
+      "directional_speedups": [
+        1.116471449487555,
+        0.8892803357498519
+      ],
+      "correctness": {
+        "B0": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "B1": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "A1": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        }
+      },
+      "resident_weight_bytes": 97255424,
+      "target": 1.01,
+      "target_pass": false,
+      "note": "Sequential microbenchmark only; full-model wall and full-logit checks still required."
+    },
+    "square": {
+      "order": "ABBA",
+      "arms": {
+        "A0": {
+          "gpu_us": 174.135,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "174.135",
+            "p25_us": "172.789",
+            "p75_us": "174.396",
+            "wall_us": "8668.375",
+            "cold_ms": "411.163",
+            "logical_weight_bytes": "9437184",
+            "logical_weight_GBs": "54.195",
+            "GFLOPs": "192.692",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B0": {
+          "gpu_us": 129.62,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "129.620",
+            "p25_us": "129.402",
+            "p75_us": "129.924",
+            "wall_us": "7056.083",
+            "cold_ms": "390.231",
+            "logical_weight_bytes": "9437184",
+            "logical_weight_GBs": "72.807",
+            "GFLOPs": "258.868",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "B1": {
+          "gpu_us": 129.424,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "129.424",
+            "p25_us": "128.988",
+            "p75_us": "129.764",
+            "wall_us": "7102.875",
+            "cold_ms": "342.880",
+            "logical_weight_bytes": "9437184",
+            "logical_weight_GBs": "72.917",
+            "GFLOPs": "259.259",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        },
+        "A1": {
+          "gpu_us": 174.339,
+          "row": {
+            "m": "1",
+            "n": "4096",
+            "k": "4096",
+            "fmt": "Q4K",
+            "launches": "2",
+            "copies": "2",
+            "repeats": "16",
+            "gpu_us": "174.339",
+            "p25_us": "173.913",
+            "p75_us": "174.678",
+            "wall_us": "8677.334",
+            "cold_ms": "387.795",
+            "logical_weight_bytes": "9437184",
+            "logical_weight_GBs": "54.131",
+            "GFLOPs": "192.467",
+            "max_error": "0.000050"
+          },
+          "kernels": [
+            "sgemv_cols"
+          ],
+          "cell": [
+            32,
+            2,
+            4,
+            4,
+            32
+          ]
+        }
+      },
+      "directional_speedups": [
+        1.3434269402869927,
+        1.347037643713685
+      ],
+      "correctness": {
+        "B0": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "B1": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        },
+        "A1": {
+          "values": 12288,
+          "max_abs": 0.0,
+          "rms": 0.0,
+          "passed": true
+        }
+      },
+      "resident_weight_bytes": 18874368,
+      "target": 1.01,
+      "target_pass": true,
+      "note": "Sequential microbenchmark only; full-model wall and full-logit checks still required."
+    }
+  }
+}

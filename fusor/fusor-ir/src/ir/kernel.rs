@@ -1262,32 +1262,6 @@ fn carry_free_add(e: &TileExpr) -> Option<(TileExpr, u32)> {
     Some((base, c_lo))
 }
 
-/// Remove an addend contained wholly in the bits discarded by a shift.
-/// The retained operand has zeros in those bits, so neither a carry into
-/// the retained bits nor unsigned overflow is possible. This uses inferred
-/// bit bounds, not assumptions about lane IDs or runtime index values.
-fn discard_low_addend(e: &TileExpr, shift: u32, memo: &mut IndexMemo) -> Option<TileExpr> {
-    if !(1..32).contains(&shift) {
-        return None;
-    }
-    let TileExprKind::Binary {
-        op: TileBinaryOp::Add,
-        left,
-        right,
-        ..
-    } = e.kind()
-    else {
-        return None;
-    };
-    let mask = (1u32 << shift) - 1;
-    for (high, low) in [(left, right), (right, left)] {
-        if memo.bits.get(high).zero & mask == mask && !memo.bits.get(low).zero <= mask {
-            return Some(high.clone());
-        }
-    }
-    None
-}
-
 /// Rewrite index arithmetic under aligned-window algebra: when `a + c` cannot
 /// carry, shifts, masks and power-of-two div/rem distribute over it. Makes
 /// consecutive window elements' addresses structurally equal so loads share.
@@ -1583,19 +1557,6 @@ fn rewrite_index(e: &TileExpr, memo: &mut IndexMemo) -> TileExpr {
             }
         }
         TileBinaryOp::Shr => {
-            if let Some(s) = lit_u32(right)
-                && let Some(high) = discard_low_addend(left, s, memo)
-            {
-                return simplify_index_cached(
-                    &with(TileExprKind::Binary {
-                        op: *op,
-                        left: high,
-                        right: right.clone(),
-                        numeric: *numeric,
-                    }),
-                    memo,
-                );
-            }
             if let (Some((a, c)), Some(s)) = (carry_free_add(left), lit_u32(right)) {
                 let shifted = with(TileExprKind::Binary {
                     op: TileBinaryOp::Shr,
@@ -1708,19 +1669,6 @@ fn rewrite_index(e: &TileExpr, memo: &mut IndexMemo) -> TileExpr {
             }
         }
         TileBinaryOp::Div => {
-            if let Some(d) = lit_u32(right).filter(|d| d.is_power_of_two())
-                && let Some(high) = discard_low_addend(left, d.trailing_zeros(), memo)
-            {
-                return simplify_index_cached(
-                    &with(TileExprKind::Binary {
-                        op: *op,
-                        left: high,
-                        right: right.clone(),
-                        numeric: *numeric,
-                    }),
-                    memo,
-                );
-            }
             if let (Some((a, c)), Some(d)) = (carry_free_add(left), lit_u32(right)) {
                 // Splits only when `d` divides the alignment `2^t`.
                 if d.is_power_of_two() && u64::from(d) <= (1u64 << known_zero_low_bits(&a)) {
