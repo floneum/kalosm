@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: 28e6cabf436ba6008267530e4fc79a77e236f3bc
+          ref: b97cbaf8afa21c8eac5ed7d4968bf9af10505389
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
@@ -62,7 +62,7 @@ jobs:
           path: artifacts
           retention-days: 7
   release:
-    needs: check
+    needs: [red, check]
     runs-on: macos-latest
     timeout-minutes: 30
     env:
@@ -72,7 +72,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: 28e6cabf436ba6008267530e4fc79a77e236f3bc
+          ref: b97cbaf8afa21c8eac5ed7d4968bf9af10505389
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
@@ -101,4 +101,52 @@ jobs:
         with:
           name: grouped-load-default-release
           path: artifacts
+          retention-days: 7
+  red:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_OPT_LEVEL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: b87dd97364b52aa9ad114cd3e9537ba4503155e9
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fusor/target
+          key: grouped-load-red-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
+          restore-keys: |
+            attention-partition-${{ runner.os }}-
+            immutable-upload-green-${{ runner.os }}-
+      - name: Require the old emitter to fail the regression
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin b97cbaf8afa21c8eac5ed7d4968bf9af10505389
+          git show b97cbaf8afa21c8eac5ed7d4968bf9af10505389:fusor/fusor-gpu/src/emit/vector_loads_tests.rs > fusor/fusor-gpu/src/emit/vector_loads_tests.rs
+          python3 - <<'PYCODE'
+          from pathlib import Path
+          p = Path('fusor/fusor-gpu/src/emit.rs')
+          p.write_text(p.read_text() + '\n#[cfg(test)]\nmod vector_loads_tests;\n')
+          PYCODE
+          set +e
+          cargo test --locked --manifest-path fusor/Cargo.toml -p fusor-gpu --lib complete_aligned_scalar_reads_use_one_vector_storage_element -- --exact emit::vector_loads_tests::complete_aligned_scalar_reads_use_one_vector_storage_element > red.log 2>&1
+          code=$?
+          set -e
+          cat red.log
+          test "$code" = 101
+          grep -F 'four adjacent reads still use scalar storage' red.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: grouped-load-red-log
+          path: red.log
           retention-days: 7
