@@ -1261,9 +1261,14 @@ fn gemv_partials(
 }
 
 /// `(row, column)` of workgroup `wg`, the row clamped onto the last one.
-fn row_col(ctx: &Ctx<'_>, wg: TileExpr, per_row: TileExpr, rows: u32) -> (TileExpr, TileExpr) {
-    let (row, col) = ctx.b.divrem(wg, per_row);
-    (ctx.b.min(row, ctx.b.u32(rows - 1)), col)
+fn row_col(
+    b: &crate::lower::Kernel,
+    wg: TileExpr,
+    per_row: TileExpr,
+    rows: u32,
+) -> (TileExpr, TileExpr) {
+    let (row, col) = b.divrem(wg, per_row);
+    (b.min(row, b.u32(rows - 1)), col)
 }
 
 /// Vector contraction with `vector` elements of K per lane per iteration,
@@ -1289,7 +1294,7 @@ fn lower_sgemv(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> Result<KernelI
     let wg = column_workgroup_index(&ctx, grid, rows, shape.n, 1)?;
     // `wg` enumerates `[batch, m, n]` row-major; B's row is the batch's k block
     // plus the loop's k.
-    let (row, col) = row_col(&ctx, wg.clone(), ctx.dim_expr(shape.n)?, rows);
+    let (row, col) = row_col(&ctx.b, wg.clone(), ctx.dim_expr(shape.n)?, rows);
     let (batch, b_row_base) = c.batch_of(&ctx, &row)?;
     let locals = vec![b.local(c.acc.element())];
 
@@ -1374,7 +1379,7 @@ fn lower_sgemv_subgroup_cols(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> 
         &ctx.caps.limits,
     )?;
     let wg = column_workgroup_index(&ctx, grid, rows, shape.n, p.cols)?;
-    let (row, col_group) = row_col(&ctx, wg, ceil_extent(&ctx, shape.n, p.cols)?, rows);
+    let (row, col_group) = row_col(&ctx.b, wg, ceil_extent(&ctx, shape.n, p.cols)?, rows);
     let (batch, b_row_base) = c.batch_of(&ctx, &row)?;
     let sg_lane = b.builtin(Builtin::SubgroupLane);
     let col_base = b.add(
@@ -1513,4 +1518,24 @@ fn lower_sgemv_subgroup_cols(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> 
         body.push(c.store_post(&ctx, &out, total, row.clone(), col, addr, mask)?);
     }
     Ok(ctx.finish("sgemv_cols", grid, block, body))
+}
+
+#[cfg(test)]
+mod coordinate_tests {
+    use super::*;
+
+    #[test]
+    fn single_row_contractions_reuse_the_bounded_column_index() {
+        let b = crate::lower::Kernel::new();
+        let wg = b.builtin(Builtin::ProgramId(fusor_ir::ir::kernel::WorkgroupAxis::X));
+        for columns in [1, 17, 1024, 7168, 128257] {
+            let (row, col) = row_col(&b, wg.clone(), b.u32(columns), 1);
+            assert_eq!(
+                row,
+                b.u32(0),
+                "single-row indexing still computes a quotient"
+            );
+            assert_eq!(col, wg, "single-row indexing still computes a remainder");
+        }
+    }
 }
