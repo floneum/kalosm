@@ -213,3 +213,55 @@ fn grouped_storage_reads_preserve_all_bits_on_webgpu() {
         );
     }
 }
+
+#[test]
+fn adjacent_components_share_one_physical_vector_read() {
+    let b = fusor_tile::build::Kernel::new();
+    let mut ir = kernel(32, 4, 4, false, false);
+    let sum = ir
+        .body
+        .iter()
+        .map(|s| match s {
+            Stmt::Store { value, .. } => value.clone(),
+            _ => unreachable!(),
+        })
+        .reduce(|a, c| b.add(a, c))
+        .unwrap();
+    let Stmt::Store {
+        dst, addr, mask, ..
+    } = ir.body[0].clone()
+    else {
+        unreachable!()
+    };
+    ir.body = vec![Stmt::Store {
+        dst,
+        addr,
+        mask,
+        value: sum,
+    }];
+    let emitted = emit(&ir, &caps()).unwrap();
+    let function = &emitted.module.entry_points[0].function;
+    let loads = function
+        .expressions
+        .iter()
+        .filter(|(_, e)| {
+            let naga::Expression::Load { pointer } = e else {
+                return false;
+            };
+            let naga::Expression::Access { base, .. } = function.expressions[*pointer] else {
+                return false;
+            };
+            let naga::Expression::GlobalVariable(global) = function.expressions[base] else {
+                return false;
+            };
+            emitted.module.global_variables[global]
+                .binding
+                .as_ref()
+                .is_some_and(|b| b.binding == 1)
+        })
+        .count();
+    assert_eq!(
+        loads, 1,
+        "adjacent components still load the same physical vector separately"
+    );
+}
