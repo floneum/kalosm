@@ -246,8 +246,7 @@ fn recognize(b: &mut Builder<'_>, id: Id, _node: &Node, _f: &Facts<'_>) -> Optio
     let max_block = limits
         .max_compute_invocations_per_workgroup
         .min(limits.max_compute_workgroup_size[0])
-        .min(256)
-        .min(limits.max_compute_workgroup_storage_size / ((width as u32 + 2) * 4) * subgroup);
+        .min(256);
     let block = 1 << max_block.checked_ilog2()?;
     if block < subgroup {
         return None;
@@ -257,6 +256,15 @@ fn recognize(b: &mut Builder<'_>, id: Id, _node: &Node, _f: &Facts<'_>) -> Optio
     } else {
         256
     };
+    let capacity = if chunk == 0 {
+        keys.as_const()? as u32
+    } else {
+        chunk
+    };
+    let scratch = (capacity + block + block / subgroup * width as u32) * 4;
+    if scratch > limits.max_compute_workgroup_storage_size {
+        return None;
+    }
     let splits = if chunk == 0 {
         Dim::ONE
     } else {
