@@ -256,7 +256,8 @@ fn shared_fusions_and_transfers_match_host_results() {
         .is_some_and(|s| s.is_fixed())
     {
         assert!(
-            seen.iter().any(|n| n.starts_with("decode_attention_tiled")),
+            seen.iter()
+                .any(|n| n.starts_with("decode_attention_online")),
             "attention fusion was not selected: {seen:?}"
         );
     }

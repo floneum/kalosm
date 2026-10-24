@@ -9,7 +9,7 @@ use fusor_ir::ir::kernel::{
 use fusor_ir::ir::launch::Launch;
 use fusor_ir::{Error, Result};
 
-mod tiled;
+mod online;
 
 pub(super) fn lower_merge(ctx: Ctx<'_>, op: &Launch) -> Result<KernelIr> {
     let Launch::DecodeAttentionMerge {
@@ -106,5 +106,5 @@ pub(super) fn lower_merge(ctx: Ctx<'_>, op: &Launch) -> Result<KernelIr> {
 }
 
 pub(super) fn lower(ctx: Ctx<'_>, op: &Launch) -> Result<KernelIr> {
-    tiled::lower(ctx, op)
+    online::lower(ctx, op)
 }

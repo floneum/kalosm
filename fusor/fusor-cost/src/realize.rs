@@ -832,25 +832,10 @@ pub(crate) fn tile_bytes(
     if let Op::Launch(Launch::RmsNorm { block, .. }) = graph.node(id).op {
         return Ok(block * 4);
     }
-    if let Op::Launch(Launch::DecodeAttention {
-        block,
-        chunk,
-        keys,
-        ref ops,
-        ..
-    }) = graph.node(id).op
-    {
+    if let Op::Launch(Launch::DecodeAttention { block, ref ops, .. }) = graph.node(id).op {
         let width = ops[0].layout.shape()[3].as_const().unwrap_or(0);
-        let capacity = if chunk == 0 {
-            keys.as_const().unwrap_or(0)
-        } else {
-            u64::from(chunk)
-        };
-        return u32::try_from(
-            (capacity + u64::from(block) + u64::from(block / caps.subgroup_width().max(1)) * width)
-                * 4,
-        )
-        .map_err(|_| Error::Plan("attention scratch overflows u32".into()));
+        return u32::try_from(u64::from(block / caps.subgroup_width().max(1)) * (width + 2) * 4)
+            .map_err(|_| Error::Plan("attention scratch overflows u32".into()));
     }
     let scratch = fold_scratch_elements(graph, id, theta, caps);
     let tiles = tiles_for(theta, scalar_element(graph.facts(id).dtype), scratch);

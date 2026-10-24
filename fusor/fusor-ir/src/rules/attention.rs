@@ -243,30 +243,20 @@ fn recognize(b: &mut Builder<'_>, id: Id, _node: &Node, _f: &Facts<'_>) -> Optio
     {
         return None;
     }
+    let max_block = limits
+        .max_compute_invocations_per_workgroup
+        .min(limits.max_compute_workgroup_size[0])
+        .min(256)
+        .min(limits.max_compute_workgroup_storage_size / ((width as u32 + 2) * 4) * subgroup);
+    let block = 1 << max_block.checked_ilog2()?;
+    if block < subgroup {
+        return None;
+    }
     let chunk = if keys.as_const().is_some_and(|n| n <= 256) {
         0
     } else {
         256
     };
-    let capacity = if chunk == 0 {
-        keys.as_const()? as u32
-    } else {
-        chunk
-    };
-    // Scores use one word per key. Each lane needs one reduction word and
-    // width/subgroup partial numerator words. Shrink the block to fit the
-    // reported storage limit before constructing a candidate.
-    let available = (limits.max_compute_workgroup_storage_size / 4).checked_sub(capacity)?;
-    let storage_lanes = u64::from(available) * u64::from(subgroup) / (width + u64::from(subgroup));
-    let max_block = limits
-        .max_compute_invocations_per_workgroup
-        .min(limits.max_compute_workgroup_size[0])
-        .min(256)
-        .min(storage_lanes.min(u64::from(u32::MAX)) as u32);
-    let block = 1 << max_block.checked_ilog2()?;
-    if block < subgroup {
-        return None;
-    }
     let splits = if chunk == 0 {
         Dim::ONE
     } else {
