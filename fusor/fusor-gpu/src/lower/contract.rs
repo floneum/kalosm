@@ -1267,6 +1267,12 @@ fn row_col(
     per_row: TileExpr,
     rows: u32,
 ) -> (TileExpr, TileExpr) {
+    // column_workgroup_index already bounds wg to rows * per_row, including
+    // folded-grid overhangs and symbolic column extents. With one row the
+    // quotient is zero and the remainder is the bounded input itself.
+    if rows == 1 {
+        return (b.u32(0), wg);
+    }
     let (row, col) = b.divrem(wg, per_row);
     (b.min(row, b.u32(rows - 1)), col)
 }
