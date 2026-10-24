@@ -1,3 +1,40 @@
+Immutable compiler storage views: one GPU upload (2026-10-24)
+============================================================
+Runtime source 84025c02fc2c9a569063895dda87d51504870526 removes duplicate
+device allocations when lowering an immutable byte stream through its word
+view. The original leaf and compiler-created view retain one allocation,
+including background resource preparation. This uses the graph's storage
+relation and exact immutable backing identity, independent of block format,
+model or device name. Unrelated mutable leaves are not shared. Rebinding,
+adoption and clearing invalidate upload provenance; no cache pins buffers
+beyond the graph's existing bindings.
+
+The regression fails on c3ff1acd4 in 0.43 seconds with duplicate GPU storage:
+https://github.com/floneum/kalosm/actions/runs/40114412471
+The fix passes 20 CPU unit tests, 14 GPU unit tests, nine shared compiler
+tests and GPU-enabled workspace Clippy. A CPU-only Clippy run exposed old
+GPU timing variables; source 84025c02f gates those variables by feature.
+Final CPU and GPU validation both pass in:
+https://github.com/floneum/kalosm/actions/runs/40115478755
+The default release is built by that same run. Tests cover both upload
+orders across all block formats, rebinding, adopted buffers, stale prepared
+uploads, exact readback and separation of mutable leaves.
+
+Matched allocation experiment, using the same 72 MiB fixture source:
+  Baseline c3ff1acd4: first upload 75,497,472 bytes; second 75,497,472 bytes.
+  Candidate e1cfe8a95: first upload 75,497,472 bytes; second zero bytes.
+  Total GPU weight allocation: 144 MiB -> 72 MiB.
+Both arms verify all 150,994,944 bytes read back through the two views.
+Source 84025c02f changes only CPU feature gating after e1cfe8a95.
+https://github.com/floneum/kalosm/actions/runs/40115143722
+Fixture SHA256: b4f9cf64a0df85f8189ea4b698665588b297f68b8fbe0a94a6db32039d15dbd4
+
+This establishes a 50% allocation reduction for the shared weight/view
+pair, not a model throughput result. Local preflight still has about
+14.5 GiB available against the unchanged 23 GiB admission threshold.
+No model was launched and no resource-aborted workload was retried.
+The 60 tokens/sec and 2x full-model goals remain unverified.
+
 Declared compute workgroups and final translator validation (2026-10-18)
 ========================================================================
 PR head b67f55e43 pins Naga/wgpu 9c9187d26886eccc4b3fbfeb67989ce77fbd1217.
