@@ -1278,6 +1278,7 @@ fn shared_weight_views_execute_and_concatenate(session: Session) {
 on_each_backend!(shared_weight_views_execute_and_concatenate:
     shared_weight_views_cpu, shared_weight_views_gpu);
 
+#[cfg(not(target_arch = "wasm32"))]
 fn immutable_word_views_share_device_storage(session: Session) {
     use fusor_ir::dtype::{QFmt, QLayout};
     let graph = Graph::new(&session);
@@ -1298,14 +1299,29 @@ fn immutable_word_views_share_device_storage(session: Session) {
                 )
                 .unwrap();
             let words = h.words_leaf_of(source).unwrap().unwrap();
+            let source_tensor = h.tensor(source);
+            let words_tensor = h.tensor(words);
             let order = if words_first {
                 [words, source]
             } else {
                 [source, words]
             };
-            for id in order {
-                session.upload_leaf(&h.tensor(id)).unwrap();
-            }
+            session.upload_leaf(&h.tensor(order[0])).unwrap();
+            #[cfg(feature = "gpu")]
+            let allocated = session
+                .device()
+                .gpu_target()
+                .map(|t| t.pool().counters().live_bytes);
+            session.upload_leaf(&h.tensor(order[1])).unwrap();
+            #[cfg(feature = "gpu")]
+            assert_eq!(
+                session
+                    .device()
+                    .gpu_target()
+                    .map(|t| t.pool().counters().live_bytes),
+                allocated,
+                "storage view allocated additional GPU bytes"
+            );
             let source_buf = h.device_buf(source).unwrap();
             let words_buf = h.device_buf(words).unwrap();
             assert_eq!(
@@ -1328,12 +1344,103 @@ fn immutable_word_views_share_device_storage(session: Session) {
             )
             .unwrap();
             assert_eq!(read, changed);
+            // An adopted buffer is not evidence of the old host contents.
+            source_tensor.clear_device_buf();
+            words_tensor.clear_device_buf();
+            h.set_leaf_bytes_shared(source, h.leaf_bytes_shared(words).unwrap());
+            let donor = h.tensor(
+                h.quantized_leaf(
+                    fmt,
+                    QLayout::Native,
+                    [Dim::Const(4), Dim::Const(fmt.block_elements() as u64)],
+                    changed.clone(),
+                )
+                .unwrap(),
+            );
+            donor.upload().unwrap();
+            source_tensor.adopt_buffer(&donor).unwrap();
+            words_tensor.upload().unwrap();
+            assert_ne!(
+                h.device_buf(source).unwrap().addr(),
+                h.device_buf(words).unwrap().addr()
+            );
+            assert_eq!(h.read_back(words).unwrap(), bytes);
         }
     }
+    // Identical host backing does not authorize sharing mutable inputs.
+    let bytes = Arc::new(fusor_ir::target::HostBytes::from(vec![0; 16]));
+    let a = graph
+        .leaf("mutable-a", &[Dim::Const(4)], crate::Dtype::F32)
+        .unwrap();
+    let b = graph
+        .leaf("mutable-b", &[Dim::Const(4)], crate::Dtype::F32)
+        .unwrap();
+    h.set_leaf_bytes_shared(a.id, bytes.clone());
+    h.set_leaf_bytes_shared(b.id, bytes);
+    a.upload().unwrap();
+    b.upload().unwrap();
+    assert_ne!(
+        h.device_buf(a.id).unwrap().addr(),
+        h.device_buf(b.id).unwrap().addr()
+    );
 }
 
+#[cfg(not(target_arch = "wasm32"))]
 on_each_backend!(immutable_word_views_share_device_storage:
     immutable_word_storage_cpu, immutable_word_storage_gpu);
+
+#[test]
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+fn immutable_word_storage_preparation() {
+    use fusor_ir::dtype::{QFmt, QLayout};
+    let backend = match Backend::gpu_blocking() {
+        Ok(backend) => backend,
+        Err(error) => {
+            assert!(
+                std::env::var_os("FUSOR_CONFORMANCE_REQUIRE_GPU").is_none(),
+                "GPU required: {error}"
+            );
+            return;
+        }
+    };
+    let session = Session::new(backend).unwrap();
+    let graph = Graph::new(&session);
+    let h = graph.handle();
+    let bytes = vec![0x21; 4 * QFmt::Q8_0.block_bytes(QLayout::Native) as usize];
+    let source = h.tensor(
+        h.quantized_leaf(
+            QFmt::Q8_0,
+            QLayout::Native,
+            [Dim::Const(4), Dim::Const(32)],
+            bytes.clone(),
+        )
+        .unwrap(),
+    );
+    let words = h.tensor(h.words_leaf_of(source.id).unwrap().unwrap());
+    let pending = h.pending_leaf_uploads(&[source.id, words.id]);
+    assert_eq!(pending.len(), 1, "prepared compiler views need one upload");
+    let upload = &pending[0];
+    let buf = upload
+        .bytes
+        .with_slice(|bytes| {
+            session
+                .device()
+                .upload(bytes, fusor_ir::dtype::Persistence::Persistent)
+        })
+        .unwrap();
+    // Rebinding one leaf while its background upload runs cannot overwrite it.
+    h.set_leaf_bytes(source.id, vec![0x43; bytes.len()]);
+    for &id in &upload.values {
+        h.bind_prepared_leaf(id, &upload.bytes, buf.clone());
+    }
+    assert!(h.device_buf(source.id).is_none());
+    assert_eq!(h.read_back(words.id).unwrap(), bytes);
+    source.upload().unwrap();
+    assert_ne!(
+        h.device_buf(source.id).unwrap().addr(),
+        h.device_buf(words.id).unwrap().addr()
+    );
+}
 
 #[test]
 #[cfg(all(feature = "cpu", not(target_arch = "wasm32")))]

@@ -2241,16 +2241,14 @@ impl Session {
             return Ok(Some(buf));
         }
         let facts = graph.facts(id);
-        let buf = match graph.with_leaf_bytes(id, |bytes| {
+        if let Some(buf) = graph.upload_leaf_bytes(id, |bytes| {
             self.inner.device.upload(bytes, facts.persistence)
-        }) {
-            Some(uploaded) => uploaded?,
-            None => {
-                let elements = resolve_elements(&facts.shape, graph)?;
-                let bytes = (elements * facts.dtype.byte_size()).max(4);
-                self.inner.device.target().alloc(bytes, facts.persistence)?
-            }
-        };
+        })? {
+            return Ok(Some(buf));
+        }
+        let elements = resolve_elements(&facts.shape, graph)?;
+        let bytes = (elements * facts.dtype.byte_size()).max(4);
+        let buf = self.inner.device.target().alloc(bytes, facts.persistence)?;
         graph.bind_leaf(id, buf.clone(), None);
         Ok(Some(buf))
     }

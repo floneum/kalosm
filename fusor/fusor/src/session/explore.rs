@@ -107,7 +107,7 @@ struct Preparation {
     arena: u64,
     incumbent: fusor_ir::extract::PlanHash,
     candidate: fusor_ir::extract::PlanHash,
-    uploads: Vec<(Id, Arc<fusor_ir::target::HostBytes>)>,
+    uploads: Vec<crate::graph::HostUpload>,
     job: std::thread::JoinHandle<fusor_ir::Result<Vec<fusor_ir::target::Buf>>>,
 }
 
@@ -626,8 +626,10 @@ impl Session {
             if let Ok(Ok(buffers)) = prepared.job.join()
                 && matches
             {
-                for ((id, bytes), buffer) in prepared.uploads.into_iter().zip(buffers) {
-                    graph.bind_prepared_leaf(id, &bytes, buffer);
+                for (upload, buffer) in prepared.uploads.into_iter().zip(buffers) {
+                    for id in upload.values {
+                        graph.bind_prepared_leaf(id, &upload.bytes, buffer.clone());
+                    }
                 }
             }
             if matches {
@@ -652,12 +654,13 @@ impl Session {
             .collect::<Vec<_>>();
         ids.sort_unstable();
         ids.dedup();
-        let uploads: Vec<_> = graph
+        let pending: Vec<_> = graph
             .external_leaf_buffers(&ids)
             .into_iter()
             .filter(|(_, buffer)| buffer.is_none())
-            .filter_map(|(id, _)| graph.leaf_bytes_shared(id).map(|bytes| (id, bytes)))
+            .map(|(id, _)| id)
             .collect();
+        let uploads = graph.pending_leaf_uploads(&pending);
         let dims = graph.dim_bindings();
         let job = match &self.inner.device {
             Backend::Gpu(target) => target.prepare_resources(
@@ -665,7 +668,10 @@ impl Session {
                 &graph.state().egraph.lock(),
                 &dims,
                 changed,
-                uploads.iter().map(|(_, bytes)| Arc::clone(bytes)).collect(),
+                uploads
+                    .iter()
+                    .map(|upload| Arc::clone(&upload.bytes))
+                    .collect(),
             ),
             #[cfg(feature = "cpu")]
             Backend::Cpu(_) => unreachable!(),
