@@ -14,15 +14,13 @@ jobs:
       CARGO_PROFILE_DEV_OPT_LEVEL: 0
       CARGO_PROFILE_DEV_DEBUG: 0
       FUSOR_AUTOTUNE_MIN_MACS: '18446744073709551615'
-      FUSOR_PIN_CONTRACT_FAMILY: sgemv
-      FUSOR_PIN_SGEMV: '32,2,4,4,32'
       FUSOR_COMPILE_THREADS: '1'
       LAB_QLAYOUT: native
       LAB_VALIDATE_ONLY: '1'
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: f34161ee6f41cb9c2f6a009de254cc83f6175889
+          ref: 38e8ae830d1650add65411e93b7b64f7ef0dc17f
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
@@ -37,7 +35,7 @@ jobs:
             attention-shapes-${{ runner.os }}-
             attention-partition-${{ runner.os }}-
       - name: Exercise actual projection address expressions
-        run: LAB_ASSERT_VECTOR_STORAGE=1 cargo run --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer --example qmatmul_lab -- 1 4096 4096 q4k 3
+        run: FUSOR_PIN_CONTRACT_FAMILY=sgemv FUSOR_PIN_SGEMV=32,2,4,4,32 LAB_ASSERT_VECTOR_STORAGE=1 cargo run --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer --example qmatmul_lab -- 1 4096 4096 q4k 3
       - name: Storage regression tests
         run: cargo test --locked --manifest-path fusor/Cargo.toml -p fusor-gpu --lib emit::vector_loads_tests -- --test-threads=1
       - name: Shared GPU correctness and lint
