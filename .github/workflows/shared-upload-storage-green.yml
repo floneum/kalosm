@@ -1,0 +1,97 @@
+name: Shared immutable storage validation
+on:
+  push:
+    branches: [codex/shared-upload-green]
+permissions:
+  contents: read
+env:
+  CARGO_BUILD_JOBS: 1
+  CARGO_INCREMENTAL: 0
+jobs:
+  cpu:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      CARGO_PROFILE_DEV_OPT_LEVEL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: e1cfe8a95c99e7f15223a471903222955f20f601
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fusor -> target
+          shared-key: upload-reclaim-host
+      - run: cargo test --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features cpu --lib -- --test-threads=1
+      - run: cargo clippy --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features cpu --lib -- -D warnings
+  gpu:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      CARGO_PROFILE_DEV_OPT_LEVEL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      FUSOR_CONFORMANCE_REQUIRE_GPU: '1'
+      FUSOR_COMPILE_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: e1cfe8a95c99e7f15223a471903222955f20f601
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fusor/target
+          key: immutable-upload-green-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
+          restore-keys: immutable-upload-red-${{ runner.os }}-
+      - name: Check immutable storage, rebinding, preparation, and compiler conformance
+        run: |
+          cargo fmt --manifest-path fusor/Cargo.toml --all -- --check
+          cargo test --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer,compiler-tests --lib -- --test-threads=1
+          cargo test --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer,compiler-tests --test shared_compiler -- --ignored --test-threads=1
+          cargo clippy --locked --manifest-path fusor/Cargo.toml --workspace --all-targets --features fusor/kernel-observer,fusor/compiler-tests -- -D warnings
+  release:
+    needs: [cpu, gpu]
+    runs-on: macos-latest
+    timeout-minutes: 35
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/model-release-target
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: e1cfe8a95c99e7f15223a471903222955f20f601
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            model-release-target
+          key: immutable-upload-model-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            upload-reclaim-model-${{ runner.os }}-
+            workgroup-model-${{ runner.os }}-
+      - name: Build default release
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir artifacts
+          {
+            rustc -Vv
+            git rev-parse HEAD
+            shasum -a 256 models/kalosm-llama/examples/profile_forward.rs models/kalosm-llama/src/model/inference.rs
+            echo 'cargo build --locked -j 1 -p kalosm-llama --example profile_forward --release --target aarch64-apple-darwin'
+          } > artifacts/provenance.txt
+          cargo build --locked -j 1 -p kalosm-llama --example profile_forward --release --target aarch64-apple-darwin
+          cp "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/examples/profile_forward" artifacts/profile-forward-storage
+          shasum -a 256 artifacts/profile-forward-storage >> artifacts/provenance.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: immutable-upload-default-release
+          path: artifacts
+          retention-days: 7
