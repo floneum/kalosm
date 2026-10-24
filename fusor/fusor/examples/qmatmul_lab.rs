@@ -93,6 +93,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .find(|fmt| format!("{fmt:?}").eq_ignore_ascii_case(&format_name))
         .ok_or("FORMAT must be one of q4_0, q5_0, q8_0, q4k, q5k, q6k")?;
     let elements = fmt.block_elements() as usize;
+    let validate_only = std::env::var_os("LAB_VALIDATE_ONLY").is_some();
     let iters: usize = args.next().unwrap_or_else(|| "11".into()).parse()?;
     assert!(
         args.next().is_none()
@@ -111,6 +112,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .transpose()?
         .unwrap_or(1);
     assert!((1..=128).contains(&repeats));
+    assert!(
+        !validate_only || repeats == 1,
+        "validation-only mode does not replay timings"
+    );
     if repeats > 1
         && std::env::var("FUSOR_AUTOTUNE_MIN_MACS")
             .ok()
@@ -376,7 +381,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut cold_ms = 0.0;
         let mut max_error = 0f64;
         let mut launches = 0;
-        for iteration in 0..iters + 3 {
+        for iteration in 0..if validate_only { 3 } else { iters + 3 } {
             if step_control {
                 println!(
                     "LAB_CONTROL {}",
@@ -401,7 +406,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             for output in &outputs {
                 output.clear_device_buf();
             }
-            target.launcher().set_tuning(iteration > 0 && repeats == 1);
+            target
+                .launcher()
+                .set_tuning(!validate_only && iteration > 0 && repeats == 1);
             target.launcher().take_last_profile();
             let start = Instant::now();
             device.session().resolve(&outputs)?;
@@ -473,6 +480,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
         target.launcher().set_tuning(false);
+        if validate_only {
+            println!(
+                "MATMUL_VALIDATED m={m} n={n} k={k} fmt={fmt:?} inputs=3 copies={copies} max_error={max_error:.6}"
+            );
+            continue;
+        }
         gpu_samples.sort_by(f64::total_cmp);
         wall_samples.sort_by(f64::total_cmp);
         let us = gpu_samples[gpu_samples.len() / 2];
