@@ -876,64 +876,6 @@ impl Emitter<'_> {
         })
     }
 
-    /// Complete the operand with the most temporary state first, then retain
-    /// only its result while evaluating smaller operands. Existing memo values
-    /// need no new evaluation. This never changes argument positions.
-    fn scheduled_operands<const N: usize>(
-        &mut self,
-        operands: [&TileExpr; N],
-        enabled: bool,
-        body: &mut Block,
-    ) -> Result<[Handle<Expression>; N], EmitError> {
-        let mut order: [usize; N] = std::array::from_fn(|i| i);
-        if enabled {
-            let pressures: Option<Vec<_>> = operands
-                .iter()
-                .map(|e| {
-                    let peak = self.pressure.get(e)?;
-                    let words = super::schedule::result_words(e);
-                    let cached = self
-                        .memo
-                        .get(*e)
-                        .is_some_and(|(_, stamp)| self.stamp_is_current(e.mem_reads(), stamp));
-                    Some(if cached {
-                        0
-                    } else {
-                        peak.saturating_sub(words)
-                    })
-                })
-                .collect();
-            if let Some(pressures) = pressures {
-                order.sort_by_key(|&i| std::cmp::Reverse(pressures[i]));
-            }
-        }
-        let mut values = [None; N];
-        for (position, i) in order.into_iter().enumerate() {
-            let value = self.expr(operands[i], body)?;
-            if position < i
-                && matches!(
-                    self.exprs[value],
-                    Expression::Math { .. }
-                        | Expression::Binary { .. }
-                        | Expression::Unary { .. }
-                        | Expression::As { .. }
-                        | Expression::Compose { .. }
-                        | Expression::Splat { .. }
-                        | Expression::Swizzle { .. }
-                        | Expression::Select { .. }
-                )
-            {
-                // An Emit fixes SSA scope, but does not prevent a backend from
-                // inlining a single-use value into its consumer. Bake the early
-                // result so its input temporaries can die before later operands.
-                let n = self.forced_names.len();
-                self.forced_names.push((value, format!("scheduled_{n}")));
-            }
-            values[i] = Some(value);
-        }
-        Ok(values.map(|v| v.expect("every operand was emitted")))
-    }
-
     fn binary(
         &mut self,
         body: &mut Block,
@@ -954,14 +896,16 @@ impl Emitter<'_> {
                 } = mul.kind()
                     && inner.contract
                 {
-                    let [a, b, c] =
-                        self.scheduled_operands([a, b, other], numeric.reassoc, body)?;
+                    let a = self.expr(a, body)?;
+                    let b = self.expr(b, body)?;
+                    let c = self.expr(other, body)?;
                     return Ok(self.math(body, MathFunction::Fma, &[a, b, c]));
                 }
             }
         }
 
-        let [l, r] = self.scheduled_operands([left, right], numeric.reassoc, body)?;
+        let l = self.expr(left, body)?;
+        let r = self.expr(right, body)?;
 
         // Reassociation permits identity elimination and literal folding.
         // Under `reassoc: false` the operation is emitted literally.

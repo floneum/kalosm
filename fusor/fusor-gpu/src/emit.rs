@@ -8,7 +8,6 @@ pub(crate) mod coop;
 pub(crate) mod expr;
 pub(crate) mod quantized;
 pub(crate) mod reduce;
-mod schedule;
 pub(crate) mod stmt;
 mod storage;
 pub(crate) mod types;
@@ -429,7 +428,6 @@ pub(crate) struct Emitter<'a> {
     /// Write counter per memory space (storage, tile, local). Monotonic and not
     /// part of [`expr::Scope`]: a nested store must invalidate enclosing reads.
     pub(crate) mem_epoch: MemStamp,
-    pressure: schedule::Pressure,
     /// Latest SSA value of each cooperative accumulator local: one `Load`,
     /// N MMAs, one `Store` per scope.
     pub(crate) coop_acc: FxHashMap<usize, naga::Handle<naga::Expression>>,
@@ -494,7 +492,6 @@ impl<'a> Emitter<'a> {
             forced_names: Vec::new(),
             memo: FxHashMap::default(),
             mem_epoch: MemStamp::default(),
-            pressure: schedule::Pressure::default(),
             coop_acc: FxHashMap::default(),
             workgroup_invocations,
             workgroup_size: [workgroup_invocations, 1, 1],
@@ -774,99 +771,6 @@ mod tests {
         assert_eq!(
             run(&target, &ir, Uniforms::default()),
             [304, 2 * 103u32.pow(3)]
-        );
-    }
-
-    #[test]
-    fn expression_schedule_finishes_nested_fma_before_loading_outer_operands() {
-        let target = crate::target::GpuTarget::new_blocking().expect("GPU adapter");
-        let b = Kernel::new();
-        let ty = ScalarElement::U32.element();
-        let input = buffer(0, ty, 8, BufferAccess::Read);
-        let output = buffer(1, ty, 1, BufferAccess::ReadWrite);
-        let load = |index| {
-            b.cast(
-                b.load(
-                    Source::Storage(input.clone()),
-                    Addr::Linear(b.u32(index)),
-                    b.bool(true),
-                    b.u32(0),
-                ),
-                ScalarElement::F32.element(),
-            )
-        };
-        let value = b.fma(load(0), load(1), b.fma(load(2), load(3), load(4)));
-        let ir = KernelIr {
-            buffers: vec![input.buffer, output.buffer.clone()],
-            grid: [1, 1, 1],
-            block: 1,
-            body: vec![Stmt::Store {
-                dst: output,
-                addr: Addr::Linear(b.u32(0)),
-                value: b.bitcast(value, ty),
-                mask: b.bool(true),
-            }],
-            byte_arena: None,
-            name: "expression_schedule",
-        };
-        let emitted = emit(&ir, target.caps()).unwrap();
-        let expressions = &emitted.module.entry_points[0].function.expressions;
-        let first_fma = expressions
-            .iter()
-            .find_map(|(h, e)| {
-                matches!(
-                    e,
-                    naga::Expression::Math {
-                        fun: naga::MathFunction::Fma,
-                        ..
-                    }
-                )
-                .then_some(h.index())
-            })
-            .unwrap();
-        let outer_load = expressions
-            .iter()
-            .find_map(|(h, e)| {
-                let naga::Expression::Load { pointer } = e else {
-                    return None;
-                };
-                let naga::Expression::Access { index, .. } = expressions[*pointer] else {
-                    return None;
-                };
-                matches!(
-                    expressions[index],
-                    naga::Expression::Literal(naga::Literal::U32(0))
-                )
-                .then_some(h.index())
-            })
-            .unwrap();
-        assert!(
-            first_fma < outer_load,
-            "outer operands stay live across the nested multiply-add"
-        );
-        assert!(
-            emitted.module.entry_points[0]
-                .function
-                .named_expressions
-                .keys()
-                .any(|h| h.index() == first_fma),
-            "scheduled result is inlined again, extending its operands' lifetimes"
-        );
-        let fmas = expressions
-            .iter()
-            .filter(|(_, e)| {
-                matches!(
-                    e,
-                    naga::Expression::Math {
-                        fun: naga::MathFunction::Fma,
-                        ..
-                    }
-                )
-            })
-            .count();
-        assert_eq!(
-            fmas, 2,
-            "scheduling must preserve both arithmetic operations"
         );
     }
 
