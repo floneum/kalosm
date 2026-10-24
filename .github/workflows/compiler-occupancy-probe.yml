@@ -1,0 +1,76 @@
+name: WebGPU compiler occupancy probe
+on:
+  push:
+    branches: [codex/compiler-occupancy-probe]
+permissions:
+  contents: read
+jobs:
+  fixtures:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_OPT_LEVEL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      FUSOR_AUTOTUNE_MIN_MACS: '18446744073709551615'
+      FUSOR_COMPILE_THREADS: '1'
+      LAB_QLAYOUT: native
+      LAB_VALIDATE_ONLY: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: b87dd97364b52aa9ad114cd3e9537ba4503155e9
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache/restore@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fusor/target
+          key: grouped-load-projection-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
+          restore-keys: |
+            grouped-load-projection-${{ runner.os }}-
+      - name: Build isolated compiler hints through WebGPU
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir artifacts
+          rustc -Vv > artifacts/provenance.txt
+          git rev-parse HEAD >> artifacts/provenance.txt
+          cargo metadata --locked --manifest-path fusor/Cargo.toml --format-version 1 > /tmp/occupancy-metadata.json
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          ps=[p for p in json.loads(Path('/tmp/occupancy-metadata.json').read_text())['packages'] if p['name']=='naga']
+          assert len(ps)==1 and '9c9187d26886eccc4b3fbfeb67989ce77fbd1217' in ps[0]['source']
+          p=Path(ps[0]['manifest_path']).parent/'src/back/msl/writer.rs'
+          Path('/tmp/occupancy-writer-path').write_text(str(p))
+          Path('/tmp/occupancy-writer-original').write_text(p.read_text())
+          PY
+          for hint in 0 128 256 512; do
+            HINT="$hint" python3 - <<'PY'
+          import os, difflib
+          from pathlib import Path
+          hint=int(os.environ['HINT'])
+          p=Path(Path('/tmp/occupancy-writer-path').read_text())
+          original=Path('/tmp/occupancy-writer-original').read_text()
+          needle='                    writeln!(self.out, "[[max_total_threads_per_threadgroup({threads})]]")?;'
+          assert original.count(needle)==1
+          replacement=f'                    let threads = threads.max({hint});\n'+needle if hint else needle
+          changed=original.replace(needle,replacement)
+          p.write_text(changed)
+          Path(f'artifacts/hint-{hint}.patch').write_text(''.join(difflib.unified_diff(original.splitlines(True),changed.splitlines(True),fromfile='naga/src/back/msl/writer.rs',tofile='naga/src/back/msl/writer.rs')))
+          PY
+            cargo clean --manifest-path fusor/Cargo.toml -p naga
+            cargo build --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer --example qmatmul_lab
+            cp fusor/target/debug/examples/qmatmul_lab "artifacts/qmatmul-hint-$hint"
+            shasum -a 256 "artifacts/qmatmul-hint-$hint" "artifacts/hint-$hint.patch" >> artifacts/provenance.txt
+            FUSOR_PIN_CONTRACT_FAMILY=sgemv FUSOR_PIN_SGEMV=32,2,4,4,32 "artifacts/qmatmul-hint-$hint" 1 4096 4096 q4k 3
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: compiler-occupancy-fixtures
+          path: artifacts
+          retention-days: 7
