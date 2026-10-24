@@ -47,7 +47,10 @@ fn kernel(elements: u32, components: u32, offset: u32, writable: bool, masked: b
     );
     input.offset = offset;
     let output = storage(2, BufferAccess::ReadWrite);
-    let base = b.mul(b.builtin(Builtin::ProgramId(0)), b.u32(4));
+    let base = b.mul(
+        b.builtin(Builtin::ProgramId(fusor_ir::ir::kernel::WorkgroupAxis::X)),
+        b.u32(4),
+    );
     let body = (0..components)
         .map(|i| {
             let index = b.add(base.clone(), b.u32(i));
