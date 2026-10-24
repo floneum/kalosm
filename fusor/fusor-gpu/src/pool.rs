@@ -729,6 +729,41 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(all(not(target_arch = "wasm32"), feature = "compiler-tests"))]
+    fn initial_uploads_do_not_retain_a_second_full_device_copy() {
+        let target = pollster::block_on(crate::target::GpuTarget::with_config(GpuConfig {
+            max_gpu_memory_bytes: Some(256 << 20),
+            ..GpuConfig::default()
+        }))
+        .unwrap();
+        let pool = target.pool();
+        let before = pool.device.get_internal_counters().hal.buffers.read();
+        let data: Vec<_> = (0..16 << 20).map(|i| (i as u8).wrapping_mul(37)).collect();
+        let buffers: Vec<_> = (0..9)
+            .map(|_| pool.create_buffer_init(&data, TENSOR_USAGE).unwrap())
+            .collect();
+        // Poll only submitted work. A poll does not submit pending wgpu upload
+        // copies; their native staging allocations remain observable here.
+        pool.device
+            .poll(wgpu::PollType::wait_indefinitely())
+            .unwrap();
+        let live = pool.device.get_internal_counters().hal.buffers.read() - before;
+        assert!(
+            live >= buffers.len() as isize,
+            "backend buffer counters unavailable"
+        );
+        assert!(
+            live <= buffers.len() as isize + 3,
+            "initial upload staging grows with the complete tensor set: {live} native buffers for {} tensors",
+            buffers.len()
+        );
+        for buffer in buffers {
+            let actual = pollster::block_on(target.readback(&buffer, data.len() as u64)).unwrap();
+            assert_eq!(actual, data);
+        }
+    }
+
+    #[test]
     #[cfg(not(target_arch = "wasm32"))]
     fn mapped_upload_roundtrip_and_reuse() {
         let target = pollster::block_on(crate::target::GpuTarget::with_config(GpuConfig {

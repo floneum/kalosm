@@ -38,7 +38,7 @@ wgpu = { version = "29", default-features = false, features = ["webgpu", "wgsl",
 
 [features]
 # Expensive compiler invariants are exercised by conformance, never dispatch.
-compiler-tests = ["fusor-ir/compiler-tests", "fusor-cost/compiler-tests"]
+compiler-tests = ["fusor-ir/compiler-tests", "fusor-cost/compiler-tests", "wgpu/counters"]
 default = []
 # Opt-in host observation of lowered kernels for offline compiler diagnostics.
 kernel-observer = []
