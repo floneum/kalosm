@@ -13,7 +13,7 @@ pub(super) fn result_words(e: &TileExpr) -> u32 {
     }
     match e.element() {
         ElementType::Scalar(_) => 1,
-        ElementType::Vector { lanes, .. } => u32::from(lanes),
+        ElementType::Vector { lanes, .. } => lanes,
         ElementType::CoopMatrix { .. } => 0,
     }
 }
