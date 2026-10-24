@@ -1,0 +1,35 @@
+name: Grouped storage load compiler checks
+on:
+  push:
+    branches: [codex/grouped-load-checks]
+permissions:
+  contents: read
+jobs:
+  check:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_OPT_LEVEL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      FUSOR_CONFORMANCE_REQUIRE_GPU: '1'
+      FUSOR_COMPILE_THREADS: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 084244b8c
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fusor/target
+          key: grouped-load-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
+          restore-keys: |
+            attention-partition-${{ runner.os }}-
+            immutable-upload-green-${{ runner.os }}-
+      - name: Verify complete-group emission and exact output preservation
+        run: cargo test --locked --manifest-path fusor/Cargo.toml -p fusor-gpu --lib emit::vector_loads_tests -- --test-threads=1
