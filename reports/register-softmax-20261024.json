@@ -1,0 +1,184 @@
+{
+  "status": "rejected: common-width attention regresses",
+  "source": "5042b40cedf47d2d4031160c5589650642002af9",
+  "ci": "https://github.com/floneum/kalosm/actions/runs/40128796570",
+  "provenance": "rustc 1.99.1 (58cf8f9c3 2026-10-13)\nbinary: rustc\ncommit-hash: 58cf8f9c35b355199727627d07ae34a4e2846d67\ncommit-date: 2026-10-13\nhost: aarch64-apple-darwin\nrelease: 1.99.1\nLLVM version: 23.1.1\ncandidate\n5042b40cedf47d2d4031160c5589650642002af9\nb97e786187301c8326b2e819525dc243a3e0d59f543d558f5a4aa343340c5fe7  artifacts/attention-candidate\nbaseline\n5042b40cedf47d2d4031160c5589650642002af9\nc7aceb0e18f66b2217ede9553915bf17ca1bd1ec1b299a5f3649528d86af50fa  artifacts/attention-baseline\n",
+  "cases": [
+    {
+      "shape": {
+        "keys": 512,
+        "prefix": 512,
+        "heads": 32,
+        "kv_heads": 8,
+        "width": 128,
+        "batch": 1,
+        "stress": false
+      },
+      "gpu_us": [
+        98.326,
+        166.669,
+        166.744,
+        88.607
+      ],
+      "directional_speedups": [
+        0.5899477407316297,
+        0.531395432519311
+      ],
+      "max_cpu_error": 1.1e-06
+    },
+    {
+      "shape": {
+        "keys": 512,
+        "prefix": 257,
+        "heads": 32,
+        "kv_heads": 8,
+        "width": 128,
+        "batch": 1,
+        "stress": false
+      },
+      "gpu_us": [
+        101.74,
+        135.619,
+        124.484,
+        90.458
+      ],
+      "directional_speedups": [
+        0.7501898701509375,
+        0.7266636676199351
+      ],
+      "max_cpu_error": 1.1e-06
+    },
+    {
+      "shape": {
+        "keys": 2048,
+        "prefix": 2048,
+        "heads": 32,
+        "kv_heads": 8,
+        "width": 128,
+        "batch": 1,
+        "stress": false
+      },
+      "gpu_us": [
+        261.283,
+        475.565,
+        476.457,
+        261.25
+      ],
+      "directional_speedups": [
+        0.54941595786065,
+        0.5483181063558726
+      ],
+      "max_cpu_error": 1.1e-06
+    },
+    {
+      "shape": {
+        "keys": 128,
+        "prefix": 17,
+        "heads": 32,
+        "kv_heads": 8,
+        "width": 128,
+        "batch": 1,
+        "stress": false
+      },
+      "gpu_us": [
+        38.334,
+        34.286,
+        36.479,
+        38.326
+      ],
+      "directional_speedups": [
+        1.1180656827859767,
+        1.050631870391184
+      ],
+      "max_cpu_error": 1.9e-06
+    },
+    {
+      "shape": {
+        "keys": 512,
+        "prefix": 511,
+        "heads": 1,
+        "kv_heads": 1,
+        "width": 32,
+        "batch": 1,
+        "stress": false
+      },
+      "gpu_us": [
+        42.908,
+        65.31,
+        65.237,
+        43.207
+      ],
+      "directional_speedups": [
+        0.6569897412341142,
+        0.6623081993347334
+      ],
+      "max_cpu_error": 2e-07
+    },
+    {
+      "shape": {
+        "keys": 512,
+        "prefix": 512,
+        "heads": 8,
+        "kv_heads": 8,
+        "width": 64,
+        "batch": 2,
+        "stress": false
+      },
+      "gpu_us": [
+        68.089,
+        102.128,
+        98.544,
+        70.63
+      ],
+      "directional_speedups": [
+        0.6667025693247689,
+        0.7167356713752232
+      ],
+      "max_cpu_error": 5e-07
+    },
+    {
+      "shape": {
+        "keys": 512,
+        "prefix": 257,
+        "heads": 64,
+        "kv_heads": 8,
+        "width": 256,
+        "batch": 1,
+        "stress": false
+      },
+      "gpu_us": [
+        1256.736,
+        1462.036,
+        1462.1,
+        1257.312
+      ],
+      "directional_speedups": [
+        0.8595793810822716,
+        0.8599357089118391
+      ],
+      "max_cpu_error": 1.6e-06
+    },
+    {
+      "shape": {
+        "keys": 512,
+        "prefix": 511,
+        "heads": 32,
+        "kv_heads": 8,
+        "width": 128,
+        "batch": 1,
+        "stress": true
+      },
+      "gpu_us": [
+        99.292,
+        166.439,
+        166.645,
+        111.633
+      ],
+      "directional_speedups": [
+        0.5965669103996059,
+        0.6698850850610578
+      ],
+      "max_cpu_error": 1e-07
+    }
+  ]
+}
