@@ -908,8 +908,28 @@ impl Emitter<'_> {
             }
         }
         let mut values = [None; N];
-        for i in order {
-            values[i] = Some(self.expr(operands[i], body)?);
+        for (position, i) in order.into_iter().enumerate() {
+            let value = self.expr(operands[i], body)?;
+            if position < i
+                && matches!(
+                    self.exprs[value],
+                    Expression::Math { .. }
+                        | Expression::Binary { .. }
+                        | Expression::Unary { .. }
+                        | Expression::As { .. }
+                        | Expression::Compose { .. }
+                        | Expression::Splat { .. }
+                        | Expression::Swizzle { .. }
+                        | Expression::Select { .. }
+                )
+            {
+                // An Emit fixes SSA scope, but does not prevent a backend from
+                // inlining a single-use value into its consumer. Bake the early
+                // result so its input temporaries can die before later operands.
+                let n = self.forced_names.len();
+                self.forced_names.push((value, format!("scheduled_{n}")));
+            }
+            values[i] = Some(value);
         }
         Ok(values.map(|v| v.expect("every operand was emitted")))
     }
