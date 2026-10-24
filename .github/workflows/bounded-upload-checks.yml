@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: e230ac73c4c41f1add23aec7c35078d0fae898c4
+          ref: 9f52cde755f06575510c7a62e872d89bb0a96c81
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -37,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: e230ac73c4c41f1add23aec7c35078d0fae898c4
+          ref: 9f52cde755f06575510c7a62e872d89bb0a96c81
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
@@ -48,6 +48,7 @@ jobs:
             fusor/target
           key: immutable-upload-green-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
           restore-keys: |
+            bounded-upload-red-${{ runner.os }}-
             immutable-upload-green-${{ runner.os }}-
             immutable-upload-red-${{ runner.os }}-
       - name: Check immutable storage, rebinding, preparation, and compiler conformance
@@ -82,6 +83,13 @@ jobs:
       - name: Prove pending staging retains the second allocation set
         shell: bash
         run: |
+          python3 - <<'PYTEST'
+          from pathlib import Path
+          p = Path('fusor/fusor-gpu/src/pool.rs')
+          s = p.read_text().replace('        let before = pool.device.get_internal_counters().hal.buffers.read();', '        pool.queue.submit([]);\n        pool.device.poll(wgpu::PollType::wait_indefinitely()).unwrap();\n        let before = pool.device.get_internal_counters().hal.buffers.read();')
+          p.write_text(s)
+          PYTEST
+          git diff
           set +e
           cargo test --locked --manifest-path fusor/Cargo.toml -p fusor-gpu --features compiler-tests --lib initial_uploads_do_not_retain_a_second_full_device_copy -- --test-threads=1 > red.log 2>&1
           code=$?
@@ -98,7 +106,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: e230ac73c4c41f1add23aec7c35078d0fae898c4
+          ref: 9f52cde755f06575510c7a62e872d89bb0a96c81
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
