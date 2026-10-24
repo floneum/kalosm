@@ -1025,8 +1025,8 @@ impl Emitter<'_> {
                         let mut len = self.emit_expr(body, Expression::ArrayLength(base_for_len));
                         if self.packed_half(&view.buffer) {
                             len = self.mul_literal_u32(body, len, 2);
-                        } else if self.packed_vector(&view.buffer) {
-                            len = self.mul_literal_u32(body, len, 4);
+                        } else if let Some(width) = self.packed_vector(&view.buffer) {
+                            len = self.mul_literal_u32(body, len, width);
                         }
                         let one = self.u32_lit(1);
                         let last = self.bin(body, BinaryOperator::Subtract, len, one);

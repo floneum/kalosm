@@ -21,12 +21,11 @@ impl Emitter<'_> {
             && self.buffer_element(buffer) == ElementType::Scalar(ScalarElement::U32)
     }
 
-    pub(crate) fn packed_vector(&self, buffer: &Buffer) -> bool {
-        matches!(buffer.element, ElementType::Scalar(_))
-            && matches!(
-                self.buffer_element(buffer),
-                ElementType::Vector { lanes: 4, .. }
-            )
+    pub(crate) fn packed_vector(&self, buffer: &Buffer) -> Option<u32> {
+        match (buffer.element, self.buffer_element(buffer)) {
+            (ElementType::Scalar(_), ElementType::Vector { lanes, .. }) => Some(lanes),
+            _ => None,
+        }
     }
 
     /// Pointer at an absolute index in the view's element units.
@@ -38,9 +37,9 @@ impl Emitter<'_> {
     ) -> Result<Handle<Expression>, EmitError> {
         let global = self.buffer_global(&view.buffer)?;
         let base = self.global_var(global);
-        if self.packed_vector(&view.buffer) {
-            let vector = self.div_literal_u32(body, index, 4);
-            let component = self.mod_literal_u32(body, index, 4);
+        if let Some(width) = self.packed_vector(&view.buffer) {
+            let vector = self.div_literal_u32(body, index, width);
+            let component = self.mod_literal_u32(body, index, width);
             let base = self.emit_expr(
                 body,
                 Expression::Access {
@@ -70,11 +69,11 @@ impl Emitter<'_> {
         view: &StorageView,
         index: Handle<Expression>,
     ) -> Result<Handle<Expression>, EmitError> {
-        if self.packed_vector(&view.buffer) {
+        if let Some(width) = self.packed_vector(&view.buffer) {
             let global = self.buffer_global(&view.buffer)?;
             let base = self.global_var(global);
-            let vector = self.div_literal_u32(body, index, 4);
-            let component = self.mod_literal_u32(body, index, 4);
+            let vector = self.div_literal_u32(body, index, width);
+            let component = self.mod_literal_u32(body, index, width);
             let pointer = self.emit_expr(
                 body,
                 Expression::Access {

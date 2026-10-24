@@ -297,11 +297,14 @@ pub(crate) fn create_storage_globals(em: &mut Emitter<'_>) -> Result<(), EmitErr
         if views.iter().any(|b| b.access == BufferAccess::ReadWrite) {
             decl.access = BufferAccess::ReadWrite;
         }
-        if !mixed && !atomic && em.analysis.vector_buffers.contains(&first.binding) {
+        if !mixed
+            && !atomic
+            && let Some(&lanes) = em.analysis.vector_buffers.get(&first.binding)
+        {
             let ElementType::Scalar(scalar) = decl.element else {
                 unreachable!("vector storage analysis requires scalar views");
             };
-            decl.element = ElementType::Vector { scalar, lanes: 4 };
+            decl.element = ElementType::Vector { scalar, lanes };
         }
         // Neighboring f16 elements share a word. A compare-exchange store
         // preserves the other half even when different lanes write it.

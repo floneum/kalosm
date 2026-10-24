@@ -89,7 +89,7 @@ pub(crate) struct Analysis {
     /// First-use-ordered, deduplicated declaration lists.
     pub buffers: Vec<Buffer>,
     /// Read-only scalar bindings whose accesses cover complete aligned vectors.
-    vector_buffers: FxHashSet<u32>,
+    vector_buffers: FxHashMap<u32, u32>,
     pub tiles: Vec<Tile>,
     pub locals: Vec<Local>,
     /// The device's fixed subgroup width, which decides [`collective_tree`].

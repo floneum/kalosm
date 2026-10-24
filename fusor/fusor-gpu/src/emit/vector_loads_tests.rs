@@ -116,6 +116,17 @@ fn complete_aligned_scalar_reads_use_one_vector_storage_element() {
 }
 
 #[test]
+fn complete_scalar_pairs_use_two_component_storage() {
+    assert!(matches!(
+        input_type(&kernel(30, 2, 2, false, false)),
+        naga::TypeInner::Vector {
+            size: naga::VectorSize::Bi,
+            ..
+        }
+    ));
+}
+
+#[test]
 fn incomplete_or_unproven_storage_groups_remain_scalar() {
     for args in [
         (31, 4, 0, false, false),

@@ -7,7 +7,24 @@ use fusor_ir::ir::kernel::{
 use fusor_tile::build::Kernel;
 use rustc_hash::{FxHashMap, FxHashSet};
 
-pub(super) fn analyze(buffers: &[Buffer], expressions: &FxHashSet<TileExpr>) -> FxHashSet<u32> {
+pub(super) fn analyze(
+    buffers: &[Buffer],
+    expressions: &FxHashSet<TileExpr>,
+) -> FxHashMap<u32, u32> {
+    let mut widths = FxHashMap::default();
+    for width in [2, 4] {
+        for binding in analyze_width(buffers, expressions, width) {
+            widths.insert(binding, width);
+        }
+    }
+    widths
+}
+
+fn analyze_width(
+    buffers: &[Buffer],
+    expressions: &FxHashSet<TileExpr>,
+    width: u32,
+) -> FxHashSet<u32> {
     let mut rejected = FxHashSet::default();
     for buffer in buffers {
         // The symbolic declaration extent is only a lower-bound placeholder;
@@ -16,7 +33,7 @@ pub(super) fn analyze(buffers: &[Buffer], expressions: &FxHashSet<TileExpr>) -> 
         if !buffer.element_count_is_static
             || buffer.access != BufferAccess::Read
             || count == 0
-            || !count.is_multiple_of(4)
+            || !count.is_multiple_of(u64::from(width))
             || !matches!(
                 buffer.element,
                 ElementType::Scalar(ScalarElement::F32 | ScalarElement::I32 | ScalarElement::U32)
@@ -50,11 +67,11 @@ pub(super) fn analyze(buffers: &[Buffer], expressions: &FxHashSet<TileExpr>) -> 
                 return None;
             }
             let index = physical_index(&b, view, addr)?;
-            let component = simplify_index(&b.rem(index.clone(), b.u32(4)));
+            let component = simplify_index(&b.rem(index.clone(), b.u32(width)));
             let TileExprKind::Literal(TileLiteral::U32(component)) = component.kind() else {
                 return None;
             };
-            let group = simplify_index(&b.div(index, b.u32(4)));
+            let group = simplify_index(&b.div(index, b.u32(width)));
             Some((group, *component))
         })();
         if let Some((group, component)) = group {
@@ -66,8 +83,11 @@ pub(super) fn analyze(buffers: &[Buffer], expressions: &FxHashSet<TileExpr>) -> 
     groups
         .into_iter()
         .filter_map(|(binding, groups)| {
-            (!rejected.contains(&binding) && groups.values().all(|&components| components == 15))
-                .then_some(binding)
+            (!rejected.contains(&binding)
+                && groups
+                    .values()
+                    .all(|&components| components == (1 << width) - 1))
+            .then_some(binding)
         })
         .collect()
 }
