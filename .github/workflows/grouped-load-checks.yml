@@ -1,7 +1,7 @@
 name: Grouped storage load compiler checks
 on:
   push:
-    branches: [codex/grouped-load-checks]
+    branches: [codex/grouped-load-checks, codex/grouped-load-green]
 permissions:
   contents: read
 jobs:
@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: 084244b8c1f6980b0cbb4be884db452c64de2585
+          ref: 28e6cabf436ba6008267530e4fc79a77e236f3bc
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
@@ -33,3 +33,72 @@ jobs:
             immutable-upload-green-${{ runner.os }}-
       - name: Verify complete-group emission and exact output preservation
         run: cargo test --locked --manifest-path fusor/Cargo.toml -p fusor-gpu --lib emit::vector_loads_tests -- --test-threads=1
+      - name: Shared compiler correctness and lint
+        run: |
+          cargo fmt --manifest-path fusor/Cargo.toml --all -- --check
+          cargo test --locked --manifest-path fusor/Cargo.toml -p fusor-gpu --lib -- --test-threads=1
+          cargo test --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer,compiler-tests --test shared_compiler -- --ignored --test-threads=1
+          cargo clippy --locked --manifest-path fusor/Cargo.toml --workspace --all-targets --features fusor/kernel-observer,fusor/compiler-tests -- -D warnings
+      - name: Build matched projection fixtures
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir artifacts
+          rustc -Vv > artifacts/provenance.txt
+          for arm in candidate baseline; do
+            if [ "$arm" = baseline ]; then
+              git fetch --depth=1 origin b87dd97364b52aa9ad114cd3e9537ba4503155e9
+              git checkout --detach b87dd97364b52aa9ad114cd3e9537ba4503155e9
+            fi
+            echo "$arm" >> artifacts/provenance.txt
+            git rev-parse HEAD >> artifacts/provenance.txt
+            cargo build --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer --example qmatmul_lab
+            cp fusor/target/debug/examples/qmatmul_lab "artifacts/qmatmul-$arm"
+            shasum -a 256 "artifacts/qmatmul-$arm" >> artifacts/provenance.txt
+          done
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grouped-load-fixtures
+          path: artifacts
+          retention-days: 7
+  release:
+    needs: check
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_TARGET_DIR: ${{ github.workspace }}/model-release-target
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 28e6cabf436ba6008267530e4fc79a77e236f3bc
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            model-release-target
+          key: grouped-load-model-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            immutable-upload-model-${{ runner.os }}-
+      - name: Build ordinary default decode profiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir artifacts
+          {
+            rustc -Vv
+            git rev-parse HEAD
+            shasum -a 256 models/kalosm-llama/examples/profile_forward.rs models/kalosm-llama/src/model/inference.rs
+          } > artifacts/provenance.txt
+          cargo build --locked -j 1 -p kalosm-llama --example profile_forward --release --target aarch64-apple-darwin
+          cp "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/examples/profile_forward" artifacts/profile-forward-vector
+          shasum -a 256 artifacts/profile-forward-vector >> artifacts/provenance.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: grouped-load-default-release
+          path: artifacts
+          retention-days: 7
