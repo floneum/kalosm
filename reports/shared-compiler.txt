@@ -1,3 +1,42 @@
+Completed full-model verification and corrected pressure monitor (2026-10-24)
+============================================================================
+Runtime a0d355d317570ff636f836ab9902b53726f37921 completes the ordinary WebGPU
+chat path on Meta-Llama-3.1-8B-Instruct-Q4_K_M, on Apple M2 Max with 32 GiB.
+The verified release binary is fb405201495b7a5243dc29a149ee2ef4049b36583eb3843ca7c95a93672e83d3.
+No compiler/runtime tuning overrides are set. Seed is zero, with eight warmup
+tokens and 512 actual measured tokens per round, repeated three times.
+
+All rounds complete with identical sampled token IDs:
+  Round 0: 37.277 tokens/sec, 26.826 ms mean, 58.610 ms maximum gap.
+  Round 1: 36.221 tokens/sec, 27.608 ms mean, 56.533 ms maximum gap.
+  Round 2: 35.686 tokens/sec, 28.022 ms mean, 57.886 ms maximum gap.
+Excluding the first full round as specified before the run leaves 1,024 tokens:
+35.951 tokens/sec, 27.815 ms mean, 31.461 ms p95 and 57.886 ms maximum gap.
+Every measured gap remains included. Both later rounds' worst gap occurs at
+measured token index 449 (zero-based); this pause remains observable.
+The 60 tokens/sec goal is not met. No matched 2x throughput result is claimed.
+
+The full run takes 87.372 seconds including loading and all three rounds.
+Minimum monitored headroom: 7.905 GiB; peak process RSS: 9.688 GiB.
+Kernel pressure remains normal at every sample; added swapouts: zero.
+Peak compression is 4.880 GiB. Thus the earlier compression-only refusals
+were not evidence that this model could not fit. The extra 23 GiB reservation
+was an experiment assumption, not an actual model requirement.
+
+The old runner first stops loading after 2.019 seconds solely because
+compression grew by 512 MiB, despite 14.019 GiB headroom and no added swapouts.
+A regression reproduces that false stop. The corrected runner records
+compression but checks the kernel's actual pressure state, rejecting warning,
+critical, unknown or unavailable readings. Startup/runtime headroom, swap,
+disk, timeout, cross-worktree lock and owned-process cleanup remain enforced.
+All 26 Python tool tests pass, including 14 guard tests. CI now runs them.
+No Rust/model code changed during these two attempts; the second run validates
+the corrected monitor, rather than automatically retrying the old policy.
+
+Machine-readable results: reports/verified-decode-20261024.json.
+Raw evidence: target/stall-validation/immutable-storage-20261024/
+full-model-pressure-verified/{decode.log,resources.jsonl,provenance.json}.
+
 Immutable compiler storage views: one GPU upload (2026-10-24)
 ============================================================
 Runtime source a0d355d317570ff636f836ab9902b53726f37921 removes duplicate
@@ -40,11 +79,9 @@ https://github.com/floneum/kalosm/actions/runs/40115143722
 Fixture SHA256: b4f9cf64a0df85f8189ea4b698665588b297f68b8fbe0a94a6db32039d15dbd4
 
 This establishes a 50% allocation reduction for the shared weight/view
-pair, not a model throughput result. Local preflight still has about
-14.75 GiB available against the unchanged 23 GiB full-model admission threshold
-(also below the canonical guard's 15.17 GiB minimum for this model).
-No model was launched and no resource-aborted workload was retried.
-The 60 tokens/sec and 2x full-model goals remain unverified.
+pair, not a model throughput result. The later full-model measurement above
+supersedes the earlier memory-blocked assessment. The 60 tokens/sec target
+is not met; a matched full-model 2x speedup is not established.
 
 Declared compute workgroups and final translator validation (2026-10-18)
 ========================================================================

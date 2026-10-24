@@ -14,10 +14,33 @@ import benchmark_guard as guard
 
 GIB = 1024**3
 HEALTHY = guard.Snapshot(available_bytes=24*GIB, compressed_bytes=0,
-                         swapout_bytes=0, disk_free_bytes=32*GIB)
+                         swapout_bytes=0, disk_free_bytes=32*GIB, pressure_level=1)
 
 
 class GuardTests(unittest.TestCase):
+    def test_normal_pressure_compression_is_not_exhaustion(self):
+        # Reproduce the 8B loading trace: 14 GiB still available, no new swap,
+        # but compression rose from 0.46 to 1.02 GiB and falsely stopped it.
+        initial = dataclasses.replace(HEALTHY, available_bytes=16*GIB,
+                                      compressed_bytes=int(.46*GIB))
+        for compressed in [int(1.02*GIB), 3*GIB]:
+            with self.subTest(compressed=compressed):
+                current = dataclasses.replace(initial, available_bytes=14*GIB,
+                                              compressed_bytes=compressed)
+                guard.check_resources(current, initial=initial)
+        guard.check_resources(dataclasses.replace(HEALTHY, compressed_bytes=3*GIB))
+
+    def test_pressure_probe_accepts_only_known_dispatch_flags(self):
+        for raw in ["1\n", "2\n", "4\n"]:
+            with self.subTest(raw=raw), patch.object(guard.subprocess, "check_output",
+                                                    return_value=raw):
+                self.assertEqual(guard.read_pressure_level(), int(raw))
+        for raw in ["", "unknown", "0", "3", "8"]:
+            with self.subTest(raw=raw), patch.object(guard.subprocess, "check_output",
+                                                    return_value=raw):
+                with self.assertRaises(guard.ResourceLimitError):
+                    guard.read_pressure_level()
+
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp.cleanup)
@@ -46,9 +69,10 @@ class GuardTests(unittest.TestCase):
                 self.run_child(model_bytes=12*GIB)
         self.assertFalse(self.marker.exists())
 
-    def test_refuses_low_disk_and_compression(self):
+    def test_refuses_low_disk_and_non_normal_pressure(self):
         for changes, reason in [({"disk_free_bytes": 7*GIB}, "disk"),
-                                ({"compressed_bytes": 3*GIB}, "compress")]:
+                                *[({"pressure_level": level}, "pressure")
+                                  for level in [0, 2, 4, 8]]]:
             with self.subTest(reason=reason), patch.object(guard, "read_snapshot",
                     return_value=dataclasses.replace(HEALTHY, **changes)):
                 with self.assertRaisesRegex(guard.ResourceLimitError, reason):
@@ -60,7 +84,8 @@ class GuardTests(unittest.TestCase):
         # or READY event. A monitor failure must also stop the child.
         for failure in [dataclasses.replace(HEALTHY, available_bytes=5*GIB),
                         dataclasses.replace(HEALTHY, swapout_bytes=128*1024**2),
-                        dataclasses.replace(HEALTHY, compressed_bytes=GIB),
+                        dataclasses.replace(HEALTHY, pressure_level=2),
+                        dataclasses.replace(HEALTHY, pressure_level=4),
                         dataclasses.replace(HEALTHY, disk_free_bytes=3*GIB),
                         OSError("monitor unavailable")]:
             self.marker.unlink(missing_ok=True)
@@ -121,7 +146,7 @@ class GuardTests(unittest.TestCase):
         controller_code = """
 import pathlib, sys
 import benchmark_guard as guard
-guard.read_snapshot = lambda _: guard.Snapshot(24*guard.GIB, 0, 0, 32*guard.GIB)
+guard.read_snapshot = lambda _: guard.Snapshot(24*guard.GIB, 0, 0, 32*guard.GIB, 1)
 guard.run_guarded([sys.executable, '-c', sys.argv[3], sys.argv[1]],
                   cwd=pathlib.Path(sys.argv[1]).parent, timeout=5,
                   lock_path=pathlib.Path(sys.argv[2]), poll_seconds=.01)

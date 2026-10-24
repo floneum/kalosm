@@ -410,7 +410,9 @@ metadata. K must be a multiple of that format's block element count.
 use the original native blocks before any GPU layout conversion.
 
 `tools/benchmark_guard.py` bounds experiment startup and monitors memory,
-compression, swap, disk space, and timeout. A per-user lock prevents overlapping
+kernel memory pressure, swap, disk space, and timeout. Compression is recorded
+but does not imply exhaustion on its own. The macOS pressure probe must report
+normal; unavailable or unknown readings fail closed. A per-user lock prevents overlapping
 guarded runs across worktrees. It terminates and reaps only its own process group
 on failure, and never retries a resource abort automatically. Direct binary
 launches are not guarded. Do not run a build or another GPU experiment alongside

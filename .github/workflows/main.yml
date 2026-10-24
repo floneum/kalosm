@@ -62,6 +62,15 @@ env:
   FEATURES: kalosm/language,kalosm/llama,kalosm/bert,kalosm/structured,kalosm/fs-documents,kalosm/sound,kalosm/sound-denoise,kalosm/sound-source,kalosm/sound-voice-detection,kalosm/vision,kalosm/remote,kalosm/scrape,kalosm/surrealdb-local
 
 jobs:
+  benchmark-tools:
+    name: Benchmark tools
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v6
+      - name: Check resource guards and measurement validation
+        run: python3 -m unittest discover -s fusor/fusor-visualize/tools -p 'test_*.py'
+
   build:
     if: github.event.pull_request.draft == false
     name: Build

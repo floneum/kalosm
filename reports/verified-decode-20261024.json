@@ -1,0 +1,192 @@
+{
+  "metric": "actual-token decode latency",
+  "excluded_warmup_rounds": 1,
+  "rounds": 2,
+  "tokens": 1024,
+  "total_ms": 28482.90799999999,
+  "mean_ms": 27.81533984374999,
+  "p50_ms": 28.847624999999997,
+  "p95_ms": 31.460958999999995,
+  "max_ms": 57.885875000000006,
+  "slowest_tokens": [
+    {
+      "round": 2,
+      "token": 449,
+      "ms": 57.885875000000006
+    },
+    {
+      "round": 1,
+      "token": 449,
+      "ms": 56.532833
+    },
+    {
+      "round": 2,
+      "token": 480,
+      "ms": 33.271041000000004
+    },
+    {
+      "round": 2,
+      "token": 479,
+      "ms": 33.063917
+    },
+    {
+      "round": 2,
+      "token": 501,
+      "ms": 32.997459
+    }
+  ],
+  "tokens_per_second": 35.951385300967175,
+  "resource_summary": {
+    "elapsed_seconds": 87.37224079099542,
+    "minimum_headroom_gib": 7.9052886962890625,
+    "peak_rss_gib": 9.687942504882812,
+    "pressure_levels": [
+      1
+    ],
+    "added_swapout_bytes": 0,
+    "peak_compressed_gib": 4.8804931640625,
+    "end_event": "complete"
+  },
+  "runtime_source": "a0d355d317570ff636f836ab9902b53726f37921",
+  "binary_sha256": "fb405201495b7a5243dc29a149ee2ef4049b36583eb3843ca7c95a93672e83d3",
+  "model": "Meta-Llama-3.1-8B-Instruct-Q4_K_M.gguf",
+  "model_bytes": 4920739168,
+  "backend": "WebGPU",
+  "hardware": "Apple M2 Max, 32 GiB",
+  "prompt": "Write a detailed numbered list of 100 practical Rust performance tips. Keep going until the list is complete.",
+  "seed": 0,
+  "warmup_tokens_per_round": 8,
+  "tokens_per_round": 512,
+  "total_rounds": 3,
+  "all_rounds_have_identical_token_ids": true,
+  "per_round": [
+    {
+      "rounds": 1,
+      "tokens": 512,
+      "total_ms": 13735.153041999984,
+      "mean_ms": 26.826470785156218,
+      "p50_ms": 25.380625000000002,
+      "p95_ms": 30.933374999999998,
+      "max_ms": 58.609792,
+      "slowest_tokens": [
+        {
+          "round": 0,
+          "token": 449,
+          "ms": 58.609792
+        },
+        {
+          "round": 0,
+          "token": 504,
+          "ms": 31.919666
+        },
+        {
+          "round": 0,
+          "token": 503,
+          "ms": 31.649584
+        },
+        {
+          "round": 0,
+          "token": 496,
+          "ms": 31.601875
+        },
+        {
+          "round": 0,
+          "token": 481,
+          "ms": 31.523042
+        }
+      ],
+      "tokens_per_second": 37.27661413268442
+    },
+    {
+      "rounds": 1,
+      "tokens": 512,
+      "total_ms": 14135.496459000005,
+      "mean_ms": 27.608391521484386,
+      "p50_ms": 28.211125,
+      "p95_ms": 31.273459000000003,
+      "max_ms": 56.532833,
+      "slowest_tokens": [
+        {
+          "round": 1,
+          "token": 449,
+          "ms": 56.532833
+        },
+        {
+          "round": 1,
+          "token": 472,
+          "ms": 32.802875
+        },
+        {
+          "round": 1,
+          "token": 475,
+          "ms": 32.586375000000004
+        },
+        {
+          "round": 1,
+          "token": 479,
+          "ms": 32.370709
+        },
+        {
+          "round": 1,
+          "token": 508,
+          "ms": 32.005292
+        }
+      ],
+      "tokens_per_second": 36.22087144127237
+    },
+    {
+      "rounds": 1,
+      "tokens": 512,
+      "total_ms": 14347.41154100001,
+      "mean_ms": 28.022288166015645,
+      "p50_ms": 29.329209,
+      "p95_ms": 31.981999999999996,
+      "max_ms": 57.885875000000006,
+      "slowest_tokens": [
+        {
+          "round": 2,
+          "token": 449,
+          "ms": 57.885875000000006
+        },
+        {
+          "round": 2,
+          "token": 480,
+          "ms": 33.271041000000004
+        },
+        {
+          "round": 2,
+          "token": 479,
+          "ms": 33.063917
+        },
+        {
+          "round": 2,
+          "token": 501,
+          "ms": 32.997459
+        },
+        {
+          "round": 2,
+          "token": 478,
+          "ms": 32.8945
+        }
+      ],
+      "tokens_per_second": 35.68587954258359
+    }
+  ],
+  "guard": {
+    "guard_sha256": "59557de846899460a06edd0ba6fd024422cbff980088e88ce1fa092126fe545f",
+    "guard_regression_tests_passed": 14,
+    "pressure_values": {
+      "normal": 1,
+      "warning": 2,
+      "critical": 4
+    },
+    "headroom_and_swap_limits_changed": false,
+    "compression_recorded_as_telemetry": true
+  },
+  "evidence_sha256": {
+    "decode.log": "28c8f04e97e706f80fa943b623244200f7fa638f2e89ef31a0d4474ad7097cb0",
+    "resources.jsonl": "d93b8a70db2aceb2a15a9604ca3ee30ba60c05fe00055a49b81816fa694db8a3",
+    "provenance.json": "90f2a85ec11ea4f4b0ce90c040aaf6ea9ad47677d83ba92f42e958bbc6aa264a"
+  },
+  "goal_met": false
+}

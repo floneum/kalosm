@@ -36,6 +36,20 @@ class Snapshot:
     compressed_bytes: int
     swapout_bytes: int
     disk_free_bytes: int
+    pressure_level: int
+
+
+def read_pressure_level():
+    # XNU's sysctl returns dispatch flags, not the internal pressure enum:
+    # NORMAL=1, WARN=2, CRITICAL=4. See kern_memorystatus_notify.c's
+    # sysctl_memorystatus_vm_pressure_level. This private read-only interface
+    # may be unavailable on another OS version; refuse rather than guessing.
+    raw = subprocess.check_output(
+        ["/usr/sbin/sysctl", "-n", "kern.memorystatus_vm_pressure_level"],
+        text=True, timeout=2).strip()
+    if raw not in {"1", "2", "4"}:
+        raise ResourceLimitError("cannot parse macOS memory pressure level")
+    return int(raw)
 
 
 def read_snapshot(directory):
@@ -56,6 +70,7 @@ def read_snapshot(directory):
         compressed_bytes=pages["Pages occupied by compressor"] * page_bytes,
         swapout_bytes=pages["Swapouts"] * page_bytes,
         disk_free_bytes=shutil.disk_usage(directory).free,
+        pressure_level=read_pressure_level(),
     )
 
 
@@ -72,11 +87,12 @@ def check_resources(current, *, initial=None, model_bytes=0):
     if current.disk_free_bytes < disk_floor:
         raise ResourceLimitError(
             f"disk headroom {current.disk_free_bytes/GIB:.2f} GiB < {disk_floor/GIB:.0f} GiB")
-    if current.compressed_bytes > 2*GIB:
-        raise ResourceLimitError("compressor exceeds 2 GiB; leave memory for user applications")
+    # Compression can rise while macOS has ample reclaimable memory and no
+    # pressure. Record it for analysis, but use the kernel's actual pressure
+    # state plus headroom and swap growth to decide whether to stop.
+    if current.pressure_level != 1:
+        raise ResourceLimitError(f"macOS memory pressure is not normal: {current.pressure_level}")
     if initial is not None:
-        if current.compressed_bytes - initial.compressed_bytes > GIB//2:
-            raise ResourceLimitError("compressor grew by more than 512 MiB during benchmark")
         if current.swapout_bytes - initial.swapout_bytes > 64*1024**2:
             raise ResourceLimitError("swapouts grew by more than 64 MiB during benchmark")
 
