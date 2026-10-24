@@ -18,7 +18,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: 0b78aae107a7f7e80c1c11ad6424d65f3c40fe82
+          ref: 5042b40cedf47d2d4031160c5589650642002af9
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
@@ -27,8 +27,9 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             fusor/target
-          key: attention-factor-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
+          key: grouped-load-projection-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
           restore-keys: |
+            grouped-load-projection-${{ runner.os }}-
             attention-shapes-${{ runner.os }}-
             grouped-load-${{ runner.os }}-
       - name: Isolate attention from the independent expression experiment
