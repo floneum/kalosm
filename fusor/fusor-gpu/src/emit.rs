@@ -775,6 +775,91 @@ mod tests {
     }
 
     #[test]
+    fn expression_schedule_finishes_nested_fma_before_loading_outer_operands() {
+        let target = crate::target::GpuTarget::new_blocking().expect("GPU adapter");
+        let b = Kernel::new();
+        let ty = ScalarElement::U32.element();
+        let input = buffer(0, ty, 8, BufferAccess::Read);
+        let output = buffer(1, ty, 1, BufferAccess::ReadWrite);
+        let load = |index| {
+            b.cast(
+                b.load(
+                    Source::Storage(input.clone()),
+                    Addr::Linear(b.u32(index)),
+                    b.bool(true),
+                    b.u32(0),
+                ),
+                ScalarElement::F32.element(),
+            )
+        };
+        let value = b.fma(load(0), load(1), b.fma(load(2), load(3), load(4)));
+        let ir = KernelIr {
+            buffers: vec![input.buffer, output.buffer.clone()],
+            grid: [1, 1, 1],
+            block: 1,
+            body: vec![Stmt::Store {
+                dst: output,
+                addr: Addr::Linear(b.u32(0)),
+                value: b.bitcast(value, ty),
+                mask: b.bool(true),
+            }],
+            byte_arena: None,
+            name: "expression_schedule",
+        };
+        let emitted = emit(&ir, target.caps()).unwrap();
+        let expressions = &emitted.module.entry_points[0].function.expressions;
+        let first_fma = expressions
+            .iter()
+            .find_map(|(h, e)| {
+                matches!(
+                    e,
+                    naga::Expression::Math {
+                        fun: naga::MathFunction::Fma,
+                        ..
+                    }
+                )
+                .then_some(h.index())
+            })
+            .unwrap();
+        let outer_load = expressions
+            .iter()
+            .find_map(|(h, e)| {
+                let naga::Expression::Load { pointer } = e else {
+                    return None;
+                };
+                let naga::Expression::Access { index, .. } = expressions[*pointer] else {
+                    return None;
+                };
+                matches!(
+                    expressions[index],
+                    naga::Expression::Literal(naga::Literal::U32(0))
+                )
+                .then_some(h.index())
+            })
+            .unwrap();
+        assert!(
+            first_fma < outer_load,
+            "outer operands stay live across the nested multiply-add"
+        );
+        let fmas = expressions
+            .iter()
+            .filter(|(_, e)| {
+                matches!(
+                    e,
+                    naga::Expression::Math {
+                        fun: naga::MathFunction::Fma,
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(
+            fmas, 2,
+            "scheduling must preserve both arithmetic operations"
+        );
+    }
+
+    #[test]
     fn loop_updates_keep_the_old_values_for_cross_dependencies() {
         let Ok(target) = crate::target::GpuTarget::new_blocking() else {
             eprintln!("no GPU adapter; skipping");
