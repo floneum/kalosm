@@ -1,0 +1,95 @@
+name: Materialized expression checks
+on:
+  push:
+    branches: [codex/materialized-expression-checks]
+permissions:
+  contents: read
+jobs:
+  diagnose:
+    runs-on: macos-latest
+    timeout-minutes: 25
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_OPT_LEVEL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      FUSOR_AUTOTUNE_MIN_MACS: '18446744073709551615'
+      FUSOR_COMPILE_THREADS: '1'
+      LAB_QLAYOUT: native
+      LAB_VALIDATE_ONLY: '1'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 293d44eac
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fusor/target
+          key: grouped-load-projection-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
+          restore-keys: |
+            grouped-load-${{ runner.os }}-
+            attention-shapes-${{ runner.os }}-
+            attention-partition-${{ runner.os }}-
+      - name: Exercise actual projection address expressions
+        run: FUSOR_PIN_CONTRACT_FAMILY=sgemv FUSOR_PIN_SGEMV=32,2,4,4,32 cargo run --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer --example qmatmul_lab -- 1 4096 4096 q4k 3
+      - name: Integer index proofs
+        run: cargo test --locked --manifest-path fusor/Cargo.toml -p fusor-ir --test known_index_bits
+      - name: Expression scheduling tests
+        run: |
+          cargo test --locked --manifest-path fusor/Cargo.toml -p fusor-gpu --lib -- --test-threads=1
+      - name: Shared GPU correctness and lint
+        run: |
+          cargo test --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer,compiler-tests --test shared_compiler -- --ignored --test-threads=1
+          cargo clippy --locked --manifest-path fusor/Cargo.toml --workspace --all-targets --features fusor/kernel-observer,fusor/compiler-tests -- -D warnings
+      - name: Build current projection fixture
+        shell: bash
+        run: |
+          mkdir artifacts
+          rustc -Vv > artifacts/provenance.txt
+          git rev-parse HEAD >> artifacts/provenance.txt
+          cargo build --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer --example qmatmul_lab
+          cp fusor/target/debug/examples/qmatmul_lab artifacts/qmatmul-candidate
+          shasum -a 256 artifacts/qmatmul-candidate >> artifacts/provenance.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: materialized-expression-fixtures
+          path: artifacts
+          retention-days: 7
+  red:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_OPT_LEVEL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: e9771cd82
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            fusor/target
+          key: materialized-expression-red-${{ runner.os }}-${{ hashFiles('fusor/Cargo.lock') }}
+          restore-keys: |
+            grouped-load-projection-${{ runner.os }}-
+            grouped-load-${{ runner.os }}-
+      - name: Require the prior emitter to inline the scheduled result
+        shell: bash
+        run: |
+          set +e
+          cargo test --locked --manifest-path fusor/Cargo.toml -p fusor-gpu --lib expression_schedule_finishes_nested_fma_before_loading_outer_operands > red.log 2>&1
+          code=$?
+          set -e
+          cat red.log
+          test "$code" = 101
+          grep -F "scheduled result is inlined again, extending its operands' lifetimes" red.log
