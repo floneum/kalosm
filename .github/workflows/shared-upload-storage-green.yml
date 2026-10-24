@@ -17,7 +17,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: 84025c02fc2c9a569063895dda87d51504870526
+          ref: a0d355d317570ff636f836ab9902b53726f37921
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
@@ -37,7 +37,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: 84025c02fc2c9a569063895dda87d51504870526
+          ref: a0d355d317570ff636f836ab9902b53726f37921
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
@@ -53,7 +53,8 @@ jobs:
       - name: Check immutable storage, rebinding, preparation, and compiler conformance
         run: |
           cargo fmt --manifest-path fusor/Cargo.toml --all -- --check
-          cargo test --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer,compiler-tests --lib immutable_word_storage -- --test-threads=1
+          cargo test --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer,compiler-tests --lib -- --test-threads=1
+          cargo test --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer,compiler-tests --test shared_compiler -- --ignored --test-threads=1
           cargo clippy --locked --manifest-path fusor/Cargo.toml --workspace --all-targets --features fusor/kernel-observer,fusor/compiler-tests -- -D warnings
   release:
     needs: [cpu, gpu]
@@ -64,7 +65,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: 84025c02fc2c9a569063895dda87d51504870526
+          ref: a0d355d317570ff636f836ab9902b53726f37921
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache@v4
@@ -75,6 +76,7 @@ jobs:
             model-release-target
           key: immutable-upload-model-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
+            immutable-upload-model-${{ runner.os }}-
             upload-reclaim-model-${{ runner.os }}-
             workgroup-model-${{ runner.os }}-
       - name: Build default release
@@ -91,6 +93,11 @@ jobs:
           cargo build --locked -j 1 -p kalosm-llama --example profile_forward --release --target aarch64-apple-darwin
           cp "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/examples/profile_forward" artifacts/profile-forward-storage
           shasum -a 256 artifacts/profile-forward-storage >> artifacts/provenance.txt
+          echo 'cargo build --locked -j 1 -p kalosm --example chat --features llama --release --target aarch64-apple-darwin' >> artifacts/provenance.txt
+          shasum -a 256 interfaces/kalosm/examples/chat.rs >> artifacts/provenance.txt
+          cargo build --locked -j 1 -p kalosm --example chat --features llama --release --target aarch64-apple-darwin
+          cp "$CARGO_TARGET_DIR/aarch64-apple-darwin/release/examples/chat" artifacts/chat-storage
+          shasum -a 256 artifacts/chat-storage >> artifacts/provenance.txt
       - uses: actions/upload-artifact@v4
         with:
           name: immutable-upload-default-release
