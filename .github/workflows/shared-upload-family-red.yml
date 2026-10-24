@@ -1,0 +1,43 @@
+name: Immutable storage family restore regression
+on:
+  push:
+    branches: [codex/shared-upload-family-red]
+permissions:
+  contents: read
+jobs:
+  red:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      CARGO_BUILD_JOBS: 1
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_OPT_LEVEL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: 60f76758819430d0958569dcda89af855aad004f
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: fusor -> target
+          shared-key: upload-reclaim-host
+      - name: Reproduce stale upload provenance after family restore
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir artifacts
+          if cargo test --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features cpu --lib immutable_word_storage_family_cpu -- --test-threads=1 > artifacts/red.log 2>&1; then
+            cat artifacts/red.log
+            echo 'family binding regression unexpectedly passed'
+            exit 1
+          fi
+          cat artifacts/red.log
+          grep -q 'family restore retained provenance for a different buffer' artifacts/red.log
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: immutable-upload-family-red
+          path: artifacts
+          retention-days: 7
