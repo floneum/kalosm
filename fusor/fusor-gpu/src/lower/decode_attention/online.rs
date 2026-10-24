@@ -2,6 +2,7 @@
 //! Each subgroup publishes all channel and statistic values before the sole barrier.
 //! Empty key partitions publish zero numerator/denominator and a finite floor.
 use super::*;
+use fusor_ir::ir::kernel::TileExpr;
 
 pub(super) fn lower(ctx: Ctx<'_>, op: &Launch) -> Result<KernelIr> {
     let Launch::DecodeAttention {
