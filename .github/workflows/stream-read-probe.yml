@@ -16,7 +16,7 @@ jobs:
     steps:
       - uses: actions/checkout@v6
         with:
-          ref: 6e9492f0cab9abdab02a08937966d9882cd4a86b
+          ref: 390960c9d3fa32894e16f2abafade079e386b951
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
       - uses: actions/cache/restore@v4
