@@ -39,7 +39,8 @@ jobs:
       - name: Integer index proofs
         run: cargo test --locked --manifest-path fusor/Cargo.toml -p fusor-ir --test known_index_bits
       - name: Expression scheduling tests
-        run: cargo test --locked --manifest-path fusor/Cargo.toml -p fusor-gpu --lib emit:: -- --test-threads=1
+        run: |
+          cargo test --locked --manifest-path fusor/Cargo.toml -p fusor-gpu --lib emit:: -- --test-threads=1
       - name: Shared GPU correctness and lint
         run: |
           cargo test --locked --manifest-path fusor/Cargo.toml -p fusor --no-default-features --features gpu,kernel-observer,compiler-tests --test shared_compiler -- --ignored --test-threads=1
