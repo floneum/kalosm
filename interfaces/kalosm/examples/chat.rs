@@ -1,4 +1,10 @@
-// cargo run -j 1 -p kalosm --example chat --features llama --release
+// KALOSM_TRACE_DECODE_TIMING=1 \
+// FUSOR_TRACE_DECODE=1 \
+// KALOSM_LLAMA_GPU_SAMPLE_TOKEN=1 \
+// KALOSM_LLAMA_GPU_FUSED_LOGITS=1 \
+// KALOSM_LLAMA_GPU_SAMPLE_TOP_K=128 \
+// KALOSM_LLAMA_SAMPLER=standard \
+// cargo run -p kalosm --example chat --features llama --release
 use kalosm::language::*;
 use std::io::{BufWriter, Write};
 use std::time::Duration;
@@ -21,16 +27,16 @@ fn main() {
             let mut stdout = BufWriter::with_capacity(8192, stdout.lock());
             let mut last_flush = Instant::now();
             // Time between the first and last streamed chunks. This excludes
-            // prefill latency and task cleanup. A text chunk can contain
-            // multiple tokens, so this display reports chunks, not token rate.
+            // prefill latency before the first token and any task-cleanup work
+            // after the last token, isolating steady-state generation.
             let mut first: Option<Instant> = None;
             let mut last: Option<Instant> = None;
-            let mut chunks: usize = 0;
+            let mut tokens: usize = 0;
             while let Some(chunk) = response.next().await {
                 let now = Instant::now();
                 first.get_or_insert(now);
                 last = Some(now);
-                chunks += 1;
+                tokens += 1;
                 stdout.write_all(chunk.as_bytes()).unwrap();
                 if last_flush.elapsed() >= Duration::from_millis(50) {
                     stdout.flush().unwrap();
@@ -40,13 +46,13 @@ fn main() {
             stdout.flush().unwrap();
             if let (Some(first), Some(last)) = (first, last) {
                 let elapsed = (last - first).as_secs_f64();
-                // chunks-1 inter-chunk gaps fit inside `elapsed`.
-                let rate = if elapsed > 0.0 && chunks > 1 {
-                    (chunks - 1) as f64 / elapsed
+                // tokens-1 inter-token gaps fit inside `elapsed`.
+                let rate = if elapsed > 0.0 && tokens > 1 {
+                    (tokens - 1) as f64 / elapsed
                 } else {
                     0.0
                 };
-                println!("\n[{chunks} text chunks in {elapsed:.2}s — {rate:.2} chunks/s]");
+                println!("\n[{tokens} tokens in {elapsed:.2}s — {rate:.2} tok/s]");
             }
         }
     });
