@@ -124,12 +124,34 @@ pub(crate) fn run(spec: &ContractSpec, bufs: &[RawBuf]) -> Result<()> {
                 // SAFETY: the reach of every operand was checked against its
                 // binding above; a materialized side is exactly its dense size.
                 unsafe {
+                    let a_ptr = a_ptr.add(index * a_strides[0] as usize);
+                    let b_ptr = b_ptr.add(index * b_strides[0] as usize);
+                    // Reorient equivalent contiguous vectors to share the vectorized/BLAS reduction order,
+                    // avoiding scalar row dots; the single output row/column remains contiguous.
+                    let (dims, a_ptr, a_strides, b_ptr, b_strides) =
+                        if m == 1 && n > 1 && a_strides[2] == 1 && b_strides[1] == 1 {
+                            (
+                                [n, 1, k],
+                                b_ptr,
+                                [b_strides[2] as usize, b_strides[1] as usize],
+                                a_ptr,
+                                [a_strides[2] as usize, a_strides[1] as usize],
+                            )
+                        } else {
+                            (
+                                [m, n, k],
+                                a_ptr,
+                                [a_strides[1] as usize, a_strides[2] as usize],
+                                b_ptr,
+                                [b_strides[1] as usize, b_strides[2] as usize],
+                            )
+                        };
                     sgemm(
-                        [m, n, k],
-                        a_ptr.add(index * a_strides[0] as usize),
-                        [a_strides[1] as usize, a_strides[2] as usize],
-                        b_ptr.add(index * b_strides[0] as usize),
-                        [b_strides[1] as usize, b_strides[2] as usize],
+                        dims,
+                        a_ptr,
+                        a_strides,
+                        b_ptr,
+                        b_strides,
                         (out.ptr as *mut f32).add(index * m * n),
                     );
                 }
@@ -562,6 +584,8 @@ fn axpy(scale: f32, x: &[f32], y: &mut [f32]) {
 #[cfg(test)]
 mod portable_tests {
     use super::*;
+    use crate::slices::SliceOp;
+    use fusor_ir::scalar::BinOp;
 
     #[test]
     #[ignore]
@@ -671,6 +695,194 @@ mod portable_tests {
                     );
                 }
             }
+        }
+    }
+
+    fn assert_row_vector_case(
+        batch: usize,
+        n: usize,
+        k: usize,
+        broadcast_a: bool,
+        broadcast_b: bool,
+        transform_a: bool,
+    ) {
+        let a_batch_stride = if broadcast_a { 0 } else { k + 7 };
+        let b_row_stride = k + 5;
+        let b_batch_stride = if broadcast_b { 0 } else { n * b_row_stride + 3 };
+        let mut a = vec![0.0f32; (batch - 1) * a_batch_stride + k];
+        let mut b = vec![0.0f32; (batch - 1) * b_batch_stride + (n - 1) * b_row_stride + k];
+        for bi in 0..if broadcast_a { 1 } else { batch } {
+            let scale = if bi % 2 == 0 { 1.0 } else { -0.5 };
+            for i in 0..k {
+                a[bi * a_batch_stride + i] = scale;
+            }
+        }
+        for bi in 0..if broadcast_b { 1 } else { batch } {
+            for j in 0..n {
+                for i in 0..k {
+                    b[bi * b_batch_stride + j * b_row_stride + i] = match (i + j + bi) % 4 {
+                        0 => 1.0e-3,
+                        1 => 1.0e-10,
+                        2 => -1.0e-3,
+                        _ => 1.0e-10,
+                    };
+                }
+            }
+        }
+        let mut out = vec![0.0f32; batch * n];
+        let raw = |values: &[f32]| RawBuf {
+            ptr: values.as_ptr() as *mut u8,
+            bytes: std::mem::size_of_val(values),
+        };
+        let mut spec = ContractSpec {
+            m: 1,
+            n: n as u32,
+            k: k as u32,
+            batch: batch as u32,
+            out: 2,
+            a: 0,
+            a_strides: [a_batch_stride as u32, 0, 1],
+            bias: None,
+            b: 1,
+            b_strides: [b_batch_stride as u32, 1, b_row_stride as u32],
+            pre_a: Vec::new(),
+            pre_b: Vec::new(),
+            post: Vec::new(),
+        };
+        if transform_a {
+            spec.pre_a = vec![
+                SliceOp::Arg(0),
+                SliceOp::Const(2.0),
+                SliceOp::Bin(BinOp::Mul),
+            ];
+        }
+        let bufs = [
+            raw(&a),
+            raw(&b),
+            RawBuf {
+                ptr: out.as_mut_ptr().cast(),
+                bytes: std::mem::size_of_val(out.as_slice()),
+            },
+        ];
+        run(&spec, &bufs).unwrap();
+
+        let mut column = vec![0.0f32; batch * n];
+        for bi in 0..batch {
+            let a_bi = if broadcast_a { 0 } else { bi };
+            let b_bi = if broadcast_b { 0 } else { bi };
+            let input: Vec<f32> = (0..k)
+                .map(|i| {
+                    let value = a[a_bi * a_batch_stride + i];
+                    if transform_a { value * 2.0 } else { value }
+                })
+                .collect();
+            let weights = unsafe { b.as_ptr().add(b_bi * b_batch_stride) };
+            unsafe {
+                sgemm(
+                    [n, 1, k],
+                    weights,
+                    [b_row_stride, 1],
+                    input.as_ptr(),
+                    [1, 1],
+                    column.as_mut_ptr().add(bi * n),
+                );
+            }
+            for j in 0..n {
+                let mut reference = 0.0f64;
+                let mut sum_abs = 0.0f64;
+                for i in 0..k {
+                    let product = f64::from(input[i])
+                        * f64::from(b[b_bi * b_batch_stride + j * b_row_stride + i]);
+                    reference += product;
+                    sum_abs += product.abs();
+                }
+                let error = (f64::from(out[bi * n + j]) - reference).abs();
+                let tolerance = 5.0e-8 * sum_abs + 1.0e-12;
+                assert!(
+                    error <= tolerance,
+                    "f64 reference mismatch for batch {bi}, column {j}: error={error:e}, tolerance={tolerance:e}"
+                );
+                assert_eq!(
+                    out[bi * n + j].to_bits(),
+                    column[bi * n + j].to_bits(),
+                    "row/column GEMM mismatch for [{n}, {k}], batch {bi}, column {j}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn row_vector_matches_column_matvec_for_cancellation_sensitive_sizes() {
+        assert_row_vector_case(1, 32, 512, false, false, false);
+        assert_row_vector_case(1, 64, 512, false, false, false);
+        assert_row_vector_case(1, 64, 512, false, false, true);
+    }
+
+    #[test]
+    fn row_vector_supports_tails_padding_batches_broadcast_and_transforms() {
+        assert_row_vector_case(2, 5, 19, false, false, true);
+        assert_row_vector_case(2, 4, 37, true, false, false);
+        assert_row_vector_case(2, 6, 23, false, true, false);
+    }
+
+    #[test]
+    fn row_major_rhs_keeps_the_sparse_accumulator_contraction_layout() {
+        let (n, k) = (65usize, 832usize);
+        let mut a = vec![0.0f32; k];
+        a[7] = 1.0;
+        a[126] = -0.5;
+        a[700] = 0.25;
+        let b: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 11) as i32 - 5) as f32 / 4096.0)
+            .collect();
+        let mut out = vec![0.0f32; n];
+        let raw = |values: &[f32]| RawBuf {
+            ptr: values.as_ptr() as *mut u8,
+            bytes: std::mem::size_of_val(values),
+        };
+        let spec = ContractSpec {
+            m: 1,
+            n: n as u32,
+            k: k as u32,
+            batch: 1,
+            out: 2,
+            a: 0,
+            a_strides: [0, 0, 1],
+            bias: None,
+            b: 1,
+            b_strides: [0, n as u32, 1],
+            pre_a: Vec::new(),
+            pre_b: Vec::new(),
+            post: Vec::new(),
+        };
+        let bufs = [
+            raw(&a),
+            raw(&b),
+            RawBuf {
+                ptr: out.as_mut_ptr().cast(),
+                bytes: std::mem::size_of_val(out.as_slice()),
+            },
+        ];
+        run(&spec, &bufs).unwrap();
+
+        let mut reference_out = vec![0.0f32; n];
+        unsafe {
+            sgemm(
+                [1, n, k],
+                a.as_ptr(),
+                [0, 1],
+                b.as_ptr(),
+                [n, 1],
+                reference_out.as_mut_ptr(),
+            );
+        }
+        for j in 0..n {
+            assert_eq!(out[j].to_bits(), reference_out[j].to_bits());
+            let mut reference = 0.0f64;
+            for i in 0..k {
+                reference += f64::from(a[i]) * f64::from(b[i * n + j]);
+            }
+            assert_eq!(f64::from(out[j]), reference, "column {j}");
         }
     }
 }
