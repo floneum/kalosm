@@ -160,8 +160,21 @@ jobs:
           # (`list` extracts without running anything).
           cargo nextest list --archive-file root-tests.tar.zst --workspace-remap . --extract-to . > /dev/null
           cargo nextest list --archive-file fusor-tests.tar.zst --workspace-remap fusor --extract-to fusor > /dev/null
-          cp warp/d3d10warp.dll dxc/dxcompiler.dll dxc/dxil.dll target/ci/deps/
-          cp warp/d3d10warp.dll dxc/dxcompiler.dll dxc/dxil.dll fusor/target/ci/deps/
+          for workspace_target in target fusor/target; do
+            if [[ ! -d "$workspace_target" ]]; then
+              echo "nextest did not extract $workspace_target" >&2
+              exit 1
+            fi
+            test_dirs=$(find "$workspace_target" -type f -name '*.exe' -exec dirname {} \; | sort -u)
+            if [[ -z "$test_dirs" ]]; then
+              echo "no extracted test executables found under $workspace_target" >&2
+              exit 1
+            fi
+            while IFS= read -r test_dir; do
+              printf 'Staging WARP/DXC DLLs beside test executables in %s\n' "$test_dir"
+              cp warp/d3d10warp.dll dxc/dxcompiler.dll dxc/dxil.dll "$test_dir/"
+            done <<< "$test_dirs"
+          done
           cargo nextest run --archive-file fusor-tests.tar.zst --workspace-remap fusor --extract-to fusor --extract-overwrite \
             --run-ignored only --test-threads 1 -E 'binary(shared_compiler)'
           # WARP/DX12 tests share one software adapter inside each binary;
