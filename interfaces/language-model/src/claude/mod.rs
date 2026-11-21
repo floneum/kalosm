@@ -13,6 +13,17 @@ pub struct AnthropicCompatibleClient {
     api_key: Option<String>,
     resolved_api_key: OnceLock<String>,
     version: String,
+    #[cfg(feature = "resilience")]
+    pub(crate) resilience: Option<Resilience>,
+}
+
+/// Retry policy for overloaded responses, enabled with the `resilience` feature.
+#[cfg(feature = "resilience")]
+#[derive(Debug, Clone)]
+pub(crate) struct Resilience {
+    pub(crate) breaker: llm_resilience::CircuitBreaker,
+    pub(crate) spend: llm_resilience::RetrySpend,
+    pub(crate) call_usd: f64,
 }
 
 impl Default for AnthropicCompatibleClient {
@@ -30,6 +41,8 @@ impl AnthropicCompatibleClient {
             resolved_api_key: OnceLock::new(),
             api_key: None,
             version: "2023-06-01".to_string(),
+            #[cfg(feature = "resilience")]
+            resilience: None,
         }
     }
 
@@ -58,6 +71,25 @@ impl AnthropicCompatibleClient {
     /// Set the reqwest client for the builder.
     pub fn with_reqwest_client(mut self, client: reqwest::Client) -> Self {
         self.reqwest_client = client;
+        self
+    }
+
+    /// Retry 429, 529 and other transient statuses before any token is streamed.
+    ///
+    /// Each retry is booked against `spend` at `call_usd`, so retries are capped in
+    /// dollars, and `breaker` fails calls fast while the API keeps failing.
+    #[cfg(feature = "resilience")]
+    pub fn with_resilience(
+        mut self,
+        breaker: llm_resilience::CircuitBreaker,
+        spend: llm_resilience::RetrySpend,
+        call_usd: f64,
+    ) -> Self {
+        self.resilience = Some(Resilience {
+            breaker,
+            spend,
+            call_usd,
+        });
         self
     }
 
