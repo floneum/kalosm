@@ -1156,8 +1156,14 @@ fn fold_view_sinking_projects_only_unit_axes() {
             2,
             [15, 5, 0]
         ),
-        reject!("equal-count mismatch", b, s, mismatched),
-        runtime!("runtime bounds", runtime_base, dynamic_specs, t),
+        reject!("equal-count mismatch", b.clone(), s.clone(), mismatched),
+        runtime!(
+            "constant base runtime bounds",
+            b.clone(),
+            s.clone(),
+            t.clone()
+        ),
+        runtime!("symbolic runtime bounds", runtime_base, dynamic_specs, t),
     ];
 
     for (name, base_shape, specs, target, bounds, expected) in cases {
