@@ -464,6 +464,132 @@ fn ordinary_attention_replays_across_cache_growth() {
 
 #[test]
 #[ignore = "requires a live WebGPU device"]
+fn generic_grouped_folds_replay_across_symbolic_cache_growth() {
+    use fusor::cache::KvCache;
+
+    let device = pollster::block_on(Device::gpu()).unwrap();
+    let target = device.backend().gpu_target().unwrap();
+    let dispatches = Arc::new(Mutex::new(Vec::new()));
+    let observed = dispatches.clone();
+    target.set_plan_observer(Some(Arc::new(move |_, _, _, _, commands| {
+        observed
+            .lock()
+            .unwrap()
+            .extend(commands.iter().filter_map(|command| match command {
+                fusor_gpu::launch::CommandRecord::Dispatch { name, .. } => Some(name.to_string()),
+                _ => None,
+            }));
+    })));
+
+    let (batch, heads, width) = (2, 2, 64);
+    let initial_k = data(batch * heads * 255 * width, 31);
+    let initial_v = data(initial_k.len(), 32);
+    let mut k_rows: Vec<Vec<f32>> = initial_k.chunks(255 * width).map(<[f32]>::to_vec).collect();
+    let mut v_rows: Vec<Vec<f32>> = initial_v.chunks(255 * width).map(<[f32]>::to_vec).collect();
+    let mut cache = KvCache::with_capacity(2, 256);
+    cache.append(
+        &Tensor::from_slice(&device, [batch, heads, 255, width], &initial_k),
+        &Tensor::from_slice(&device, [batch, heads, 255, width], &initial_v),
+    );
+    cache.detach();
+    let k_input = Tensor::from_slice(
+        &device,
+        [batch, heads, 1, width],
+        &vec![0.; batch * heads * width],
+    );
+    let v_input = Tensor::from_slice(
+        &device,
+        [batch, heads, 1, width],
+        &vec![0.; batch * heads * width],
+    );
+    let mut outputs = None;
+    let mut warm_compiles = 0;
+
+    for step in 0..2 {
+        KvCache::reserve_all(std::slice::from_mut(&mut cache), 1).unwrap();
+        let k = data(batch * heads * width, 41 + step);
+        let v = data(k.len(), 43 + step);
+        k_input.set_elements(&k);
+        v_input.set_elements(&v);
+        for row in 0..batch * heads {
+            k_rows[row].extend_from_slice(&k[row * width..(row + 1) * width]);
+            v_rows[row].extend_from_slice(&v[row * width..(row + 1) * width]);
+        }
+        if step == 0 {
+            cache.append(&k_input, &v_input);
+            outputs = Some((
+                cache.k().unwrap().sum::<3>(3).as_dyn().clone(),
+                cache.v().unwrap().sum::<3>(3).as_dyn().clone(),
+            ));
+        } else {
+            assert!(cache.can_replay(1));
+            cache.replay_append(1).unwrap();
+        }
+
+        let (k_output, v_output) = outputs.as_ref().unwrap();
+        k_output.clear_device_buf();
+        v_output.clear_device_buf();
+        let values = [k_output.clone(), v_output.clone()];
+        KvCache::resolve_and_commit_all(
+            device.session(),
+            std::slice::from_mut(&mut cache),
+            &values,
+        )
+        .unwrap();
+
+        let expected_k: Vec<_> = k_rows
+            .iter()
+            .flat_map(|row| {
+                row.chunks_exact(width)
+                    .map(|token| token.iter().sum::<f32>())
+            })
+            .collect();
+        let expected_v: Vec<_> = v_rows
+            .iter()
+            .flat_map(|row| {
+                row.chunks_exact(width)
+                    .map(|token| token.iter().sum::<f32>())
+            })
+            .collect();
+        close(
+            &k_output
+                .narrow(2, 0, 256 + step)
+                .unwrap()
+                .to_vec_f32()
+                .unwrap(),
+            &expected_k,
+            1e-5,
+        );
+        close(
+            &v_output
+                .narrow(2, 0, 256 + step)
+                .unwrap()
+                .to_vec_f32()
+                .unwrap(),
+            &expected_v,
+            1e-5,
+        );
+
+        if step == 0 {
+            warm_compiles = target.launcher().pipeline_compiles();
+        } else {
+            assert_eq!(
+                target.launcher().pipeline_compiles(),
+                warm_compiles,
+                "generic grouped cache growth compiled new shaders"
+            );
+        }
+    }
+
+    let dispatches = dispatches.lock().unwrap();
+    assert!(
+        dispatches.iter().any(|name| name == "kgroup"),
+        "no executed plan dispatched LaunchGroup: {dispatches:?}"
+    );
+}
+
+#[test]
+#[ignore = "requires a live WebGPU device"]
 fn full_size_views_replay_their_producer() {
     let device = pollster::block_on(Device::gpu()).unwrap();
     let input = Tensor::from_slice(&device, [2, 3], &[0.; 6]);
