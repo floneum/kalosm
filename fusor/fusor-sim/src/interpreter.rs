@@ -859,9 +859,10 @@ impl Execution<'_> {
                 for lane in lanes.iter_mut().filter(|lane| lane.active) {
                     lane.waiting = None;
                 }
-                group.workgroup_generation = group.workgroup_generation.wrapping_add(1);
                 if kind == BarrierKind::Storage {
                     group.storage_generation = group.storage_generation.wrapping_add(1);
+                } else {
+                    group.workgroup_generation = group.workgroup_generation.wrapping_add(1);
                 }
                 Ok(true)
             }
