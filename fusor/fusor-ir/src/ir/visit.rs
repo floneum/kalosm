@@ -80,16 +80,6 @@ impl Op {
 
 fn launch(op: &mut Launch, visitor: &mut impl VisitMut, generated: Option<usize>) {
     match op {
-        Launch::RmsNorm {
-            output,
-            epsilon,
-            ops,
-            ..
-        } => {
-            dims(&mut output.dims, visitor);
-            visitor.scalar(epsilon);
-            operands(ops, visitor);
-        }
         Launch::Map {
             space, body, ops, ..
         } => {

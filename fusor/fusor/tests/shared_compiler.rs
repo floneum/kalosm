@@ -192,6 +192,17 @@ fn shared_fusions_and_transfers_match_host_results() {
         assert_eq!(x.to_vec_f32(), values);
         assert_eq!(r.to_vec_f32(), residual);
     }
+    let rms_kernels = seen.lock().unwrap().clone();
+    assert!(
+        rms_kernels.iter().any(|n| n == "kmap"),
+        "RMS normalization did not use the generic map lowering: {rms_kernels:?}"
+    );
+    assert!(
+        rms_kernels
+            .iter()
+            .any(|n| matches!(n.as_str(), "kfold" | "kfold_carrier" | "kstream_fold")),
+        "RMS normalization did not use the generic fold lowering: {rms_kernels:?}"
+    );
     for (batch, heads, kv_heads, keys, width) in [
         (1, 3, 3, 17, 32),
         (1, 3, 3, 23, 37),
@@ -239,15 +250,6 @@ fn shared_fusions_and_transfers_match_host_results() {
         target.launcher().pipeline_compiles(),
         compiles,
         "copies should not compile shaders"
-    );
-    let seen = seen.lock().unwrap();
-    assert!(
-        seen.iter().any(|n| n == "rms_norm"),
-        "normalization fusion was not selected: {seen:?}"
-    );
-    assert!(
-        seen.iter().any(|n| n == "rms_norm_residual"),
-        "residual normalization was not fused: {seen:?}"
     );
 }
 

@@ -68,21 +68,6 @@ pub fn verify_launch(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<(
         return check_schedule_domain(fold, sched, cx.caps, planner);
     }
 
-    // 1 + 2.
-    if let Launch::RmsNorm { sched, block, .. } = op
-        && (cx.caps.kind != crate::device::DeviceKind::Gpu
-            || !cx.result.numeric.reassoc
-            || !cx.result.numeric.contract
-            || cx.caps.limits.max_compute_invocations_per_workgroup < *block
-            || cx.caps.limits.max_compute_workgroup_size[0] < *block
-            || cx.caps.limits.max_compute_workgroup_storage_size < *block * 4
-            || *sched != ScheduleDomain::Point)
-    {
-        return Err(relabel(
-            cx,
-            "fused RMS normalization exceeds device capabilities".into(),
-        ));
-    }
     if let Some(sched) = op.schedule() {
         check_schedule_domain(op, sched, cx.caps, planner)
             .map_err(|e| relabel(cx, format!("{e}")))?;
