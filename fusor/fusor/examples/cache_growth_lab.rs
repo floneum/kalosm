@@ -34,7 +34,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     for cache in &mut caches {
         cache.append(&input, &input);
     }
-    KvCache::resolve_and_commit_all(&mut caches, &[])?;
+    KvCache::resolve_and_commit_all(device.session(), &mut caches, &[])?;
     device.session().wait()?;
     let target = device.backend().gpu_target().unwrap();
     let compiles_before = target.launcher().pipeline_compiles();

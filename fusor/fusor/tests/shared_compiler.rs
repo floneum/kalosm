@@ -451,6 +451,7 @@ fn ordinary_attention_replays_across_cache_growth() {
         let output = output.as_ref().unwrap();
         output.clear_device_buf();
         KvCache::resolve_and_commit_all(
+            device.session(),
             std::slice::from_mut(&mut cache),
             std::slice::from_ref(output),
         )

@@ -793,18 +793,12 @@ impl Model {
         device: &Device,
         cache: &mut LlamaCache,
     ) -> Result<()> {
-        let mut batch = Vec::with_capacity(2 * cache.blocks.len() + 1);
-        if let Some(out) = out {
-            batch.push(out.clone().into_dyn());
-        }
-        for block in &cache.blocks {
-            block.pending_into(&mut batch);
-        }
-        device.session().resolve(&batch)?;
-        for block in &mut cache.blocks {
-            block.commit();
-        }
-        Ok(())
+        let values = out.map(|out| std::slice::from_ref(out.as_dyn()));
+        KvCache::resolve_and_commit_all(
+            device.session(),
+            &mut cache.blocks,
+            values.unwrap_or_default(),
+        )
     }
 
     pub fn forward(
