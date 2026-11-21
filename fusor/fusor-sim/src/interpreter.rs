@@ -514,11 +514,20 @@ impl Execution<'_> {
             }
             let lane_index = lane_id as usize;
             let pending = peek_stmt(&lanes[lane_index]).and_then(first_reduce_in_stmt);
-            if let Some(reduce) = pending
-                && !group.reductions.contains_key(&reduce.node_ptr())
-            {
-                lanes[lane_index].waiting = Some(Waiting::ExprReduce(reduce));
-                continue;
+            if let Some(reduce) = pending {
+                let pointer = reduce.node_ptr();
+                let visit = group
+                    .reduction_visits
+                    .get(&(lane_id, pointer))
+                    .copied()
+                    .unwrap_or(0);
+                if !group.reductions.contains_key(&(pointer, visit)) {
+                    lanes[lane_index].waiting = Some(Waiting::ExprReduce {
+                        expr: reduce,
+                        visit,
+                    });
+                    continue;
+                }
             }
             let stmt = next_stmt(&mut lanes[lane_index]).ok_or_else(|| {
                 SimError::Type("scheduler selected a lane without a statement".into())
@@ -806,8 +815,8 @@ impl Execution<'_> {
                 group.workgroup_generation = group.workgroup_generation.wrapping_add(1);
                 Ok(true)
             }
-            Waiting::ExprReduce(expr) => {
-                self.resolve_expr_reduce(&expr, lanes, group, workgroup, xyz)?;
+            Waiting::ExprReduce { expr, visit } => {
+                self.resolve_expr_reduce(&expr, visit, lanes, group, workgroup, xyz)?;
                 for lane in lanes.iter_mut().filter(|lane| lane.active) {
                     lane.waiting = None;
                 }
@@ -820,6 +829,7 @@ impl Execution<'_> {
     fn resolve_expr_reduce(
         &mut self,
         expr: &TileExpr,
+        visit: u64,
         lanes: &[Lane<'_>],
         group: &mut GroupState,
         workgroup: u32,
@@ -862,7 +872,7 @@ impl Execution<'_> {
         }
         group
             .reductions
-            .insert(expr.node_ptr(), (results, lanes.len()));
+            .insert((expr.node_ptr(), visit), (results, lanes.len()));
         Ok(())
     }
 
@@ -1097,27 +1107,36 @@ impl Execution<'_> {
             }
             TileExprKind::Reduce { .. } => {
                 let pointer = expr.node_ptr();
-                let (value, empty) =
-                    {
-                        let (values, remaining) =
-                            group.reductions.get_mut(&pointer).ok_or_else(|| {
-                                SimError::Type(
-                                    "reduction expression evaluated outside its rendezvous".into(),
-                                )
-                            })?;
-                        let value = values.get(lane_id as usize).cloned().ok_or_else(|| {
-                            SimError::Bounds {
+                let visit = group
+                    .reduction_visits
+                    .get(&(lane_id, pointer))
+                    .copied()
+                    .unwrap_or(0);
+                let key = (pointer, visit);
+                let (value, empty) = {
+                    let (values, remaining) = group.reductions.get_mut(&key).ok_or_else(|| {
+                        SimError::Type(
+                            "reduction expression evaluated outside its rendezvous".into(),
+                        )
+                    })?;
+                    let value =
+                        values
+                            .get(lane_id as usize)
+                            .cloned()
+                            .ok_or_else(|| SimError::Bounds {
                                 space: "reduction lane".into(),
                                 index: lane_id as usize,
                                 length: values.len(),
-                            }
-                        })?;
-                        *remaining = remaining.saturating_sub(1);
-                        (value, *remaining == 0)
-                    };
+                            })?;
+                    *remaining = remaining.saturating_sub(1);
+                    (value, *remaining == 0)
+                };
                 if empty {
-                    group.reductions.remove(&pointer);
+                    group.reductions.remove(&key);
                 }
+                group
+                    .reduction_visits
+                    .insert((lane_id, pointer), visit.wrapping_add(1));
                 Ok(value)
             }
             TileExprKind::CoopZero { .. }
@@ -1417,7 +1436,8 @@ struct Access {
 #[derive(Default)]
 struct GroupState {
     tiles: HashMap<u64, Vec<Option<MemoryValue>>>,
-    reductions: HashMap<usize, (Vec<MemoryValue>, usize)>,
+    reductions: HashMap<(usize, u64), (Vec<MemoryValue>, usize)>,
+    reduction_visits: HashMap<(u32, usize), u64>,
     workgroup_generation: u64,
     storage_generation: u64,
 }
@@ -1436,7 +1456,10 @@ enum Waiting {
         instance: u64,
     },
     Reduce(usize),
-    ExprReduce(TileExpr),
+    ExprReduce {
+        expr: TileExpr,
+        visit: u64,
+    },
 }
 
 enum Frame<'a> {
