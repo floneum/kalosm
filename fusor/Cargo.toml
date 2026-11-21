@@ -10,7 +10,6 @@ members = [
     "fusor-cpu",
     "fusor",
     "fusor-conformance",
-    "fusor-visualize",
 ]
 # The browser runner is built by `dx` in its own directory and pulls burn; it
 # is its own workspace so `--workspace` commands here never compile it.
