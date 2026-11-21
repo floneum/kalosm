@@ -1220,12 +1220,9 @@ impl Execution<'_> {
         xyz: [u32; 3],
     ) -> Result<usize, SimError> {
         let base = match addr {
-            Addr::Linear(index) => {
-                let index = self
-                    .eval(index, lane, group, lane_id, workgroup, xyz)?
-                    .u32()?;
-                map_flat_index(&view.layout.indexing, &view.layout.extents, index as usize)?
-            }
+            Addr::Linear(index) => self
+                .eval(index, lane, group, lane_id, workgroup, xyz)?
+                .u32()? as usize,
             Addr::Rc2 { row, col } => {
                 let row = self
                     .eval(row, lane, group, lane_id, workgroup, xyz)?
@@ -1901,36 +1898,6 @@ fn bitcast(value: MemoryValue, to: ElementType) -> Result<MemoryValue, SimError>
         (_, ScalarElement::Bool) => Err(SimError::Unsupported("bitcast to or from bool".into())),
         _ => Err(SimError::Unsupported("bitcast element pair".into())),
     }
-}
-
-fn map_flat_index(
-    indexing: &MultiFlattenMap,
-    extents: &[u32],
-    flat: usize,
-) -> Result<usize, SimError> {
-    if indexing.groups.len() != extents.len() {
-        return Err(SimError::Type(
-            "KernelIr layout rank does not match its index map".into(),
-        ));
-    }
-    let total = extents
-        .iter()
-        .fold(1usize, |acc, extent| acc.saturating_mul(*extent as usize));
-    if flat >= total {
-        return Err(SimError::Bounds {
-            space: "logical address".into(),
-            index: flat,
-            length: total,
-        });
-    }
-    let mut coords = vec![0usize; extents.len()];
-    for axis in 0..extents.len() {
-        let stride = extents[axis + 1..]
-            .iter()
-            .fold(1usize, |acc, extent| acc.saturating_mul(*extent as usize));
-        coords[axis] = flat.checked_div(stride).unwrap_or(0) % extents[axis].max(1) as usize;
-    }
-    map_coordinates(indexing, &coords)
 }
 
 fn map_coordinates(indexing: &MultiFlattenMap, coords: &[usize]) -> Result<usize, SimError> {
