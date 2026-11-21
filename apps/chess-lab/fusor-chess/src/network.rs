@@ -88,22 +88,42 @@ pub fn build(device: &Device, x: &Tensor<2, f32>, config: Config) -> Result<(Vec
     };
     // A wide first layer feeding narrow hidden layers, so evaluation stays cheap.
     let w = matrix(config.width, INPUT, (6. / INPUT as f32).sqrt());
-    let mut h = x.matmul_t(&w).relu();
+    let first = x.matmul_t(&w);
+    let mut head_weights = Vec::with_capacity(config.depth);
     let mut width = config.width;
     for _ in 1..config.depth {
         let w = matrix(config.hidden, width, (3. / width as f32).sqrt());
-        let next = h.matmul_t(&w);
-        // Equal widths form a residual layer.
+        head_weights.push(w);
+        width = config.hidden;
+    }
+    head_weights.push(matrix(1, width, 0.001));
+    // A linear path from the inputs straight to the value: a table of one weight
+    // per piece-square learns from few games, the network above refines it.
+    let linear = x.matmul_t(&matrix(1, INPUT, 0.));
+    let value = build_head(&first, &linear, &head_weights, config);
+    Ok((parameters, value))
+}
+
+/// Build the shared MLP tail from its first-layer preactivation.
+pub(crate) fn build_head(
+    first: &Tensor<2, f32>,
+    linear: &Tensor<2, f32>,
+    weights: &[Tensor<2, f32>],
+    config: Config,
+) -> Tensor<2, f32> {
+    let mut h = first.relu();
+    let mut width = config.width;
+    for w in &weights[..config.depth - 1] {
+        let next = h.matmul_t(w);
         h = if width == config.hidden {
-            next.add(&h).mul_scalar(std::f32::consts::FRAC_1_SQRT_2).relu()
+            // Equal widths form a residual layer.
+            next.add(&h)
+                .mul_scalar(std::f32::consts::FRAC_1_SQRT_2)
+                .relu()
         } else {
             next.relu()
         };
         width = config.hidden;
     }
-    let value = h.matmul_t(&matrix(1, width, 0.001));
-    // A linear path from the inputs straight to the value: a table of one weight
-    // per piece-square learns from few games, the network above refines it.
-    let value = value.add(&x.matmul_t(&matrix(1, INPUT, 0.)));
-    Ok((parameters, value))
+    h.matmul_t(&weights[config.depth - 1]).add(linear)
 }

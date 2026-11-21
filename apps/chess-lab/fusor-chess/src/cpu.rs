@@ -486,39 +486,26 @@ impl Changes {
 impl Net {
     /// A zero-weight network of `config`'s shape.
     pub fn new(config: crate::Config) -> Self {
-        let (width, layers, hidden) = (config.width, config.depth, config.hidden);
+        let (width, layers) = (config.width, config.depth);
         let cpu = Device::cpu();
         let wide = width + 1;
         let zeros = |rows: usize, cols: usize| Tensor::<2, f32>::from_slice(&cpu, [rows, cols], &vec![0f32; rows * cols]);
-        let mut parameters = vec![zeros(832, wide)];
-        let mut last = width;
-        for _ in 1..layers {
-            parameters.push(zeros(hidden, last));
-            last = hidden;
+        let shapes = config.shapes();
+        let mut parameters = vec![zeros(crate::INPUT, wide)];
+        for &[rows, cols] in &shapes[1..=layers] {
+            parameters.push(zeros(rows, cols));
         }
-        parameters.push(zeros(1, last));
         let first = &parameters[0];
         // update: an accumulator plus the first layer of the change in its
         // inputs (zero but for a few entries, which the contraction skips).
         let before = zeros(1, wide);
-        let change = zeros(1, 832);
+        let change = zeros(1, crate::INPUT);
         let after = before.add(&change.matmul(first));
         let update = Program::new(after.as_dyn(), [before.as_dyn(), change.as_dyn(), after.as_dyn()]);
-        // head: the network network.rs builds for training, from the first
-        // layer's sums on.
-        let acc = zeros(wide, 1);
-        let mut h = acc.narrow(0usize, 0, width).relu();
-        let mut running = width;
-        for w in &parameters[1..layers] {
-            let next = w.matmul(&h);
-            h = if running == hidden {
-                next.add(&h).mul_scalar(std::f32::consts::FRAC_1_SQRT_2).relu()
-            } else {
-                next.relu()
-            };
-            running = hidden;
-        }
-        let value = parameters[layers].matmul(&h).add(&acc.narrow(0usize, width, 1)).tanh();
+        let acc = zeros(1, wide);
+        let first = acc.narrow(1usize, 0, width);
+        let linear = acc.narrow(1usize, width, 1);
+        let value = crate::network::build_head(&first, &linear, &parameters[1..], config).tanh();
         let head = Program::new(value.as_dyn(), [acc.as_dyn(), value.as_dyn()]);
         let parameters = parameters
             .iter()
@@ -529,7 +516,7 @@ impl Net {
             update,
             head,
             parameters,
-            linear: vec![0.; 832],
+            linear: vec![0.; crate::INPUT],
             count: crate::count_scale(),
             touched: Default::default(),
             _single: PhantomData,
@@ -545,10 +532,10 @@ impl Net {
         let (width, layers) = (self.config.width, self.config.depth);
         assert_eq!(parameters.len(), layers + 2, "parameter count of the network's shape");
         let (wide, linear) = (self.wide(), &parameters[layers + 1]);
-        let mut first = vec![0f32; 832 * wide];
-        for i in 0..832 {
+        let mut first = vec![0f32; crate::INPUT * wide];
+        for i in 0..crate::INPUT {
             for j in 0..width {
-                first[i * wide + j] = parameters[0][j * 832 + i];
+                first[i * wide + j] = parameters[0][j * crate::INPUT + i];
             }
             first[i * wide + width] = linear[i];
         }
@@ -561,13 +548,13 @@ impl Net {
     /// Every weight, in network.rs order and layout.
     pub fn parameters(&self) -> Vec<Vec<f32>> {
         let wide = self.wide();
-        let mut first = vec![0f32; 832 * wide];
+        let mut first = vec![0f32; crate::INPUT * wide];
         self.parameters[0].read_into(&mut first).expect("the first layer's weights");
         let width = self.config.width;
-        let mut out = vec![vec![0f32; width * 832]];
-        for i in 0..832 {
+        let mut out = vec![vec![0f32; width * crate::INPUT]];
+        for i in 0..crate::INPUT {
             for j in 0..width {
-                out[0][j * 832 + i] = first[i * wide + j];
+                out[0][j * crate::INPUT + i] = first[i * wide + j];
             }
         }
         for (value, size) in self.parameters[1..].iter().zip(&self.config.sizes()[1..]) {
@@ -1550,4 +1537,144 @@ pub fn answer(state: &[u32], found: &Found) -> Vec<u32> {
         out[at + 3] = b.share.to_bits();
     }
     out
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    fn position(
+        pieces: &[(usize, i8)],
+        side: i8,
+        rights: u32,
+        ep: i32,
+        kings: [i32; 2],
+    ) -> Position {
+        let mut state = vec![0u32; 135];
+        for &(square, piece) in pieces {
+            state[square] = piece as i32 as u32;
+        }
+        state[128] = side as i32 as u32;
+        state[129] = rights;
+        state[130] = ep as u32;
+        state[133] = kings[0] as u32;
+        state[134] = kings[1] as u32;
+        Position::from_state(&state)
+    }
+
+    fn test_positions() -> Vec<Position> {
+        let mut start = Vec::new();
+        let white = [4, 2, 3, 5, 6, 3, 2, 4];
+        let black = [-4, -2, -3, -5, -6, -3, -2, -4];
+        for file in 0..8 {
+            start.extend([
+                (file, white[file]),
+                (16 + file, 1),
+                (96 + file, -1),
+                (112 + file, black[file]),
+            ]);
+        }
+        let mut positions = vec![
+            position(&start, 1, 15, -1, [4, 116]),
+            position(
+                &[(4, 6), (0, 4), (7, 4), (116, -6), (112, -4), (119, -4)],
+                1,
+                15,
+                -1,
+                [4, 116],
+            ),
+            position(&[(4, 6), (68, 1), (116, -6), (67, -1)], 1, 0, 83, [4, 116]),
+            position(&[(4, 6), (96, 1), (116, -6)], 1, 0, -1, [4, 116]),
+        ];
+        let castle_moves = positions[1].moves();
+        assert!(
+            castle_moves
+                .iter()
+                .any(|&m| move_from(m) == 4 && move_to(m) == 6)
+        );
+        assert!(
+            castle_moves
+                .iter()
+                .any(|&m| move_from(m) == 4 && move_to(m) == 2)
+        );
+        assert!(
+            positions[2]
+                .moves()
+                .iter()
+                .any(|&m| move_from(m) == 68 && move_to(m) == 83)
+        );
+        assert!(
+            positions[3]
+                .moves()
+                .iter()
+                .any(|&m| move_from(m) == 96 && move_to(m) == 112 && promotion(m) != 0)
+        );
+        positions
+    }
+
+    fn parameters(config: crate::Config) -> Vec<Vec<f32>> {
+        config
+            .shapes()
+            .iter()
+            .enumerate()
+            .map(|(parameter, &[rows, cols])| {
+                let scale = if parameter == config.depth + 1 {
+                    0.002
+                } else {
+                    0.01
+                };
+                (0..rows * cols)
+                    .map(|i| (((i * 37 + parameter * 19) % 101) as f32 - 50.) * scale)
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn cpu_net_matches_the_full_graph_for_every_config() {
+        let positions = test_positions();
+        let mut features = Vec::with_capacity(positions.len() * crate::INPUT);
+        for pos in &positions {
+            features.extend(super::features(pos));
+        }
+        let device = Device::cpu();
+        let input =
+            Tensor::<2, f32>::from_slice(&device, [positions.len(), crate::INPUT], &features);
+
+        for config in crate::Config::all() {
+            let expected_parameters = parameters(config);
+            assert!(expected_parameters.last().unwrap().iter().any(|&w| w != 0.));
+            let (graph_parameters, raw_value) =
+                crate::network::build(&device, &input, config).unwrap();
+            assert_eq!(graph_parameters.len(), expected_parameters.len());
+            for (parameter, values) in graph_parameters.iter().zip(&expected_parameters) {
+                parameter
+                    .set_bytes(bytemuck::cast_slice(values).to_vec())
+                    .unwrap();
+            }
+            let expected_values = raw_value.tanh().to_vec_f32();
+
+            let net = Net::from_parameters(config, &expected_parameters);
+            assert_eq!(
+                net.parameters(),
+                expected_parameters,
+                "parameter roundtrip for {config:?}"
+            );
+            for (index, pos) in positions.iter().enumerate() {
+                let actual = net.evaluate_position(pos);
+                assert!(
+                    (actual - expected_values[index]).abs() < 1e-5,
+                    "CPU/full-graph mismatch for {config:?}, position {index}: {actual} vs {}",
+                    expected_values[index]
+                );
+            }
+            for (index, mut pos) in positions.iter().cloned().enumerate() {
+                let error = net.incremental_error(&mut pos);
+                assert!(
+                    error < 1e-5,
+                    "incremental mismatch for {config:?}, position {index}: {error}"
+                );
+            }
+        }
+    }
 }
