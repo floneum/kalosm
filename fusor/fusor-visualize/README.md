@@ -71,5 +71,6 @@ trace would be needed to describe concrete post-lowering accesses for those
 operations.
 
 The independent Rust tests cover capture, trace validation, simulation, and CLI
-output. They retain a regression ensuring reuse advice appears only when cache
-hits actually occur.
+output. They retain a regression ensuring reuse/staging advice appears even on
+cache misses; only the “cache hits already help” qualifier depends on observed
+hits.
