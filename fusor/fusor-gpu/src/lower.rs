@@ -1214,3 +1214,16 @@ pub(crate) fn lower(
     let pack = std::sync::Arc::new(UniformPack::new(cx.plan));
     lower_node(caps, node, theta, cx, DimBinding::new(), pack)
 }
+
+/// Lower one selected GPU node to [`KernelIr`] without requesting a device.
+///
+/// This is the same pure lowering path used by [`crate::GpuTarget`], exposed
+/// for native tools that execute or inspect the lowered IR themselves.
+pub fn lower_kernel_ir(
+    caps: &Caps,
+    node: &Node,
+    theta: SchedPoint,
+    cx: &LowerCtx<'_>,
+) -> Result<KernelIr> {
+    lower(caps, node, theta, cx)
+}

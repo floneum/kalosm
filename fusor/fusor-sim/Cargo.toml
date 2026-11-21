@@ -1,0 +1,22 @@
+[package]
+name = "fusor-sim"
+description = "Hardware-free interpreter and replayable GPU KernelIr fuzzer"
+edition.workspace = true
+version.workspace = true
+license.workspace = true
+authors.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "fusor-sim"
+path = "src/main.rs"
+
+[dependencies]
+fusor-ir.workspace = true
+fusor-tile.workspace = true
+fusor-cost = { workspace = true, features = ["compiler-tests"] }
+fusor-gpu.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+smallvec.workspace = true

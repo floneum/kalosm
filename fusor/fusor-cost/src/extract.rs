@@ -542,6 +542,32 @@ impl LocalSearch {
         }
         out
     }
+
+    /// Enumerate candidate replans without hiding errors for compiler diagnostics.
+    #[cfg(feature = "compiler-tests")]
+    pub fn test_launch_variant_results(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        base: &Plan,
+        launch_ix: usize,
+        cost: &dyn CostModel,
+    ) -> Vec<(String, Result<Plan>)> {
+        let Some((root, class, fair)) = fair_points(graph, base, launch_ix, 0, test_points, false)
+        else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        let mut cache = NodeCache::new(graph.len());
+        for (member, theta, label) in fair {
+            let mut ex = base.extraction.clone();
+            if !apply_variant(&mut Trail::default(), &mut ex, class, root, member, theta) {
+                continue;
+            }
+            out.push((label, self.replan(graph, roots, &mut ex, cost, &mut cache)));
+        }
+        out
+    }
 }
 
 impl Extractor for LocalSearch {
