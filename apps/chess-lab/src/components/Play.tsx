@@ -37,10 +37,10 @@ export function Play({ training, active }: { training: Training; active: boolean
   const myTurn = position.turn === player && !outcome;
 
   useEffect(() => {
-    if (active) setSnapshot({ generation: training.generation });
+    if (active && training.ready) setSnapshot({ generation: training.generation });
     // The generation this game started against; training continues meanwhile.
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active]);
+  }, [active, training.ready]);
 
   // Every finished game becomes training data, once.
   const learned = useRef('');

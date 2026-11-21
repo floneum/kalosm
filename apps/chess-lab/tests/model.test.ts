@@ -42,6 +42,7 @@ test('binary checkpoints round-trip and reject other files', () => {
   assert.deepEqual(Array.from(parsed.state), Array.from(state));
   assert.equal(parsed.metrics.games, 5);
   assert.equal(parsed.seconds, 3.5);
+  assert.equal(parsed.generation, 12);
   // JSON text, a truncated state and a non-finite weight are all refused.
   assert.throws(() => parseCheckpoint(new TextEncoder().encode('{"format":"rookie-fusor-v3"}').buffer));
   assert.throws(() => parseCheckpoint(bytes.slice(0, bytes.byteLength - 4)));
