@@ -840,3 +840,139 @@ fn symbolic_map_fusion_preserves_the_producer_address() {
         }
     }
 }
+
+#[test]
+fn map_fusion_substitutes_each_consumer_port_independently() {
+    use fusor_ir::ir::launch::{AccessPlan, IndexSpace, Launch, Operand, ScheduleDomain};
+    use fusor_ir::scalar::{BinOp, ScalarExpr};
+    use fusor_ir::shape::{Layout, SymId};
+
+    fn producer_body(arg0: ScalarExpr, arg1: ScalarExpr) -> ScalarExpr {
+        let repeated = ScalarExpr::bin(BinOp::Mul, arg0.clone(), arg0);
+        let sum = ScalarExpr::bin(BinOp::Add, repeated, arg1);
+        let indexed = ScalarExpr::bin(
+            BinOp::Add,
+            sum,
+            ScalarExpr::cast(Dtype::F32, ScalarExpr::index_of(0)),
+        );
+        ScalarExpr::bin(
+            BinOp::Add,
+            indexed,
+            ScalarExpr::uniform(SymId(11), Dtype::F32),
+        )
+    }
+
+    fn consumer_body(args: [ScalarExpr; 3]) -> ScalarExpr {
+        let doubled = args.map(|arg| ScalarExpr::bin(BinOp::Add, arg.clone(), arg));
+        let sum = ScalarExpr::bin(
+            BinOp::Add,
+            ScalarExpr::bin(BinOp::Add, doubled[0].clone(), doubled[1].clone()),
+            doubled[2].clone(),
+        );
+        let indexed = ScalarExpr::bin(
+            BinOp::Add,
+            sum,
+            ScalarExpr::cast(Dtype::F32, ScalarExpr::index_of(0)),
+        );
+        ScalarExpr::bin(
+            BinOp::Add,
+            indexed,
+            ScalarExpr::uniform(SymId(12), Dtype::F32),
+        )
+    }
+
+    let caps = caps();
+    let shape = [Dim::Const(4)];
+    let space = IndexSpace::new(shape.iter().copied());
+    let layout = Layout::contiguous(&shape);
+    let operand = |src| Operand {
+        src,
+        layout: layout.clone(),
+        access: AccessPlan::Alias,
+    };
+    let arg = |index| ScalarExpr::arg(index, Dtype::F32);
+
+    for edge in 0..3 {
+        let mut graph = graph();
+        let producer_inputs = [leaf(&mut graph, 0, &shape), leaf(&mut graph, 1, &shape)];
+        let other_inputs = [leaf(&mut graph, 2, &shape), leaf(&mut graph, 3, &shape)];
+        let producer = Launch::Map {
+            space: space.clone(),
+            body: producer_body(arg(0), arg(1)),
+            ops: producer_inputs.iter().copied().map(&operand).collect(),
+            sched: ScheduleDomain::Point,
+        };
+        let producer_id = graph.builder(&caps).add_launch(producer.clone()).unwrap();
+
+        let mut consumer_sources = other_inputs.to_vec();
+        consumer_sources.insert(edge, producer_id);
+        let consumer = Launch::Map {
+            space: space.clone(),
+            body: consumer_body([arg(0), arg(1), arg(2)]),
+            ops: consumer_sources.iter().copied().map(&operand).collect(),
+            sched: ScheduleDomain::Point,
+        };
+        let consumer_id = graph.builder(&caps).add_launch(consumer.clone()).unwrap();
+
+        let sibling = Launch::Map {
+            space: space.clone(),
+            body: arg(0),
+            ops: vec![operand(producer_id)],
+            sched: ScheduleDomain::Point,
+        };
+        let sibling_id = graph.builder(&caps).add_launch(sibling.clone()).unwrap();
+        let before = graph.len();
+
+        let fused_class = apply(
+            &mut graph,
+            &caps,
+            consumer_id,
+            fusor_ir::rules::fusion::map_into_map,
+        )
+        .expect("the same-space dense producer edge should fuse");
+
+        let base = 2;
+        let shifted_producer = producer_body(arg(base), arg(base + 1));
+        let fused_arg = |port: usize| {
+            if port < edge {
+                arg(port as u32)
+            } else if port == edge {
+                shifted_producer.clone()
+            } else {
+                arg((port - 1) as u32)
+            }
+        };
+        let expected_body = consumer_body([fused_arg(0), fused_arg(1), fused_arg(2)]);
+        let mut expected_ops: Vec<_> = consumer_sources
+            .iter()
+            .enumerate()
+            .filter(|(port, _)| *port != edge)
+            .map(|(_, &src)| operand(src))
+            .collect();
+        expected_ops.extend(producer_inputs.iter().copied().map(&operand));
+
+        let fused_id = (before..graph.len())
+            .map(|index| Id(index as u32))
+            .find(|&candidate| {
+                matches!(
+                    &graph.node(candidate).op,
+                    Op::Launch(Launch::Map {
+                        space: fused_space,
+                        body,
+                        ops,
+                        sched,
+                    }) if fused_space == &space
+                        && body == &expected_body
+                        && ops == &expected_ops
+                        && sched == &ScheduleDomain::Point
+                )
+            })
+            .expect("the fused map should contain the independently built AST");
+
+        assert_eq!(graph.class_of(consumer_id), graph.class_of(fused_id));
+        assert_eq!(graph.node(producer_id).op, Op::Launch(producer));
+        assert_eq!(graph.node(consumer_id).op, Op::Launch(consumer));
+        assert_eq!(graph.node(sibling_id).op, Op::Launch(sibling));
+        assert_eq!(graph.class_of(consumer_id), graph.class_of(fused_class));
+    }
+}
