@@ -782,6 +782,7 @@ impl GpuTarget {
         let live_total = live.iter().filter(|v| **v).count();
         let mut submitted = 0;
         let mut submitted_live = 0;
+        let mut pending_submissions = std::collections::VecDeque::new();
         let mut records = Vec::with_capacity(total);
         for (launch_ix, slot) in built.iter().enumerate() {
             let (artifact, grid, _) = slot
@@ -868,6 +869,7 @@ impl GpuTarget {
                     timing.mode(),
                     submitted_live,
                     live_total,
+                    &mut pending_submissions,
                 )?;
                 submitted_live += live[submitted..records.len()]
                     .iter()
@@ -899,6 +901,7 @@ impl GpuTarget {
                 timing.mode(),
                 submitted_live,
                 live_total,
+                &mut pending_submissions,
             )?;
         }
         #[cfg(feature = "kernel-observer")]

@@ -440,6 +440,8 @@ pub struct Launcher {
     config: GpuConfig,
     in_flight: AtomicUsize,
     poll_waits: AtomicU64,
+    #[cfg(test)]
+    test_pending_submissions: AtomicUsize,
     #[cfg(feature = "kernel-observer")]
     poll_spin_override_ms: AtomicU64,
     #[cfg(feature = "kernel-observer")]
@@ -518,6 +520,8 @@ impl Launcher {
             lost,
             in_flight: AtomicUsize::new(0),
             poll_waits: AtomicU64::new(0),
+            #[cfg(test)]
+            test_pending_submissions: AtomicUsize::new(0),
             #[cfg(feature = "kernel-observer")]
             poll_spin_override_ms: AtomicU64::new(u64::MAX),
             #[cfg(feature = "kernel-observer")]
@@ -551,6 +555,18 @@ impl Launcher {
     /// Times the runtime blocked the host.
     pub fn poll_wait_count(&self) -> u64 {
         self.poll_waits.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn note_test_submission(&self) {
+        self.test_pending_submissions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_test_submission_waited(&self) {
+        self.test_pending_submissions
+            .fetch_sub(1, Ordering::Relaxed);
     }
 
     pub fn pipeline_compiles(&self) -> u64 {
@@ -680,7 +696,8 @@ impl Launcher {
             .iter()
             .filter(|r| matches!(r, CommandRecord::Dispatch { .. }) && !r.is_empty_dispatch())
             .count();
-        self.encode_command_records_from(records, timestamps, mode, 0, total)
+        let mut pending_window = std::collections::VecDeque::new();
+        self.encode_command_records_from(records, timestamps, mode, 0, total, &mut pending_window)
     }
 
     /// Submit a consecutive portion of a resolve without resetting its query
@@ -692,6 +709,7 @@ impl Launcher {
         mode: TimingMode,
         first_dispatch: usize,
         total: usize,
+        pending: &mut std::collections::VecDeque<wgpu::SubmissionIndex>,
     ) -> Result<()> {
         // A zero grid launches nothing but would cost a pass boundary.
         let live: Vec<&CommandRecord> = records.iter().filter(|r| !r.is_empty_dispatch()).collect();
@@ -714,9 +732,6 @@ impl Launcher {
         let mut chunk: Vec<&CommandRecord> = Vec::new();
         let mut dispatches_in_chunk = 0usize;
         let mut submits = 0usize;
-        // Metal: keep at most [`METAL_INFLIGHT_CHUNKS`] chunks outstanding.
-        let mut pending: std::collections::VecDeque<wgpu::SubmissionIndex> =
-            std::collections::VecDeque::new();
 
         for record in live {
             let is_dispatch = matches!(record, CommandRecord::Dispatch { .. });
@@ -730,6 +745,7 @@ impl Launcher {
                 let started = trace.then(std::time::Instant::now);
                 let (ix, submitted) =
                     self.encode_one_submit(&chunk, timestamps, mode, dispatch_ix, total)?;
+                let mut trace_waited = false;
                 if trace {
                     let poll = self.device.poll(wgpu::PollType::wait_indefinitely());
                     #[cfg(not(target_arch = "wasm32"))]
@@ -751,31 +767,52 @@ impl Launcher {
                     if let CommandRecord::Dispatch { name, grid, .. } = record {
                         eprintln!("[trace] dispatch {name} grid={grid:?} -> {state} {__us}us");
                     }
+                    trace_waited = poll.is_ok();
                 }
                 dispatch_ix = ix;
                 chunk.clear();
                 dispatches_in_chunk = 0;
                 submits += 1;
-                pending.push_back(submitted);
-                if pending.len() > inflight_chunks(total)
-                    && let Some(oldest) = pending.pop_front()
-                {
-                    let _w = Stopwatch::start(&CHUNK_WAIT_US);
-                    self.device
-                        .poll(wgpu::PollType::Wait {
-                            submission_index: Some(oldest),
-                            timeout: None,
-                        })
-                        .map_err(|e| Error::Device(format!("device wait failed: {e}")))?;
+                if trace_waited {
+                    pending.clear();
+                    #[cfg(test)]
+                    self.test_pending_submissions.store(0, Ordering::Relaxed);
+                } else {
+                    self.track_submission(pending, submitted, total)?;
                 }
             }
         }
         if !chunk.is_empty() || submits == 0 {
-            self.encode_one_submit(&chunk, timestamps, mode, dispatch_ix, total)?;
+            let (_, submitted) =
+                self.encode_one_submit(&chunk, timestamps, mode, dispatch_ix, total)?;
+            self.track_submission(pending, submitted, total)?;
         }
         if last_portion {
             self.in_flight.fetch_add(1, Ordering::Relaxed);
             self.apply_back_pressure()?;
+        }
+        Ok(())
+    }
+
+    fn track_submission(
+        &self,
+        pending: &mut std::collections::VecDeque<wgpu::SubmissionIndex>,
+        submitted: wgpu::SubmissionIndex,
+        total: usize,
+    ) -> Result<()> {
+        pending.push_back(submitted);
+        if pending.len() > inflight_chunks(total)
+            && let Some(oldest) = pending.pop_front()
+        {
+            let _w = Stopwatch::start(&CHUNK_WAIT_US);
+            self.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(oldest),
+                    timeout: None,
+                })
+                .map_err(|e| Error::Device(format!("device wait failed: {e}")))?;
+            #[cfg(test)]
+            self.note_test_submission_waited();
         }
         Ok(())
     }
@@ -968,6 +1005,8 @@ impl Launcher {
             }
         }
         let submitted = self.queue.submit([encoder.finish()]);
+        #[cfg(test)]
+        self.note_test_submission();
         Ok((dispatch_ix, submitted))
     }
 
@@ -1616,5 +1655,136 @@ mod cancel_tests {
         buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         buffer.unmap();
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod submission_window_tests {
+    use super::*;
+
+    fn metal_launcher() -> (Launcher, Arc<wgpu::ComputePipeline>, Arc<wgpu::BindGroup>) {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))
+        .expect("request Metal adapter");
+        let info = adapter.get_info();
+        assert_eq!(info.backend, wgpu::Backend::Metal, "adapter: {}", info.name);
+        eprintln!("submission-window regression backend: {:?}", info.backend);
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("request Metal device");
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("submission-window regression"),
+            entries: &[],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("submission-window regression"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let source = "@compute @workgroup_size(1) fn main() {}";
+        let module = naga::front::wgsl::parse_str(source).expect("parse regression shader");
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("submission-window regression"),
+            source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
+        });
+        let pipeline = Arc::new(
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("submission-window regression"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            }),
+        );
+        let bind_group = Arc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("submission-window regression"),
+            layout: &bind_group_layout,
+            entries: &[],
+        }));
+
+        (
+            Launcher::new(
+                Arc::new(device),
+                Arc::new(queue),
+                info.backend,
+                GpuConfig::default(),
+                crate::device::LostFlag::default(),
+            ),
+            pipeline,
+            bind_group,
+        )
+    }
+
+    fn assert_streamed_submission_window(
+        launcher: &Launcher,
+        pipeline: &Arc<wgpu::ComputePipeline>,
+        bind_group: &Arc<wgpu::BindGroup>,
+        total: usize,
+    ) {
+        let limit = inflight_chunks(total);
+        assert_eq!(limit, METAL_INFLIGHT_CHUNKS);
+        assert_eq!(
+            dispatches_per_submit(total, wgpu::Backend::Metal),
+            METAL_SUBMIT_CHUNK
+        );
+        launcher
+            .test_pending_submissions
+            .store(0, Ordering::Relaxed);
+        let mut pending_window = std::collections::VecDeque::new();
+
+        let record = CommandRecord::Dispatch {
+            name: "submission-window regression",
+            pipeline: Arc::clone(pipeline),
+            bind_group: Arc::clone(bind_group),
+            grid: [1, 1, 1],
+        };
+        let records = vec![record; total];
+        let (first, rest) = stream_chunks(total, total.div_ceil(limit), None, limit);
+        assert_eq!(first, total.div_ceil(2));
+        assert_eq!(rest, first);
+
+        let mut offset = 0;
+        let mut portion = 0;
+        while offset < total {
+            let end = (offset + if portion == 0 { first } else { rest }).min(total);
+            launcher
+                .encode_command_records_from(
+                    &records[offset..end],
+                    None,
+                    TimingMode::All,
+                    offset,
+                    total,
+                    &mut pending_window,
+                )
+                .unwrap();
+            let pending = launcher.test_pending_submissions.load(Ordering::Relaxed);
+            assert_eq!(pending_window.len(), pending);
+            assert!(
+                pending <= limit,
+                "{total} dispatches: portion {portion} left {pending} submission handles pending (limit {limit})"
+            );
+            offset = end;
+            portion += 1;
+        }
+        assert_eq!(portion, 2);
+        launcher.poll_wait().unwrap();
+    }
+
+    #[test]
+    fn metal_submission_window_spans_1536_dispatches() {
+        let (launcher, pipeline, bind_group) = metal_launcher();
+        assert_streamed_submission_window(&launcher, &pipeline, &bind_group, 1536);
+    }
+
+    #[test]
+    fn metal_submission_window_tracks_final_partial_batch() {
+        let (launcher, pipeline, bind_group) = metal_launcher();
+        assert_streamed_submission_window(&launcher, &pipeline, &bind_group, 1538);
     }
 }
