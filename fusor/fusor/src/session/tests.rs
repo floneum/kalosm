@@ -53,6 +53,7 @@ struct RejectFirstForwardReplan {
     view_output: std::sync::Mutex<Option<(Id, Id)>>,
     extract_calls: AtomicUsize,
     seeded_calls: AtomicUsize,
+    l0_hashes: std::sync::Mutex<Vec<u64>>,
 }
 
 #[cfg(all(feature = "cpu", not(target_arch = "wasm32")))]
@@ -74,6 +75,10 @@ impl Extractor for RejectFirstForwardReplan {
     ) -> fusor_ir::Result<Plan> {
         self.extract_calls
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.l0_hashes
+            .lock()
+            .unwrap()
+            .push(fusor_cost::replay::l0_term_hash(graph, roots));
         let plan = self.delegate.extract(graph, roots, cost, budget)?;
         let Some((view, output)) = *self.view_output.lock().unwrap() else {
             return Ok(plan);
@@ -192,6 +197,7 @@ fn optional_view_forward_replan_failure_keeps_the_incumbent_executable() {
         view_output: std::sync::Mutex::new(None),
         extract_calls: AtomicUsize::new(0),
         seeded_calls: AtomicUsize::new(0),
+        l0_hashes: std::sync::Mutex::new(Vec::new()),
     });
     Arc::get_mut(&mut session.inner)
         .expect("session is uniquely owned")
@@ -252,6 +258,141 @@ fn optional_view_forward_replan_failure_keeps_the_incumbent_executable() {
             .load(std::sync::atomic::Ordering::Relaxed)
             > 0,
         "the subsequent resolve should use the retained extraction as a seed"
+    );
+}
+
+#[test]
+#[cfg(all(feature = "cpu", not(target_arch = "wasm32")))]
+fn forwarded_plan_replay_rekeys_against_members_on_an_equivalent_graph() {
+    let mut session = Session::new(Backend::cpu().unwrap()).unwrap();
+    let delegate = Arc::clone(&session.inner.extractor);
+    let rejecting = Arc::new(RejectFirstForwardReplan {
+        delegate,
+        replan_attempts: AtomicUsize::new(0),
+        rejected: AtomicBool::new(false),
+        forced_selection: AtomicBool::new(false),
+        view_output: std::sync::Mutex::new(None),
+        extract_calls: AtomicUsize::new(0),
+        seeded_calls: AtomicUsize::new(0),
+        l0_hashes: std::sync::Mutex::new(Vec::new()),
+    });
+    Arc::get_mut(&mut session.inner)
+        .expect("session is uniquely owned")
+        .extractor = rejecting.clone();
+
+    let first_graph = Graph::new(&session);
+    let first_handle = first_graph.handle();
+    let first_input = Tensor::from_elements(
+        first_handle,
+        &[Dim::Const(2), Dim::Const(3)],
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    )
+    .unwrap();
+    let first_view = first_input.transpose(0, 1).unwrap();
+    let first_output = first_view.add_scalar(10.0).unwrap();
+    *rejecting.view_output.lock().unwrap() = Some((first_view.id, first_output.id));
+
+    let first_bytes = first_handle.read_back(first_output.id).unwrap();
+    assert_eq!(
+        bytemuck::cast_slice::<u8, f32>(&first_bytes),
+        &[11.0, 14.0, 12.0, 15.0, 13.0, 16.0]
+    );
+    assert!(
+        rejecting
+            .rejected
+            .load(std::sync::atomic::Ordering::Relaxed)
+    );
+    assert_eq!(
+        rejecting
+            .replan_attempts
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1
+    );
+    let extracts_after_forwarding = rejecting
+        .extract_calls
+        .load(std::sync::atomic::Ordering::Relaxed);
+    let first_hash = *rejecting.l0_hashes.lock().unwrap().first().unwrap();
+    let key = ReplayKey {
+        l0_term: first_hash,
+        device: session.inner.cost.facts().fingerprint(),
+    };
+    let cached = session
+        .inner
+        .replay
+        .get(key)
+        .expect("forwarded plan cached");
+    let max_key = cached
+        .extraction
+        .sigma
+        .keys()
+        .map(|class| class.0.index())
+        .max()
+        .unwrap();
+
+    let second_graph = Graph::new(&session);
+    let second_handle = second_graph.handle();
+    let second_input = Tensor::from_elements(
+        second_handle,
+        &[Dim::Const(2), Dim::Const(3)],
+        &[7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+    )
+    .unwrap();
+    let second_view = second_input.transpose(0, 1).unwrap();
+    let second_output = second_view.add_scalar(10.0).unwrap();
+    *rejecting.view_output.lock().unwrap() = Some((second_view.id, second_output.id));
+    let saturated_len = {
+        let mut g = second_handle.state().egraph.lock();
+        g.clear_roots();
+        g.add_root(second_output.id);
+        Driver::new()
+            .saturate(
+                &mut g,
+                &session.caps(),
+                &session.inner.rules,
+                SaturationBudget {
+                    application_slope: 16,
+                    ..SaturationBudget::default()
+                },
+            )
+            .unwrap();
+        g.saturated_root_sets.insert(vec![second_output.id]);
+        assert_eq!(
+            fusor_cost::replay::l0_term_hash(&g, &[second_output.id]),
+            first_hash,
+            "fresh graph must have the same pre-forwarding replay key"
+        );
+        g.len()
+    };
+    let _fillers: Vec<_> = (0..max_key.saturating_add(1).saturating_sub(saturated_len))
+        .map(|_| {
+            second_graph
+                .leaf("filler", &[Dim::Const(1)], fusor_ir::dtype::Dtype::F32)
+                .unwrap()
+        })
+        .collect();
+    {
+        let g = second_handle.state().egraph.lock();
+        assert!(g.len() > max_key);
+        assert!(
+            cached.extraction.sigma.iter().any(|(class, member)| {
+                g.class_of(class.0) == *class && g.class_of(*member) != *class
+            }),
+            "replay class key should name an unrelated in-range node"
+        );
+    }
+
+    let second_result = second_handle.read_back(second_output.id);
+    assert_eq!(
+        rejecting
+            .extract_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        extracts_after_forwarding,
+        "the equivalent graph should replay without extracting"
+    );
+    let second_bytes = second_result.unwrap();
+    assert_eq!(
+        bytemuck::cast_slice::<u8, f32>(&second_bytes),
+        &[17.0, 20.0, 18.0, 21.0, 19.0, 22.0]
     );
 }
 
