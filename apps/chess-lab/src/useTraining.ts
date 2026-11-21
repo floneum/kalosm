@@ -200,6 +200,8 @@ export function useTraining() {
         setMetrics(restored.metrics);
         secondsRef.current = restored.seconds;
         setSeconds(restored.seconds);
+        generationRef.current = restored.generation;
+        setGeneration(restored.generation);
         setSaved(true);
       }
       const w = new Worker(new URL('./engine/gpu.worker.ts', import.meta.url), { type: 'module' });
