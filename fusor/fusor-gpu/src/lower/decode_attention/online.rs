@@ -9,6 +9,7 @@ pub(super) fn lower(ctx: Ctx<'_>, op: &Launch) -> Result<KernelIr> {
         kv_heads,
         keys,
         block,
+        subgroup,
         chunk,
         scale,
         prefix,
@@ -19,7 +20,7 @@ pub(super) fn lower(ctx: Ctx<'_>, op: &Launch) -> Result<KernelIr> {
         return Err(Error::Plan("expected online decode attention".into()));
     };
     let b = &ctx.b;
-    let subgroup = ctx.caps.subgroup_width();
+    let subgroup = *subgroup;
     let width = ops[0].layout.shape()[3].as_const().unwrap() as u32;
     let (block, subgroups) = (*block, *block / subgroup);
     let f = ScalarElement::F32.element();

@@ -397,6 +397,11 @@ fn ordinary_attention_replays_across_cache_growth() {
     use fusor::cache::KvCache;
     let device = pollster::block_on(Device::gpu()).unwrap();
     let target = device.backend().gpu_target().unwrap();
+    let seen = Arc::new(Mutex::new(Vec::new()));
+    let capture = seen.clone();
+    target.set_kernel_observer(Some(Arc::new(move |ir, _, _| {
+        capture.lock().unwrap().push(ir.name.to_string())
+    })));
     let (batch, heads, kv_heads, width) = (2, 4, 2, 64);
     let q = data(batch * heads * width, 17);
     let query = Tensor::from_slice(&device, [batch, heads, 1, width], &q);
@@ -468,6 +473,19 @@ fn ordinary_attention_replays_across_cache_growth() {
                 "cache growth/replay compiled new shaders at step {step}"
             );
         }
+    }
+    if device
+        .session()
+        .caps()
+        .subgroups
+        .is_some_and(|s| s.is_fixed())
+    {
+        let seen = seen.lock().unwrap();
+        assert!(
+            seen.iter()
+                .any(|n| n.starts_with("decode_attention_online")),
+            "symbolic cache-growth attention did not select the specialized kernel: {seen:?}"
+        );
     }
 }
 

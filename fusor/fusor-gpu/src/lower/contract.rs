@@ -18,8 +18,6 @@ use fusor_ir::shape::Dim;
 
 use crate::lower::{Ctx, StagedSource, distribute_workgroups, scalar_element};
 
-mod contiguous_n;
-
 /// Dispatch on the family this lowering was selected at.
 pub(crate) fn lower_contract(
     ctx: Ctx<'_>,
@@ -38,12 +36,6 @@ pub(crate) fn lower_contract(
         );
     }
     let contract = contract?;
-    if matches!((family, theta), (Family::Sgemv, SchedPoint::Sgemv(_)))
-        && crate::flags::flags().gemv_contiguous_n
-        && contiguous_n::supported(&contract, ctx.caps)
-    {
-        return contiguous_n::lower(ctx, &contract);
-    }
     match (family, theta) {
         (Family::Coop, SchedPoint::Coop { geom, staging }) => {
             lower_coop(ctx, &contract, geom, staging)

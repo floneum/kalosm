@@ -1519,6 +1519,8 @@ fn build_component<'a>(
             let iters = if let Op::Launch(Launch::DecodeAttention {
                 output,
                 keys,
+                block,
+                subgroup,
                 chunk,
                 ops,
                 ..
@@ -1529,11 +1531,12 @@ fn build_component<'a>(
                 heads
                     .saturating_mul(ops[0].layout.shape()[3].as_const().unwrap_or(0))
                     .saturating_mul(if slot == 0 {
-                        8 * if *chunk == 0 {
-                            1
-                        } else {
-                            keys.as_const().unwrap_or(1).div_ceil(u64::from(*chunk))
-                        }
+                        u64::from(*block / (*subgroup).max(1))
+                            * if *chunk == 0 {
+                                1
+                            } else {
+                                keys.as_const().unwrap_or(1).div_ceil(u64::from(*chunk))
+                            }
                     } else {
                         keys.as_const().unwrap_or(1)
                     })
@@ -2190,6 +2193,7 @@ pub(crate) mod tests {
     use super::*;
     use fusor_ir::cost::DeviceFacts;
     use fusor_ir::device::{DeviceKind, Limits, SubgroupWidths};
+    use fusor_ir::dtype::Splat;
     use fusor_ir::extract::{ExtractBudget, Extractor};
     use fusor_ir::ir::Node;
     use fusor_ir::ir::launch::{
@@ -2821,6 +2825,95 @@ pub(crate) mod tests {
                 }
                 assert_eq!(results[0], results[1], "case {case}, extent {symbolic}");
             }
+        }
+    }
+
+    #[test]
+    fn attention_query_traffic_uses_selected_geometry() {
+        let arena = Arc::new(fusor_tile::Planner::new());
+        for (width, subgroup, block, chunk, keys, expected_rereads) in [
+            (32, 32, 256, 0, 128, 8),
+            (64, 64, 256, 0, 128, 4),
+            (64, 64, 256, 256, 512, 8),
+            (64, 32, 64, 0, 128, 2),
+            (64, 32, 64, 256, 512, 4),
+        ] {
+            let query_shape = [
+                Dim::Const(2),
+                Dim::Const(4),
+                Dim::Const(1),
+                Dim::Const(width),
+            ];
+            let key_shape = [
+                Dim::Const(2),
+                Dim::Const(2),
+                Dim::Const(keys),
+                Dim::Const(width),
+            ];
+            let mut graph = new_graph(&arena);
+            let query = buffer(&mut graph, 0, &query_shape);
+            let key = buffer(&mut graph, 1, &key_shape);
+            let value = buffer(&mut graph, 2, &key_shape);
+            let splits = if chunk == 0 {
+                1
+            } else {
+                keys.div_ceil(u64::from(chunk))
+            };
+            let output_width = width + if chunk == 0 { 0 } else { 2 };
+            let node = graph
+                .add(Op::Launch(Launch::DecodeAttention {
+                    output: IndexSpace::new([
+                        Dim::Const(2),
+                        Dim::Const(4),
+                        Dim::Const(splits),
+                        Dim::Const(output_width),
+                    ]),
+                    kv_heads: 2,
+                    keys: Dim::Const(keys),
+                    block,
+                    subgroup,
+                    chunk,
+                    scale: ScalarExpr::lit(Splat::F32(1.0)),
+                    prefix: ScalarExpr::lit(Splat::U32(0)),
+                    ops: vec![
+                        alias(query, Layout::contiguous(&query_shape)),
+                        alias(key, Layout::contiguous(&key_shape)),
+                        alias(value, Layout::contiguous(&key_shape)),
+                    ],
+                    sched: ScheduleDomain::Point,
+                }))
+                .unwrap();
+            let mut extraction = Extraction {
+                sigma: selecting(&graph, [query, key, value, node]),
+                m: Default::default(),
+                theta: [(node, SchedPoint::Point)].into_iter().collect(),
+            };
+            extraction.m = Selected::new(&graph, &extraction, &[node], &mut NodeCache::default())
+                .unwrap()
+                .buffers(&graph);
+            let mut caps = caps();
+            caps.subgroups = Some(SubgroupWidths {
+                min: subgroup,
+                max: subgroup,
+            });
+            caps.limits.max_compute_invocations_per_workgroup = block;
+            caps.limits.max_compute_workgroup_size[0] = block;
+            caps.limits.max_compute_workgroup_storage_size = u32::MAX;
+            let cost = crate::Roofline::new(crate::facts::seed_facts(&caps));
+            let realized = realize(&graph, &[node], &extraction, &cost, arena.as_ref()).unwrap();
+            let component = &realized.components[0];
+            let query_index = component
+                .external
+                .iter()
+                .position(|id| graph.class_of(*id) == graph.class_of(query))
+                .unwrap();
+            let (bytes, rereads) = component.reads[query_index];
+            assert_eq!(bytes, 2 * 4 * width * 4);
+            assert_eq!(rereads, expected_rereads);
+            assert_eq!(
+                component.work.wg_bytes,
+                2 * 4 * (width + 2) * splits * u64::from(block / subgroup) * 8
+            );
         }
     }
 
