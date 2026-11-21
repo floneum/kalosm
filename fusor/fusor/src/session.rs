@@ -389,7 +389,7 @@ struct Twin {
 struct FamilyBindings<'a> {
     graph: &'a GraphRef,
     values: Vec<Id>,
-    saved: FxHashMap<Id, crate::graph::SavedBinding>,
+    saved: FxHashMap<Id, crate::graph::DeviceBinding>,
 }
 
 impl<'a> FamilyBindings<'a> {

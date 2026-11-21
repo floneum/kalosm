@@ -14,7 +14,7 @@ use fusor_ir::ir::logical::{BufferId, LeafKind, Logical};
 use fusor_ir::shape::{Dim, SymId};
 use fusor_ir::target::Buf;
 use parking_lot::Mutex;
-use rustc_hash::{FxHashMap, FxHashSet};
+use rustc_hash::FxHashMap;
 
 use crate::session::Session;
 use crate::tensor::Tensor;
@@ -41,34 +41,27 @@ impl WeakGraphRef {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct DeviceBinding {
+    buf: Buf,
+    layout: Option<Arc<fusor_ir::shape::Layout>>,
+    uploaded_backing: Option<Arc<fusor_ir::target::HostBytes>>,
+}
+
 /// Host bytes waiting to be uploaded for one external leaf, plus the device
 /// buffer once one exists. A `Persistent` leaf keeps its buffer across
 /// resolves; a `Step` leaf is re-uploaded whenever its bytes change.
 #[derive(Default)]
 pub(crate) struct LeafStore {
     pub(crate) bytes: FxHashMap<Id, Arc<fusor_ir::target::HostBytes>>,
-    /// The device buffer bound to a value, with the layout it was written
-    /// under when that is not the value's own dense shape. A selected
-    /// `Coop`/`Sgemm` geometry pads the output to its tile multiple, so a
-    /// readback that assumed contiguity would hand back the first row plus
-    /// padding.
-    device: FxHashMap<Id, (Buf, Option<Arc<fusor_ir::shape::Layout>>)>,
-    /// Only ordinary uploads witness these bindings' immutable host contents.
-    /// Rebinding or clearing a value removes its witness.
-    uploaded: FxHashSet<Id>,
+    /// The device buffer bound to a value, its non-dense layout when present,
+    /// and the exact host backing for uploads that may be shared by views.
+    device: FxHashMap<Id, DeviceBinding>,
     /// Compiler-created, read-only storage views. Ordinary mutable leaves do
     /// not join these groups merely because their host backing is identical.
     storage_owner: FxHashMap<Id, Id>,
     storage_views: FxHashMap<Id, Vec<Id>>,
     prepared_runs: Vec<Arc<crate::session::prepared::PreparedRun>>,
-}
-
-/// A temporary binding scope restores the buffer and its upload provenance
-/// together. Keeping the backing owner also prevents pointer reuse while the
-/// original binding is saved.
-pub(crate) struct SavedBinding {
-    device: (Buf, Option<Arc<fusor_ir::shape::Layout>>),
-    uploaded: Option<Arc<fusor_ir::target::HostBytes>>,
 }
 
 #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
@@ -78,51 +71,48 @@ pub(crate) struct HostUpload {
 }
 
 impl LeafStore {
-    pub(crate) fn snapshot_binding(&self, id: Id) -> Option<SavedBinding> {
-        Some(SavedBinding {
-            device: self.device.get(&id)?.clone(),
-            uploaded: self
-                .uploaded
-                .contains(&id)
-                .then(|| self.bytes.get(&id).cloned())
-                .flatten(),
-        })
+    pub(crate) fn snapshot_binding(&self, id: Id) -> Option<DeviceBinding> {
+        self.device.get(&id).cloned()
     }
 
     pub(crate) fn clear_binding(&mut self, id: Id) {
         self.device.remove(&id);
-        self.uploaded.remove(&id);
     }
 
-    pub(crate) fn restore_binding(&mut self, id: Id, saved: SavedBinding) {
-        self.uploaded.remove(&id);
-        if saved.uploaded.as_ref().is_some_and(|bytes| {
-            self.bytes
+    pub(crate) fn restore_binding(&mut self, id: Id, mut saved: DeviceBinding) {
+        if saved.uploaded_backing.as_ref().is_some_and(|bytes| {
+            !self
+                .bytes
                 .get(&id)
                 .is_some_and(|current| Arc::ptr_eq(bytes, current))
         }) {
-            self.uploaded.insert(id);
+            saved.uploaded_backing = None;
         }
-        self.device.insert(id, saved.device);
+        self.device.insert(id, saved);
     }
 
     fn reuse_uploaded_view(&mut self, id: Id) -> Option<Buf> {
-        if let Some((buf, _)) = self.device.get(&id) {
-            return Some(buf.clone());
+        if let Some(binding) = self.device.get(&id) {
+            return Some(binding.buf.clone());
         }
         let owner = self.storage_owner.get(&id).copied().unwrap_or(id);
-        let bytes = self.bytes.get(&id)?;
+        let bytes = self.bytes.get(&id)?.clone();
         let buf = self.storage_views.get(&owner)?.iter().find_map(|peer| {
-            (self.uploaded.contains(peer)
-                && self
-                    .bytes
-                    .get(peer)
-                    .is_some_and(|other| Arc::ptr_eq(bytes, other)))
-            .then(|| self.device.get(peer).map(|(buf, _)| buf.clone()))
-            .flatten()
+            let binding = self.device.get(peer)?;
+            binding
+                .uploaded_backing
+                .as_ref()
+                .filter(|other| Arc::ptr_eq(&bytes, other))
+                .map(|_| binding.buf.clone())
         })?;
-        self.device.insert(id, (buf.clone(), None));
-        self.uploaded.insert(id);
+        self.device.insert(
+            id,
+            DeviceBinding {
+                buf: buf.clone(),
+                layout: None,
+                uploaded_backing: Some(bytes),
+            },
+        );
         Some(buf)
     }
 }
@@ -631,12 +621,18 @@ impl GraphRef {
         if let Some(buf) = store.reuse_uploaded_view(id) {
             return Ok(Some(buf));
         }
-        let Some(bytes) = store.bytes.get(&id) else {
+        let Some(bytes) = store.bytes.get(&id).cloned() else {
             return Ok(None);
         };
         let buf = bytes.with_slice(upload)?;
-        store.device.insert(id, (buf.clone(), None));
-        store.uploaded.insert(id);
+        store.device.insert(
+            id,
+            DeviceBinding {
+                buf: buf.clone(),
+                layout: None,
+                uploaded_backing: Some(bytes),
+            },
+        );
         Ok(Some(buf))
     }
 
@@ -647,7 +643,7 @@ impl GraphRef {
             .lock()
             .device
             .get(&id)
-            .map(|(b, _)| b.clone())
+            .map(|binding| binding.buf.clone())
     }
 
     /// For each of `ids`, whether it is an external leaf the caller must
@@ -762,8 +758,14 @@ impl GraphRef {
             .is_some_and(|current| Arc::ptr_eq(current, bytes))
             && !store.device.contains_key(&id)
         {
-            store.device.insert(id, (buf, None));
-            store.uploaded.insert(id);
+            store.device.insert(
+                id,
+                DeviceBinding {
+                    buf,
+                    layout: None,
+                    uploaded_backing: Some(bytes.clone()),
+                },
+            );
         }
     }
 
@@ -777,8 +779,14 @@ impl GraphRef {
     ) {
         let mut store = self.state.leaves.lock();
         for id in ids {
-            store.device.insert(*id, (buf.clone(), layout.cloned()));
-            store.uploaded.remove(id);
+            store.device.insert(
+                *id,
+                DeviceBinding {
+                    buf: buf.clone(),
+                    layout: layout.cloned(),
+                    uploaded_backing: None,
+                },
+            );
         }
     }
 
@@ -797,8 +805,14 @@ impl GraphRef {
     /// this needs no e-graph lock and may run while one is held.
     pub(crate) fn bind_leaf(&self, id: Id, buf: Buf, layout: Option<Arc<fusor_ir::shape::Layout>>) {
         let mut store = self.state.leaves.lock();
-        store.device.insert(id, (buf, layout));
-        store.uploaded.remove(&id);
+        store.device.insert(
+            id,
+            DeviceBinding {
+                buf,
+                layout,
+                uploaded_backing: None,
+            },
+        );
     }
 
     /// Register each `(value, buffer, layout)` under every id of the value's
@@ -817,8 +831,14 @@ impl GraphRef {
         let mut store = self.state.leaves.lock();
         for ((_, buf, layout), members) in items.iter().zip(&classes) {
             for m in members.iter() {
-                store.device.insert(*m, (buf.clone(), layout.clone()));
-                store.uploaded.remove(m);
+                store.device.insert(
+                    *m,
+                    DeviceBinding {
+                        buf: buf.clone(),
+                        layout: layout.clone(),
+                        uploaded_backing: None,
+                    },
+                );
             }
         }
     }
@@ -829,7 +849,7 @@ impl GraphRef {
             .lock()
             .device
             .get(&id)
-            .and_then(|(_, l)| l.as_ref())
+            .and_then(|binding| binding.layout.as_ref())
             .map(|l| (**l).clone())
     }
 
