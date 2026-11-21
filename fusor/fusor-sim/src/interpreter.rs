@@ -2389,12 +2389,324 @@ mod tests {
     }
 
     #[test]
+    fn expression_reductions_follow_each_loop_iteration_per_lane() {
+        let index = Arc::new(fusor_ir::ir::kernel::LocalDecl::new(scalar(
+            ScalarElement::U32,
+        )));
+        let result = Arc::new(fusor_ir::ir::kernel::LocalDecl::new(scalar(
+            ScalarElement::F32,
+        )));
+        let index_value = TileExpr::new(
+            TileExprKind::LoadLocal(index.clone()),
+            scalar(ScalarElement::U32),
+        );
+        let partial = TileExpr::new(
+            TileExprKind::Cast {
+                value: index_value,
+                to: scalar(ScalarElement::F32),
+            },
+            scalar(ScalarElement::F32),
+        );
+        let reduce = TileExpr::new(
+            TileExprKind::Reduce {
+                op: fusor_ir::ir::kernel::TileReduceOp::Sum,
+                kind: Box::new(ReduceKind::Workgroup {
+                    scratch: Arc::new(fusor_ir::ir::kernel::TileDecl::new(
+                        scalar(ScalarElement::F32),
+                        TileLayout::contiguous(MemoryLevel::Workgroup, &[2]),
+                        "loop_reduce_scratch",
+                    )),
+                    group_size: 2,
+                }),
+                value: partial,
+            },
+            scalar(ScalarElement::F32),
+        );
+        let output = view(buffer(1, 2, BufferAccess::ReadWrite));
+        let ir = KernelIr {
+            buffers: vec![
+                buffer(0, 1, BufferAccess::Read),
+                buffer(1, 2, BufferAccess::ReadWrite),
+            ],
+            grid: [1, 1, 1],
+            block: 2,
+            body: vec![
+                Stmt::Loop {
+                    count: Some(literal_u32(3)),
+                    index: Some(index.clone()),
+                    accumulators: Vec::new(),
+                    body: vec![Stmt::StoreLocal {
+                        dst: result.clone(),
+                        value: reduce,
+                    }],
+                },
+                Stmt::Store {
+                    dst: output,
+                    addr: Addr::Linear(lane()),
+                    value: f32_load(&result),
+                    mask: bool_literal(true),
+                },
+            ],
+            byte_arena: None,
+            name: "dynamic_expr_reduce_test",
+        };
+        for seed in 0..32 {
+            let mut memory = BTreeMap::from([
+                (0, BindingMemory::uninitialized(0, 1)),
+                (1, BindingMemory::uninitialized(1, 2)),
+            ]);
+            Simulator::new(Limits::default())
+                .run(&ir, &mut memory, seed)
+                .unwrap_or_else(|error| panic!("seed {seed}: {error}"));
+            assert_eq!(
+                memory[&1].cells,
+                vec![Some(MemoryValue::F32(4.0)); 2],
+                "seed {seed}"
+            );
+        }
+    }
+
+    #[test]
+    fn unbounded_fill_tile_copies_each_nonuniform_2d_source_coordinate() {
+        let input = Arc::new(BufferDecl {
+            binding: 1,
+            element: scalar(ScalarElement::F32),
+            layout: TileLayout::contiguous(MemoryLevel::Storage, &[2, 3]),
+            access: BufferAccess::Read,
+        });
+        let input_view = view(input.clone());
+        let tile = Arc::new(fusor_ir::ir::kernel::TileDecl::new(
+            scalar(ScalarElement::F32),
+            TileLayout::contiguous(MemoryLevel::Workgroup, &[2, 3]),
+            "copied_2d_tile",
+        ));
+        let source = TileExpr::new(
+            TileExprKind::Load {
+                src: Source::Storage(input_view),
+                addr: Box::new(Addr::Rc2 {
+                    row: literal_u32(0),
+                    col: literal_u32(0),
+                }),
+                mask: bool_literal(true),
+                fill: f32_literal(0.0),
+            },
+            scalar(ScalarElement::F32),
+        );
+        let index = Arc::new(fusor_ir::ir::kernel::LocalDecl::new(scalar(
+            ScalarElement::U32,
+        )));
+        let output = view(buffer(2, 6, BufferAccess::ReadWrite));
+        let read_index = || {
+            TileExpr::new(
+                TileExprKind::LoadLocal(index.clone()),
+                scalar(ScalarElement::U32),
+            )
+        };
+        let ir = KernelIr {
+            buffers: vec![input, buffer(2, 6, BufferAccess::ReadWrite)],
+            grid: [1, 1, 1],
+            block: 1,
+            body: vec![
+                Stmt::FillTile {
+                    dst: tile.clone(),
+                    value: source,
+                    bounds: [None, None],
+                },
+                Stmt::Loop {
+                    count: Some(literal_u32(6)),
+                    index: Some(index.clone()),
+                    accumulators: Vec::new(),
+                    body: vec![Stmt::Store {
+                        dst: output,
+                        addr: Addr::Linear(read_index()),
+                        value: TileExpr::new(
+                            TileExprKind::LoadTile {
+                                tile,
+                                index: read_index(),
+                            },
+                            scalar(ScalarElement::F32),
+                        ),
+                        mask: bool_literal(true),
+                    }],
+                },
+            ],
+            byte_arena: None,
+            name: "unbounded_fill_tile_copy_test",
+        };
+        let expected = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mut memory = BTreeMap::from([
+            (1, BindingMemory::f32(1, expected)),
+            (2, BindingMemory::uninitialized(2, expected.len())),
+        ]);
+        Simulator::new(Limits::default())
+            .run(&ir, &mut memory, 17)
+            .unwrap();
+        assert_eq!(
+            memory[&2].cells,
+            expected
+                .into_iter()
+                .map(|value| Some(MemoryValue::F32(value)))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn linear_storage_address_is_already_a_physical_index() {
+        let input = Arc::new(BufferDecl {
+            binding: 1,
+            element: scalar(ScalarElement::F32),
+            layout: TileLayout::contiguous(MemoryLevel::Storage, &[6]),
+            access: BufferAccess::Read,
+        });
+        let mut input_view = view(input.clone());
+        input_view.layout = TileLayout::contiguous(MemoryLevel::Storage, &[2, 3]);
+        input_view.layout.indexing = MultiFlattenMap::affine(&[2, 3], &[1, 2]);
+        let output = view(buffer(2, 1, BufferAccess::ReadWrite));
+        let load = TileExpr::new(
+            TileExprKind::Load {
+                src: Source::Storage(input_view),
+                addr: Box::new(Addr::Linear(literal_u32(2))),
+                mask: bool_literal(true),
+                fill: f32_literal(0.0),
+            },
+            scalar(ScalarElement::F32),
+        );
+        let ir = KernelIr {
+            buffers: vec![input, buffer(2, 1, BufferAccess::ReadWrite)],
+            grid: [1, 1, 1],
+            block: 1,
+            body: vec![Stmt::Store {
+                dst: output,
+                addr: Addr::Linear(literal_u32(0)),
+                value: load,
+                mask: bool_literal(true),
+            }],
+            byte_arena: None,
+            name: "linear_physical_index_test",
+        };
+        let mut memory = BTreeMap::from([
+            (1, BindingMemory::f32(1, [0.0, 1.0, 2.0, 3.0, 4.0, 5.0])),
+            (2, BindingMemory::uninitialized(2, 1)),
+        ]);
+        Simulator::new(Limits::default())
+            .run(&ir, &mut memory, 5)
+            .unwrap();
+        assert_eq!(memory[&2].cells[0], Some(MemoryValue::F32(2.0)));
+    }
+
+    #[test]
+    fn storage_barrier_does_not_publish_workgroup_memory() {
+        let tile = Arc::new(fusor_ir::ir::kernel::TileDecl::new(
+            scalar(ScalarElement::F32),
+            TileLayout::contiguous(MemoryLevel::Workgroup, &[1]),
+            "storage_barrier_race",
+        ));
+        let condition = |lane_id| {
+            TileExpr::new(
+                TileExprKind::Compare {
+                    op: CmpOp::Eq,
+                    left: lane(),
+                    right: literal_u32(lane_id),
+                },
+                scalar(ScalarElement::Bool),
+            )
+        };
+        let local = Arc::new(fusor_ir::ir::kernel::LocalDecl::new(scalar(
+            ScalarElement::F32,
+        )));
+        let ir = KernelIr {
+            buffers: Vec::new(),
+            grid: [1, 1, 1],
+            block: 2,
+            body: vec![
+                Stmt::If {
+                    condition: condition(0),
+                    accept: vec![Stmt::StoreTile {
+                        dst: tile.clone(),
+                        index: literal_u32(0),
+                        value: f32_literal(5.0),
+                    }],
+                    reject: Vec::new(),
+                },
+                Stmt::StorageBarrier,
+                Stmt::If {
+                    condition: condition(1),
+                    accept: vec![Stmt::StoreLocal {
+                        dst: local,
+                        value: TileExpr::new(
+                            TileExprKind::LoadTile {
+                                tile,
+                                index: literal_u32(0),
+                            },
+                            scalar(ScalarElement::F32),
+                        ),
+                    }],
+                    reject: Vec::new(),
+                },
+            ],
+            byte_arena: None,
+            name: "storage_barrier_scope_test",
+        };
+        let mut memory = BTreeMap::new();
+        assert!(matches!(
+            Simulator::new(Limits::default()).run(&ir, &mut memory, 13),
+            Err(SimError::Execution { source, .. })
+                if matches!(&*source, SimError::Race { space, .. } if space == "workgroup")
+        ));
+    }
+
+    #[test]
+    fn expression_reductions_in_loop_accumulator_updates_are_rejected() {
+        let accumulator = Arc::new(fusor_ir::ir::kernel::LocalDecl::new(scalar(
+            ScalarElement::F32,
+        )));
+        let reduce = TileExpr::new(
+            TileExprKind::Reduce {
+                op: fusor_ir::ir::kernel::TileReduceOp::Sum,
+                kind: Box::new(ReduceKind::Workgroup {
+                    scratch: Arc::new(fusor_ir::ir::kernel::TileDecl::new(
+                        scalar(ScalarElement::F32),
+                        TileLayout::contiguous(MemoryLevel::Workgroup, &[2]),
+                        "accumulator_reduce_scratch",
+                    )),
+                    group_size: 2,
+                }),
+                value: f32_load(&accumulator),
+            },
+            scalar(ScalarElement::F32),
+        );
+        let ir = KernelIr {
+            buffers: Vec::new(),
+            grid: [1, 1, 1],
+            block: 2,
+            body: vec![Stmt::Loop {
+                count: Some(literal_u32(2)),
+                index: None,
+                accumulators: vec![Accumulator {
+                    local: accumulator,
+                    init: f32_literal(1.0),
+                    update: reduce,
+                }],
+                body: Vec::new(),
+            }],
+            byte_arena: None,
+            name: "loop_accumulator_reduce_test",
+        };
+        let mut memory = BTreeMap::new();
+        assert!(matches!(
+            Simulator::new(Limits::default()).run(&ir, &mut memory, 7),
+            Err(SimError::Execution { source, .. })
+                if matches!(*source, SimError::Unsupported(_))
+        ));
+    }
+
+    #[test]
     fn injected_out_of_bounds_and_uninitialized_reads_fail() {
         let (ir, mut memory) = store_kernel(2, [1, 1, 1], 3);
         let error = Simulator::new(Limits::default())
             .run(&ir, &mut memory, 1)
             .unwrap_err();
-        assert!(error.to_string().contains("logical address index 2"));
+        assert!(error.to_string().contains("index 2"));
 
         let input = view(buffer(1, 1, BufferAccess::Read));
         let output = view(buffer(2, 1, BufferAccess::ReadWrite));

@@ -80,13 +80,22 @@ pub fn campaign_with_limits(
     campaign_with_fault_hook(seed, iterations, limits, no_output_fault)
 }
 
-type OutputFault = fn(&mut [f32]);
+type OutputFault = fn(&str, &mut [f32]);
 
-fn no_output_fault(_: &mut [f32]) {}
+fn no_output_fault(_: &str, _: &mut [f32]) {}
 
 #[cfg(test)]
-fn injected_output_discrepancy(output: &mut [f32]) {
+fn injected_output_discrepancy(_: &str, output: &mut [f32]) {
     if let Some(value) = output.first_mut() {
+        *value += 1.0;
+    }
+}
+
+#[cfg(test)]
+fn injected_nonbase_discrepancy(candidate: &str, output: &mut [f32]) {
+    if candidate != "base"
+        && let Some(value) = output.first_mut()
+    {
         *value += 1.0;
     }
 }
@@ -152,6 +161,7 @@ fn campaign_with_fault_hook(
                 seed ^ u64::from(iteration).rotate_left(17) ^ work.plan.hash.0 as u64,
                 None,
                 output_fault,
+                &work.candidate,
             );
             total.dispatches += execution.dispatches;
             total.steps += execution.steps;
@@ -210,11 +220,12 @@ fn campaign_with_fault_hook(
                     match candidate_result {
                         Ok(plan) => {
                             if queue.len() < MAX_PLANS_PER_CASE {
+                                let candidate = candidate_path(&selections);
                                 queue.push_back(PlanWork {
                                     plan,
                                     selections,
                                     next_launch: launch + 1,
-                                    candidate: format!("{} -> {}", work.candidate, label),
+                                    candidate,
                                 });
                             }
                         }
@@ -224,7 +235,7 @@ fn campaign_with_fault_hook(
                                 "candidate-replan",
                                 recipe.clone(),
                                 inputs.clone(),
-                                format!("{} -> {}", work.candidate, label),
+                                candidate_path(&selections),
                                 selections,
                                 Vec::new(),
                                 error.to_string(),
@@ -324,6 +335,7 @@ fn replay_failure_with_fault(
         0,
         Some(&record.trace),
         output_fault,
+        &record.candidate,
     );
     match execution.result {
         Err((error, _)) => {
@@ -406,10 +418,12 @@ fn minimize_failure_with_fault(
 ) -> Result<FailureRecord, String> {
     replay_failure_with_fault(record, output_fault)?;
     let current = minimize_failure_search(record, |recipe| {
-        first_failure_for_recipe(recipe, record.limits, output_fault).map(|mut failure| {
-            failure.limits = record.limits;
-            failure
-        })
+        first_failure_for_recipe(recipe, record.limits, output_fault, Some(record)).map(
+            |mut failure| {
+                failure.limits = record.limits;
+                failure
+            },
+        )
     });
     replay_failure_with_fault(&current, output_fault)?;
     Ok(current)
@@ -511,13 +525,22 @@ fn shape_identity(recipe: &Recipe) -> (RecipeKind, u32, u32, u32) {
     }
 }
 
+fn candidate_path(selections: &[CandidateSelection]) -> String {
+    selections
+        .iter()
+        .fold("base".to_owned(), |path, selection| {
+            format!("{path} -> {}", selection.label)
+        })
+}
+
 fn first_failure_for_recipe(
     recipe: &Recipe,
     limits: Limits,
     output_fault: OutputFault,
+    target: Option<&FailureRecord>,
 ) -> Option<FailureRecord> {
     let inputs = generate_inputs(recipe);
-    let prepared = match prepare(recipe) {
+    let mut prepared = match prepare(recipe) {
         Ok(prepared) => prepared,
         Err(error) => {
             return Some(failure_record(
@@ -532,6 +555,63 @@ fn first_failure_for_recipe(
         }
     };
     let expected = reference(recipe, &inputs);
+    if let Some(target) = target {
+        if target.kind == "planning" {
+            return None;
+        }
+        let candidate = candidate_path(&target.selections);
+        let (plan, candidate_error) = apply_selections(&mut prepared, &target.selections).ok()?;
+        if target.kind == "candidate-replan" {
+            return candidate_error.map(|error| {
+                failure_record(
+                    "candidate-replan",
+                    recipe.clone(),
+                    inputs,
+                    candidate,
+                    target.selections.clone(),
+                    Vec::new(),
+                    error,
+                )
+            });
+        }
+        if candidate_error.is_some() {
+            return None;
+        }
+        let execution = execute_plan_with_limits(
+            &prepared.graph,
+            &prepared.roots,
+            &prepared.caps,
+            &plan?,
+            &inputs,
+            limits,
+            recipe.input_seed,
+            None,
+            output_fault,
+            &candidate,
+        );
+        return match execution.result {
+            Err((error, traces)) => Some(failure_record(
+                &classify_sim_error(&error),
+                recipe.clone(),
+                inputs,
+                candidate,
+                target.selections.clone(),
+                traces,
+                error,
+            )),
+            Ok(actual) => compare_results(&actual, &expected).map(|detail| {
+                failure_record(
+                    "differential",
+                    recipe.clone(),
+                    inputs,
+                    candidate,
+                    target.selections.clone(),
+                    execution.traces,
+                    detail,
+                )
+            }),
+        };
+    }
     let base = execute_plan_with_limits(
         &prepared.graph,
         &prepared.roots,
@@ -542,6 +622,7 @@ fn first_failure_for_recipe(
         recipe.input_seed,
         None,
         output_fault,
+        "base",
     );
     match base.result {
         Err((error, traces)) => {
@@ -586,7 +667,7 @@ fn first_failure_for_recipe(
                         "candidate-replan",
                         recipe.clone(),
                         inputs,
-                        label,
+                        candidate_path(&selection),
                         selection,
                         Vec::new(),
                         error.to_string(),
@@ -603,6 +684,7 @@ fn first_failure_for_recipe(
                         recipe.input_seed,
                         None,
                         output_fault,
+                        &candidate_path(&selection),
                     );
                     match execution.result {
                         Err((error, traces)) => {
@@ -610,7 +692,7 @@ fn first_failure_for_recipe(
                                 &classify_sim_error(&error),
                                 recipe.clone(),
                                 inputs,
-                                label,
+                                candidate_path(&selection),
                                 selection,
                                 traces,
                                 error,
@@ -622,7 +704,7 @@ fn first_failure_for_recipe(
                                     "differential",
                                     recipe.clone(),
                                     inputs,
-                                    label,
+                                    candidate_path(&selection),
                                     selection,
                                     execution.traces,
                                     detail,
@@ -987,6 +1069,7 @@ fn execute_plan(
         seed,
         replay_traces,
         no_output_fault,
+        "base",
     )
 }
 
@@ -1001,6 +1084,7 @@ fn execute_plan_with_limits(
     seed: u64,
     replay_traces: Option<&[ScheduleTrace]>,
     output_fault: OutputFault,
+    candidate: &str,
 ) -> PlanExecution {
     let mut memories = match allocate_memories(graph, plan, inputs) {
         Ok(memories) => memories,
@@ -1102,7 +1186,7 @@ fn execute_plan_with_limits(
         Ok(output) => output,
         Err(error) => return failed_execution(error, traces, steps, plan.launches.len() as u64),
     };
-    output_fault(&mut output);
+    output_fault(candidate, &mut output);
     PlanExecution {
         result: Ok(output),
         traces,
@@ -1784,6 +1868,28 @@ mod tests {
     }
 
     #[test]
+    fn injected_nonbase_discrepancy_shrinks_with_exact_candidate_path() {
+        let record =
+            campaign_with_fault_hook(7, 16, Limits::default(), injected_nonbase_discrepancy)
+                .unwrap()
+                .first_failure
+                .expect("non-base discrepancy must be detected");
+        assert_eq!(record.kind, "differential");
+        assert_ne!(record.candidate, "base");
+        assert!(!record.selections.is_empty());
+        let record: FailureRecord =
+            serde_json::from_slice(&serde_json::to_vec(&record).unwrap()).unwrap();
+        assert!(replay_failure_with_fault(&record, injected_nonbase_discrepancy).is_ok());
+        let minimized = minimize_failure_with_fault(&record, injected_nonbase_discrepancy).unwrap();
+        assert!(recipe_complexity(&minimized.recipe) < recipe_complexity(&record.recipe));
+        assert_eq!(minimized.candidate, record.candidate);
+        assert_eq!(minimized.selections, record.selections);
+        let minimized: FailureRecord =
+            serde_json::from_slice(&serde_json::to_vec(&minimized).unwrap()).unwrap();
+        assert!(replay_failure_with_fault(&minimized, injected_nonbase_discrepancy).is_ok());
+    }
+
+    #[test]
     fn invocation_limit_campaign_failure_replays_and_rejects_extra_traces() {
         let limits = Limits {
             max_invocations: 1,
@@ -1819,7 +1925,7 @@ mod tests {
             max_steps: 1,
             ..Limits::default()
         };
-        let mut record = first_failure_for_recipe(&recipe, limits, no_output_fault)
+        let mut record = first_failure_for_recipe(&recipe, limits, no_output_fault, None)
             .expect("low step limit should fail a real lowered dispatch");
         assert_eq!(record.kind, "resource-limit");
         assert!(record.trace.len() < prepare(&recipe).unwrap().plan.launches.len());
