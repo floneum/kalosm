@@ -212,12 +212,24 @@ fn hash_shape<H: Hasher>(h: &mut H, shape: &[Dim]) {
 
 /// A memoized plan against the graph as it stands now.
 enum Canonical {
-    /// Every class key is still its class's representative.
+    /// Every selected member is still in the class named by its key.
     Current,
     /// Representatives moved; here is the same plan rekeyed.
     Moved(Box<Plan>),
     /// Two selected classes have merged: not a selection any more.
     Merged,
+}
+
+/// Keep `plan` usable after an additive graph rewrite that moved class
+/// representatives, provided its selected classes did not merge.
+pub fn rekey_plan(graph: &EGraph, plan: &Plan) -> Option<Plan> {
+    let mut plan = match recanonicalize(graph, plan) {
+        Canonical::Current => plan.clone(),
+        Canonical::Moved(plan) => *plan,
+        Canonical::Merged => return None,
+    };
+    plan.extraction.m.grow(graph.len());
+    Some(plan)
 }
 
 fn recanonicalize(graph: &EGraph, plan: &Plan) -> Canonical {
@@ -226,10 +238,10 @@ fn recanonicalize(graph: &EGraph, plan: &Plan) -> Canonical {
     // A node this graph never minted means extracting again here.
     let mut moved = false;
     for (class, member) in sigma {
-        if class.0.index() >= len || member.index() >= len {
+        if member.index() >= len {
             return Canonical::Merged;
         }
-        moved |= graph.class_of(class.0) != *class;
+        moved |= graph.class_of(*member) != *class;
     }
     if !moved {
         return Canonical::Current;
@@ -245,18 +257,21 @@ fn recanonicalize(graph: &EGraph, plan: &Plan) -> Canonical {
     }
 }
 
-/// `sigma` under `class_of` now: `None` when unmoved, `Some(None)` when two
-/// keys merged onto different members, else the rekeyed map.
+/// `sigma` keyed by the selected members' current classes: `None` when
+/// unmoved, `Some(None)` when selections merged onto different members.
 fn recanonicalize_sigma(
     sigma: &FxHashMap<ClassId, Id>,
     class_of: impl Fn(Id) -> ClassId,
 ) -> Option<Option<FxHashMap<ClassId, Id>>> {
-    if sigma.keys().all(|c| class_of(c.0) == *c) {
+    if sigma
+        .iter()
+        .all(|(class, member)| class_of(*member) == *class)
+    {
         return None;
     }
     let mut out = FxHashMap::with_capacity_and_hasher(sigma.len(), Default::default());
-    for (class, member) in sigma {
-        if let Some(other) = out.insert(class_of(class.0), *member)
+    for member in sigma.values() {
+        if let Some(other) = out.insert(class_of(*member), *member)
             && other != *member
         {
             return Some(None);
