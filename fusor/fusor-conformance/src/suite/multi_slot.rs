@@ -165,9 +165,9 @@ async fn symbolic_tiled_map_case(session: &Session) -> CaseResult {
         let leaf =
             fusor::Tensor::<2>::try_from_dyn(upload(graph.handle(), &dims(&[rows, len]), &chunk)?)?;
         let input = cache.append(&leaf);
-        for row in 0..rows as usize {
+        for (row, expected_row) in expected_rows.iter_mut().enumerate() {
             let start = row * len as usize;
-            expected_rows[row].extend(chunk[start..start + len as usize].iter().map(|v| v * 2.0));
+            expected_row.extend(chunk[start..start + len as usize].iter().map(|v| v * 2.0));
         }
         let expected: Vec<f32> = expected_rows.iter().flatten().copied().collect();
         cached_len += len;
