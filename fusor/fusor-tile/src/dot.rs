@@ -6,6 +6,20 @@ use fusor_ir::ir::kernel::{ScalarElement, TileBinaryOp as Op, TileExpr, TileExpr
 
 mod fields;
 
+fn work(expr: &TileExpr) -> usize {
+    fn visit(expr: &TileExpr, seen: &mut rustc_hash::FxHashSet<TileExpr>) {
+        if !seen.insert(expr.clone()) {
+            return;
+        }
+        expr.kind().visit_children(&mut |e| visit(e, seen));
+    }
+    let mut seen = rustc_hash::FxHashSet::default();
+    visit(expr, &mut seen);
+    seen.iter()
+        .filter(|e| matches!(e.kind(), K::Binary { .. } | K::Unary { .. } | K::Dot { .. }))
+        .count()
+}
+
 /// Accumulate products, extracting factors shared across the unrolled window.
 /// Strict arithmetic keeps its original left-to-right evaluation. Expansion is
 /// bounded; an oversized or non-f32 window keeps the original expression too.
@@ -48,45 +62,36 @@ pub fn accumulate(
         numeric,
     );
     let original = original();
-    // Expansion can increase work when a fused pre-expression has no repeated
-    // factor. Keep the original unless the shared DAG actually gets smaller.
-    fn work(expr: &TileExpr) -> usize {
-        fn visit(expr: &TileExpr, seen: &mut rustc_hash::FxHashSet<TileExpr>) {
-            if !seen.insert(expr.clone()) {
-                return;
-            }
-            expr.kind().visit_children(&mut |e| visit(e, seen));
-        }
-        let mut seen = rustc_hash::FxHashSet::default();
-        visit(expr, &mut seen);
-        seen.iter()
-            .filter(|e| matches!(e.kind(), K::Binary { .. } | K::Unary { .. } | K::Dot { .. }))
-            .count()
+    let mut best = original;
+    let mut best_cost = work(&best);
+    let candidate_cost = work(&candidate);
+    if candidate_cost < best_cost {
+        best = candidate;
+        best_cost = candidate_cost;
     }
-    if work(&candidate) < work(&original) {
-        if fields::pack_casts(b, &mut terms, numeric) {
-            let mut expanded = Vec::new();
-            for term in terms {
-                let value = term
-                    .factors
-                    .into_iter()
-                    .reduce(|a, c| b.binary(Op::Mul, a, c, numeric))
-                    .unwrap_or_else(|| b.f32(1.));
-                let Some(mut parts) = expand(&value, 128 - expanded.len()) else {
-                    return candidate;
-                };
-                for part in &mut parts {
-                    part.negative ^= term.negative;
-                }
-                expanded.extend(parts);
+    if fields::pack_casts(b, &mut terms, numeric) {
+        let mut expanded = Vec::new();
+        for term in terms {
+            let value = term
+                .factors
+                .into_iter()
+                .reduce(|a, c| b.binary(Op::Mul, a, c, numeric))
+                .unwrap_or_else(|| b.f32(1.));
+            let Some(mut parts) = expand(&value, 128 - expanded.len()) else {
+                return best;
+            };
+            for part in &mut parts {
+                part.negative ^= term.negative;
             }
-            b.binary(Op::Add, initial, factor(b, expanded, numeric, 0), numeric)
-        } else {
-            candidate
+            expanded.extend(parts);
         }
-    } else {
-        original
+        let packed = b.binary(Op::Add, initial, factor(b, expanded, numeric, 0), numeric);
+        let packed_cost = work(&packed);
+        if packed_cost < best_cost {
+            best = packed;
+        }
     }
+    best
 }
 
 #[derive(Clone)]
@@ -297,6 +302,53 @@ mod tests {
         let mut n = usize::from(matches!(e.kind(), K::Binary { op: Op::Mul, .. }));
         e.kind().visit_children(&mut |c| n += multiplies(c));
         n
+    }
+
+    #[test]
+    fn packed_cast_expansion_keeps_the_best_final_dag() {
+        let b = Kernel::new();
+        let numeric = NumericContract::RELAXED;
+        let word = b.load_local(b.local(ScalarElement::U32.element()));
+        let scale = b.load_local(b.local(ScalarElement::F32.element()));
+        let low = b.cast(
+            b.binary(Op::BitAnd, word.clone(), b.u32(1023), numeric),
+            ScalarElement::F32.element(),
+        );
+        let high = b.cast(
+            b.binary(
+                Op::BitAnd,
+                b.binary(Op::Shr, word, b.u32(16), numeric),
+                b.u32(1023),
+                numeric,
+            ),
+            ScalarElement::F32.element(),
+        );
+        let pairs = vec![(low.clone(), scale.clone()), (high.clone(), scale.clone())];
+        let initial = b.f32(0.);
+        let original = pairs.iter().fold(initial.clone(), |sum, (a, c)| {
+            b.binary(
+                Op::Add,
+                sum,
+                b.binary(Op::Mul, a.clone(), c.clone(), numeric),
+                numeric,
+            )
+        });
+        let expected = b.binary(
+            Op::Add,
+            initial.clone(),
+            b.binary(
+                Op::Mul,
+                b.binary(Op::Add, low.clone(), high.clone(), numeric),
+                scale,
+                numeric,
+            ),
+            numeric,
+        );
+        let result = accumulate(&b, initial, &pairs, numeric);
+        assert_eq!(work(&original), 7);
+        assert_eq!(work(&expected), 6);
+        // The old scoring guard returned an 11-work packed DAG for this input.
+        assert!(work(&result) <= work(&expected));
     }
     #[test]
     fn common_scales_and_offsets_are_factored_without_format_metadata() {

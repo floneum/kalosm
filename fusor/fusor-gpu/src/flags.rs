@@ -46,7 +46,6 @@ pub(crate) struct Flags {
     pub dump_contract: bool,
     /// Diagnostic SGEMV accumulation chains per column; default preserves order.
     pub gemv_chains: usize,
-    pub gemv_contiguous_n: bool,
     pub scatter_single_linear: Option<u32>,
     pub time_passes: bool,
     pub no_debug_groups: bool,
@@ -134,7 +133,6 @@ pub(crate) fn flags() -> &'static Flags {
                     n
                 })
                 .unwrap_or(1),
-            gemv_contiguous_n: on("FUSOR_PROFILE_GEMV_CONTIGUOUS_N"),
             scatter_single_linear: std::env::var("FUSOR_PROFILE_SCATTER_SINGLE_LINEAR")
                 .ok()
                 .map(|s| {
