@@ -423,8 +423,7 @@ fn hash_both(lanes: &mut [FxHasher; 2], value: &impl Hash) {
 pub(crate) fn without_schedule(op: &Op) -> Op {
     let mut op = op.clone();
     if let Op::Launch(
-        Launch::RmsNorm { sched, .. }
-        | Launch::Map { sched, .. }
+        Launch::Map { sched, .. }
         | Launch::Fold { sched, .. }
         | Launch::StreamFold { sched, .. }
         | Launch::Contract { sched, .. }

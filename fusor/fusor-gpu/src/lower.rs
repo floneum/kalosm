@@ -6,7 +6,6 @@ pub(crate) mod contract;
 pub(crate) mod gather_scatter;
 pub(crate) mod group;
 pub(crate) mod map_fold;
-mod rms_norm;
 pub(crate) mod slab;
 
 use fusor_cost::realize::distribute_workgroups;
@@ -1204,7 +1203,6 @@ fn lower_launch(ctx: Ctx<'_>, node: &Node, theta: SchedPoint, member: bool) -> R
         )));
     };
     match op {
-        Launch::RmsNorm { .. } => rms_norm::lower(ctx, op),
         Launch::Map { .. } => map_fold::lower_kmap(ctx, op, theta),
         Launch::Fold { .. } | Launch::StreamFold { .. } => map_fold::lower_kfold(ctx, op, theta),
         Launch::Contract { family, .. } => contract::lower_contract(ctx, op, *family, theta),

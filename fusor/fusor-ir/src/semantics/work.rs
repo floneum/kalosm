@@ -277,16 +277,6 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             }
         }
 
-        Launch::RmsNorm {
-            output, width, ops, ..
-        } => Work {
-            macs: output
-                .iterations()
-                .unwrap_or(0)
-                .saturating_mul(3 + u64::from(ops.len() == 3)),
-            transcendentals: output.iterations().unwrap_or(0) / u64::from(*width).max(1),
-            ..Work::default()
-        },
         // Members carry their own work; sequencing adds none.
         Launch::Slab { .. } | Launch::Group { .. } => Work::default(),
     }

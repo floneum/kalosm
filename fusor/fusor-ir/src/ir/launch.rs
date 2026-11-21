@@ -10,24 +10,10 @@ use crate::shape::{Dim, Dims, Layout, MultiFlattenMap, SlidingWindow};
 use smallvec::SmallVec;
 use std::sync::Arc;
 
-/// Bound retained row values per lane so normalization does not create an
-/// unbounded straight-line shader or register footprint.
-pub const MAX_NORMALIZATION_VALUES_PER_LANE: u32 = 32;
-
 /// The Launch op family.
 #[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Launch {
-    /// F32 row-wise RMS normalization: input, learned scale, and an optional
-    /// same-shaped residual added before the square-sum reduction.
-    RmsNorm {
-        output: IndexSpace,
-        width: u32,
-        block: u32,
-        epsilon: ScalarExpr,
-        ops: Vec<Operand>,
-        sched: ScheduleDomain,
-    },
     Map {
         space: IndexSpace,
         body: ScalarExpr,
@@ -295,7 +281,6 @@ impl Launch {
 
     pub const fn tag(&self) -> OpTag {
         match self {
-            Self::RmsNorm { .. } => OpTag::LaunchRmsNorm,
             Self::Map { .. } => OpTag::LaunchMap,
             Self::Fold { .. } => OpTag::LaunchFold,
             Self::StreamFold { .. } => OpTag::LaunchStreamFold,
@@ -334,8 +319,7 @@ impl Launch {
     /// two sides.
     fn operand_lists(&self) -> [&[Operand]; 2] {
         match self {
-            Self::RmsNorm { ops, .. }
-            | Self::Map { ops, .. }
+            Self::Map { ops, .. }
             | Self::Fold { ops, .. }
             | Self::Gather { ops, .. }
             | Self::Scatter { ops, .. } => [ops, &[]],
@@ -372,8 +356,7 @@ impl Launch {
     /// side then its B side.
     pub fn operands_mut(&mut self) -> impl Iterator<Item = &mut Operand> {
         let [a, b]: [&mut [Operand]; 2] = match self {
-            Self::RmsNorm { ops, .. }
-            | Self::Map { ops, .. }
+            Self::Map { ops, .. }
             | Self::Fold { ops, .. }
             | Self::Gather { ops, .. }
             | Self::Scatter { ops, .. } => [ops, &mut []],
@@ -386,8 +369,7 @@ impl Launch {
     /// This node's enumerable schedule space.
     pub fn schedule(&self) -> Option<&ScheduleDomain> {
         match self {
-            Self::RmsNorm { sched, .. }
-            | Self::Map { sched, .. }
+            Self::Map { sched, .. }
             | Self::Fold { sched, .. }
             | Self::StreamFold { sched, .. }
             | Self::Contract { sched, .. }

@@ -9,42 +9,6 @@ use crate::ir::launch::Launch;
 /// Infer the result facts of a Launch node from its operands' facts.
 pub fn infer_launch(op: &Launch, ins: &[ValueFacts]) -> Result<ValueFacts> {
     match op {
-        Launch::RmsNorm {
-            output,
-            width,
-            block,
-            epsilon,
-            ops,
-            ..
-        } => {
-            let mut args = Vec::new();
-            epsilon.collect_args(&mut args);
-            if *width == 0
-                || width.div_ceil((*block).max(1))
-                    > crate::ir::launch::MAX_NORMALIZATION_VALUES_PER_LANE
-                || !matches!(*block, 32 | 64 | 128 | 256 | 512 | 1024)
-                || output.dims.last().and_then(|d| d.as_const()) != Some(u64::from(*width))
-                || output
-                    .iterations()
-                    .is_none_or(|n| n == 0 || n > u64::from(u32::MAX))
-                || !matches!(ops.len(), 2 | 3)
-                || ins.len() != ops.len()
-                || ins.iter().any(|f| f.dtype != Dtype::F32)
-                || epsilon.dtype() != Dtype::F32
-                || !args.is_empty()
-                || epsilon.reads_index_of()
-                || ops[0].layout.shape() != output.dims.as_slice()
-                || ops[1].layout.shape() != [crate::shape::Dim::Const(u64::from(*width))]
-                || ops
-                    .get(2)
-                    .is_some_and(|r| r.layout.shape() != output.dims.as_slice())
-            {
-                return Err(Error::Shape(
-                    "unsupported fused RMS normalization geometry".into(),
-                ));
-            }
-            Ok(ValueFacts::step(Dtype::F32, output.dims.clone(), ins))
-        }
         Launch::StreamFold {
             producer,
             fold,

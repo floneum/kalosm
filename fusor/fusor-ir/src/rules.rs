@@ -8,7 +8,6 @@ pub mod fusion;
 pub mod group;
 pub mod layout;
 pub mod lower_floor;
-pub mod normalization;
 pub mod promote;
 pub mod rebase;
 pub mod scatter_fold;
@@ -37,7 +36,6 @@ pub struct RuleId(pub u16);
 /// Every rule `fusor-ir` owns, in a fixed order.
 pub static CORE_RULES: &[Rule] = &[
     // Logical algebra
-    normalization::FUSE_ROW_NORMALIZATION,
     algebra::STRIP,
     algebra::RECOGNIZE_CONTRACT,
     algebra::CONTRACT_REASSOC,

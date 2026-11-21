@@ -829,9 +829,6 @@ pub(crate) fn tile_bytes(
     caps: &Caps,
     arena: &dyn ArenaPlanner,
 ) -> Result<u32> {
-    if let Op::Launch(Launch::RmsNorm { block, .. }) = graph.node(id).op {
-        return Ok(block * 4);
-    }
     let scratch = fold_scratch_elements(graph, id, theta, caps);
     let tiles = tiles_for(theta, scalar_element(graph.facts(id).dtype), scratch);
     arena.workgroup_bytes(&tiles, caps)
@@ -1765,15 +1762,6 @@ fn member_geometry(graph: &EGraph, extraction: &Extraction, m: Id, caps: &Caps) 
         _ => None,
     };
     match launch {
-        Some(Launch::RmsNorm {
-            output,
-            width,
-            block,
-            ..
-        }) => Geometry {
-            block: *block,
-            workgroups: output.iterations().unwrap_or(0) / u64::from(*width).max(1),
-        },
         Some(Launch::Slab { slabs, members, .. }) => Geometry {
             block: slab_block_of(graph, *slabs, members, caps),
             workgroups: u64::from(*slabs).max(1),
