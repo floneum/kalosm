@@ -220,6 +220,18 @@ enum Canonical {
     Merged,
 }
 
+/// Keep `plan` usable after an additive graph rewrite that moved class
+/// representatives, provided its selected classes did not merge.
+pub fn rekey_plan(graph: &EGraph, plan: &Plan) -> Option<Plan> {
+    let mut plan = match recanonicalize(graph, plan) {
+        Canonical::Current => plan.clone(),
+        Canonical::Moved(plan) => *plan,
+        Canonical::Merged => return None,
+    };
+    plan.extraction.m.grow(graph.len());
+    Some(plan)
+}
+
 fn recanonicalize(graph: &EGraph, plan: &Plan) -> Canonical {
     let sigma = &plan.extraction.sigma;
     let len = graph.len();

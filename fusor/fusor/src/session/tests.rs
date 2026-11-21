@@ -1,6 +1,8 @@
 use super::*;
 use crate::graph::Graph;
 use fusor_ir::ir::launch::SchedPoint;
+#[cfg(all(feature = "cpu", not(target_arch = "wasm32")))]
+use std::sync::atomic::{AtomicBool, AtomicUsize};
 
 /// Plan `roots` selecting exactly `members`, with `launch` at `point` or, by
 /// default, its first schedule point.
@@ -40,6 +42,217 @@ fn run_f32(session: &Session, h: &GraphRef, plan: &Plan, out: &Tensor) -> Vec<f3
     session.run(h, plan, std::slice::from_ref(out)).unwrap();
     let bytes = session.read_bytes_locked(&resolving, h, out.id).unwrap();
     bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+}
+
+#[cfg(all(feature = "cpu", not(target_arch = "wasm32")))]
+struct RejectFirstForwardReplan {
+    delegate: Arc<dyn Extractor>,
+    replan_attempts: AtomicUsize,
+    rejected: AtomicBool,
+    forced_selection: AtomicBool,
+    view_output: std::sync::Mutex<Option<(Id, Id)>>,
+    extract_calls: AtomicUsize,
+    seeded_calls: AtomicUsize,
+}
+
+#[cfg(all(feature = "cpu", not(target_arch = "wasm32")))]
+impl Extractor for RejectFirstForwardReplan {
+    fn lower_bound(
+        &self,
+        graph: &EGraph,
+        cost: &dyn CostModel,
+    ) -> Vec<fusor_ir::cost::Picoseconds> {
+        self.delegate.lower_bound(graph, cost)
+    }
+
+    fn extract(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        cost: &dyn CostModel,
+        budget: ExtractBudget,
+    ) -> fusor_ir::Result<Plan> {
+        self.extract_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let plan = self.delegate.extract(graph, roots, cost, budget)?;
+        let Some((view, output)) = *self.view_output.lock().unwrap() else {
+            return Ok(plan);
+        };
+        if self
+            .forced_selection
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Ok(plan);
+        }
+
+        let view_class = graph.class_of(view);
+        let output_class = graph.class_of(output);
+        let is_view_copy = |id: Id| {
+            matches!(
+                &graph.node(id).op,
+                Op::Launch(fusor_ir::ir::launch::Launch::Map { body, ops, .. })
+                    if ops.len() == 1
+                        && matches!(body.kind(), fusor_ir::scalar::ScalarKind::Arg(0))
+                        && matches!(ops[0].access, fusor_ir::ir::launch::AccessPlan::Alias)
+            )
+        };
+        let view_copy = (0..graph.len())
+            .map(|i| Id(i as u32))
+            .find(|id| graph.class_of(*id) == view_class && is_view_copy(*id));
+        let consumer = (0..graph.len()).map(|i| Id(i as u32)).find(|id| {
+            if graph.class_of(*id) != output_class {
+                return false;
+            }
+            let Op::Launch(launch) = &graph.node(*id).op else {
+                return false;
+            };
+            launch
+                .operands()
+                .any(|operand| graph.class_of(operand.src) == view_class)
+        });
+        let (Some(view_copy), Some(consumer)) = (view_copy, consumer) else {
+            return Err(fusor_ir::Error::Plan(
+                "test graph lacks a selectable view copy and consumer".into(),
+            ));
+        };
+        let mut extraction = plan.extraction.clone();
+        extraction.sigma.insert(view_class, view_copy);
+        extraction.sigma.insert(output_class, consumer);
+        extraction.theta.retain(|node, _| {
+            let class = graph.class_of(*node);
+            class != view_class && class != output_class
+        });
+        self.delegate
+            .replan_extraction(graph, roots, &mut extraction, cost)
+    }
+
+    fn extract_seeded(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        cost: &dyn CostModel,
+        budget: ExtractBudget,
+        seed: &Plan,
+    ) -> fusor_ir::Result<Plan> {
+        self.seeded_calls
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.delegate
+            .extract_seeded(graph, roots, cost, budget, seed)
+    }
+
+    fn replan_extraction(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        ex: &mut fusor_ir::extract::Extraction,
+        cost: &dyn CostModel,
+    ) -> fusor_ir::Result<Plan> {
+        self.replan_attempts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if !self
+            .rejected
+            .swap(true, std::sync::atomic::Ordering::Relaxed)
+        {
+            return Err(fusor_ir::Error::Plan(
+                "injected optional forwarding replan failure".into(),
+            ));
+        }
+        self.delegate.replan_extraction(graph, roots, ex, cost)
+    }
+
+    #[cfg(feature = "compiler-tests")]
+    fn verify_plan(&self, graph: &EGraph, plan: &Plan) -> fusor_ir::Result<()> {
+        self.delegate.verify_plan(graph, plan)
+    }
+
+    #[cfg(feature = "compiler-tests")]
+    fn test_launch_variants(
+        &self,
+        graph: &EGraph,
+        roots: &[Id],
+        base: &Plan,
+        launch_ix: usize,
+        cost: &dyn CostModel,
+    ) -> Vec<(String, Plan)> {
+        self.delegate
+            .test_launch_variants(graph, roots, base, launch_ix, cost)
+    }
+}
+
+#[test]
+#[cfg(all(feature = "cpu", not(target_arch = "wasm32")))]
+fn optional_view_forward_replan_failure_keeps_the_incumbent_executable() {
+    let mut session = Session::new(Backend::cpu().unwrap()).unwrap();
+    let delegate = Arc::clone(&session.inner.extractor);
+    let rejecting = Arc::new(RejectFirstForwardReplan {
+        delegate,
+        replan_attempts: AtomicUsize::new(0),
+        rejected: AtomicBool::new(false),
+        forced_selection: AtomicBool::new(false),
+        view_output: std::sync::Mutex::new(None),
+        extract_calls: AtomicUsize::new(0),
+        seeded_calls: AtomicUsize::new(0),
+    });
+    Arc::get_mut(&mut session.inner)
+        .expect("session is uniquely owned")
+        .extractor = rejecting.clone();
+
+    let graph = Graph::new(&session);
+    let h = graph.handle();
+    let input = Tensor::from_elements(
+        h,
+        &[Dim::Const(2), Dim::Const(3)],
+        &[1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+    )
+    .unwrap();
+    let view = input.transpose(0, 1).unwrap();
+    let output = view.add_scalar(10.0).unwrap();
+    *rejecting.view_output.lock().unwrap() = Some((view.id, output.id));
+    let read = |id| {
+        let bytes = h.read_back(id).unwrap();
+        bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
+    };
+
+    assert_eq!(read(output.id), vec![11.0, 14.0, 12.0, 15.0, 13.0, 16.0]);
+    assert!(
+        rejecting
+            .rejected
+            .load(std::sync::atomic::Ordering::Relaxed),
+        "the selected-view forwarding replan was not rejected"
+    );
+    assert_eq!(
+        rejecting
+            .replan_attempts
+            .load(std::sync::atomic::Ordering::Relaxed),
+        1,
+        "CPU resolve should attempt only the selected-view replan"
+    );
+
+    let extracts_after_first = rejecting
+        .extract_calls
+        .load(std::sync::atomic::Ordering::Relaxed);
+    input
+        .set_bytes(bytemuck::cast_slice(&[7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0]).to_vec())
+        .unwrap();
+    output.clear_device_buf();
+    assert_eq!(read(output.id), vec![17.0, 20.0, 18.0, 21.0, 19.0, 22.0]);
+    assert_eq!(
+        rejecting
+            .extract_calls
+            .load(std::sync::atomic::Ordering::Relaxed),
+        extracts_after_first,
+        "the same root should replay without extracting again"
+    );
+
+    let next = output.add_scalar(1.0).unwrap();
+    assert_eq!(read(next.id), vec![18.0, 21.0, 19.0, 22.0, 20.0, 23.0]);
+    assert!(
+        rejecting
+            .seeded_calls
+            .load(std::sync::atomic::Ordering::Relaxed)
+            > 0,
+        "the subsequent resolve should use the retained extraction as a seed"
+    );
 }
 
 #[test]

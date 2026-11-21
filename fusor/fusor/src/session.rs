@@ -788,12 +788,24 @@ impl Session {
                 if fusor_cost::forward::forward_selected_views(
                     &mut g, &caps, &roots, &next, &mut ex,
                 ) {
-                    next = Arc::new(self.inner.extractor.replan_extraction(
+                    let replanned = self.inner.extractor.replan_extraction(
                         &g,
                         &roots,
                         &mut ex,
                         self.inner.cost.as_ref(),
-                    )?);
+                    );
+                    next = Arc::new(match replanned {
+                        Ok(plan) => plan,
+                        Err(_) => {
+                            // Forwarding is optional; the incumbent already realized. Its
+                            // class keys moved with the graph unions, so rekey before reuse.
+                            fusor_cost::replay::rekey_plan(&g, &next).ok_or_else(|| {
+                                Error::Plan(
+                                    "selected-view forwarding merged the incumbent plan".into(),
+                                )
+                            })?
+                        }
+                    });
                 }
                 // Independent launches of one dependency level share a dispatch.
                 let grouped =
