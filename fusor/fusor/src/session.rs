@@ -277,6 +277,13 @@ pub(crate) struct SessionInner {
     /// own pipeline cache.
     #[cfg(feature = "cpu")]
     cpu_executables: parking_lot::Mutex<FxHashMap<(u128, u64), Arc<CpuExecutable>>>,
+    /// While a `CpuProgram` compiles, the compiling thread's CPU launches are
+    /// appended here; `record_lock` admits one compile at a time.
+    #[cfg(feature = "cpu")]
+    recording:
+        parking_lot::Mutex<Option<(std::thread::ThreadId, Vec<crate::cpu_program::Recorded>)>>,
+    #[cfg(feature = "cpu")]
+    record_lock: parking_lot::Mutex<()>,
     /// Shape families: terms equal modulo the constants of their step
     /// buffers and views. A family whose constants vary across calls gets a
     /// symbolic twin term planned once and re-bound per call.
@@ -515,6 +522,10 @@ impl Session {
                 saturation: SaturationMemo::default(),
                 #[cfg(feature = "cpu")]
                 cpu_executables: parking_lot::Mutex::new(FxHashMap::default()),
+                #[cfg(feature = "cpu")]
+                recording: parking_lot::Mutex::new(None),
+                #[cfg(feature = "cpu")]
+                record_lock: parking_lot::Mutex::new(()),
                 families: parking_lot::Mutex::new(FxHashMap::default()),
                 launches: AtomicU64::new(0),
                 in_flight: AtomicU32::new(0),
@@ -590,6 +601,18 @@ impl Session {
         // Every requested value already has a device buffer: nothing to plan.
         if values.iter().all(|v| graph.device_buf(v.id).is_some()) {
             return Ok(());
+        }
+
+        // A requested external leaf is its own value: it takes its bytes and
+        // there is nothing to plan. Planned as a root it would match the
+        // shape family of any other leaf of its shape and take that one's.
+        if values.iter().any(Tensor::is_external_leaf) {
+            let (leaves, computed): (Vec<Tensor>, Vec<Tensor>) =
+                values.iter().cloned().partition(Tensor::is_external_leaf);
+            for leaf in &leaves {
+                self.leaf_buffer(&graph, leaf.id)?;
+            }
+            return self.resolve_locked(resolving, &computed);
         }
 
         // Release dead values before allocating a new execution's buffers.
@@ -1644,6 +1667,24 @@ impl Session {
         Ok((buf, true))
     }
 
+    /// Run `resolve` with every CPU launch it makes on this thread recorded.
+    #[cfg(feature = "cpu")]
+    pub(crate) fn record_cpu(
+        &self,
+        resolve: impl FnOnce() -> Result<()>,
+    ) -> Result<Vec<crate::cpu_program::Recorded>> {
+        let _one = self.inner.record_lock.lock();
+        *self.inner.recording.lock() = Some((std::thread::current().id(), Vec::new()));
+        let result = resolve();
+        let recorded = self
+            .inner
+            .recording
+            .lock()
+            .take()
+            .map(|(_, launches)| launches);
+        result.map(|()| recorded.unwrap_or_default())
+    }
+
     /// The generic runner: one `lower -> emit -> launch` per plan launch, in
     /// plan order. The GPU takes `GpuTarget::resolve` instead, which adds the
     /// plan cache, the parallel build cohort and one encoder per resolve.
@@ -1713,6 +1754,16 @@ impl Session {
             // lowering indexed the body against. When they disagree the
             // kernel silently computes a prefix of its output.
             target.launch(&launch.artifact, launch.grid, &binds, &uniforms)?;
+            if let Some((thread, recording)) = self.inner.recording.lock().as_mut()
+                && *thread == std::thread::current().id()
+            {
+                recording.push(crate::cpu_program::Recorded {
+                    artifact: launch.artifact.clone(),
+                    grid: launch.grid,
+                    binds: binds.clone(),
+                    uniforms: uniforms.clone(),
+                });
+            }
             if flags().debug_cpu_nan {
                 let root = plan.launches[launch_ix].root;
                 if let Some(buffer) = supplied

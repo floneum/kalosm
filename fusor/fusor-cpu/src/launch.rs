@@ -31,8 +31,14 @@ pub(crate) fn run(
     if let Some(contract) = &kernel.artifact.contract {
         return crate::gemm::run(contract, bufs);
     }
+    if let Some(rows) = &kernel.artifact.rows {
+        return rows.run(bufs);
+    }
+    if let Some(slices) = &kernel.artifact.slices {
+        return slices.run(bufs);
+    }
 
-    let jit = kernel.artifact.jit.ok_or_else(|| {
+    let jit = kernel.artifact.jit.as_ref().ok_or_else(|| {
         Error::Device(format!(
             "CPU kernel {} has neither a Cranelift artifact nor a GEMM contract",
             kernel.name
@@ -41,17 +47,23 @@ pub(crate) fn run(
 
     let pool = WorkerPool::global();
     // Atomic kernels run on one worker, keeping the result bit-reproducible.
-    let grain = if prog.has_atomic || total <= pool.num_threads() as u64 {
-        total
-    } else {
-        grain_for(total, pool.num_threads())
-    };
+    // The wasmi runner copies whole buffers per chunk, so under `wasm-emit` a
+    // launch is one chunk or concurrent chunks would clobber each other.
+    let grain =
+        if prog.has_atomic || total <= pool.num_threads() as u64 || cfg!(feature = "wasm-emit") {
+            total
+        } else {
+            grain_for(total, pool.num_threads())
+        };
 
     let bufs_ref: &[RawBuf] = bufs;
     // Dispatches attributable to this launch alone.
     let dispatches = std::sync::atomic::AtomicU64::new(0);
     let body = |span: std::ops::Range<u64>| {
         dispatches.fetch_add(1, Ordering::Relaxed);
+        #[cfg(all(not(target_arch = "wasm32"), feature = "wasm-emit"))]
+        jit.run_each(bufs_ref, grid, span.map(|linear| unlinearize(linear, grid)));
+        #[cfg(not(all(not(target_arch = "wasm32"), feature = "wasm-emit")))]
         for linear in span {
             let gid = unlinearize(linear, grid);
             jit.run(bufs_ref, gid, grid);
@@ -60,6 +72,46 @@ pub(crate) fn run(
 
     pool.parallel_for(0..total, grain, &body);
     DISPATCH_COUNT.store(dispatches.load(Ordering::Relaxed), Ordering::Relaxed);
+    Ok(())
+}
+
+/// A launch's buffers resolved once, for a kernel that is re-run on the same
+/// bindings: holding it keeps every buffer alive.
+pub struct Bound {
+    buffers: BoundBuffers,
+    _held: Vec<Buf>,
+}
+
+/// Resolve `binds` for repeated [`run_bound`] calls.
+pub(crate) fn bind(kernel: &CpuKernel, binds: &[Buf], uniforms: &Uniforms) -> Result<Bound> {
+    Ok(Bound {
+        buffers: bind_buffers(&kernel.artifact.prog, binds, uniforms)?,
+        _held: binds.to_vec(),
+    })
+}
+
+/// Run one dispatch on the calling thread over already-resolved buffers.
+pub(crate) fn run_bound(kernel: &CpuKernel, grid: [u32; 3], bound: &Bound) -> Result<()> {
+    let bufs = bound.buffers.raw.as_slice();
+    if let Some(contract) = &kernel.artifact.contract {
+        return crate::gemm::run(contract, bufs);
+    }
+    if let Some(rows) = &kernel.artifact.rows {
+        return rows.run(bufs);
+    }
+    if let Some(slices) = &kernel.artifact.slices {
+        return slices.run(bufs);
+    }
+    let jit = kernel.artifact.jit.as_ref().ok_or_else(|| {
+        Error::Device(format!(
+            "CPU kernel {} has no compiled artifact",
+            kernel.name
+        ))
+    })?;
+    let total = grid[0] as u64 * grid[1] as u64 * grid[2] as u64;
+    for linear in 0..total {
+        jit.run(bufs, unlinearize(linear, grid), grid);
+    }
     Ok(())
 }
 
@@ -215,6 +267,8 @@ mod tests {
             artifact: crate::emit::CpuArtifact {
                 prog,
                 contract: None,
+                rows: None,
+                slices: None,
                 jit: None,
                 name: "missing_native_test",
             },

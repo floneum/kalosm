@@ -311,6 +311,27 @@ fn shape_family_replay_preserves_inputs_and_prior_results() {
 
 #[test]
 #[cfg(feature = "cpu")]
+fn leaves_of_one_shape_read_back_their_own_bytes() {
+    let session = Session::new(Backend::cpu().unwrap()).unwrap();
+    let graph = Graph::new(&session);
+    let h = graph.handle();
+    let leaves: Vec<Tensor> = (0..3)
+        .map(|i| Tensor::from_elements(h, &[Dim::Const(2)], &[i as f32, 10.0 + i as f32]).unwrap())
+        .collect();
+    for round in 0..2 {
+        for (i, leaf) in leaves.iter().enumerate() {
+            let want = [(i + round * 100) as f32, 10.0 + i as f32];
+            if round == 1 {
+                leaf.set_bytes(bytemuck::cast_slice(&want).to_vec())
+                    .unwrap();
+            }
+            assert_eq!(leaf.to_vec_f32().unwrap(), want, "leaf {i}, round {round}");
+        }
+    }
+}
+
+#[test]
+#[cfg(feature = "cpu")]
 fn dead_input_buffers_live_until_their_last_reader_drops() {
     let session = Session::new(Backend::cpu().unwrap()).unwrap();
     let graph = Graph::new(&session);

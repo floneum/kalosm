@@ -9,7 +9,7 @@ use fusor_ir::ir::kernel::{
 };
 use fusor_ir::ir::launch::{ContractSide, Launch};
 use fusor_ir::ir::{Node, Op};
-use fusor_ir::scalar::{ScalarExpr, ScalarKind};
+use fusor_ir::scalar::ScalarExpr;
 use fusor_ir::shape::{Dim, Layout};
 use fusor_ir::target::LowerCtx;
 use fusor_tile::build::Kernel;
@@ -39,18 +39,16 @@ pub(crate) fn lower(node: &Node, cx: &LowerCtx<'_>) -> Result<KernelIr> {
     ];
     let binds = Binds::build(cx)?;
     let out = binds.of(cx.launch.root)?;
-    // The platform GEMM is Accelerate (macOS only); elsewhere the Cranelift path.
-    let platform = if cfg!(target_os = "macos") {
-        side(cx, &binds, a, [batch, m, k])
-            .zip(side(cx, &binds, b, [batch, k, n]))
-            .and_then(|(bound_a, bound_b)| {
-                gemm_name(
-                    m, n, k, batch, &out, &bound_a, &bound_b, &a.pre, &b.pre, post,
-                )
-            })
-    } else {
-        None
-    };
+    // A dense product goes to the platform GEMM, with any fused elementwise
+    // transform of an operand or of the result applied around it; what that
+    // cannot state (masks, absorbed producers) takes the JIT path below.
+    let platform = side(cx, &binds, a, [batch, m, k])
+        .zip(side(cx, &binds, b, [batch, k, n]))
+        .and_then(|(bound_a, bound_b)| {
+            gemm_name(
+                m, n, k, batch, &out, &bound_a, &bound_b, &a.pre, &b.pre, post,
+            )
+        });
     if let Some(name) = platform {
         return Ok(binds.finish(name, [1, 1, 1], 1, Vec::new()));
     }
@@ -95,10 +93,11 @@ fn lower_jit(
     acc: fusor_ir::dtype::Dtype,
 ) -> Result<KernelIr> {
     let b = Kernel::new();
-    let block = DEFAULT_BLOCK;
     let total = u64::from(batch) * u64::from(m) * u64::from(n);
     let total_u32 = u32::try_from(total)
         .map_err(|_| Error::Legality("CPU JIT contraction output exceeds u32 indexing".into()))?;
+    // No more lanes than outputs: a masked lane still runs the whole k loop.
+    let block = DEFAULT_BLOCK.min(total_u32.max(1));
     let grid = grid_for(total, block);
     let flat = global_lane(&b, block);
     let valid = b.lt(flat.clone(), b.u32(total_u32));
@@ -364,7 +363,6 @@ fn gemm_name(
     b_pre: &ScalarExpr,
     post: &ScalarExpr,
 ) -> Option<&'static str> {
-    let arg0 = |e: &ScalarExpr| matches!(e.kind(), ScalarKind::Arg(0));
     let f32s = ElementType::Scalar(ScalarElement::F32);
     let key = |(buf, s): &(Arc<BufferDecl>, [u32; 3])| {
         format!("{},{},{},{}", buf.binding, s[0], s[1], s[2])
@@ -372,25 +370,50 @@ fn gemm_name(
     let [(_, bstrides)] = b.as_slice() else {
         return None;
     };
-    if !arg0(b_pre)
-        || !arg0(post)
-        || out.element != f32s
-        || a.iter().chain(b).any(|(buf, _)| buf.element != f32s)
-        || !compatible(*bstrides, [k, n], [1, 0])
-    {
+    if out.element != f32s || a.iter().chain(b).any(|(buf, _)| buf.element != f32s) {
         return None;
     }
-    let (kind, a_key) = match a.as_slice() {
-        [(_, s)] if arg0(a_pre) && compatible(*s, [m, k], [0, 1]) => ("blas", key(&a[0])),
+    // Accelerate addresses a matrix by a leading dimension; a transformed side
+    // is gathered dense first and the portable kernel takes any strides.
+    let accelerate = cfg!(all(target_os = "macos", not(feature = "wasm-emit")));
+    let pre_b = crate::gemm::encode(b_pre)?;
+    let post = crate::gemm::encode(post)?;
+    if accelerate && pre_b.is_empty() && !compatible(*bstrides, [k, n], [1, 0]) {
+        return None;
+    }
+    let (kind, a_key, pre_a) = match a.as_slice() {
+        [(_, s)] => {
+            let pre_a = crate::gemm::encode(a_pre)?;
+            if accelerate && pre_a.is_empty() && !compatible(*s, [m, k], [0, 1]) {
+                return None;
+            }
+            ("blas", key(&a[0]), pre_a)
+        }
+        // The fused-GELU prepass is a Cranelift kernel Accelerate follows.
         [(_, s), (_, bias)]
-            if *a_pre == tanh_gelu_of_bias() && *s == [0, k, 1] && *bias == [0, 0, 1] =>
+            if cfg!(target_os = "macos")
+                && pre_b.is_empty()
+                && post.is_empty()
+                && compatible(*bstrides, [k, n], [1, 0])
+                && *a_pre == tanh_gelu_of_bias()
+                && *s == [0, k, 1]
+                && *bias == [0, 0, 1] =>
         {
-            ("gelu_blas", format!("{},{}", key(&a[0]), key(&a[1])))
+            (
+                "gelu_blas",
+                format!("{},{}", key(&a[0]), key(&a[1])),
+                String::new(),
+            )
         }
         _ => return None,
     };
+    let transforms = if pre_a.is_empty() && pre_b.is_empty() && post.is_empty() {
+        String::new()
+    } else {
+        format!(";{pre_a};{pre_b};{post}")
+    };
     Some(leak(format!(
-        "cpu_contract_{kind}:{m},{n},{k},{batch},{},{a_key},{}",
+        "cpu_contract_{kind}:{m},{n},{k},{batch},{},{a_key},{}{transforms}",
         out.binding,
         key(&b[0])
     )))

@@ -258,7 +258,9 @@ pub fn sessions() -> Vec<Session> {
     {
         out.push(session);
     }
-    if let Some(gpu) = cached_gpu()
+    // `FUSOR_CONFORMANCE_CPU_ONLY` leaves the GPU out: a CPU emitter run.
+    if std::env::var_os("FUSOR_CONFORMANCE_CPU_ONLY").is_none()
+        && let Some(gpu) = cached_gpu()
         && let Ok(session) = Session::new(gpu)
     {
         out.push(session);

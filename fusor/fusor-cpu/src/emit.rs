@@ -76,7 +76,9 @@ impl Program {
 pub struct CpuArtifact {
     pub prog: Arc<Program>,
     pub contract: Option<crate::gemm::ContractSpec>,
-    pub jit: Option<crate::jit::JitKernel>,
+    pub rows: Option<crate::rows::GatherRows>,
+    pub slices: Option<crate::slices::MapSlices>,
+    pub jit: Option<crate::kernel::Kernel>,
     pub name: &'static str,
 }
 
@@ -91,6 +93,14 @@ impl CpuKernel {
     /// Run one dispatch. `binds` is positional, exactly as on GPU.
     pub fn run(&self, grid: [u32; 3], binds: &[Buf], uniforms: &Uniforms) -> Result<()> {
         crate::launch::run(self, grid, binds, uniforms)
+    }
+    /// Resolve `binds` once for repeated [`Self::run_bound`] calls.
+    pub fn bind(&self, binds: &[Buf], uniforms: &Uniforms) -> Result<crate::launch::Bound> {
+        crate::launch::bind(self, binds, uniforms)
+    }
+    /// One dispatch on the calling thread over buffers resolved by [`Self::bind`].
+    pub fn run_bound(&self, grid: [u32; 3], bound: &crate::launch::Bound) -> Result<()> {
+        crate::launch::run_bound(self, grid, bound)
     }
 }
 
@@ -128,15 +138,22 @@ pub(crate) fn compile(ir: &KernelIr, caps: &Caps) -> std::result::Result<CpuArti
         has_atomic: c.has_atomic,
     });
 
+    if std::env::var_os("FUSOR_DUMP_CPU").is_some() {
+        eprintln!("[cpu kernel] {} grid {:?} {prog:?}", ir.name, ir.grid);
+    }
     let contract = crate::gemm::ContractSpec::parse(ir.name);
-    let jit = if contract.is_none() {
-        Some(crate::jit::compile(&prog).map_err(EmitError::Unsupported)?)
+    let rows = crate::rows::GatherRows::parse(ir.name);
+    let slices = crate::slices::MapSlices::parse(ir.name);
+    let jit = if contract.is_none() && rows.is_none() && slices.is_none() {
+        Some(crate::kernel::compile(&prog).map_err(EmitError::Unsupported)?)
     } else {
         None
     };
     Ok(CpuArtifact {
         prog,
         contract,
+        rows,
+        slices,
         jit,
         name: ir.name,
     })
@@ -1065,6 +1082,7 @@ fn visit_stmt_exprs(s: &Stmt, f: &mut impl FnMut(&TileExpr)) {
 
 /// A raw view of one bound buffer.
 #[derive(Copy, Clone)]
+#[repr(C)]
 pub struct RawBuf {
     pub ptr: *mut u8,
     pub bytes: usize,

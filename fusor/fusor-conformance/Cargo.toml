@@ -28,6 +28,8 @@ default = ["cpu", "compiler-tests"]
 # Internal compiler checks are opt-in when this crate is used as a benchmark library.
 compiler-tests = ["fusor/compiler-tests"]
 cpu = ["fusor/cpu"]
+# The CPU cases run through the wasm emitter under `wasmi`.
+wasm-emit = ["fusor/wasm-emit"]
 # Burn's WebGPU backend as the baseline the benchmark page compares against.
 burn-bench = ["dep:burn"]
 

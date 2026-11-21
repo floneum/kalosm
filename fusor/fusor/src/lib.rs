@@ -32,6 +32,8 @@ pub mod autograd;
 mod broadcast;
 pub mod cache;
 pub mod composite;
+#[cfg(feature = "cpu")]
+pub mod cpu_program;
 pub mod device;
 pub mod graph;
 pub mod layers;
@@ -42,6 +44,8 @@ pub mod sampling;
 pub mod session;
 pub mod tensor;
 
+#[cfg(feature = "cpu")]
+pub use cpu_program::{CpuProgram, CpuValue};
 pub use device::Device;
 pub use tensor::typed::{Axis, Element, Minus1, Minus2, Tensor, stack};
 

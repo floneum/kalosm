@@ -70,15 +70,22 @@ fn lower_map(node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<Kernel
     let extents = const_extents(cx, &space.dims)?;
     let n = extents.iter().map(|e| *e as u64).product::<u64>().max(1);
 
+    let out = binds.of(cx.launch.root)?;
+    if let Some(name) = slices_name(&b, cx, &binds, &out, ops, body, n) {
+        return Ok(binds.finish(name, [1, 1, 1], 1, Vec::new()));
+    }
+
     let tm = match theta {
         SchedPoint::Map(t) => t.tm.max(1),
         _ => 1,
     };
-    let block = DEFAULT_BLOCK;
-    let grid = grid_for(n.div_ceil(tm as u64), block);
+    let lanes = n.div_ceil(tm as u64);
+    // No more lanes than elements: a tiny map's masked lanes are pure cost.
+    let block = DEFAULT_BLOCK.min(u32::try_from(lanes).unwrap_or(u32::MAX).max(1));
+    let grid = grid_for(lanes, block);
     let stride = grid[0] * block;
 
-    let out = view(&binds.of(cx.launch.root)?);
+    let out = view(&out);
     let mut stmts = Vec::with_capacity(tm as usize);
     for t in 0..tm {
         let flat = b.add(global_lane(&b, block), b.u32(t * stride));
@@ -98,6 +105,51 @@ fn lower_map(node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<Kernel
     }
 
     Ok(binds.finish("cpu_map", grid, block, stmts))
+}
+
+/// The slice-kernel name of a map over plain f32 buffers, each contiguous
+/// over the whole space or one broadcast element, whose body is arithmetic
+/// the slice evaluator states; None sends the map to the JIT.
+fn slices_name(
+    b: &Kernel,
+    cx: &LowerCtx<'_>,
+    binds: &Binds,
+    out: &std::sync::Arc<fusor_ir::ir::kernel::BufferDecl>,
+    ops: &[fusor_ir::ir::launch::Operand],
+    body: &fusor_ir::scalar::ScalarExpr,
+    n: u64,
+) -> Option<&'static str> {
+    let f32_ty = ElementType::Scalar(ScalarElement::F32);
+    if out.element != f32_ty {
+        return None;
+    }
+    let mut args = Vec::with_capacity(ops.len());
+    for operand in ops {
+        let super::OperandSrc::Buffer(buffer) =
+            super::operand_src(b, cx, binds, operand.src).ok()?
+        else {
+            return None;
+        };
+        if buffer.element != f32_ty {
+            return None;
+        }
+        // The flat index reads `offset + flat` (contiguous) or `offset` (one
+        // element broadcast); anything else is the JIT's.
+        let map = super::resolved_address_map(cx, operand).ok()?;
+        let broadcast = match map.terms.as_slice() {
+            [] => true,
+            [t] if t.divisor == 1 && t.stride == 1 && u64::from(t.modulus) >= n => false,
+            _ => return None,
+        };
+        args.push((
+            buffer.binding as usize,
+            map.offset as usize,
+            broadcast && n > 1,
+        ));
+    }
+    let body = crate::slices::encode(body, ops.len() as u32)?;
+    let name = crate::slices::MapSlices::name(out.binding as usize, n as usize, &args, &body);
+    Some(Box::leak(name.into_boxed_str()))
 }
 
 /// Lower a `Fold` through its carrier: one identity-seeded accumulator per

@@ -24,7 +24,12 @@ const MIN_K: u64 = 256;
 const MIN_CHUNK: u64 = 32;
 const SPLITS: [u64; 4] = [4, 8, 16, 32];
 
-pub fn split_k(b: &mut Builder<'_>, id: Id, node: &Node, _f: &Facts<'_>) -> Option<Id> {
+pub fn split_k(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> Option<Id> {
+    // The split buys a wider grid. A CPU contraction is one GEMM call, which
+    // runs the chunks one after another and then pays for the sum.
+    if f.caps().kind == crate::device::DeviceKind::Cpu {
+        return None;
+    }
     let Op::Launch(
         op @ Launch::Contract {
             output,
