@@ -117,6 +117,20 @@ impl DimBinding {
         }
     }
 
+    // Isolate each member's grid derivation while sharing body consultations.
+    pub(crate) fn fork_group_member(&self) -> Self {
+        Self {
+            values: self.values.clone(),
+            consulted: self.consulted.clone(),
+            grid: Default::default(),
+        }
+    }
+
+    pub(crate) fn merge_group_grid_symbols(&self, member: &Self) {
+        let symbols = member.grid.lock().symbols.clone();
+        self.grid.lock().symbols.extend(symbols);
+    }
+
     pub(crate) fn get(&self, sym: SymId) -> Option<u64> {
         if sym.is_derived() {
             // A derived symbol consults the symbols its expression reaches.
