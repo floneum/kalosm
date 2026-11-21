@@ -3,7 +3,6 @@
 //! never re-derived; a mismatch is a broken plan ([`Error::Plan`]).
 
 pub(crate) mod contract;
-mod decode_attention;
 pub(crate) mod gather_scatter;
 pub(crate) mod group;
 pub(crate) mod map_fold;
@@ -1205,8 +1204,6 @@ fn lower_launch(ctx: Ctx<'_>, node: &Node, theta: SchedPoint, member: bool) -> R
         )));
     };
     match op {
-        Launch::DecodeAttention { .. } => decode_attention::lower(ctx, op),
-        Launch::DecodeAttentionMerge { .. } => decode_attention::lower_merge(ctx, op),
         Launch::RmsNorm { .. } => rms_norm::lower(ctx, op),
         Launch::Map { .. } => map_fold::lower_kmap(ctx, op, theta),
         Launch::Fold { .. } | Launch::StreamFold { .. } => map_fold::lower_kfold(ctx, op, theta),

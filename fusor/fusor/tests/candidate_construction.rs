@@ -1204,39 +1204,60 @@ fn attention_expression(g: &mut EGraph, width: u64, keys: Dim, grouped: bool) ->
 }
 
 #[test]
-fn ordinary_attention_is_recognized_for_multiple_widths_and_subgroups() {
-    let rule = fusor_ir::rules::attention::FUSE_STREAMING_ATTENTION.apply;
-    for subgroup in [16, 32, 64] {
-        for width in [32, 64, 96, 128, 256] {
-            if width % subgroup != 0 {
-                continue;
-            }
-            for grouped in [false, true] {
-                for keys in [
-                    Dim::Const(17),
-                    Dim::Const(513),
-                    Dim::Sym(fusor_ir::shape::SymId(77)),
-                ] {
-                    let mut g = graph();
-                    let root = attention_expression(&mut g, width, keys, grouped);
-                    let mut c = gpu_caps();
-                    c.name = "anonymous capability fixture".into();
-                    c.subgroups = Some(SubgroupWidths {
-                        min: subgroup as u32,
-                        max: subgroup as u32,
-                    });
-                    assert!(
-                        apply(&mut g, &c, root, rule).is_some(),
-                        "width={width} subgroup={subgroup} grouped={grouped} keys={keys:?}"
-                    );
-                }
-            }
+fn ordinary_attention_saturates_to_generic_fold_candidates() {
+    use fusor_ir::egraph::{Saturate, SaturationBudget};
+    use fusor_ir::extract::Extractor;
+    use fusor_ir::ir::launch::Launch;
+
+    for (width, keys, grouped, subgroup) in [
+        (32, Dim::Const(17), false, Some(32)),
+        (64, Dim::Const(513), true, Some(64)),
+        (32, Dim::Sym(fusor_ir::shape::SymId(77)), true, Some(64)),
+        (64, Dim::Sym(fusor_ir::shape::SymId(78)), false, Some(32)),
+        (32, Dim::Const(513), true, None),
+        (64, Dim::Const(17), false, None),
+    ] {
+        let (planner, mut g) = planner_graph();
+        let root = attention_expression(&mut g, width, keys, grouped);
+        g.add_root(root);
+        let mut c = gpu_caps();
+        c.name = "generic attention saturation fixture".into();
+        c.subgroups = subgroup.map(|width| SubgroupWidths {
+            min: width,
+            max: width,
+        });
+        let rules: Vec<_> = fusor_ir::CORE_RULES
+            .iter()
+            .chain(fusor_tile::SCHED_RULES)
+            .copied()
+            .collect();
+        fusor_ir::Driver::new()
+            .saturate(&mut g, &c, &rules, SaturationBudget::default())
+            .unwrap();
+
+        let root_class = g.members(g.class_of(root));
+        assert!(
+            root_class
+                .iter()
+                .any(|&id| matches!(g.node(id).op, Op::Launch(Launch::Fold { .. }))),
+            "generic Fold missing for width={width}, keys={keys:?}, grouped={grouped}, subgroup={subgroup:?}"
+        );
+
+        if keys.as_const().is_some() {
+            let cost = fusor_cost::Roofline::new(fusor_cost::facts::seed_facts(&c));
+            let extractor = fusor_cost::LocalSearch::new(planner, c);
+            let bounds = extractor.lower_bound(&g, &cost);
+            let selected = extractor.seed(&g, &[root], &bounds, &cost).unwrap();
+            let member = selected.selected(g.class_of(root)).unwrap();
+            assert!(matches!(
+                g.node(member).op,
+                Op::Launch(
+                    Launch::Map { .. }
+                        | Launch::Fold { .. }
+                        | Launch::StreamFold { .. }
+                        | Launch::Contract { .. }
+                )
+            ));
         }
     }
-    let mut g = graph();
-    let root = attention_expression(&mut g, 128, Dim::Const(17), false);
-    let mut c = gpu_caps();
-    c.subgroups = None;
-    assert_declines(&mut g, &c, root, rule);
-    assert_declines(&mut g, &caps(), root, rule);
 }

@@ -13,11 +13,7 @@ use crate::shape::{Dim, Layout, const_elements};
 rule!(
     ABSORB_VIEW_INTO_CONTRACT,
     level = Level::Launch,
-    heads = [
-        OpTag::LaunchContract,
-        OpTag::LaunchDecodeAttention,
-        OpTag::LaunchRmsNorm
-    ],
+    heads = [OpTag::LaunchContract, OpTag::LaunchRmsNorm],
     tag = RuleTag::Additive,
     apply = absorb_view,
 );
@@ -250,7 +246,6 @@ pub fn forward_views(
         Launch::Map { .. }
         | Launch::Fold { .. }
         | Launch::Contract { .. }
-        | Launch::DecodeAttention { .. }
         | Launch::RmsNorm { .. }
         | Launch::Gather { .. }
         | Launch::Scatter { .. } => {

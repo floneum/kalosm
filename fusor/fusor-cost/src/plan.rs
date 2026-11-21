@@ -424,8 +424,6 @@ pub(crate) fn without_schedule(op: &Op) -> Op {
     let mut op = op.clone();
     if let Op::Launch(
         Launch::RmsNorm { sched, .. }
-        | Launch::DecodeAttention { sched, .. }
-        | Launch::DecodeAttentionMerge { sched, .. }
         | Launch::Map { sched, .. }
         | Launch::Fold { sched, .. }
         | Launch::StreamFold { sched, .. }
