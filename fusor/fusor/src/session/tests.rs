@@ -1436,6 +1436,25 @@ fn immutable_word_storage_survives_family_binding_restore(session: Session) {
         original.addr(),
         "family restore lost valid immutable upload provenance"
     );
+
+    let changed = vec![0x65; bytes.len()];
+    {
+        let _bindings = FamilyBindings::new(h, &[source.id]).unwrap();
+        h.set_leaf_bytes(source.id, changed);
+    }
+    assert_eq!(
+        h.device_buf(source.id).unwrap().addr(),
+        original.addr(),
+        "family restore lost the saved device binding"
+    );
+    words.clear_device_buf();
+    words.upload().unwrap();
+    assert_ne!(
+        h.device_buf(words.id).unwrap().addr(),
+        original.addr(),
+        "family restore retained upload provenance for changed host bytes"
+    );
+    assert_eq!(h.read_back(words.id).unwrap(), bytes);
 }
 
 on_each_backend!(immutable_word_storage_survives_family_binding_restore:
