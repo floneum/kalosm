@@ -1030,6 +1030,298 @@ fn symbolic_map_fusion_preserves_the_producer_address() {
     }
 }
 
+#[test]
+fn fold_view_sinking_projects_only_unit_axes() {
+    use fusor_ir::ir::launch::{AccessPlan, IndexSpace, Launch, Operand, ScheduleDomain};
+    use fusor_ir::scalar::ScalarExpr;
+    use fusor_ir::shape::{BoundsProof, Layout, StrideSpec, SymId};
+
+    macro_rules! accept {
+        ($name:expr, $base:expr, $specs:expr, $target:expr, $offset:expr, [$($stride:expr),* $(,)?]) => {
+            ($name, $base, $specs, $target, BoundsProof::Static, Some(($offset, vec![$($stride),*])))
+        };
+    }
+    macro_rules! reject {
+        ($name:expr, $base:expr, $specs:expr, $target:expr) => {
+            ($name, $base, $specs, $target, BoundsProof::Static, None)
+        };
+    }
+    macro_rules! runtime {
+        ($name:expr, $base:expr, $specs:expr, $target:expr) => {
+            (
+                $name,
+                $base,
+                $specs,
+                $target,
+                BoundsProof::RuntimeMask,
+                None,
+            )
+        };
+    }
+
+    fn reader(
+        graph: &mut EGraph,
+        base: Id,
+        specs: &[StrideSpec],
+        bounds: BoundsProof,
+        target: &[Dim],
+    ) -> Id {
+        let view = graph
+            .add(Op::Logical(Logical::Restride {
+                specs: specs.to_vec().into(),
+                bounds,
+                x: base,
+            }))
+            .unwrap();
+        graph
+            .add(Op::Launch(Launch::Map {
+                space: IndexSpace::new(target.iter().copied()),
+                body: ScalarExpr::arg(0, Dtype::F32),
+                ops: vec![Operand {
+                    src: view,
+                    layout: Layout::contiguous(target),
+                    access: AccessPlan::Alias,
+                }],
+                sched: ScheduleDomain::Point,
+            }))
+            .unwrap()
+    }
+
+    fn address(layout: &Layout, coords: &[u64]) -> u64 {
+        layout.offset().as_const().unwrap()
+            + coords
+                .iter()
+                .zip(layout.strides())
+                .map(|(coord, stride)| coord * stride.as_const().unwrap())
+                .sum::<u64>()
+    }
+
+    fn unflatten(mut flat: u64, shape: &[Dim]) -> Vec<u64> {
+        let mut coords = vec![0; shape.len()];
+        for axis in (0..shape.len()).rev() {
+            let extent = shape[axis].as_const().unwrap();
+            coords[axis] = flat % extent;
+            flat /= extent;
+        }
+        coords
+    }
+
+    let caps = caps();
+    let spec = |axis, size| StrideSpec::dim(axis, Dim::Const(size));
+    let target = consts([2, 3, 1]).to_vec();
+    let source_specs = vec![
+        spec(0, 2),
+        spec(1, 3),
+        spec(2, 1),
+        spec(3, 1).with_offset(Dim::Const(2)),
+    ];
+    let moved_specs = vec![spec(0, 2), spec(0, 1), spec(1, 3)];
+    let empty_target = consts([0, 3, 1]).to_vec();
+    let empty_base = consts([0, 3, 1, 5]).to_vec();
+    let empty_specs = vec![
+        spec(0, 0),
+        spec(1, 3),
+        spec(2, 1),
+        spec(3, 1).with_offset(Dim::Const(2)),
+    ];
+    let source_base = consts([2, 3, 1, 5]).to_vec();
+    let mismatched = consts([3, 2, 1]).to_vec();
+    let elements = |shape: &[Dim]| {
+        shape
+            .iter()
+            .map(|dim| dim.as_const().unwrap())
+            .product::<u64>()
+    };
+    assert_eq!(2 * 3, elements(&mismatched));
+    let symbolic = Dim::Sym(SymId(7));
+    let dynamic_specs = vec![spec(0, 2), spec(1, 3), spec(2, 1), spec(2, 1)];
+    let moved_base = consts([2, 3]).to_vec();
+    let (b, s, t) = (source_base, source_specs, target);
+    let runtime_base = vec![Dim::Const(2), Dim::Const(3), symbolic];
+    let cases = [
+        accept!("drop axis", b.clone(), s.clone(), t.clone(), 2, [15, 5, 0]),
+        accept!(
+            "move unit axis",
+            moved_base,
+            moved_specs,
+            t.clone(),
+            0,
+            [3, 1, 0]
+        ),
+        accept!(
+            "empty shape",
+            empty_base,
+            empty_specs,
+            empty_target,
+            2,
+            [15, 5, 0]
+        ),
+        reject!("equal-count mismatch", b, s, mismatched),
+        runtime!("runtime bounds", runtime_base, dynamic_specs, t),
+    ];
+
+    for (name, base_shape, specs, target, bounds, expected) in cases {
+        let mut graph = graph();
+        let base = leaf(&mut graph, 0, &base_shape);
+        let reader = reader(&mut graph, base, &specs, bounds, &target);
+        if let Some((offset, strides)) = expected {
+            let fused = apply(
+                &mut graph,
+                &caps,
+                reader,
+                fusor_ir::rules::sink::fold_views_into_index,
+            )
+            .unwrap_or_else(|| panic!("{name} should sink"));
+            let operand = graph
+                .members(graph.class_of(fused))
+                .into_iter()
+                .find_map(|member| match &graph.node(member).op {
+                    Op::Launch(Launch::Map { ops, .. }) if ops.len() == 1 && ops[0].src == base => {
+                        Some(ops[0].clone())
+                    }
+                    _ => None,
+                })
+                .expect("projected operand");
+            let strides: Vec<_> = strides.into_iter().map(Dim::Const).collect();
+            let expected = Layout::from_parts(Dim::Const(offset), &target, &strides).unwrap();
+            assert_eq!(operand.src, base, "{name} source");
+            assert_eq!(operand.layout, expected, "{name} layout");
+            let view_shape: Vec<_> = specs.iter().map(|spec| spec.size).collect();
+            let base_strides = Layout::row_major_strides(&base_shape);
+            let elements = target
+                .iter()
+                .map(|dim| dim.as_const().unwrap())
+                .product::<u64>();
+            for flat in 0..elements {
+                let coords = unflatten(flat, &target);
+                let view_coords = unflatten(flat, &view_shape);
+                let source_address = specs
+                    .iter()
+                    .zip(view_coords)
+                    .map(|(spec, coord)| {
+                        let input =
+                            coord * u64::from(spec.multiplier) + spec.offset.as_const().unwrap();
+                        base_strides[spec.input_dim as usize].as_const().unwrap() * input
+                    })
+                    .sum::<u64>();
+                assert_eq!(
+                    address(&operand.layout, &coords),
+                    source_address,
+                    "{name} address at {coords:?}"
+                );
+            }
+        } else {
+            assert_declines(
+                &mut graph,
+                &caps,
+                reader,
+                fusor_ir::rules::sink::fold_views_into_index,
+            );
+        }
+    }
+}
+
+/// Build normalization through scalar algebra, without calling an RMS helper.
+fn normalization_expression(g: &mut EGraph, rows: u64, width: u64, mean_scale: f32) -> Id {
+    use fusor_autograd::tape::{GraphTape, TapeExt};
+    use fusor_ir::autograd::Tape;
+    use fusor_ir::scalar::{BinOp, ScalarExpr, UnOp};
+    let x = leaf(g, 0, &consts([rows, width]));
+    let w = leaf(g, 1, &consts([width]));
+    let mut t = GraphTape::new(g);
+    let square = t.binary(BinOp::Mul, x, x).unwrap();
+    let sum = t.fold_binop(BinOp::Add, 1, Dtype::F32, square).unwrap();
+    let mean = t.mul_scalar(sum, mean_scale).unwrap();
+    let eps = ScalarExpr::lit(fusor_ir::dtype::Splat::F32(1e-5));
+    let inv = t
+        .map(
+            ScalarExpr::un(
+                UnOp::InverseSqrt,
+                ScalarExpr::bin(BinOp::Add, ScalarExpr::arg(0, Dtype::F32), eps),
+            ),
+            &[mean],
+        )
+        .unwrap();
+    let inv = t.broadcast_axis(inv, 1, Dim::Const(width)).unwrap();
+    let y = t.binary(BinOp::Mul, x, inv).unwrap();
+    let w = t.broadcast_to(w, &consts([rows, width])).unwrap();
+    t.binary(BinOp::Mul, y, w).unwrap()
+}
+
+#[test]
+fn ordinary_algebra_gets_normalization_on_capability_variants() {
+    use fusor_ir::ir::launch::Launch;
+    let rule = fusor_ir::rules::normalization::FUSE_ROW_NORMALIZATION.apply;
+    for subgroup in [None, Some(16), Some(32), Some(64)] {
+        for (rows, width) in [(7, 37), (2, 128), (5, 257), (3, 768)] {
+            let mut g = graph();
+            let root = normalization_expression(&mut g, rows, width, 1.0 / width as f32);
+            let mut c = gpu_caps();
+            c.name = "anonymous capability fixture".into();
+            c.subgroups = subgroup.map(|n| SubgroupWidths { min: n, max: n });
+            c.limits.max_compute_invocations_per_workgroup = 128;
+            c.limits.max_compute_workgroup_size[0] = 128;
+            assert!(
+                apply(&mut g, &c, root, rule).is_some(),
+                "{subgroup:?}, {rows}x{width}"
+            );
+            assert!(g.class_ids(g.class_of(root)).iter().any(|id| matches!(
+                g.node(*id).op,
+                Op::Launch(Launch::RmsNorm {
+                    block: 32 | 64 | 128,
+                    ..
+                })
+            )));
+        }
+    }
+    // Wide rows can use more parallel lanes, but never exceed the granted
+    // invocation, X dimension, storage, or per-lane live-value limits.
+    for (width, lanes, x_limit, storage, expected) in [
+        (4096, 1024, 1024, 32768, Some(512)),
+        (8192, 512, 512, 32768, Some(512)),
+        (16384, 512, 512, 32768, Some(512)),
+        (16385, 512, 512, 32768, None),
+        (4096, 256, 1024, 32768, Some(256)),
+        (4096, 1024, 128, 32768, Some(128)),
+        (4096, 1024, 1024, 512, Some(128)),
+        (8193, 256, 256, 32768, None),
+        (37, 1024, 1024, 32768, Some(64)),
+    ] {
+        for subgroup in [
+            None,
+            Some(SubgroupWidths { min: 16, max: 32 }),
+            Some(SubgroupWidths { min: 64, max: 64 }),
+        ] {
+            let mut g = graph();
+            let root = normalization_expression(&mut g, 2, width, 1.0 / width as f32);
+            let mut c = gpu_caps();
+            c.subgroups = subgroup;
+            c.limits.max_compute_invocations_per_workgroup = lanes;
+            c.limits.max_compute_workgroup_size[0] = x_limit;
+            c.limits.max_compute_workgroup_storage_size = storage;
+            let fused = apply(&mut g, &c, root, rule);
+            let actual = g.class_ids(g.class_of(root)).iter().find_map(|id| {
+                if let Op::Launch(Launch::RmsNorm { block, .. }) = g.node(*id).op {
+                    Some(block)
+                } else {
+                    None
+                }
+            });
+            assert_eq!(fused.is_some(), actual.is_some());
+            assert_eq!(
+                actual, expected,
+                "width={width} limits={lanes}/{x_limit}/{storage}"
+            );
+        }
+    }
+    let mut g = graph();
+    let root = normalization_expression(&mut g, 3, 37, 1.0 / 36.0);
+    assert_declines(&mut g, &gpu_caps(), root, rule);
+    let mut g = graph();
+    let root = normalization_expression(&mut g, 3, 37, 1.0 / 37.0);
+    assert_declines(&mut g, &caps(), root, rule);
+}
+
 fn attention_expression(g: &mut EGraph, width: u64, keys: Dim, grouped: bool) -> Id {
     use fusor_autograd::tape::{GraphTape, TapeExt};
     use fusor_ir::autograd::Tape;
