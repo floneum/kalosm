@@ -263,6 +263,15 @@ fn validate_kernel_storage(ir: &KernelIr) -> Result<(), SimError> {
 
     fn validate_statements(statements: &[Stmt]) -> Result<(), SimError> {
         for stmt in statements {
+            if let Stmt::Loop { accumulators, .. } = stmt
+                && accumulators
+                    .iter()
+                    .any(|accumulator| first_reduce_in_expr(&accumulator.update).is_some())
+            {
+                return Err(SimError::Unsupported(
+                    "expression reductions in loop accumulator updates".into(),
+                ));
+            }
             let mut reductions = HashMap::new();
             let mut error = None;
             stmt.for_each_expr(&mut |expr| {
