@@ -698,6 +698,22 @@ impl Execution<'_> {
                         "FillTile requires a rank-2 destination tile".into(),
                     ));
                 };
+                if !matches!(mask.kind(), TileExprKind::Literal(TileLiteral::Bool(true))) {
+                    return Err(SimError::Unsupported(
+                        "FillTile source mask must be literal true".into(),
+                    ));
+                }
+                if source.buffer.element != dst.element {
+                    return Err(SimError::Unsupported(
+                        "FillTile source and destination element types differ".into(),
+                    ));
+                }
+                let row_major_indexing = MultiFlattenMap::affine(&dst.layout.extents, &[*cols, 1]);
+                if dst.layout.indexing != row_major_indexing {
+                    return Err(SimError::Unsupported(
+                        "FillTile destination must be contiguous row-major".into(),
+                    ));
+                }
                 let row_base = self
                     .eval(row, lane, group, lane_id, workgroup, xyz)?
                     .u32()?;
@@ -2548,6 +2564,86 @@ mod tests {
                 .map(|value| Some(MemoryValue::F32(value)))
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn fill_tile_rejects_masks_type_conversions_and_noncontiguous_layouts() {
+        fn fill_ir(
+            mask: TileExpr,
+            destination_element: ElementType,
+            destination_layout: TileLayout,
+        ) -> KernelIr {
+            let input = Arc::new(BufferDecl {
+                binding: 1,
+                element: scalar(ScalarElement::F32),
+                layout: TileLayout::contiguous(MemoryLevel::Storage, &[2, 3]),
+                access: BufferAccess::Read,
+            });
+            let value = TileExpr::new(
+                TileExprKind::Load {
+                    src: Source::Storage(view(input.clone())),
+                    addr: Box::new(Addr::Rc2 {
+                        row: literal_u32(0),
+                        col: literal_u32(0),
+                    }),
+                    mask,
+                    fill: f32_literal(0.0),
+                },
+                scalar(ScalarElement::F32),
+            );
+            let tile = Arc::new(fusor_ir::ir::kernel::TileDecl::new(
+                destination_element,
+                destination_layout,
+                "guarded_fill_tile",
+            ));
+            KernelIr {
+                buffers: vec![input],
+                grid: [1, 1, 1],
+                block: 1,
+                body: vec![Stmt::FillTile {
+                    dst: tile,
+                    value,
+                    bounds: [None, None],
+                }],
+                byte_arena: None,
+                name: "unsupported_fill_tile_test",
+            }
+        }
+
+        fn assert_fill_unsupported(ir: &KernelIr, expected: &str) {
+            let mut memory = BTreeMap::from([(1, BindingMemory::uninitialized(1, 6))]);
+            assert!(matches!(
+                Simulator::new(Limits::default()).run(ir, &mut memory, 1),
+                Err(SimError::Execution { source, .. })
+                    if matches!(&*source, SimError::Unsupported(detail) if detail.contains(expected))
+            ));
+        }
+
+        let contiguous = TileLayout::contiguous(MemoryLevel::Workgroup, &[2, 3]);
+        let dynamic_mask = TileExpr::new(
+            TileExprKind::Compare {
+                op: CmpOp::Lt,
+                left: lane(),
+                right: literal_u32(1),
+            },
+            scalar(ScalarElement::Bool),
+        );
+        let masked = fill_ir(dynamic_mask, scalar(ScalarElement::F32), contiguous.clone());
+        assert_fill_unsupported(&masked, "source mask");
+
+        let converted = fill_ir(
+            bool_literal(true),
+            scalar(ScalarElement::I32),
+            contiguous.clone(),
+        );
+        assert_fill_unsupported(&converted, "element types differ");
+
+        for strides in [[4, 1], [1, 2]] {
+            let mut layout = contiguous.clone();
+            layout.indexing = MultiFlattenMap::affine(&[2, 3], &strides);
+            let noncontiguous = fill_ir(bool_literal(true), scalar(ScalarElement::F32), layout);
+            assert_fill_unsupported(&noncontiguous, "contiguous row-major");
+        }
     }
 
     #[test]

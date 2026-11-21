@@ -27,6 +27,9 @@ const MAX_EXECUTED_PLANS_PER_CASE: usize = 16;
 const MAX_RECIPE_DIMENSION: u32 = 65;
 const MAX_RECIPE_ELEMENTS: u64 = 8192;
 
+mod cache;
+pub use cache::{CacheCampaignResult, CacheRecord, cache_campaign, replay_cache_record};
+
 #[derive(Clone, Copy, Debug, Serialize, Deserialize, PartialEq, Eq, Hash)]
 #[serde(rename_all = "snake_case")]
 pub enum RecipeKind {
@@ -1752,6 +1755,76 @@ mod tests {
     #[test]
     fn real_lowered_transpose_view_matches_independent_reference() {
         check_lowered_recipe(RecipeKind::TransposeMap);
+    }
+
+    #[test]
+    fn transpose_candidate_forwards_a_real_selected_view_copy() {
+        let recipe = recipe(RecipeKind::TransposeMap);
+        let base = prepare(&recipe).unwrap();
+        let candidates = (0..base.plan.launches.len())
+            .flat_map(|launch| {
+                base.search
+                    .test_launch_variant_results(
+                        &base.graph,
+                        &base.roots,
+                        &base.plan,
+                        launch,
+                        &base.cost,
+                    )
+                    .into_iter()
+                    .filter_map(move |(label, result)| {
+                        result.ok().map(|_| CandidateSelection { launch, label })
+                    })
+            })
+            .collect::<Vec<_>>();
+        let inputs = generate_inputs(&recipe);
+        let mut witness = None;
+        for selection in candidates {
+            let mut prepared = prepare(&recipe).unwrap();
+            let Ok((Some(plan), None)) =
+                apply_selections(&mut prepared, std::slice::from_ref(&selection))
+            else {
+                continue;
+            };
+            let mut extraction = plan.extraction.clone();
+            if !fusor_cost::forward::forward_selected_views(
+                &mut prepared.graph,
+                &prepared.caps,
+                &prepared.roots,
+                &plan,
+                &mut extraction,
+            ) {
+                continue;
+            }
+            let forwarded = prepared
+                .search
+                .replan_extraction(
+                    &prepared.graph,
+                    &prepared.roots,
+                    &mut extraction,
+                    &prepared.cost,
+                )
+                .unwrap();
+            let execution = execute_plan(
+                &prepared.graph,
+                &prepared.roots,
+                &prepared.caps,
+                &forwarded,
+                &inputs,
+                23,
+                None,
+            );
+            let actual = execution
+                .result
+                .unwrap_or_else(|(error, _)| panic!("forwarded candidate: {error}"));
+            assert!(compare_results(&actual, &reference(&recipe, &inputs)).is_none());
+            witness = Some(selection);
+            break;
+        }
+        assert!(
+            witness.is_some(),
+            "no re-planned transpose candidate forwarded"
+        );
     }
 
     #[test]

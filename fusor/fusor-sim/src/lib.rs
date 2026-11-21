@@ -29,6 +29,7 @@ pub struct FailureRecord {
 mod fuzz;
 
 pub use fuzz::{
-    CampaignResult, CandidateSelection, Recipe, RecipeKind, campaign, campaign_with_limits,
-    minimize_failure, replay_failure,
+    CacheCampaignResult, CacheRecord, CampaignResult, CandidateSelection, Recipe, RecipeKind,
+    cache_campaign, campaign, campaign_with_limits, minimize_failure, replay_cache_record,
+    replay_failure,
 };
