@@ -2,7 +2,7 @@
 //! Data loads remain unknown. Unknown values can flow through arithmetic/stores,
 //! but are rejected if needed for an address, predicate or loop count. This keeps
 //! diagnostics honest for data-dependent gathers and branching.
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 
 use fusor_ir::ir::kernel::*;
 use fusor_ir::scalar::{BinOp, CmpOp};
@@ -90,7 +90,7 @@ pub fn capture(ir: &KernelIr, options: CaptureOptions) -> Result<Trace> {
         ir.byte_arena.is_none(),
         "byte-arena aliasing requires a post-emission lane-address trace",
     )?;
-    validate_body(&ir.body)?;
+    validate_body(&ir.body, &mut ExprValidator::default())?;
     let mut recorder = Recorder {
         ir, known_bindings: options.known_bindings, remaining: options.max_actions, subgroup_size: options.subgroup_size,
         workgroup: [0; 3], locals: BTreeMap::new(), tiles: BTreeMap::new(), decoded: BTreeMap::new(),
@@ -181,56 +181,70 @@ fn expand_quantized(expr: &TileExpr) -> Result<TileExpr> {
         .map_err(|e| Error(format!("quantized decoder: {e}")))
 }
 
-fn validate_expr(expr: &TileExpr) -> Result<()> {
-    require(
-        !matches!(expr.element(), ElementType::CoopMatrix { .. }),
-        "cooperative values require a post-emission lane-address trace",
-    )?;
-    match expr.kind() {
-        TileExprKind::Load {
-            src: Source::Quantized(_),
-            ..
-        } => {
-            return validate_expr(&expand_quantized(expr)?);
-        }
-        TileExprKind::Reduce { kind, .. } if !matches!(**kind, ReduceKind::Subgroup) => {
-            return Err(Error(
-                "workgroup reduction scratch lowering requires a post-emission lane-address trace"
-                    .into(),
-            ));
-        }
-        TileExprKind::CoopZero { .. }
-        | TileExprKind::CoopLoad { .. }
-        | TileExprKind::CoopMma { .. } => {
-            return Err(Error(
-                "vector/cooperative expressions require a post-emission lane-address trace".into(),
-            ));
-        }
-        _ => {}
-    }
-    let mut result = Ok(());
-    expr.kind().visit_children(&mut |child| {
-        if result.is_ok() {
-            result = validate_expr(child);
-        }
-    });
-    result
+#[derive(Default)]
+struct ExprValidator {
+    seen: HashSet<usize>,
+    expanded: Vec<TileExpr>,
 }
 
-fn validate_body(body: &[Stmt]) -> Result<()> {
+impl ExprValidator {
+    fn validate(&mut self, expr: &TileExpr) -> Result<()> {
+        if !self.seen.insert(expr.node_ptr()) {
+            return Ok(());
+        }
+        require(
+            !matches!(expr.element(), ElementType::CoopMatrix { .. }),
+            "cooperative values require a post-emission lane-address trace",
+        )?;
+        match expr.kind() {
+            TileExprKind::Load {
+                src: Source::Quantized(_),
+                ..
+            } => {
+                let expanded = expand_quantized(expr)?;
+                self.expanded.push(expanded.clone());
+                return self.validate(&expanded);
+            }
+            TileExprKind::Reduce { kind, .. } if !matches!(**kind, ReduceKind::Subgroup) => {
+                return Err(Error(
+                    "workgroup reduction scratch lowering requires a post-emission lane-address trace"
+                        .into(),
+                ));
+            }
+            TileExprKind::CoopZero { .. }
+            | TileExprKind::CoopLoad { .. }
+            | TileExprKind::CoopMma { .. } => {
+                return Err(Error(
+                    "vector/cooperative expressions require a post-emission lane-address trace"
+                        .into(),
+                ));
+            }
+            _ => {}
+        }
+        let mut result = Ok(());
+        expr.kind().visit_children(&mut |child| {
+            if result.is_ok() {
+                result = self.validate(child);
+            }
+        });
+        result
+    }
+}
+
+fn validate_body(body: &[Stmt], validator: &mut ExprValidator) -> Result<()> {
     for stmt in body {
         match stmt {
             Stmt::FillTile { .. } | Stmt::CoopStore { .. } | Stmt::CoopStoreTile { .. } | Stmt::Reduce { .. } =>
                 return Err(Error("collective fill/store/reduction has backend-specific memory instructions; capture a post-emission lane-address trace or use explicit scalar staging".into())),
             Stmt::Loop { count: None, .. } | Stmt::Break => return Err(Error("unbounded loops/break are not supported by the scalar IR recorder".into())),
-            Stmt::If { accept, reject, .. } => { validate_body(accept)?; validate_body(reject)?; }
-            Stmt::Loop { body, .. } => validate_body(body)?,
+            Stmt::If { accept, reject, .. } => { validate_body(accept, validator)?; validate_body(reject, validator)?; }
+            Stmt::Loop { body, .. } => validate_body(body, validator)?,
             _ => {}
         }
         let mut result = Ok(());
         stmt.for_each_expr(&mut |expr| {
             if result.is_ok() {
-                result = validate_expr(expr);
+                result = validator.validate(expr);
             }
         });
         result?;
@@ -847,5 +861,46 @@ fn compare(op: CmpOp, a: Value, b: Value) -> Value {
         (Value::F(a), Value::F(b)) => cmp!(a, b),
         (Value::B(a), Value::B(b)) => cmp!(a, b),
         _ => Value::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use fusor_ir::{dtype::NumericContract, scalar::BinOp};
+
+    use super::*;
+
+    #[test]
+    fn shared_expression_dag_validation_is_bounded_before_action_budget() {
+        let mut ir = crate::demo::kernel("coalesced", 4).unwrap();
+        let mut value = TileExpr::new(
+            TileExprKind::Literal(TileLiteral::U32(1)),
+            ScalarElement::U32.element(),
+        );
+        for _ in 0..30 {
+            value = TileExpr::new(
+                TileExprKind::Binary {
+                    op: BinOp::Add,
+                    left: value.clone(),
+                    right: value,
+                    numeric: NumericContract::STRICT,
+                },
+                ScalarElement::U32.element(),
+            );
+        }
+        ir.body = vec![Stmt::StoreLocal {
+            dst: Arc::new(LocalDecl::new(ScalarElement::U32.element())),
+            value,
+        }];
+
+        let error = capture(
+            &ir,
+            CaptureOptions {
+                max_actions: 1,
+                ..CaptureOptions::default()
+            },
+        )
+        .unwrap_err();
+        assert!(error.0.contains("capture action budget exceeded"));
     }
 }
