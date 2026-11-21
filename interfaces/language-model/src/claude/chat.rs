@@ -166,6 +166,10 @@ pub enum AnthropicCompatibleChatModelError {
     /// An error occurred while streaming the response from the Anthropic API.
     #[error("Error streaming response from Anthropic API: {0}")]
     StreamError(#[from] AnthropicCompatibleChatResponseError),
+    /// The circuit breaker is open after repeated failures from the Anthropic API.
+    #[cfg(feature = "resilience")]
+    #[error("Anthropic API circuit breaker is open")]
+    CircuitOpen,
 }
 
 impl From<reqwest_eventsource::Error> for AnthropicCompatibleChatModelError {
@@ -332,19 +336,8 @@ impl ChatModel<GenerationParameters> for AnthropicCompatibleChatModel {
 
         async move {
             let api_key = myself.client.resolve_api_key()?;
-            let mut event_source = myself
-                .client
-                .reqwest_client
-                .post(format!("{}/messages", myself.client.base_url()))
-                .header("Content-Type", "application/json")
-                .header("x-api-key", api_key)
-                .header("anthropic-version", myself.client.version())
-                .json(&json)
-                .eventsource()
-                .unwrap();
-
             let new_message_text =
-                consume_anthropic_stream(&mut event_source, &mut on_token).await?;
+                send_anthropic_request(&myself.client, &api_key, &json, &mut on_token).await?;
 
             let new_message =
                 crate::ChatMessage::new(crate::MessageType::ModelAnswer, new_message_text);
@@ -414,19 +407,8 @@ where
         async move {
             let json = json?;
             let api_key = myself.client.resolve_api_key()?;
-            let mut event_source = myself
-                .client
-                .reqwest_client
-                .post(format!("{}/messages", myself.client.base_url()))
-                .header("Content-Type", "application/json")
-                .header("x-api-key", &api_key)
-                .header("anthropic-version", myself.client.version())
-                .json(&json)
-                .eventsource()
-                .unwrap();
-
             let new_message_text =
-                consume_anthropic_stream(&mut event_source, &mut on_token).await?;
+                send_anthropic_request(&myself.client, &api_key, &json, &mut on_token).await?;
 
             let result = serde_json::from_str::<P>(&new_message_text).map_err(|err| {
                 tracing::error!(
@@ -471,6 +453,68 @@ fn build_anthropic_request_json(
         json["system"] = system.into();
     }
     json
+}
+
+async fn send_anthropic_request(
+    client: &AnthropicCompatibleClient,
+    api_key: &str,
+    json: &serde_json::Value,
+    on_token: &mut impl FnMut(String) -> Result<(), AnthropicCompatibleChatModelError>,
+) -> Result<String, AnthropicCompatibleChatModelError> {
+    let open = || {
+        client
+            .reqwest_client
+            .post(format!("{}/messages", client.base_url()))
+            .header("Content-Type", "application/json")
+            .header("x-api-key", api_key)
+            .header("anthropic-version", client.version())
+            .json(json)
+            .eventsource()
+            .unwrap()
+    };
+
+    #[cfg(feature = "resilience")]
+    if let Some(resilience) = &client.resilience {
+        let mut attempt = 0u32;
+        loop {
+            let permit = resilience
+                .breaker
+                .try_acquire()
+                .ok_or(AnthropicCompatibleChatModelError::CircuitOpen)?;
+            let mut event_source = open();
+            let result = consume_anthropic_stream(&mut event_source, on_token).await;
+            event_source.close();
+            let status = match &result {
+                Err(AnthropicCompatibleChatModelError::EventSourceError(err)) => match &**err {
+                    reqwest_eventsource::Error::InvalidStatusCode(status, _) => {
+                        Some(status.as_u16())
+                    }
+                    _ => None,
+                },
+                _ => None,
+            };
+            match status {
+                Some(status) if llm_resilience::retryable_status(status) => {
+                    permit.failure();
+                    if attempt >= 4 || resilience.spend.try_retry(resilience.call_usd).is_err() {
+                        return result;
+                    }
+                    attempt += 1;
+                    tracing::warn!("Anthropic API returned {status}, retry {attempt}");
+                    tokio::time::sleep(std::time::Duration::from_millis(250 << attempt)).await;
+                }
+                _ => {
+                    if result.is_ok() {
+                        resilience.spend.record_spend(resilience.call_usd);
+                        permit.success();
+                    }
+                    return result;
+                }
+            }
+        }
+    }
+
+    consume_anthropic_stream(&mut open(), on_token).await
 }
 
 async fn consume_anthropic_stream(
@@ -945,5 +989,66 @@ mod tests {
             assert!(!all_text.is_empty());
             assert!(matches!(response.contains_name, ContainsName::No));
         }
+    }
+
+    #[tokio::test]
+    #[cfg(feature = "resilience")]
+    async fn test_overloaded_response_is_retried() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let overloaded =
+                "HTTP/1.1 529 Overloaded\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}";
+            let body = "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"ok\"}}\n\ndata: {\"type\":\"message_stop\"}\n\n";
+            let ok = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            for response in [overloaded.to_string(), ok] {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut buf = [0u8; 8192];
+                let _ = socket.read(&mut buf).await.unwrap();
+                socket.write_all(response.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            }
+        });
+
+        let client = crate::AnthropicCompatibleClient::new()
+            .with_api_key("test")
+            .with_base_url(format!("http://{addr}"))
+            .with_resilience(
+                llm_resilience::CircuitBreaker::new(5, 0.5, std::time::Duration::from_secs(30)),
+                llm_resilience::RetrySpend::new(1.0),
+                0.01,
+            );
+        let model = AnthropicCompatibleChatModelBuilder::new()
+            .with_model("claude-test")
+            .with_client(client)
+            .build();
+
+        let all_text = Arc::new(RwLock::new(String::new()));
+        let messages = vec![crate::ChatMessage::new(
+            crate::MessageType::UserMessage,
+            "hi".to_string(),
+        )];
+        model
+            .add_messages_with_callback(
+                model.new_chat_session().unwrap(),
+                &messages,
+                GenerationParameters::default(),
+                {
+                    let all_text = all_text.clone();
+                    move |token| {
+                        all_text.write().unwrap().push_str(&token);
+                        Ok(())
+                    }
+                },
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(*all_text.read().unwrap(), "ok");
     }
 }

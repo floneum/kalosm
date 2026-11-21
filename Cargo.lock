@@ -3974,6 +3974,7 @@ dependencies = [
  "kalosm-common",
  "kalosm-model-types",
  "kalosm-sample",
+ "llm-resilience",
  "lru 0.12.5",
  "postcard",
  "pretty_assertions",
@@ -4253,6 +4254,17 @@ name = "litrs"
 version = "1.0.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "11d3d7f243d5c5a8b9bb5d6dd2b1602c0cb0b9db1621bafc7ed66e35ff9fe092"
+
+[[package]]
+name = "llm-resilience"
+version = "0.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a4fafca5201b2933a00b87b97c03a73d0e577e504cd53a50781b05be9d119b3c"
+dependencies = [
+ "parking_lot",
+ "tokio",
+ "tracing",
+]
 
 [[package]]
 name = "lmdb-master-sys"
