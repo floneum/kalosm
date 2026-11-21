@@ -350,6 +350,7 @@ impl Recorder<'_> {
                     } else {
                         AccessKind::Write
                     };
+                    let writes = !lanes.is_empty();
                     self.push(
                         &source,
                         Action::Memory {
@@ -358,7 +359,9 @@ impl Recorder<'_> {
                             lanes,
                         },
                     );
-                    self.known_bindings.remove(&dst.buffer.binding);
+                    if writes {
+                        self.known_bindings.remove(&dst.buffer.binding);
+                    }
                 }
                 Stmt::StoreTile { dst, index, value } => {
                     self.eval(value, &active, &format!("{source}.value"))?;

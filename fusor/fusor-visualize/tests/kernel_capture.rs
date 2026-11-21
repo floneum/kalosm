@@ -7,7 +7,7 @@ use fusor_visualize::{
     AccessKind, Action, GpuConfig, Simulator, demo,
     kernel::{CaptureOptions, capture},
 };
-use std::sync::Arc;
+use std::{collections::BTreeMap, sync::Arc};
 
 fn lit(v: u32) -> TileExpr {
     TileExpr::new(
@@ -64,6 +64,48 @@ fn reads(trace: &fusor_visualize::Trace) -> Vec<Vec<u64>> {
             _ => None,
         })
         .collect()
+}
+fn known_bindings() -> BTreeMap<u32, Vec<u8>> {
+    BTreeMap::from([(
+        1,
+        [3u32, 2, 1, 0]
+            .into_iter()
+            .flat_map(u32::to_le_bytes)
+            .collect(),
+    )])
+}
+fn ir_with_write(atomic: bool, mask: TileExpr) -> KernelIr {
+    let mut ir = demo::kernel("coalesced", 4).unwrap();
+    let buffer = ir.buffers[0].clone();
+    let dst = StorageView {
+        layout: buffer.layout.clone(),
+        buffer,
+        offset: 0,
+    };
+    let write = if atomic {
+        Stmt::AtomicAdd {
+            dst,
+            addr: Addr::Linear(lane()),
+            value: lit(1),
+            mask,
+        }
+    } else {
+        Stmt::Store {
+            dst,
+            addr: Addr::Linear(lane()),
+            value: lit(1),
+            mask,
+        }
+    };
+    let indirect = load(&ir, load(&ir, lane(), lit(1)), lit(1));
+    ir.body = vec![
+        write,
+        Stmt::StoreLocal {
+            dst: Arc::new(LocalDecl::new(ScalarElement::U32.element())),
+            value: indirect,
+        },
+    ];
+    ir
 }
 
 #[test]
@@ -444,4 +486,46 @@ fn unsupported_collectives_are_rejected_even_in_unreachable_branches() {
             .0
             .contains("backend-specific")
     );
+}
+
+#[test]
+fn masked_store_preserves_known_binding_when_no_lane_writes() {
+    let ir = ir_with_write(false, lit(0));
+    let trace = capture(
+        &ir,
+        CaptureOptions {
+            known_bindings: known_bindings(),
+            ..CaptureOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(reads(&trace), vec![vec![0, 4, 8, 12], vec![12, 8, 4, 0]]);
+}
+
+#[test]
+fn masked_atomic_add_preserves_known_binding_when_no_lane_writes() {
+    let ir = ir_with_write(true, lit(0));
+    let trace = capture(
+        &ir,
+        CaptureOptions {
+            known_bindings: known_bindings(),
+            ..CaptureOptions::default()
+        },
+    )
+    .unwrap();
+    assert_eq!(reads(&trace), vec![vec![0, 4, 8, 12], vec![12, 8, 4, 0]]);
+}
+
+#[test]
+fn atomic_add_with_selected_lanes_invalidates_known_binding() {
+    let ir = ir_with_write(true, lit(1));
+    let error = capture(
+        &ir,
+        CaptureOptions {
+            known_bindings: known_bindings(),
+            ..CaptureOptions::default()
+        },
+    )
+    .unwrap_err();
+    assert!(error.0.contains("unknown"));
 }
