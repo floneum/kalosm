@@ -324,7 +324,13 @@ impl Simulator {
                 step.hints.push(format!("{} sectors vs packed lower bound {}: inspect lane stride/alignment or transpose the tile.", step.metrics.transactions, step.metrics.ideal_transactions));
             }
             if step.metrics.cross_subgroup_reuse_bytes > 0 {
-                step.hints.push("Other subgroups read these bytes: consider workgroup staging if reuse repays stores and barriers; cache hits already help.".into());
+                let hint = "Other subgroups read these bytes: consider workgroup staging if reuse repays stores and barriers";
+                let hint = if step.metrics.cache_hits > 0 {
+                    format!("{hint}; cache hits already help.")
+                } else {
+                    format!("{hint}.")
+                };
+                step.hints.push(hint);
             }
             if step.metrics.within_subgroup_duplicate_bytes > 0 {
                 step.hints.push("Lanes share read bytes: consider one load plus subgroup broadcast; duplicate reads already coalesce.".into());

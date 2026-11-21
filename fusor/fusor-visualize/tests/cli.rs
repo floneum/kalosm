@@ -55,6 +55,44 @@ fn text_reports_action_and_model_metrics() {
 }
 
 #[test]
+fn reuse_advice_only_mentions_cache_hits_when_they_occur() {
+    let without_cache = run(&[
+        "--demo",
+        "reuse",
+        "--subgroup-size",
+        "16",
+        "--cache-bytes",
+        "0",
+        "--format",
+        "text",
+        "--max-steps",
+        "2",
+    ]);
+    assert!(without_cache.status.success());
+    let without_cache = String::from_utf8(without_cache.stdout).unwrap();
+    assert!(without_cache.contains("cache line hits 0 / misses 1"));
+    assert!(without_cache.contains("Other subgroups read these bytes: consider workgroup staging"));
+    assert!(!without_cache.contains("cache hits already help"));
+
+    let with_cache = run(&[
+        "--demo",
+        "reuse",
+        "--subgroup-size",
+        "16",
+        "--cache-bytes",
+        "128",
+        "--format",
+        "text",
+        "--max-steps",
+        "2",
+    ]);
+    assert!(with_cache.status.success());
+    let with_cache = String::from_utf8(with_cache.stdout).unwrap();
+    assert!(with_cache.contains("cache line hits 1 / misses 0"));
+    assert!(with_cache.contains("cache hits already help"));
+}
+
+#[test]
 fn invalid_options_and_non_terminal_tui_fail_cleanly() {
     for args in [
         vec!["--subgroup-size", "0"],
