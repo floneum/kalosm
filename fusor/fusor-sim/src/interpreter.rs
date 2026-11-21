@@ -664,7 +664,37 @@ impl Execution<'_> {
                         "bounded FillTile (including 2D bounds)".into(),
                     ));
                 }
-                let value = self.eval(value, lane, group, lane_id, workgroup, xyz)?;
+                let (source, row, col, mask, fill) = match value.kind() {
+                    TileExprKind::Load {
+                        src: Source::Storage(source),
+                        addr,
+                        mask,
+                        fill,
+                    } => {
+                        let Addr::Rc2 { row, col } = &**addr else {
+                            return Err(SimError::Unsupported(
+                                "FillTile source must use a rank-2 address".into(),
+                            ));
+                        };
+                        (source, row, col, mask, fill)
+                    }
+                    _ => {
+                        return Err(SimError::Unsupported(
+                            "FillTile source must be a dense storage Load".into(),
+                        ));
+                    }
+                };
+                let [rows, cols] = dst.layout.extents.as_slice() else {
+                    return Err(SimError::Unsupported(
+                        "FillTile requires a rank-2 destination tile".into(),
+                    ));
+                };
+                let row_base = self
+                    .eval(row, lane, group, lane_id, workgroup, xyz)?
+                    .u32()?;
+                let col_base = self
+                    .eval(col, lane, group, lane_id, workgroup, xyz)?
+                    .u32()?;
                 let count = usize::try_from(dst.layout.element_count()).map_err(|_| {
                     SimError::MemoryLimit {
                         required: u64::MAX,
@@ -673,7 +703,38 @@ impl Execution<'_> {
                 })?;
                 let mut index = lane_id as usize;
                 while index < count {
-                    self.store_tile(dst, index, value.clone(), lane_id, workgroup, group)?;
+                    let local_row = index / *cols as usize;
+                    let local_col = index % *cols as usize;
+                    if local_row >= *rows as usize {
+                        return Err(SimError::Bounds {
+                            space: "FillTile destination".into(),
+                            index,
+                            length: count,
+                        });
+                    }
+                    let value = if self
+                        .eval(mask, lane, group, lane_id, workgroup, xyz)?
+                        .bool()?
+                    {
+                        let source_index = map_coordinates(
+                            &source.layout.indexing,
+                            &[
+                                row_base.wrapping_add(local_row as u32) as usize,
+                                col_base.wrapping_add(local_col as u32) as usize,
+                            ],
+                        )?;
+                        self.load_storage(
+                            source,
+                            source.offset as usize + source_index,
+                            lane_id,
+                            workgroup,
+                            group,
+                            false,
+                        )?
+                    } else {
+                        self.eval(fill, lane, group, lane_id, workgroup, xyz)?
+                    };
+                    self.store_tile(dst, index, value, lane_id, workgroup, group)?;
                     index = index.saturating_add(self.ir.block as usize);
                 }
             }
