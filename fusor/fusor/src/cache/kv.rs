@@ -667,16 +667,18 @@ impl<const R: usize, T: Element> KvCache<R, T> {
         Self::fixed_pair(axis, capacity, None)
     }
 
-    /// Resolve these caches' pending writes and `values`, then commit them.
-    /// Uses the ordinary session resolve; retained values keep their semantics.
-    pub fn resolve_and_commit_all(caches: &mut [Self], values: &[Dyn]) -> Result<()> {
-        let mut roots = values.to_vec();
+    /// Resolve `values` and these caches' pending writes with `session`, then commit them.
+    pub fn resolve_and_commit_all(
+        session: &crate::Session,
+        caches: &mut [Self],
+        values: &[Dyn],
+    ) -> Result<()> {
+        let mut roots = Vec::with_capacity(values.len() + 2 * caches.len());
+        roots.extend_from_slice(values);
         for cache in caches.iter() {
             cache.pending_into(&mut roots);
         }
-        if let Some(first) = roots.first() {
-            first.graph().session().resolve(&roots)?;
-        }
+        session.resolve(&roots)?;
         for cache in caches {
             cache.commit();
         }
@@ -863,14 +865,7 @@ mod tests {
     }
 
     fn commit(device: &Device, caches: &mut [KvCache<3>]) {
-        let mut roots = Vec::new();
-        for cache in &*caches {
-            cache.pending_into(&mut roots);
-        }
-        device.session().resolve(&roots).unwrap();
-        for cache in caches {
-            cache.commit();
-        }
+        KvCache::resolve_and_commit_all(device.session(), caches, &[]).unwrap();
     }
 
     fn check(caches: &[KvCache<3>], total: usize) {
@@ -958,6 +953,84 @@ mod tests {
             }
             check(&caches, total);
         }
+    }
+
+    #[test]
+    fn resolve_and_commit_all_resolves_outputs_and_multiple_caches() {
+        let device = device();
+        let k0 = Tensor::from_slice(&device, [2, 1, 2], &[1., 2., 3., 4.]);
+        let v0 = k0.mul_scalar(2.);
+        let k1 = Tensor::from_slice(&device, [2, 1, 2], &[11., 12., 13., 14.]);
+        let v1 = k1.mul_scalar(2.);
+        let output = k0.mul_scalar(3.);
+        let mut caches = [
+            KvCache::<3>::with_capacity(1, 1),
+            KvCache::<3>::with_capacity(1, 1),
+        ];
+        caches[0].append(&k0, &v0);
+        caches[1].append(&k1, &v1);
+
+        KvCache::resolve_and_commit_all(
+            device.session(),
+            &mut caches,
+            std::slice::from_ref(output.as_dyn()),
+        )
+        .unwrap();
+
+        assert!(output.graph().device_buf(output.id()).is_some());
+        assert_eq!(output.to_flat(), vec![3., 6., 9., 12.]);
+        assert_eq!(
+            caches[0].k().unwrap().narrow(1, 0, 1).to_flat(),
+            vec![1., 2., 3., 4.]
+        );
+        assert_eq!(
+            caches[0].v().unwrap().narrow(1, 0, 1).to_flat(),
+            vec![2., 4., 6., 8.]
+        );
+        assert_eq!(
+            caches[1].k().unwrap().narrow(1, 0, 1).to_flat(),
+            vec![11., 12., 13., 14.]
+        );
+        assert_eq!(
+            caches[1].v().unwrap().narrow(1, 0, 1).to_flat(),
+            vec![22., 24., 26., 28.]
+        );
+        let mut pending = Vec::new();
+        for cache in &caches {
+            cache.pending_into(&mut pending);
+        }
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn resolve_and_commit_all_handles_empty_inputs() {
+        let device = device();
+        let mut caches: [KvCache<3>; 0] = [];
+        KvCache::resolve_and_commit_all(device.session(), &mut caches, &[]).unwrap();
+    }
+
+    #[test]
+    fn failed_mixed_graph_resolve_keeps_cache_writes_pending() {
+        let device = device();
+        let mut caches = [KvCache::<3>::with_capacity(1, 1)];
+        let input = Tensor::from_slice(&device, [2, 1, 2], &[1., 2., 3., 4.]);
+        caches[0].append(&input, &input.mul_scalar(2.));
+
+        let other_session = crate::Session::new(crate::session::test_backend()).unwrap();
+        let other_graph = crate::Graph::new(&other_session);
+        let other_device = Device::of_graph(other_graph.handle());
+        let foreign = Tensor::from_slice(&other_device, [2, 1, 2], &[5., 6., 7., 8.]);
+        let error = KvCache::resolve_and_commit_all(
+            device.session(),
+            &mut caches,
+            std::slice::from_ref(foreign.as_dyn()),
+        )
+        .unwrap_err();
+        assert!(matches!(error, crate::Error::Device(_)));
+
+        let mut pending = Vec::new();
+        caches[0].pending_into(&mut pending);
+        assert_eq!(pending.len(), 2);
     }
 
     #[test]

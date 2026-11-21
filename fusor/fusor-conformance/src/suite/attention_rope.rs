@@ -926,6 +926,7 @@ async fn padded_cache_growth_replay(session: &Session) -> CaseResult {
         let output = output.as_ref().expect("cache attention");
         output.as_dyn().clear_device_buf();
         fusor::cache::KvCache::resolve_and_commit_all(
+            session,
             std::slice::from_mut(&mut cache),
             &[output.as_dyn().clone()],
         )?;
@@ -1013,6 +1014,7 @@ async fn fixed_cache_commit_all_shared_store(session: &Session) -> CaseResult {
         } else {
             let roots = old_read.iter().cloned().collect::<Vec<_>>();
             fusor::cache::KvCache::resolve_and_commit_all(
+                session,
                 std::slice::from_mut(&mut cache),
                 &roots,
             )?;
@@ -1103,6 +1105,7 @@ async fn cache_replay_ring(session: &Session, commit_all: bool) -> CaseResult {
             }
             if commit_all {
                 fusor::cache::KvCache::resolve_and_commit_all(
+                    session,
                     std::slice::from_mut(&mut cache),
                     &[],
                 )?;
