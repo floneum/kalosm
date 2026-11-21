@@ -21,6 +21,7 @@ pub use bindings::{BindingDesc, bindings_from_module};
 pub use device::{GpuDevice, removed_reason};
 pub use emit::emit;
 pub use launch::Launcher;
+pub use lower::lower_kernel_ir;
 pub use pool::BufferPool;
 pub use rules::GPU_RULES;
 pub use target::GpuTarget;

@@ -2521,6 +2521,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "fusor-sim"
+version = "0.1.0"
+dependencies = [
+ "fusor-cost",
+ "fusor-gpu",
+ "fusor-ir",
+ "fusor-tile",
+ "serde",
+ "serde_json",
+ "smallvec",
+]
+
+[[package]]
 name = "fusor-tile"
 version = "0.1.0"
 dependencies = [
