@@ -57,10 +57,8 @@ pub(crate) fn lower(
         // Members are read by id: the last one shares the slab's class, and
         // selecting it would lower the slab again.
         Launch::Slab { members, .. } => compose(caps, members, theta, cx, "cpu_slab"),
-        Launch::RmsNorm { .. }
-        | Launch::DecodeAttention { .. }
-        | Launch::DecodeAttentionMerge { .. } => Err(fusor_ir::Error::Plan(
-            "specialized decode launch is GPU-only".into(),
+        Launch::RmsNorm { .. } => Err(fusor_ir::Error::Plan(
+            "specialized normalization launch is GPU-only".into(),
         )),
         Launch::Group { members, .. } => compose(caps, members, theta, cx, "cpu_group"),
     }

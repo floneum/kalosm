@@ -4,7 +4,6 @@
 
 pub mod absorb_view;
 pub mod algebra;
-pub mod attention;
 pub mod fusion;
 pub mod group;
 pub mod layout;
@@ -39,7 +38,6 @@ pub struct RuleId(pub u16);
 pub static CORE_RULES: &[Rule] = &[
     // Logical algebra
     normalization::FUSE_ROW_NORMALIZATION,
-    attention::FUSE_STREAMING_ATTENTION,
     algebra::STRIP,
     algebra::RECOGNIZE_CONTRACT,
     algebra::CONTRACT_REASSOC,

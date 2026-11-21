@@ -28,32 +28,6 @@ pub enum Launch {
         ops: Vec<Operand>,
         sched: ScheduleDomain,
     },
-    /// Single-query F32 attention over a symbolic key extent. This is
-    /// an optional lowering of the ordinary QK/softmax/PV graph, with the
-    /// same output [batch, query heads, 1, head dimension].
-    DecodeAttention {
-        output: IndexSpace,
-        kv_heads: u32,
-        keys: Dim,
-        /// Threads per query head, a multiple of the fixed subgroup width.
-        block: u32,
-        /// Fixed subgroup width used by this schedule.
-        subgroup: u32,
-        /// Zero emits final attention. Otherwise emit [B,H,ceil(keys/chunk),D+2]
-        /// with D unnormalized PV values, the local max, and exponential sum.
-        chunk: u32,
-        scale: ScalarExpr,
-        prefix: ScalarExpr,
-        ops: Vec<Operand>,
-        sched: ScheduleDomain,
-    },
-    /// Stable merge of split attention's [numerator[D], max, sum].
-    DecodeAttentionMerge {
-        output: IndexSpace,
-        splits: Dim,
-        ops: Vec<Operand>,
-        sched: ScheduleDomain,
-    },
     Map {
         space: IndexSpace,
         body: ScalarExpr,
@@ -322,8 +296,6 @@ impl Launch {
     pub const fn tag(&self) -> OpTag {
         match self {
             Self::RmsNorm { .. } => OpTag::LaunchRmsNorm,
-            Self::DecodeAttention { .. } => OpTag::LaunchDecodeAttention,
-            Self::DecodeAttentionMerge { .. } => OpTag::LaunchDecodeAttentionMerge,
             Self::Map { .. } => OpTag::LaunchMap,
             Self::Fold { .. } => OpTag::LaunchFold,
             Self::StreamFold { .. } => OpTag::LaunchStreamFold,
@@ -363,8 +335,6 @@ impl Launch {
     fn operand_lists(&self) -> [&[Operand]; 2] {
         match self {
             Self::RmsNorm { ops, .. }
-            | Self::DecodeAttention { ops, .. }
-            | Self::DecodeAttentionMerge { ops, .. }
             | Self::Map { ops, .. }
             | Self::Fold { ops, .. }
             | Self::Gather { ops, .. }
@@ -403,8 +373,6 @@ impl Launch {
     pub fn operands_mut(&mut self) -> impl Iterator<Item = &mut Operand> {
         let [a, b]: [&mut [Operand]; 2] = match self {
             Self::RmsNorm { ops, .. }
-            | Self::DecodeAttention { ops, .. }
-            | Self::DecodeAttentionMerge { ops, .. }
             | Self::Map { ops, .. }
             | Self::Fold { ops, .. }
             | Self::Gather { ops, .. }
@@ -419,8 +387,6 @@ impl Launch {
     pub fn schedule(&self) -> Option<&ScheduleDomain> {
         match self {
             Self::RmsNorm { sched, .. }
-            | Self::DecodeAttention { sched, .. }
-            | Self::DecodeAttentionMerge { sched, .. }
             | Self::Map { sched, .. }
             | Self::Fold { sched, .. }
             | Self::StreamFold { sched, .. }

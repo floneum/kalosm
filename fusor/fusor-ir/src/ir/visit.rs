@@ -90,30 +90,6 @@ fn launch(op: &mut Launch, visitor: &mut impl VisitMut, generated: Option<usize>
             visitor.scalar(epsilon);
             operands(ops, visitor);
         }
-        Launch::DecodeAttention {
-            output,
-            keys,
-            scale,
-            prefix,
-            ops,
-            ..
-        } => {
-            dims(&mut output.dims, visitor);
-            visitor.dim(keys);
-            visitor.scalar(scale);
-            visitor.scalar(prefix);
-            operands(ops, visitor);
-        }
-        Launch::DecodeAttentionMerge {
-            output,
-            splits,
-            ops,
-            ..
-        } => {
-            dims(&mut output.dims, visitor);
-            visitor.dim(splits);
-            operands(ops, visitor);
-        }
         Launch::Map {
             space, body, ops, ..
         } => {
