@@ -870,6 +870,7 @@ fn compare(op: CmpOp, a: Value, b: Value) -> Value {
 #[cfg(test)]
 mod tests {
     use fusor_ir::{dtype::NumericContract, scalar::BinOp};
+    use std::sync::Arc;
 
     use super::*;
 
