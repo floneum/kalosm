@@ -65,7 +65,11 @@ fn invariant_along(o: &Operand, space: &IndexSpace, axis: u32) -> Option<bool> {
 /// the layout (the floor spells a broadcast as a `Restride`), plus the id it names.
 pub(crate) fn effective(b: &Builder<'_>, o: &Operand, space: &IndexSpace) -> (Operand, Id) {
     let plain = || (o.clone(), o.src);
-    if !matches!(o.access, AccessPlan::Alias) || !o.layout.is_contiguous() {
+    if !matches!(o.access, AccessPlan::Alias)
+        || !o.layout.is_contiguous()
+        || o.layout.shape() != space.dims.as_slice()
+        || o.layout.offset() != Dim::Const(0)
+    {
         return plain();
     }
     let spine = b.trace_pure_views(o.src);
@@ -98,14 +102,18 @@ pub(crate) fn effective(b: &Builder<'_>, o: &Operand, space: &IndexSpace) -> (Op
 }
 
 /// Whether two edges read the same elements of the same value.
-fn same_read(a: &Operand, b: &Operand) -> bool {
+fn same_read(a: &Operand, b: &Operand, space: &IndexSpace) -> bool {
     if a.src != b.src || std::mem::discriminant(&a.access) != std::mem::discriminant(&b.access) {
         return false;
     }
     if a.layout == b.layout {
         return true;
     }
-    if matches!(a.access, AccessPlan::Alias) && matches!(b.access, AccessPlan::Alias) {
+    if matches!(a.access, AccessPlan::Alias)
+        && matches!(b.access, AccessPlan::Alias)
+        && a.layout.shape() == space.dims.as_slice()
+        && b.layout.shape() == space.dims.as_slice()
+    {
         let a_shape = a.layout.shape();
         let b_shape = b.layout.shape();
         if a.layout.offset() == b.layout.offset()
@@ -128,9 +136,9 @@ fn same_read(a: &Operand, b: &Operand) -> bool {
 
 #[cfg(test)]
 mod same_read_tests {
-    use super::same_read;
+    use super::{on_iter_space, same_read};
     use crate::egraph::Id;
-    use crate::ir::launch::{AccessPlan, Operand};
+    use crate::ir::launch::{AccessPlan, IndexSpace, Operand};
     use crate::shape::{Dim, Layout, SymId};
 
     #[test]
@@ -144,6 +152,7 @@ mod same_read_tests {
             length,
         ];
         let dense = Layout::contiguous(&shape);
+        let space = IndexSpace::new(shape);
         let mut unit_stride = dense.strides().to_vec();
         unit_stride[3] = Dim::Const(0);
         let unit = Layout::from_parts(Dim::Const(0), &shape, &unit_stride).unwrap();
@@ -155,7 +164,8 @@ mod same_read_tests {
         let dense_read = operand(dense.clone(), AccessPlan::Alias);
         assert!(same_read(
             &dense_read,
-            &operand(unit.clone(), AccessPlan::Alias)
+            &operand(unit.clone(), AccessPlan::Alias),
+            &space,
         ));
 
         assert!(!same_read(
@@ -163,7 +173,8 @@ mod same_read_tests {
             &operand(
                 Layout::from_parts(Dim::Const(1), &shape, &unit_stride).unwrap(),
                 AccessPlan::Alias,
-            )
+            ),
+            &space,
         ));
 
         let mut changed_stride = dense.strides().to_vec();
@@ -173,7 +184,8 @@ mod same_read_tests {
             &operand(
                 Layout::from_parts(Dim::Const(0), &shape, &changed_stride).unwrap(),
                 AccessPlan::Alias,
-            )
+            ),
+            &space,
         ));
 
         let symbolic_unit = Dim::Sym(SymId(1));
@@ -185,6 +197,7 @@ mod same_read_tests {
             length,
         ];
         let symbolic_dense = Layout::contiguous(&symbolic_shape);
+        let symbolic_space = IndexSpace::new(symbolic_shape);
         let mut symbolic_stride = symbolic_dense.strides().to_vec();
         symbolic_stride[3] = Dim::Const(0);
         assert!(!same_read(
@@ -192,22 +205,233 @@ mod same_read_tests {
             &operand(
                 Layout::from_parts(Dim::Const(0), &symbolic_shape, &symbolic_stride).unwrap(),
                 AccessPlan::Alias,
-            )
+            ),
+            &symbolic_space,
         ));
 
-        assert!(!same_read(&dense_read, &operand(unit, AccessPlan::Gather)));
+        assert!(!same_read(
+            &dense_read,
+            &operand(unit, AccessPlan::Gather),
+            &space,
+        ));
         assert!(!same_read(
             &dense_read,
             &Operand {
                 src: Id(8),
                 layout: dense,
                 access: AccessPlan::Alias,
-            }
+            },
+            &space,
         ));
+
+        let short_shape = [Dim::ONE, length];
+        let short_dense = Layout::contiguous(&short_shape);
+        let short_zero =
+            Layout::from_parts(Dim::Const(0), &short_shape, &[Dim::Const(0), Dim::Const(1)])
+                .unwrap();
+        let larger_space = IndexSpace::new([Dim::Const(2), length]);
+        assert!(!same_read(
+            &operand(short_dense, AccessPlan::Alias),
+            &operand(short_zero, AccessPlan::Alias),
+            &larger_space,
+        ));
+    }
+
+    #[test]
+    fn undersized_unit_alias_layouts_are_not_projected_or_compared() {
+        use crate::ir::launch::{Launch, ScheduleDomain};
+        use crate::scalar::ScalarExpr;
+
+        let n = Dim::Sym(SymId(2));
+        let large_space = IndexSpace::new([Dim::Const(2), n]);
+        let short_shape = [Dim::ONE, n];
+        let dense = Layout::contiguous(&short_shape);
+        let zero = Layout::from_parts(Dim::Const(0), &short_shape, &[Dim::Const(0), Dim::Const(1)])
+            .unwrap();
+        let dense_read = Operand {
+            src: Id(9),
+            layout: dense,
+            access: AccessPlan::Alias,
+        };
+        let zero_read = Operand {
+            src: Id(9),
+            layout: zero,
+            access: AccessPlan::Alias,
+        };
+        let map = Launch::Map {
+            space: large_space.clone(),
+            body: ScalarExpr::arg(0, crate::dtype::Dtype::F32),
+            ops: vec![dense_read.clone()],
+            sched: ScheduleDomain::Point,
+        };
+        assert!(crate::verify_launch::check_operand_access(&map).is_ok());
+        assert!(!same_read(&dense_read, &zero_read, &large_space));
+
+        let vector_space = IndexSpace::new([Dim::Const(2), Dim::Const(2), n]);
+        let short_vector_shape = [Dim::Const(2), Dim::ONE, n];
+        let short_vector = Operand {
+            src: Id(10),
+            layout: Layout::from_parts(
+                Dim::Const(0),
+                &short_vector_shape,
+                &[n, Dim::Const(0), Dim::Const(1)],
+            )
+            .unwrap(),
+            access: AccessPlan::Alias,
+        };
+        let vector_map = Launch::Map {
+            space: vector_space.clone(),
+            body: ScalarExpr::arg(0, crate::dtype::Dtype::F32),
+            ops: vec![short_vector.clone()],
+            sched: ScheduleDomain::Point,
+        };
+        assert!(crate::verify_launch::check_operand_access(&vector_map).is_ok());
+        assert!(on_iter_space(&short_vector, &vector_space, &[1]).is_none());
     }
 }
 
-/// One step of an `accum`-endomorphism surround on the path from a lift's root down to
+#[cfg(test)]
+mod effective_tests {
+    use super::effective;
+    use crate::device::{Caps, DeviceKind, Limits};
+    use crate::egraph::{EGraph, Id};
+    use crate::error::Result;
+    use crate::ir::Op;
+    use crate::ir::kernel::{ArenaPlan, ArenaPlanner, BarrierSuggestion, KernelIr, Tiles};
+    use crate::ir::launch::{AccessPlan, IndexSpace, Operand};
+    use crate::ir::logical::{BufferId, LeafKind, Logical};
+    use crate::shape::{BoundsProof, Dim, Layout, StrideSpec};
+    use smallvec::smallvec;
+    use std::sync::Arc;
+
+    struct UnusedArena;
+
+    impl ArenaPlanner for UnusedArena {
+        fn arena_plan(&self, _: &KernelIr, _: &Caps) -> Result<ArenaPlan> {
+            unreachable!()
+        }
+
+        fn workgroup_bytes(&self, _: &Tiles, _: &Caps) -> Result<u32> {
+            unreachable!()
+        }
+
+        fn barrier_suggestions(&self, _: &KernelIr) -> Vec<BarrierSuggestion> {
+            unreachable!()
+        }
+
+        fn verify_arena(&self, _: &KernelIr, _: &ArenaPlan) -> Result<()> {
+            unreachable!()
+        }
+
+        fn verify_uniformity(&self, _: &KernelIr) -> Result<()> {
+            unreachable!()
+        }
+    }
+
+    fn caps() -> Caps {
+        Caps {
+            kind: DeviceKind::Cpu,
+            name: "rebase effective test".into(),
+            limits: Limits::default(),
+            subgroups: None,
+            f16: false,
+            bf16: false,
+            coop: Default::default(),
+            atomic_f32: false,
+            workgroup_alias: false,
+            mixed_precision_coop_store: false,
+            pipeline_cache: false,
+            timestamp_query: false,
+            simd_widths: Default::default(),
+            threads: 1,
+        }
+    }
+
+    fn view_graph() -> (EGraph, Caps, Id, Id, IndexSpace) {
+        let caps = caps();
+        let mut graph = EGraph::new(crate::CoreSemantics::new(Arc::new(UnusedArena)));
+        let shape = [Dim::Const(2), Dim::Const(3)];
+        let base = graph
+            .add(Op::Logical(Logical::Leaf(LeafKind::Buffer {
+                name: BufferId(0),
+                dtype: crate::dtype::Dtype::F32,
+                shape: shape.iter().copied().collect(),
+            })))
+            .unwrap();
+        let view = graph
+            .add(Op::Logical(Logical::Restride {
+                specs: smallvec![
+                    StrideSpec::dim(1, Dim::Const(3)),
+                    StrideSpec::dim(0, Dim::Const(2)),
+                ],
+                bounds: BoundsProof::Static,
+                x: base,
+            }))
+            .unwrap();
+        (
+            graph,
+            caps,
+            base,
+            view,
+            IndexSpace::new([Dim::Const(3), Dim::Const(2)]),
+        )
+    }
+
+    #[test]
+    fn effective_view_composition_requires_exact_zero_offset_read_space() {
+        let (mut graph, caps, base, view, space) = view_graph();
+        let exact = Operand {
+            src: view,
+            layout: Layout::contiguous(&space.dims),
+            access: AccessPlan::Alias,
+        };
+        let (composed, source) = {
+            let b = graph.builder(&caps);
+            effective(&b, &exact, &space)
+        };
+        assert_eq!(source, base);
+        assert_eq!(composed.src, base);
+        assert_eq!(
+            composed.layout,
+            Layout::from_parts(Dim::Const(0), &space.dims, &[Dim::Const(1), Dim::Const(3)],)
+                .unwrap()
+        );
+
+        let short_shape = [Dim::ONE, Dim::Const(2)];
+        let mismatched = Operand {
+            src: view,
+            layout: Layout::contiguous(&short_shape),
+            access: AccessPlan::Alias,
+        };
+        assert!(mismatched.layout.is_contiguous());
+        let (unchanged, source) = {
+            let b = graph.builder(&caps);
+            effective(&b, &mismatched, &space)
+        };
+        assert_eq!(source, view);
+        assert_eq!(unchanged, mismatched);
+
+        let nonzero_offset = Operand {
+            src: view,
+            layout: Layout::from_parts(
+                Dim::Const(1),
+                &space.dims,
+                &Layout::row_major_strides(&space.dims),
+            )
+            .unwrap(),
+            access: AccessPlan::Alias,
+        };
+        assert_eq!(nonzero_offset.layout.offset(), Dim::Const(1));
+        let (unchanged, source) = {
+            let b = graph.builder(&caps);
+            effective(&b, &nonzero_offset, &space)
+        };
+        assert_eq!(source, view);
+        assert_eq!(unchanged, nonzero_offset);
+    }
+}
+
+/// One step of an accum-endomorphism surround on the path from a lift's root down to
 /// a folded subterm.
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Peel {
@@ -785,6 +1009,9 @@ pub(crate) fn on_iter_space(o: &Operand, space: &IndexSpace, vec_axes: &[u32]) -
         return Some(o.clone());
     }
     let o = as_alias_over(o, space)?;
+    if o.layout.shape() != space.dims.as_slice() {
+        return None;
+    }
     if vec_axes.iter().any(|a| {
         o.layout
             .strides()
@@ -1037,7 +1264,9 @@ fn common_basis(
     for _ in 0..MAX_EXPANSIONS {
         let place = |o: &Operand| -> Option<usize> {
             let (eff, _) = effective(b, o, &v.space);
-            reader.iter().position(|(x, _)| same_read(x, &eff))
+            reader
+                .iter()
+                .position(|(x, _)| same_read(x, &eff, &v.space))
         };
         if let Some(remap) = ops.iter().map(place).collect::<Option<Vec<_>>>() {
             return Some(map_args(&lift, &|i| {

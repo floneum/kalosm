@@ -44,6 +44,322 @@ fn run_f32(session: &Session, h: &GraphRef, plan: &Plan, out: &Tensor) -> Vec<f3
     bytemuck::cast_slice::<u8, f32>(&bytes).to_vec()
 }
 
+#[test]
+#[cfg(feature = "cpu")]
+fn symbolic_generic_retarget_carrier_executes_cpu() {
+    symbolic_generic_retarget_carrier_executes(Session::new(Backend::cpu().unwrap()).unwrap());
+}
+
+#[test]
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+fn symbolic_generic_retarget_carrier_executes_gpu() {
+    symbolic_generic_retarget_carrier_executes(
+        Session::new(Backend::gpu_blocking().expect("GPU backend required")).unwrap(),
+    );
+}
+
+fn symbolic_generic_retarget_carrier_executes(session: Session) {
+    use fusor_ir::carrier::{Carrier, SlotTy};
+    use fusor_ir::dtype::{Dtype, Splat};
+    use fusor_ir::egraph::Id;
+    use fusor_ir::ir::launch::{AccessPlan, IndexSpace, Launch, Operand, ScheduleDomain};
+    use fusor_ir::scalar::{BinOp, ScalarExpr, ScalarKind, UnOp};
+    use fusor_ir::shape::Layout;
+    use smallvec::smallvec;
+    use std::collections::HashSet;
+
+    fn selected_dag(g: &EGraph, plan: &Plan, root: Id) -> HashSet<Id> {
+        let mut todo = vec![root];
+        let mut selected = HashSet::new();
+        while let Some(id) = todo.pop() {
+            let chosen = plan
+                .extraction
+                .sigma
+                .get(&g.class_of(id))
+                .copied()
+                .unwrap_or(id);
+            if !selected.insert(chosen) {
+                continue;
+            }
+            for child in &g.node(chosen).children {
+                todo.push(
+                    plan.extraction
+                        .sigma
+                        .get(&g.class_of(*child))
+                        .copied()
+                        .unwrap_or(*child),
+                );
+            }
+        }
+        selected
+    }
+
+    const D: usize = 2;
+    let graph = Graph::new(&session);
+    let h = graph.handle();
+    let n = graph.sym("n");
+    graph.bind("n", 3);
+    let iter = [Dim::Const(2), Dim::Const(2), Dim::Const(2), Dim::ONE, n];
+    let full = [
+        Dim::Const(2),
+        Dim::Const(2),
+        Dim::Const(2),
+        Dim::ONE,
+        Dim::Const(D as u64),
+        n,
+    ];
+    let score = graph.leaf("scores", &iter, Dtype::F32).unwrap();
+    let value = graph.leaf("values", &full, Dtype::F32).unwrap();
+    let caps = session.caps();
+    let (root_reader, plan) = {
+        let mut g = h.state().egraph.lock();
+        let maximum = g
+            .builder(&caps)
+            .add_launch(Launch::Fold {
+                space: IndexSpace::new(iter),
+                axis: 4,
+                vec_axes: smallvec![],
+                carrier: Carrier::binop(
+                    BinOp::Max,
+                    Carrier::binop_identity(BinOp::Max, Dtype::F32).unwrap(),
+                    Dtype::F32,
+                ),
+                acc: Dtype::F32,
+                post: smallvec![ScalarExpr::arg(0, Dtype::F32)],
+                ops: vec![Operand {
+                    src: score.id,
+                    layout: Layout::contiguous(&iter),
+                    access: AccessPlan::Alias,
+                }],
+                sched: ScheduleDomain::Point,
+            })
+            .unwrap();
+        let score_layout = Layout::contiguous(&iter);
+        let body_carrier = Carrier {
+            slots: smallvec![SlotTy::Scalar, SlotTy::Vector(Dim::Const(D as u64))],
+            identity: smallvec![Splat::F32(0.0), Splat::F32(0.0)],
+            lift: smallvec![
+                ScalarExpr::un(
+                    UnOp::Exp,
+                    ScalarExpr::bin(
+                        BinOp::Sub,
+                        ScalarExpr::arg(0, Dtype::F32),
+                        ScalarExpr::arg(1, Dtype::F32),
+                    ),
+                ),
+                ScalarExpr::bin(
+                    BinOp::Mul,
+                    ScalarExpr::un(
+                        UnOp::Exp,
+                        ScalarExpr::bin(
+                            BinOp::Sub,
+                            ScalarExpr::arg(0, Dtype::F32),
+                            ScalarExpr::arg(1, Dtype::F32),
+                        ),
+                    ),
+                    ScalarExpr::arg(2, Dtype::F32),
+                ),
+            ],
+            merge: smallvec![
+                ScalarExpr::bin(
+                    BinOp::Add,
+                    ScalarExpr::arg(0, Dtype::F32),
+                    ScalarExpr::arg(2, Dtype::F32),
+                ),
+                ScalarExpr::bin(
+                    BinOp::Add,
+                    ScalarExpr::arg(1, Dtype::F32),
+                    ScalarExpr::arg(3, Dtype::F32),
+                ),
+            ],
+            associative: true,
+            tie: None,
+        };
+        let body = g
+            .builder(&caps)
+            .add_launch(Launch::Fold {
+                space: IndexSpace::new(full),
+                axis: 5,
+                vec_axes: smallvec![4],
+                carrier: body_carrier,
+                acc: Dtype::F32,
+                post: smallvec![
+                    ScalarExpr::arg(0, Dtype::F32),
+                    ScalarExpr::arg(1, Dtype::F32),
+                ],
+                ops: vec![
+                    Operand {
+                        src: score.id,
+                        layout: Layout::from_parts(
+                            Dim::Const(0),
+                            &full,
+                            &[
+                                score_layout.strides()[0],
+                                score_layout.strides()[1],
+                                score_layout.strides()[2],
+                                Dim::Const(0),
+                                Dim::Const(0),
+                                Dim::Const(1),
+                            ],
+                        )
+                        .unwrap(),
+                        access: AccessPlan::Alias,
+                    },
+                    Operand {
+                        src: maximum,
+                        layout: Layout::from_parts(
+                            Dim::Const(0),
+                            &full,
+                            &[
+                                Dim::Const(4),
+                                Dim::Const(2),
+                                Dim::Const(1),
+                                Dim::ONE,
+                                Dim::Const(0),
+                                Dim::Const(0),
+                            ],
+                        )
+                        .unwrap(),
+                        access: AccessPlan::Alias,
+                    },
+                    Operand {
+                        src: value.id,
+                        layout: Layout::contiguous(&full),
+                        access: AccessPlan::Alias,
+                    },
+                ],
+                sched: ScheduleDomain::Point,
+            })
+            .unwrap();
+        g.add_root(body);
+        let before = g.len();
+        let node = g.node(body).clone();
+        let facts = g.facts_view(body, &caps);
+        let retargeted =
+            fusor_ir::rules::rebase::retarget(&mut g.builder(&caps), body, &node, &facts)
+                .expect("generic symbolic Fold did not RETARGET");
+        let carrier_id = (before..g.len())
+            .map(|index| Id(index as u32))
+            .find(|id| {
+                matches!(
+                    &g.node(*id).op,
+                    Op::Launch(Launch::Fold { carrier, .. })
+                        if carrier.slots.as_slice()
+                            == [SlotTy::Scalar, SlotTy::Scalar, SlotTy::Vector(Dim::Const(D as u64))]
+                )
+            })
+            .expect("RETARGET did not mint the three-slot carrier");
+        let mut readbacks: Vec<_> = (before..g.len())
+            .map(|index| Id(index as u32))
+            .filter(|id| {
+                g.class_of(*id) == g.class_of(retargeted)
+                    && matches!(
+                        &g.node(*id).op,
+                        Op::Launch(Launch::Map { body, ops, .. })
+                            if matches!(body.kind(), ScalarKind::Arg(0))
+                                && ops.len() == 1
+                                && ops[0].src == carrier_id
+                    )
+            })
+            .collect();
+        assert_eq!(
+            readbacks.len(),
+            1,
+            "expected exactly one newly minted Map readback for the carrier"
+        );
+        let root_reader = readbacks.pop().unwrap();
+        assert_ne!(root_reader, body, "readback must not be the original Fold");
+        assert!(matches!(
+            &g.node(root_reader).op,
+            Op::Launch(Launch::Map { ops, .. }) if ops[0].src == carrier_id
+        ));
+        let plan = replan_with(
+            &session,
+            &g,
+            &[root_reader],
+            &[score.id, value.id, root_reader, carrier_id],
+            carrier_id,
+            None,
+        );
+        assert_eq!(
+            plan.extraction.sigma.get(&g.class_of(carrier_id)),
+            Some(&carrier_id)
+        );
+        let dispatch_nodes: HashSet<_> = plan
+            .launches
+            .iter()
+            .flat_map(|dispatch| {
+                std::iter::once(dispatch.root).chain(dispatch.members.iter().copied())
+            })
+            .collect();
+        assert!(
+            plan.launches
+                .iter()
+                .any(|dispatch| dispatch.root == carrier_id)
+        );
+        assert!(
+            plan.launches
+                .iter()
+                .any(|dispatch| dispatch.root == root_reader)
+        );
+        assert!(!dispatch_nodes.contains(&maximum));
+        assert!(!dispatch_nodes.contains(&body));
+        let dag = selected_dag(&g, &plan, root_reader);
+        assert!(
+            dag.contains(&carrier_id),
+            "selected root does not reach carrier"
+        );
+        assert!(
+            !dag.contains(&maximum),
+            "selected DAG contains old max Fold"
+        );
+        assert!(
+            !dag.contains(&body),
+            "selected DAG contains original body Fold"
+        );
+        (root_reader, plan)
+    };
+    let output = h.tensor(root_reader);
+
+    for length in [3usize, 7, 11] {
+        graph.bind("n", length as u64);
+        let scores: Vec<f32> = (0..8 * length)
+            .map(|i| ((i * 7 % 23) as f32 - 11.) / 8.)
+            .collect();
+        let values: Vec<f32> = (0..8 * D * length)
+            .map(|i| ((i * 13 % 29) as f32 - 14.) / 9.)
+            .collect();
+        score
+            .set_bytes(bytemuck::cast_slice(&scores).to_vec())
+            .unwrap();
+        value
+            .set_bytes(bytemuck::cast_slice(&values).to_vec())
+            .unwrap();
+        let actual = run_f32(&session, h, &plan, &output);
+        let mut expected = Vec::with_capacity(8 * (D + 1));
+        for row in 0..8 {
+            let row_scores = &scores[row * length..(row + 1) * length];
+            let max = row_scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let weights: Vec<f32> = row_scores.iter().map(|x| (x - max).exp()).collect();
+            expected.push(weights.iter().sum());
+            for lane in 0..D {
+                expected.push(
+                    (0..length)
+                        .map(|key| weights[key] * values[(row * D + lane) * length + key])
+                        .sum::<f32>(),
+                );
+            }
+        }
+        assert_eq!(actual.len(), expected.len(), "length={length}");
+        for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+            assert!(
+                actual.is_finite() && (actual - expected).abs() <= 2e-4,
+                "length={length} output[{index}]={actual} expected={expected}"
+            );
+        }
+    }
+}
+
 // A symbolic K retains the full unrolled loop even at K=3. Its register
 // pressure exposed a backend compiling for fewer threads than the declared
 // workgroup size. Exercise actual extracted plans, including materialized
