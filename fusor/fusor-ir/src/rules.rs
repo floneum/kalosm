@@ -352,8 +352,7 @@ pub(crate) fn composed_spine_layout(
         if *bounds != crate::shape::BoundsProof::Static {
             return None;
         }
-        // Only a dense row-major stage is addressed correctly by a spec
-        // overrunning its axis (an axis-merging reshape).
+        // Overrunning an axis is a flat carry only in a dense row-major stage.
         let dense = {
             let mut want = 1u64;
             let mut ok = true;
@@ -369,28 +368,49 @@ pub(crate) fn composed_spine_layout(
             }
             ok
         };
+        let mut composition_strides = strides.clone();
+        if dense && shape.contains(&1) {
+            let mut row_major_stride = 1u64;
+            for i in (0..shape.len()).rev() {
+                if shape[i] == 1 {
+                    composition_strides[i] = row_major_stride;
+                } else if shape[i] > 1 {
+                    row_major_stride = row_major_stride.checked_mul(shape[i])?;
+                }
+            }
+        }
+        let mut axis_reaches = vec![0u64; shape.len()];
+        let mut empty = false;
         let mut nshape: Vec<u64> = Vec::with_capacity(specs.len());
         let mut nstrides: Vec<u64> = Vec::with_capacity(specs.len());
         for s in specs {
             let idim = s.input_dim as usize;
-            let in_ext = *shape.get(idim)?;
-            let in_stride = *strides.get(idim)?;
+            shape.get(idim)?;
+            let in_stride = *composition_strides.get(idim)?;
             let size = s.size.as_const()?;
             let off = s.offset.as_const()?;
             offset = offset.checked_add(off.checked_mul(in_stride)?)?;
+            empty |= size == 0;
+            let coordinate_reach = u64::from(s.multiplier).checked_mul(size.saturating_sub(1))?;
+            let reach = off.checked_add(coordinate_reach)?;
+            let axis_reach = axis_reaches.get_mut(idim)?;
+            *axis_reach = axis_reach.checked_add(reach)?;
             if s.multiplier == 0 {
                 nshape.push(size);
                 nstrides.push(0);
                 continue;
             }
-            let span = u64::from(s.multiplier)
-                .checked_mul(size.saturating_sub(1))?
-                .checked_add(off)?;
-            if span >= in_ext.max(1) && !dense {
-                return None;
-            }
             nshape.push(size);
             nstrides.push(in_stride.checked_mul(u64::from(s.multiplier))?);
+        }
+        if !dense
+            && !empty
+            && axis_reaches
+                .iter()
+                .zip(&shape)
+                .any(|(reach, extent)| reach >= extent)
+        {
+            return None;
         }
         shape = nshape;
         strides = nstrides;

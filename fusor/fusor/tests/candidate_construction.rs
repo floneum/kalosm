@@ -1227,6 +1227,357 @@ fn fold_view_sinking_projects_only_unit_axes() {
     }
 }
 
+#[test]
+fn overlapping_views_on_padded_rows_preserve_flat_carries() {
+    use fusor_ir::ir::launch::{AccessPlan, IndexSpace, Launch, Operand, ScheduleDomain};
+    use fusor_ir::scalar::ScalarExpr;
+    use fusor_ir::shape::{BoundsProof, Layout, StrideSpec};
+
+    let mut graph = graph();
+    let base_shape = consts([2, 5]);
+    let base = leaf(&mut graph, 0, &base_shape);
+    let restride = |graph: &mut EGraph, x, specs: &[StrideSpec]| {
+        graph
+            .add(Op::Logical(Logical::Restride {
+                specs: specs.to_vec().into(),
+                bounds: BoundsProof::Static,
+                x,
+            }))
+            .unwrap()
+    };
+    let narrowed = restride(
+        &mut graph,
+        base,
+        &[
+            StrideSpec::dim(0, Dim::Const(2)),
+            StrideSpec::dim(1, Dim::Const(4)),
+        ],
+    );
+    let overlapping = restride(
+        &mut graph,
+        narrowed,
+        &[
+            StrideSpec::dim(1, Dim::Const(3)),
+            StrideSpec::dim(1, Dim::Const(3)),
+            StrideSpec::dim(1, Dim::Const(1)),
+        ],
+    );
+    let squeezed = restride(
+        &mut graph,
+        overlapping,
+        &[
+            StrideSpec::dim(0, Dim::Const(3)),
+            StrideSpec::dim(1, Dim::Const(3)),
+        ],
+    );
+    let target = consts([3, 3]);
+    let reader = graph
+        .add(Op::Launch(Launch::Map {
+            space: IndexSpace::new(target),
+            body: ScalarExpr::arg(0, Dtype::F32),
+            ops: vec![Operand {
+                src: squeezed,
+                layout: Layout::contiguous(&target),
+                access: AccessPlan::Alias,
+            }],
+            sched: ScheduleDomain::Point,
+        }))
+        .unwrap();
+    assert_declines(
+        &mut graph,
+        &caps(),
+        reader,
+        fusor_ir::rules::sink::fold_views_into_index,
+    );
+}
+
+#[test]
+fn public_overlapping_views_on_padded_rows_preserve_flat_carries() {
+    use fusor::{Device, Tensor};
+    use fusor_ir::shape::StrideSpec;
+
+    let device = Device::cpu();
+    let base: Tensor<2, f32> = Tensor::new(
+        &device,
+        [[0.0, 1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0, 9.0]],
+    );
+    let narrowed = base.narrow(1, 0, 4);
+    let overlapping = narrowed.restride([
+        StrideSpec::dim(1, Dim::Const(3)),
+        StrideSpec::dim(1, Dim::Const(3)),
+        StrideSpec::dim(1, Dim::Const(1)),
+    ]);
+    let output = overlapping.squeeze::<2>(2);
+    let actual = output.read().unwrap().to_flat();
+    assert_eq!(actual, [0.0, 1.0, 2.0, 1.0, 2.0, 3.0, 2.0, 3.0, 5.0]);
+}
+
+#[test]
+fn safe_duplicate_axes_preserve_addresses_and_dense_flat_carries() {
+    use fusor_ir::ir::launch::{AccessPlan, IndexSpace, Launch, Operand, ScheduleDomain};
+    use fusor_ir::scalar::ScalarExpr;
+    use fusor_ir::shape::{BoundsProof, Layout, StrideSpec};
+
+    fn restride(graph: &mut EGraph, x: Id, specs: &[StrideSpec]) -> Id {
+        graph
+            .add(Op::Logical(Logical::Restride {
+                specs: specs.to_vec().into(),
+                bounds: BoundsProof::Static,
+                x,
+            }))
+            .unwrap()
+    }
+
+    fn make_reader(graph: &mut EGraph, src: Id, target: &[Dim]) -> Id {
+        graph
+            .add(Op::Launch(Launch::Map {
+                space: IndexSpace::new(target.iter().copied()),
+                body: ScalarExpr::arg(0, Dtype::F32),
+                ops: vec![Operand {
+                    src,
+                    layout: Layout::contiguous(target),
+                    access: AccessPlan::Alias,
+                }],
+                sched: ScheduleDomain::Point,
+            }))
+            .unwrap()
+    }
+
+    fn candidate_layout(graph: &mut EGraph, root: Id, base: Id, caps: &Caps) -> Layout {
+        let fused = apply(
+            graph,
+            caps,
+            root,
+            fusor_ir::rules::sink::fold_views_into_index,
+        )
+        .expect("safe view composition");
+        graph
+            .members(graph.class_of(fused))
+            .into_iter()
+            .find_map(|member| match &graph.node(member).op {
+                Op::Launch(Launch::Map { ops, .. }) if ops.len() == 1 && ops[0].src == base => {
+                    Some(ops[0].layout.clone())
+                }
+                _ => None,
+            })
+            .expect("composed base layout")
+    }
+
+    fn address(layout: &Layout, coords: &[u64]) -> u64 {
+        layout.offset().as_const().unwrap()
+            + coords
+                .iter()
+                .zip(layout.strides())
+                .map(|(coord, stride)| coord * stride.as_const().unwrap())
+                .sum::<u64>()
+    }
+
+    let caps = caps();
+    let mut graph = graph();
+    let padded_base = leaf(&mut graph, 0, &consts([2, 5]));
+    let narrowed = restride(
+        &mut graph,
+        padded_base,
+        &[
+            StrideSpec::dim(0, Dim::Const(2)),
+            StrideSpec::dim(1, Dim::Const(4)),
+        ],
+    );
+    let duplicate = restride(
+        &mut graph,
+        narrowed,
+        &[
+            StrideSpec::dim(1, Dim::Const(2)),
+            StrideSpec::dim(1, Dim::Const(2)),
+        ],
+    );
+    let target = consts([2, 2]);
+    let padded_reader = make_reader(&mut graph, duplicate, &target);
+    let layout = candidate_layout(&mut graph, padded_reader, padded_base, &caps);
+    for i in 0..2 {
+        for j in 0..2 {
+            let flat = i + j;
+            let expected = (flat / 4) * 5 + flat % 4;
+            assert_eq!(
+                address(&layout, &[i, j]),
+                expected,
+                "safe duplicate [{i}, {j}]"
+            );
+        }
+    }
+
+    let mut dense_graph = planner_graph().1;
+    let dense_base = leaf(&mut dense_graph, 1, &consts([2, 4]));
+    let identity = restride(
+        &mut dense_graph,
+        dense_base,
+        &[
+            StrideSpec::dim(0, Dim::Const(2)),
+            StrideSpec::dim(1, Dim::Const(4)),
+        ],
+    );
+    let overlap = restride(
+        &mut dense_graph,
+        identity,
+        &[
+            StrideSpec::dim(1, Dim::Const(3)),
+            StrideSpec::dim(1, Dim::Const(3)),
+            StrideSpec::dim(1, Dim::Const(1)),
+        ],
+    );
+    let squeezed = restride(
+        &mut dense_graph,
+        overlap,
+        &[
+            StrideSpec::dim(0, Dim::Const(3)),
+            StrideSpec::dim(1, Dim::Const(3)),
+        ],
+    );
+    let target = consts([3, 3]);
+    let dense_reader = make_reader(&mut dense_graph, squeezed, &target);
+    let layout = candidate_layout(&mut dense_graph, dense_reader, dense_base, &caps);
+    for i in 0..3 {
+        for j in 0..3 {
+            assert_eq!(address(&layout, &[i, j]), i + j, "dense carry [{i}, {j}]");
+        }
+    }
+}
+
+#[test]
+fn overlapping_axis_reach_includes_zero_stride_offsets() {
+    use fusor_ir::ir::launch::{AccessPlan, IndexSpace, Launch, Operand, ScheduleDomain};
+    use fusor_ir::scalar::ScalarExpr;
+    use fusor_ir::shape::{BoundsProof, Layout, StrideSpec};
+
+    fn restride(graph: &mut EGraph, x: Id, specs: &[StrideSpec]) -> Id {
+        graph
+            .add(Op::Logical(Logical::Restride {
+                specs: specs.to_vec().into(),
+                bounds: BoundsProof::Static,
+                x,
+            }))
+            .unwrap()
+    }
+
+    let mut graph = graph();
+    let base = leaf(&mut graph, 0, &consts([2, 5]));
+    let narrowed = restride(
+        &mut graph,
+        base,
+        &[
+            StrideSpec::dim(0, Dim::Const(2)),
+            StrideSpec::dim(1, Dim::Const(4)),
+        ],
+    );
+    let at_boundary = restride(
+        &mut graph,
+        narrowed,
+        &[
+            StrideSpec::dim_with(1, Dim::Const(2), 1).with_offset(Dim::Const(1)),
+            StrideSpec::dim_with(1, Dim::Const(1), 0).with_offset(Dim::Const(2)),
+        ],
+    );
+    let target = consts([2, 1]);
+    let reader = graph
+        .add(Op::Launch(Launch::Map {
+            space: IndexSpace::new(target),
+            body: ScalarExpr::arg(0, Dtype::F32),
+            ops: vec![Operand {
+                src: at_boundary,
+                layout: Layout::contiguous(&target),
+                access: AccessPlan::Alias,
+            }],
+            sched: ScheduleDomain::Point,
+        }))
+        .unwrap();
+    assert_declines(
+        &mut graph,
+        &caps(),
+        reader,
+        fusor_ir::rules::sink::fold_views_into_index,
+    );
+}
+
+#[test]
+fn dense_unit_axis_strides_preserve_flat_carries() {
+    use fusor_ir::ir::launch::{AccessPlan, IndexSpace, Launch, Operand, ScheduleDomain};
+    use fusor_ir::scalar::ScalarExpr;
+    use fusor_ir::shape::{BoundsProof, Layout, StrideSpec};
+
+    fn restride(graph: &mut EGraph, x: Id, specs: &[StrideSpec]) -> Id {
+        graph
+            .add(Op::Logical(Logical::Restride {
+                specs: specs.to_vec().into(),
+                bounds: BoundsProof::Static,
+                x,
+            }))
+            .unwrap()
+    }
+
+    fn address(layout: &Layout, index: u64) -> u64 {
+        layout.offset().as_const().unwrap() + index * layout.strides()[0].as_const().unwrap()
+    }
+
+    let caps = caps();
+    for unit_stride in [2, 0] {
+        let mut graph = graph();
+        let base = leaf(&mut graph, 0, &consts([2, 3]));
+        let unit_axis = restride(
+            &mut graph,
+            base,
+            &[
+                StrideSpec::dim(0, Dim::Const(2)),
+                StrideSpec::dim_with(1, Dim::Const(1), unit_stride),
+                StrideSpec::dim(1, Dim::Const(3)),
+            ],
+        );
+        let expanded = restride(
+            &mut graph,
+            unit_axis,
+            &[
+                StrideSpec::dim(1, Dim::Const(2)),
+                StrideSpec::dim(2, Dim::Const(1)),
+            ],
+        );
+        let squeezed = restride(&mut graph, expanded, &[StrideSpec::dim(0, Dim::Const(2))]);
+        let target = consts([2]);
+        let reader = graph
+            .add(Op::Launch(Launch::Map {
+                space: IndexSpace::new(target),
+                body: ScalarExpr::arg(0, Dtype::F32),
+                ops: vec![Operand {
+                    src: squeezed,
+                    layout: Layout::contiguous(&target),
+                    access: AccessPlan::Alias,
+                }],
+                sched: ScheduleDomain::Point,
+            }))
+            .unwrap();
+        let fused = apply(
+            &mut graph,
+            &caps,
+            reader,
+            fusor_ir::rules::sink::fold_views_into_index,
+        )
+        .expect("dense unit-axis view composition");
+        let layout = graph
+            .members(graph.class_of(fused))
+            .into_iter()
+            .find_map(|member| match &graph.node(member).op {
+                Op::Launch(Launch::Map { ops, .. }) if ops.len() == 1 && ops[0].src == base => {
+                    Some(ops[0].layout.clone())
+                }
+                _ => None,
+            })
+            .expect("composed base layout");
+        assert_eq!(
+            [address(&layout, 0), address(&layout, 1)],
+            [0, 3],
+            "physical unit-axis stride {unit_stride}"
+        );
+    }
+}
+
 fn attention_expression(g: &mut EGraph, width: u64, keys: Dim, grouped: bool) -> Id {
     use fusor_autograd::tape::{GraphTape, TapeExt};
     use fusor_ir::autograd::Tape;
