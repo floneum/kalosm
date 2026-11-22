@@ -105,9 +105,105 @@ fn same_read(a: &Operand, b: &Operand) -> bool {
     if a.layout == b.layout {
         return true;
     }
+    if matches!(a.access, AccessPlan::Alias) && matches!(b.access, AccessPlan::Alias) {
+        let a_shape = a.layout.shape();
+        let b_shape = b.layout.shape();
+        if a.layout.offset() == b.layout.offset()
+            && a_shape == b_shape
+            // A unit axis has coordinate zero even when neighboring strides are symbolic.
+            && a_shape
+                .iter()
+                .zip(a.layout.strides())
+                .zip(b.layout.strides())
+                .all(|((extent, a), b)| extent.as_const() == Some(1) || a == b)
+        {
+            return true;
+        }
+    }
     match (a.address_map(), b.address_map()) {
         (Some(x), Some(y)) => x == y,
         _ => false,
+    }
+}
+
+#[cfg(test)]
+mod same_read_tests {
+    use super::same_read;
+    use crate::egraph::Id;
+    use crate::ir::launch::{AccessPlan, Operand};
+    use crate::shape::{Dim, Layout, SymId};
+
+    #[test]
+    fn alias_reads_ignore_strides_only_on_static_unit_axes() {
+        let length = Dim::Sym(SymId(0));
+        let shape = [
+            Dim::Const(2),
+            Dim::Const(2),
+            Dim::Const(2),
+            Dim::ONE,
+            length,
+        ];
+        let dense = Layout::contiguous(&shape);
+        let mut unit_stride = dense.strides().to_vec();
+        unit_stride[3] = Dim::Const(0);
+        let unit = Layout::from_parts(Dim::Const(0), &shape, &unit_stride).unwrap();
+        let operand = |layout, access| Operand {
+            src: Id(7),
+            layout,
+            access,
+        };
+        let dense_read = operand(dense.clone(), AccessPlan::Alias);
+        assert!(same_read(
+            &dense_read,
+            &operand(unit.clone(), AccessPlan::Alias)
+        ));
+
+        assert!(!same_read(
+            &dense_read,
+            &operand(
+                Layout::from_parts(Dim::Const(1), &shape, &unit_stride).unwrap(),
+                AccessPlan::Alias,
+            )
+        ));
+
+        let mut changed_stride = dense.strides().to_vec();
+        changed_stride[4] = Dim::Const(2);
+        assert!(!same_read(
+            &dense_read,
+            &operand(
+                Layout::from_parts(Dim::Const(0), &shape, &changed_stride).unwrap(),
+                AccessPlan::Alias,
+            )
+        ));
+
+        let symbolic_unit = Dim::Sym(SymId(1));
+        let symbolic_shape = [
+            Dim::Const(2),
+            Dim::Const(2),
+            Dim::Const(2),
+            symbolic_unit,
+            length,
+        ];
+        let symbolic_dense = Layout::contiguous(&symbolic_shape);
+        let mut symbolic_stride = symbolic_dense.strides().to_vec();
+        symbolic_stride[3] = Dim::Const(0);
+        assert!(!same_read(
+            &operand(symbolic_dense, AccessPlan::Alias),
+            &operand(
+                Layout::from_parts(Dim::Const(0), &symbolic_shape, &symbolic_stride).unwrap(),
+                AccessPlan::Alias,
+            )
+        ));
+
+        assert!(!same_read(&dense_read, &operand(unit, AccessPlan::Gather)));
+        assert!(!same_read(
+            &dense_read,
+            &Operand {
+                src: Id(8),
+                layout: dense,
+                access: AccessPlan::Alias,
+            }
+        ));
     }
 }
 

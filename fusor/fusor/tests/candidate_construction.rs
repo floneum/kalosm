@@ -880,6 +880,164 @@ fn fold_split_declines_unbound_carrier_slots_and_changed_coordinates_before_mint
     }
 }
 
+#[test]
+fn symbolic_generic_retarget_builds_joint_max_mass_vector_carrier() {
+    use fusor_ir::carrier::{Carrier, SlotTy};
+    use fusor_ir::dtype::Splat;
+    use fusor_ir::ir::launch::{AccessPlan, IndexSpace, Launch, Operand, ScheduleDomain};
+    use fusor_ir::scalar::{BinOp, ScalarExpr, UnOp};
+    use fusor_ir::shape::Layout;
+    use smallvec::smallvec;
+
+    let caps = gpu_caps();
+    let mut graph = graph();
+    let length = Dim::Sym(graph.fresh_sym());
+    let iter = [
+        Dim::Const(2),
+        Dim::Const(2),
+        Dim::Const(2),
+        Dim::ONE,
+        length,
+    ];
+    let vector = Dim::Const(2);
+    let full = [
+        Dim::Const(2),
+        Dim::Const(2),
+        Dim::Const(2),
+        Dim::ONE,
+        vector,
+        length,
+    ];
+    let score = leaf(&mut graph, 0, &iter);
+    let value = leaf(&mut graph, 1, &full);
+    let score_layout = Layout::contiguous(&iter);
+    let maximum = graph
+        .builder(&caps)
+        .add_launch(Launch::Fold {
+            space: IndexSpace::new(iter),
+            axis: 4,
+            vec_axes: smallvec![],
+            carrier: Carrier::binop(
+                BinOp::Max,
+                Carrier::binop_identity(BinOp::Max, Dtype::F32).unwrap(),
+                Dtype::F32,
+            ),
+            acc: Dtype::F32,
+            post: smallvec![ScalarExpr::arg(0, Dtype::F32)],
+            ops: vec![Operand {
+                src: score,
+                layout: score_layout.clone(),
+                access: AccessPlan::Alias,
+            }],
+            sched: ScheduleDomain::Point,
+        })
+        .unwrap();
+
+    let score_strides = vec![
+        score_layout.strides()[0],
+        score_layout.strides()[1],
+        score_layout.strides()[2],
+        Dim::Const(0),
+        Dim::Const(0),
+        Dim::Const(1),
+    ];
+    let score_read = Operand {
+        src: score,
+        layout: Layout::from_parts(Dim::Const(0), &full, &score_strides).unwrap(),
+        access: AccessPlan::Alias,
+    };
+    let maximum_read = Operand {
+        src: maximum,
+        layout: Layout::from_parts(
+            Dim::Const(0),
+            &full,
+            &[
+                Dim::Const(4),
+                Dim::Const(2),
+                Dim::Const(1),
+                Dim::Const(1),
+                Dim::Const(0),
+                Dim::Const(0),
+            ],
+        )
+        .unwrap(),
+        access: AccessPlan::Alias,
+    };
+    let shifted = ScalarExpr::bin(
+        BinOp::Sub,
+        ScalarExpr::arg(0, Dtype::F32),
+        ScalarExpr::arg(1, Dtype::F32),
+    );
+    let weight = ScalarExpr::un(UnOp::Exp, shifted);
+    let carrier = Carrier {
+        slots: smallvec![SlotTy::Scalar, SlotTy::Vector(vector)],
+        identity: smallvec![Splat::F32(0.0), Splat::F32(0.0)],
+        lift: smallvec![
+            weight.clone(),
+            ScalarExpr::bin(BinOp::Mul, weight, ScalarExpr::arg(2, Dtype::F32)),
+        ],
+        merge: smallvec![
+            ScalarExpr::bin(
+                BinOp::Add,
+                ScalarExpr::arg(0, Dtype::F32),
+                ScalarExpr::arg(2, Dtype::F32),
+            ),
+            ScalarExpr::bin(
+                BinOp::Add,
+                ScalarExpr::arg(1, Dtype::F32),
+                ScalarExpr::arg(3, Dtype::F32),
+            ),
+        ],
+        associative: true,
+        tie: None,
+    };
+    let body = graph
+        .builder(&caps)
+        .add_launch(Launch::Fold {
+            space: IndexSpace::new(full),
+            axis: 5,
+            vec_axes: smallvec![4],
+            carrier,
+            acc: Dtype::F32,
+            post: smallvec![
+                ScalarExpr::arg(0, Dtype::F32),
+                ScalarExpr::arg(1, Dtype::F32),
+            ],
+            ops: vec![
+                score_read,
+                maximum_read,
+                Operand {
+                    src: value,
+                    layout: Layout::contiguous(&full),
+                    access: AccessPlan::Alias,
+                },
+            ],
+            sched: ScheduleDomain::Point,
+        })
+        .unwrap();
+
+    let before = graph.len();
+    let retargeted = apply(&mut graph, &caps, body, fusor_ir::rules::rebase::retarget)
+        .expect("symbolic Alias reads differing only on a unit axis should retarget");
+    assert!(retargeted.index() >= before);
+    let carrier = (before..graph.len())
+        .map(|index| Id(index as u32))
+        .find_map(|id| match &graph.node(id).op {
+            Op::Launch(Launch::Fold { carrier, .. })
+                if carrier.slots.as_slice()
+                    == [SlotTy::Scalar, SlotTy::Scalar, SlotTy::Vector(vector)] =>
+            {
+                Some(carrier)
+            }
+            _ => None,
+        })
+        .expect("RETARGET must construct a generic Fold carrier");
+    assert_eq!(
+        carrier.slots.as_slice(),
+        &[SlotTy::Scalar, SlotTy::Scalar, SlotTy::Vector(vector),]
+    );
+}
+
 fn assert_graph_invariants(graph: &EGraph, caps: &Caps) {
     use fusor_ir::ir::VerifyCtx;
     for index in 0..graph.len() {
