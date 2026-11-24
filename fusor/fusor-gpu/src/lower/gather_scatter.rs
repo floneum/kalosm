@@ -234,7 +234,7 @@ pub(crate) fn lower_kscatter(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Re
     .element();
     let max_block = ctx.caps.limits.max_compute_invocations_per_workgroup;
     let shape = ScatterGeometry::of(ops, *axis as usize, |d| ctx.binding.require(d), Error::Plan)?;
-    let slots = crate::flags::flags().scatter_single_linear.unwrap_or(4);
+    let slots = 4;
     // A consecutive index expression is invertible. Prove its complete range
     // fits before replacing the update scan with one direct source lookup.
     let range = fusor_tile::index_range::index_start(ctx.cx, idx)

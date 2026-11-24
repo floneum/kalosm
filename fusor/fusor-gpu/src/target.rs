@@ -28,8 +28,6 @@ use crate::pool::BufferPool;
 use crate::uniforms::UniformPack;
 
 mod transfers;
-mod warm;
-use warm::WarmArtifacts;
 
 /// Runtime policy.
 #[derive(Clone, Debug)]
@@ -186,19 +184,11 @@ pub type DispatchObserver = dyn Fn(u128, [u32; 3], &Uniforms) + Send + Sync;
 pub type PlanObserver =
     dyn Fn(&Plan, &EGraph, &BindingEnv, &[(u128, [u32; 3])], &[CommandRecord]) + Send + Sync;
 
-/// Diagnostic schedule substitution before any allocation or dispatch. The
-/// callback must preserve buffers, bindings, launch order and graph semantics.
-/// It may only select a legal schedule for an existing launch, and must not
-/// recursively resolve. Useful for comparing schedules with shared weights.
-#[cfg(feature = "kernel-observer")]
-pub type ScheduleOverride = dyn Fn(&Plan, &EGraph, &BindingEnv) -> Option<Arc<Plan>> + Send + Sync;
-
 /// The wgpu backend.
 pub struct GpuTarget {
     device: Arc<GpuDevice>,
     pool: BufferPool,
     artifacts: parking_lot::Mutex<lru::LruCache<ArtifactKey, ArtifactEntry>>,
-    warm_artifacts: parking_lot::Mutex<Vec<WarmArtifacts>>,
     /// Compiled pipelines by kernel-body identity ([`pipeline_hash`]). The
     /// slot is a single-flight claim held across the compile; the cohort
     /// `try_lock`s it and moves on, only the serial tail waits.
@@ -214,10 +204,6 @@ pub struct GpuTarget {
     dispatch_observer: parking_lot::RwLock<Option<Arc<DispatchObserver>>>,
     #[cfg(feature = "kernel-observer")]
     plan_observer: parking_lot::RwLock<Option<Arc<PlanObserver>>>,
-    #[cfg(feature = "kernel-observer")]
-    schedule_override: parking_lot::RwLock<Option<Arc<ScheduleOverride>>>,
-    #[cfg(feature = "kernel-observer")]
-    stream_submit_rest_override: std::sync::atomic::AtomicUsize,
 }
 
 // Explicit `Send + Sync`: the auto-trait solver otherwise recurses through
@@ -235,7 +221,6 @@ fn gpu_target_fields_are_send_sync() {
     assert::<Arc<GpuDevice>>();
     assert::<BufferPool>();
     assert::<parking_lot::Mutex<lru::LruCache<ArtifactKey, ArtifactEntry>>>();
-    assert::<parking_lot::Mutex<Vec<WarmArtifacts>>>();
     assert::<parking_lot::Mutex<lru::LruCache<u128, PipelineSlot>>>();
     assert::<parking_lot::Mutex<lru::LruCache<String, Artifact>>>();
     assert::<Launcher>();
@@ -246,10 +231,6 @@ fn gpu_target_fields_are_send_sync() {
     assert::<parking_lot::RwLock<Option<Arc<DispatchObserver>>>>();
     #[cfg(feature = "kernel-observer")]
     assert::<parking_lot::RwLock<Option<Arc<PlanObserver>>>>();
-    #[cfg(feature = "kernel-observer")]
-    assert::<parking_lot::RwLock<Option<Arc<ScheduleOverride>>>>();
-    #[cfg(feature = "kernel-observer")]
-    assert::<std::sync::atomic::AtomicUsize>();
 }
 
 impl GpuTarget {
@@ -279,7 +260,6 @@ impl GpuTarget {
             device,
             pool,
             artifacts: lru(),
-            warm_artifacts: parking_lot::Mutex::new(Vec::new()),
             pipelines: lru(),
             pipelines_by_source: lru(),
             launcher,
@@ -290,10 +270,6 @@ impl GpuTarget {
             dispatch_observer: parking_lot::RwLock::new(None),
             #[cfg(feature = "kernel-observer")]
             plan_observer: parking_lot::RwLock::new(None),
-            #[cfg(feature = "kernel-observer")]
-            schedule_override: parking_lot::RwLock::new(None),
-            #[cfg(feature = "kernel-observer")]
-            stream_submit_rest_override: std::sync::atomic::AtomicUsize::new(usize::MAX),
         })
     }
 
@@ -413,59 +389,6 @@ impl GpuTarget {
     /// serial allocation in plan order; parallel lower/emit/compile of the
     /// launches a warm probe missed; serial encode in exact plan order.
     pub fn resolve(&self, plan: &Plan, graph: &EGraph, binds: &BindingEnv) -> Result<()> {
-        #[cfg(feature = "kernel-observer")]
-        let overridden = self
-            .schedule_override
-            .read()
-            .clone()
-            .and_then(|f| f(plan, graph, binds));
-        #[cfg(feature = "kernel-observer")]
-        if let Some(candidate) = &overridden
-            && (candidate.launches != plan.launches
-                || candidate.buffers != plan.buffers
-                || candidate.arena_bytes != plan.arena_bytes
-                || candidate.symbols != plan.symbols
-                || candidate.scalar_symbols != plan.scalar_symbols
-                || candidate.extraction.sigma != plan.extraction.sigma
-                || candidate.extraction.m != plan.extraction.m
-                || candidate.extraction.theta.len() != plan.extraction.theta.len()
-                || candidate.extraction.theta.iter().any(|(id, value)| {
-                    match (plan.extraction.theta.get(id), value) {
-                        (Some(old), new) if old == new => false,
-                        (Some(SchedPoint::Sgemv(_)), SchedPoint::Sgemv(p)) => {
-                            !fusor_tile::domains::sgemv::cols_structure_legal(p, self.caps())
-                        }
-                        _ => true,
-                    }
-                }))
-        {
-            return Err(Error::Plan("diagnostic schedule override changed plan semantics or supplied an illegal schedule".into()));
-        }
-        #[cfg(feature = "kernel-observer")]
-        let plan = overridden.as_deref().unwrap_or(plan);
-        self.resolve_scheduled(plan, graph, binds)
-    }
-
-    /// Install a diagnostic schedule substitution; `None` restores normal plans.
-    #[cfg(feature = "kernel-observer")]
-    pub fn set_schedule_override(&self, callback: Option<Arc<ScheduleOverride>>) {
-        *self.schedule_override.write() = callback;
-    }
-
-    /// Bounded diagnostic preparation batching; launch order stays unchanged.
-    #[cfg(feature = "kernel-observer")]
-    pub fn set_stream_submit_rest(&self, dispatches: Option<usize>) -> Result<()> {
-        if dispatches.is_some_and(|n| !(1..=4096).contains(&n)) {
-            return Err(Error::Plan("stream submit rest must be 1..=4096".into()));
-        }
-        self.stream_submit_rest_override.store(
-            dispatches.unwrap_or(usize::MAX),
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        Ok(())
-    }
-
-    fn resolve_scheduled(&self, plan: &Plan, graph: &EGraph, binds: &BindingEnv) -> Result<()> {
         self.cache_stats();
         let start = Instant::now();
         // `FUSOR_GAPSTEP`: one line per resolve. `outside` = ms since the last
@@ -479,22 +402,7 @@ impl GpuTarget {
             let outside = prev.map(|p| start.duration_since(p).as_secs_f64() * 1e3);
             eprint!("GAPSTEP outside={:.2} ", outside.unwrap_or(0.0));
         }
-        let bundle_enabled =
-            !flags.verify_artifact_cache && WarmArtifacts::within_budget(plan, binds);
-        // Layouts depend on symbol order, not their current values. Always
-        // refill binding 0; the snapshot contains no tensor or uniform bytes.
-        let pack = bundle_enabled
-            .then(|| {
-                self.warm_artifacts
-                    .lock()
-                    .iter()
-                    .rev()
-                    .find_map(|snapshot| {
-                        snapshot.pack(graph.arena_id(), &plan.symbols, &plan.scalar_symbols)
-                    })
-            })
-            .flatten()
-            .unwrap_or_else(|| Arc::new(UniformPack::new(plan)));
+        let pack = Arc::new(UniformPack::new(plan));
         let uniforms = pack.fill(&binds.dims, &binds.scalars)?;
         let __t_pack = gap.then(|| start.elapsed());
 
@@ -554,70 +462,22 @@ impl GpuTarget {
                     .sum::<usize>(),
             );
         }
-        let owned_warm = bundle_enabled
-            .then(|| {
-                self.warm_artifacts
-                    .lock()
-                    .iter()
-                    .rev()
-                    .find_map(|snapshot| snapshot.owned(plan, graph.arena_id(), binds))
-            })
-            .flatten();
-        let keys = if owned_warm.is_some() {
-            Vec::new()
-        } else {
-            bundle_enabled
-                .then(|| {
-                    self.warm_artifacts
-                        .lock()
-                        .iter()
-                        .rev()
-                        .find_map(|snapshot| snapshot.keys(plan, graph.arena_id()))
-                })
-                .flatten()
-                .unwrap_or_else(|| plan_artifact_keys(plan, &pack, graph.arena_id()))
-        };
-        // Warm launches finish here with a hash lookup; the rest is the cold
-        // set for the build cohort.
+        let keys = plan_artifact_keys(plan, &pack, graph.arena_id());
         let mut cold: Vec<usize> = Vec::new();
-        // One binding for the whole probe; grid replay only reads it.
-        let warm = owned_warm.or_else(|| {
-            bundle_enabled
-                .then(|| {
-                    self.warm_artifacts
-                        .lock()
-                        .iter()
-                        .rev()
-                        .find(|snapshot| snapshot.matches(&keys, binds))
-                        .map(WarmArtifacts::built)
-                })
-                .flatten()
-        });
-        let warm_hit = warm.is_some();
-        let mut built = warm.unwrap_or_else(|| Arc::new(Vec::with_capacity(plan.launches.len())));
-        if !warm_hit {
-            let probe_binding =
-                crate::lower::DimBinding::from_pairs(binds.dims.iter().map(|(k, v)| (*k, *v)));
-            let transfers = transfers::Transfers::prepare(plan, graph, binds);
-            for (launch_ix, transfer) in transfers.into_iter().enumerate() {
-                let hit = if let Some(transfer) = transfer {
-                    Some((Artifact::new(transfer), [0; 3], 0))
-                } else {
-                    self.cached_artifact(
-                        plan,
-                        graph,
-                        launch_ix,
-                        binds,
-                        &probe_binding,
-                        &keys,
-                        &pack,
-                    )?
-                };
-                if hit.is_none() {
-                    cold.push(launch_ix);
-                }
-                Arc::make_mut(&mut built).push(hit);
+        let mut built = Vec::with_capacity(plan.launches.len());
+        let probe_binding =
+            crate::lower::DimBinding::from_pairs(binds.dims.iter().map(|(k, v)| (*k, *v)));
+        let transfers = transfers::Transfers::prepare(plan, graph, binds);
+        for (launch_ix, transfer) in transfers.into_iter().enumerate() {
+            let hit = if let Some(transfer) = transfer {
+                Some((Artifact::new(transfer), [0; 3], 0))
+            } else {
+                self.cached_artifact(plan, graph, launch_ix, binds, &probe_binding, &keys, &pack)?
+            };
+            if hit.is_none() {
+                cold.push(launch_ix);
             }
+            built.push(hit);
         }
         let __t_probe = start.elapsed();
         let __cold = cold.len();
@@ -647,7 +507,7 @@ impl GpuTarget {
                 }
                 let ph = l.ph;
                 let grid = self.record_variant(keys[launch_ix], l, &artifact, binds)?;
-                Arc::make_mut(&mut built)[launch_ix] = Some((artifact, grid, ph));
+                built[launch_ix] = Some((artifact, grid, ph));
             }
         } else if !cold.is_empty() {
             let len = cold.len();
@@ -715,25 +575,7 @@ impl GpuTarget {
                 }
                 let ph = l.ph;
                 let grid = self.record_variant(keys[launch_ix], l, &artifact, binds)?;
-                Arc::make_mut(&mut built)[launch_ix] = Some((artifact, grid, ph));
-            }
-        }
-
-        if bundle_enabled && !warm_hit {
-            let snapshot = WarmArtifacts::capture(
-                plan,
-                &keys,
-                binds,
-                &built,
-                &self.artifacts.lock(),
-                (&plan.symbols, &plan.scalar_symbols, pack.clone()),
-            );
-            if let Some(snapshot) = snapshot {
-                let mut snapshots = self.warm_artifacts.lock();
-                if snapshots.len() == 2 {
-                    snapshots.remove(0);
-                }
-                snapshots.push(snapshot);
+                built[launch_ix] = Some((artifact, grid, ph));
             }
         }
 
@@ -743,34 +585,8 @@ impl GpuTarget {
         let focus = self.launcher.take_tuning_focus();
         // Preparation/submission overlap for every plan. Keep each resolve within the
         // configured in-flight window and retain records for timing/observers.
-        let stream_size = std::env::var("FUSOR_PROFILE_STREAM_SUBMIT")
-            .ok()
-            .map(|v| v.parse::<usize>().expect("stream size must be an integer"))
-            .inspect(|n| assert!(*n > 0, "stream size must be positive"))
-            .or_else(|| {
-                (total > 1).then_some(total.div_ceil(crate::launch::inflight_chunks(total)))
-            });
-        let stream_rest = flags.stream_submit_rest;
-        #[cfg(feature = "kernel-observer")]
-        let stream_rest = match self
-            .stream_submit_rest_override
-            .load(std::sync::atomic::Ordering::Relaxed)
-        {
-            usize::MAX => stream_rest,
-            n => Some(n),
-        };
-        // Large prefill plans retain their existing pressure policy. Bound the
-        // full chunk schedule before beginning an early decode submission.
-        let stream_rest =
-            stream_rest.filter(|_| total < flags.large_plan_min_dispatches.unwrap_or(4096));
-        let stream_chunks = stream_size.map(|first| {
-            crate::launch::stream_chunks(
-                total,
-                first,
-                stream_rest,
-                crate::launch::inflight_chunks(total),
-            )
-        });
+        let stream_chunk_size =
+            (total > 1).then(|| total.div_ceil(crate::launch::METAL_INFLIGHT_CHUNKS));
         let live: Vec<bool> = built
             .iter()
             .map(|slot| {
@@ -860,9 +676,7 @@ impl GpuTarget {
                 });
             }
             drop(buffers);
-            if stream_chunks.is_some_and(|(first, rest)| {
-                records.len() - submitted >= if submitted == 0 { first } else { rest }
-            }) {
+            if stream_chunk_size.is_some_and(|chunk| records.len() - submitted >= chunk) {
                 self.launcher.encode_command_records_from(
                     &records[submitted..],
                     timing.set(),
@@ -945,7 +759,7 @@ impl GpuTarget {
         if gap {
             let end = start.elapsed();
             eprintln!(
-                "p1={:.2} probe={:.2} cold={} build={:.2} lowus={} compus={} bind={:.2} enc={:.2} tail={:.2} tot={:.2} n={} compiles={} pollwait={} chunkwait={:.2} pollus={:.2} warm={}",
+                "p1={:.2} probe={:.2} cold={} build={:.2} lowus={} compus={} bind={:.2} enc={:.2} tail={:.2} tot={:.2} n={} compiles={} pollwait={} chunkwait={:.2} pollus={:.2}",
                 __t_p1.as_secs_f64() * 1e3,
                 (__t_probe - __t_p1).as_secs_f64() * 1e3,
                 __cold,
@@ -963,7 +777,6 @@ impl GpuTarget {
                     / 1e3,
                 crate::launch::POLL_WAIT_US.swap(0, std::sync::atomic::Ordering::Relaxed) as f64
                     / 1e3,
-                u8::from(warm_hit),
             );
             *LAST_EXIT.lock() = Some(Instant::now());
         }
@@ -1207,9 +1020,6 @@ pub struct BindingEnv {
     pub dims: FxHashMap<SymId, u64>,
     pub scalars: FxHashMap<SymId, f32>,
     pub buffers: FxHashMap<Id, Buf>,
-    /// Optional immutable owner for metadata reuse. The target verifies that
-    /// it owns the actual borrowed plan before trusting this identity.
-    pub plan_owner: Option<std::sync::Weak<Plan>>,
 }
 
 impl BindingEnv {
@@ -1390,7 +1200,6 @@ impl GpuTarget {
     /// Forget every compiled kernel only a losing race candidate used, so
     /// autotuning and the member sweep don't grow the caches without bound.
     pub fn release_candidates(&self, arena: u64, candidates: &[Arc<Plan>], keep: &Plan) {
-        self.warm_artifacts.lock().clear();
         let keep_keys: FxHashSet<ArtifactKey> =
             plan_artifact_keys(keep, &UniformPack::new(keep), arena)
                 .into_iter()
@@ -1412,9 +1221,6 @@ impl GpuTarget {
     /// Forget every compiled kernel of graph `arena`, which can never be
     /// looked up again.
     pub fn release_arena(&self, arena: u64) {
-        self.warm_artifacts
-            .lock()
-            .retain(|snapshot| !snapshot.uses_arena(arena));
         if lru_retain(&mut self.artifacts.lock(), |k, _| k.arena != arena) {
             self.sweep_unreferenced();
         }

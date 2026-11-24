@@ -24,18 +24,11 @@ pub fn forward_selected_views(
     for _ in 0..plan.launches.len() {
         let before = graph.len();
         let mut trial = next.extraction.clone();
-        if forward_selection(graph, caps, roots, &next, &mut trial) {
-            match replan(graph, &mut trial) {
-                Ok(plan) => {
-                    next = plan;
-                    continue;
-                }
-                Err(error) => {
-                    if std::env::var_os("FUSOR_EXTRACT_PROFILE").is_some() {
-                        eprintln!("VIEW_FORWARD_DECLINED {error}");
-                    }
-                }
-            }
+        if forward_selection(graph, caps, roots, &next, &mut trial)
+            && let Ok(plan) = replan(graph, &mut trial)
+        {
+            next = plan;
+            continue;
         }
         if graph.len() != before {
             let mut incumbent = next.extraction.clone();

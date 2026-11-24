@@ -1390,8 +1390,7 @@ fn lower_sgemv_subgroup_cols(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> 
             (col, ok)
         })
         .collect();
-    let chains = crate::flags::flags().gemv_chains;
-    let locals: Vec<_> = (0..cps as usize * chains)
+    let locals: Vec<_> = (0..cps as usize)
         .map(|_| b.local(c.acc.element()))
         .collect();
 
@@ -1462,11 +1461,11 @@ fn lower_sgemv_subgroup_cols(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> 
             a_vals.push((k, mask, av));
         }
 
-        let mut partials = Vec::with_capacity(cps as usize * chains);
-        for (locals, (col, col_ok)) in from.chunks_exact(chains).zip(&cols_of_subgroup) {
-            let mut partial: Vec<_> = locals.iter().cloned().map(|l| b.load_local(l)).collect();
-            let mut products = vec![Vec::new(); chains];
-            for (v, (k, mask, av)) in a_vals.iter().enumerate() {
+        let mut partials = Vec::with_capacity(cps as usize);
+        for (local, (col, col_ok)) in from.iter().cloned().zip(&cols_of_subgroup) {
+            let mut partial = b.load_local(local);
+            let mut products = Vec::with_capacity(a_vals.len());
+            for (k, mask, av) in &a_vals {
                 let load_mask = match col_exact {
                     true => mask.clone(),
                     false => b.and(mask.clone(), col_ok.clone()),
@@ -1474,13 +1473,11 @@ fn lower_sgemv_subgroup_cols(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> 
                 let b_row = b.add(b_row_base.clone(), k.clone());
                 let bv = c.b.value(&ctx, &b_row, col, &load_mask, &batch, c.acc)?;
                 let bv = zero_unless(&ctx, masked, mask, bv, c.acc);
-                products[v % chains].push((av.clone(), bv));
+                products.push((av.clone(), bv));
             }
             let numeric = ctx.cx.graph.facts(ctx.cx.launch.root).numeric;
-            for (partial, products) in partial.iter_mut().zip(products) {
-                *partial = fusor_tile::dot::accumulate(b, partial.clone(), &products, numeric);
-            }
-            partials.extend(partial);
+            partial = fusor_tile::dot::accumulate(b, partial, &products, numeric);
+            partials.push(partial);
         }
         Ok(partials)
     };
@@ -1492,13 +1489,8 @@ fn lower_sgemv_subgroup_cols(ctx: Ctx<'_>, c: &Contract<'_>, p: SgemvParams) -> 
     // Each column's partials never leave its subgroup, so the close is a
     // subgroup sum and the store is that subgroup's lane 0.
     let lane0 = b.eq(sg_lane, b.u32(0));
-    for (locals, (col, col_ok)) in locals.chunks_exact(chains).zip(cols_of_subgroup) {
-        let partial = locals
-            .iter()
-            .cloned()
-            .map(|l| b.load_local(l))
-            .reduce(|a, v| b.add(a, v))
-            .expect("at least one accumulation chain");
+    for (local, (col, col_ok)) in locals.iter().cloned().zip(cols_of_subgroup) {
+        let partial = b.load_local(local);
         let total = b.reduce(TileReduceOp::Sum, ReduceKind::Subgroup, partial);
         let addr = Addr::Linear(b.add(b.mul(row.clone(), n_e.clone()), col.clone()));
         let mask = b.and(lane0.clone(), col_ok);

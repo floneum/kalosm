@@ -61,7 +61,6 @@ pub(crate) struct LeafStore {
     /// not join these groups merely because their host backing is identical.
     storage_owner: FxHashMap<Id, Id>,
     storage_views: FxHashMap<Id, Vec<Id>>,
-    prepared_runs: Vec<Arc<crate::session::prepared::PreparedRun>>,
 }
 
 #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
@@ -657,10 +656,6 @@ impl GraphRef {
                 .filter(|id| is_external_leaf(&g.node(*id).op))
                 .collect()
         };
-        self.prepared_leaf_buffers(&external)
-    }
-
-    pub(crate) fn prepared_leaf_buffers(&self, external: &[Id]) -> Vec<(Id, Option<Buf>)> {
         let mut store = self.state.leaves.lock();
         external
             .iter()
@@ -695,35 +690,6 @@ impl GraphRef {
             uploads[index].values.push(id);
         }
         uploads
-    }
-
-    pub(crate) fn prepare_run(
-        &self,
-        plan: &Arc<fusor_ir::extract::Plan>,
-    ) -> Option<Arc<crate::session::prepared::PreparedRun>> {
-        if let Some(cached) = self
-            .state
-            .leaves
-            .lock()
-            .prepared_runs
-            .iter()
-            .find(|cached| cached.matches(plan))
-            .cloned()
-        {
-            return Some(cached);
-        }
-        let g = self.state.egraph.lock();
-        let cached = Arc::new(crate::session::prepared::PreparedRun::capture(
-            plan,
-            |id| is_external_leaf(&g.node(id).op),
-        )?);
-        drop(g);
-        let mut leaves = self.state.leaves.lock();
-        if leaves.prepared_runs.len() == 2 {
-            leaves.prepared_runs.remove(0);
-        }
-        leaves.prepared_runs.push(cached.clone());
-        Some(cached)
     }
 
     /// Drop the device buffers bound to `id`'s whole class.

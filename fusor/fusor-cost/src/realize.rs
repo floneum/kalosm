@@ -2045,22 +2045,7 @@ pub(crate) fn selectable(graph: &EGraph, class: ClassId, caps: &Caps) -> Vec<Id>
     }
     let pool = narrow(graph.members(class), |m| !is_self_referential(graph, m));
     let pool = narrow(pool, |m| is_runnable(graph, m));
-    let pool = narrow(pool, |m| composite_bindings_fit(graph, m, caps));
-    let flags = crate::debug::flags();
-    if flags.contract_family.is_none() && flags.contract_small_family.is_none() {
-        return pool;
-    }
-    narrow(pool, |id| match graph.node(id).op {
-        Op::Launch(Launch::Contract { family, m, .. }) => m.as_const().is_some_and(|m| {
-            let wanted = if m >= flags.contract_min_m {
-                flags.contract_family
-            } else {
-                flags.contract_small_family
-            };
-            wanted == Some(family)
-        }),
-        _ => false,
-    })
+    narrow(pool, |m| composite_bindings_fit(graph, m, caps))
 }
 
 /// The classes reachable from `roots`, ascending, and a mask of every id

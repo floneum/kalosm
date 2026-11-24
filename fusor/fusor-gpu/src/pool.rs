@@ -146,9 +146,6 @@ impl BufferPool {
         lost: crate::device::LostFlag,
     ) -> Self {
         let ceiling = config.max_gpu_memory_bytes.unwrap_or_else(default_ceiling);
-        let ceiling = crate::flags::flags()
-            .memory_budget_bytes
-            .map_or(ceiling, |limit| ceiling.min(limit));
         Self {
             device,
             queue,
