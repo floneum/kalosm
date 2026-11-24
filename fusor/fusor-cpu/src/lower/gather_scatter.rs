@@ -13,7 +13,10 @@ use fusor_ir::ir::{Node, Op};
 use fusor_ir::target::LowerCtx;
 use fusor_tile::build::Kernel;
 
-use super::{Binds, DEFAULT_BLOCK, const_extents, global_lane, grid_for, operand_src, view};
+use super::{
+    Binds, DEFAULT_BLOCK, const_extents, coords_of, global_lane, grid_for, operand_at, operand_src,
+    view,
+};
 
 pub(crate) fn lower(node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result<KernelIr> {
     let Op::Launch(op) = &node.op else {
@@ -22,8 +25,12 @@ pub(crate) fn lower(node: &Node, theta: SchedPoint, cx: &LowerCtx<'_>) -> Result
     let tm = lane_tile(theta)?;
     match op {
         Launch::Gather {
-            space, axis, ops, ..
-        } => gather(cx, space, *axis, ops, tm),
+            space,
+            axis,
+            post,
+            ops,
+            ..
+        } => gather(cx, space, *axis, post, ops, tm),
         Launch::Scatter {
             axis, combine, ops, ..
         } => scatter(cx, *axis, *combine, ops, tm),
@@ -62,6 +69,7 @@ fn gather(
     cx: &LowerCtx<'_>,
     space: &IndexSpace,
     axis: u32,
+    post: &fusor_ir::scalar::ScalarExpr,
     ops: &[Operand],
     tm: u32,
 ) -> Result<KernelIr> {
@@ -104,10 +112,24 @@ fn gather(
             b.add(b.mul(outer, b.u32(src_stride)), b.mul(row, b.u32(inner))),
             within,
         );
+        let mut args = vec![src.at(&b, src_index, mask.clone())];
+        for operand in &ops[2..] {
+            args.push(operand_at(
+                &b,
+                cx,
+                &binds,
+                operand,
+                flat.clone(),
+                n,
+                mask.clone(),
+            )?);
+        }
+        let coords = coords_of(&b, &flat, &extents);
+        let value = binds.translate(&b, &args, &coords, post)?;
         body.push(Stmt::Store {
             dst: out.clone(),
             addr: Addr::Linear(flat),
-            value: src.at(&b, src_index, mask.clone()),
+            value,
             mask,
         });
     }

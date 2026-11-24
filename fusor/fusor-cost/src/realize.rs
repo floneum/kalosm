@@ -327,7 +327,7 @@ pub struct Component {
 }
 
 impl Component {
-    fn launch<'a>(&'a self, extraction: &'a Extraction) -> LaunchPlan<'a> {
+    pub(crate) fn launch<'a>(&'a self, extraction: &'a Extraction) -> LaunchPlan<'a> {
         LaunchPlan {
             members: &self.members,
             root: self.root,
@@ -2984,6 +2984,34 @@ pub(crate) mod tests {
             before_cost - cost.launch_cost(&before.components[1].launch(&ex))
                 + cost.launch_cost(&replacement.launch(&ex)),
             after_cost
+        );
+
+        // The ordinary additive model can reuse its unchanged sum. A custom
+        // nonlinear model must decline, and saturated totals must be repriced.
+        let old_launch = cost.0.launch_cost(&before.components[1].launch(&ex));
+        let replacement_launch = replacement.launch(&ex);
+        let linear_before = cost.0.total(&before.launches(&ex));
+        assert_eq!(
+            cost.total_replacing(before_cost, old_launch, &replacement_launch),
+            None
+        );
+        assert_eq!(
+            cost.0
+                .total_replacing(linear_before, old_launch, &replacement_launch),
+            Some(cost.0.total(&after.launches(&ex)))
+        );
+        assert_eq!(
+            cost.0
+                .total_replacing(Picoseconds(u64::MAX), old_launch, &replacement_launch),
+            None
+        );
+        assert_eq!(
+            cost.0.total_replacing(
+                Picoseconds(old_launch.0 - 1),
+                old_launch,
+                &replacement_launch
+            ),
+            None
         );
 
         let bounds = search.lower_bound(&graph, &cost);

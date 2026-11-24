@@ -120,6 +120,20 @@ fn dim_scalar(dim: Dim) -> Result<ScalarExpr> {
         Dim::Sym(sym) => Ok(match sym.derived_expr() {
             Some(DimExpr::Add(a, b)) => ScalarExpr::bin(BinOp::Add, dim_scalar(a)?, dim_scalar(b)?),
             Some(DimExpr::Mul(a, b)) => ScalarExpr::bin(BinOp::Mul, dim_scalar(a)?, dim_scalar(b)?),
+            Some(DimExpr::DivCeil(a, divisor)) => {
+                let d = dim_scalar(Dim::Const(divisor))?;
+                let n = dim_scalar(a)?;
+                // n / d + (n % d != 0), without overflowing n + d - 1.
+                ScalarExpr::bin(
+                    BinOp::Add,
+                    ScalarExpr::bin(BinOp::Div, n.clone(), d.clone()),
+                    ScalarExpr::cmp(
+                        CmpOp::Ne,
+                        ScalarExpr::bin(BinOp::Rem, n, d),
+                        dim_scalar(Dim::Const(0))?,
+                    ),
+                )
+            }
             None => ScalarExpr::uniform(sym, fusor_ir::dtype::Dtype::U32),
         }),
     }

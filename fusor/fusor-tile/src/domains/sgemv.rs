@@ -121,7 +121,12 @@ pub fn sgemv_domain(cx: &DomainCtx<'_>) -> SgemvDomain {
             if subgroups.saturating_mul(width) > max_lanes(cx.caps) {
                 continue;
             }
-            for cols in COLS_CHOICES {
+            // Explicit probes may tune between the power-of-two cells without
+            // expanding the normal search. The same legality/unroll bounds apply.
+            for cols in COLS_CHOICES.into_iter().chain(
+                pin.map(|p| p.cols)
+                    .filter(|c| *c > 1 && !COLS_CHOICES.contains(c)),
+            ) {
                 let cell = v(vector, subgroups, cols);
                 if cols > 1
                     && (!cols_structure_legal(&cell, cx.caps)
@@ -139,7 +144,12 @@ pub fn sgemv_domain(cx: &DomainCtx<'_>) -> SgemvDomain {
                     continue;
                 }
                 for parts in PARTS_CHOICES {
-                    for gap in GAP_CHOICES {
+                    // An explicitly pinned experiment may probe another legal
+                    // packed-word distance without expanding the default domain.
+                    for gap in GAP_CHOICES
+                        .into_iter()
+                        .chain(pin.map(|p| p.gap).filter(|g| !GAP_CHOICES.contains(g)))
+                    {
                         let cell = w(vector, subgroups, cols, parts, gap);
                         if cols_structure_legal(&cell, cx.caps) && pin.is_none_or(|p| p == cell) {
                             all.push(cell);

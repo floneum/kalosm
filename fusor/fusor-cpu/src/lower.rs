@@ -484,6 +484,15 @@ pub(crate) fn operand_src(
     if let Some(splat) = const_splat(cx, src) {
         return Ok(OperandSrc::Const(b.lit(splat_literal(splat))));
     }
+    if let Op::Logical(fusor_ir::ir::logical::Logical::Leaf(
+        fusor_ir::ir::logical::LeafKind::Uniform { sym, dtype },
+    )) = &cx.graph.node(cx.selected(src)).op
+    {
+        // Scalar uniforms have f32 payloads even when the logical leaf is an
+        // integer. They are free operands in the plan, with no tensor binding.
+        let scalar = ScalarExpr::cast(*dtype, ScalarExpr::uniform(*sym, Dtype::F32));
+        return Ok(OperandSrc::Const(binds.translate(b, &[], &[], &scalar)?));
+    }
     let buffer = binds.of(src)?;
     let facts = cx.graph.facts(src);
     if let Dtype::Q(fmt) = facts.dtype {

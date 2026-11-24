@@ -201,7 +201,7 @@ impl AsyncShardedVarBuilder {
                 fmt: ingest_qfmt(tensor.ty)?,
                 layout: QLayout::Native,
                 shape: tensor.shape.clone(),
-                bytes: bytes.into_boxed_slice(),
+                bytes: bytes.into_boxed_slice().into(),
             });
         }
         Err(Error::Io(format!("no tensor named {path} in any shard")))

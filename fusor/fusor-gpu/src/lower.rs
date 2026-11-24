@@ -116,6 +116,20 @@ impl DimBinding {
         }
     }
 
+    // Isolate each member's grid derivation while sharing body consultations.
+    pub(crate) fn fork_group_member(&self) -> Self {
+        Self {
+            values: self.values.clone(),
+            consulted: self.consulted.clone(),
+            grid: Default::default(),
+        }
+    }
+
+    pub(crate) fn merge_group_grid_symbols(&self, member: &Self) {
+        let symbols = member.grid.lock().symbols.clone();
+        self.grid.lock().symbols.extend(symbols);
+    }
+
     pub(crate) fn get(&self, sym: SymId) -> Option<u64> {
         if sym.is_derived() {
             // A derived symbol consults the symbols its expression reaches.
@@ -489,7 +503,7 @@ impl<'a> Ctx<'a> {
         Ok(Self {
             caps,
             cx,
-            b: Kernel::new(),
+            b: Kernel::with_subgroup_widths(caps.subgroups),
             binding,
             buffers,
             slot_of,
@@ -795,20 +809,6 @@ impl<'a> Ctx<'a> {
             .add(self.b.mul(self.linear_workgroup(), self.b.u32(block)), lane)
     }
 
-    /// How many threads this dispatch launches: the stride of a grid-stride
-    /// loop. Read from `@builtin(num_workgroups)` like [`Self::global_index`]
-    /// so the dispatch extents are never baked into the body.
-    pub(crate) fn grid_threads(&self, block: u32) -> TileExpr {
-        use fusor_ir::ir::kernel::WorkgroupAxis;
-        let x = self.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::X));
-        let y = self.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::Y));
-        let z = self.b.builtin(Builtin::NumWorkgroups(WorkgroupAxis::Z));
-        let xy = self.b.mul(x, y);
-        let groups = self.b.mul(xy, z);
-        let block_e = self.b.u32(block);
-        self.b.mul(groups, block_e)
-    }
-
     /// The value this launch writes: the launch root when it is bound for
     /// writing, else the first writable binding.
     pub(crate) fn output(&self) -> Result<Id> {
@@ -873,7 +873,10 @@ impl<'a> Ctx<'a> {
             K::Uniform(sym) if expr.dtype() == Dtype::U32 && self.pack.dim_slot(*sym).is_some() => {
                 self.dim_expr(Dim::Sym(*sym))?
             }
-            K::Uniform(sym) => self.scalar_expr(*sym)?,
+            K::Uniform(sym) => self.b.cast(
+                self.scalar_expr(*sym)?,
+                scalar_element(expr.dtype()).element(),
+            ),
             K::IndexOf(axis) => {
                 let c = coords.get(*axis as usize).cloned().ok_or_else(|| {
                     Error::Plan(format!(
@@ -1057,6 +1060,16 @@ impl<'a> Ctx<'a> {
         // A `Leaf::Const` folds into the kernel and has no binding.
         if let Some(lit) = self.const_operand(operand.src) {
             return Ok(lit);
+        }
+        if let Op::Logical(fusor_ir::ir::logical::Logical::Leaf(
+            fusor_ir::ir::logical::LeafKind::Uniform { sym, dtype },
+        )) = &self.cx.graph.node(self.cx.selected(operand.src)).op
+        {
+            return self.eval_scalar(
+                &fusor_ir::scalar::ScalarExpr::uniform(*sym, *dtype),
+                &[],
+                &[],
+            );
         }
         let index = self.repad_index(operand.src, index)?;
         // A quantized operand runs its decode program at flat index `i`.

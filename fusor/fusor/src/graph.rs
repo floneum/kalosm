@@ -41,18 +41,79 @@ impl WeakGraphRef {
     }
 }
 
+#[derive(Clone)]
+pub(crate) struct DeviceBinding {
+    buf: Buf,
+    layout: Option<Arc<fusor_ir::shape::Layout>>,
+    uploaded_backing: Option<Arc<fusor_ir::target::HostBytes>>,
+}
+
 /// Host bytes waiting to be uploaded for one external leaf, plus the device
 /// buffer once one exists. A `Persistent` leaf keeps its buffer across
 /// resolves; a `Step` leaf is re-uploaded whenever its bytes change.
 #[derive(Default)]
 pub(crate) struct LeafStore {
-    pub(crate) bytes: FxHashMap<Id, Arc<Vec<u8>>>,
-    /// The device buffer bound to a value, with the layout it was written
-    /// under when that is not the value's own dense shape. A selected
-    /// `Coop`/`Sgemm` geometry pads the output to its tile multiple, so a
-    /// readback that assumed contiguity would hand back the first row plus
-    /// padding.
-    pub(crate) device: FxHashMap<Id, (Buf, Option<Arc<fusor_ir::shape::Layout>>)>,
+    pub(crate) bytes: FxHashMap<Id, Arc<fusor_ir::target::HostBytes>>,
+    /// The device buffer bound to a value, its non-dense layout when present,
+    /// and the exact host backing for uploads that may be shared by views.
+    device: FxHashMap<Id, DeviceBinding>,
+    /// Compiler-created, read-only storage views. Ordinary mutable leaves do
+    /// not join these groups merely because their host backing is identical.
+    storage_owner: FxHashMap<Id, Id>,
+    storage_views: FxHashMap<Id, Vec<Id>>,
+}
+
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+pub(crate) struct HostUpload {
+    pub(crate) values: Vec<Id>,
+    pub(crate) bytes: Arc<fusor_ir::target::HostBytes>,
+}
+
+impl LeafStore {
+    pub(crate) fn snapshot_binding(&self, id: Id) -> Option<DeviceBinding> {
+        self.device.get(&id).cloned()
+    }
+
+    pub(crate) fn clear_binding(&mut self, id: Id) {
+        self.device.remove(&id);
+    }
+
+    pub(crate) fn restore_binding(&mut self, id: Id, mut saved: DeviceBinding) {
+        if saved.uploaded_backing.as_ref().is_some_and(|bytes| {
+            !self
+                .bytes
+                .get(&id)
+                .is_some_and(|current| Arc::ptr_eq(bytes, current))
+        }) {
+            saved.uploaded_backing = None;
+        }
+        self.device.insert(id, saved);
+    }
+
+    fn reuse_uploaded_view(&mut self, id: Id) -> Option<Buf> {
+        if let Some(binding) = self.device.get(&id) {
+            return Some(binding.buf.clone());
+        }
+        let owner = self.storage_owner.get(&id).copied().unwrap_or(id);
+        let bytes = self.bytes.get(&id)?.clone();
+        let buf = self.storage_views.get(&owner)?.iter().find_map(|peer| {
+            let binding = self.device.get(peer)?;
+            binding
+                .uploaded_backing
+                .as_ref()
+                .filter(|other| Arc::ptr_eq(&bytes, other))
+                .map(|_| binding.buf.clone())
+        })?;
+        self.device.insert(
+            id,
+            DeviceBinding {
+                buf: buf.clone(),
+                layout: None,
+                uploaded_backing: Some(bytes),
+            },
+        );
+        Some(buf)
+    }
 }
 
 /// Symbolic bindings: extents for `Dim::Sym` and values for `Leaf::Uniform`.
@@ -325,13 +386,23 @@ impl GraphRef {
         shape: [Dim; 2],
         bytes: Vec<u8>,
     ) -> Result<Id> {
+        self.quantized_leaf_shared(fmt, layout, shape, Arc::new(bytes.into()))
+    }
+
+    pub(crate) fn quantized_leaf_shared(
+        &self,
+        fmt: QFmt,
+        layout: QLayout,
+        shape: [Dim; 2],
+        bytes: Arc<fusor_ir::target::HostBytes>,
+    ) -> Result<Id> {
         let id = self.add_logical(Logical::Leaf(LeafKind::Quantized {
             name: self.fresh_buffer_id(),
             fmt,
             layout,
             shape: shape.into_iter().collect(),
         }))?;
-        self.set_leaf_bytes(id, bytes);
+        self.set_leaf_bytes_shared(id, bytes);
         Ok(id)
     }
 
@@ -376,6 +447,18 @@ impl GraphRef {
         }
         let id = self.buffer_leaf(Dtype::U32, &[Dim::Const(bytes.len() as u64 / 4)])?;
         self.set_leaf_bytes_shared(id, bytes);
+        {
+            // This private constructor only exposes a read-only word spelling
+            // to scalar lowering, never a mutable parameter or cache store.
+            let mut store = self.state.leaves.lock();
+            let owner = store.storage_owner.get(&src).copied().unwrap_or(src);
+            store.storage_owner.insert(id, owner);
+            let views = store
+                .storage_views
+                .entry(owner)
+                .or_insert_with(|| vec![owner]);
+            views.push(id);
+        }
         self.state.word_leaves.lock().insert(src, id);
         Ok(Some(id))
     }
@@ -411,20 +494,34 @@ impl GraphRef {
             let Some(bytes) = self.leaf_bytes_shared(src) else {
                 return Ok(None);
             };
-            let mut repacked = Vec::new();
-            fusor_gguf::repack::repack(
-                fmt,
-                QLayout::Native,
-                QLayout::F32Scales,
-                &bytes,
-                &mut repacked,
-            )?;
+            let stride = fmt.block_bytes(QLayout::Native) as usize;
+            if !bytes.len().is_multiple_of(stride) {
+                return Err(Error::Shape(format!(
+                    "{} bytes is not a whole number of {fmt:?}/Native blocks ({stride} bytes each)",
+                    bytes.len()
+                )));
+            }
+            let len = (bytes.len() / stride)
+                .checked_mul(fmt.block_bytes(QLayout::F32Scales) as usize)
+                .ok_or_else(|| Error::Shape("repacked host extent overflows usize".into()))?;
+            let repacked = fusor_ir::target::HostBytes::transformed(bytes, len, move |bytes| {
+                let mut repacked = Vec::with_capacity(len);
+                fusor_gguf::repack::repack(
+                    fmt,
+                    QLayout::Native,
+                    QLayout::F32Scales,
+                    bytes,
+                    &mut repacked,
+                )
+                .expect("immutable source has a validated whole-block extent");
+                repacked
+            });
             let shape = [shape[0], shape[1]];
-            Ok(Some(self.quantized_leaf(
+            Ok(Some(self.quantized_leaf_shared(
                 fmt,
                 QLayout::F32Scales,
                 shape,
-                repacked,
+                Arc::new(repacked),
             )?))
         };
         let out = mint()?;
@@ -471,6 +568,7 @@ impl GraphRef {
     }
 
     /// Every `(sym, value)` runtime scalar declared so far, by symbol.
+    #[cfg(feature = "cpu")]
     pub(crate) fn uniform_scalars(&self) -> Vec<(SymId, f32)> {
         sorted(&self.state.symbols.lock().scalars)
     }
@@ -480,43 +578,61 @@ impl GraphRef {
         sorted(&self.state.symbols.lock().dims)
     }
 
+    /// GPU binding maps are keyed by symbol, so rebuilding them through
+    /// sorted vectors adds work without changing their meaning.
+    #[cfg(feature = "gpu")]
+    pub(crate) fn binding_symbols(&self) -> (FxHashMap<SymId, u64>, FxHashMap<SymId, f32>) {
+        let symbols = self.state.symbols.lock();
+        (symbols.dims.clone(), symbols.scalars.clone())
+    }
+
     /// Attach host bytes to an external leaf.
     pub(crate) fn set_leaf_bytes(&self, id: Id, bytes: Vec<u8>) {
-        self.set_leaf_bytes_shared(id, Arc::new(bytes));
+        self.set_leaf_bytes_shared(id, Arc::new(bytes.into()));
     }
 
     /// [`Self::set_leaf_bytes`] without a copy: two leaves may share one
     /// byte stream — a quantized weight and its `U32`-word respelling are
     /// the same allocation.
-    pub(crate) fn set_leaf_bytes_shared(&self, id: Id, bytes: Arc<Vec<u8>>) {
+    pub(crate) fn set_leaf_bytes_shared(&self, id: Id, bytes: Arc<fusor_ir::target::HostBytes>) {
         let mut store = self.state.leaves.lock();
         store.bytes.insert(id, bytes);
         // A changed upload invalidates the device copy, never the plan.
-        store.device.remove(&id);
-    }
-
-    pub(crate) fn leaf_bytes(&self, id: Id) -> Option<Vec<u8>> {
-        self.state
-            .leaves
-            .lock()
-            .bytes
-            .get(&id)
-            .map(|b| b.as_ref().clone())
+        store.clear_binding(id);
     }
 
     /// The shared handle to a leaf's host bytes, no copy.
-    pub(crate) fn leaf_bytes_shared(&self, id: Id) -> Option<Arc<Vec<u8>>> {
+    pub(crate) fn leaf_bytes_shared(&self, id: Id) -> Option<Arc<fusor_ir::target::HostBytes>> {
         self.state.leaves.lock().bytes.get(&id).cloned()
     }
 
-    /// Run `f` over an external leaf's host bytes without copying them.
+    /// Upload immutable host bytes once across their compiler storage views.
     ///
-    /// `f` runs with the `leaves` mutex held, so it must not re-enter this
+    /// `upload` runs with the `leaves` mutex held, so it must not re-enter this
     /// graph. The only caller uploads through the target's pool, which locks
     /// nothing of the graph's.
-    pub(crate) fn with_leaf_bytes<T>(&self, id: Id, f: impl FnOnce(&[u8]) -> T) -> Option<T> {
-        let store = self.state.leaves.lock();
-        store.bytes.get(&id).map(|b| f(b.as_slice()))
+    pub(crate) fn upload_leaf_bytes(
+        &self,
+        id: Id,
+        upload: impl FnOnce(&[u8]) -> Result<Buf>,
+    ) -> Result<Option<Buf>> {
+        let mut store = self.state.leaves.lock();
+        if let Some(buf) = store.reuse_uploaded_view(id) {
+            return Ok(Some(buf));
+        }
+        let Some(bytes) = store.bytes.get(&id).cloned() else {
+            return Ok(None);
+        };
+        let buf = bytes.with_slice(upload)?;
+        store.device.insert(
+            id,
+            DeviceBinding {
+                buf: buf.clone(),
+                layout: None,
+                uploaded_backing: Some(bytes),
+            },
+        );
+        Ok(Some(buf))
     }
 
     /// The device buffer backing `id`, once a resolve has produced one.
@@ -526,7 +642,7 @@ impl GraphRef {
             .lock()
             .device
             .get(&id)
-            .map(|(b, _)| b.clone())
+            .map(|binding| binding.buf.clone())
     }
 
     /// For each of `ids`, whether it is an external leaf the caller must
@@ -540,11 +656,40 @@ impl GraphRef {
                 .filter(|id| is_external_leaf(&g.node(*id).op))
                 .collect()
         };
-        let store = self.state.leaves.lock();
+        let mut store = self.state.leaves.lock();
         external
-            .into_iter()
-            .map(|id| (id, store.device.get(&id).map(|(b, _)| b.clone())))
+            .iter()
+            .copied()
+            .map(|id| (id, store.reuse_uploaded_view(id)))
             .collect()
+    }
+
+    /// Group pending preparation by the compiler's storage relation and exact
+    /// immutable backing. A changed source and its old view remain distinct.
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    pub(crate) fn pending_leaf_uploads(&self, ids: &[Id]) -> Vec<HostUpload> {
+        let store = self.state.leaves.lock();
+        let mut groups = FxHashMap::default();
+        let mut uploads: Vec<HostUpload> = Vec::new();
+        for &id in ids {
+            if store.device.contains_key(&id) {
+                continue;
+            }
+            let Some(bytes) = store.bytes.get(&id) else {
+                continue;
+            };
+            let owner = store.storage_owner.get(&id).copied().unwrap_or(id);
+            let key = (owner, Arc::as_ptr(bytes));
+            let index = *groups.entry(key).or_insert_with(|| {
+                uploads.push(HostUpload {
+                    values: Vec::new(),
+                    bytes: bytes.clone(),
+                });
+                uploads.len() - 1
+            });
+            uploads[index].values.push(id);
+        }
+        uploads
     }
 
     /// Drop the device buffers bound to `id`'s whole class.
@@ -561,12 +706,17 @@ impl GraphRef {
         };
         let mut store = self.state.leaves.lock();
         for m in members.iter() {
-            store.device.remove(m);
+            store.clear_binding(*m);
         }
     }
 
     #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
-    pub(crate) fn bind_prepared_leaf(&self, id: Id, bytes: &Arc<Vec<u8>>, buf: Buf) {
+    pub(crate) fn bind_prepared_leaf(
+        &self,
+        id: Id,
+        bytes: &Arc<fusor_ir::target::HostBytes>,
+        buf: Buf,
+    ) {
         let mut store = self.state.leaves.lock();
         if store
             .bytes
@@ -574,7 +724,14 @@ impl GraphRef {
             .is_some_and(|current| Arc::ptr_eq(current, bytes))
             && !store.device.contains_key(&id)
         {
-            store.device.insert(id, (buf, None));
+            store.device.insert(
+                id,
+                DeviceBinding {
+                    buf,
+                    layout: None,
+                    uploaded_backing: Some(bytes.clone()),
+                },
+            );
         }
     }
 
@@ -588,7 +745,14 @@ impl GraphRef {
     ) {
         let mut store = self.state.leaves.lock();
         for id in ids {
-            store.device.insert(*id, (buf.clone(), layout.cloned()));
+            store.device.insert(
+                *id,
+                DeviceBinding {
+                    buf: buf.clone(),
+                    layout: layout.cloned(),
+                    uploaded_backing: None,
+                },
+            );
         }
     }
 
@@ -606,7 +770,15 @@ impl GraphRef {
     /// Bind one buffer under a leaf id alone. A leaf is its own class, so
     /// this needs no e-graph lock and may run while one is held.
     pub(crate) fn bind_leaf(&self, id: Id, buf: Buf, layout: Option<Arc<fusor_ir::shape::Layout>>) {
-        self.state.leaves.lock().device.insert(id, (buf, layout));
+        let mut store = self.state.leaves.lock();
+        store.device.insert(
+            id,
+            DeviceBinding {
+                buf,
+                layout,
+                uploaded_backing: None,
+            },
+        );
     }
 
     /// Register each `(value, buffer, layout)` under every id of the value's
@@ -625,7 +797,14 @@ impl GraphRef {
         let mut store = self.state.leaves.lock();
         for ((_, buf, layout), members) in items.iter().zip(&classes) {
             for m in members.iter() {
-                store.device.insert(*m, (buf.clone(), layout.clone()));
+                store.device.insert(
+                    *m,
+                    DeviceBinding {
+                        buf: buf.clone(),
+                        layout: layout.clone(),
+                        uploaded_backing: None,
+                    },
+                );
             }
         }
     }
@@ -636,7 +815,7 @@ impl GraphRef {
             .lock()
             .device
             .get(&id)
-            .and_then(|(_, l)| l.as_ref())
+            .and_then(|binding| binding.layout.as_ref())
             .map(|l| (**l).clone())
     }
 

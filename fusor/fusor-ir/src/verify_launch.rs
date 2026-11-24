@@ -68,7 +68,6 @@ pub fn verify_launch(cx: &VerifyCtx<'_>, planner: &dyn ArenaPlanner) -> Result<(
         return check_schedule_domain(fold, sched, cx.caps, planner);
     }
 
-    // 1 + 2.
     if let Some(sched) = op.schedule() {
         check_schedule_domain(op, sched, cx.caps, planner)
             .map_err(|e| relabel(cx, format!("{e}")))?;
@@ -373,6 +372,13 @@ pub fn check_operand_access(op: &Launch) -> Result<()> {
     }
     let space = op.space();
     for (i, o) in op.operands().enumerate() {
+        // Source and indices have their own logical spaces; only a gather's
+        // elementwise epilogue operands use the output space.
+        let space = if matches!(op, Launch::Gather { .. }) && i < 2 {
+            None
+        } else {
+            space
+        };
         let fail = |msg: String| Error::Legality(format!("operand {i}: {msg}"));
         match &o.access {
             // Always legal: a gather derives its own addresses.
@@ -559,6 +565,7 @@ fn store_dtype(op: &Launch) -> Dtype {
         Launch::Map { body, .. } => body.dtype(),
         Launch::Fold { acc, .. } => *acc,
         Launch::Contract { post, .. } => post.dtype(),
+        Launch::Gather { post, .. } => post.dtype(),
         _ => Dtype::F32,
     }
 }

@@ -259,12 +259,13 @@ pub fn work_l1(op: &Launch, ins: &[ValueFacts], out: &ValueFacts) -> Work {
             w
         }
 
-        Launch::Gather { ops, .. } => Work {
+        Launch::Gather { ops, post, .. } => Work {
             index_ops: e
                 .saturating_mul(2)
                 .saturating_add(operand_index_ops(ops, e)),
             ..Work::default()
-        },
+        }
+        .add(epilogue_work(post, e)),
 
         Launch::Scatter { ops, .. } => {
             let upd = ins.last().map_or(e, elements);

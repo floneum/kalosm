@@ -503,6 +503,7 @@ pub fn lower_gather(b: &mut Builder<'_>, id: Id, node: &Node, f: &Facts<'_>) -> 
             space: space_of(f),
             axis: *axis,
             mode: GatherMode::RowPerGroup,
+            post: ident_expr(f.own().dtype),
             ops: vec![
                 alias_operand_of(*x, &f.operand(0)?.shape.clone()),
                 alias_operand_of(*idx, &f.operand(1)?.shape.clone()),

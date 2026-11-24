@@ -70,6 +70,9 @@ pub enum Launch {
         space: IndexSpace,
         axis: u32,
         mode: GatherMode,
+        /// Arg(0) is the gathered scalar; Arg(1..) read ops[2..] at the
+        /// output coordinate. The first two operands remain source/indices.
+        post: ScalarExpr,
         ops: Vec<Operand>,
         sched: ScheduleDomain,
     },
@@ -392,6 +395,18 @@ impl IndexSpace {
 
     pub fn rank(&self) -> usize {
         self.dims.len()
+    }
+
+    /// Whether flat indexing of this space can address an operand's shape.
+    /// Scalars broadcast at any rank; other layouts must match a suffix, with
+    /// singleton axes allowed. Equal element counts alone are insufficient.
+    pub fn addresses_shape(&self, shape: &[Dim]) -> bool {
+        shape.iter().all(|d| d.known_eq(Dim::Const(1)))
+            || (shape.len() <= self.rank()
+                && shape
+                    .iter()
+                    .zip(&self.dims[self.rank() - shape.len()..])
+                    .all(|(a, b)| a.known_eq(*b) || a.known_eq(Dim::Const(1))))
     }
 
     /// The legality side of `map_into_fold`: a producer may be inlined only
@@ -1114,7 +1129,7 @@ impl WindowAdjoint {
 }
 
 /// Scratch budget for a cooperative schedule, as lowering declares it,
-/// including the output staging tile.
+/// including one output fragment per subgroup, reused by the epilogue.
 pub fn coop_tiles(
     geom: CoopGeom,
     elem: super::kernel::ScalarElement,
@@ -1134,7 +1149,11 @@ pub fn coop_tiles(
         decls: smallvec::smallvec![
             tile("coop_a", elem, &[depth * geom.bm, geom.bk]),
             tile("coop_b", elem, &[depth * geom.bk, bn_pass]),
-            tile("coop_acc", ScalarElement::F32, &[geom.bm, bn_pass]),
+            tile(
+                "coop_acc",
+                ScalarElement::F32,
+                &[geom.subgroups * CoopGeom::COOP_DIM, CoopGeom::COOP_DIM]
+            ),
         ],
     }
 }

@@ -9,6 +9,7 @@
 //! The two carriers are the oracles from `fusor_ir::carrier::oracle` —
 //! the same definitions that crate's unit tests run on the host evaluator.
 
+use fusor::cache::TensorCache;
 use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
 use fusor_ir::carrier::{Carrier, oracle};
@@ -44,6 +45,8 @@ pub fn cases() -> Cases {
     // group that is not a multiple of the extent merges padded identity lanes,
     // and an unguarded rescale computes `0 * exp((-inf) - (-inf)) = NaN` there.
     cases.push("identity_lanes_do_not_poison_the_merge", identity_lane_case);
+    cases.push("grouped_tiled_map_welford", grouped_tiled_map_welford_case);
+    cases.push("symbolic_tiled_map", symbolic_tiled_map_case);
     cases
 }
 
@@ -96,6 +99,86 @@ async fn shift_stabilized_case(session: &Session, shape: &[u64], seed: u32) -> C
         if (lse - want).abs() > 1e-4 * want.abs().max(1.0) {
             return Err(format!("row {i} log-sum-exp: got {lse}, want {want}").into());
         }
+    }
+    Ok(())
+}
+
+async fn grouped_tiled_map_welford_case(session: &Session) -> CaseResult {
+    let (rows, axis) = (32u64, 211u64);
+    let data: Vec<f32> = (0..rows * axis)
+        .map(|i| ((i % 31) as f32 - 15.0) / 8.0)
+        .collect();
+    let graph = graph_of(session);
+    let leaf =
+        fusor::Tensor::<2>::try_from_dyn(upload(graph.handle(), &dims(&[rows, axis]), &data)?)?;
+    let mut cache = TensorCache::<2>::fixed(1, 256);
+    let input = cache.append(&leaf);
+    let mapped = input.as_dyn().mul_scalar(2.0)?;
+    let folded = input
+        .as_dyn()
+        .fold_carrier(oracle::welford(Dtype::F32), 1)?;
+
+    session.resolve(&[mapped.clone(), folded.clone()])?;
+    session.wait()?;
+
+    let map_view = mapped.narrow(1, 0, axis as usize)?;
+    let actual_map = read(&map_view).await?;
+    let expected_map: Vec<f32> = data.iter().map(|v| v * 2.0).collect();
+    expect_values(
+        session,
+        &[rows, axis],
+        Dtype::F32,
+        &actual_map,
+        &expected_map,
+    )
+    .await?;
+
+    let actual_fold = read(&folded).await?;
+    let mut expected_fold = Vec::with_capacity((rows * 3) as usize);
+    for row in data.chunks(axis as usize) {
+        let count = row.len() as f32;
+        let mean = row.iter().sum::<f32>() / count;
+        let m2 = row.iter().map(|v| (v - mean) * (v - mean)).sum::<f32>();
+        expected_fold.extend([count, mean, m2]);
+    }
+    expect_values(
+        session,
+        &[rows, 3],
+        Dtype::F32,
+        &actual_fold,
+        &expected_fold,
+    )
+    .await
+}
+
+async fn symbolic_tiled_map_case(session: &Session) -> CaseResult {
+    let rows = 32u64;
+    let graph = graph_of(session);
+    let mut cache = TensorCache::<2>::fixed(1, 256);
+    let mut expected_rows = vec![Vec::new(); rows as usize];
+    let mut cached_len = 0;
+
+    for (len, seed) in [(173u64, 17u32), (38, 29)] {
+        let chunk: Vec<f32> = (0..rows * len)
+            .map(|i| ((i as u32 * 17 + seed * 13) % 101) as f32 / 37.0 - 1.1)
+            .collect();
+        let leaf =
+            fusor::Tensor::<2>::try_from_dyn(upload(graph.handle(), &dims(&[rows, len]), &chunk)?)?;
+        let input = cache.append(&leaf);
+        for (row, expected_row) in expected_rows.iter_mut().enumerate() {
+            let start = row * len as usize;
+            expected_row.extend(chunk[start..start + len as usize].iter().map(|v| v * 2.0));
+        }
+        let expected: Vec<f32> = expected_rows.iter().flatten().copied().collect();
+        cached_len += len;
+        let mapped = input.as_dyn().mul_scalar(2.0)?;
+
+        session.resolve(std::slice::from_ref(&mapped))?;
+        session.wait()?;
+
+        let map_view = mapped.narrow(1, 0, cached_len as usize)?;
+        let actual = read(&map_view).await?;
+        expect_values(session, &[rows, cached_len], Dtype::F32, &actual, &expected).await?;
     }
     Ok(())
 }

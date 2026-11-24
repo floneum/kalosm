@@ -1,4 +1,4 @@
-//! The saturation driver: a creation-order worklist over a `(RuleId, Id)`
+//! The saturation driver: rule-ordered rounds over a `(RuleId, Id)`
 //! bitset, bounded by [`SaturationBudget`]. On exhaustion only
 //! [`RuleTag::StrictlyLowering`] rules run, so the plan degrades but stays valid.
 
@@ -83,17 +83,20 @@ impl Saturate for CoreSaturate {
         'rounds: while rounds < budget.max_rounds && !work.is_empty() {
             rounds += 1;
             let mut fired_this_round = 0u32;
-            while let Some(id) = work.pop_front() {
-                if id.index() >= graph.len() {
-                    continue;
+            // Offer each rule across the frontier before moving to the next
+            // rule. Otherwise an early node's expanding alternatives can use
+            // the whole budget before later nodes see even map substitution.
+            // Creation order within a rule preserves producer-before-reader
+            // discovery. New nodes still wait until the following round.
+            let mut matches: Vec<Vec<Id>> = vec![Vec::new(); rules.len()];
+            for id in work.drain(..) {
+                for rid in &by_head[graph.node(id).op.tag() as usize] {
+                    matches[rid.0 as usize].push(id);
                 }
-                let candidates = &by_head[graph.node(id).op.tag() as usize];
-                if candidates.is_empty() {
-                    continue;
-                }
-                let node = graph.node(id).clone();
-                let facts = graph.facts_view(id, caps);
-                for &rid in candidates.iter() {
+            }
+            for (rule_index, ids) in matches.into_iter().enumerate() {
+                let rid = RuleId(rule_index as u16);
+                for id in ids {
                     if graph.len() >= max_nodes || applications >= max_applications {
                         saturated = false;
                         let class = graph.class_of(id).0;
@@ -111,6 +114,8 @@ impl Saturate for CoreSaturate {
                     }
                     fired.grow_and_insert(bit);
                     let before = graph.len();
+                    let node = graph.node(id).clone();
+                    let facts = graph.facts_view(id, caps);
                     let mut builder = graph.builder(caps);
                     applications += 1;
                     let applied = (rules[rid.0 as usize].apply)(&mut builder, id, &node, &facts);

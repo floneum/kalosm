@@ -1,7 +1,7 @@
 //! Total inference for the Launch op family. A Launch node's result shape is its
 //! index space minus the reduced axes, and its dtype is the epilogue's.
 
-use crate::dtype::{Dtype, Persistence};
+use crate::dtype::Dtype;
 use crate::error::{Error, Result};
 use crate::facts::ValueFacts;
 use crate::ir::launch::Launch;
@@ -52,18 +52,50 @@ pub fn infer_launch(op: &Launch, ins: &[ValueFacts]) -> Result<ValueFacts> {
         Launch::Contract { output, post, .. } => {
             Ok(ValueFacts::step(post.dtype(), output.dims.clone(), ins))
         }
-        // `QuantizedRows` decodes what it gathers: float-typed and step-lived,
-        // never the leaf's `Q(fmt)` dtype or persistence.
         Launch::Gather {
             space,
-            mode: crate::ir::launch::GatherMode::QuantizedRows,
+            mode,
+            post,
+            ops,
             ..
-        } => Ok(ValueFacts::step(Dtype::F32, space.dims.clone(), ins)),
-        Launch::Gather { space, .. } => Ok(ValueFacts {
-            dtype: ins.first().map_or(Dtype::F32, |f| f.dtype),
-            persistence: ins.first().map_or(Persistence::Step, |f| f.persistence),
-            ..ValueFacts::step(Dtype::F32, space.dims.clone(), ins)
-        }),
+        } => {
+            use crate::ir::launch::GatherMode;
+            use crate::scalar::ScalarKind;
+            if ops.len() < 2 || ins.len() != ops.len() {
+                return Err(Error::Shape(
+                    "gather requires source and index operands".into(),
+                ));
+            }
+            let gathered = match mode {
+                GatherMode::QuantizedRows => Dtype::F32,
+                GatherMode::RowPerGroup => ins[0].dtype,
+            };
+            let mut valid = true;
+            post.walk(&mut |expr| match expr.kind() {
+                ScalarKind::Arg(0) => valid &= expr.dtype() == gathered,
+                ScalarKind::Arg(i) => {
+                    valid &= (*i as usize)
+                        .checked_add(1)
+                        .and_then(|i| ins.get(i))
+                        .is_some_and(|f| f.dtype == expr.dtype())
+                }
+                ScalarKind::IndexOf(axis) => valid &= (*axis as usize) < space.rank(),
+                _ => {}
+            });
+            if !valid {
+                return Err(Error::Dtype(
+                    "gather epilogue reads an absent or incompatible value".into(),
+                ));
+            }
+            let mut facts = ValueFacts::step(post.dtype(), space.dims.clone(), ins);
+            if *mode == GatherMode::RowPerGroup
+                && ops.len() == 2
+                && matches!(post.kind(), ScalarKind::Arg(0))
+            {
+                facts.persistence = ins[0].persistence;
+            }
+            Ok(facts)
+        }
 
         // A scatter's value is its base, so its shape comes from operand 0,
         // never from `space` (which may be the update domain).

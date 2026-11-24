@@ -137,7 +137,14 @@ fn launch(op: &mut Launch, visitor: &mut impl VisitMut, generated: Option<usize>
             }
             visitor.scalar(post);
         }
-        Launch::Gather { space, ops, .. } | Launch::Scatter { space, ops, .. } => {
+        Launch::Gather {
+            space, post, ops, ..
+        } => {
+            dims(&mut space.dims, visitor);
+            visitor.scalar(post);
+            operands(ops, visitor);
+        }
+        Launch::Scatter { space, ops, .. } => {
             dims(&mut space.dims, visitor);
             operands(ops, visitor);
         }

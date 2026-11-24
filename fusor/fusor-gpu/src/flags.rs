@@ -41,7 +41,9 @@ pub(crate) struct Flags {
 pub(crate) fn flags() -> &'static Flags {
     static FLAGS: OnceLock<Flags> = OnceLock::new();
     FLAGS.get_or_init(|| {
-        let on = |name| std::env::var_os(name).is_some();
+        let on = |name| {
+            std::env::var(name).is_ok_and(|v| !matches!(v.as_str(), "0" | "false" | "off" | "no"))
+        };
         let path = |name| std::env::var_os(name).map(PathBuf::from);
         let number = |name| std::env::var(name).ok().and_then(|v| v.parse().ok());
         Flags {
@@ -52,7 +54,7 @@ pub(crate) fn flags() -> &'static Flags {
             mismatch_dump: path("FUSOR_MISMATCH_DUMP"),
             no_pipeline_share: on("FUSOR_NO_PIPELINE_SHARE"),
             wgsl_dump: path("FUSOR_WGSL_DUMP"),
-            compile_threads: number("FUSOR_COMPILE_THREADS"),
+            compile_threads: Some(number("FUSOR_COMPILE_THREADS").unwrap_or(1)),
             time_plan: on("FUSOR_TIME_PLAN"),
             time_range: number("FUSOR_TIME_RANGE"),
             trace_dispatch: on("FUSOR_TRACE_DISPATCH"),

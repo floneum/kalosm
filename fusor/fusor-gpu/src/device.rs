@@ -1,5 +1,5 @@
-//! Adapter and device acquisition at WebGPU baseline limits, widened only
-//! where a selected kernel proves it needs it, so plan legality is portable.
+//! Adapter and device acquisition. Request supported buffer and workgroup
+//! capacity; compile every schedule against the limits actually granted.
 
 use fusor_ir::Result;
 use fusor_ir::cost::DeviceFacts;
@@ -43,8 +43,8 @@ pub struct GpuDevice {
 }
 
 impl GpuDevice {
-    /// Probe an adapter, request a device at baseline limits widened by
-    /// `extra`, then seed (or load cached) facts.
+    /// Probe an adapter, request its buffer and workgroup capacity plus any
+    /// `extra` limits, then seed (or load cached) facts.
     pub async fn request(extra: Option<wgpu::Limits>) -> Result<Self> {
         request_device(extra).await
     }
@@ -82,8 +82,7 @@ impl GpuDevice {
     }
 }
 
-/// Pick an adapter, request its device at non-adapter limits, and probe
-/// compiler capabilities.
+/// Pick an adapter, request supported capacity, and probe compiler capabilities.
 async fn request_device(extra: Option<wgpu::Limits>) -> Result<GpuDevice> {
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
     let adapter = instance
@@ -99,6 +98,10 @@ async fn request_device(extra: Option<wgpu::Limits>) -> Result<GpuDevice> {
     let features = caps::requested_features(&adapter);
     let adapter_limits = adapter.limits();
     let mut limits = caps::widen_limits(caps::baseline_limits(), extra, &adapter_limits)?;
+    // Compile against the workgroup limits granted by this adapter.
+    limits.max_compute_invocations_per_workgroup =
+        adapter_limits.max_compute_invocations_per_workgroup;
+    limits.max_compute_workgroup_size_x = adapter_limits.max_compute_workgroup_size_x;
     // Buffer-size ceilings are capacity, not legality: take the adapter's, since
     // 7B+ models have single weights past the baseline's 256 MiB.
     limits.max_buffer_size = limits.max_buffer_size.max(adapter_limits.max_buffer_size);

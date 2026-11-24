@@ -33,6 +33,7 @@ pub struct LocalSearch {
 #[derive(Default)]
 struct SearchTrace {
     moves: u32,
+    full_prices: u32,
     /// Realizations `co_select` spent; bounded separately from `moves`.
     co_moves: u32,
     improved: bool,
@@ -95,8 +96,7 @@ impl LocalSearch {
         let mut trail = Trail::default();
         match search.price(&mut at.ex, &mut cache, &mut trail) {
             Some((realized, cost)) => {
-                at.realized = realized;
-                at.cost = cost;
+                at.update(realized, cost, search.cost);
             }
             None => trail.rollback(&mut at.ex, 0),
         }
@@ -132,7 +132,6 @@ impl LocalSearch {
                 at = b_at;
             }
         }
-
         let plan = derive_plan(graph, &at.ex, &at.realized, cost.facts(), at.cost)?;
         debug::dump_plan(graph, &plan, &at.ex, &at.realized, &self.caps, cost);
         #[cfg(feature = "compiler-tests")]
@@ -155,8 +154,7 @@ impl LocalSearch {
         let mut trail = Trail::default();
         let plan = self
             .search(graph, roots, cost)
-            .price(ex, cache, &mut trail)
-            .ok_or_else(|| Error::Plan("autotune candidate does not realize".into()))
+            .price_checked(ex, cache, &mut trail)
             .and_then(|(realized, exact)| derive_plan(graph, ex, &realized, cost.facts(), exact));
         if plan.is_err() {
             trail.rollback(ex, 0);
@@ -185,6 +183,20 @@ struct Incumbent {
     ex: Extraction,
     realized: Realized,
     cost: Picoseconds,
+    // Costs at the accepted schedules, before a trial mutates `ex.theta`.
+    launch_costs: Vec<Picoseconds>,
+}
+
+impl Incumbent {
+    fn update(&mut self, realized: Realized, cost: Picoseconds, model: &dyn CostModel) {
+        self.launch_costs = realized
+            .components
+            .iter()
+            .map(|component| model.launch_cost(&component.launch(&self.ex)))
+            .collect();
+        self.realized = realized;
+        self.cost = cost;
+    }
 }
 
 /// The fixed inputs of one descent.
@@ -272,7 +284,17 @@ impl Search<'_> {
             match attempt {
                 Ok(realized) => {
                     let cost = realize::exact_cost(&realized, &ex, self.cost);
-                    let at = Incumbent { ex, realized, cost };
+                    let launch_costs = realized
+                        .components
+                        .iter()
+                        .map(|component| self.cost.launch_cost(&component.launch(&ex)))
+                        .collect();
+                    let at = Incumbent {
+                        ex,
+                        realized,
+                        cost,
+                        launch_costs,
+                    };
                     return Ok(self.choose_seed(at, lb, cache, &reused));
                 }
                 Err(error) => {
@@ -306,8 +328,6 @@ impl Search<'_> {
             .filter(|(class, root)| reused.get(class) != Some(root))
             .map(|(class, _)| class)
             .collect();
-        let ordinary = |id| matches!(graph.node(id).op, Op::Launch(_)) && !is_composite(graph, id);
-        let inputs = |id: Id| graph.node(id).children.iter().map(|c| graph.class_of(*c));
         for class in classes {
             let mut members = realize::selectable(graph, class, self.caps);
             members.sort_by_key(|member| (order_costs[member.index()], *member));
@@ -325,35 +345,17 @@ impl Search<'_> {
                 if candidate == current {
                     continue;
                 }
-                let same_inputs = component.members.as_slice() == [current]
-                    && ordinary(current)
-                    && ordinary(candidate)
-                    && inputs(current).eq(inputs(candidate));
                 let mut trail = Trail::default();
                 trail.select(&mut at.ex, class, candidate);
                 // A same-inputs swap is screened on its own launch first.
-                if same_inputs {
-                    seed_theta_trailed(
-                        graph,
-                        &mut at.ex,
-                        &[candidate],
-                        self.cost,
-                        cache,
-                        &mut trail,
-                    );
-                    let score = realize::ordinary_component(
-                        graph, &at.ex, candidate, self.cost, self.arena, cache,
-                    )
-                    .map(|replacement| {
-                        at.realized
-                            .cost_replacing(index, &replacement, &at.ex, self.cost)
-                    });
-                    if !score.is_ok_and(|score| score < at.cost) {
-                        trail.rollback(&mut at.ex, 0);
-                        continue;
-                    }
+                let screen = self.screen_replacement(&mut at, candidate, cache, &mut trail);
+                let screened = screen.unwrap_or(false);
+                if screened {
+                    trail.rollback(&mut at.ex, 0);
                 }
-                self.improve(&mut at, cache, &mut trail);
+                if !screened {
+                    self.improve(&mut at, cache, &mut trail);
+                }
             }
         }
         at
@@ -390,7 +392,19 @@ impl Search<'_> {
                     }
                     trace.moves += 1;
                     let mut trail = Trail::default();
-                    if trail.apply(&mut at.ex, candidate) && self.improve(at, cache, &mut trail) {
+                    if !trail.apply(&mut at.ex, candidate) {
+                        continue;
+                    }
+                    let node = match candidate {
+                        moves::Candidate::Select { node, .. }
+                        | moves::Candidate::Schedule { node, .. } => node,
+                    };
+                    if self.screen_replacement(at, node, cache, &mut trail) == Some(true) {
+                        trail.rollback(&mut at.ex, 0);
+                        continue;
+                    }
+                    trace.full_prices += 1;
+                    if self.improve(at, cache, &mut trail) {
                         trace.improved = true;
                         improved = true;
                         break;
@@ -406,6 +420,54 @@ impl Search<'_> {
         while trace.co_moves < climb.cap && self.co_select(climb.producers, climb, at, cache, trace)
         {
         }
+    }
+
+    /// Price a one-launch replacement without rebuilding its unchanged DAG.
+    /// A cost model may provide an exact independent replacement total; other
+    /// models still see the complete sequence, preserving shared/nonlinear
+    /// totals. Composites and changed inputs require full pricing.
+    /// `Some(true)` rejects the trial; the caller owns rollback in either case.
+    fn screen_replacement(
+        &self,
+        at: &mut Incumbent,
+        candidate: Id,
+        cache: &mut NodeCache,
+        trail: &mut Trail,
+    ) -> Option<bool> {
+        let graph = self.graph;
+        let class = graph.class_of(candidate);
+        let index = at
+            .realized
+            .components
+            .iter()
+            .position(|c| graph.class_of(c.root) == class)?;
+        let component = &at.realized.components[index];
+        let current = component.root;
+        let ordinary = |id| matches!(graph.node(id).op, Op::Launch(_)) && !is_composite(graph, id);
+        let inputs = |id: Id| graph.node(id).children.iter().map(|c| graph.class_of(*c));
+        if component.members.as_slice() != [current]
+            || !ordinary(current)
+            || !ordinary(candidate)
+            || !inputs(current).eq(inputs(candidate))
+        {
+            return None;
+        }
+        seed_theta_trailed(graph, &mut at.ex, &[candidate], self.cost, cache, trail);
+        let score =
+            realize::ordinary_component(graph, &at.ex, candidate, self.cost, self.arena, cache)
+                .map(|replacement| {
+                    self.cost
+                        .total_replacing(
+                            at.cost,
+                            at.launch_costs[index],
+                            &replacement.launch(&at.ex),
+                        )
+                        .unwrap_or_else(|| {
+                            at.realized
+                                .cost_replacing(index, &replacement, &at.ex, self.cost)
+                        })
+                });
+        Some(!score.is_ok_and(|score| score < at.cost))
     }
 
     /// One co-selection sweep: per producer, adopt together every reading
@@ -467,14 +529,22 @@ impl Search<'_> {
         cache: &mut NodeCache,
         trail: &mut Trail,
     ) -> Option<(Realized, Picoseconds)> {
-        let selected = pin_selection(self.graph, self.roots, ex, trail, cache).ok()?;
+        self.price_checked(ex, cache, trail).ok()
+    }
+
+    /// Preserve a rejected rewrite's exact planning error for diagnostics.
+    fn price_checked(
+        &self,
+        ex: &mut Extraction,
+        cache: &mut NodeCache,
+        trail: &mut Trail,
+    ) -> Result<(Realized, Picoseconds)> {
+        let selected = pin_selection(self.graph, self.roots, ex, trail, cache)?;
         seed_theta_trailed(self.graph, ex, &selected.order, self.cost, cache, trail);
         trail.buffers(ex, selected.buffers(self.graph));
-        let realized = selected
-            .realize(self.graph, ex, self.cost, self.arena, cache)
-            .ok()?;
+        let realized = selected.realize(self.graph, ex, self.cost, self.arena, cache)?;
         let c = realize::exact_cost(&realized, ex, self.cost);
-        Some((realized, c))
+        Ok((realized, c))
     }
 
     /// Keep the trial on `trail` on a strict improvement, else undo it and
@@ -482,8 +552,7 @@ impl Search<'_> {
     fn improve(&self, at: &mut Incumbent, cache: &mut NodeCache, trail: &mut Trail) -> bool {
         match self.price(&mut at.ex, cache, trail) {
             Some((realized, cost)) if cost < at.cost => {
-                at.realized = realized;
-                at.cost = cost;
+                at.update(realized, cost, self.cost);
                 true
             }
             _ => {
@@ -1258,4 +1327,121 @@ fn test_points(domain: &ScheduleDomain) -> SmallVec<[SchedPoint; 8]> {
         .into_iter()
         .filter_map(|i| domain.point(i))
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::realize::tests::{alias, buffer, caps, new_graph};
+    use fusor_ir::dtype::Dtype;
+    use fusor_ir::ir::launch::{IndexSpace, MapDomain, MapTiling};
+    use fusor_ir::scalar::{ScalarExpr, UnOp};
+    use fusor_ir::shape::Layout;
+
+    struct CountedCost {
+        inner: crate::Roofline,
+        totals: std::sync::atomic::AtomicUsize,
+    }
+
+    impl CostModel for CountedCost {
+        fn facts(&self) -> &fusor_ir::cost::DeviceFacts {
+            self.inner.facts()
+        }
+        fn launch_cost(&self, launch: &fusor_ir::cost::LaunchPlan<'_>) -> Picoseconds {
+            self.inner.launch_cost(launch)
+        }
+        fn node_math(
+            &self,
+            node: &fusor_ir::ir::Node,
+            ins: &[fusor_ir::facts::ValueFacts],
+            out: &fusor_ir::facts::ValueFacts,
+            theta: Option<SchedPoint>,
+        ) -> Picoseconds {
+            self.inner.node_math(node, ins, out, theta)
+        }
+        fn traffic(&self, bytes: u64, rereads: u32) -> Picoseconds {
+            self.inner.traffic(bytes, rereads)
+        }
+        fn total(&self, launches: &[fusor_ir::cost::LaunchPlan<'_>]) -> Picoseconds {
+            self.totals
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.total(launches)
+        }
+        fn total_replacing(
+            &self,
+            total: Picoseconds,
+            old: Picoseconds,
+            new: &fusor_ir::cost::LaunchPlan<'_>,
+        ) -> Option<Picoseconds> {
+            self.inner.total_replacing(total, old, new)
+        }
+    }
+
+    #[test]
+    fn independent_schedule_rejections_do_not_rebuild_the_whole_dag() {
+        let caps = caps();
+        let arena = Arc::new(fusor_tile::Planner::new());
+        let mut graph = new_graph(&arena);
+        let mut roots = Vec::new();
+        for i in 0..32 {
+            let shape = [Dim::Const(1024 + i as u64 * 8)];
+            let input = buffer(&mut graph, i, &shape);
+            let root = graph
+                .add(Op::Launch(Launch::Map {
+                    space: IndexSpace::new(shape),
+                    body: ScalarExpr::un(UnOp::Neg, ScalarExpr::arg(0, Dtype::F32)),
+                    ops: vec![alias(input, Layout::contiguous(&shape))],
+                    sched: ScheduleDomain::Map(
+                        MapDomain {
+                            tilings: [1, 2, 4]
+                                .map(|tm| MapTiling {
+                                    dim: None,
+                                    tm,
+                                    vector: 1,
+                                })
+                                .into_iter()
+                                .collect(),
+                        }
+                        .into(),
+                    ),
+                }))
+                .unwrap();
+            roots.push(root);
+        }
+        let cost = CountedCost {
+            inner: crate::Roofline::new(crate::facts::seed_facts(&caps)),
+            totals: Default::default(),
+        };
+        let extractor = LocalSearch::new(arena, caps.clone());
+        let search = extractor.search(&graph, &roots, &cost);
+        let (classes, mask) = realize::reachable(&graph, &roots);
+        let bounds = crate::lower_bound::bounds_scoped(&graph, Some(&cost), &mask);
+        let mut cache = NodeCache::new(graph.len());
+        let mut at = search
+            .seed_realized(&bounds.costs, &bounds.launches, &classes, &mut cache, None)
+            .unwrap();
+        let before = derive_plan(&graph, &at.ex, &at.realized, cost.facts(), at.cost).unwrap();
+        let climb = Climb {
+            lb: &bounds.costs,
+            readers: &FxHashMap::default(),
+            producers: &[],
+            cap: 1000,
+        };
+        let mut trace = SearchTrace::default();
+        cost.totals.store(0, std::sync::atomic::Ordering::Relaxed);
+        search.descend(&climb, &mut at, &mut cache, &mut trace);
+        assert_eq!(
+            cost.totals.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "independent additive replacements must not reprice unchanged launches"
+        );
+        let after = derive_plan(&graph, &at.ex, &at.realized, cost.facts(), at.cost).unwrap();
+        assert_eq!(after.hash, before.hash);
+        assert_eq!(after.cost, before.cost);
+        assert_eq!(trace.moves, 64);
+        assert_eq!(
+            trace.full_prices, 0,
+            "independent rejected schedules must not rebuild all 32 branches"
+        );
+    }
 }

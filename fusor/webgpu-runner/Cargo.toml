@@ -37,9 +37,11 @@ getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] 
 
 # Patch tables only apply from the build root, so the workspace's naga fork
 # is repeated here; see ../Cargo.toml.
+# Naga also carries declared compute workgroup sizes into Metal compilation,
+# preventing register allocation from selecting a smaller dispatch limit.
 [patch.crates-io]
-wgpu = { git = "https://github.com/ealmloff/wgpu", rev = "24a7d3577213fc147637fe7fb20e0e845a74df8a" }
-naga = { git = "https://github.com/ealmloff/wgpu", rev = "24a7d3577213fc147637fe7fb20e0e845a74df8a" }
+wgpu = { git = "https://github.com/ealmloff/wgpu", rev = "9c9187d26886eccc4b3fbfeb67989ce77fbd1217" }
+naga = { git = "https://github.com/ealmloff/wgpu", rev = "9c9187d26886eccc4b3fbfeb67989ce77fbd1217" }
 
 # CI builds: the conformance sweep runs the planner and every raced kernel
 # body on the host, and unoptimized planner code is most of its wall time.

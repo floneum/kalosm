@@ -11,6 +11,7 @@
 
 use fusor::tensor::Dyn as Tensor;
 use fusor::{Dtype, Session};
+use fusor_ir::shape::{Dim, StrideSpec};
 
 use crate::harness::{CaseResult, Cases, FuzzDim, Rng, dims};
 use crate::suite::support::{
@@ -247,6 +248,49 @@ pub fn cases() -> Cases {
             .await
         },
     );
+
+    cases.push("overlapping_padded_rows_flat_carry", async move |session| {
+        let graph = graph_of(session);
+        let base_values = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let base = upload(graph.handle(), &dims(&[2, 5]), &base_values)?;
+        let narrowed = base.narrow(1, 0, 4)?;
+        let overlapping = narrowed.restride(&[
+            StrideSpec::dim(1, Dim::Const(3)),
+            StrideSpec::dim(1, Dim::Const(3)),
+            StrideSpec::dim(1, Dim::Const(1)),
+        ])?;
+        let output = overlapping.squeeze(2)?;
+        let actual = read(&output).await?;
+        let expected = [0.0, 1.0, 2.0, 1.0, 2.0, 3.0, 2.0, 3.0, 5.0];
+        expect_values(session, &[3, 3], Dtype::F32, &actual, &expected).await
+    });
+
+    cases.push("dense_unit_axis_flat_carry", async move |session| {
+        let base_values = [0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        for unit_stride in [2, 0] {
+            for (row_offset, rows, expected) in [(0, 2, [0.0, 3.0]), (1, 3, [3.0, 6.0])] {
+                let graph = graph_of(session);
+                let base = upload(
+                    graph.handle(),
+                    &dims(&[rows, 3]),
+                    &base_values[..(rows * 3) as usize],
+                )?;
+                let unit_axis = base.restride(&[
+                    StrideSpec::dim(0, Dim::Const(2)).with_offset(Dim::Const(row_offset)),
+                    StrideSpec::dim_with(1, Dim::Const(1), unit_stride),
+                    StrideSpec::dim(1, Dim::Const(3)),
+                ])?;
+                let expanded = unit_axis.restride(&[
+                    StrideSpec::dim(1, Dim::Const(2)),
+                    StrideSpec::dim(2, Dim::Const(1)),
+                ])?;
+                let output = expanded.squeeze(1)?;
+                let actual = read(&output).await?;
+                expect_values(session, &[2], Dtype::F32, &actual, &expected).await?;
+            }
+        }
+        Ok(())
+    });
 
     cases.fuzz("restride_layout", SPEC3, async move |s, shape, seed| {
         check_view(s, shape, seed, &|x| x.transpose(0, 2), &|d| {

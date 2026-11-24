@@ -40,6 +40,8 @@ wgpu = { version = "29", default-features = false, features = ["webgpu", "wgsl",
 # Expensive compiler invariants are exercised by conformance, never dispatch.
 compiler-tests = ["fusor-ir/compiler-tests", "fusor-cost/compiler-tests"]
 default = []
+# Opt-in host observation of lowered kernels for offline compiler diagnostics.
+kernel-observer = []
 # The wgpu fork contributes exactly two capabilities: workgroup-alias byte-arena
 # packing and mixed-precision cooperative store. Without it the arena falls back
 # to per-stride-class regions and an f32-accumulated f16-output kernel pays a

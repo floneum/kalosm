@@ -76,13 +76,28 @@ pub(crate) fn float_leaf(
     graph.constant_leaf(dtype, &[Dim::Const(values.len() as u64)], bytes)
 }
 
-/// `index_leaf` over the run `start .. start + len`.
+/// A symbolic index expression, so ordinary range writes retain their geometry
+/// through planning instead of becoming opaque uploaded index buffers.
 pub(crate) fn index_run(graph: &GraphRef, start: u64, len: u64) -> Result<Id> {
-    let values: Vec<u32> = (0..len)
-        .map(|i| {
-            u32::try_from(start + i)
-                .map_err(|_| Error::Shape(format!("index {} exceeds a u32", start + i)))
-        })
-        .collect::<Result<_>>()?;
-    index_leaf(graph, &values)
+    use fusor_autograd::tape::TapeExt;
+    use fusor_ir::autograd::Tape;
+    use fusor_ir::dtype::{Dtype, Splat};
+    use fusor_ir::scalar::{BinOp, ScalarExpr};
+    if start
+        .checked_add(len)
+        .is_none_or(|end| end > u64::from(u32::MAX) + 1)
+        || start > u64::from(u32::MAX)
+    {
+        return Err(Error::Shape("index range exceeds a u32".into()));
+    }
+    graph.build(|t| {
+        let shape = t.zeros_shaped(Dtype::U32, &[Dim::Const(len)])?;
+        let index = ScalarExpr::index_of(0);
+        let expr = if start == 0 {
+            index
+        } else {
+            ScalarExpr::bin(BinOp::Add, index, ScalarExpr::lit(Splat::U32(start as u32)))
+        };
+        t.map(expr, &[shape])
+    })
 }

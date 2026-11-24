@@ -159,4 +159,21 @@ impl CostModel for Roofline {
     fn total(&self, launches: &[LaunchPlan<'_>]) -> Picoseconds {
         launches.iter().map(|launch| self.launch_cost(launch)).sum()
     }
+
+    fn total_replacing(
+        &self,
+        previous_total: Picoseconds,
+        previous_launch: Picoseconds,
+        replacement: &LaunchPlan<'_>,
+    ) -> Option<Picoseconds> {
+        // The saturated total does not reveal how much cost was discarded.
+        // In that case subtraction could invent an improvement.
+        if previous_total.0 == u64::MAX {
+            return None;
+        }
+        Some(
+            Picoseconds(previous_total.0.checked_sub(previous_launch.0)?)
+                + self.launch_cost(replacement),
+        )
+    }
 }

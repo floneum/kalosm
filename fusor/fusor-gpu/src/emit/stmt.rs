@@ -14,6 +14,41 @@ use super::coop::{row_major_tile_stride, tile_shape};
 use super::expr::{barrier, push, push_break_if, push_if, push_loop};
 use super::{Emitter, LOCAL_INVOCATION_INDEX_ARG, ScratchKind, key};
 
+/// A loop update may be stored immediately if no later update reads that
+/// local's entering value. Walk the shared expression DAG once, backwards
+/// across updates. Deferred values preserve simultaneous assignment, including
+/// cycles, without keeping every independent update live until the end.
+fn early_accumulator_stores(accumulators: &[Accumulator]) -> Vec<bool> {
+    use fusor_ir::ir::kernel::TileExprKind;
+    use rustc_hash::FxHashSet;
+
+    // Cooperative values also have deferred stores in the emitter. Leave that
+    // protocol unchanged; this schedule concerns ordinary private values.
+    if accumulators
+        .iter()
+        .any(|a| matches!(a.local.element, ElementType::CoopMatrix { .. }))
+    {
+        return vec![false; accumulators.len()];
+    }
+    fn reads(expr: &TileExpr, seen: &mut FxHashSet<TileExpr>, locals: &mut FxHashSet<usize>) {
+        if !seen.insert(expr.clone()) {
+            return;
+        }
+        if let TileExprKind::LoadLocal(local) = expr.kind() {
+            locals.insert(key(local));
+        }
+        expr.kind().visit_children(&mut |e| reads(e, seen, locals));
+    }
+    let mut seen = FxHashSet::default();
+    let mut later_reads = FxHashSet::default();
+    let mut early = vec![false; accumulators.len()];
+    for (i, acc) in accumulators.iter().enumerate().rev() {
+        early[i] = !later_reads.contains(&key(&acc.local));
+        reads(&acc.update, &mut seen, &mut later_reads);
+    }
+    early
+}
+
 impl Emitter<'_> {
     pub(crate) fn block(&mut self, body: &[Stmt]) -> Result<Block, EmitError> {
         let (block, ()) = self.nested(|em, block| {
@@ -318,6 +353,7 @@ impl Emitter<'_> {
         }
         let count_h = self.expr(count, out)?;
         let iter_local = index.map(|i| self.private_local(i)).transpose()?;
+        let early = early_accumulator_stores(accumulators);
         let accumulators = accumulators.to_vec();
         let body = body.to_vec();
         self.dynamic_loop(out, count_h, move |em, loop_body, loop_index| {
@@ -327,12 +363,17 @@ impl Emitter<'_> {
             for stmt in &body {
                 em.stmt(stmt, loop_body)?;
             }
-            let values: Vec<Handle<Expression>> = accumulators
-                .iter()
-                .map(|acc| em.expr(&acc.update, loop_body))
-                .collect::<Result<_, _>>()?;
-            for (acc, value) in accumulators.iter().zip(values) {
+            let mut deferred = Vec::new();
+            for (acc, early) in accumulators.iter().zip(&early) {
+                let value = em.expr(&acc.update, loop_body)?;
                 let local = em.private_local(&acc.local)?;
+                if *early {
+                    em.store_local(loop_body, local, value);
+                } else {
+                    deferred.push((local, value));
+                }
+            }
+            for (local, value) in deferred {
                 em.store_local(loop_body, local, value);
             }
             em.flush_coop_acc(loop_body);

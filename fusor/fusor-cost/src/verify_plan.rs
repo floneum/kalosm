@@ -151,21 +151,7 @@ pub(crate) fn check_operand_spaces(graph: &EGraph, plan: &Plan) -> Result<()> {
                 continue;
             }
             let shape = o.layout.shape();
-            let single = shape.iter().all(|d| d.known_eq(Dim::Const(1)));
-            if single {
-                continue;
-            }
-            let full_rank = shape.len() == space.rank()
-                && shape
-                    .iter()
-                    .zip(&space.dims)
-                    .all(|(l, d)| l.known_eq(*d) || l.known_eq(Dim::Const(1)));
-            let suffix = shape.len() < space.rank()
-                && shape
-                    .iter()
-                    .zip(&space.dims[space.rank() - shape.len()..])
-                    .all(|(l, d)| l.known_eq(*d) || l.known_eq(Dim::Const(1)));
-            if !(full_rank || suffix) {
+            if !space.addresses_shape(shape) {
                 return Err(Error::Plan(format!(
                     "selected {id}: fold operand {i} aliases a {shape:?} layout the flat index \
                      map of space {:?} cannot address; fix the rule that minted it",

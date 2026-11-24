@@ -24,7 +24,56 @@ pub struct RawTensorBytes {
     pub fmt: Dtype,
     pub layout: QLayout,
     pub shape: SmallVec<[u64; 4]>,
-    pub bytes: Box<[u8]>,
+    pub bytes: TensorBytes,
+}
+
+/// A contiguous, immutable range retaining its source file or owned bytes.
+#[derive(Clone)]
+pub struct TensorBytes {
+    owner: Arc<dyn AsRef<[u8]> + Send + Sync>,
+    range: std::ops::Range<usize>,
+}
+impl std::ops::Deref for TensorBytes {
+    type Target = [u8];
+    fn deref(&self) -> &[u8] {
+        &self.owner.as_ref().as_ref()[self.range.clone()]
+    }
+}
+impl AsRef<[u8]> for TensorBytes {
+    fn as_ref(&self) -> &[u8] {
+        self
+    }
+}
+impl std::fmt::Debug for TensorBytes {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TensorBytes")
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+impl PartialEq for TensorBytes {
+    fn eq(&self, other: &Self) -> bool {
+        self.as_ref() == other.as_ref()
+    }
+}
+impl Eq for TensorBytes {}
+impl From<Box<[u8]>> for TensorBytes {
+    fn from(bytes: Box<[u8]>) -> Self {
+        let range = 0..bytes.len();
+        Self {
+            owner: Arc::new(bytes),
+            range,
+        }
+    }
+}
+impl TensorBytes {
+    /// Keep this range alive in a device leaf without copying tensor data.
+    pub fn shared_host_bytes(&self) -> Arc<fusor_ir::target::HostBytes> {
+        Arc::new(
+            fusor_ir::target::HostBytes::shared(Arc::new(self.clone()), 0..self.len())
+                .expect("range spans this immutable tensor"),
+        )
+    }
 }
 
 /// A prefixed cursor into one GGUF file.
@@ -122,7 +171,15 @@ impl VarBuilder {
             fmt: ingest_qfmt(tensor.ty)?,
             layout: QLayout::Native,
             shape: tensor.shape.clone(),
-            bytes: bytes.to_vec().into_boxed_slice(),
+            bytes: {
+                // get() already validated the tensor range. Derive the offset
+                // from that exact borrowed slice, avoiding duplicate arithmetic.
+                let start = bytes.as_ptr() as usize - self.file.bytes().as_ptr() as usize;
+                TensorBytes {
+                    owner: self.file.clone(),
+                    range: start..start + bytes.len(),
+                }
+            },
         })
     }
 }
@@ -150,6 +207,36 @@ mod tests {
             ],
         );
         Arc::new(Gguf::from_bytes(file).unwrap())
+    }
+
+    #[test]
+    fn raw_tensor_and_upload_retain_their_own_shard_without_copying() {
+        let first = model();
+        let second = model();
+        let first_ptr = first.tensor_bytes("blk.0.attn_q.weight").unwrap().as_ptr();
+        let second_ptr = second.tensor_bytes("blk.0.attn_q.weight").unwrap().as_ptr();
+        assert_ne!(first_ptr, second_ptr);
+        let weak_first = Arc::downgrade(&first);
+        let weak_second = Arc::downgrade(&second);
+        let raw = VarBuilder::new(first)
+            .get_raw("blk.0.attn_q.weight")
+            .unwrap();
+        let other = VarBuilder::new(second)
+            .get_raw("blk.0.attn_q.weight")
+            .unwrap();
+        assert_eq!(raw.bytes.as_ptr(), first_ptr);
+        assert_eq!(other.bytes.as_ptr(), second_ptr);
+        let upload = raw.bytes.shared_host_bytes();
+        drop(raw);
+        drop(other);
+        assert!(weak_second.upgrade().is_none());
+        assert!(weak_first.upgrade().is_some());
+        upload.with_slice(|bytes| {
+            assert_eq!(bytes.as_ptr(), first_ptr);
+            assert_eq!(bytes, (0..18u8).collect::<Vec<_>>());
+        });
+        drop(upload);
+        assert!(weak_first.upgrade().is_none());
     }
 
     #[test]

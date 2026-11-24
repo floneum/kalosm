@@ -23,4 +23,4 @@ pub use blocks::{BLOCK_SPECS, block_spec};
 pub use parse::{GgmlType, Gguf, GgufMetadata, GgufTensor, GgufValue};
 pub use repack::repack;
 pub use sharded::{AsyncShardedVarBuilder, ShardedVarBuilder};
-pub use varbuilder::{RawTensorBytes, VarBuilder};
+pub use varbuilder::{RawTensorBytes, TensorBytes, VarBuilder};

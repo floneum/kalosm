@@ -5,7 +5,7 @@
 //! slab's buffer. No tiling: a slab buys dispatch count.
 
 use fusor_ir::Result;
-use fusor_ir::egraph::ClassId;
+use fusor_ir::egraph::{ClassId, Id};
 use fusor_ir::error::Error;
 use fusor_ir::ir::Op;
 use fusor_ir::ir::kernel::{
@@ -128,6 +128,9 @@ pub(crate) fn lower_kslab(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resul
     let Some(last) = members.last().copied() else {
         return Err(Error::Plan("a Slab has no members".into()));
     };
+    if let Some(kernel) = inline_map_chain(&ctx, members)? {
+        return Ok(ctx.finish("kmap_inline_slab", kernel.grid, kernel.block, kernel.body));
+    }
     let stage = |m| match &ctx.cx.graph.node(m).op {
         Op::Launch(stage) => Ok(stage),
         _ => Err(Error::Plan(format!("slab member {m} is not a Launch node"))),
@@ -197,6 +200,87 @@ pub(crate) fn lower_kslab(ctx: Ctx<'_>, op: &Launch, theta: SchedPoint) -> Resul
         }
     }
     Ok(ctx.finish("kslab", grid, block, body))
+}
+
+/// A private chain of pure maps needs neither scratch nor workgroup barriers.
+/// Compose each operand's address before substituting its scalar expression;
+/// this preserves transposes, slices and broadcasts as well as plain copies.
+struct InlineMapChain {
+    grid: [u32; 3],
+    block: u32,
+    body: Vec<Stmt>,
+}
+
+fn inline_map_chain(ctx: &Ctx<'_>, members: &[Id]) -> Result<Option<InlineMapChain>> {
+    if members.len() > 16 {
+        return Ok(None);
+    }
+    let last = *members.last().expect("nonempty slab");
+    let mut stages = FxHashMap::default();
+    for &id in members {
+        if id != last && ctx.has_buffer(id) {
+            return Ok(None);
+        }
+        let Op::Launch(op @ Launch::Map { space, .. }) = &ctx.cx.graph.node(id).op else {
+            return Ok(None);
+        };
+        if space.iterations().is_none() {
+            return Ok(None);
+        }
+        stages.insert(ctx.cx.graph.class_of(id), op);
+    }
+    fn value(
+        ctx: &Ctx<'_>,
+        op: &Launch,
+        index: TileExpr,
+        stages: &FxHashMap<ClassId, &Launch>,
+        depth: usize,
+    ) -> Result<TileExpr> {
+        if depth > stages.len() {
+            return Err(Error::Plan("cyclic map slab".into()));
+        }
+        let Launch::Map {
+            space, body, ops, ..
+        } = op
+        else {
+            unreachable!("only maps are admitted");
+        };
+        let total = space.iterations().expect("constant map space");
+        let args = ops
+            .iter()
+            .map(|operand| {
+                if let Some(producer) = stages.get(&ctx.cx.graph.class_of(operand.src)) {
+                    let at = ctx.operand_address(operand, index.clone(), total)?;
+                    value(ctx, producer, at, stages, depth + 1)
+                } else {
+                    ctx.load_mapped(operand, index.clone(), total)
+                }
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let coords = ctx.coords_from_linear(index, space)?;
+        // Match the intermediate store's element conversion, including f16
+        // rounding, before a later stage consumes it.
+        Ok(ctx.b.cast(
+            ctx.eval_scalar(body, &args, &coords)?,
+            scalar_element(body.dtype()).element(),
+        ))
+    }
+    let last_op = stages[&ctx.cx.graph.class_of(last)];
+    let Launch::Map { space, .. } = last_op else {
+        unreachable!()
+    };
+    let block = ctx.block(fusor_tile::domains::emitted_block(1, ctx.caps));
+    let grid = crate::lower::grid_for(space, block, &ctx.binding, &ctx.caps.limits)?;
+    let index = ctx.global_index(block);
+    let result = value(ctx, last_op, index.clone(), &stages, 0)?;
+    let out = ctx.linear_view(ctx.output()?)?;
+    let body = vec![Stmt::Store {
+        value: ctx.b.cast(result, out.buffer.element),
+        dst: out,
+        addr: Addr::Linear(index.clone()),
+        mask: ctx.b.lt(index, ctx.extent_product(&space.dims)?),
+    }];
+    Ok(Some(InlineMapChain { grid, block, body }))
 }
 
 /// `count / slabs`, refusing a partition the rule should never have produced.

@@ -388,7 +388,7 @@ struct Twin {
 struct FamilyBindings<'a> {
     graph: &'a GraphRef,
     values: Vec<Id>,
-    saved: FxHashMap<Id, (Buf, Option<Arc<Layout>>)>,
+    saved: FxHashMap<Id, crate::graph::DeviceBinding>,
 }
 
 impl<'a> FamilyBindings<'a> {
@@ -405,11 +405,11 @@ impl<'a> FamilyBindings<'a> {
                 .iter()
                 .any(|id| matches!(g.node(*id).op, Op::Logical(Logical::Leaf(_))));
             for id in members.iter() {
-                if let Some(binding) = leaves.device.get(id) {
-                    saved.entry(*id).or_insert_with(|| binding.clone());
+                if let Some(binding) = leaves.snapshot_binding(*id) {
+                    saved.entry(*id).or_insert(binding);
                 }
                 if !external {
-                    leaves.device.remove(id);
+                    leaves.clear_binding(*id);
                 }
             }
         }
@@ -428,10 +428,12 @@ impl Drop for FamilyBindings<'_> {
         for value in &self.values {
             let class = g.class_of(*value);
             for id in g.class_ids_cached(class).iter() {
-                leaves.device.remove(id);
+                leaves.clear_binding(*id);
             }
         }
-        leaves.device.extend(self.saved.drain());
+        for (id, binding) in self.saved.drain() {
+            leaves.restore_binding(id, binding);
+        }
     }
 }
 
@@ -500,7 +502,6 @@ impl Session {
         rules.extend_from_slice(SCHED_RULES);
         rules.extend_from_slice(fusor_autograd::ADJOINT_RULES);
         rules.extend_from_slice(target.rules());
-
         Ok(Self {
             inner: Arc::new(SessionInner {
                 device,
@@ -701,9 +702,22 @@ impl Session {
                 // lowering when this budget is exhausted.
                 let budget = SaturationBudget {
                     application_slope: 16,
+                    node_slope: 8,
+                    max_applications: 200_000,
                     ..SaturationBudget::default()
                 };
-                Driver::new().saturate(&mut g, &caps, &self.inner.rules, budget)?;
+                let report = Driver::new().saturate(&mut g, &caps, &self.inner.rules, budget)?;
+                if flags().resolve_profile {
+                    eprintln!(
+                        "SATURATION saturated={} rounds={} applications={} initial={} final={} truncated={}",
+                        report.saturated,
+                        report.rounds,
+                        report.applications,
+                        report.initial_nodes,
+                        report.final_nodes,
+                        report.truncated.len()
+                    );
+                }
                 if let Some(pre) = pre {
                     self.inner.saturation.insert(g.record_saturation(pre));
                 }
@@ -760,18 +774,20 @@ impl Session {
             // the forwarded plan is what every later hit on this key replays.
             let __t_fwd = Instant::now();
             let plan = if missed {
-                let mut ex = plan.extraction.clone();
-                let mut next = plan;
-                if fusor_cost::forward::forward_selected_views(
-                    &mut g, &caps, &roots, &next, &mut ex,
-                ) {
-                    next = Arc::new(self.inner.extractor.replan_extraction(
-                        &g,
-                        &roots,
-                        &mut ex,
-                        self.inner.cost.as_ref(),
-                    )?);
-                }
+                let mut next = Arc::new(fusor_cost::forward::forward_selected_views(
+                    &mut g,
+                    &caps,
+                    &roots,
+                    &plan,
+                    &mut |g, ex| {
+                        self.inner.extractor.replan_extraction(
+                            g,
+                            &roots,
+                            ex,
+                            self.inner.cost.as_ref(),
+                        )
+                    },
+                )?);
                 // Independent launches of one dependency level share a dispatch.
                 let grouped =
                     fusor_cost::wavefront::group_wavefronts(&mut g, &caps, &next, &mut |g, ex| {
@@ -923,12 +939,15 @@ impl Session {
     }
 
     /// For each requested value that is a chain of pure views over a computed
-    /// value with no device buffer, that base value (deduplicated).
+    /// value with no device buffer, materialize a base only for a partial view.
+    /// Full-size reshapes/permutations stay in the same replay plan as their
+    /// producer; splitting them would freeze an intermediate from an old step.
     fn unresolved_view_bases(&self, graph: &GraphRef, values: &[Tensor]) -> Vec<Id> {
         let g = graph.state().egraph.lock();
         let mut out: Vec<Id> = Vec::new();
         for value in values {
             let mut id = value.id;
+            let mut partial = false;
             loop {
                 match logical_children(&g, id) {
                     Some(kids) if matches!(g.node(id).op, Op::Union(..)) && kids.len() == 1 => {
@@ -937,12 +956,35 @@ impl Session {
                     Some(kids)
                         if matches!(g.node(id).op, Op::Logical(Logical::Restride { .. })) =>
                     {
+                        // Constant products and the multiset of symbolic
+                        // factors prove full-size permutations, reshapes and
+                        // expanding broadcasts without consulting this step's
+                        // bindings. Only a smaller view needs a materialized base.
+                        let factors = |shape: &[Dim]| {
+                            let mut constant = 1u64;
+                            let mut symbols = Vec::new();
+                            for dim in shape {
+                                match dim {
+                                    Dim::Const(n) => constant = constant.checked_mul(*n)?,
+                                    Dim::Sym(s) if *s != fusor_ir::shape::OPAQUE_SYM => {
+                                        symbols.push(*s)
+                                    }
+                                    _ => return None,
+                                }
+                            }
+                            symbols.sort_unstable();
+                            Some((constant, symbols))
+                        };
+                        partial |= factors(&g.facts(id).shape)
+                            .zip(factors(&g.facts(kids[0]).shape))
+                            .is_none_or(|(view, base)| view.1 != base.1 || view.0 < base.0);
                         id = kids[0];
                     }
                     _ => break,
                 }
             }
-            if id != value.id
+            if partial
+                && id != value.id
                 && !matches!(g.node(id).op, Op::Logical(Logical::Leaf(_)))
                 && graph.device_buf(id).is_none()
                 && !out.contains(&id)
@@ -1515,8 +1557,8 @@ impl Session {
         // per binding; only the values that are genuinely unbacked reach
         // `leaf_buffer` and upload.
         let mut supplied: FxHashMap<Id, Buf> = FxHashMap::default();
-        let mut bound: rustc_hash::FxHashSet<Id> = rustc_hash::FxHashSet::default();
-        let mut distinct: Vec<Id> = Vec::with_capacity(plan.launches.len());
+        let mut bound = rustc_hash::FxHashSet::default();
+        let mut distinct = Vec::with_capacity(plan.launches.len());
         for launch in &plan.launches {
             for binding in &launch.bindings {
                 if bound.insert(binding.value) {
@@ -1524,7 +1566,8 @@ impl Session {
                 }
             }
         }
-        for (id, existing) in graph.external_leaf_buffers(&distinct) {
+        let external = graph.external_leaf_buffers(&distinct);
+        for (id, existing) in external {
             match existing {
                 Some(buf) => {
                     supplied.insert(id, buf);
@@ -1587,16 +1630,12 @@ impl Session {
         match &self.inner.device {
             #[cfg(feature = "gpu")]
             Backend::Gpu(target) => {
-                let mut env = fusor_gpu::target::BindingEnv::new();
-                for (sym, value) in graph.dim_bindings() {
-                    env = env.with_dim(sym, value);
-                }
-                for (sym, value) in graph.uniform_scalars() {
-                    env = env.with_scalar(sym, value);
-                }
-                for (id, buf) in &supplied {
-                    env = env.with_buffer(*id, buf.clone());
-                }
+                let (dims, scalars) = graph.binding_symbols();
+                let env = fusor_gpu::target::BindingEnv {
+                    dims,
+                    scalars,
+                    buffers: supplied,
+                };
                 let g = graph.state().egraph.lock();
                 target.resolve(plan, &g, &env)?;
                 Ok((plan.launches.len(), None))
@@ -2159,16 +2198,14 @@ impl Session {
             return Ok(Some(buf));
         }
         let facts = graph.facts(id);
-        let buf = match graph.with_leaf_bytes(id, |bytes| {
+        if let Some(buf) = graph.upload_leaf_bytes(id, |bytes| {
             self.inner.device.upload(bytes, facts.persistence)
-        }) {
-            Some(uploaded) => uploaded?,
-            None => {
-                let elements = resolve_elements(&facts.shape, graph)?;
-                let bytes = (elements * facts.dtype.byte_size()).max(4);
-                self.inner.device.target().alloc(bytes, facts.persistence)?
-            }
-        };
+        })? {
+            return Ok(Some(buf));
+        }
+        let elements = resolve_elements(&facts.shape, graph)?;
+        let bytes = (elements * facts.dtype.byte_size()).max(4);
+        let buf = self.inner.device.target().alloc(bytes, facts.persistence)?;
         graph.bind_leaf(id, buf.clone(), None);
         Ok(Some(buf))
     }

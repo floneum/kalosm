@@ -65,7 +65,7 @@ pub(crate) fn lru_retain<K: std::hash::Hash + Eq + Clone, V>(
 /// Dispatches packed into one compute pass: chunked past the threshold,
 /// never one pass per dispatch (a Metal pass boundary costs a small kernel).
 pub fn dispatches_per_pass(total: usize) -> usize {
-    if let Some(n) = crate::flags().pass_size {
+    if let Some(n) = crate::flags::flags().pass_size {
         return n;
     }
     if total >= PASS_CHUNK_THRESHOLD {
@@ -210,20 +210,68 @@ impl KernelProfile {
     }
 }
 
+/// One checked buffer operation in a transfer launch.
+#[derive(Clone)]
+pub enum BufferTransfer {
+    Copy {
+        src: Buf,
+        dst: Buf,
+        src_offset: u64,
+        dst_offset: u64,
+        bytes: u64,
+    },
+    Clear {
+        dst: Buf,
+        offset: u64,
+        bytes: u64,
+    },
+}
+
 /// One recorded command, in exact plan order.
 #[derive(Clone)]
 pub enum CommandRecord {
+    /// One ordinary tensor launch implemented by buffer copies/clears.
+    Transfers { copies: Vec<BufferTransfer> },
     Dispatch {
         name: &'static str,
         pipeline: Arc<wgpu::ComputePipeline>,
         bind_group: Arc<wgpu::BindGroup>,
         grid: [u32; 3],
     },
-    /// `bytes` from the start of `src` to the start of `dst`.
-    CopyBuffer { src: Buf, dst: Buf, bytes: u64 },
+    /// An aligned byte range copied through the ordinary WebGPU encoder.
+    CopyBuffer {
+        src: Buf,
+        dst: Buf,
+        src_offset: u64,
+        dst_offset: u64,
+        bytes: u64,
+    },
 }
 
 impl CommandRecord {
+    /// Bytes moved by a copy; diagnostic observers use this to identify pass
+    /// boundaries and traffic omitted by dispatch-only attribution.
+    pub fn copy_bytes(&self) -> Option<u64> {
+        match self {
+            Self::CopyBuffer { bytes, .. } => Some(*bytes),
+            Self::Transfers { copies } => Some(
+                copies
+                    .iter()
+                    .map(|c| match c {
+                        BufferTransfer::Copy { bytes, .. } => *bytes,
+                        BufferTransfer::Clear { .. } => 0,
+                    })
+                    .sum(),
+            ),
+            Self::Dispatch { .. } => None,
+        }
+    }
+
+    /// Whether this command owns a compute timestamp slot.
+    pub fn is_live_dispatch(&self) -> bool {
+        matches!(self, Self::Dispatch { grid, .. } if !grid.contains(&0))
+    }
+
     /// A dispatch whose grid contains a zero launches nothing and is skipped.
     pub fn is_empty_dispatch(&self) -> bool {
         matches!(self, Self::Dispatch { grid, .. } if grid.contains(&0))
@@ -311,6 +359,8 @@ pub struct Launcher {
     config: GpuConfig,
     in_flight: AtomicUsize,
     poll_waits: AtomicU64,
+    #[cfg(test)]
+    test_pending_submissions: AtomicUsize,
     dispatches: AtomicU64,
     pipeline_compiles: AtomicU64,
     profiles: Mutex<Vec<KernelProfile>>,
@@ -384,6 +434,8 @@ impl Launcher {
             lost,
             in_flight: AtomicUsize::new(0),
             poll_waits: AtomicU64::new(0),
+            #[cfg(test)]
+            test_pending_submissions: AtomicUsize::new(0),
             dispatches: AtomicU64::new(0),
             pipeline_compiles: AtomicU64::new(0),
             profiles: Mutex::new(Vec::new()),
@@ -412,6 +464,18 @@ impl Launcher {
     /// Times the runtime blocked the host.
     pub fn poll_wait_count(&self) -> u64 {
         self.poll_waits.load(Ordering::Relaxed)
+    }
+
+    #[cfg(test)]
+    fn note_test_submission(&self) {
+        self.test_pending_submissions
+            .fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[cfg(test)]
+    fn note_test_submission_waited(&self) {
+        self.test_pending_submissions
+            .fetch_sub(1, Ordering::Relaxed);
     }
 
     pub fn pipeline_compiles(&self) -> u64 {
@@ -537,28 +601,46 @@ impl Launcher {
         timestamps: Option<&wgpu::QuerySet>,
         mode: TimingMode,
     ) -> Result<()> {
+        let total = records
+            .iter()
+            .filter(|r| matches!(r, CommandRecord::Dispatch { .. }) && !r.is_empty_dispatch())
+            .count();
+        let mut pending_window = std::collections::VecDeque::new();
+        self.encode_command_records_from(records, timestamps, mode, 0, total, &mut pending_window)
+    }
+
+    /// Submit a consecutive portion of a resolve without resetting its query
+    /// indices. The caller preserves plan order and bounds outstanding chunks.
+    pub(crate) fn encode_command_records_from(
+        &self,
+        records: &[CommandRecord],
+        timestamps: Option<&wgpu::QuerySet>,
+        mode: TimingMode,
+        first_dispatch: usize,
+        total: usize,
+        pending: &mut std::collections::VecDeque<wgpu::SubmissionIndex>,
+    ) -> Result<()> {
         // A zero grid launches nothing but would cost a pass boundary.
         let live: Vec<&CommandRecord> = records.iter().filter(|r| !r.is_empty_dispatch()).collect();
-        let total = live
-            .iter()
-            .filter(|r| matches!(r, CommandRecord::Dispatch { .. }))
-            .count();
+        let last_portion = first_dispatch
+            + live
+                .iter()
+                .filter(|r| matches!(r, CommandRecord::Dispatch { .. }))
+                .count()
+            == total;
         // `FUSOR_TRACE_DISPATCH`: one dispatch per submit, each waited on, to
         // attribute an asynchronous device loss to a kernel.
-        let trace = crate::flags().trace_dispatch;
+        let trace = crate::flags::flags().trace_dispatch;
         let per_submit = if trace {
             1
         } else {
             dispatches_per_submit(total, self.backend)
         };
 
-        let mut dispatch_ix = 0usize;
+        let mut dispatch_ix = first_dispatch;
         let mut chunk: Vec<&CommandRecord> = Vec::new();
         let mut dispatches_in_chunk = 0usize;
         let mut submits = 0usize;
-        // Metal: keep at most [`METAL_INFLIGHT_CHUNKS`] chunks outstanding.
-        let mut pending: std::collections::VecDeque<wgpu::SubmissionIndex> =
-            std::collections::VecDeque::new();
 
         for record in live {
             let is_dispatch = matches!(record, CommandRecord::Dispatch { .. });
@@ -572,6 +654,7 @@ impl Launcher {
                 let started = trace.then(std::time::Instant::now);
                 let (ix, submitted) =
                     self.encode_one_submit(&chunk, timestamps, mode, dispatch_ix, total)?;
+                let mut trace_waited = false;
                 if trace {
                     let poll = self.device.poll(wgpu::PollType::wait_indefinitely());
                     #[cfg(not(target_arch = "wasm32"))]
@@ -593,30 +676,53 @@ impl Launcher {
                     if let CommandRecord::Dispatch { name, grid, .. } = record {
                         eprintln!("[trace] dispatch {name} grid={grid:?} -> {state} {__us}us");
                     }
+                    trace_waited = poll.is_ok();
                 }
                 dispatch_ix = ix;
                 chunk.clear();
                 dispatches_in_chunk = 0;
                 submits += 1;
-                pending.push_back(submitted);
-                if pending.len() > METAL_INFLIGHT_CHUNKS
-                    && let Some(oldest) = pending.pop_front()
-                {
-                    let _w = Stopwatch::start(&CHUNK_WAIT_US);
-                    self.device
-                        .poll(wgpu::PollType::Wait {
-                            submission_index: Some(oldest),
-                            timeout: None,
-                        })
-                        .map_err(|e| Error::Device(format!("device wait failed: {e}")))?;
+                if trace_waited {
+                    pending.clear();
+                    #[cfg(test)]
+                    self.test_pending_submissions.store(0, Ordering::Relaxed);
+                } else {
+                    self.track_submission(pending, submitted)?;
                 }
             }
         }
         if !chunk.is_empty() || submits == 0 {
-            self.encode_one_submit(&chunk, timestamps, mode, dispatch_ix, total)?;
+            let (_, submitted) =
+                self.encode_one_submit(&chunk, timestamps, mode, dispatch_ix, total)?;
+            self.track_submission(pending, submitted)?;
         }
-        self.in_flight.fetch_add(1, Ordering::Relaxed);
-        self.apply_back_pressure()
+        if last_portion {
+            self.in_flight.fetch_add(1, Ordering::Relaxed);
+            self.apply_back_pressure()?;
+        }
+        Ok(())
+    }
+
+    fn track_submission(
+        &self,
+        pending: &mut std::collections::VecDeque<wgpu::SubmissionIndex>,
+        submitted: wgpu::SubmissionIndex,
+    ) -> Result<()> {
+        pending.push_back(submitted);
+        if pending.len() > METAL_INFLIGHT_CHUNKS
+            && let Some(oldest) = pending.pop_front()
+        {
+            let _w = Stopwatch::start(&CHUNK_WAIT_US);
+            self.device
+                .poll(wgpu::PollType::Wait {
+                    submission_index: Some(oldest),
+                    timeout: None,
+                })
+                .map_err(|e| Error::Device(format!("device wait failed: {e}")))?;
+            #[cfg(test)]
+            self.note_test_submission_waited();
+        }
+        Ok(())
     }
 
     /// One encoder's passes; returns the next query index and submission.
@@ -668,10 +774,50 @@ impl Launcher {
         let mut at = 0usize;
         while at < records.len() {
             match records[at] {
-                CommandRecord::CopyBuffer { src, dst, bytes } => {
+                CommandRecord::Transfers { copies } => {
+                    for copy in copies {
+                        match copy {
+                            BufferTransfer::Copy {
+                                src,
+                                dst,
+                                src_offset,
+                                dst_offset,
+                                bytes,
+                            } => {
+                                let s = GpuBuffer::of(src, "copy source")?;
+                                let d = GpuBuffer::of(dst, "copy destination")?;
+                                encoder.copy_buffer_to_buffer(
+                                    &s.buffer,
+                                    *src_offset,
+                                    &d.buffer,
+                                    *dst_offset,
+                                    *bytes,
+                                );
+                            }
+                            BufferTransfer::Clear { dst, offset, bytes } => {
+                                let d = GpuBuffer::of(dst, "clear destination")?;
+                                encoder.clear_buffer(&d.buffer, *offset, Some(*bytes));
+                            }
+                        }
+                    }
+                    at += 1;
+                }
+                CommandRecord::CopyBuffer {
+                    src,
+                    dst,
+                    src_offset,
+                    dst_offset,
+                    bytes,
+                } => {
                     let s = GpuBuffer::of(src, "copy source")?;
                     let d = GpuBuffer::of(dst, "copy destination")?;
-                    encoder.copy_buffer_to_buffer(&s.buffer, 0, &d.buffer, 0, *bytes);
+                    encoder.copy_buffer_to_buffer(
+                        &s.buffer,
+                        *src_offset,
+                        &d.buffer,
+                        *dst_offset,
+                        *bytes,
+                    );
                     at += 1;
                 }
                 CommandRecord::Dispatch { .. } => {
@@ -757,6 +903,8 @@ impl Launcher {
             }
         }
         let submitted = self.queue.submit([encoder.finish()]);
+        #[cfg(test)]
+        self.note_test_submission();
         Ok((dispatch_ix, submitted))
     }
 
@@ -867,6 +1015,8 @@ impl Launcher {
         let record = CommandRecord::CopyBuffer {
             src: src.clone(),
             dst: dst.clone(),
+            src_offset: 0,
+            dst_offset: 0,
             bytes,
         };
         self.encode_command_records(&[record], None, TimingMode::All)
@@ -876,7 +1026,7 @@ impl Launcher {
     /// wgpu's lives across the `await` (a held `BufferSlice` overflows callers'
     /// `Send` checks), so the map is two sync halves around [`MapDone`].
     async fn readback_into(&self, src: &Buf, staging: &Buf, bytes: u64) -> Result<Vec<u8>> {
-        let trace = crate::flags().trace_dispatch;
+        let trace = crate::flags::flags().trace_dispatch;
         let state = |what: &str| {
             if trace {
                 let src_size = src.downcast_ref::<GpuBuffer>().map_or(0, |b| b.size);
@@ -962,6 +1112,7 @@ impl Launcher {
         set: &wgpu::QuerySet,
         dispatches: usize,
     ) -> Result<Vec<f64>> {
+        let period = f64::from(self.queue.get_timestamp_period());
         let slots = dispatches.saturating_mul(2);
         if slots == 0 {
             return Ok(Vec::new());
@@ -1001,8 +1152,6 @@ impl Launcher {
         pool.recycle(staging);
         pool.recycle(resolved);
 
-        // A zero period reads every span as zero, i.e. "not timed".
-        let period = f64::from(self.queue.get_timestamp_period());
         let tick = |i: usize| {
             raw.get(i * 8..i * 8 + 8)
                 .and_then(|b| <[u8; 8]>::try_from(b).ok())
@@ -1015,29 +1164,24 @@ impl Launcher {
 
     /// Choose how a resolve is timed. A named `focus` wins over whole-plan
     /// timing, so a caller gets exactly the launches it will read.
-    pub(crate) fn timing_plan(
+    pub(crate) fn timing_plan_for_dispatches(
         &self,
-        records: &[CommandRecord],
+        records: &[bool],
         focus: Option<Vec<usize>>,
     ) -> TimingPlan {
         // Focus is restated in live-dispatch indices, sorted and deduped for
         // the binary-searched slot map.
+        let flags = crate::flags::flags();
         let mut focus = focus.unwrap_or_default();
         focus.sort_unstable();
         focus.dedup();
-        let live_before = |ix: usize| {
-            records[..ix]
-                .iter()
-                .filter(|r| !r.is_empty_dispatch())
-                .count()
-        };
+        let live_before = |ix: usize| records[..ix].iter().filter(|r| **r).count();
         let focus: Vec<(usize, usize)> = focus
             .into_iter()
-            .filter(|&ix| records.get(ix).is_some_and(|r| !r.is_empty_dispatch()))
+            .filter(|&ix| records.get(ix).copied().unwrap_or(false))
             .map(|ix| (ix, live_before(ix)))
             .collect();
         let live: Vec<usize> = focus.iter().map(|&(_, l)| l).collect();
-        let flags = crate::flags();
         let (set, kind) = if !focus.is_empty() {
             (self.timestamp_query_set(focus.len()), TimingKind::Focus)
         } else if flags.time_plan {
@@ -1085,7 +1229,7 @@ impl Launcher {
         self.poll_wait()?;
         let name = |r: &CommandRecord| match r {
             CommandRecord::Dispatch { name, .. } => *name,
-            CommandRecord::CopyBuffer { .. } => "?",
+            CommandRecord::CopyBuffer { .. } | CommandRecord::Transfers { .. } => "copy",
         };
         match timing.kind {
             // Only focused dispatches were timed; other slots read zero.
@@ -1111,7 +1255,7 @@ impl Launcher {
                 let live: Vec<(usize, &CommandRecord)> = records
                     .iter()
                     .enumerate()
-                    .filter(|(_, r)| !r.is_empty_dispatch())
+                    .filter(|(_, r)| r.is_live_dispatch())
                     .collect();
                 for (j, us) in samples.iter().enumerate() {
                     let ix = start + j;
@@ -1128,14 +1272,14 @@ impl Launcher {
                 }
             }
             TimingKind::All => {
-                let live = records.iter().filter(|r| !r.is_empty_dispatch()).count();
+                let live = records.iter().filter(|r| r.is_live_dispatch()).count();
                 let mut samples = self.read_timestamps(pool, set, live)?.into_iter();
                 // Back to plan order: zero-grid launches own no sample.
                 let per_launch: Vec<f64> = records
                     .iter()
-                    .map(|r| match r.is_empty_dispatch() {
-                        true => 0.0,
-                        false => samples.next().unwrap_or(0.0),
+                    .map(|r| match r.is_live_dispatch() {
+                        false => 0.0,
+                        true => samples.next().unwrap_or(0.0),
                     })
                     .collect();
                 if self.config.trace_gpu_kernels {
@@ -1280,5 +1424,136 @@ mod cancel_tests {
         buffer.slice(..).map_async(wgpu::MapMode::Read, |_| {});
         let _ = device.poll(wgpu::PollType::wait_indefinitely());
         buffer.unmap();
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod submission_window_tests {
+    use super::*;
+
+    fn metal_launcher() -> (Launcher, Arc<wgpu::ComputePipeline>, Arc<wgpu::BindGroup>) {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let adapter = pollster::block_on(instance.request_adapter(&wgpu::RequestAdapterOptions {
+            power_preference: wgpu::PowerPreference::HighPerformance,
+            force_fallback_adapter: false,
+            compatible_surface: None,
+        }))
+        .expect("request Metal adapter");
+        let info = adapter.get_info();
+        assert_eq!(info.backend, wgpu::Backend::Metal, "adapter: {}", info.name);
+        eprintln!("submission-window regression backend: {:?}", info.backend);
+        let (device, queue) =
+            pollster::block_on(adapter.request_device(&wgpu::DeviceDescriptor::default()))
+                .expect("request Metal device");
+
+        let bind_group_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+            label: Some("submission-window regression"),
+            entries: &[],
+        });
+        let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("submission-window regression"),
+            bind_group_layouts: &[Some(&bind_group_layout)],
+            immediate_size: 0,
+        });
+        let source = "@compute @workgroup_size(1) fn main() {}";
+        let module = naga::front::wgsl::parse_str(source).expect("parse regression shader");
+        let module = device.create_shader_module(wgpu::ShaderModuleDescriptor {
+            label: Some("submission-window regression"),
+            source: wgpu::ShaderSource::Naga(std::borrow::Cow::Owned(module)),
+        });
+        let pipeline = Arc::new(
+            device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("submission-window regression"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: Default::default(),
+                cache: None,
+            }),
+        );
+        let bind_group = Arc::new(device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("submission-window regression"),
+            layout: &bind_group_layout,
+            entries: &[],
+        }));
+
+        (
+            Launcher::new(
+                Arc::new(device),
+                Arc::new(queue),
+                info.backend,
+                GpuConfig::default(),
+                crate::device::LostFlag::default(),
+            ),
+            pipeline,
+            bind_group,
+        )
+    }
+
+    fn assert_streamed_submission_window(
+        launcher: &Launcher,
+        pipeline: &Arc<wgpu::ComputePipeline>,
+        bind_group: &Arc<wgpu::BindGroup>,
+        total: usize,
+    ) {
+        let limit = METAL_INFLIGHT_CHUNKS;
+        assert_eq!(limit, 2);
+        assert_eq!(
+            dispatches_per_submit(total, wgpu::Backend::Metal),
+            METAL_SUBMIT_CHUNK
+        );
+        launcher
+            .test_pending_submissions
+            .store(0, Ordering::Relaxed);
+        let mut pending_window = std::collections::VecDeque::new();
+
+        let record = CommandRecord::Dispatch {
+            name: "submission-window regression",
+            pipeline: Arc::clone(pipeline),
+            bind_group: Arc::clone(bind_group),
+            grid: [1, 1, 1],
+        };
+        let records = vec![record; total];
+        let chunk = total.div_ceil(limit);
+        assert_eq!(chunk, total.div_ceil(2));
+        assert_eq!(total.div_ceil(chunk), limit);
+
+        let mut offset = 0;
+        let mut portion = 0;
+        while offset < total {
+            let end = (offset + chunk).min(total);
+            launcher
+                .encode_command_records_from(
+                    &records[offset..end],
+                    None,
+                    TimingMode::All,
+                    offset,
+                    total,
+                    &mut pending_window,
+                )
+                .unwrap();
+            let pending = launcher.test_pending_submissions.load(Ordering::Relaxed);
+            assert_eq!(pending_window.len(), pending);
+            assert!(
+                pending <= limit,
+                "{total} dispatches: portion {portion} left {pending} submission handles pending (limit {limit})"
+            );
+            offset = end;
+            portion += 1;
+        }
+        assert_eq!(portion, 2);
+        launcher.poll_wait().unwrap();
+    }
+
+    #[test]
+    fn metal_submission_window_spans_1536_dispatches() {
+        let (launcher, pipeline, bind_group) = metal_launcher();
+        assert_streamed_submission_window(&launcher, &pipeline, &bind_group, 1536);
+    }
+
+    #[test]
+    fn metal_submission_window_tracks_final_partial_batch() {
+        let (launcher, pipeline, bind_group) = metal_launcher();
+        assert_streamed_submission_window(&launcher, &pipeline, &bind_group, 1538);
     }
 }

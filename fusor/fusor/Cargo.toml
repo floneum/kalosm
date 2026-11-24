@@ -31,6 +31,7 @@ default = ["cpu", "gpu"]
 # At least one must be on.
 cpu = ["dep:fusor-cpu"]
 gpu = ["dep:fusor-gpu"]
+kernel-observer = ["gpu", "fusor-gpu/kernel-observer"]
 
 [[example]]
 name = "coop_attn_repro"

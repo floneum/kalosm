@@ -180,6 +180,78 @@ pub fn cases() -> Cases {
     );
 
     cases.fuzz("rms_norm_residual", BWD_SPEC, residual_case);
+    cases.fuzz(
+        "rms_norm_decode_rows",
+        &[FuzzDim::Fixed(1)],
+        async |session, _, seed| {
+            let graph = graph_of(session);
+            for rows in [1usize, 4] {
+                for width in [1usize, 127, 257, 4096, 8191, 8192] {
+                    let data = Domain::Wide.sample(seed, rows * width);
+                    let weight: Vec<f32> =
+                        (0..width).map(|i| (i % 19) as f32 / 7.0 - 1.0).collect();
+                    let w = upload(graph.handle(), &dims(&[width as u64]), &weight)?;
+                    // Exercise both ordinary rows and absorbed strided views.
+                    for strided in [false, true] {
+                        let x = if strided {
+                            let mut transposed = vec![0.0; data.len()];
+                            for r in 0..rows {
+                                for c in 0..width {
+                                    transposed[c * rows + r] = data[r * width + c];
+                                }
+                            }
+                            upload(
+                                graph.handle(),
+                                &dims(&[width as u64, rows as u64]),
+                                &transposed,
+                            )?
+                            .transpose(0, 1)?
+                        } else {
+                            upload(graph.handle(), &dims(&[rows as u64, width as u64]), &data)?
+                        };
+                        let actual = read(&x.rms_norm(&w, EPS)?).await?;
+                        let expected = affine(&by_row(&data, width, host_rms), &weight, None);
+                        expect_values(
+                            session,
+                            &[rows as u64, width as u64],
+                            Dtype::F32,
+                            &actual,
+                            &expected,
+                        )
+                        .await?;
+                        let residual_values: Vec<f32> = (0..rows * width)
+                            .map(|i| (i % 31) as f32 / 13.0 - 0.7)
+                            .collect();
+                        let residual = upload(
+                            graph.handle(),
+                            &dims(&[width as u64, rows as u64]),
+                            &(0..width)
+                                .flat_map(|c| (0..rows).map(move |r| r * width + c))
+                                .map(|i| residual_values[i])
+                                .collect::<Vec<_>>(),
+                        )?
+                        .transpose(0, 1)?;
+                        let sum: Vec<f32> = data
+                            .iter()
+                            .zip(&residual_values)
+                            .map(|(a, b)| a + b)
+                            .collect();
+                        let expected = affine(&by_row(&sum, width, host_rms), &weight, None);
+                        let actual = read(&x.rms_norm_residual(&residual, &w, None, EPS)?).await?;
+                        expect_values(
+                            session,
+                            &[rows as u64, width as u64],
+                            Dtype::F32,
+                            &actual,
+                            &expected,
+                        )
+                        .await?;
+                    }
+                }
+            }
+            Ok(())
+        },
+    );
     cases.fuzz("variance_last", FD_SPEC, variance_case);
     cases.fuzz("softmax_rows_sum_to_one", FWD_SPEC, rows_sum_to_one);
     cases.fuzz("softmax_is_shift_invariant", FWD_SPEC, shift_invariance);

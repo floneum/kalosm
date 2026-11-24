@@ -8,6 +8,18 @@ The main entrypoint for this crate is the [`Llama`](https://docs.rs/kalosm-llama
 you can use the [`ChatModelExt`](https://docs.rs/kalosm-language/0.4.2/kalosm_language/prelude/trait.ChatModelExt.html#method.chat) trait to start a chat session or start a task.
 
 
+## Chat
+
+```sh
+cargo run -j 1 -p kalosm --example chat --features llama --release
+```
+
+The builder uses the ordinary Fusor GPU device. Compiler optimizations are
+shared with other tensor workloads and selected from graph structure and
+reported device capabilities. No model preset or adapter-name check is needed.
+Quantized GGUF weights share their mapped source bytes through Fusor's shared
+storage interface; keep those model files unchanged while a model is alive.
+
 ## Example
 
 ```rust

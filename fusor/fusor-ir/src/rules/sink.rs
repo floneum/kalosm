@@ -102,6 +102,24 @@ fn fold_operand_views(
         if spine.views.is_empty() {
             continue;
         }
+        if b.facts_of(slot.src).shape.as_slice() != space.dims.as_slice() {
+            if slot.layout.offset() != Dim::Const(0) {
+                continue;
+            }
+            let Some(layout) = crate::rules::composed_spine_layout(b, &spine) else {
+                continue;
+            };
+            let Some(layout) = project_unit_axes(&layout, &space.dims) else {
+                continue;
+            };
+            *slot = Operand {
+                src: spine.base,
+                layout,
+                access: AccessPlan::Alias,
+            };
+            changed = true;
+            continue;
+        }
         if spine.views.len() > 1 {
             // A multi-node spine composes to one stride vector when
             // `composed_spine_layout` can state it.
@@ -150,6 +168,35 @@ fn fold_operand_views(
         changed = true;
     }
     changed.then_some(new_ops)
+}
+
+/// Re-spell a statically composed view with a consumer rank that differs only
+/// by unit axes. Non-unit extents and their order remain unchanged.
+fn project_unit_axes(layout: &Layout, target: &[Dim]) -> Option<Layout> {
+    let source: Vec<(u64, u64)> = layout
+        .shape()
+        .iter()
+        .zip(layout.strides())
+        .map(|(extent, stride)| Some((extent.as_const()?, stride.as_const()?)))
+        .collect::<Option<_>>()?;
+    let mut source_non_unit = source.iter().copied().filter(|(extent, _)| *extent != 1);
+    let mut target_strides = Vec::with_capacity(target.len());
+    for dim in target {
+        let extent = dim.as_const()?;
+        if extent == 1 {
+            target_strides.push(Dim::Const(0));
+        } else {
+            let (source_extent, source_stride) = source_non_unit.next()?;
+            if source_extent != extent || (source_extent > 1 && source_stride == 0) {
+                return None;
+            }
+            target_strides.push(Dim::Const(source_stride));
+        }
+    }
+    if source_non_unit.next().is_some() {
+        return None;
+    }
+    Layout::from_parts(layout.offset(), target, &target_strides).ok()
 }
 
 /// The index map a spec vector induces over a dense base, and its base

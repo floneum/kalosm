@@ -56,13 +56,14 @@ impl Dim {
     pub const ONE: Dim = Dim::Const(1);
 }
 
-/// Symbolic dim arithmetic: a sum or product that does not fold becomes a
+/// Symbolic dim arithmetic: an expression that does not fold becomes a
 /// derived symbol, interned process-wide so `known_eq` stays structural, and
 /// evaluated at dispatch by [`Dim::evaluate`].
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum DimExpr {
     Add(Dim, Dim),
     Mul(Dim, Dim),
+    DivCeil(Dim, u64),
 }
 
 /// Derived symbols occupy `[DERIVED_BASE, DERIVED_END)`: above any symbol a
@@ -106,6 +107,17 @@ impl SymId {
 }
 
 impl Dim {
+    /// Ceiling division by a nonzero constant, retaining symbolic extents.
+    pub fn div_ceil(self, divisor: u64) -> Self {
+        assert!(divisor > 0, "dimension divisor must be nonzero");
+        match self {
+            Dim::Const(value) => Dim::Const(value.div_ceil(divisor)),
+            dim if divisor == 1 => dim,
+            Dim::Sym(OPAQUE_SYM) => Dim::Sym(OPAQUE_SYM),
+            dim => Dim::derived(DimExpr::DivCeil(dim, divisor)),
+        }
+    }
+
     fn derived(expr: DimExpr) -> Dim {
         let mut table = derived_table().lock().unwrap_or_else(|e| e.into_inner());
         if let Some(&i) = table.by_expr.get(&expr) {
@@ -172,6 +184,7 @@ impl Dim {
             Dim::Sym(s) => match s.derived_expr() {
                 Some(DimExpr::Add(a, b)) => a.evaluate(resolve)?.checked_add(b.evaluate(resolve)?),
                 Some(DimExpr::Mul(a, b)) => a.evaluate(resolve)?.checked_mul(b.evaluate(resolve)?),
+                Some(DimExpr::DivCeil(a, divisor)) => Some(a.evaluate(resolve)?.div_ceil(divisor)),
                 None => resolve(s),
             },
         }
